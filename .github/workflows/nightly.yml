@@ -1,8 +1,7 @@
 name: Nightly
 
 on:
-  schedule:
-    - cron: "17 3 * * 6"
+  push:
   workflow_dispatch:
 
 permissions:
