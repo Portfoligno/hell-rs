@@ -1,0 +1,19 @@
+[package]
+name = "hell-ci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "hell-ci"
+path = "src/main.rs"
+
+[dependencies]
+hell-compiler = { path = "../hell-compiler" }
+hell-source = { path = "../hell-source" }
+hell-syntax = { path = "../hell-syntax" }
+hell-testkit = { path = "../hell-testkit" }
+
+[lints]
+workspace = true

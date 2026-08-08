@@ -24,3 +24,38 @@ hell --version
 
 The upstream Haskell implementation is a read-only differential-test oracle.
 The Rust executable does not invoke GHC or an upstream `hell` process.
+
+## Continuous integration
+
+Build the Rust CI driver:
+
+```text
+cargo build --locked --profile ci --package hell-ci --bin hell-ci
+```
+
+Run repository policy checks:
+
+```text
+target/ci/hell-ci policy --report ci-out/policy.json
+```
+
+Reproduce Linux verification:
+
+```text
+target/ci/hell-ci verify --report ci-out/verify-local.json
+```
+
+Run the portability suite:
+
+```text
+target/ci/hell-ci portability --report ci-out/portability-local.json
+```
+
+Run release and stress gates:
+
+```text
+target/ci/hell-ci nightly --report ci-out/nightly-local.json
+```
+
+On Windows, invoke the built driver directly as
+`target\ci\hell-ci.exe`, using the same subcommands and arguments.

@@ -1,0 +1,5 @@
+main = do
+  let x = "Hello!"
+  Text.putStrLn (Function.id x)
+  let lengths = List.map Text.length ["foo", "mu"]
+  IO.mapM_ (\i -> Text.putStrLn (Int.show i)) lengths

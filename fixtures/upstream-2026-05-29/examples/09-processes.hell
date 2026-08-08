@@ -1,0 +1,20 @@
+main = do
+  Text.putStrLn "OK"
+  (code, out, err) <- ByteString.readProcess (Process.proc "ls" ["-al"])
+  ByteString.hPutStr IO.stdout out
+  ByteString.hPutStr IO.stdout err
+
+  (out, err) <- Text.readProcess_ (Process.proc "df" ["-h", "/"])
+  Text.hPutStr IO.stdout out
+  Text.hPutStr IO.stdout err
+
+  code <- Process.runProcess (Process.proc "false" [])
+
+  Process.runProcess_ (Process.proc "echo" ["Hello, World!"])
+
+  let config = Process.proc "false" []
+  code <- Process.runProcess config
+
+  Process.runProcess $ Process.setWorkingDir "/etc/" $ Process.proc "pwd" []
+
+  Text.putStrLn "Done."

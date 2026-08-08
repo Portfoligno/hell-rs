@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/hell-builtins",
+    "crates/hell-ci",
     "crates/hell-cli",
     "crates/hell-compiler",
     "crates/hell-core",
@@ -18,7 +19,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
-repository = "https://github.com/meristal/hell-rs"
+repository = "https://github.com/Portfoligno/hell-rs"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -27,3 +28,7 @@ unsafe_code = "forbid"
 all = "warn"
 pedantic = "warn"
 
+[profile.ci]
+inherits = "dev"
+incremental = false
+debug = "line-tables-only"

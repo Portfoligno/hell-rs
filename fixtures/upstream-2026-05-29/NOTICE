@@ -1,0 +1,9 @@
+Vendored upstream Hell examples
+
+Repository: https://github.com/chrisdone/hell
+Commit: d4d028609ed46a560c62caea8c70e7e91d1afd29
+Language version: 2026-05-29
+Pinned source SHA-256: 6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9
+
+The 44 files under examples/ are copied verbatim from the pinned commit.
+LICENSE is the license file from that same commit.

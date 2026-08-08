@@ -1,0 +1,7 @@
+main = do
+  IO.mapM_ Text.putStrLn ["Hello, ", "World!"]
+
+  Function.fix (\(loop :: IO ()) -> do
+    Text.putStrLn "Ahhhhh! More?"
+    l <- Text.getLine
+    loop)
