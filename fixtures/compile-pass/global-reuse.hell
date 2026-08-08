@@ -1,0 +1,5 @@
+identity = \x -> x
+main = do
+  IO.print (Main.identity 1)
+  Text.putStrLn (Main.identity "text")
+

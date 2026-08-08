@@ -1,0 +1,10 @@
+[upstream]
+repository = "chrisdone/hell"
+commit = "d4d028609ed46a560c62caea8c70e7e91d1afd29"
+language_version = "2026-05-29"
+source_sha256 = "6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9"
+example_count = 44
+unique_primitive_count = 355
+public_primitive_count = 345
+internal_primitive_count = 10
+

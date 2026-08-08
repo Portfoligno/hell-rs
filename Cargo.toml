@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hell-builtins",
+    "crates/hell-cli",
+    "crates/hell-compiler",
+    "crates/hell-core",
+    "crates/hell-docgen",
+    "crates/hell-platform",
+    "crates/hell-runtime",
+    "crates/hell-source",
+    "crates/hell-syntax",
+    "crates/hell-testkit",
+    "crates/hell-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/meristal/hell-rs"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+

@@ -1,0 +1,2 @@
+main = IO.print $ List.take 5 $ List.iterate' (Int.plus 1) 0
+

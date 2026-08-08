@@ -1,0 +1,12 @@
+[package]
+name = "hell-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hell-source = { path = "../hell-source" }
+
+[lints]
+workspace = true
+

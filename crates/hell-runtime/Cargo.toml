@@ -1,0 +1,17 @@
+[package]
+name = "hell-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hell-builtins = { path = "../hell-builtins" }
+hell-core = { path = "../hell-core" }
+hell-types = { path = "../hell-types" }
+
+[dev-dependencies]
+hell-compiler = { path = "../hell-compiler" }
+hell-source = { path = "../hell-source" }
+
+[lints]
+workspace = true

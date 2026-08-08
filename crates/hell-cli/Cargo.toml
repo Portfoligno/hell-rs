@@ -1,0 +1,19 @@
+[package]
+name = "hell-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hell"
+path = "src/main.rs"
+
+[dependencies]
+hell-builtins = { path = "../hell-builtins" }
+hell-compiler = { path = "../hell-compiler" }
+hell-core = { path = "../hell-core" }
+hell-platform = { path = "../hell-platform" }
+hell-runtime = { path = "../hell-runtime" }
+
+[lints]
+workspace = true

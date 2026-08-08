@@ -1,0 +1,13 @@
+[package]
+name = "hell-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+hell-compiler = { path = "../hell-compiler" }
+hell-source = { path = "../hell-source" }
+hell-syntax = { path = "../hell-syntax" }
+
+[lints]
+workspace = true

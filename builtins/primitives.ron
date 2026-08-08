@@ -1,0 +1,14 @@
+// The canonical names and executable schemes live in hell-builtins/src/lib.rs.
+// This file is retained as the manifest boundary described by the design.
+(
+  baseline: "2026-05-29",
+  public_names: 345,
+  internal_names: 10,
+  known_duplicate_source_entries: [
+    "Text.isPrefixOf",
+    "Text.isSuffixOf",
+    "Tuple.(,)",
+  ],
+  known_quirks: ["List.mapAccumR-dispatches-to-mapAccumL"],
+)
+

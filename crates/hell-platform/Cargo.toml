@@ -1,0 +1,12 @@
+[package]
+name = "hell-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hell-runtime = { path = "../hell-runtime" }
+
+[lints]
+workspace = true
+

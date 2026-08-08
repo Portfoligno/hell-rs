@@ -1,0 +1,8 @@
+This software implements behavior from Hell by Chris Done and contributors.
+
+Compatibility baseline:
+  https://github.com/chrisdone/hell/commit/d4d028609ed46a560c62caea8c70e7e91d1afd29
+
+Hell is distributed under the BSD 3-Clause License. The exact upstream license
+text is reproduced in LICENSES/BSD-3-Clause-Hell.txt.
+

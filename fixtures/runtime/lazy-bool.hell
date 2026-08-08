@@ -1,0 +1,2 @@
+main = IO.print $ Bool.bool 1 (Error.error "boom" :: Int) Bool.False
+
