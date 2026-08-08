@@ -9,6 +9,39 @@ use hell_compiler::{CompilerSession, compile_source};
 use hell_runtime::policy::{Limit, RuntimePolicy};
 use hell_runtime::{RuntimeContext, run_main};
 
+struct OneShotGateReader {
+    receiver: mpsc::Receiver<()>,
+    opened: bool,
+}
+
+impl OneShotGateReader {
+    fn new(receiver: mpsc::Receiver<()>) -> Self {
+        Self {
+            receiver,
+            opened: false,
+        }
+    }
+}
+
+impl Read for OneShotGateReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.opened {
+            return Ok(0);
+        }
+        self.receiver.recv().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "HTTP cancellation gate was dropped",
+            )
+        })?;
+        let signal = b"\n";
+        let written = signal.len().min(buffer.len());
+        buffer[..written].copy_from_slice(&signal[..written]);
+        self.opened = true;
+        Ok(written)
+    }
+}
+
 fn available_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -860,7 +893,7 @@ fn response_stream_flush_is_visible_before_callback_completion() {
 }
 
 #[test]
-fn timeout_cancellation_wakes_a_partial_request_body_read() {
+fn timed_cancellation_wakes_a_partial_request_body_read() {
     let port = available_port();
     let source = format!(
         concat!(
@@ -868,20 +901,34 @@ fn timeout_cancellation_wakes_a_partial_request_body_read() {
             "  body <- Http.consumeRequestBodyStrict request\n",
             "  respond $ Http.responseBuilder (Http.mkStatus 200 \"OK\") []\n",
             "    (Builder.byteString body)\n",
+            "cancel = do\n",
+            "  _ready <- Text.getLine\n",
+            "  Concurrent.threadDelay 200000\n",
             "main = do\n",
-            "  _result <- Timeout.timeout 200000 Main.server\n",
+            "  _result <- Async.race Main.server Main.cancel\n",
             "  IO.pure ()\n",
         ),
         port = port
     );
-    let (worker, receiver) = start_server_with_limit(&source, std::env::temp_dir(), 100);
+    let (cancel_sender, cancel_receiver) = mpsc::channel();
+    let context = RuntimeContext::with_host(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        true,
+    )
+    .with_http_request_limit(100)
+    .with_stdin(OneShotGateReader::new(cancel_receiver));
+    let (worker, receiver, _) = start_server_in_context(&source, context);
     let mut stream = connect(port);
     stream
         .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\npartial")
         .unwrap();
+    cancel_sender.send(()).unwrap();
     receiver
         .recv_timeout(Duration::from_secs(3))
-        .expect("HTTP timeout cancelled the partial request body")
+        .expect("timed cancellation woke the partial HTTP request body")
         .unwrap();
     worker.join().unwrap();
 }

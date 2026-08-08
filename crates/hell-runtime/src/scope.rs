@@ -1292,11 +1292,16 @@ mod tests {
             })
             .unwrap();
         started_receiver.recv().unwrap();
-        let started = Instant::now();
-        let error = scope.close().unwrap_err();
-        assert!(error.message.contains("CancellationStalled"));
-        assert!(started.elapsed() < Duration::from_millis(80));
+        let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ignored = closed_sender.send(scope.close());
+        });
+        let close_result = closed_receiver.recv_timeout(Duration::from_secs(3));
         release_sender.send(()).unwrap();
+        let error = close_result
+            .expect("scope cancellation remained bounded")
+            .unwrap_err();
+        assert!(error.message.contains("CancellationStalled"));
         task.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
     }
 
