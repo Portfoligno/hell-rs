@@ -41,12 +41,21 @@ fn run_with_input(source: &str, input: Vec<u8>) -> Vec<u8> {
 }
 
 fn run_in(source: &str, cwd: PathBuf, allow_filesystem: bool) -> Result<String, String> {
+    run_in_with_args(source, Vec::new(), cwd, allow_filesystem)
+}
+
+fn run_in_with_args(
+    source: &str,
+    arguments: Vec<Arc<str>>,
+    cwd: PathBuf,
+    allow_filesystem: bool,
+) -> Result<String, String> {
     let program = compile_source(&mut CompilerSession::default(), "test.hell", source).unwrap();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     run_main(
         program,
         RuntimeContext::with_host(
-            Vec::new(),
+            arguments,
             Vec::new(),
             SharedWriter(Arc::clone(&bytes)),
             cwd,
@@ -61,6 +70,12 @@ fn run_in(source: &str, cwd: PathBuf, allow_filesystem: bool) -> Result<String, 
 fn run_error(source: &str) -> Arc<RuntimeError> {
     let program = compile_source(&mut CompilerSession::default(), "test.hell", source).unwrap();
     run_main(program, RuntimeContext::new(Vec::new(), Vec::<u8>::new())).unwrap_err()
+}
+
+fn process_fixture_arguments() -> Vec<Arc<str>> {
+    vec![Arc::from(env!(
+        "CARGO_BIN_EXE_hell-runtime-process-fixture"
+    ))]
 }
 
 #[test]
@@ -247,45 +262,63 @@ fn text_files_and_directory_operations_use_the_logical_cwd_and_capability() {
 
 #[test]
 fn process_descriptions_execute_fresh_with_capture_streams_and_capabilities() {
+    let directory = std::env::temp_dir().join(format!("hell-rs-process-{}", std::process::id()));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
     let source = concat!(
         "main = do\n",
-        "  (out, err) <- Text.readProcess_\n",
-        "    (Process.proc \"/bin/sh\" [\"-c\", \"printf hello\"])\n",
-        "  Text.hPutStr IO.stdout out\n",
-        "  (env, err) <- Text.readProcess_ $\n",
-        "    Process.setEnv [(\"HELLO\", \"world\")] $\n",
-        "    Process.proc \"/bin/sh\" [\"-c\", \"printf $HELLO\"]\n",
-        "  Text.hPutStr IO.stdout env\n",
-        "  (code, out, err) <- ByteString.readProcess\n",
-        "    (Process.proc \"/usr/bin/false\" [])\n",
-        "  Exit.exitCode (Text.putStrLn \"success\") IO.print code\n",
-        "  Process.runProcess_ $ Process.setStdout Process.nullStream $\n",
-        "    Process.proc \"/bin/sh\" [\"-c\", \"printf hidden\"]\n",
+        "  helpers <- Environment.getArgs\n",
+        "  Monad.forM_ helpers \\helper -> do\n",
+        "    let process = Process.proc helper [\"emit\", \"hello\", \"error\"]\n",
+        "    (out, err) <- Text.readProcess_ process\n",
+        "    Text.hPutStr IO.stdout out\n",
+        "    Text.hPutStr IO.stdout err\n",
+        "    (freshOut, freshErr) <- Text.readProcess_ process\n",
+        "    Text.hPutStr IO.stdout freshOut\n",
+        "    Text.hPutStr IO.stdout freshErr\n",
+        "    (env, envErr) <- Text.readProcess_ $\n",
+        "      Process.setEnv [(\"PATH\", \"world\")] $\n",
+        "      Process.proc helper [\"environment-path\"]\n",
+        "    Text.hPutStr IO.stdout env\n",
+        "    Text.hPutStr IO.stdout envErr\n",
+        "    (code, exitOut, exitErr) <- ByteString.readProcess\n",
+        "      (Process.proc helper [\"exit\", \"7\"])\n",
+        "    ByteString.hPutStr IO.stdout exitOut\n",
+        "    ByteString.hPutStr IO.stdout exitErr\n",
+        "    Exit.exitCode (Text.putStrLn \"success\") IO.print code\n",
+        "    Process.runProcess_ $ Process.setStdout Process.nullStream $\n",
+        "      Process.proc helper [\"emit\", \"hidden\", \"\"]\n",
     );
     assert_eq!(
-        run_in(source, std::env::temp_dir(), true).unwrap(),
-        "helloworld1\n"
+        run_in_with_args(source, process_fixture_arguments(), directory.clone(), true,).unwrap(),
+        "helloerrorhelloerrorworld7\n"
     );
 
     let program = compile_source(
         &mut CompilerSession::default(),
         "test.hell",
-        "main = Process.runProcess_ (Process.proc \"/usr/bin/true\" [])\n",
+        concat!(
+            "main = do\n",
+            "  helpers <- Environment.getArgs\n",
+            "  Monad.forM_ helpers \\helper ->\n",
+            "    Process.runProcess_ (Process.proc helper [\"exit\", \"0\"])\n",
+        ),
     )
     .unwrap();
     let error = run_main(
         program,
         RuntimeContext::with_host_capabilities(
-            Vec::new(),
+            process_fixture_arguments(),
             Vec::new(),
             Vec::<u8>::new(),
-            std::env::temp_dir(),
+            directory.clone(),
             true,
             false,
         ),
     )
     .unwrap_err();
     assert_eq!(error.code, "H0903");
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -378,17 +411,20 @@ fn scoped_temp_resources_and_explicit_file_handles_cleanup_and_preserve_bytes() 
         "  Temp.withSystemTempFile \"hell-rs-scope\" \\path tempHandle -> do\n",
         "    ByteString.hPutStr tempHandle (Text.encodeUtf8 \"raw λ\")\n",
         "    Text.putStrLn path\n",
-        "  Temp.withSystemTempFile \"hell-rs-process\" \\path processHandle -> do\n",
-        "    let process = Process.setStdout (Process.useHandleClose processHandle) $\n",
-        "          Process.proc \"/bin/sh\" [\"-c\", \"printf redirected\"]\n",
-        "    Text.putStrLn path\n",
-        "    Process.runProcess_ process\n",
-        "    IO.hClose processHandle\n",
-        "    redirected <- Text.readFile path\n",
-        "    Text.putStrLn redirected\n",
+        "  helpers <- Environment.getArgs\n",
+        "  Monad.forM_ helpers \\helper ->\n",
+        "    Temp.withSystemTempFile \"hell-rs-process\" \\path processHandle -> do\n",
+        "      let process = Process.setStdout (Process.useHandleClose processHandle) $\n",
+        "            Process.proc helper [\"emit\", \"redirected\", \"\"]\n",
+        "      Text.putStrLn path\n",
+        "      Process.runProcess_ process\n",
+        "      IO.hClose processHandle\n",
+        "      redirected <- Text.readFile path\n",
+        "      Text.putStrLn redirected\n",
         "  Directory.removeFile \"out.txt\"\n",
     );
-    let output = run_in(source, directory.clone(), true).unwrap();
+    let output =
+        run_in_with_args(source, process_fixture_arguments(), directory.clone(), true).unwrap();
     let mut lines = output.lines();
     assert_eq!(lines.next(), Some("hello λ"));
     let temp_directory = PathBuf::from(lines.next().unwrap());

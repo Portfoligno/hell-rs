@@ -147,8 +147,11 @@ fn utc_time_parsing_formatting_arithmetic_and_clock_override_are_deterministic()
                 "  Text.putStrLn $ UTCTime.iso8601Show now\n",
             ),
             |bytes| {
+                // Windows SystemTime has 100 ns granularity. Keep the injected host-clock
+                // value exactly representable there; the parsed value above independently
+                // covers UtcTime's finer value-layer precision.
                 RuntimeContext::new(Vec::new(), SharedWriter(bytes))
-                    .with_current_time(UNIX_EPOCH + Duration::new(1, 195_147_084))
+                    .with_current_time(UNIX_EPOCH + Duration::new(1, 195_147_000))
             },
         ),
         concat!(
@@ -162,7 +165,7 @@ fn utc_time_parsing_formatting_arithmetic_and_clock_override_are_deterministic()
             "Nothing\n",
             "Just 2025-05-31 00:00:00 UTC\n",
             "Just 2025-05-30 23:59:60 UTC\n",
-            "1970-01-01T00:00:01.195147084Z\n",
+            "1970-01-01T00:00:01.195147Z\n",
         )
     );
 
@@ -171,10 +174,11 @@ fn utc_time_parsing_formatting_arithmetic_and_clock_override_are_deterministic()
             "main = Monad.bind UTCTime.getCurrentTime \
              (\\time -> Text.putStrLn (UTCTime.iso8601Show time))\n",
             |bytes| {
+                // Use the smallest pre-epoch instant representable by Windows SystemTime.
                 RuntimeContext::new(Vec::new(), SharedWriter(bytes))
-                    .with_current_time(UNIX_EPOCH - Duration::from_nanos(1))
+                    .with_current_time(UNIX_EPOCH - Duration::from_nanos(100))
             },
         ),
-        "1969-12-31T23:59:59.999999999Z\n"
+        "1969-12-31T23:59:59.9999999Z\n"
     );
 }

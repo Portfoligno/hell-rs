@@ -940,6 +940,10 @@ struct Parser {
     nesting_depth: usize,
 }
 
+// Bound recursive descent with the same deterministic resource policy on every
+// target. The token preflight enforces this before parser frames accumulate.
+const MAX_PARSER_DEPTH: usize = 64;
+
 impl Parser {
     fn alloc_expr(&mut self, expression: Expr) -> ExprId {
         let id = ExprId(u32::try_from(self.expressions.len()).expect("expression arena overflow"));
@@ -1698,7 +1702,7 @@ impl Parser {
     }
 
     fn parse_parenthesized(&mut self, start: Span) -> Result<ExprId, SyntaxError> {
-        if self.nesting_depth >= 256 {
+        if self.nesting_depth >= MAX_PARSER_DEPTH {
             return Err(SyntaxError::resource_limit(
                 "parser nesting limit exceeded",
                 start,
@@ -1894,6 +1898,7 @@ fn fixity(operator: &str) -> Option<(u8, bool)> {
 /// Returns every lexical error, or the parser errors recovered at declaration boundaries.
 pub fn parse(source: &SourceFile) -> Result<ParsedFile, Vec<SyntaxError>> {
     let tokens = lex(source)?;
+    reject_excessive_delimiter_nesting(&tokens)?;
     Parser {
         tokens,
         at: 0,
@@ -1903,4 +1908,62 @@ pub fn parse(source: &SourceFile) -> Result<ParsedFile, Vec<SyntaxError>> {
         nesting_depth: 0,
     }
     .parse()
+}
+
+fn reject_excessive_delimiter_nesting(tokens: &[Token]) -> Result<(), Vec<SyntaxError>> {
+    // Reject unsafe input before recursive descent accumulates parser frames.
+    // The parser's own guard remains the grammar-level backstop.
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token.kind {
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                if depth >= MAX_PARSER_DEPTH {
+                    return Err(vec![SyntaxError::resource_limit(
+                        "parser nesting limit exceeded",
+                        token.span,
+                    )]);
+                }
+                depth += 1;
+            }
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use hell_source::{SourceFile, SourceMap};
+
+    use super::{MAX_PARSER_DEPTH, parse};
+
+    fn nested_application_source(delimiter_depth: usize) -> Arc<SourceFile> {
+        let application_depth = delimiter_depth
+            .checked_sub(1)
+            .expect("the unit expression requires one delimiter level");
+        let text = format!(
+            "main = IO.pure {}(){}\n",
+            "Function.id (".repeat(application_depth),
+            ")".repeat(application_depth)
+        );
+        SourceMap::new().add_text("nesting.hell", text)
+    }
+
+    #[test]
+    fn parser_accepts_the_depth_limit_and_rejects_the_next_level() {
+        let at_limit = nested_application_source(MAX_PARSER_DEPTH);
+        parse(&at_limit).expect("the configured parser depth limit must remain accepted");
+
+        let beyond_limit = nested_application_source(MAX_PARSER_DEPTH + 1);
+        let errors =
+            parse(&beyond_limit).expect_err("input beyond the parser depth limit must be rejected");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "H0801");
+        assert_eq!(errors[0].message.as_ref(), "parser nesting limit exceeded");
+    }
 }

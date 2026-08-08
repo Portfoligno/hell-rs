@@ -216,7 +216,7 @@ fn shebang_preserves_original_error_line() {
 }
 
 #[test]
-fn deep_valid_source_succeeds_or_hits_a_structured_compiler_limit() {
+fn deep_valid_source_hits_the_structured_parser_limit() {
     const DEPTH: usize = 2_048;
     let source = format!(
         "main = IO.pure {}(){}\n",
@@ -224,11 +224,5 @@ fn deep_valid_source_succeeds_or_hits_a_structured_compiler_limit() {
         ")".repeat(DEPTH)
     );
     let output = check_source("deep-applications", &source);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("H0801") || stderr.contains("H0802"),
-            "deep valid source crashed or failed without a resource diagnostic: {stderr}"
-        );
-    }
+    assert_diagnostic(&output, "H0801");
 }

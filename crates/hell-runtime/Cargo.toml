@@ -13,5 +13,12 @@ hell-types = { path = "../hell-types" }
 hell-compiler = { path = "../hell-compiler" }
 hell-source = { path = "../hell-source" }
 
+[[bin]]
+name = "hell-runtime-process-fixture"
+path = "test-support/process_fixture.rs"
+test = false
+bench = false
+doc = false
+
 [lints]
 workspace = true

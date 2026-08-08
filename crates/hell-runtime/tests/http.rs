@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -115,8 +115,8 @@ fn exchange(port: u16, request: &[u8]) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
+    // Requests are self-delimiting; a half-close races the server's response close on macOS.
     stream.write_all(request).unwrap();
-    stream.shutdown(Shutdown::Write).unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
     response

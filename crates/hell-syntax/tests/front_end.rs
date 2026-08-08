@@ -178,3 +178,17 @@ fn case_layout_can_close_before_a_parenthesized_block_argument() {
     ))
     .unwrap();
 }
+
+#[test]
+fn excessive_expression_nesting_returns_a_structured_resource_limit() {
+    const DEPTH: usize = 2_048;
+    let text = format!(
+        "main = IO.pure {}(){}\n",
+        "Function.id (".repeat(DEPTH),
+        ")".repeat(DEPTH)
+    );
+    let errors = parse(&source(&text)).expect_err("deep input must reach the parser boundary");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, "H0801");
+    assert_eq!(errors[0].message.as_ref(), "parser nesting limit exceeded");
+}

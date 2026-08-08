@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CACHE_SHA: &str = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
@@ -17,6 +17,7 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
             &mut failures,
         );
     }
+    check_checkout_attributes(root, &mut failures);
     check_workflows(root, &tracked, &mut failures);
     check_test_infrastructure(root, &tracked, &mut failures);
     check_environment_configuration(root, &tracked, &mut failures);
@@ -27,20 +28,110 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
     }
 }
 
+fn check_checkout_attributes(root: &Path, failures: &mut Vec<String>) {
+    const PATHS: &[&str] = &[
+        "crates/hell-docgen/src/lib.rs",
+        "compat/upstream-2026-05-29.json",
+        "builtins/primitives.ron",
+        "fixtures/upstream-2026-05-29/expected/01.stdout",
+        "fixtures/upstream-2026-05-29/examples/01-hello-world.hell",
+    ];
+
+    let mut command = Command::new("git");
+    command.args([
+        "check-attr",
+        "--cached",
+        "-z",
+        "text",
+        "eol",
+        "linguist-language",
+        "--",
+    ]);
+    command.args(PATHS);
+    command.current_dir(root);
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            failures.push(format!("git check-attr failed to start: {error}"));
+            return;
+        }
+    };
+    if !output.status.success() {
+        failures.push(format!(
+            "git check-attr failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+        return;
+    }
+    let attributes = match parse_checked_attributes(&output.stdout) {
+        Ok(attributes) => attributes,
+        Err(error) => {
+            failures.push(error);
+            return;
+        }
+    };
+    for path in PATHS {
+        require_attribute(&attributes, path, "text", "auto", failures);
+        require_attribute(&attributes, path, "eol", "lf", failures);
+    }
+    require_attribute(
+        &attributes,
+        "fixtures/upstream-2026-05-29/examples/01-hello-world.hell",
+        "linguist-language",
+        "Haskell",
+        failures,
+    );
+}
+
+fn parse_checked_attributes(bytes: &[u8]) -> Result<BTreeMap<(String, String), String>, String> {
+    let fields = split_nul(bytes).collect::<Vec<_>>();
+    if !fields.len().is_multiple_of(3) {
+        return Err("git check-attr returned malformed NUL-delimited output".to_owned());
+    }
+    let mut attributes = BTreeMap::new();
+    for record in fields.chunks_exact(3) {
+        let path = std::str::from_utf8(record[0])
+            .map_err(|_| "git check-attr returned a non-UTF-8 path".to_owned())?;
+        let attribute = std::str::from_utf8(record[1])
+            .map_err(|_| "git check-attr returned a non-UTF-8 attribute".to_owned())?;
+        let value = std::str::from_utf8(record[2])
+            .map_err(|_| "git check-attr returned a non-UTF-8 value".to_owned())?;
+        attributes.insert((path.to_owned(), attribute.to_owned()), value.to_owned());
+    }
+    Ok(attributes)
+}
+
+fn require_attribute(
+    attributes: &BTreeMap<(String, String), String>,
+    path: &str,
+    attribute: &str,
+    expected: &str,
+    failures: &mut Vec<String>,
+) {
+    let key = (path.to_owned(), attribute.to_owned());
+    let actual = attributes.get(&key).map_or("unspecified", String::as_str);
+    if actual != expected {
+        failures.push(format!(
+            "checkout attribute {attribute} for {path} is {actual}, expected {expected}"
+        ));
+    }
+}
+
 pub fn normalized_relative_path(value: &str) -> Result<PathBuf, String> {
-    let path = Path::new(value);
-    if value.is_empty() || path.is_absolute() {
+    if value.is_empty() {
         return Err(format!("path must be nonempty and relative: {value}"));
     }
     let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            _ => return Err(format!("path is not normalized: {value}")),
+    for part in value.split('/') {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('\\')
+            || part.contains(':')
+        {
+            return Err(format!("path is not normalized: {value}"));
         }
-    }
-    if normalized.as_os_str() != path.as_os_str() {
-        return Err(format!("path is not normalized: {value}"));
+        normalized.push(part);
     }
     Ok(normalized)
 }
@@ -539,6 +630,51 @@ mod tests {
     }
 
     #[test]
+    fn cached_attribute_output_preserves_checkout_policy() {
+        let attributes = parse_checked_attributes(
+            b"compat/upstream-2026-05-29.json\0text\0auto\0compat/upstream-2026-05-29.json\0eol\0lf\0fixtures/upstream-2026-05-29/examples/01-hello-world.hell\0linguist-language\0Haskell\0",
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        require_attribute(
+            &attributes,
+            "compat/upstream-2026-05-29.json",
+            "text",
+            "auto",
+            &mut failures,
+        );
+        require_attribute(
+            &attributes,
+            "compat/upstream-2026-05-29.json",
+            "eol",
+            "lf",
+            &mut failures,
+        );
+        require_attribute(
+            &attributes,
+            "fixtures/upstream-2026-05-29/examples/01-hello-world.hell",
+            "linguist-language",
+            "Haskell",
+            &mut failures,
+        );
+        assert!(failures.is_empty());
+
+        require_attribute(
+            &attributes,
+            "compat/upstream-2026-05-29.json",
+            "eol",
+            "crlf",
+            &mut failures,
+        );
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn malformed_cached_attribute_output_is_rejected() {
+        assert!(parse_checked_attributes(b"path\0text\0").is_err());
+    }
+
+    #[test]
     fn unsafe_workflow_forms_are_rejected() {
         for value in [
             "      - run: |\n          cargo test\n",
@@ -570,10 +706,26 @@ mod tests {
     fn path_normalization_confines_fixture_paths() {
         assert_eq!(
             normalized_relative_path("examples/01.hell").unwrap(),
-            Path::new("examples/01.hell")
+            Path::new("examples").join("01.hell")
         );
-        assert!(normalized_relative_path("../escape").is_err());
-        assert!(normalized_relative_path("/absolute").is_err());
+        for value in [
+            "",
+            "../escape",
+            "examples/../escape",
+            "/absolute",
+            "examples/",
+            "examples//01.hell",
+            "examples/./01.hell",
+            "examples\\01.hell",
+            "\\\\server\\share\\01.hell",
+            "C:examples/01.hell",
+            "C:/examples/01.hell",
+        ] {
+            assert!(
+                normalized_relative_path(value).is_err(),
+                "accepted {value:?}"
+            );
+        }
     }
 
     #[test]

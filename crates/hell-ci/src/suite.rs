@@ -373,8 +373,9 @@ fn generated_runtime_cases(
     let mut observations = 0;
     let mut failures_seen = 0;
     for index in 0..CASES {
-        let program =
-            format!("-- deterministic runtime case {index}\nmain = IO.print $ Int.plus {index} 1\n");
+        let program = format!(
+            "-- deterministic runtime case {index}\nmain = IO.print $ Int.plus {index} 1\n"
+        );
         fs::write(&source, program).map_err(|_| FailureKind::Io)?;
         observations += 1;
         let passed = run_command(
