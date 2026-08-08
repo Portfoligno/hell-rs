@@ -9,11 +9,11 @@ name = "hell"
 path = "src/main.rs"
 
 [dependencies]
-hell-builtins = { path = "../hell-builtins" }
-hell-compiler = { path = "../hell-compiler" }
-hell-core = { path = "../hell-core" }
-hell-platform = { path = "../hell-platform" }
-hell-runtime = { path = "../hell-runtime" }
+hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
+hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
+hell-core = { version = "0.1.0", path = "../hell-core" }
+hell-platform = { version = "0.1.0", path = "../hell-platform" }
+hell-runtime = { version = "0.1.0", path = "../hell-runtime" }
 
 [lints]
 workspace = true

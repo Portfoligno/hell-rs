@@ -889,10 +889,10 @@ impl ExecutionScope {
                         ))
                     }),
                 };
-                let _ignored = sender.send(result);
                 drop(permit);
                 worker_finished.store(true, Ordering::Release);
                 group.1.notify_all();
+                let _ignored = sender.send(result);
             });
         let worker = match worker {
             Ok(worker) => worker,
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_task_eventually_releases_shared_budget_permit() {
+    fn stalled_task_releases_shared_budget_permit_before_result_is_observed() {
         let mut policy = RuntimePolicy::deterministic_test();
         policy.cancellation.graceful_shutdown = Duration::from_millis(5);
         policy.cancellation.forced_shutdown = Duration::from_millis(5);

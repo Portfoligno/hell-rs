@@ -5,10 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hell-builtins = { path = "../hell-builtins" }
-hell-source = { path = "../hell-source" }
-hell-types = { path = "../hell-types" }
+hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
+hell-source = { version = "0.1.0", path = "../hell-source" }
+hell-types = { version = "0.1.0", path = "../hell-types" }
 
 [lints]
 workspace = true
-

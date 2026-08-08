@@ -5,12 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hell-platform = { path = "../hell-platform" }
+hell-platform = { version = "0.1.0", path = "../hell-platform" }
 
 [dev-dependencies]
-hell-compiler = { path = "../hell-compiler" }
-hell-source = { path = "../hell-source" }
-hell-syntax = { path = "../hell-syntax" }
+hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
+hell-source = { version = "0.1.0", path = "../hell-source" }
+hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 
 [lints]
 workspace = true

@@ -5,15 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hell-builtins = { path = "../hell-builtins" }
-hell-core = { path = "../hell-core" }
-hell-host = { path = "../hell-host" }
-hell-http-host = { path = "../hell-http-host" }
-hell-types = { path = "../hell-types" }
+hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
+hell-core = { version = "0.1.0", path = "../hell-core" }
+hell-host = { version = "0.1.0", path = "../hell-host" }
+hell-http-host = { version = "0.1.0", path = "../hell-http-host" }
+hell-types = { version = "0.1.0", path = "../hell-types" }
 
 [dev-dependencies]
-hell-compiler = { path = "../hell-compiler" }
-hell-source = { path = "../hell-source" }
+hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
+hell-source = { version = "0.1.0", path = "../hell-source" }
 
 [[bin]]
 name = "hell-runtime-process-fixture"

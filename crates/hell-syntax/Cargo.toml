@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hell-source = { path = "../hell-source" }
+hell-source = { version = "0.1.0", path = "../hell-source" }
 
 [lints]
 workspace = true
-
