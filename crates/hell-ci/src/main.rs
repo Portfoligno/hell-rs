@@ -8,21 +8,45 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use hell_testkit::Digest;
 use report::Report;
 use suite::FailureKind;
 
 enum Invocation {
-    Policy { report: PathBuf },
-    Verify { report: PathBuf },
-    Portability { report: PathBuf },
-    Nightly { report: PathBuf },
-    Examples { profile: String, report: PathBuf },
+    Policy {
+        report: PathBuf,
+    },
+    Verify {
+        report: PathBuf,
+    },
+    Portability {
+        report: PathBuf,
+    },
+    Nightly {
+        report: PathBuf,
+        oracle: PathBuf,
+        oracle_sha256: Digest,
+    },
+    NativeOracleShard {
+        report: PathBuf,
+        source: PathBuf,
+        platform: String,
+    },
+    MergeNativeShards {
+        report: PathBuf,
+        input: PathBuf,
+    },
+    Examples {
+        profile: String,
+        report: PathBuf,
+    },
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci nightly --report PATH\n       hell-ci examples --profile ci|release --report PATH"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH"
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, String> {
     let mut arguments = arguments.into_iter();
     let command = arguments
@@ -32,6 +56,11 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         .map_err(|_| "subcommand must be UTF-8".to_owned())?;
     let mut report = None;
     let mut profile = None;
+    let mut oracle = None;
+    let mut oracle_sha256 = None;
+    let mut source = None;
+    let mut platform = None;
+    let mut input = None;
     while let Some(flag) = arguments.next() {
         let flag = flag
             .into_string()
@@ -59,23 +88,145 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                         .map_err(|_| "profile must be UTF-8".to_owned())?,
                 );
             }
+            "--oracle" => {
+                if oracle.is_some() {
+                    return Err("--oracle was provided more than once".to_owned());
+                }
+                oracle = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--oracle requires PATH".to_owned())?,
+                ));
+            }
+            "--oracle-sha256" => {
+                if oracle_sha256.is_some() {
+                    return Err("--oracle-sha256 was provided more than once".to_owned());
+                }
+                let digest = arguments
+                    .next()
+                    .ok_or_else(|| "--oracle-sha256 requires HEX".to_owned())?
+                    .into_string()
+                    .map_err(|_| "--oracle-sha256 must be UTF-8".to_owned())?;
+                oracle_sha256 = Some(Digest::from_hex(&digest).map_err(str::to_owned)?);
+            }
+            "--source" => {
+                if source.is_some() {
+                    return Err("--source was provided more than once".to_owned());
+                }
+                source = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--source requires PATH".to_owned())?,
+                ));
+            }
+            "--platform" => {
+                if platform.is_some() {
+                    return Err("--platform was provided more than once".to_owned());
+                }
+                platform = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--platform requires ID".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--platform must be UTF-8".to_owned())?,
+                );
+            }
+            "--input" => {
+                if input.is_some() {
+                    return Err("--input was provided more than once".to_owned());
+                }
+                input = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--input requires PATH".to_owned())?,
+                ));
+            }
             _ => return Err(format!("unknown option {flag}\n{}", usage())),
         }
     }
     let report = report.ok_or_else(|| "--report is required".to_owned())?;
     match command.as_str() {
-        "policy" if profile.is_none() => Ok(Invocation::Policy { report }),
-        "verify" if profile.is_none() => Ok(Invocation::Verify { report }),
-        "portability" if profile.is_none() => Ok(Invocation::Portability { report }),
-        "nightly" if profile.is_none() => Ok(Invocation::Nightly { report }),
-        "examples" => Ok(Invocation::Examples {
-            profile: match profile.as_deref() {
-                Some("ci" | "release") => profile.expect("profile was matched"),
-                Some(value) => return Err(format!("invalid profile {value}\n{}", usage())),
-                None => return Err("examples requires --profile".to_owned()),
-            },
-            report,
-        }),
+        "policy"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none() =>
+        {
+            Ok(Invocation::Policy { report })
+        }
+        "verify"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none() =>
+        {
+            Ok(Invocation::Verify { report })
+        }
+        "portability"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none() =>
+        {
+            Ok(Invocation::Portability { report })
+        }
+        "nightly"
+            if profile.is_none() && source.is_none() && platform.is_none() && input.is_none() =>
+        {
+            Ok(Invocation::Nightly {
+                report,
+                oracle: oracle.ok_or_else(|| "nightly requires --oracle PATH".to_owned())?,
+                oracle_sha256: oracle_sha256
+                    .ok_or_else(|| "nightly requires --oracle-sha256 HEX".to_owned())?,
+            })
+        }
+        "native-oracle-shard"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && input.is_none() =>
+        {
+            Ok(Invocation::NativeOracleShard {
+                report,
+                source: source.ok_or_else(|| "native-oracle-shard requires --source".to_owned())?,
+                platform: platform
+                    .ok_or_else(|| "native-oracle-shard requires --platform".to_owned())?,
+            })
+        }
+        "merge-native-shards"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none() =>
+        {
+            Ok(Invocation::MergeNativeShards {
+                report,
+                input: input.ok_or_else(|| "merge-native-shards requires --input".to_owned())?,
+            })
+        }
+        "examples"
+            if oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none() =>
+        {
+            Ok(Invocation::Examples {
+                profile: match profile.as_deref() {
+                    Some("ci" | "release") => profile.expect("profile was matched"),
+                    Some(value) => return Err(format!("invalid profile {value}\n{}", usage())),
+                    None => return Err("examples requires --profile".to_owned()),
+                },
+                report,
+            })
+        }
         _ => Err(format!("invalid subcommand options\n{}", usage())),
     }
 }
@@ -103,7 +254,9 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Policy { report } => ("policy", report),
         Invocation::Verify { report } => ("verify", report),
         Invocation::Portability { report } => ("portability", report),
-        Invocation::Nightly { report } => ("nightly", report),
+        Invocation::Nightly { report, .. } => ("nightly", report),
+        Invocation::NativeOracleShard { report, .. } => ("native-oracle-shard", report),
+        Invocation::MergeNativeShards { report, .. } => ("merge-native-shards", report),
         Invocation::Examples { report, .. } => ("examples", report),
     };
     let mut report = Report::new(suite_name);
@@ -112,7 +265,17 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Policy { .. } => suite::policy_suite(root, &mut report),
         Invocation::Verify { .. } => suite::verify(root, &mut report, &failures),
         Invocation::Portability { .. } => suite::portability(root, &mut report, &failures),
-        Invocation::Nightly { .. } => suite::nightly(root, &mut report, &failures),
+        Invocation::Nightly {
+            oracle,
+            oracle_sha256,
+            ..
+        } => suite::nightly(root, &mut report, &failures, oracle, *oracle_sha256),
+        Invocation::NativeOracleShard {
+            source, platform, ..
+        } => suite::native_oracle_shard(root, &mut report, &failures, source, platform),
+        Invocation::MergeNativeShards { input, .. } => {
+            suite::merge_native_shards(input, &mut report)
+        }
         Invocation::Examples { profile, .. } => {
             suite::examples(root, &mut report, &failures, profile)
         }
@@ -154,5 +317,61 @@ mod tests {
     fn rejects_missing_report_and_unknown_flags() {
         assert!(parse([OsString::from("policy")]).is_err());
         assert!(parse(["policy", "--unknown", "value"].map(OsString::from)).is_err());
+    }
+
+    #[test]
+    fn nightly_requires_an_explicit_oracle_identity() {
+        assert!(parse(["nightly", "--report", "out.json"].map(OsString::from)).is_err());
+        let digest = "00".repeat(32);
+        assert!(matches!(
+            parse(
+                [
+                    "nightly",
+                    "--oracle",
+                    "oracle",
+                    "--oracle-sha256",
+                    &digest,
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::Nightly { .. })
+        ));
+    }
+
+    #[test]
+    fn native_oracle_shard_requires_typed_source_and_platform() {
+        assert!(
+            parse(["native-oracle-shard", "--report", "out.json"].map(OsString::from)).is_err()
+        );
+        assert!(matches!(
+            parse(
+                [
+                    "native-oracle-shard",
+                    "--source",
+                    "upstream",
+                    "--platform",
+                    "macos-arm64",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::NativeOracleShard { .. })
+        ));
+    }
+
+    #[test]
+    fn nightly_workflow_matches_the_reviewed_oracle_record() {
+        const DIGEST: &str = "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9";
+        const URL: &str =
+            "https://github.com/chrisdone/hell/releases/download/2026-05-29/hell-linux-amd64";
+        let record = include_str!("../oracle/linux-amd64.toml");
+        let workflow = include_str!("../../../.github/workflows/nightly.yml");
+        assert!(record.contains(DIGEST));
+        assert!(record.contains(URL));
+        assert!(workflow.contains(DIGEST));
+        assert!(workflow.contains(URL));
     }
 }

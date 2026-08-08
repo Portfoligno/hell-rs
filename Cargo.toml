@@ -7,6 +7,8 @@ members = [
     "crates/hell-compiler",
     "crates/hell-core",
     "crates/hell-docgen",
+    "crates/hell-http-host",
+    "crates/hell-host",
     "crates/hell-platform",
     "crates/hell-runtime",
     "crates/hell-source",

@@ -1,26 +1,28 @@
 //! HTTP/1 server values and adapters for the WAI-shaped guest API.
 
-use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
+use hell_http_host::{
+    Application as HostApplication, BodyProducer, BodySink, Cancellation as HostCancellation,
+    Header as HostHeader, HostError, HostRequest, HostResponse, ResponseBody, ServerConfig,
+};
+
+use crate::budget::BudgetPermit;
+use crate::concurrency::CancelReason;
 use crate::native_integer::BigInteger;
+use crate::policy::{Limit, RuntimeProfile};
+use crate::scope::{ChildScopePolicy, ResourceKind, ScopeGuard, ScopedResource};
 use crate::typeclasses::CaseInsensitiveValue;
 use crate::{
     Evaluator, ForceOutcome, FunctionValue, HostFunction, IoAction, RuntimeContext, RuntimeError,
     RuntimeResult, Suspension, Thunk, ThunkRef, Value, list_from_values,
 };
 
-const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HEADER_COUNT: usize = 256;
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-const BODY_CHUNK_BYTES: usize = 8 * 1024;
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const SANDBOX_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
 
 type Header = (Arc<[u8]>, Arc<[u8]>);
@@ -42,27 +44,16 @@ pub struct FilePart {
 #[derive(Debug)]
 pub struct Request {
     alive: AtomicBool,
-    method: Arc<str>,
     path: Arc<[Arc<str>]>,
     headers: Arc<[Header]>,
     query: Arc<[QueryParameter]>,
-    body: Mutex<RequestBody>,
+    body: Arc<hell_http_host::RequestBody>,
 }
 
-#[derive(Debug)]
-struct RequestBody {
-    stream: TcpStream,
-    pending: VecDeque<u8>,
-    mode: BodyMode,
-    consumed: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum BodyMode {
-    Empty,
-    ContentLength(usize),
-    Chunked,
-    Finished,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpVersion {
+    Http10,
+    Http11,
 }
 
 #[derive(Debug)]
@@ -197,7 +188,7 @@ fn make_status(evaluator: &mut Evaluator, arguments: &[ThunkRef]) -> RuntimeResu
         .filter(|code| (100..=999).contains(code))
         .ok_or_else(|| RuntimeError::http("Http.mkStatus: status code must be three digits"))?;
     let reason = evaluator.force_text(&arguments[1])?;
-    validate_reason(reason.as_bytes())?;
+    validate_reason(reason.as_bytes(), evaluator.policy.limits.http_reason_bytes)?;
     Ok(Status {
         code,
         reason: Arc::from(reason.as_bytes()),
@@ -243,124 +234,131 @@ fn body_action(request: Arc<Request>, consume_remainder: bool) -> IoAction {
     IoAction::new(move |evaluator, _| {
         evaluator.ensure_not_cancelled()?;
         request.ensure_alive()?;
-        let mut body = request
-            .body
-            .lock()
-            .map_err(|_| RuntimeError::internal("HTTP request-body mutex was poisoned"))?;
         let bytes = if consume_remainder {
-            body.consume_remainder()?
+            let mut output = Vec::new();
+            while let Some(chunk) = request
+                .body
+                .next_chunk()
+                .map_err(|error| RuntimeError::http(error.message()))?
+            {
+                output.extend_from_slice(&chunk);
+            }
+            output
         } else {
-            body.next_chunk()?.unwrap_or_default()
+            request
+                .body
+                .next_chunk()
+                .map_err(|error| RuntimeError::http(error.message()))?
+                .map_or_else(Vec::new, |bytes| bytes.to_vec())
         };
         Ok(Thunk::evaluated(Value::ByteString(bytes.into())))
     })
 }
 
-impl RequestBody {
-    fn next_chunk(&mut self) -> RuntimeResult<Option<Vec<u8>>> {
-        let next = match self.mode {
-            BodyMode::Empty | BodyMode::Finished => None,
-            BodyMode::ContentLength(remaining) => {
-                let amount = remaining.min(BODY_CHUNK_BYTES);
-                let chunk = self.read_exact(amount)?;
-                self.mode = if remaining == amount {
-                    BodyMode::Finished
-                } else {
-                    BodyMode::ContentLength(remaining - amount)
-                };
-                Some(chunk)
-            }
-            BodyMode::Chunked => self.read_chunked()?,
+struct RuntimeHttpApplication {
+    application: ThunkRef,
+    evaluator: Mutex<Evaluator>,
+    context: RuntimeContext,
+    first_error: Arc<Mutex<Option<Arc<RuntimeError>>>>,
+}
+
+struct ScopedHttpServer {
+    cancellation: HostCancellation,
+    closed: Arc<AtomicBool>,
+}
+
+impl ScopedResource for ScopedHttpServer {
+    fn kind(&self) -> ResourceKind {
+        ResourceKind::Listener
+    }
+
+    fn request_cancel(&self, _reason: &CancelReason) {
+        self.cancellation.cancel();
+    }
+
+    fn close(&self) -> RuntimeResult<()> {
+        self.cancellation.cancel();
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl HostApplication for RuntimeHttpApplication {
+    fn call(&self, request: HostRequest) -> Result<HostResponse, HostError> {
+        let task_permit = self
+            .context
+            .budget
+            .acquire_task()
+            .map_err(|error| self.host_error(&error))?;
+        let template = self
+            .evaluator
+            .lock()
+            .map_err(|_| HostError::new("HTTP evaluator template mutex was poisoned"))?;
+        let request_scope = template
+            .execution_scope()
+            .child(ChildScopePolicy::default())
+            .map_err(|error| self.host_error(&error))?
+            .guard();
+        let runtime_cancellation = request_scope.cancellation().clone();
+        let mut evaluator = template.fork_with_scope((*request_scope).clone());
+        drop(template);
+        request
+            .cancellation
+            .on_cancel(move || runtime_cancellation.cancel(CancelReason::ParentCancelled));
+        let (path, query) = parse_target(&request.target);
+        let version = match request.version {
+            hell_http_host::HttpVersion::Http10 => HttpVersion::Http10,
+            hell_http_host::HttpVersion::Http11 => HttpVersion::Http11,
         };
-        if let Some(bytes) = &next {
-            self.consumed = self.consumed.checked_add(bytes.len()).ok_or_else(|| {
-                RuntimeError::http("HTTP request body length overflowed host limits")
-            })?;
-            if self.consumed > MAX_BODY_BYTES {
-                return Err(RuntimeError::http(format!(
-                    "HTTP request body exceeded the {MAX_BODY_BYTES}-byte limit"
-                )));
-            }
-        }
-        Ok(next)
+        let method = Arc::clone(&request.method);
+        let runtime_request = Arc::new(Request {
+            alive: AtomicBool::new(true),
+            path: path.into(),
+            headers: request
+                .headers
+                .iter()
+                .map(|header| (Arc::clone(&header.name), Arc::clone(&header.value)))
+                .collect::<Vec<_>>()
+                .into(),
+            query: query.into(),
+            body: Arc::clone(&request.body),
+        });
+        let response = invoke_application_response(
+            &runtime_request,
+            Arc::clone(&self.application),
+            &mut evaluator,
+            &self.context,
+        )
+        .and_then(|response| {
+            prepare_host_response(
+                &response,
+                evaluator,
+                self.context.clone(),
+                ascii_eq(&method, b"HEAD"),
+                version,
+                request.cancellation,
+                Arc::clone(&self.first_error),
+                task_permit,
+                request_scope,
+            )
+        });
+        runtime_request.close();
+        response.map_err(|error| self.host_error(&error))
     }
+}
 
-    fn consume_remainder(&mut self) -> RuntimeResult<Vec<u8>> {
-        let mut output = Vec::new();
-        while let Some(chunk) = self.next_chunk()? {
-            output.extend_from_slice(&chunk);
+impl RuntimeHttpApplication {
+    fn host_error(&self, error: &Arc<RuntimeError>) -> HostError {
+        if let Ok(mut first_error) = self.first_error.lock()
+            && first_error.is_none()
+        {
+            *first_error = Some(Arc::clone(error));
         }
-        Ok(output)
-    }
-
-    fn read_chunked(&mut self) -> RuntimeResult<Option<Vec<u8>>> {
-        let line = self.read_line(MAX_HEADER_BYTES)?;
-        let size = line
-            .split(|byte| *byte == b';')
-            .next()
-            .and_then(|digits| std::str::from_utf8(digits).ok())
-            .and_then(|digits| usize::from_str_radix(digits.trim(), 16).ok())
-            .ok_or_else(|| RuntimeError::http("HTTP request has an invalid chunk size"))?;
-        if size == 0 {
-            loop {
-                if self.read_line(MAX_HEADER_BYTES)?.is_empty() {
-                    break;
-                }
-            }
-            self.mode = BodyMode::Finished;
-            return Ok(None);
-        }
-        if size > MAX_BODY_BYTES.saturating_sub(self.consumed) {
-            return Err(RuntimeError::http(format!(
-                "HTTP request body exceeded the {MAX_BODY_BYTES}-byte limit"
-            )));
-        }
-        let chunk = self.read_exact(size)?;
-        if self.read_exact(2)? != b"\r\n" {
-            return Err(RuntimeError::http(
-                "HTTP request chunk was not terminated by CRLF",
-            ));
-        }
-        Ok(Some(chunk))
-    }
-
-    fn read_line(&mut self, limit: usize) -> RuntimeResult<Vec<u8>> {
-        let mut output = Vec::new();
-        while output.len() <= limit {
-            output.push(self.read_byte()?);
-            if output.ends_with(b"\r\n") {
-                output.truncate(output.len() - 2);
-                return Ok(output);
-            }
-        }
-        Err(RuntimeError::http("HTTP request line exceeded its limit"))
-    }
-
-    fn read_byte(&mut self) -> RuntimeResult<u8> {
-        if let Some(byte) = self.pending.pop_front() {
-            return Ok(byte);
-        }
-        let mut byte = [0_u8; 1];
-        self.stream
-            .read_exact(&mut byte)
-            .map_err(|error| http_io("read request body", error))?;
-        Ok(byte[0])
-    }
-
-    fn read_exact(&mut self, amount: usize) -> RuntimeResult<Vec<u8>> {
-        let mut output = Vec::with_capacity(amount);
-        while output.len() < amount {
-            if let Some(byte) = self.pending.pop_front() {
-                output.push(byte);
-            } else {
-                let old_len = output.len();
-                output.resize(amount, 0);
-                self.stream
-                    .read_exact(&mut output[old_len..])
-                    .map_err(|error| http_io("read request body", error))?;
-            }
-        }
-        Ok(output)
+        HostError::new(error.to_string())
     }
 }
 
@@ -370,101 +368,505 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
         let port = evaluator.force_int(&port)?;
         let port = u16::try_from(port)
             .map_err(|_| RuntimeError::http("Http.run: port must be between 0 and 65535"))?;
-        let listener = TcpListener::bind(("0.0.0.0", port))
-            .map_err(|error| http_io("Http.run: listen", error))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| http_io("Http.run: configure listener", error))?;
-        let mut workers: Vec<JoinHandle<RuntimeResult<()>>> = Vec::new();
-        let mut accepted = 0_usize;
-        loop {
-            evaluator.ensure_not_cancelled()?;
-            match listener.accept() {
-                Ok((stream, _address)) => {
-                    accepted = accepted.saturating_add(1);
-                    let callback = Arc::clone(&application);
-                    let worker_context = context.clone();
-                    let mut child =
-                        evaluator.fork_with_cancellation(evaluator.child_cancellation());
-                    workers.push(std::thread::spawn(move || {
-                        handle_connection(stream, callback, &mut child, &worker_context)
-                    }));
-                    if context
-                        .http_request_limit
-                        .is_some_and(|limit| accepted >= limit)
-                    {
-                        break;
-                    }
-                    reap_workers(&mut workers);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    reap_workers(&mut workers);
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) => return Err(http_io("Http.run: accept", error)),
+        let cancellation = evaluator.child_cancellation();
+        let shutdown_cancellation = cancellation.clone();
+        let server_cancellation = cancellation.clone();
+        let host_shutdown = HostCancellation::new();
+        let server_resource = evaluator.execution_scope().register(ScopedHttpServer {
+            cancellation: host_shutdown.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        })?;
+        let first_error = Arc::new(Mutex::new(None));
+        let server_scope = evaluator
+            .execution_scope()
+            .child(ChildScopePolicy::default())?
+            .guard();
+        let application = Arc::new(RuntimeHttpApplication {
+            application: Arc::clone(&application),
+            evaluator: Mutex::new(evaluator.fork_with_scope((*server_scope).clone())),
+            context: context.clone(),
+            first_error: Arc::clone(&first_error),
+        });
+        let limits = &context.policy.limits;
+        let connection_budget = Arc::clone(&context.budget);
+        let config = ServerConfig {
+            port,
+            loopback_only: !context.policy.capabilities.network_external,
+            max_connections: limits.http_connections.value(),
+            max_headers: limits
+                .http_header_count
+                .value()
+                .and_then(|limit| usize::try_from(limit).ok()),
+            max_header_bytes: limits
+                .http_header_bytes
+                .value()
+                .and_then(|limit| usize::try_from(limit).ok()),
+            max_body_bytes: limits.http_body_bytes.value(),
+            idle_timeout: (context.policy.profile != RuntimeProfile::Upstream)
+                .then_some(SANDBOX_SOCKET_TIMEOUT),
+            graceful_shutdown: context.policy.cancellation.graceful_shutdown,
+            request_limit: context.http_request_limit,
+            shutdown_requested: Arc::new(move || {
+                shutdown_cancellation.is_cancelled() || host_shutdown.is_cancelled()
+            }),
+            acquire_connection: Arc::new(move || {
+                connection_budget
+                    .acquire_http_connection()
+                    .map(|permit| Box::new(permit) as Box<dyn Send>)
+                    .map_err(|error| HostError::new(error.to_string()))
+            }),
+        };
+        let result = hell_http_host::serve(config, application);
+        server_resource
+            .resource()
+            .closed
+            .store(true, Ordering::Release);
+        let body = (|| {
+            if server_cancellation.is_cancelled() {
+                return Ok(Thunk::evaluated(Value::Unit));
             }
-        }
-        for worker in workers {
-            join_worker(worker)??;
-        }
-        Ok(Thunk::evaluated(Value::Unit))
+            if let Some(error) = first_error
+                .lock()
+                .map_err(|_| RuntimeError::internal("HTTP server error mutex was poisoned"))?
+                .take()
+            {
+                return Err(error);
+            }
+            result.map_err(|error| RuntimeError::http(error.message()))?;
+            Ok(Thunk::evaluated(Value::Unit))
+        })();
+        let cleanup = server_scope.close().map(|_| ());
+        crate::finish_with_cleanup(body, [cleanup])
     })
 }
 
-fn reap_workers(workers: &mut Vec<JoinHandle<RuntimeResult<()>>>) {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            let _ignored = join_worker(worker);
-        } else {
-            index += 1;
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn prepare_host_response(
+    response: &Response,
+    mut evaluator: Evaluator,
+    context: RuntimeContext,
+    suppress_body: bool,
+    version: HttpVersion,
+    cancellation: HostCancellation,
+    first_error: Arc<Mutex<Option<Arc<RuntimeError>>>>,
+    task_permit: BudgetPermit,
+    request_scope: ScopeGuard,
+) -> RuntimeResult<HostResponse> {
+    match &response.kind {
+        ResponseKind::Builder {
+            status,
+            headers,
+            builder,
+        } => {
+            let status = force_status(&mut evaluator, status)?;
+            let headers = force_headers(&mut evaluator, headers)?;
+            let bytes = force_builder(&mut evaluator, builder)?;
+            validate_response_framing_headers(&headers)?;
+            if response_content_length(&headers)?.is_some_and(|length| length != bytes.len()) {
+                return Err(RuntimeError::http(
+                    "HTTP response Content-Length does not match the builder body",
+                ));
+            }
+            if response_is_chunked(&headers) && version == HttpVersion::Http10 {
+                return Err(RuntimeError::http(
+                    "HTTP/1.0 response cannot use chunked Transfer-Encoding",
+                ));
+            }
+            let forbidden = status_forbids_body(status.code);
+            let mut host_headers = host_headers(headers);
+            if suppress_body
+                && !forbidden
+                && response_content_length_from_host(&host_headers).is_none()
+            {
+                host_headers.push(content_length_header(bytes.len()));
+            }
+            let body = if suppress_body || forbidden {
+                drop(task_permit);
+                request_scope.close()?;
+                ResponseBody::Empty
+            } else if response_is_chunked_host(&host_headers) {
+                ResponseBody::Stream {
+                    producer: Box::new(FixedBodyProducer {
+                        bytes,
+                        _task_permit: task_permit,
+                        _scope: request_scope,
+                    }),
+                    content_length: None,
+                }
+            } else {
+                drop(task_permit);
+                request_scope.close()?;
+                ResponseBody::Fixed(bytes)
+            };
+            Ok(host_response(status, host_headers, body))
+        }
+        ResponseKind::File {
+            status,
+            headers,
+            path,
+            part,
+        } => {
+            let status = force_status(&mut evaluator, status)?;
+            let headers = force_headers(&mut evaluator, headers)?;
+            let path = evaluator.force_text(path)?;
+            let path = context.resolve_path("Http.responseFile", &path)?;
+            let mut file = File::open(path).map_err(|error| http_io("Http.responseFile", error))?;
+            let actual_size = file
+                .metadata()
+                .map_err(|error| http_io("Http.responseFile", error))?
+                .len();
+            let part_value = evaluator.force(part)?;
+            let (offset, count) = match part_value.as_ref() {
+                Value::Maybe(None) => (0, actual_size),
+                Value::Maybe(Some(part)) => {
+                    let part = evaluator.force(part)?;
+                    let Value::HttpFilePart(part) = part.as_ref() else {
+                        return Err(RuntimeError::internal(
+                            "Http.responseFile received a non-FilePart value",
+                        ));
+                    };
+                    let offset = part.offset.to_u64().ok_or_else(|| {
+                        RuntimeError::http(
+                            "Http.responseFile: file offset is negative or too large",
+                        )
+                    })?;
+                    let count = part.byte_count.to_u64().ok_or_else(|| {
+                        RuntimeError::http("Http.responseFile: byte count is negative or too large")
+                    })?;
+                    let declared_size = part.file_size.to_u64().ok_or_else(|| {
+                        RuntimeError::http("Http.responseFile: file size is negative or too large")
+                    })?;
+                    let end = offset.checked_add(count).ok_or_else(|| {
+                        RuntimeError::http("Http.responseFile: file range overflowed")
+                    })?;
+                    if end > actual_size || end > declared_size {
+                        return Err(RuntimeError::http(
+                            "Http.responseFile: file range exceeds the file size",
+                        ));
+                    }
+                    (offset, count)
+                }
+                _ => {
+                    return Err(RuntimeError::internal(
+                        "Http.responseFile received a non-Maybe FilePart value",
+                    ));
+                }
+            };
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| http_io("Http.responseFile", error))?;
+            let length = usize::try_from(count).map_err(|_| {
+                RuntimeError::http("Http.responseFile body is too large for this host")
+            })?;
+            validate_response_framing_headers(&headers)?;
+            if response_content_length(&headers)?.is_some_and(|declared| declared != length) {
+                return Err(RuntimeError::http(
+                    "HTTP response Content-Length does not match the file body",
+                ));
+            }
+            if response_is_chunked(&headers) && version == HttpVersion::Http10 {
+                return Err(RuntimeError::http(
+                    "HTTP/1.0 response cannot use chunked Transfer-Encoding",
+                ));
+            }
+            let forbidden = status_forbids_body(status.code);
+            let mut host_headers = host_headers(headers);
+            if suppress_body
+                && !forbidden
+                && response_content_length_from_host(&host_headers).is_none()
+            {
+                host_headers.push(content_length_header(length));
+            }
+            let body = if suppress_body || forbidden {
+                request_scope.close()?;
+                ResponseBody::Empty
+            } else {
+                let content_length = (!response_is_chunked_host(&host_headers)).then_some(count);
+                ResponseBody::Stream {
+                    producer: Box::new(FileBodyProducer {
+                        file,
+                        remaining: count,
+                        evaluator,
+                        first_error,
+                        _task_permit: task_permit,
+                        _scope: request_scope,
+                    }),
+                    content_length,
+                }
+            };
+            Ok(host_response(status, host_headers, body))
+        }
+        ResponseKind::Stream {
+            status,
+            headers,
+            callback,
+        } => {
+            let status = force_status(&mut evaluator, status)?;
+            let headers = force_headers(&mut evaluator, headers)?;
+            validate_response_framing_headers(&headers)?;
+            let forbidden = status_forbids_body(status.code);
+            let supplied_length = response_content_length(&headers)?;
+            if response_is_chunked(&headers) && version == HttpVersion::Http10 {
+                return Err(RuntimeError::http(
+                    "HTTP/1.0 response cannot use chunked Transfer-Encoding",
+                ));
+            }
+            let host_headers = host_headers(headers);
+            let body = if suppress_body || forbidden {
+                request_scope.close()?;
+                ResponseBody::Empty
+            } else {
+                ResponseBody::Stream {
+                    producer: Box::new(StreamBodyProducer {
+                        callback: Arc::clone(callback),
+                        evaluator,
+                        context,
+                        remaining: supplied_length.map(|length| Arc::new(Mutex::new(length))),
+                        cancellation,
+                        first_error,
+                        _task_permit: task_permit,
+                        _scope: request_scope,
+                    }),
+                    content_length: supplied_length.and_then(|length| u64::try_from(length).ok()),
+                }
+            };
+            Ok(host_response(status, host_headers, body))
         }
     }
 }
 
-fn join_worker<T>(worker: JoinHandle<T>) -> RuntimeResult<T> {
-    worker.join().map_err(|payload| {
-        let message = payload
-            .downcast_ref::<&str>()
-            .map_or("HTTP worker panicked", |message| *message);
-        RuntimeError::panic_contained(message)
+fn host_response(status: Status, headers: Vec<HostHeader>, body: ResponseBody) -> HostResponse {
+    HostResponse {
+        status: status.code,
+        reason: status.reason,
+        headers,
+        body,
+    }
+}
+
+fn host_headers(headers: Vec<Header>) -> Vec<HostHeader> {
+    headers
+        .into_iter()
+        .map(|(name, value)| HostHeader { name, value })
+        .collect()
+}
+
+fn response_content_length_from_host(headers: &[HostHeader]) -> Option<usize> {
+    headers
+        .iter()
+        .find(|header| ascii_eq(&header.name, b"content-length"))
+        .and_then(|header| parse_content_length(&header.value).ok())
+}
+
+fn response_is_chunked_host(headers: &[HostHeader]) -> bool {
+    headers.iter().any(|header| {
+        ascii_eq(&header.name, b"transfer-encoding")
+            && header
+                .value
+                .split(|byte| *byte == b',')
+                .map(trim_optional_whitespace)
+                .any(|token| ascii_eq(token, b"chunked"))
     })
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    application: ThunkRef,
-    evaluator: &mut Evaluator,
-    context: &RuntimeContext,
-) -> RuntimeResult<()> {
-    stream
-        .set_read_timeout(Some(SOCKET_TIMEOUT))
-        .map_err(|error| http_io("configure HTTP read timeout", error))?;
-    stream
-        .set_write_timeout(Some(SOCKET_TIMEOUT))
-        .map_err(|error| http_io("configure HTTP write timeout", error))?;
-    let request = parse_request(&stream)?;
-    let result = invoke_application(
-        Arc::clone(&request),
-        application,
-        evaluator,
-        context,
-        &mut stream,
-    );
-    request.close();
-    result
+fn content_length_header(length: usize) -> HostHeader {
+    HostHeader {
+        name: Arc::from(b"Content-Length".as_slice()),
+        value: Arc::from(length.to_string().into_bytes()),
+    }
 }
 
-fn invoke_application(
-    request: Arc<Request>,
+struct FixedBodyProducer {
+    bytes: Arc<[u8]>,
+    _task_permit: BudgetPermit,
+    _scope: ScopeGuard,
+}
+
+impl BodyProducer for FixedBodyProducer {
+    fn produce(self: Box<Self>, sink: BodySink) -> Result<(), HostError> {
+        sink.send(self.bytes.to_vec())
+    }
+}
+
+struct FileBodyProducer {
+    file: File,
+    remaining: u64,
+    evaluator: Evaluator,
+    first_error: Arc<Mutex<Option<Arc<RuntimeError>>>>,
+    _task_permit: BudgetPermit,
+    _scope: ScopeGuard,
+}
+
+impl BodyProducer for FileBodyProducer {
+    fn produce(mut self: Box<Self>, sink: BodySink) -> Result<(), HostError> {
+        let result = (|| {
+            let mut buffer = [0_u8; 16 * 1024];
+            while self.remaining != 0 {
+                self.evaluator.ensure_not_cancelled()?;
+                let amount = usize::try_from(self.remaining.min(buffer.len() as u64))
+                    .expect("bounded HTTP file read fits usize");
+                let read = self
+                    .file
+                    .read(&mut buffer[..amount])
+                    .map_err(|error| http_io("Http.responseFile", error))?;
+                if read == 0 {
+                    return Err(RuntimeError::http(
+                        "Http.responseFile: file ended before the requested range",
+                    ));
+                }
+                sink.send(buffer[..read].to_vec())
+                    .map_err(|error| RuntimeError::http(error.message()))?;
+                self.remaining -= u64::try_from(read).expect("read size fits u64");
+            }
+            Ok(())
+        })();
+        let result = result.map_err(|error| {
+            if error.kind == crate::RuntimeErrorKind::Cancelled {
+                RuntimeError::http("HTTP response connection closed while sending a file")
+            } else {
+                error
+            }
+        });
+        result.map_err(|error| record_host_runtime_error(&self.first_error, &error))
+    }
+}
+
+struct StreamBodyProducer {
+    callback: ThunkRef,
+    evaluator: Evaluator,
+    context: RuntimeContext,
+    remaining: Option<Arc<Mutex<usize>>>,
+    cancellation: HostCancellation,
+    first_error: Arc<Mutex<Option<Arc<RuntimeError>>>>,
+    _task_permit: BudgetPermit,
+    _scope: ScopeGuard,
+}
+
+impl BodyProducer for StreamBodyProducer {
+    fn produce(mut self: Box<Self>, sink: BodySink) -> Result<(), HostError> {
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = host_stream_writer(
+            sink.clone(),
+            Arc::clone(&alive),
+            self.remaining.clone(),
+            self.cancellation.clone(),
+        );
+        let flush = host_stream_flush(sink, Arc::clone(&alive), self.cancellation.clone());
+        let with_writer = Thunk::suspended(Suspension::Apply {
+            function: Arc::clone(&self.callback),
+            argument: Thunk::evaluated(Value::Function(FunctionValue::Host(writer))),
+        });
+        let with_flush = Thunk::suspended(Suspension::Apply {
+            function: with_writer,
+            argument: Thunk::evaluated(Value::Io(flush)),
+        });
+        let result =
+            (|| {
+                let action = self.evaluator.force_io(&with_flush)?;
+                let returned = action.run(&mut self.evaluator, &self.context)?;
+                if !matches!(self.evaluator.force(&returned)?.as_ref(), Value::Unit) {
+                    return Err(RuntimeError::internal(
+                        "Http.responseStream callback returned a non-unit value",
+                    ));
+                }
+                if self.remaining.as_ref().is_some_and(|remaining| {
+                    remaining.lock().map_or(true, |remaining| *remaining != 0)
+                }) {
+                    return Err(RuntimeError::http(
+                        "HTTP response stream ended before Content-Length bytes were written",
+                    ));
+                }
+                Ok(())
+            })();
+        alive.store(false, Ordering::Release);
+        let result = result.map_err(|error| {
+            if error.kind == crate::RuntimeErrorKind::Cancelled && self.cancellation.is_cancelled()
+            {
+                RuntimeError::http("HTTP response connection closed while streaming")
+            } else {
+                error
+            }
+        });
+        result.map_err(|error| record_host_runtime_error(&self.first_error, &error))
+    }
+}
+
+fn host_stream_writer(
+    sink: BodySink,
+    alive: Arc<AtomicBool>,
+    remaining: Option<Arc<Mutex<usize>>>,
+    cancellation: HostCancellation,
+) -> HostFunction {
+    HostFunction::new(move |builder| {
+        let sink = sink.clone();
+        let alive = Arc::clone(&alive);
+        let remaining = remaining.clone();
+        let cancellation = cancellation.clone();
+        Ok(ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
+            move |evaluator, _| {
+                ensure_stream_alive(&alive)?;
+                evaluator.ensure_not_cancelled()?;
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::cancelled());
+                }
+                let bytes = force_builder(evaluator, &builder)?;
+                if let Some(remaining) = &remaining {
+                    let mut remaining = remaining.lock().map_err(|_| {
+                        RuntimeError::internal("HTTP stream-length mutex was poisoned")
+                    })?;
+                    if bytes.len() > *remaining {
+                        return Err(RuntimeError::http(
+                            "HTTP response stream exceeded Content-Length",
+                        ));
+                    }
+                    sink.send(bytes.to_vec())
+                        .map_err(|error| RuntimeError::http(error.message()))?;
+                    *remaining -= bytes.len();
+                } else {
+                    sink.send(bytes.to_vec())
+                        .map_err(|error| RuntimeError::http(error.message()))?;
+                }
+                Ok(Thunk::evaluated(Value::Unit))
+            },
+        )))))
+    })
+}
+
+fn host_stream_flush(
+    sink: BodySink,
+    alive: Arc<AtomicBool>,
+    cancellation: HostCancellation,
+) -> IoAction {
+    IoAction::new(move |evaluator, _| {
+        ensure_stream_alive(&alive)?;
+        evaluator.ensure_not_cancelled()?;
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled());
+        }
+        sink.flush()
+            .map_err(|error| RuntimeError::http(error.message()))?;
+        Ok(Thunk::evaluated(Value::Unit))
+    })
+}
+
+fn record_host_runtime_error(
+    first_error: &Mutex<Option<Arc<RuntimeError>>>,
+    error: &Arc<RuntimeError>,
+) -> HostError {
+    if let Ok(mut first_error) = first_error.lock()
+        && first_error.is_none()
+    {
+        *first_error = Some(Arc::clone(error));
+    }
+    HostError::new(error.to_string())
+}
+
+fn invoke_application_response(
+    request: &Arc<Request>,
     application: ThunkRef,
     evaluator: &mut Evaluator,
     context: &RuntimeContext,
-    stream: &mut TcpStream,
-) -> RuntimeResult<()> {
+) -> RuntimeResult<Arc<Response>> {
     let response_id = NEXT_RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
-    let suppress_body = request.method.eq_ignore_ascii_case("HEAD");
     let response_slot = Arc::new(Mutex::new(None::<Arc<Response>>));
     let response_used = Arc::new(AtomicBool::new(false));
     let responder = {
@@ -496,7 +898,7 @@ fn invoke_application(
     };
     let with_request = Thunk::suspended(Suspension::Apply {
         function: application,
-        argument: Thunk::evaluated(Value::HttpRequest(request)),
+        argument: Thunk::evaluated(Value::HttpRequest(Arc::clone(request))),
     });
     let with_responder = Thunk::suspended(Suspension::Apply {
         function: with_request,
@@ -517,120 +919,14 @@ fn invoke_application(
             ));
         }
     }
-    let response = response_slot
+    response_slot
         .lock()
         .map_err(|_| RuntimeError::internal("HTTP response mutex was poisoned"))?
         .take()
-        .ok_or_else(|| RuntimeError::http("HTTP application did not send a response"))?;
-    send_response(&response, evaluator, context, stream, suppress_body)
+        .ok_or_else(|| RuntimeError::http("HTTP application did not send a response"))
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_request(stream: &TcpStream) -> RuntimeResult<Arc<Request>> {
-    let mut reader = stream
-        .try_clone()
-        .map_err(|error| http_io("clone HTTP request stream", error))?;
-    let mut input = Vec::new();
-    let header_end = loop {
-        if let Some(index) = find_bytes(&input, b"\r\n\r\n") {
-            break index + 4;
-        }
-        if input.len() >= MAX_HEADER_BYTES {
-            return Err(RuntimeError::http(format!(
-                "HTTP request headers exceeded the {MAX_HEADER_BYTES}-byte limit"
-            )));
-        }
-        let mut buffer = [0_u8; 4096];
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| http_io("read HTTP request headers", error))?;
-        if read == 0 {
-            return Err(RuntimeError::http(
-                "HTTP connection closed before request headers completed",
-            ));
-        }
-        input.extend_from_slice(&buffer[..read]);
-    };
-    let pending = VecDeque::from(input.split_off(header_end));
-    let head = &input[..header_end - 4];
-    let mut lines = head.split(|byte| *byte == b'\n').map(trim_cr);
-    let request_line = lines
-        .next()
-        .ok_or_else(|| RuntimeError::http("HTTP request line is missing"))?;
-    let request_line = std::str::from_utf8(request_line)
-        .map_err(|_| RuntimeError::http("HTTP request line is not valid ASCII"))?;
-    let mut pieces = request_line.split(' ');
-    let method = pieces.next().filter(|part| !part.is_empty());
-    let target = pieces.next().filter(|part| !part.is_empty());
-    let version = pieces.next();
-    if pieces.next().is_some()
-        || method.is_none()
-        || target.is_none()
-        || !matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
-    {
-        return Err(RuntimeError::http("HTTP request line is malformed"));
-    }
-    let method = method.expect("request method was checked");
-    if !method.bytes().all(is_token_byte) {
-        return Err(RuntimeError::http("HTTP request method is invalid"));
-    }
-    let target = target.expect("request target was checked");
-    let mut headers = Vec::new();
-    for line in lines {
-        if headers.len() >= MAX_HEADER_COUNT {
-            return Err(RuntimeError::http(format!(
-                "HTTP request exceeded the {MAX_HEADER_COUNT}-header limit"
-            )));
-        }
-        let colon = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or_else(|| RuntimeError::http("HTTP request header is malformed"))?;
-        let name = &line[..colon];
-        if name.is_empty() || !name.iter().copied().all(is_token_byte) {
-            return Err(RuntimeError::http("HTTP request header name is invalid"));
-        }
-        let value = trim_optional_whitespace(&line[colon + 1..]);
-        if value.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
-            return Err(RuntimeError::http("HTTP request header value is invalid"));
-        }
-        headers.push((Arc::from(name), Arc::from(value)));
-    }
-    let transfer_encoding = header_value(&headers, b"transfer-encoding");
-    let content_length = header_value(&headers, b"content-length");
-    let mode = if transfer_encoding.is_some_and(|value| ascii_eq(value, b"chunked")) {
-        if content_length.is_some() {
-            return Err(RuntimeError::http(
-                "HTTP request cannot contain both chunked encoding and Content-Length",
-            ));
-        }
-        BodyMode::Chunked
-    } else if let Some(length) = content_length {
-        let length = std::str::from_utf8(length)
-            .ok()
-            .and_then(|length| length.parse::<usize>().ok())
-            .filter(|length| *length <= MAX_BODY_BYTES)
-            .ok_or_else(|| RuntimeError::http("HTTP Content-Length is invalid or too large"))?;
-        BodyMode::ContentLength(length)
-    } else {
-        BodyMode::Empty
-    };
-    let (path, query) = parse_target(target.as_bytes());
-    Ok(Arc::new(Request {
-        alive: AtomicBool::new(true),
-        method: Arc::from(method),
-        path: path.into(),
-        headers: headers.into(),
-        query: query.into(),
-        body: Mutex::new(RequestBody {
-            stream: reader,
-            pending,
-            mode,
-            consumed: 0,
-        }),
-    }))
-}
-
 fn parse_target(target: &[u8]) -> (Vec<Arc<str>>, Vec<QueryParameter>) {
     let (path, query) = target
         .iter()
@@ -643,10 +939,8 @@ fn parse_target(target: &[u8]) -> (Vec<Arc<str>>, Vec<QueryParameter>) {
         Vec::new()
     } else {
         path.split(|byte| *byte == b'/')
-            .map(|part| {
-                Arc::from(String::from_utf8_lossy(&percent_decode(part, false)).into_owned())
-            })
-            .collect()
+            .map(|part| Arc::from(String::from_utf8_lossy(&percent_decode(part, false)).as_ref()))
+            .collect::<Vec<_>>()
     };
     let query = query.map_or_else(Vec::new, |query| {
         if query.is_empty() {
@@ -695,248 +989,6 @@ fn percent_decode(input: &[u8], plus_as_space: bool) -> Vec<u8> {
         }
     }
     output
-}
-
-fn send_response(
-    response: &Response,
-    evaluator: &mut Evaluator,
-    context: &RuntimeContext,
-    stream: &mut TcpStream,
-    suppress_body: bool,
-) -> RuntimeResult<()> {
-    match &response.kind {
-        ResponseKind::Builder {
-            status,
-            headers,
-            builder,
-        } => {
-            let status = force_status(evaluator, status)?;
-            let headers = force_headers(evaluator, headers)?;
-            let bytes = force_builder(evaluator, builder)?;
-            write_head(stream, &status, &headers, &BodyHeader::Length(bytes.len()))?;
-            if !suppress_body {
-                stream
-                    .write_all(&bytes)
-                    .map_err(|error| http_io("write HTTP response", error))?;
-            }
-            Ok(())
-        }
-        ResponseKind::File {
-            status,
-            headers,
-            path,
-            part,
-        } => send_file(
-            status,
-            headers,
-            path,
-            part,
-            ResponseTarget {
-                evaluator,
-                context,
-                stream,
-                suppress_body,
-            },
-        ),
-        ResponseKind::Stream {
-            status,
-            headers,
-            callback,
-        } => send_stream(
-            status,
-            headers,
-            callback,
-            ResponseTarget {
-                evaluator,
-                context,
-                stream,
-                suppress_body,
-            },
-        ),
-    }
-}
-
-struct ResponseTarget<'a> {
-    evaluator: &'a mut Evaluator,
-    context: &'a RuntimeContext,
-    stream: &'a mut TcpStream,
-    suppress_body: bool,
-}
-
-fn send_file(
-    status: &ThunkRef,
-    headers: &ThunkRef,
-    path: &ThunkRef,
-    part: &ThunkRef,
-    target: ResponseTarget<'_>,
-) -> RuntimeResult<()> {
-    let ResponseTarget {
-        evaluator,
-        context,
-        stream,
-        suppress_body,
-    } = target;
-    let status = force_status(evaluator, status)?;
-    let headers = force_headers(evaluator, headers)?;
-    let path = evaluator.force_text(path)?;
-    let path = context.resolve_path("Http.responseFile", &path)?;
-    let mut file = File::open(path).map_err(|error| http_io("Http.responseFile", error))?;
-    let actual_size = file
-        .metadata()
-        .map_err(|error| http_io("Http.responseFile", error))?
-        .len();
-    let part_value = evaluator.force(part)?;
-    let (offset, count) = match part_value.as_ref() {
-        Value::Maybe(None) => (0, actual_size),
-        Value::Maybe(Some(part)) => {
-            let part = evaluator.force(part)?;
-            let Value::HttpFilePart(part) = part.as_ref() else {
-                return Err(RuntimeError::internal(
-                    "Http.responseFile received a non-FilePart value",
-                ));
-            };
-            let offset = part.offset.to_u64().ok_or_else(|| {
-                RuntimeError::http("Http.responseFile: file offset is negative or too large")
-            })?;
-            let count = part.byte_count.to_u64().ok_or_else(|| {
-                RuntimeError::http("Http.responseFile: byte count is negative or too large")
-            })?;
-            let declared_size = part.file_size.to_u64().ok_or_else(|| {
-                RuntimeError::http("Http.responseFile: file size is negative or too large")
-            })?;
-            let end = offset
-                .checked_add(count)
-                .ok_or_else(|| RuntimeError::http("Http.responseFile: file range overflowed"))?;
-            if end > actual_size || end > declared_size {
-                return Err(RuntimeError::http(
-                    "Http.responseFile: file range exceeds the file size",
-                ));
-            }
-            (offset, count)
-        }
-        _ => {
-            return Err(RuntimeError::internal(
-                "Http.responseFile received a non-Maybe FilePart value",
-            ));
-        }
-    };
-    let length = usize::try_from(count)
-        .map_err(|_| RuntimeError::http("Http.responseFile body is too large for this host"))?;
-    write_head(stream, &status, &headers, &BodyHeader::Length(length))?;
-    if suppress_body {
-        return Ok(());
-    }
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| http_io("Http.responseFile", error))?;
-    let mut remaining = count;
-    let mut buffer = [0_u8; 16 * 1024];
-    while remaining != 0 {
-        evaluator.ensure_not_cancelled()?;
-        let amount = usize::try_from(remaining.min(buffer.len() as u64))
-            .expect("bounded HTTP file read fits usize");
-        let read = file
-            .read(&mut buffer[..amount])
-            .map_err(|error| http_io("Http.responseFile", error))?;
-        if read == 0 {
-            return Err(RuntimeError::http(
-                "Http.responseFile: file ended before the requested range",
-            ));
-        }
-        stream
-            .write_all(&buffer[..read])
-            .map_err(|error| http_io("write HTTP file response", error))?;
-        remaining -= u64::try_from(read).expect("read size fits u64");
-    }
-    Ok(())
-}
-
-fn send_stream(
-    status: &ThunkRef,
-    headers: &ThunkRef,
-    callback: &ThunkRef,
-    target: ResponseTarget<'_>,
-) -> RuntimeResult<()> {
-    let ResponseTarget {
-        evaluator,
-        context,
-        stream,
-        suppress_body,
-    } = target;
-    let status = force_status(evaluator, status)?;
-    let headers = force_headers(evaluator, headers)?;
-    write_head(stream, &status, &headers, &BodyHeader::Chunked)?;
-    if suppress_body {
-        return Ok(());
-    }
-    let output = Arc::new(Mutex::new(
-        stream
-            .try_clone()
-            .map_err(|error| http_io("clone HTTP response stream", error))?,
-    ));
-    let alive = Arc::new(AtomicBool::new(true));
-    let writer = stream_writer(Arc::clone(&output), Arc::clone(&alive));
-    let flush = stream_flush(Arc::clone(&output), Arc::clone(&alive));
-    let with_writer = Thunk::suspended(Suspension::Apply {
-        function: Arc::clone(callback),
-        argument: Thunk::evaluated(Value::Function(FunctionValue::Host(writer))),
-    });
-    let with_flush = Thunk::suspended(Suspension::Apply {
-        function: with_writer,
-        argument: Thunk::evaluated(Value::Io(flush)),
-    });
-    let result = (|| {
-        let action = evaluator.force_io(&with_flush)?;
-        let returned = action.run(evaluator, context)?;
-        match evaluator.force(&returned)?.as_ref() {
-            Value::Unit => Ok(()),
-            _ => Err(RuntimeError::internal(
-                "Http.responseStream callback returned a non-unit value",
-            )),
-        }
-    })();
-    alive.store(false, Ordering::Release);
-    result?;
-    stream
-        .write_all(b"0\r\n\r\n")
-        .map_err(|error| http_io("finish HTTP response stream", error))?;
-    Ok(())
-}
-
-fn stream_writer(output: Arc<Mutex<TcpStream>>, alive: Arc<AtomicBool>) -> HostFunction {
-    HostFunction::new(move |builder| {
-        let output = Arc::clone(&output);
-        let alive = Arc::clone(&alive);
-        Ok(ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
-            move |evaluator, _| {
-                ensure_stream_alive(&alive)?;
-                evaluator.ensure_not_cancelled()?;
-                let bytes = force_builder(evaluator, &builder)?;
-                if !bytes.is_empty() {
-                    let mut output = output.lock().map_err(|_| {
-                        RuntimeError::internal("HTTP stream-writer mutex was poisoned")
-                    })?;
-                    write!(output, "{:X}\r\n", bytes.len())
-                        .and_then(|()| output.write_all(&bytes))
-                        .and_then(|()| output.write_all(b"\r\n"))
-                        .map_err(|error| http_io("write HTTP response stream", error))?;
-                }
-                Ok(Thunk::evaluated(Value::Unit))
-            },
-        )))))
-    })
-}
-
-fn stream_flush(output: Arc<Mutex<TcpStream>>, alive: Arc<AtomicBool>) -> IoAction {
-    IoAction::new(move |evaluator, _| {
-        ensure_stream_alive(&alive)?;
-        evaluator.ensure_not_cancelled()?;
-        output
-            .lock()
-            .map_err(|_| RuntimeError::internal("HTTP stream-writer mutex was poisoned"))?
-            .flush()
-            .map_err(|error| http_io("flush HTTP response stream", error))?;
-        Ok(Thunk::evaluated(Value::Unit))
-    })
 }
 
 fn ensure_stream_alive(alive: &AtomicBool) -> RuntimeResult<()> {
@@ -993,60 +1045,11 @@ fn force_headers(evaluator: &mut Evaluator, value: &ThunkRef) -> RuntimeResult<V
     Ok(headers)
 }
 
-enum BodyHeader {
-    Length(usize),
-    Chunked,
-}
-
-fn write_head(
-    stream: &mut TcpStream,
-    status: &Status,
-    headers: &[Header],
-    body: &BodyHeader,
-) -> RuntimeResult<()> {
-    validate_reason(&status.reason)?;
-    write!(stream, "HTTP/1.1 {} ", status.code)
-        .and_then(|()| stream.write_all(&status.reason))
-        .and_then(|()| stream.write_all(b"\r\n"))
-        .map_err(|error| http_io("write HTTP response status", error))?;
-    let mut has_connection = false;
-    let mut has_length = false;
-    let mut has_transfer_encoding = false;
-    for (name, value) in headers {
-        validate_header(name, value)?;
-        has_connection |= ascii_eq(name, b"connection");
-        has_length |= ascii_eq(name, b"content-length");
-        has_transfer_encoding |= ascii_eq(name, b"transfer-encoding");
-        stream
-            .write_all(name)
-            .and_then(|()| stream.write_all(b": "))
-            .and_then(|()| stream.write_all(value))
-            .and_then(|()| stream.write_all(b"\r\n"))
-            .map_err(|error| http_io("write HTTP response header", error))?;
-    }
-    match *body {
-        BodyHeader::Length(length) if !has_length && !has_transfer_encoding => {
-            write!(stream, "Content-Length: {length}\r\n")
-                .map_err(|error| http_io("write HTTP Content-Length", error))?;
-        }
-        BodyHeader::Chunked if !has_length && !has_transfer_encoding => stream
-            .write_all(b"Transfer-Encoding: chunked\r\n")
-            .map_err(|error| http_io("write HTTP Transfer-Encoding", error))?,
-        BodyHeader::Length(_) | BodyHeader::Chunked => {}
-    }
-    if !has_connection {
-        stream
-            .write_all(b"Connection: close\r\n")
-            .map_err(|error| http_io("write HTTP Connection header", error))?;
-    }
-    stream
-        .write_all(b"\r\n")
-        .map_err(|error| http_io("finish HTTP response headers", error))?;
-    Ok(())
-}
-
-fn validate_reason(reason: &[u8]) -> RuntimeResult<()> {
-    if reason.len() > 1024 || reason.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+fn validate_reason(reason: &[u8], limit: Limit<u64>) -> RuntimeResult<()> {
+    let too_long = limit
+        .value()
+        .is_some_and(|maximum| u64::try_from(reason.len()).unwrap_or(u64::MAX) > maximum);
+    if too_long || reason.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
         Err(RuntimeError::http(
             "HTTP status reason is too long or contains a forbidden byte",
         ))
@@ -1067,7 +1070,7 @@ fn validate_header(name: &[u8], value: &[u8]) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn is_token_byte(byte: u8) -> bool {
+const fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
@@ -1088,19 +1091,78 @@ fn is_token_byte(byte: u8) -> bool {
         )
 }
 
-fn header_value<'a>(headers: &'a [Header], wanted: &[u8]) -> Option<&'a [u8]> {
+fn header_values<'a>(headers: &'a [Header], wanted: &[u8]) -> Vec<&'a [u8]> {
     headers
         .iter()
-        .find(|(name, _)| ascii_eq(name, wanted))
+        .filter(|(name, _)| ascii_eq(name, wanted))
         .map(|(_, value)| value.as_ref())
+        .collect()
 }
 
-fn ascii_eq(left: &[u8], right: &[u8]) -> bool {
+fn parse_content_length(value: &[u8]) -> RuntimeResult<usize> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(RuntimeError::http("HTTP Content-Length is invalid"));
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| RuntimeError::http("HTTP Content-Length is too large"))
+}
+
+fn validate_response_framing_headers(headers: &[Header]) -> RuntimeResult<()> {
+    if !header_values(headers, b"content-length").is_empty()
+        && !header_values(headers, b"transfer-encoding").is_empty()
+    {
+        return Err(RuntimeError::http(
+            "HTTP response cannot contain both Transfer-Encoding and Content-Length",
+        ));
+    }
+    if !header_values(headers, b"transfer-encoding").is_empty() && !response_is_chunked(headers) {
+        return Err(RuntimeError::http(
+            "HTTP response has an unsupported Transfer-Encoding",
+        ));
+    }
+    Ok(())
+}
+
+fn response_content_length(headers: &[Header]) -> RuntimeResult<Option<usize>> {
+    let values = header_values(headers, b"content-length");
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let lengths = values
+        .iter()
+        .flat_map(|value| value.split(|byte| *byte == b','))
+        .map(trim_optional_whitespace)
+        .map(parse_content_length)
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    let Some(length) = lengths.first().copied() else {
+        return Err(RuntimeError::http("HTTP Content-Length is empty"));
+    };
+    if lengths.iter().any(|candidate| *candidate != length) {
+        return Err(RuntimeError::http(
+            "HTTP response has conflicting Content-Length values",
+        ));
+    }
+    Ok(Some(length))
+}
+
+fn response_is_chunked(headers: &[Header]) -> bool {
+    let values = header_values(headers, b"transfer-encoding");
+    let codings = values
+        .iter()
+        .flat_map(|value| value.split(|byte| *byte == b','))
+        .map(trim_optional_whitespace)
+        .collect::<Vec<_>>();
+    codings.len() == 1 && ascii_eq(codings[0], b"chunked")
+}
+
+fn status_forbids_body(status: u16) -> bool {
+    (100..200).contains(&status) || matches!(status, 204 | 304)
+}
+
+const fn ascii_eq(left: &[u8], right: &[u8]) -> bool {
     left.eq_ignore_ascii_case(right)
-}
-
-fn trim_cr(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
@@ -1119,13 +1181,7 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn hex(byte: u8) -> Option<u8> {
+const fn hex(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

@@ -190,5 +190,8 @@ fn excessive_expression_nesting_returns_a_structured_resource_limit() {
     let errors = parse(&source(&text)).expect_err("deep input must reach the parser boundary");
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].code, "H0801");
-    assert_eq!(errors[0].message.as_ref(), "parser nesting limit exceeded");
+    assert_eq!(
+        errors[0].message.as_ref(),
+        "parser nesting limit exceeded: operation=parse_nesting profile=sandboxed configured=64 observed=65"
+    );
 }

@@ -1,5 +1,7 @@
 //! Runtime representations shared by manifest-driven class adapters.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::sync::Arc;
 
 use hell_core::ClassEvidence;
@@ -1154,24 +1156,56 @@ fn sort_list_on(
     function: &ThunkRef,
     list: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
-    let mut keyed = Vec::new();
+    let mut runs = Vec::new();
     for value in evaluator.force_list_elements(list)? {
+        evaluator.ensure_not_cancelled()?;
         let key = Thunk::suspended(Suspension::Apply {
             function: Arc::clone(function),
             argument: Arc::clone(&value),
         });
-        keyed.push((key, value));
+        runs.push(vec![(key, value)]);
     }
-    for index in 1..keyed.len() {
-        let mut cursor = index;
-        while cursor > 0 && evaluator.less_values(&keyed[cursor].0, &keyed[cursor - 1].0)? {
-            keyed.swap(cursor, cursor - 1);
-            cursor -= 1;
+    while runs.len() > 1 {
+        evaluator.ensure_not_cancelled()?;
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
+        let mut current = runs.into_iter();
+        while let Some(left) = current.next() {
+            if let Some(right) = current.next() {
+                merged.push(merge_keyed_runs(evaluator, left, right)?);
+            } else {
+                merged.push(left);
+            }
         }
+        runs = merged;
     }
     Ok(ForceOutcome::Alias(list_from_values(
-        keyed.into_iter().map(|(_, value)| value).collect(),
+        runs.pop()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
     )))
+}
+
+fn merge_keyed_runs(
+    evaluator: &mut Evaluator,
+    left: Vec<(ThunkRef, ThunkRef)>,
+    right: Vec<(ThunkRef, ThunkRef)>,
+) -> RuntimeResult<Vec<(ThunkRef, ThunkRef)>> {
+    let mut output = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some((left_key, _)), Some((right_key, _))) = (left.peek(), right.peek()) {
+        evaluator.ensure_not_cancelled()?;
+        if evaluator.less_values(right_key, left_key)? {
+            output.push(right.next().expect("peeked right keyed item exists"));
+        } else {
+            output.push(left.next().expect("peeked left keyed item exists"));
+        }
+    }
+    output.extend(left);
+    output.extend(right);
+    Ok(output)
 }
 
 fn list_to_maybe(evaluator: &mut Evaluator, list: &ThunkRef) -> RuntimeResult<ForceOutcome> {
@@ -1280,6 +1314,11 @@ fn option_leaf_parser(
             "Options leaf parser received non-modifier metadata",
         ));
     };
+    validate_option_modifiers(
+        modifiers,
+        !matches!(implementation, "options_str_argument"),
+        implementation,
+    )?;
     let parser = match implementation {
         "options_switch" => OptionParser::Switch(modifiers.clone()),
         "options_str_option" => OptionParser::StringOption(modifiers.clone()),
@@ -1303,6 +1342,7 @@ fn option_flag(
             "Options.flag received non-modifier metadata",
         ));
     };
+    validate_option_modifiers(modifiers, true, "Options.flag")?;
     Ok(ForceOutcome::Value(Arc::new(Value::OptionsParser(
         Arc::new(OptionParser::Flag {
             inactive: inactive.cloned(),
@@ -1384,6 +1424,7 @@ fn option_subparser(
             "Options.hsubparser received non-command modifiers",
         ));
     };
+    validate_command_modifiers(modifiers)?;
     Ok(ForceOutcome::Value(Arc::new(Value::OptionsParser(
         Arc::new(OptionParser::Commands(modifiers.clone())),
     ))))
@@ -1399,217 +1440,615 @@ fn option_exec(evaluator: &mut Evaluator, info: &ThunkRef) -> RuntimeResult<Forc
     let info = info.clone();
     Ok(ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
         move |evaluator, context| {
-            let mut state = OptionParseState {
-                arguments: Arc::clone(&context.args),
-                used: vec![false; context.args.len()],
+            let mut state = match tokenize_options(&info, &context.args)? {
+                TokenizedOptions::State(state) => state,
+                TokenizedOptions::Help {
+                    info: help_info,
+                    inherited_helper,
+                } => {
+                    let help = render_option_help(&help_info, inherited_helper)?;
+                    context.write(help.as_bytes())?;
+                    return Err(RuntimeError::exit(0));
+                }
             };
-            let value = parse_option(evaluator, &info.parser, &mut state)?.ok_or_else(|| {
-                RuntimeError::user(option_usage_error(&info, "missing required option"))
-            })?;
-            if let Some((_, unexpected)) = state
-                .used
-                .iter()
-                .zip(state.arguments.iter())
-                .find(|(used, _)| !**used)
-            {
-                return Err(RuntimeError::user(option_usage_error(
-                    &info,
-                    &format!("unexpected argument `{unexpected}`"),
-                )));
-            }
+            let value = match evaluate_option(evaluator, &info.parser, &mut state)? {
+                OptionEvaluation::Success { value, .. } => value,
+                OptionEvaluation::Missing { expected, .. } => {
+                    return Err(RuntimeError::user(option_usage_error(
+                        &info,
+                        &format!("missing {expected}"),
+                    )));
+                }
+            };
+            ensure_no_option_leftovers(&info, &state)?;
             Ok(value)
         },
     )))))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlannedOptionKind {
+    Flag,
+    Value,
+}
+
+#[derive(Default)]
+struct ParserPlan {
+    options: BTreeMap<Arc<str>, PlannedOptionKind>,
+    commands: BTreeMap<Arc<str>, ParserInfo>,
+    command_order: Vec<Arc<str>>,
+    helper: bool,
+}
+
+enum TokenizedOptions {
+    State(OptionParseState),
+    Help {
+        info: ParserInfo,
+        inherited_helper: bool,
+    },
+}
+
 struct OptionParseState {
-    arguments: Arc<[Arc<str>]>,
-    used: Vec<bool>,
+    options: BTreeMap<Arc<str>, VecDeque<OptionOccurrence>>,
+    positionals: VecDeque<OsString>,
+    selected_command: Option<SelectedCommand>,
+}
+
+struct OptionOccurrence {
+    position: usize,
+    value: OptionOccurrenceValue,
+}
+
+enum OptionOccurrenceValue {
+    Flag,
+    Value(OsString),
+}
+
+struct SelectedCommand {
+    info: ParserInfo,
+    state: Box<OptionParseState>,
+}
+
+enum OptionEvaluation {
+    Success { value: ThunkRef, consumed: usize },
+    Missing { expected: Arc<str>, consumed: usize },
+}
+
+fn validate_option_modifiers(
+    modifiers: &OptionModifiers,
+    requires_long: bool,
+    implementation: &str,
+) -> RuntimeResult<()> {
+    let mut long_count = 0usize;
+    let mut metavar_count = 0usize;
+    let mut default_count = 0usize;
+    for modifier in modifiers.0.iter() {
+        match modifier {
+            OptionModifier::Long(long) => {
+                long_count += 1;
+                if long.is_empty()
+                    || long.starts_with('-')
+                    || long.contains('=')
+                    || long.chars().any(char::is_whitespace)
+                {
+                    return Err(RuntimeError::user(format!(
+                        "{implementation} has an invalid long option name `{long}`"
+                    )));
+                }
+            }
+            OptionModifier::Help(_) => {}
+            OptionModifier::Metavar(_) => metavar_count += 1,
+            OptionModifier::Default(_) => default_count += 1,
+            OptionModifier::Command { .. } => {
+                return Err(RuntimeError::user(format!(
+                    "{implementation} cannot use a command modifier"
+                )));
+            }
+        }
+    }
+    if requires_long && long_count == 0 {
+        return Err(RuntimeError::user(format!(
+            "{implementation} requires exactly one long modifier"
+        )));
+    }
+    if !requires_long && long_count != 0 {
+        return Err(RuntimeError::user(format!(
+            "{implementation} cannot use a long modifier"
+        )));
+    }
+    let accepts_value_metadata = matches!(
+        implementation,
+        "options_str_option" | "options_str_argument"
+    );
+    if !accepts_value_metadata && (metavar_count != 0 || default_count != 0) {
+        return Err(RuntimeError::user(format!(
+            "{implementation} cannot use metavar or default modifiers"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_command_modifiers(modifiers: &OptionModifiers) -> RuntimeResult<()> {
+    let mut names = BTreeSet::new();
+    for modifier in modifiers.0.iter() {
+        let OptionModifier::Command { name, .. } = modifier else {
+            return Err(RuntimeError::user(
+                "Options.hsubparser accepts only command modifiers",
+            ));
+        };
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            return Err(RuntimeError::user(format!(
+                "Options.command has an invalid command name `{name}`"
+            )));
+        }
+        if !names.insert(Arc::clone(name)) {
+            return Err(RuntimeError::user(format!(
+                "Options.hsubparser has duplicate command `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn compile_option_plan(parser: &OptionParser, plan: &mut ParserPlan) -> RuntimeResult<()> {
+    match parser {
+        OptionParser::Pure(_) | OptionParser::StringArgument(_) => {}
+        OptionParser::Helper => plan.helper = true,
+        OptionParser::Map { parser, .. }
+        | OptionParser::Optional(parser)
+        | OptionParser::Many(parser) => compile_option_plan(parser, plan)?,
+        OptionParser::Apply { function, argument } => {
+            compile_option_plan(function, plan)?;
+            compile_option_plan(argument, plan)?;
+        }
+        OptionParser::Switch(modifiers) | OptionParser::Flag { modifiers, .. } => {
+            plan_option(modifiers, PlannedOptionKind::Flag, plan)?;
+        }
+        OptionParser::StringOption(modifiers) => {
+            plan_option(modifiers, PlannedOptionKind::Value, plan)?;
+        }
+        OptionParser::Commands(modifiers) => {
+            for modifier in modifiers.0.iter() {
+                let OptionModifier::Command { name, parser } = modifier else {
+                    return Err(RuntimeError::user(
+                        "Options.hsubparser accepts only command modifiers",
+                    ));
+                };
+                if plan
+                    .commands
+                    .insert(Arc::clone(name), parser.clone())
+                    .is_some()
+                {
+                    return Err(RuntimeError::user(format!(
+                        "ambiguous command `{name}` is declared more than once"
+                    )));
+                }
+                plan.command_order.push(Arc::clone(name));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_option(
+    modifiers: &OptionModifiers,
+    kind: PlannedOptionKind,
+    plan: &mut ParserPlan,
+) -> RuntimeResult<()> {
+    let mut aliases = BTreeSet::new();
+    for long in modifier_longs(modifiers) {
+        let long: Arc<str> = long.into();
+        if !aliases.insert(Arc::clone(&long)) {
+            continue;
+        }
+        if plan.options.insert(Arc::clone(&long), kind).is_some() {
+            return Err(RuntimeError::user(format!(
+                "ambiguous option `--{long}` is declared more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn tokenize_options(info: &ParserInfo, arguments: &[OsString]) -> RuntimeResult<TokenizedOptions> {
+    let mut plan = ParserPlan::default();
+    compile_option_plan(&info.parser, &mut plan)?;
+    tokenize_with_plan(info, &plan, arguments)
+}
+
+#[allow(clippy::too_many_lines)]
+fn tokenize_with_plan(
+    info: &ParserInfo,
+    plan: &ParserPlan,
+    arguments: &[OsString],
+) -> RuntimeResult<TokenizedOptions> {
+    let mut state = OptionParseState {
+        options: BTreeMap::new(),
+        positionals: VecDeque::new(),
+        selected_command: None,
+    };
+    let mut option_mode = true;
+    let mut index = 0usize;
+    while let Some(token) = arguments.get(index) {
+        if option_mode && token == "--" {
+            option_mode = false;
+            index += 1;
+            continue;
+        }
+        if option_mode && plan.helper && matches!(token.to_str(), Some("--help" | "-h")) {
+            return Ok(TokenizedOptions::Help {
+                info: info.clone(),
+                inherited_helper: plan.helper,
+            });
+        }
+        if option_mode
+            && let Some(long_token) = token.to_str().and_then(|token| token.strip_prefix("--"))
+        {
+            let (name, attached) = long_token
+                .split_once('=')
+                .map_or((long_token, None), |(name, value)| (name, Some(value)));
+            let Some(kind) = plan.options.get(name) else {
+                return Err(RuntimeError::user(option_usage_error(
+                    info,
+                    &format!("unknown option `--{name}`"),
+                )));
+            };
+            let token_position = index;
+            let value = match kind {
+                PlannedOptionKind::Flag => {
+                    if attached.is_some() {
+                        return Err(RuntimeError::user(option_usage_error(
+                            info,
+                            &format!("flag `--{name}` does not take an argument"),
+                        )));
+                    }
+                    OptionOccurrenceValue::Flag
+                }
+                PlannedOptionKind::Value => {
+                    if let Some(value) = attached {
+                        OptionOccurrenceValue::Value(OsString::from(value))
+                    } else {
+                        index += 1;
+                        let Some(value) = arguments.get(index) else {
+                            return Err(RuntimeError::user(option_usage_error(
+                                info,
+                                &format!("option `--{name}` requires an argument"),
+                            )));
+                        };
+                        OptionOccurrenceValue::Value(value.clone())
+                    }
+                }
+            };
+            state
+                .options
+                .entry(Arc::<str>::from(name))
+                .or_default()
+                .push_back(OptionOccurrence {
+                    position: token_position,
+                    value,
+                });
+            index += 1;
+            continue;
+        }
+        if option_mode
+            && token
+                .to_str()
+                .is_some_and(|token| token.starts_with('-') && token != "-")
+        {
+            return Err(RuntimeError::user(option_usage_error(
+                info,
+                &format!("unknown option `{}`", token.to_string_lossy()),
+            )));
+        }
+        if !plan.commands.is_empty() && state.selected_command.is_none() {
+            let Some(command_name) = token.to_str() else {
+                return Err(RuntimeError::user(option_usage_error(
+                    info,
+                    "command name is not valid Unicode",
+                )));
+            };
+            let Some(command_info) = plan.commands.get(command_name) else {
+                return Err(RuntimeError::user(option_usage_error(
+                    info,
+                    &format!("invalid command `{command_name}`"),
+                )));
+            };
+            let mut command_plan = ParserPlan::default();
+            compile_option_plan(&command_info.parser, &mut command_plan)?;
+            command_plan.helper |= plan.helper;
+            match tokenize_with_plan(command_info, &command_plan, &arguments[index + 1..])? {
+                TokenizedOptions::State(command_state) => {
+                    state.selected_command = Some(SelectedCommand {
+                        info: command_info.clone(),
+                        state: Box::new(command_state),
+                    });
+                    return Ok(TokenizedOptions::State(state));
+                }
+                TokenizedOptions::Help {
+                    info: help_info,
+                    inherited_helper,
+                } => {
+                    return Ok(TokenizedOptions::Help {
+                        info: help_info,
+                        inherited_helper,
+                    });
+                }
+            }
+        }
+        state.positionals.push_back(token.clone());
+        index += 1;
+    }
+    Ok(TokenizedOptions::State(state))
 }
 
 #[allow(clippy::only_used_in_recursion, clippy::too_many_lines)]
-fn parse_option(
+fn evaluate_option(
     evaluator: &mut Evaluator,
     parser: &OptionParser,
     state: &mut OptionParseState,
-) -> RuntimeResult<Option<ThunkRef>> {
+) -> RuntimeResult<OptionEvaluation> {
     match parser {
-        OptionParser::Pure(value) => Ok(Some(Arc::clone(value))),
+        OptionParser::Pure(value) => Ok(option_success(Arc::clone(value), 0)),
         OptionParser::Helper => {
             let identity = hell_builtins::lookup("Function.id")
                 .ok_or_else(|| RuntimeError::internal("Function.id is missing from registry"))?;
-            Ok(Some(Thunk::evaluated(Value::Function(
-                FunctionValue::Native {
+            Ok(option_success(
+                Thunk::evaluated(Value::Function(FunctionValue::Native {
                     builtin: identity.id,
                     arguments: Arc::from([]),
                     evidence: None,
-                },
-            ))))
+                })),
+                0,
+            ))
         }
         OptionParser::Map { function, parser } => {
-            let Some(argument) = parse_option(evaluator, parser, state)? else {
-                return Ok(None);
+            let result = evaluate_option(evaluator, parser, state)?;
+            let OptionEvaluation::Success { value, consumed } = result else {
+                return Ok(result);
             };
-            Ok(Some(Thunk::suspended(Suspension::Apply {
-                function: Arc::clone(function),
-                argument,
-            })))
+            Ok(option_success(
+                Thunk::suspended(Suspension::Apply {
+                    function: Arc::clone(function),
+                    argument: value,
+                }),
+                consumed,
+            ))
         }
         OptionParser::Apply { function, argument } => {
-            let Some(function) = parse_option(evaluator, function, state)? else {
-                return Ok(None);
+            let function_result = evaluate_option(evaluator, function, state)?;
+            let OptionEvaluation::Success {
+                value: function,
+                consumed: function_consumed,
+            } = function_result
+            else {
+                return Ok(function_result);
             };
-            let Some(argument) = parse_option(evaluator, argument, state)? else {
-                return Ok(None);
+            let argument_result = evaluate_option(evaluator, argument, state)?;
+            let OptionEvaluation::Success {
+                value: argument,
+                consumed: argument_consumed,
+            } = argument_result
+            else {
+                let OptionEvaluation::Missing { expected, consumed } = argument_result else {
+                    unreachable!("option evaluation has two variants")
+                };
+                return Ok(OptionEvaluation::Missing {
+                    expected,
+                    consumed: function_consumed.saturating_add(consumed),
+                });
             };
-            Ok(Some(Thunk::suspended(Suspension::Apply {
-                function,
-                argument,
-            })))
+            Ok(option_success(
+                Thunk::suspended(Suspension::Apply { function, argument }),
+                function_consumed.saturating_add(argument_consumed),
+            ))
         }
-        OptionParser::Optional(parser) => Ok(Some(Thunk::evaluated(Value::Maybe(parse_option(
-            evaluator, parser, state,
-        )?)))),
+        OptionParser::Optional(parser) => match evaluate_option(evaluator, parser, state)? {
+            OptionEvaluation::Success { value, consumed } => Ok(option_success(
+                Thunk::evaluated(Value::Maybe(Some(value))),
+                consumed,
+            )),
+            OptionEvaluation::Missing { consumed: 0, .. } => {
+                Ok(option_success(Thunk::evaluated(Value::Maybe(None)), 0))
+            }
+            missing @ OptionEvaluation::Missing { .. } => Ok(missing),
+        },
         OptionParser::Many(parser) => {
             let mut values = Vec::new();
+            let mut consumed = 0usize;
             loop {
-                let before = state.used.iter().filter(|used| **used).count();
-                let Some(value) = parse_option(evaluator, parser, state)? else {
-                    break;
-                };
-                let after = state.used.iter().filter(|used| **used).count();
-                if after == before {
-                    return Err(RuntimeError::internal(
-                        "Alternative.many parser accepted empty input",
-                    ));
+                match evaluate_option(evaluator, parser, state)? {
+                    OptionEvaluation::Success {
+                        value,
+                        consumed: item_consumed,
+                    } => {
+                        if item_consumed == 0 {
+                            return Err(RuntimeError::user(
+                                "Alternative.many parser accepted empty input",
+                            ));
+                        }
+                        consumed = consumed.saturating_add(item_consumed);
+                        values.push(value);
+                    }
+                    OptionEvaluation::Missing { consumed: 0, .. } => break,
+                    OptionEvaluation::Missing {
+                        expected,
+                        consumed: item_consumed,
+                    } => {
+                        return Ok(OptionEvaluation::Missing {
+                            expected,
+                            consumed: consumed.saturating_add(item_consumed),
+                        });
+                    }
                 }
-                values.push(value);
             }
-            Ok(Some(list_from_values(values)))
+            Ok(option_success(list_from_values(values), consumed))
         }
         OptionParser::Switch(modifiers) => {
-            let Some(long) = modifier_long(modifiers) else {
-                return Err(RuntimeError::internal(
-                    "Options.switch is missing Flag.long",
-                ));
-            };
-            let needle = format!("--{long}");
-            let found = state
-                .arguments
-                .iter()
-                .enumerate()
-                .find(|(index, value)| !state.used[*index] && value.as_ref() == needle)
-                .map(|(index, _)| index);
-            if let Some(index) = found {
-                state.used[index] = true;
-            }
-            Ok(Some(Thunk::evaluated(Value::Bool(found.is_some()))))
+            let _ = required_long(modifiers)?;
+            let found = take_option_occurrence(state, modifiers).is_some();
+            Ok(option_success(
+                Thunk::evaluated(Value::Bool(found)),
+                usize::from(found),
+            ))
         }
         OptionParser::Flag {
             inactive,
             active,
             modifiers,
         } => {
-            let Some(long) = modifier_long(modifiers) else {
-                return Err(RuntimeError::internal("Options.flag is missing Flag.long"));
-            };
-            let needle = format!("--{long}");
-            let found = state
-                .arguments
-                .iter()
-                .enumerate()
-                .find(|(index, value)| !state.used[*index] && value.as_ref() == needle)
-                .map(|(index, _)| index);
-            if let Some(index) = found {
-                state.used[index] = true;
-                Ok(Some(Arc::clone(active)))
+            let long = required_long(modifiers)?;
+            if take_option_occurrence(state, modifiers).is_some() {
+                Ok(option_success(Arc::clone(active), 1))
+            } else if let Some(inactive) = inactive {
+                Ok(option_success(Arc::clone(inactive), 0))
             } else {
-                Ok(inactive.clone())
+                Ok(option_missing(format!("option `--{long}`"), 0))
             }
         }
         OptionParser::StringOption(modifiers) => {
-            let Some(long) = modifier_long(modifiers) else {
-                return Err(RuntimeError::internal(
-                    "Options.strOption is missing Option.long",
-                ));
-            };
-            let needle = format!("--{long}");
-            let found = state
-                .arguments
-                .iter()
-                .enumerate()
-                .find(|(index, value)| !state.used[*index] && value.as_ref() == needle)
-                .map(|(index, _)| index);
-            let Some(index) = found else {
-                return Ok(modifier_default(modifiers));
-            };
-            let value_index = index + 1;
-            let Some(value) = state.arguments.get(value_index).cloned() else {
-                return Err(RuntimeError::user(format!(
-                    "option `--{long}` requires an argument"
-                )));
-            };
-            if state.used[value_index] {
-                return Err(RuntimeError::user(format!(
-                    "option `--{long}` has no available argument"
-                )));
+            let long = required_long(modifiers)?;
+            match take_option_occurrence(state, modifiers).map(|occurrence| occurrence.value) {
+                Some(OptionOccurrenceValue::Value(value)) => Ok(option_success(
+                    Thunk::evaluated(Value::Text(host_text(value)?)),
+                    1,
+                )),
+                Some(OptionOccurrenceValue::Flag) => Err(RuntimeError::internal(
+                    "value option was tokenized as a flag",
+                )),
+                None => match modifier_default(modifiers) {
+                    Some(default) => Ok(option_success(default, 0)),
+                    None => Ok(option_missing(format!("option `--{long}`"), 0)),
+                },
             }
-            state.used[index] = true;
-            state.used[value_index] = true;
-            Ok(Some(Thunk::evaluated(Value::Text(value))))
         }
         OptionParser::StringArgument(modifiers) => {
-            let found = state
-                .arguments
-                .iter()
-                .enumerate()
-                .find(|(index, value)| !state.used[*index] && !value.starts_with('-'))
-                .map(|(index, value)| (index, Arc::clone(value)));
-            let Some((index, value)) = found else {
-                return Ok(modifier_default(modifiers));
-            };
-            state.used[index] = true;
-            let _metavar = modifiers.0.iter().find_map(|modifier| match modifier {
-                OptionModifier::Metavar(value) => Some(value),
-                _ => None,
-            });
-            Ok(Some(Thunk::evaluated(Value::Text(value))))
+            if let Some(value) = state.positionals.pop_front() {
+                return Ok(option_success(
+                    Thunk::evaluated(Value::Text(host_text(value)?)),
+                    1,
+                ));
+            }
+            match modifier_default(modifiers) {
+                Some(default) => Ok(option_success(default, 0)),
+                None => Ok(option_missing(argument_metavar(modifiers), 0)),
+            }
         }
-        OptionParser::Commands(modifiers) => {
-            let found = state
-                .arguments
-                .iter()
-                .enumerate()
-                .find(|(index, _)| !state.used[*index])
-                .map(|(index, value)| (index, Arc::clone(value)));
-            let Some((index, command)) = found else {
-                return Ok(None);
+        OptionParser::Commands(_) => {
+            let Some(mut selected) = state.selected_command.take() else {
+                return Ok(option_missing("command", 0));
             };
-            let parser = modifiers.0.iter().find_map(|modifier| match modifier {
-                OptionModifier::Command { name, parser } if name == &command => Some(parser),
-                _ => None,
-            });
-            let Some(parser) = parser else {
-                return Err(RuntimeError::user(format!("unknown command `{command}`")));
-            };
-            state.used[index] = true;
-            parse_option(evaluator, &parser.parser, state)
+            let result = evaluate_option(evaluator, &selected.info.parser, &mut selected.state)?;
+            match result {
+                OptionEvaluation::Success { value, consumed } => {
+                    ensure_no_option_leftovers(&selected.info, &selected.state)?;
+                    Ok(option_success(value, consumed.saturating_add(1)))
+                }
+                OptionEvaluation::Missing { expected, .. } => Err(RuntimeError::user(
+                    option_usage_error(&selected.info, &format!("missing {expected}")),
+                )),
+            }
         }
     }
 }
 
+fn host_text(value: OsString) -> RuntimeResult<Arc<str>> {
+    value
+        .into_string()
+        .map(Arc::<str>::from)
+        .map_err(|_| RuntimeError::user("option argument is not valid Unicode"))
+}
+
+fn option_success(value: ThunkRef, consumed: usize) -> OptionEvaluation {
+    OptionEvaluation::Success { value, consumed }
+}
+
+fn option_missing(expected: impl Into<Arc<str>>, consumed: usize) -> OptionEvaluation {
+    OptionEvaluation::Missing {
+        expected: expected.into(),
+        consumed,
+    }
+}
+
+fn required_long(modifiers: &OptionModifiers) -> RuntimeResult<&str> {
+    modifier_long(modifiers)
+        .ok_or_else(|| RuntimeError::user("option is missing its long modifier"))
+}
+
+fn take_option_occurrence(
+    state: &mut OptionParseState,
+    modifiers: &OptionModifiers,
+) -> Option<OptionOccurrence> {
+    let long = modifier_longs(modifiers)
+        .filter_map(|long| {
+            state
+                .options
+                .get(long)
+                .and_then(VecDeque::front)
+                .map(|occurrence| (occurrence.position, long))
+        })
+        .min_by_key(|(position, _)| *position)
+        .map(|(_, long)| long)?;
+    state.options.get_mut(long).and_then(VecDeque::pop_front)
+}
+
+fn argument_metavar(modifiers: &OptionModifiers) -> Arc<str> {
+    modifiers
+        .0
+        .iter()
+        .rev()
+        .find_map(|modifier| match modifier {
+            OptionModifier::Metavar(value) => Some(Arc::clone(value)),
+            _ => None,
+        })
+        .unwrap_or_else(|| Arc::from("argument"))
+}
+
+fn ensure_no_option_leftovers(info: &ParserInfo, state: &OptionParseState) -> RuntimeResult<()> {
+    if let Some((long, _)) = state
+        .options
+        .iter()
+        .find(|(_, occurrences)| !occurrences.is_empty())
+    {
+        return Err(RuntimeError::user(option_usage_error(
+            info,
+            &format!("unexpected repeated option `--{long}`"),
+        )));
+    }
+    if let Some(unexpected) = state.positionals.front() {
+        return Err(RuntimeError::user(option_usage_error(
+            info,
+            &format!("unexpected argument `{}`", unexpected.to_string_lossy()),
+        )));
+    }
+    if state.selected_command.is_some() {
+        return Err(RuntimeError::user(option_usage_error(
+            info,
+            "unexpected command",
+        )));
+    }
+    Ok(())
+}
+
 fn modifier_long(modifiers: &OptionModifiers) -> Option<&str> {
-    modifiers.0.iter().find_map(|modifier| match modifier {
+    modifier_longs(modifiers).next()
+}
+
+fn modifier_longs(modifiers: &OptionModifiers) -> impl Iterator<Item = &str> {
+    modifiers.0.iter().filter_map(|modifier| match modifier {
         OptionModifier::Long(value) => Some(value.as_ref()),
         _ => None,
     })
 }
 
 fn modifier_default(modifiers: &OptionModifiers) -> Option<ThunkRef> {
-    modifiers.0.iter().find_map(|modifier| match modifier {
-        OptionModifier::Default(value) => Some(Arc::clone(value)),
-        _ => None,
-    })
+    modifiers
+        .0
+        .iter()
+        .rev()
+        .find_map(|modifier| match modifier {
+            OptionModifier::Default(value) => Some(Arc::clone(value)),
+            _ => None,
+        })
 }
 
 fn option_usage_error(info: &ParserInfo, message: &str) -> String {
@@ -1632,6 +2071,133 @@ fn option_usage_error(info: &ParserInfo, message: &str) -> String {
     output
 }
 
+fn render_option_help(info: &ParserInfo, inherited_helper: bool) -> RuntimeResult<String> {
+    let mut plan = ParserPlan::default();
+    compile_option_plan(&info.parser, &mut plan)?;
+    plan.helper |= inherited_helper;
+    let mut output = String::new();
+    if let Some(header) = &info.modifiers.header {
+        output.push_str(header);
+        output.push_str("\n\n");
+    }
+    output.push_str("Usage:");
+    if !plan.options.is_empty() || plan.helper {
+        output.push_str(" [OPTIONS]");
+    }
+    if !plan.commands.is_empty() {
+        output.push_str(" COMMAND");
+    }
+    if parser_has_positional(&info.parser) {
+        output.push_str(" ARGUMENTS");
+    }
+    output.push('\n');
+    if let Some(description) = &info.modifiers.program_description {
+        output.push('\n');
+        output.push_str(description);
+        output.push('\n');
+    }
+    let mut entries = Vec::new();
+    collect_option_help(&info.parser, &mut entries);
+    if plan.helper {
+        entries.push((
+            "-h, --help".to_owned(),
+            Some(Arc::from("Show this help text")),
+        ));
+    }
+    if !entries.is_empty() {
+        output.push_str("\nAvailable options:\n");
+        for (syntax, help) in entries {
+            output.push_str("  ");
+            output.push_str(&syntax);
+            if let Some(help) = help {
+                output.push_str("  ");
+                output.push_str(&help);
+            }
+            output.push('\n');
+        }
+    }
+    if !plan.commands.is_empty() {
+        output.push_str("\nAvailable commands:\n");
+        for name in &plan.command_order {
+            let command = plan
+                .commands
+                .get(name)
+                .expect("planned command order references a command");
+            output.push_str("  ");
+            output.push_str(name);
+            if let Some(description) = &command.modifiers.program_description {
+                output.push_str("  ");
+                output.push_str(description);
+            }
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn parser_has_positional(parser: &OptionParser) -> bool {
+    match parser {
+        OptionParser::StringArgument(_) => true,
+        OptionParser::Map { parser, .. }
+        | OptionParser::Optional(parser)
+        | OptionParser::Many(parser) => parser_has_positional(parser),
+        OptionParser::Apply { function, argument } => {
+            parser_has_positional(function) || parser_has_positional(argument)
+        }
+        _ => false,
+    }
+}
+
+fn collect_option_help(parser: &OptionParser, entries: &mut Vec<(String, Option<Arc<str>>)>) {
+    match parser {
+        OptionParser::Map { parser, .. }
+        | OptionParser::Optional(parser)
+        | OptionParser::Many(parser) => collect_option_help(parser, entries),
+        OptionParser::Apply { function, argument } => {
+            collect_option_help(function, entries);
+            collect_option_help(argument, entries);
+        }
+        OptionParser::Switch(modifiers) | OptionParser::Flag { modifiers, .. } => {
+            if let Some(syntax) = option_long_syntax(modifiers) {
+                entries.push((syntax, modifier_help(modifiers)));
+            }
+        }
+        OptionParser::StringOption(modifiers) => {
+            if let Some(mut syntax) = option_long_syntax(modifiers) {
+                let metavar = argument_metavar(modifiers);
+                syntax.push(' ');
+                syntax.push_str(&metavar);
+                entries.push((syntax, modifier_help(modifiers)));
+            }
+        }
+        OptionParser::StringArgument(modifiers) => {
+            entries.push((
+                argument_metavar(modifiers).to_string(),
+                modifier_help(modifiers),
+            ));
+        }
+        OptionParser::Pure(_) | OptionParser::Helper | OptionParser::Commands(_) => {}
+    }
+}
+
+fn option_long_syntax(modifiers: &OptionModifiers) -> Option<String> {
+    let aliases = modifier_longs(modifiers)
+        .map(|long| format!("--{long}"))
+        .collect::<Vec<_>>();
+    (!aliases.is_empty()).then(|| aliases.join("|"))
+}
+
+fn modifier_help(modifiers: &OptionModifiers) -> Option<Arc<str>> {
+    modifiers
+        .0
+        .iter()
+        .rev()
+        .find_map(|modifier| match modifier {
+            OptionModifier::Help(help) => Some(Arc::clone(help)),
+            _ => None,
+        })
+}
+
 fn parser_help(parser: &OptionParser) -> Option<&str> {
     match parser {
         OptionParser::Map { parser, .. }
@@ -1645,10 +2211,14 @@ fn parser_help(parser: &OptionParser) -> Option<&str> {
         | OptionParser::StringOption(modifiers)
         | OptionParser::StringArgument(modifiers)
         | OptionParser::Commands(modifiers) => {
-            modifiers.0.iter().find_map(|modifier| match modifier {
-                OptionModifier::Help(help) => Some(help.as_ref()),
-                _ => None,
-            })
+            modifiers
+                .0
+                .iter()
+                .rev()
+                .find_map(|modifier| match modifier {
+                    OptionModifier::Help(help) => Some(help.as_ref()),
+                    _ => None,
+                })
         }
         OptionParser::Pure(_) | OptionParser::Helper => None,
     }

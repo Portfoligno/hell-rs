@@ -1,7 +1,9 @@
 //! Call-by-need graph evaluator and reusable IO action values.
 
+pub mod budget;
 mod concurrency;
 pub mod internal;
+mod lazy_list;
 mod native_collections;
 pub mod native_handle;
 pub mod native_http;
@@ -11,9 +13,13 @@ mod native_list;
 pub mod native_process;
 mod native_temp;
 pub mod native_time;
+pub mod policy;
+pub mod scope;
 mod typeclasses;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -21,7 +27,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 use hell_builtins::BuiltinId;
@@ -29,12 +35,17 @@ use hell_core::{
     CaseBranch, ClassEvidence, Constant, CoreId, CoreKind, ExecutableProgram, Projection,
     RecordLayout, VariantLayout, VerifiedProgram,
 };
+use hell_host::{HostServices, SupervisedChild};
 use native_handle::{BufferMode, FileMode, HostHandle};
 use native_integer::BigInteger;
 use native_process::ProcessSpec;
+use policy::{Limit, RuntimePolicy};
 use typeclasses::{
     CaseInsensitiveValue, InfoModifiers, OptionModifiers, OptionParser, ParserInfo, TreeValue,
 };
+
+pub use native_collections::{OrderedMap, OrderedSet};
+pub use native_json::{JsonDocument, JsonNumber};
 
 pub type ThunkRef = Arc<Thunk>;
 pub type ValueRef = Arc<Value>;
@@ -49,6 +60,7 @@ pub enum RuntimeErrorKind {
     Exit(i32),
     Io,
     ResourceLimit,
+    CancellationStalled,
     InternalInvariant,
 }
 
@@ -57,6 +69,7 @@ pub struct RuntimeError {
     pub code: &'static str,
     pub kind: RuntimeErrorKind,
     pub message: Arc<str>,
+    pub suppressed: Arc<[Arc<RuntimeError>]>,
 }
 
 impl RuntimeError {
@@ -65,6 +78,7 @@ impl RuntimeError {
             code: "H0901",
             kind: RuntimeErrorKind::UserError,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -73,6 +87,7 @@ impl RuntimeError {
             code: "H9001",
             kind: RuntimeErrorKind::InternalInvariant,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -81,6 +96,7 @@ impl RuntimeError {
             code: "H0803",
             kind: RuntimeErrorKind::ResourceLimit,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -89,6 +105,16 @@ impl RuntimeError {
             code: "H0906",
             kind: RuntimeErrorKind::Cancelled,
             message: "IO action was cancelled".into(),
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn cancellation_stalled(message: impl Into<Arc<str>>) -> Arc<Self> {
+        Arc::new(Self {
+            code: "H0909",
+            kind: RuntimeErrorKind::CancellationStalled,
+            message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -97,6 +123,7 @@ impl RuntimeError {
             code: "H0907",
             kind: RuntimeErrorKind::Exit(status),
             message: "guest requested process exit".into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -105,6 +132,7 @@ impl RuntimeError {
             code: "H9004",
             kind: RuntimeErrorKind::InternalInvariant,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -113,6 +141,7 @@ impl RuntimeError {
             code: "H0908",
             kind: RuntimeErrorKind::Io,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -121,6 +150,7 @@ impl RuntimeError {
             code: "H0909",
             kind: RuntimeErrorKind::Io,
             message: message.into(),
+            suppressed: Arc::from([]),
         })
     }
 }
@@ -135,7 +165,7 @@ impl std::error::Error for RuntimeError {}
 
 #[derive(Clone)]
 pub struct RuntimeContext {
-    pub args: Arc<[Arc<str>]>,
+    pub args: Arc<[OsString]>,
     environment: Arc<[(Arc<str>, Arc<str>)]>,
     stdin: Arc<Mutex<Box<dyn BufRead + Send>>>,
     stdout: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -150,6 +180,9 @@ pub struct RuntimeContext {
     current_time: Option<SystemTime>,
     allow_network: bool,
     http_request_limit: Option<usize>,
+    policy: Arc<RuntimePolicy>,
+    budget: Arc<budget::Budget>,
+    host_services: Arc<HostServices>,
 }
 
 impl fmt::Debug for RuntimeContext {
@@ -163,6 +196,7 @@ impl fmt::Debug for RuntimeContext {
             .field("current_time_override", &self.current_time.is_some())
             .field("allow_network", &self.allow_network)
             .field("http_request_limit", &self.http_request_limit)
+            .field("policy", &self.policy.id)
             .finish_non_exhaustive()
     }
 }
@@ -207,8 +241,22 @@ impl RuntimeContext {
         allow_filesystem: bool,
         allow_process: bool,
     ) -> Self {
+        let host_environment = environment
+            .iter()
+            .map(|(name, value)| {
+                (
+                    OsString::from(name.as_ref()),
+                    OsString::from(value.as_ref()),
+                )
+            })
+            .collect();
+        let policy = Arc::new(RuntimePolicy::upstream());
+        let budget = Arc::new(budget::Budget::new(Arc::clone(&policy)));
         Self {
-            args: args.into(),
+            args: args
+                .into_iter()
+                .map(|argument| OsString::from(argument.as_ref()))
+                .collect(),
             environment: environment.into(),
             stdin: Arc::new(Mutex::new(Box::new(BufReader::new(std::io::stdin())))),
             stdout: Arc::new(Mutex::new(Box::new(stdout))),
@@ -223,7 +271,32 @@ impl RuntimeContext {
             current_time: None,
             allow_network: true,
             http_request_limit: None,
+            policy,
+            budget,
+            host_services: Arc::new(HostServices::from_environment(host_environment)),
         }
+    }
+
+    #[must_use]
+    pub fn with_policy(mut self, policy: RuntimePolicy) -> Self {
+        let policy = Arc::new(policy);
+        self.budget = Arc::new(budget::Budget::new(Arc::clone(&policy)));
+        self.allow_filesystem = policy.capabilities.filesystem;
+        self.allow_process = policy.capabilities.process;
+        self.allow_network =
+            policy.capabilities.network_loopback || policy.capabilities.network_external;
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn policy(&self) -> &RuntimePolicy {
+        &self.policy
+    }
+
+    #[must_use]
+    pub fn budget(&self) -> &Arc<budget::Budget> {
+        &self.budget
     }
 
     /// Overrides the number of workers used by pooled concurrency actions.
@@ -261,8 +334,9 @@ impl RuntimeContext {
         self
     }
 
-    fn current_time(&self) -> SystemTime {
-        self.current_time.unwrap_or_else(SystemTime::now)
+    pub(crate) fn current_time(&self) -> RuntimeResult<SystemTime> {
+        self.require_clock("UTCTime.getCurrentTime")?;
+        Ok(self.current_time.unwrap_or_else(SystemTime::now))
     }
 
     fn require_network(&self, operation: &'static str) -> RuntimeResult<()> {
@@ -275,13 +349,37 @@ impl RuntimeContext {
         }
     }
 
+    fn require_environment_read(&self, operation: &'static str) -> RuntimeResult<()> {
+        self.policy
+            .capabilities
+            .environment_read
+            .then_some(())
+            .ok_or_else(|| Self::io_error(operation, "environment read capability is disabled"))
+    }
+
+    fn require_clock(&self, operation: &'static str) -> RuntimeResult<()> {
+        self.policy
+            .capabilities
+            .clock
+            .then_some(())
+            .ok_or_else(|| Self::io_error(operation, "clock capability is disabled"))
+    }
+
+    fn require_exit_process(&self, operation: &'static str) -> RuntimeResult<()> {
+        self.policy
+            .capabilities
+            .exit_process
+            .then_some(())
+            .ok_or_else(|| Self::io_error(operation, "process-exit capability is disabled"))
+    }
+
     /// Creates a runtime view of the current process environment.
     ///
     /// # Errors
     ///
     /// Returns an invalid-data error rather than silently dropping an
     /// environment name or value that cannot be represented as Hell `Text`.
-    pub fn process(args: Vec<Arc<str>>) -> std::io::Result<Self> {
+    pub fn process(args: Vec<OsString>) -> std::io::Result<Self> {
         let environment = std::env::vars_os()
             .map(|(name, value)| {
                 let name = name.into_string().map_err(|_| {
@@ -299,7 +397,9 @@ impl RuntimeContext {
                 Ok((Arc::<str>::from(name), Arc::<str>::from(value)))
             })
             .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(Self::with_environment(args, environment, std::io::stdout()))
+        let mut context = Self::with_environment(Vec::new(), environment, std::io::stdout());
+        context.args = args.into();
+        Ok(context)
     }
 
     fn write(&self, bytes: &[u8]) -> RuntimeResult<()> {
@@ -342,6 +442,17 @@ impl RuntimeContext {
         Ok(())
     }
 
+    fn text_args(&self, operation: &'static str) -> RuntimeResult<Vec<Arc<str>>> {
+        self.args
+            .iter()
+            .map(|argument| {
+                argument.to_str().map(Arc::from).ok_or_else(|| {
+                    Self::io_error(operation, "argument is not valid Unicode on this platform")
+                })
+            })
+            .collect()
+    }
+
     fn read_stdin_line(&self, operation: &'static str) -> RuntimeResult<Arc<str>> {
         let mut input = self
             .stdin
@@ -378,14 +489,29 @@ impl RuntimeContext {
     }
 
     fn read_stdin_all(&self, operation: &'static str) -> RuntimeResult<Vec<u8>> {
-        const LIMIT: usize = 64 * 1024 * 1024;
-        let bytes = self.read_stdin_up_to(operation, LIMIT + 1)?;
-        if bytes.len() > LIMIT {
-            return Err(RuntimeError::resource_limit(format!(
-                "{operation} exceeds the 64 MiB input limit"
-            )));
+        match self.policy.limits.stdin_bytes {
+            Limit::Unlimited => {
+                let mut input = self
+                    .stdin
+                    .lock()
+                    .map_err(|_| RuntimeError::internal("stdin mutex was poisoned"))?;
+                let mut bytes = Vec::new();
+                input
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| Self::io_error(operation, error))?;
+                Ok(bytes)
+            }
+            Limit::At(limit) => {
+                let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+                let bytes = self.read_stdin_up_to(operation, limit.saturating_add(1))?;
+                if bytes.len() > limit {
+                    return Err(RuntimeError::resource_limit(format!(
+                        "{operation} exceeds the configured input limit of {limit} bytes"
+                    )));
+                }
+                Ok(bytes)
+            }
         }
-        Ok(bytes)
     }
 
     fn io_error(operation: &'static str, error: impl fmt::Display) -> Arc<RuntimeError> {
@@ -393,6 +519,7 @@ impl RuntimeContext {
             code: "H0903",
             kind: RuntimeErrorKind::Io,
             message: format!("{operation}: {error}").into(),
+            suppressed: Arc::from([]),
         })
     }
 
@@ -488,6 +615,8 @@ impl IoAction {
     }
 
     fn run(&self, evaluator: &mut Evaluator, context: &RuntimeContext) -> RuntimeResult<ThunkRef> {
+        let budget = Arc::clone(&evaluator.budget);
+        let _budget = ActiveBudgetGuard::enter(&budget);
         (self.operation)(evaluator, context)
     }
 }
@@ -499,6 +628,8 @@ pub enum Value {
     Int(i64),
     Integer(Arc<BigInteger>),
     Double(f64),
+    JsonNumber(JsonNumber),
+    JsonDocument(Arc<JsonDocument>, usize),
     Day(native_time::Day),
     DayOfWeek(native_time::DayOfWeek),
     UtcTime(native_time::UtcTime),
@@ -538,8 +669,8 @@ pub enum Value {
     PrimitiveVariant(PrimitiveVariantValue),
     List(ListCell),
     Vector(Arc<[ThunkRef]>),
-    Map(Arc<[(ThunkRef, ThunkRef)]>),
-    Set(Arc<[ThunkRef]>),
+    Map(Arc<OrderedMap>),
+    Set(Arc<OrderedSet>),
     Io(IoAction),
 }
 
@@ -626,6 +757,7 @@ type Environment = Arc<[ThunkRef]>;
 pub struct Thunk {
     state: Mutex<ThunkState>,
     ready: Condvar,
+    _live_thunk_permit: Option<budget::BudgetPermit>,
 }
 
 impl fmt::Debug for Thunk {
@@ -732,24 +864,78 @@ enum Suspension {
     },
     Fix {
         function: ThunkRef,
+        recursive: Weak<Thunk>,
     },
     Native(Arc<NativeThunkOperation>),
 }
 
 impl Thunk {
-    fn suspended(suspension: Suspension) -> ThunkRef {
+    fn allocate(state: ThunkState) -> ThunkRef {
+        let admission = ACTIVE_BUDGET.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map(|budget| {
+                    budget
+                        .charge_allocation(1)
+                        .and_then(|()| budget.acquire_live_thunk())
+                })
+        });
+        let (state, permit) = match admission {
+            Some(Ok(permit)) => (state, Some(permit)),
+            Some(Err(error)) => (ThunkState::Failed(error), None),
+            None => (state, None),
+        };
         Arc::new(Self {
-            state: Mutex::new(ThunkState::Suspended(suspension)),
+            state: Mutex::new(state),
             ready: Condvar::new(),
+            _live_thunk_permit: permit,
+        })
+    }
+
+    fn suspended(suspension: Suspension) -> ThunkRef {
+        Self::allocate(ThunkState::Suspended(suspension))
+    }
+
+    fn failed_without_admission(error: Arc<RuntimeError>) -> ThunkRef {
+        Arc::new(Self {
+            state: Mutex::new(ThunkState::Failed(error)),
+            ready: Condvar::new(),
+            _live_thunk_permit: None,
+        })
+    }
+
+    fn fixed(function: ThunkRef) -> ThunkRef {
+        let admission = ACTIVE_BUDGET.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map(|budget| {
+                    budget
+                        .charge_allocation(1)
+                        .and_then(|()| budget.acquire_live_thunk())
+                })
+        });
+        let permit = match admission {
+            Some(Err(error)) => return Self::failed_without_admission(error),
+            Some(Ok(permit)) => Some(permit),
+            None => None,
+        };
+        Arc::new_cyclic(|recursive| Self {
+            state: Mutex::new(ThunkState::Suspended(Suspension::Fix {
+                function,
+                recursive: recursive.clone(),
+            })),
+            ready: Condvar::new(),
+            _live_thunk_permit: permit,
         })
     }
 
     #[must_use]
     pub fn evaluated(value: Value) -> ThunkRef {
-        Arc::new(Self {
-            state: Mutex::new(ThunkState::Evaluated(Arc::new(value))),
-            ready: Condvar::new(),
-        })
+        Self::allocate(ThunkState::Evaluated(Arc::new(value)))
     }
 
     /// Creates a memoized deferred host computation for embedding and runtime
@@ -760,6 +946,30 @@ impl Thunk {
         operation: impl Fn(&mut Evaluator) -> RuntimeResult<ValueRef> + Send + Sync + 'static,
     ) -> ThunkRef {
         Self::suspended(Suspension::Native(Arc::new(operation)))
+    }
+}
+
+thread_local! {
+    static ACTIVE_BUDGET: RefCell<Option<Weak<budget::Budget>>> = const { RefCell::new(None) };
+}
+
+struct ActiveBudgetGuard {
+    previous: Option<Weak<budget::Budget>>,
+}
+
+impl ActiveBudgetGuard {
+    fn enter(budget: &Arc<budget::Budget>) -> Self {
+        let previous =
+            ACTIVE_BUDGET.with(|active| active.borrow_mut().replace(Arc::downgrade(budget)));
+        Self { previous }
+    }
+}
+
+impl Drop for ActiveBudgetGuard {
+    fn drop(&mut self) {
+        ACTIVE_BUDGET.with(|active| {
+            *active.borrow_mut() = self.previous.take();
+        });
     }
 }
 
@@ -793,6 +1003,7 @@ fn register_wait(waiter: EvaluationId, owner: EvaluationId) -> RuntimeResult<Wai
                 code: "H0902",
                 kind: RuntimeErrorKind::BlackHole,
                 message: "cross-evaluator black hole detected in thunk wait graph".into(),
+                suppressed: Arc::from([]),
             }));
         }
         let Some(next) = graph.get(&current) else {
@@ -816,7 +1027,10 @@ fn next_evaluation_id() -> EvaluationId {
 pub struct Evaluator {
     program: Arc<ExecutableProgram>,
     evaluation_id: EvaluationId,
-    max_machine_frames: usize,
+    max_machine_frames: Limit<usize>,
+    policy: Arc<RuntimePolicy>,
+    budget: Arc<budget::Budget>,
+    scope: scope::ExecutionScope,
     cancellation: concurrency::CancellationToken,
     max_concurrent_actions: usize,
 }
@@ -902,11 +1116,22 @@ enum Frame {
 impl Evaluator {
     #[must_use]
     pub fn new(program: Arc<ExecutableProgram>) -> Self {
+        let policy = Arc::new(RuntimePolicy::upstream());
+        let budget = Arc::new(budget::Budget::new(Arc::clone(&policy)));
+        let cancellation = concurrency::CancellationToken::new();
+        let scope = scope::ExecutionScope::with_cancellation(
+            Arc::clone(&policy),
+            Arc::clone(&budget),
+            cancellation.clone(),
+        );
         Self {
             program,
             evaluation_id: next_evaluation_id(),
-            max_machine_frames: 1_000_000,
-            cancellation: concurrency::CancellationToken::new(),
+            max_machine_frames: policy.limits.machine_frames,
+            budget,
+            policy,
+            scope,
+            cancellation,
             max_concurrent_actions: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
         }
@@ -918,14 +1143,46 @@ impl Evaluator {
         program: Arc<ExecutableProgram>,
         max_machine_frames: usize,
     ) -> Self {
+        let policy = Arc::new(RuntimePolicy::sandboxed());
+        let budget = Arc::new(budget::Budget::new(Arc::clone(&policy)));
+        let cancellation = concurrency::CancellationToken::new();
+        let scope = scope::ExecutionScope::with_cancellation(
+            Arc::clone(&policy),
+            Arc::clone(&budget),
+            cancellation.clone(),
+        );
         Self {
             program,
             evaluation_id: next_evaluation_id(),
-            max_machine_frames,
-            cancellation: concurrency::CancellationToken::new(),
+            max_machine_frames: Limit::At(max_machine_frames),
+            budget,
+            policy,
+            scope,
+            cancellation,
             max_concurrent_actions: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
         }
+    }
+
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<RuntimePolicy>, budget: Arc<budget::Budget>) -> Self {
+        self.max_machine_frames = policy.limits.machine_frames;
+        self.max_concurrent_actions = policy
+            .limits
+            .concurrent_tasks
+            .value()
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            })
+            .max(1);
+        self.scope = scope::ExecutionScope::with_cancellation(
+            Arc::clone(&policy),
+            Arc::clone(&budget),
+            self.cancellation.clone(),
+        );
+        self.budget = budget;
+        self.policy = policy;
+        self
     }
 
     /// Overrides the bounded worker count used by pooled concurrency actions.
@@ -941,11 +1198,21 @@ impl Evaluator {
         self.expression_thunk(self.program.root(), Arc::from([]))
     }
 
-    fn fork_with_cancellation(&self, cancellation: concurrency::CancellationToken) -> Self {
+    /// Returns a wakeable cancellation handle for embedding-controlled shutdown.
+    #[must_use]
+    pub fn cancellation_handle(&self) -> scope::CancellationToken {
+        self.cancellation.clone()
+    }
+
+    fn fork_with_scope(&self, scope: scope::ExecutionScope) -> Self {
+        let cancellation = scope.cancellation().clone();
         Self {
             program: Arc::clone(&self.program),
             evaluation_id: next_evaluation_id(),
             max_machine_frames: self.max_machine_frames,
+            policy: Arc::clone(&self.policy),
+            budget: Arc::clone(&self.budget),
+            scope,
             cancellation,
             max_concurrent_actions: self.max_concurrent_actions,
         }
@@ -953,6 +1220,10 @@ impl Evaluator {
 
     fn child_cancellation(&self) -> concurrency::CancellationToken {
         self.cancellation.child()
+    }
+
+    fn execution_scope(&self) -> &scope::ExecutionScope {
+        &self.scope
     }
 
     fn concurrent_action_limit(&self) -> usize {
@@ -969,6 +1240,7 @@ impl Evaluator {
 
     #[allow(clippy::unused_self)]
     fn expression_thunk(&self, node: CoreId, environment: Environment) -> ThunkRef {
+        let _budget = ActiveBudgetGuard::enter(&self.budget);
         Thunk::suspended(Suspension::Expression { node, environment })
     }
 
@@ -979,7 +1251,9 @@ impl Evaluator {
     /// Returns a runtime error for user failures, black holes, invalid verified
     /// invariants, or when the controlled evaluator stack limit is exceeded.
     pub fn force(&mut self, original: &ThunkRef) -> RuntimeResult<ValueRef> {
+        let budget = Arc::clone(&self.budget);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _budget = ActiveBudgetGuard::enter(&budget);
             self.run_machine(Control::Enter(Arc::clone(original)))
         }))
         .unwrap_or_else(|_| {
@@ -990,10 +1264,11 @@ impl Evaluator {
     }
 
     fn push_frame(&self, stack: &mut Vec<Frame>, frame: Frame) -> RuntimeResult<()> {
-        if stack.len() >= self.max_machine_frames {
+        if let Limit::At(maximum) = self.max_machine_frames
+            && stack.len() >= maximum
+        {
             return Err(RuntimeError::resource_limit(format!(
-                "evaluation exceeded the configured limit of {} machine frames",
-                self.max_machine_frames
+                "evaluation exceeded the configured limit of {maximum} machine frames"
             )));
         }
         stack.push(frame);
@@ -1003,6 +1278,8 @@ impl Evaluator {
     fn run_machine(&mut self, mut control: Control) -> RuntimeResult<ValueRef> {
         let mut stack = Vec::new();
         loop {
+            self.budget.charge_steps(1)?;
+            self.ensure_not_cancelled()?;
             match control {
                 Control::Raise(error) => return Self::unwind_machine(&mut stack, error),
                 Control::Return(ForceOutcome::Alias(target)) => {
@@ -1080,22 +1357,26 @@ impl Evaluator {
                         code: "H0902",
                         kind: RuntimeErrorKind::BlackHole,
                         message: "black hole while forcing a recursive thunk".into(),
+                        suppressed: Arc::from([]),
                     })));
                 }
                 ThunkState::Evaluating { owner } => {
                     let wait = register_wait(self.evaluation_id, *owner)?;
-                    state = current
+                    let (next_state, _) = current
                         .ready
-                        .wait(state)
+                        .wait_timeout(state, std::time::Duration::from_millis(10))
                         .map_err(|_| RuntimeError::internal("thunk mutex was poisoned"))?;
+                    state = next_state;
                     drop(wait);
                     drop(state);
+                    self.ensure_not_cancelled()?;
                 }
                 ThunkState::Suspended(_) => {
-                    if stack.len() >= self.max_machine_frames {
+                    if let Limit::At(maximum) = self.max_machine_frames
+                        && stack.len() >= maximum
+                    {
                         return Err(RuntimeError::resource_limit(format!(
-                            "evaluation exceeded the configured limit of {} machine frames",
-                            self.max_machine_frames
+                            "evaluation exceeded the configured limit of {maximum} machine frames"
                         )));
                     }
                     let old = std::mem::replace(
@@ -1128,10 +1409,13 @@ impl Evaluator {
                 self.push_frame(stack, Frame::Apply { argument })?;
                 Ok(Control::Enter(function))
             }
-            Suspension::Fix { function } => {
-                let recursive = Thunk::suspended(Suspension::Fix {
-                    function: Arc::clone(&function),
-                });
+            Suspension::Fix {
+                function,
+                recursive,
+            } => {
+                let recursive = recursive.upgrade().ok_or_else(|| {
+                    RuntimeError::internal("Function.fix recursive thunk was released")
+                })?;
                 self.push_frame(
                     stack,
                     Frame::Apply {
@@ -1944,9 +2228,7 @@ impl Evaluator {
                 function: Arc::clone(&arguments[0]),
                 argument: Arc::clone(&arguments[1]),
             }))),
-            "fix" => Ok(ForceOutcome::Alias(Thunk::suspended(Suspension::Fix {
-                function: Arc::clone(&arguments[0]),
-            }))),
+            "fix" => Ok(ForceOutcome::Alias(Thunk::fixed(Arc::clone(&arguments[0])))),
             "error" => Err(RuntimeError::user(self.force_text(&arguments[0])?)),
             "int_eq" => value(Value::Bool(
                 self.force_int(&arguments[0])? == self.force_int(&arguments[1])?,
@@ -2040,9 +2322,13 @@ impl Evaluator {
                 let number = self.force_double(&arguments[1])?;
                 let suffix = self.force_text(&arguments[2])?;
                 let rendered = if implementation == "double_show_e_float" {
-                    show_double_exponential(number, precision)?
+                    show_double_exponential(
+                        number,
+                        precision,
+                        self.policy.limits.numeric_precision,
+                    )?
                 } else {
-                    show_double_fixed(number, precision)?
+                    show_double_fixed(number, precision, self.policy.limits.numeric_precision)?
                 };
                 value(Value::Text(format!("{rendered}{suffix}").into()))
             }
@@ -2433,6 +2719,7 @@ impl Evaluator {
                                 error.utf8_error().valid_up_to()
                             )
                             .into(),
+                            suppressed: Arc::from([]),
                         })
                     })?;
                     Ok(Thunk::evaluated(Value::Text(text.into())))
@@ -2505,8 +2792,12 @@ impl Evaluator {
                     let path = evaluator.force_text(&path)?;
                     let mode = evaluator.force_file_mode(&mode)?;
                     let path = context.resolve_path("IO.openFile", &path)?;
-                    let handle = native_handle::FileHandle::open(&path, mode)
+                    let permit = context.budget.acquire_handle()?;
+                    let handle = native_handle::FileHandle::open(&path, mode, permit)
                         .map_err(|error| RuntimeContext::io_error("IO.openFile", error))?;
+                    evaluator
+                        .execution_scope()
+                        .register(ScopedFileResource(Arc::clone(&handle)))?;
                     Ok(Thunk::evaluated(Value::Handle(HostHandle::File {
                         handle,
                         close_after_process: false,
@@ -2546,12 +2837,19 @@ impl Evaluator {
                 let callback = Arc::clone(&arguments[1]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
                     context.require_filesystem("Temp.withSystemTempDirectory")?;
+                    let _permit = context.budget.acquire_temp_resource()?;
                     let template = evaluator.force_text(&template)?;
-                    let resource = native_temp::TempResource::create_directory(&template).map_err(
-                        |error| RuntimeContext::io_error("Temp.withSystemTempDirectory", error),
-                    )?;
-                    let path =
-                        path_to_text("Temp.withSystemTempDirectory", resource.path().to_owned())?;
+                    let resource = native_temp::TempResource::create_directory(
+                        &template,
+                        context.policy.cleanup.temp_create_retries,
+                        context.policy.cleanup.temp_delete_retries,
+                    )
+                    .map_err(|error| {
+                        RuntimeContext::io_error("Temp.withSystemTempDirectory", error)
+                    })?;
+                    let resource = ScopedTempResource::new(resource);
+                    evaluator.execution_scope().register(resource.clone())?;
+                    let path = path_to_text("Temp.withSystemTempDirectory", resource.path()?)?;
                     let applied = Thunk::suspended(Suspension::Apply {
                         function: Arc::clone(&callback),
                         argument: Thunk::evaluated(Value::Text(path)),
@@ -2562,13 +2860,7 @@ impl Evaluator {
                     let cleanup = resource.cleanup().map_err(|error| {
                         RuntimeContext::io_error("Temp.withSystemTempDirectory cleanup", error)
                     });
-                    match result {
-                        Err(error) => Err(error),
-                        Ok(value) => {
-                            cleanup?;
-                            Ok(value)
-                        }
-                    }
+                    finish_with_cleanup(result, [cleanup])
                 })))
             }
             "temp_with_file" => {
@@ -2576,12 +2868,24 @@ impl Evaluator {
                 let callback = Arc::clone(&arguments[1]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
                     context.require_filesystem("Temp.withSystemTempFile")?;
+                    let _permit = context.budget.acquire_temp_resource()?;
+                    let handle_permit = context.budget.acquire_handle()?;
                     let template = evaluator.force_text(&template)?;
-                    let (resource, handle) = native_temp::TempResource::create_file(&template)
-                        .map_err(|error| {
-                            RuntimeContext::io_error("Temp.withSystemTempFile", error)
-                        })?;
-                    let path = path_to_text("Temp.withSystemTempFile", resource.path().to_owned())?;
+                    let (resource, handle) = native_temp::TempResource::create_file(
+                        &template,
+                        context.policy.cleanup.temp_create_retries,
+                        context.policy.cleanup.temp_delete_retries,
+                    )
+                    .map_err(|error| RuntimeContext::io_error("Temp.withSystemTempFile", error))?;
+                    handle.attach_permit(handle_permit).map_err(|error| {
+                        RuntimeContext::io_error("Temp.withSystemTempFile", error)
+                    })?;
+                    evaluator
+                        .execution_scope()
+                        .register(ScopedFileResource(Arc::clone(&handle)))?;
+                    let resource = ScopedTempResource::new(resource);
+                    evaluator.execution_scope().register(resource.clone())?;
+                    let path = path_to_text("Temp.withSystemTempFile", resource.path()?)?;
                     let path_application = Thunk::suspended(Suspension::Apply {
                         function: Arc::clone(&callback),
                         argument: Thunk::evaluated(Value::Text(path)),
@@ -2602,14 +2906,7 @@ impl Evaluator {
                     let cleanup = resource.cleanup().map_err(|error| {
                         RuntimeContext::io_error("Temp.withSystemTempFile cleanup", error)
                     });
-                    match result {
-                        Err(error) => Err(error),
-                        Ok(value) => {
-                            close?;
-                            cleanup?;
-                            Ok(value)
-                        }
-                    }
+                    finish_with_cleanup(result, [close, cleanup])
                 })))
             }
             "process_null_stream" => value(Value::Handle(HostHandle::Null)),
@@ -2652,10 +2949,17 @@ impl Evaluator {
                             "byte count must be non-negative",
                         )
                     })?;
-                    if amount > 64 * 1024 * 1024 {
-                        return Err(RuntimeError::resource_limit(
-                            "ByteString.hGet exceeds the 64 MiB per-read limit",
-                        ));
+                    if context
+                        .policy
+                        .limits
+                        .handle_read_bytes
+                        .value()
+                        .is_some_and(|limit| u64::try_from(amount).unwrap_or(u64::MAX) > limit)
+                    {
+                        return Err(RuntimeError::resource_limit(format!(
+                            "ByteString.hGet exceeds the configured per-read limit of {:?} bytes",
+                            context.policy.limits.handle_read_bytes.value()
+                        )));
                     }
                     let mut bytes = Vec::with_capacity(amount);
                     match handle {
@@ -2768,9 +3072,14 @@ impl Evaluator {
                 let checked = implementation == "process_run_checked";
                 value(Value::Io(IoAction::new(move |evaluator, context| {
                     let process = evaluator.force_process(&process)?;
-                    let output =
-                        run_child_process(process.as_ref(), context, "Process.runProcess")?;
-                    forward_process_output(process.as_ref(), context, &output)?;
+                    let output = run_child_process(
+                        process.as_ref(),
+                        context,
+                        "Process.runProcess",
+                        false,
+                        &evaluator.cancellation,
+                        evaluator.execution_scope(),
+                    )?;
                     if checked {
                         ensure_process_success(process.as_ref(), &output)?;
                         Ok(Thunk::evaluated(Value::Unit))
@@ -2789,7 +3098,14 @@ impl Evaluator {
                 let implementation = implementation.to_owned();
                 value(Value::Io(IoAction::new(move |evaluator, context| {
                     let process = evaluator.force_process(&process)?;
-                    let output = run_child_process(process.as_ref(), context, "readProcess")?;
+                    let output = run_child_process(
+                        process.as_ref(),
+                        context,
+                        "readProcess",
+                        true,
+                        &evaluator.cancellation,
+                        evaluator.execution_scope(),
+                    )?;
                     if implementation.contains("checked") {
                         ensure_process_success(process.as_ref(), &output)?;
                     }
@@ -3018,6 +3334,7 @@ impl Evaluator {
             "exit_die" => {
                 let message = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
+                    context.require_exit_process("Exit.die")?;
                     let message = evaluator.force_text(&message)?;
                     context.write_stderr(message.as_bytes())?;
                     context.write_stderr(b"\n")?;
@@ -3026,7 +3343,8 @@ impl Evaluator {
             }
             "exit_with" => {
                 let exit = Arc::clone(&arguments[0]);
-                value(Value::Io(IoAction::new(move |evaluator, _| {
+                value(Value::Io(IoAction::new(move |evaluator, context| {
+                    context.require_exit_process("Exit.exitWith")?;
                     let exit = evaluator.force(&exit)?;
                     let Value::PrimitiveVariant(exit) = exit.as_ref() else {
                         return Err(RuntimeError::internal(
@@ -3092,13 +3410,24 @@ impl Evaluator {
             }
             "json_encode" => {
                 let mut output = String::new();
-                self.encode_json(&arguments[0], &mut output, 0)?;
+                self.encode_json(&arguments[0], &mut output)?;
                 value(Value::ByteString(Arc::from(output.into_bytes())))
             }
             "json_decode" => {
                 let bytes = self.force_bytes(&arguments[0])?;
-                let decoded = native_json::parse(&bytes)
-                    .map(json_node_value)
+                let max_depth = self
+                    .policy
+                    .limits
+                    .json_depth
+                    .value()
+                    .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+                let max_nodes = self.policy.limits.json_nodes.value();
+                let decoded = native_json::parse_with_limits(&bytes, max_depth, max_nodes)
+                    .map(JsonDocument::from_node)
+                    .map(|document| {
+                        let root = document.root();
+                        Value::JsonDocument(Arc::new(document), root)
+                    })
                     .map(Thunk::evaluated);
                 value(Value::Maybe(decoded))
             }
@@ -3134,16 +3463,17 @@ impl Evaluator {
                 })))
             }
             "environment_get_args" => value(Value::Io(IoAction::new(|_, context| {
-                let elements: Vec<_> = context
-                    .args
-                    .iter()
-                    .map(|arg| Thunk::evaluated(Value::Text(Arc::clone(arg))))
+                let elements = context
+                    .text_args("Environment.getArgs")?
+                    .into_iter()
+                    .map(|argument| Thunk::evaluated(Value::Text(argument)))
                     .collect();
                 Ok(list_from_values(elements))
             }))),
             "environment_get_env" => {
                 let name = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
+                    context.require_environment_read("Environment.getEnv")?;
                     let name = evaluator.force_text(&name)?;
                     let value = context
                         .environment
@@ -3155,12 +3485,14 @@ impl Evaluator {
                                 code: "H0903",
                                 kind: RuntimeErrorKind::Io,
                                 message: format!("environment variable `{name}` is not set").into(),
+                                suppressed: Arc::from([]),
                             })
                         })?;
                     Ok(Thunk::evaluated(Value::Text(value)))
                 })))
             }
             "environment_get_environment" => value(Value::Io(IoAction::new(|_, context| {
+                context.require_environment_read("Environment.getEnvironment")?;
                 let entries = context
                     .environment
                     .iter()
@@ -3190,18 +3522,19 @@ impl Evaluator {
             }))),
             "directory_get_home" => value(Value::Io(IoAction::new(|_, context| {
                 context.require_filesystem("Directory.getHomeDirectory")?;
-                let home = context
-                    .environment
-                    .iter()
-                    .find(|(name, _)| name.as_ref() == "HOME")
-                    .map(|(_, value)| Arc::clone(value))
-                    .ok_or_else(|| {
-                        RuntimeContext::io_error(
-                            "Directory.getHomeDirectory",
-                            std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"),
-                        )
-                    })?;
-                Ok(Thunk::evaluated(Value::Text(home)))
+                let home = context.host_services.home_directory().ok_or_else(|| {
+                    RuntimeContext::io_error(
+                        "Directory.getHomeDirectory",
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "platform home directory is unavailable",
+                        ),
+                    )
+                })?;
+                Ok(Thunk::evaluated(Value::Text(path_to_text(
+                    "Directory.getHomeDirectory",
+                    home,
+                )?)))
             }))),
             "directory_copy_file" | "directory_rename_file" => {
                 let source = Arc::clone(&arguments[0]);
@@ -3406,6 +3739,12 @@ impl Evaluator {
         handlers: &[ThunkRef],
     ) -> RuntimeResult<ForceOutcome> {
         let value = self.force(scrutinee)?;
+        if family == PrimitiveFamily::Json
+            && let Value::JsonDocument(document, index) = value.as_ref()
+        {
+            let materialized = Thunk::evaluated(json_document_value(document, *index)?);
+            return self.eliminate_primitive(&materialized, family, handlers);
+        }
         let Value::PrimitiveVariant(variant) = value.as_ref() else {
             return Err(RuntimeError::internal(
                 "primitive eliminator received a non-primitive variant",
@@ -3421,87 +3760,150 @@ impl Evaluator {
             .ok_or_else(|| RuntimeError::internal("primitive constructor is out of bounds"))?;
         let mut selected = Arc::clone(handler);
         for payload in variant.payloads.iter() {
+            let payload = if family == PrimitiveFamily::Json && variant.constructor_index == 3 {
+                match self.force(payload)?.as_ref() {
+                    Value::JsonNumber(number) => Thunk::evaluated(Value::Double(number.to_f64())),
+                    Value::Double(_) => Arc::clone(payload),
+                    _ => {
+                        return Err(RuntimeError::internal(
+                            "Json.Number payload is neither exact decimal nor Double",
+                        ));
+                    }
+                }
+            } else {
+                Arc::clone(payload)
+            };
             selected = Thunk::suspended(Suspension::Apply {
                 function: selected,
-                argument: Arc::clone(payload),
+                argument: payload,
             });
         }
         Ok(ForceOutcome::Alias(selected))
     }
 
-    fn encode_json(
-        &mut self,
-        thunk: &ThunkRef,
-        output: &mut String,
-        depth: usize,
-    ) -> RuntimeResult<()> {
-        if depth > 512 {
-            return Err(RuntimeError::resource_limit(
-                "JSON encoding exceeds the 512-level nesting limit",
-            ));
+    #[allow(clippy::too_many_lines)]
+    fn encode_json(&mut self, thunk: &ThunkRef, output: &mut String) -> RuntimeResult<()> {
+        enum Task {
+            Value(ThunkRef, usize),
+            ObjectKey(ThunkRef),
+            Raw(&'static str),
         }
-        let value = self.force(thunk)?;
-        let Value::PrimitiveVariant(value) = value.as_ref() else {
-            return Err(RuntimeError::internal("Json.encode received a non-Value"));
-        };
-        if value.family != PrimitiveFamily::Json {
-            return Err(RuntimeError::internal(
-                "Json.encode received the wrong primitive family",
-            ));
-        }
-        match (value.constructor_index, value.payloads.as_ref()) {
-            (0, []) => output.push_str("null"),
-            (1, [payload]) => output.push_str(if self.force_bool(payload)? {
-                "true"
-            } else {
-                "false"
-            }),
-            (2, [payload]) => {
-                native_json::push_string(output, &self.force_text(payload)?);
-            }
-            (3, [payload]) => {
-                let number = self.force_double(payload)?;
-                if !number.is_finite() {
-                    return Err(RuntimeError::user(
-                        "Json.encode cannot encode NaN or an infinite number",
-                    ));
+
+        let mut tasks = vec![Task::Value(Arc::clone(thunk), 0)];
+        while let Some(task) = tasks.pop() {
+            self.ensure_not_cancelled()?;
+            match task {
+                Task::Raw(text) => output.push_str(text),
+                Task::ObjectKey(key) => {
+                    native_json::push_string(output, &self.force_text(&key)?);
                 }
-                output.push_str(&number.to_string());
-            }
-            (4, [payload]) => {
-                let payload = self.force(payload)?;
-                let Value::Vector(values) = payload.as_ref() else {
-                    return Err(RuntimeError::internal("Json.Array payload is not a Vector"));
-                };
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
+                Task::Value(thunk, depth) => {
+                    if self
+                        .policy
+                        .limits
+                        .json_depth
+                        .value()
+                        .is_some_and(|maximum| {
+                            usize::try_from(maximum).is_ok_and(|maximum| depth > maximum)
+                        })
+                    {
+                        return Err(RuntimeError::resource_limit(format!(
+                            "JSON encoding exceeds the configured nesting limit {:?}",
+                            self.policy.limits.json_depth.value()
+                        )));
                     }
-                    self.encode_json(value, output, depth + 1)?;
-                }
-                output.push(']');
-            }
-            (5, [payload]) => {
-                let payload = self.force(payload)?;
-                let Value::Map(entries) = payload.as_ref() else {
-                    return Err(RuntimeError::internal("Json.Object payload is not a Map"));
-                };
-                output.push('{');
-                for (index, (key, value)) in entries.iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
+                    let value = self.force(&thunk)?;
+                    if let Value::JsonDocument(document, index) = value.as_ref() {
+                        tasks.push(Task::Value(
+                            Thunk::evaluated(json_document_value(document, *index)?),
+                            depth,
+                        ));
+                        continue;
                     }
-                    native_json::push_string(output, &self.force_text(key)?);
-                    output.push(':');
-                    self.encode_json(value, output, depth + 1)?;
+                    let Value::PrimitiveVariant(value) = value.as_ref() else {
+                        return Err(RuntimeError::internal("Json.encode received a non-Value"));
+                    };
+                    if value.family != PrimitiveFamily::Json {
+                        return Err(RuntimeError::internal(
+                            "Json.encode received the wrong primitive family",
+                        ));
+                    }
+                    match (value.constructor_index, value.payloads.as_ref()) {
+                        (0, []) => output.push_str("null"),
+                        (1, [payload]) => output.push_str(if self.force_bool(payload)? {
+                            "true"
+                        } else {
+                            "false"
+                        }),
+                        (2, [payload]) => {
+                            native_json::push_string(output, &self.force_text(payload)?);
+                        }
+                        (3, [payload]) => {
+                            let payload = self.force(payload)?;
+                            match payload.as_ref() {
+                                Value::JsonNumber(number) => number.push_json(output),
+                                Value::Double(number) if number.is_nan() => output.push_str("null"),
+                                Value::Double(number) if number.is_infinite() => {
+                                    output.push_str(if number.is_sign_negative() {
+                                        "\"-inf\""
+                                    } else {
+                                        "\"+inf\""
+                                    });
+                                }
+                                Value::Double(number)
+                                    if number.classify() == std::num::FpCategory::Zero =>
+                                {
+                                    output.push('0');
+                                }
+                                Value::Double(number) => output.push_str(&number.to_string()),
+                                _ => {
+                                    return Err(RuntimeError::internal(
+                                        "Json.Number payload is neither exact decimal nor Double",
+                                    ));
+                                }
+                            }
+                        }
+                        (4, [payload]) => {
+                            let payload = self.force(payload)?;
+                            let Value::Vector(values) = payload.as_ref() else {
+                                return Err(RuntimeError::internal(
+                                    "Json.Array payload is not a Vector",
+                                ));
+                            };
+                            output.push('[');
+                            tasks.push(Task::Raw("]"));
+                            for (index, value) in values.iter().enumerate().rev() {
+                                tasks.push(Task::Value(Arc::clone(value), depth + 1));
+                                if index != 0 {
+                                    tasks.push(Task::Raw(","));
+                                }
+                            }
+                        }
+                        (5, [payload]) => {
+                            let payload = self.force(payload)?;
+                            let Value::Map(entries) = payload.as_ref() else {
+                                return Err(RuntimeError::internal(
+                                    "Json.Object payload is not a Map",
+                                ));
+                            };
+                            output.push('{');
+                            tasks.push(Task::Raw("}"));
+                            for (index, (key, value)) in entries.iter().enumerate().rev() {
+                                tasks.push(Task::Value(Arc::clone(value), depth + 1));
+                                tasks.push(Task::Raw(":"));
+                                tasks.push(Task::ObjectKey(Arc::clone(key)));
+                                if index != 0 {
+                                    tasks.push(Task::Raw(","));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(RuntimeError::internal(
+                                "Json.encode received a malformed constructor payload",
+                            ));
+                        }
+                    }
                 }
-                output.push('}');
-            }
-            _ => {
-                return Err(RuntimeError::internal(
-                    "Json.encode received a malformed constructor payload",
-                ));
             }
         }
         Ok(())
@@ -3582,6 +3984,8 @@ impl Evaluator {
             match self.force(&list)?.as_ref() {
                 Value::List(ListCell::Nil) => return Ok(elements),
                 Value::List(ListCell::Cons { head, tail }) => {
+                    self.budget.charge_materialization(1)?;
+                    self.ensure_not_cancelled()?;
                     elements.push(Arc::clone(head));
                     list = Arc::clone(tail);
                 }
@@ -3651,6 +4055,11 @@ impl Evaluator {
             Value::Int(value) => Ok(value.to_string()),
             Value::Integer(value) => Ok(value.to_string()),
             Value::Double(value) => Ok(show_double(*value)),
+            Value::JsonNumber(value) => Ok(value.as_json().to_owned()),
+            Value::JsonDocument(document, index) => self.show_value_at(
+                &Thunk::evaluated(json_document_value(document, *index)?),
+                precedence,
+            ),
             Value::Character(value) => Ok(format!("{value:?}")),
             Value::Builder(value) | Value::ByteString(value) => Ok(format!("{value:?}")),
             Value::CaseInsensitive(value) => self.show_value_at(&value.original, precedence),
@@ -3811,6 +4220,15 @@ impl Evaluator {
             (Value::Int(left), Value::Int(right)) => Ok(left == right),
             (Value::Integer(left), Value::Integer(right)) => Ok(left == right),
             (Value::Double(left), Value::Double(right)) => Ok(left == right),
+            (Value::JsonNumber(left), Value::JsonNumber(right)) => Ok(left == right),
+            (Value::JsonDocument(document, index), _) => self.equal_values(
+                &Thunk::evaluated(json_document_value(document, *index)?),
+                &Thunk::evaluated(right.as_ref().clone()),
+            ),
+            (_, Value::JsonDocument(document, index)) => self.equal_values(
+                &Thunk::evaluated(left.as_ref().clone()),
+                &Thunk::evaluated(json_document_value(document, *index)?),
+            ),
             (Value::Character(left), Value::Character(right)) => Ok(left == right),
             (Value::Builder(left), Value::Builder(right))
             | (Value::ByteString(left), Value::ByteString(right)) => Ok(left == right),
@@ -3873,7 +4291,18 @@ impl Evaluator {
             (Value::PrimitiveVariant(left), Value::PrimitiveVariant(right)) => {
                 self.equal_primitive_variants(left, right)
             }
-            (Value::Vector(left), Value::Vector(right)) | (Value::Set(left), Value::Set(right)) => {
+            (Value::Vector(left), Value::Vector(right)) => {
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for (left, right) in left.iter().zip(right.iter()) {
+                    if !self.equal_values(left, right)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Value::Set(left), Value::Set(right)) => {
                 if left.len() != right.len() {
                     return Ok(false);
                 }
@@ -4019,7 +4448,7 @@ impl Evaluator {
                 }
                 Ok(false)
             }
-            (Value::Set(left), Value::Set(right)) => self.less_ordered_slices(left, right),
+            (Value::Set(left), Value::Set(right)) => self.less_ordered_sets(left, right),
             (Value::List(_), Value::List(_)) => {
                 let mut left = Thunk::evaluated(left.as_ref().clone());
                 let mut right = Thunk::evaluated(right.as_ref().clone());
@@ -4075,6 +4504,12 @@ impl Evaluator {
         }
         Ok(left.len() < right.len())
     }
+
+    fn less_ordered_sets(&mut self, left: &OrderedSet, right: &OrderedSet) -> RuntimeResult<bool> {
+        let left = left.iter().cloned().collect::<Vec<_>>();
+        let right = right.iter().cloned().collect::<Vec<_>>();
+        self.less_ordered_slices(&left, &right)
+    }
 }
 
 fn parenthesize_application(rendered: String, precedence: u8) -> String {
@@ -4098,42 +4533,109 @@ fn list_from_values(mut values: Vec<ThunkRef>) -> ThunkRef {
     result
 }
 
-fn json_node_value(node: native_json::JsonNode) -> Value {
-    let (constructor_index, payloads): (u8, Arc<[ThunkRef]>) = match node {
-        native_json::JsonNode::Null => (0, Arc::from([])),
-        native_json::JsonNode::Bool(value) => {
-            (1, Arc::from([Thunk::evaluated(Value::Bool(value))]))
+fn finish_with_cleanup<T>(
+    body: RuntimeResult<T>,
+    cleanup: impl IntoIterator<Item = RuntimeResult<()>>,
+) -> RuntimeResult<T> {
+    let cleanup_errors = cleanup
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    match body {
+        Ok(value) => {
+            let Some((primary, suppressed)) = cleanup_errors.split_first() else {
+                return Ok(value);
+            };
+            Err(error_with_suppressed(primary, suppressed.iter().cloned()))
         }
-        native_json::JsonNode::String(value) => {
-            (2, Arc::from([Thunk::evaluated(Value::Text(value.into()))]))
+        Err(primary) if cleanup_errors.is_empty() => Err(primary),
+        Err(primary) => Err(error_with_suppressed(&primary, cleanup_errors)),
+    }
+}
+
+#[cfg(test)]
+mod capability_policy_tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_denies_environment_clock_and_process_exit_capabilities() {
+        let mut policy = RuntimePolicy::sandboxed();
+        policy.capabilities.clock = false;
+        let context = RuntimeContext::new(Vec::new(), Vec::new()).with_policy(policy);
+        assert!(
+            context
+                .require_environment_read("Environment.getEnvironment")
+                .is_err()
+        );
+        assert!(context.current_time().is_err());
+        assert!(context.require_exit_process("Exit.exitWith").is_err());
+        assert!(context.require_network("Http.run").is_ok());
+        assert!(!context.policy.capabilities.network_external);
+    }
+}
+
+fn error_with_suppressed(
+    primary: &Arc<RuntimeError>,
+    additional: impl IntoIterator<Item = Arc<RuntimeError>>,
+) -> Arc<RuntimeError> {
+    let mut suppressed = primary.suppressed.to_vec();
+    suppressed.extend(additional);
+    Arc::new(RuntimeError {
+        code: primary.code,
+        kind: primary.kind.clone(),
+        message: Arc::clone(&primary.message),
+        suppressed: suppressed.into(),
+    })
+}
+
+fn json_document_value(document: &Arc<JsonDocument>, index: usize) -> RuntimeResult<Value> {
+    let node = document
+        .node(index)
+        .ok_or_else(|| RuntimeError::internal("decoded JSON node index is out of bounds"))?;
+    Ok(match node {
+        native_json::JsonDocumentNode::Null => json_primitive_value(0, Arc::from([])),
+        native_json::JsonDocumentNode::Bool(value) => {
+            json_primitive_value(1, Arc::from([Thunk::evaluated(Value::Bool(*value))]))
         }
-        native_json::JsonNode::Number(value) => {
-            (3, Arc::from([Thunk::evaluated(Value::Double(value))]))
-        }
-        native_json::JsonNode::Array(values) => {
-            let values = values
-                .into_iter()
-                .map(json_node_value)
-                .map(Thunk::evaluated)
+        native_json::JsonDocumentNode::String(value) => json_primitive_value(
+            2,
+            Arc::from([Thunk::evaluated(Value::Text(value.clone().into()))]),
+        ),
+        native_json::JsonDocumentNode::Number(value) => json_primitive_value(
+            3,
+            Arc::from([Thunk::evaluated(Value::JsonNumber(value.clone()))]),
+        ),
+        native_json::JsonDocumentNode::Array(children) => {
+            let children = children
+                .iter()
+                .map(|index| Thunk::evaluated(Value::JsonDocument(Arc::clone(document), *index)))
                 .collect::<Vec<_>>();
-            (
+            json_primitive_value(
                 4,
-                Arc::from([Thunk::evaluated(Value::Vector(values.into()))]),
+                Arc::from([Thunk::evaluated(Value::Vector(children.into()))]),
             )
         }
-        native_json::JsonNode::Object(values) => {
-            let entries = values
-                .into_iter()
-                .map(|(key, value)| {
+        native_json::JsonDocumentNode::Object(entries) => {
+            let entries = entries
+                .iter()
+                .map(|(key, index)| {
                     (
-                        Thunk::evaluated(Value::Text(key.into())),
-                        Thunk::evaluated(json_node_value(value)),
+                        Thunk::evaluated(Value::Text(key.clone().into())),
+                        Thunk::evaluated(Value::JsonDocument(Arc::clone(document), *index)),
                     )
                 })
                 .collect::<Vec<_>>();
-            (5, Arc::from([Thunk::evaluated(Value::Map(entries.into()))]))
+            json_primitive_value(
+                5,
+                Arc::from([Thunk::evaluated(Value::Map(Arc::new(
+                    OrderedMap::from_sorted(&entries),
+                )))]),
+            )
         }
-    };
+    })
+}
+
+fn json_primitive_value(constructor_index: u8, payloads: Arc<[ThunkRef]>) -> Value {
     Value::PrimitiveVariant(PrimitiveVariantValue {
         family: PrimitiveFamily::Json,
         constructor_index,
@@ -4153,12 +4655,147 @@ fn path_to_text(operation: &'static str, path: PathBuf) -> RuntimeResult<Arc<str
         })
 }
 
+struct ScopedFileResource(Arc<native_handle::FileHandle>);
+
+impl scope::ScopedResource for ScopedFileResource {
+    fn kind(&self) -> scope::ResourceKind {
+        scope::ResourceKind::Handle
+    }
+
+    fn request_cancel(&self, _reason: &scope::CancelReason) {
+        let _ignored = self.0.close();
+    }
+
+    fn close(&self) -> RuntimeResult<()> {
+        self.0
+            .close()
+            .map_err(|error| RuntimeContext::io_error("scoped handle cleanup", error))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+struct ScopedProcessResource(Mutex<Option<SupervisedChild>>);
+
+impl ScopedProcessResource {
+    fn new(child: SupervisedChild) -> Self {
+        Self(Mutex::new(Some(child)))
+    }
+
+    fn take_stdin(&self) -> Option<std::process::ChildStdin> {
+        self.0.lock().ok()?.as_mut()?.take_stdin()
+    }
+
+    fn take_stdout(&self) -> Option<std::process::ChildStdout> {
+        self.0.lock().ok()?.as_mut()?.take_stdout()
+    }
+
+    fn take_stderr(&self) -> Option<std::process::ChildStderr> {
+        self.0.lock().ok()?.as_mut()?.take_stderr()
+    }
+
+    fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("process-resource mutex was poisoned"))?
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("process tree is closed"))?
+            .try_wait()
+    }
+
+    fn terminate(&self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("process-resource mutex was poisoned"))?
+            .take()
+            .ok_or_else(|| std::io::Error::other("process tree is closed"))?;
+        child.terminate().map(|(status, _)| status)
+    }
+}
+
+#[derive(Clone)]
+struct ScopedTempResource(Arc<Mutex<Option<native_temp::TempResource>>>);
+
+impl ScopedTempResource {
+    fn new(resource: native_temp::TempResource) -> Self {
+        Self(Arc::new(Mutex::new(Some(resource))))
+    }
+
+    fn path(&self) -> RuntimeResult<PathBuf> {
+        self.0
+            .lock()
+            .map_err(|_| RuntimeError::internal("temporary-resource mutex was poisoned"))?
+            .as_ref()
+            .map(|resource| resource.path().to_owned())
+            .ok_or_else(|| RuntimeError::resource_closed("temporary resource is closed"))
+    }
+
+    fn cleanup(&self) -> std::io::Result<()> {
+        let resource = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("temporary-resource mutex was poisoned"))?
+            .take();
+        resource.map_or(Ok(()), native_temp::TempResource::cleanup)
+    }
+}
+
+impl scope::ScopedResource for ScopedTempResource {
+    fn kind(&self) -> scope::ResourceKind {
+        scope::ResourceKind::Temporary
+    }
+
+    fn request_cancel(&self, _reason: &scope::CancelReason) {
+        let _ignored = self.cleanup();
+    }
+
+    fn close(&self) -> RuntimeResult<()> {
+        self.cleanup()
+            .map_err(|error| RuntimeContext::io_error("scoped temporary cleanup", error))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.lock().map_or(true, |resource| resource.is_none())
+    }
+}
+
+impl scope::ScopedResource for ScopedProcessResource {
+    fn kind(&self) -> scope::ResourceKind {
+        scope::ResourceKind::Process
+    }
+
+    fn request_cancel(&self, _reason: &scope::CancelReason) {
+        let _ignored = self.terminate();
+    }
+
+    fn close(&self) -> RuntimeResult<()> {
+        if self.is_closed() {
+            return Ok(());
+        }
+        self.terminate()
+            .map(|_| ())
+            .map_err(|error| RuntimeContext::io_error("scoped process cleanup", error))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.lock().map_or(true, |child| child.is_none())
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_child_process(
     process: &ProcessSpec,
     context: &RuntimeContext,
     operation: &'static str,
+    capture: bool,
+    cancellation: &concurrency::CancellationToken,
+    execution_scope: &scope::ExecutionScope,
 ) -> RuntimeResult<Output> {
     context.require_process(operation)?;
+    let _permit = context.budget.acquire_process()?;
     validate_process_streams(process)?;
 
     let mut command = Command::new(process.command.as_ref());
@@ -4187,28 +4824,109 @@ fn run_child_process(
         command.stdin(match &process.stdin {
             HostHandle::Stdin => Stdio::inherit(),
             HostHandle::Null => Stdio::null(),
-            HostHandle::Stdout | HostHandle::Stderr | HostHandle::File { .. } => {
+            HostHandle::File { handle, .. } => Stdio::from(
+                handle
+                    .try_clone_file()
+                    .map_err(|error| RuntimeContext::io_error(operation, error))?,
+            ),
+            HostHandle::Stdout | HostHandle::Stderr => {
                 return Err(RuntimeError::internal(
                     "process stdin handle redirection is not available for this handle",
                 ));
             }
         });
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| RuntimeContext::io_error(operation, error))?;
-    if let Some(input) = &process.stdin_bytes {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            RuntimeError::internal("piped child stdin was unavailable after spawn")
-        })?;
-        stdin
-            .write_all(input)
-            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+    if capture {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    } else {
+        command
+            .stdout(process_output_stdio(&process.stdout, true, operation)?)
+            .stderr(process_output_stdio(&process.stderr, false, operation)?);
     }
-    child
-        .wait_with_output()
-        .map_err(|error| RuntimeContext::io_error(operation, error))
+    let body = (|| {
+        let child = SupervisedChild::spawn(&mut command)
+            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+        let child = execution_scope.register(ScopedProcessResource::new(child))?;
+
+        let stdout = child.resource().take_stdout().map(|stdout| {
+            let context = context.clone();
+            let target = process.stdout.clone();
+            let limit = context.policy.limits.process_capture_bytes;
+            std::thread::spawn(move || {
+                if capture {
+                    read_process_capture(stdout, limit)
+                } else {
+                    forward_process_reader(stdout, &target, &context).map(|()| Vec::new())
+                }
+            })
+        });
+        let stderr = child.resource().take_stderr().map(|stderr| {
+            let context = context.clone();
+            let target = process.stderr.clone();
+            let limit = context.policy.limits.process_capture_bytes;
+            std::thread::spawn(move || {
+                if capture {
+                    read_process_capture(stderr, limit)
+                } else {
+                    forward_process_reader(stderr, &target, &context).map(|()| Vec::new())
+                }
+            })
+        });
+        let stdin_writer = if let Some(input) = &process.stdin_bytes {
+            let mut stdin = child.resource().take_stdin().ok_or_else(|| {
+                RuntimeError::internal("piped child stdin was unavailable after spawn")
+            })?;
+            let input = Arc::clone(input);
+            Some(std::thread::spawn(move || {
+                stdin
+                    .write_all(&input)
+                    .map_err(|error| RuntimeContext::io_error(operation, error))
+            }))
+        } else {
+            None
+        };
+        let mut was_cancelled = false;
+        let status = loop {
+            if cancellation.wait_timeout(std::time::Duration::from_millis(2)) {
+                was_cancelled = true;
+                let status = child
+                    .resource()
+                    .terminate()
+                    .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                break status;
+            }
+            if let Some(status) = child
+                .resource()
+                .try_wait()
+                .map_err(|error| RuntimeContext::io_error(operation, error))?
+            {
+                // A descendant can inherit a capture pipe and outlive the process
+                // leader. Close the scoped process tree before joining pipe
+                // readers so a detached descendant cannot hang the evaluator.
+                child
+                    .resource()
+                    .terminate()
+                    .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                break status;
+            }
+        };
+        let stdout = join_process_reader(stdout, operation)?;
+        let stderr = join_process_reader(stderr, operation)?;
+        if let Some(writer) = stdin_writer {
+            writer
+                .join()
+                .map_err(|_| RuntimeError::panic_contained("process stdin writer panicked"))??;
+        }
+        if was_cancelled {
+            return Err(RuntimeError::cancelled());
+        }
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })();
+    finish_with_cleanup(body, [close_process_handles(process, operation)])
 }
 
 fn validate_process_streams(process: &ProcessSpec) -> RuntimeResult<()> {
@@ -4220,21 +4938,18 @@ fn validate_process_streams(process: &ProcessSpec) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn forward_process_output(
-    process: &ProcessSpec,
-    context: &RuntimeContext,
-    output: &Output,
-) -> RuntimeResult<()> {
-    forward_process_stream(&process.stdout, context, &output.stdout)?;
-    forward_process_stream(&process.stderr, context, &output.stderr)?;
+fn close_process_handles(process: &ProcessSpec, operation: &'static str) -> RuntimeResult<()> {
+    let mut cleanup = Vec::new();
     if let HostHandle::File {
         handle,
         close_after_process: true,
     } = &process.stdout
     {
-        handle
-            .close()
-            .map_err(|error| RuntimeContext::io_error("Process.setStdout", error))?;
+        cleanup.push(
+            handle
+                .close()
+                .map_err(|error| RuntimeContext::io_error(operation, error)),
+        );
     }
     if let HostHandle::File {
         handle,
@@ -4249,29 +4964,99 @@ fn forward_process_output(
             } if Arc::ptr_eq(stdout, handle)
         );
         if !already_closed {
-            handle
-                .close()
-                .map_err(|error| RuntimeContext::io_error("Process.setStderr", error))?;
+            cleanup.push(
+                handle
+                    .close()
+                    .map_err(|error| RuntimeContext::io_error(operation, error)),
+            );
         }
     }
-    Ok(())
+    finish_with_cleanup(Ok(()), cleanup)
 }
 
-fn forward_process_stream(
+fn process_output_stdio(
+    stream: &HostHandle,
+    is_stdout: bool,
+    operation: &'static str,
+) -> RuntimeResult<Stdio> {
+    match stream {
+        HostHandle::Stdout if is_stdout => Ok(Stdio::inherit()),
+        HostHandle::Stderr if !is_stdout => Ok(Stdio::inherit()),
+        HostHandle::Stdout | HostHandle::Stderr => Ok(Stdio::piped()),
+        HostHandle::Null => Ok(Stdio::null()),
+        HostHandle::File { handle, .. } => handle
+            .try_clone_file()
+            .map(Stdio::from)
+            .map_err(|error| RuntimeContext::io_error(operation, error)),
+        HostHandle::Stdin => Err(RuntimeError::internal(
+            "process output was configured with the standard-input handle",
+        )),
+    }
+}
+
+fn forward_process_reader(
+    mut reader: impl Read,
     stream: &HostHandle,
     context: &RuntimeContext,
-    bytes: &[u8],
 ) -> RuntimeResult<()> {
-    match stream {
-        HostHandle::Stdout => context.write(bytes)?,
-        HostHandle::Stderr => context.write_stderr(bytes)?,
-        HostHandle::Null => {}
-        HostHandle::Stdin => unreachable!("process streams validated"),
-        HostHandle::File { handle, .. } => handle
-            .write_all(bytes)
-            .map_err(|error| RuntimeContext::io_error("Process output", error))?,
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| RuntimeContext::io_error("Process output", error))?;
+        if read == 0 {
+            return Ok(());
+        }
+        match stream {
+            HostHandle::Stdout => context.write(&buffer[..read])?,
+            HostHandle::Stderr => context.write_stderr(&buffer[..read])?,
+            HostHandle::Null | HostHandle::File { .. } => {}
+            HostHandle::Stdin => unreachable!("process streams validated"),
+        }
     }
-    Ok(())
+}
+
+fn read_process_capture(mut reader: impl Read, limit: Limit<u64>) -> RuntimeResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut exceeded = false;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| RuntimeContext::io_error("readProcess", error))?;
+        if read == 0 {
+            break;
+        }
+        let next = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if limit.value().is_some_and(|maximum| next > maximum) {
+            exceeded = true;
+        } else if !exceeded {
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
+    if exceeded {
+        Err(RuntimeError::resource_limit(
+            "readProcess output exceeded the configured capture budget",
+        ))
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn join_process_reader(
+    reader: Option<std::thread::JoinHandle<RuntimeResult<Vec<u8>>>>,
+    operation: &'static str,
+) -> RuntimeResult<Vec<u8>> {
+    reader.map_or_else(
+        || Ok(Vec::new()),
+        |reader| {
+            reader
+                .join()
+                .map_err(|_| RuntimeError::panic_contained(operation))?
+        },
+    )
 }
 
 fn ensure_process_success(process: &ProcessSpec, output: &Output) -> RuntimeResult<()> {
@@ -4368,24 +5153,32 @@ fn show_double(value: f64) -> String {
     rendered
 }
 
-fn checked_precision(precision: i64) -> RuntimeResult<usize> {
+fn checked_precision(precision: i64, limit: Limit<u32>) -> RuntimeResult<usize> {
     let precision = precision.max(0);
-    if precision > 1_000 {
-        return Err(RuntimeError::resource_limit(
-            "floating-point output precision exceeds 1000 digits",
-        ));
+    if limit
+        .value()
+        .is_some_and(|maximum| u64::try_from(precision).unwrap_or(u64::MAX) > u64::from(maximum))
+    {
+        return Err(RuntimeError::resource_limit(format!(
+            "floating-point output precision exceeds the configured limit {:?}",
+            limit.value()
+        )));
     }
     usize::try_from(precision)
         .map_err(|_| RuntimeError::resource_limit("floating-point precision is out of range"))
 }
 
-fn show_double_exponential(value: f64, precision: Option<i64>) -> RuntimeResult<String> {
+fn show_double_exponential(
+    value: f64,
+    precision: Option<i64>,
+    limit: Limit<u32>,
+) -> RuntimeResult<String> {
     if !value.is_finite() {
         return Ok(show_double(value));
     }
     Ok(match precision {
         Some(precision) => {
-            let precision = checked_precision(precision)?;
+            let precision = checked_precision(precision, limit)?;
             format!("{value:.precision$e}")
         }
         None => format_double_exponential(value),
@@ -4404,13 +5197,17 @@ fn format_double_exponential(value: f64) -> String {
     }
 }
 
-fn show_double_fixed(value: f64, precision: Option<i64>) -> RuntimeResult<String> {
+fn show_double_fixed(
+    value: f64,
+    precision: Option<i64>,
+    limit: Limit<u32>,
+) -> RuntimeResult<String> {
     if !value.is_finite() {
         return Ok(show_double(value));
     }
     Ok(match precision {
         Some(precision) => {
-            let precision = checked_precision(precision)?;
+            let precision = checked_precision(precision, limit)?;
             format!("{value:.precision$}")
         }
         None => format_double_fixed(value),
@@ -4443,17 +5240,44 @@ fn int_to_double(value: i64) -> f64 {
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_main(program: VerifiedProgram, context: RuntimeContext) -> RuntimeResult<()> {
     let executable = Arc::new(program.executable().clone());
-    let mut evaluator = Evaluator::new(executable);
+    let mut evaluator = Evaluator::new(executable)
+        .with_policy(Arc::clone(&context.policy), Arc::clone(&context.budget));
     if let Some(max_concurrent_actions) = context.max_concurrent_actions {
         evaluator = evaluator.with_max_concurrent_actions(max_concurrent_actions);
     }
-    let main = evaluator.root_thunk();
-    let action = evaluator.force_io(&main)?;
-    let result = action.run(&mut evaluator, &context)?;
-    match evaluator.force(&result)?.as_ref() {
-        Value::Unit => Ok(()),
-        _ => Err(RuntimeError::internal(
-            "verified IO () action returned a non-unit value",
-        )),
+    let root_scope = evaluator.execution_scope().clone().guard();
+    let body = (|| {
+        let main = evaluator.root_thunk();
+        let action = evaluator.force_io(&main)?;
+        let result = action.run(&mut evaluator, &context)?;
+        match evaluator.force(&result)?.as_ref() {
+            Value::Unit => Ok(()),
+            _ => Err(RuntimeError::internal(
+                "verified IO () action returned a non-unit value",
+            )),
+        }
+    })();
+    match body {
+        Ok(()) => {
+            let report = root_scope.close()?;
+            let after = &report.after;
+            let budget = &after.budget;
+            if after.child_scopes != 0
+                || after.live_tasks != 0
+                || after.resources != 0
+                || after.finalizers != 0
+                || budget.live_tasks != 0
+                || budget.live_handles != 0
+                || budget.live_processes != 0
+                || budget.live_http_connections != 0
+                || budget.live_temp_resources != 0
+            {
+                return Err(RuntimeError::cancellation_stalled(format!(
+                    "execution scope did not return to its resource baseline: {after:?}"
+                )));
+            }
+            Ok(())
+        }
+        Err(error) => root_scope.close_with_primary(Some(error)).map(|_| ()),
     }
 }

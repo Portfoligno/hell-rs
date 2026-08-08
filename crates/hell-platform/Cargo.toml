@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hell-host = { path = "../hell-host" }
 hell-runtime = { path = "../hell-runtime" }
 
 [lints]
 workspace = true
-

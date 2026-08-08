@@ -1,11 +1,10 @@
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-const CAPTURE_LIMIT: usize = 1024 * 1024;
+use hell_testkit::{Digest, run_supervised_command};
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -24,6 +23,10 @@ pub struct CommandResult {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_sha256: Digest,
+    pub stderr_sha256: Digest,
 }
 
 impl CommandSpec {
@@ -68,70 +71,29 @@ impl CommandSpec {
 
     pub fn run(&self) -> std::io::Result<CommandResult> {
         let mut command = Command::new(&self.program);
-        command
-            .args(&self.arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.args(&self.arguments);
         if let Some(directory) = &self.current_directory {
             command.current_dir(directory);
         }
 
         let started = Instant::now();
-        let mut child = command.spawn()?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || read_bounded(stdout));
-        let stderr_reader = thread::spawn(move || read_bounded(stderr));
-
-        let (status, timed_out) = loop {
-            if let Some(status) = child.try_wait()? {
-                break (status, false);
-            }
-            if started.elapsed() >= self.timeout {
-                child.kill()?;
-                break (child.wait()?, true);
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-
-        let (stdout, stdout_truncated) = join_reader(stdout_reader)?;
-        let (stderr, stderr_truncated) = join_reader(stderr_reader)?;
+        let output = run_supervised_command(&mut command, &[], self.timeout)?;
+        let stdout = output.stdout.retained_bytes();
+        let stderr = output.stderr.retained_bytes();
         std::io::stdout().write_all(&stdout)?;
         std::io::stderr().write_all(&stderr)?;
         Ok(CommandResult {
-            status,
+            status: output.status,
             duration: started.elapsed(),
-            timed_out,
+            timed_out: output.timed_out,
             stdout,
             stderr,
-            stdout_truncated,
-            stderr_truncated,
+            stdout_truncated: output.stdout.truncated,
+            stderr_truncated: output.stderr.truncated,
+            stdout_bytes: output.stdout.total_bytes,
+            stderr_bytes: output.stderr.total_bytes,
+            stdout_sha256: output.stdout.sha256,
+            stderr_sha256: output.stderr.sha256,
         })
     }
-}
-
-fn read_bounded(mut stream: impl std::io::Read) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut captured = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = CAPTURE_LIMIT.saturating_sub(captured.len());
-        let retained = remaining.min(read);
-        captured.extend_from_slice(&buffer[..retained]);
-        truncated |= retained != read;
-    }
-    Ok((captured, truncated))
-}
-
-fn join_reader(
-    reader: thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    reader
-        .join()
-        .map_err(|_| std::io::Error::other("output reader panicked"))?
 }

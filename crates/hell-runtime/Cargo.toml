@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 hell-builtins = { path = "../hell-builtins" }
 hell-core = { path = "../hell-core" }
+hell-host = { path = "../hell-host" }
+hell-http-host = { path = "../hell-http-host" }
 hell-types = { path = "../hell-types" }
 
 [dev-dependencies]

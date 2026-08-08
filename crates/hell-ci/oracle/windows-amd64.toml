@@ -1,0 +1,12 @@
+schema_version = 1
+role = "upstream-oracle"
+platform = "windows-amd64"
+reported_version = "2026-05-29"
+availability = "unavailable"
+upstream_repository = "https://github.com/chrisdone/hell"
+source_commit = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+release_tag = "2026-05-29"
+reason = "the pinned upstream release publishes no Windows oracle asset"
+
+# Release evidence must classify this platform as skipped and remain red until
+# a content-addressed native oracle and Tier-3 shard are reviewed.

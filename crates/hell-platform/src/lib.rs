@@ -1,9 +1,12 @@
 //! Host adapter helpers kept outside the compiler and pure evaluator.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hell_runtime::RuntimeContext;
+
+pub use hell_host::{HostServices, SupervisedChild, TerminationReport, WaitOutcome};
 
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityPolicy {
@@ -26,7 +29,7 @@ impl PlatformContext {
     /// # Errors
     ///
     /// Returns an I/O error when the process working directory is unavailable.
-    pub fn process(arguments: Vec<Arc<str>>) -> std::io::Result<Self> {
+    pub fn process(arguments: Vec<OsString>) -> std::io::Result<Self> {
         Ok(Self {
             runtime: RuntimeContext::process(arguments)?,
             cwd: Arc::new(std::env::current_dir()?),

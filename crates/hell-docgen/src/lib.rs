@@ -2,7 +2,10 @@
 
 use std::fmt::Write as _;
 
-use hell_builtins::{ClassHeadKind, Compatibility, Fixity, TypeClass, Visibility};
+use hell_builtins::{
+    ClaimPlatform, ClaimStatus, ClassHeadKind, CompatibilityDimension, ExecutionProfile, Fixity,
+    TypeClass, Visibility, WiringStatus,
+};
 
 #[must_use]
 pub fn render_api_markdown() -> String {
@@ -52,12 +55,8 @@ pub fn render_api_markdown() -> String {
         } else {
             output.push_str(" *(adapter pending)*");
         }
-        writeln!(
-            output,
-            " — compatibility: `{}`",
-            compatibility_name(primitive.compatibility)
-        )
-        .expect("writing to String");
+        writeln!(output, " — wiring: `{}`", wiring_name(primitive.wiring))
+            .expect("writing to String");
     }
 
     output.push_str("\n## Closed class instances\n\n");
@@ -78,7 +77,13 @@ pub fn render_api_markdown() -> String {
 
 /// Renders the stable, sorted source-of-truth snapshot used by compatibility
 /// review and release gates.
+///
+/// # Panics
+///
+/// Panics only if the registry and compatibility-claim inventory diverge;
+/// repository policy validates that invariant before release generation.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn render_compatibility_json() -> String {
     let mut output = String::new();
     writeln!(output, "{{").expect("writing to String");
@@ -161,17 +166,35 @@ pub fn render_compatibility_json() -> String {
     for (index, term) in terms.iter().enumerate() {
         writeln!(
             output,
-            "    {{ \"name\": \"{}\", \"visibility\": \"{}\", \"scheme\": {}, \"fixity\": {}, \"class\": {}, \"compatibility\": \"{}\", \"implementation\": {} }}{}",
+            "    {{ \"name\": \"{}\", \"visibility\": \"{}\", \"scheme\": {}, \"fixity\": {}, \"class\": {}, \"wiring\": \"{}\", \"implementation\": {}, \"claims\": [",
             json_escape(term.name),
             visibility_name(term.visibility),
             optional_json_string(term.scheme),
             fixity_json(term.fixity),
             optional_json_string(term.type_class.map(hell_builtins::TypeClass::as_str)),
-            compatibility_name(term.compatibility),
-            optional_json_string(term.implementation),
-            comma(index, terms.len())
+            wiring_name(term.wiring),
+            optional_json_string(term.implementation)
         )
         .expect("writing to String");
+        let claim = hell_builtins::compatibility_claim(term.id)
+            .expect("every registry term has a compatibility claim");
+        for (claim_index, dimension) in claim.dimensions.iter().enumerate() {
+            writeln!(
+                output,
+                "      {{ \"dimension\": \"{}\", \"status\": \"{}\", \"profiles\": {}, \"platforms\": {}, \"evidence\": {}, \"normalizers\": {}, \"rationale\": {}, \"issue\": {} }}{}",
+                dimension_name(dimension.dimension),
+                status_name(dimension.status),
+                json_array(dimension.profiles.iter().copied().map(profile_name)),
+                json_array(dimension.platforms.iter().copied().map(platform_name)),
+                json_array(dimension.evidence.iter().copied()),
+                json_array(dimension.normalizers.iter().copied()),
+                optional_json_string(dimension.rationale),
+                optional_json_string(dimension.issue),
+                comma(claim_index, claim.dimensions.len())
+            )
+            .expect("writing to String");
+        }
+        writeln!(output, "    ] }}{}", comma(index, terms.len())).expect("writing to String");
     }
     output.push_str("  ]\n}\n");
     output
@@ -268,13 +291,59 @@ fn class_head_json(kind: ClassHeadKind) -> &'static str {
     }
 }
 
-fn compatibility_name(compatibility: Compatibility) -> &'static str {
-    match compatibility {
-        Compatibility::Exact => "exact",
-        Compatibility::Normalized => "normalized",
-        Compatibility::PlatformDependent => "platform-dependent",
-        Compatibility::Pending => "pending",
+fn wiring_name(wiring: WiringStatus) -> &'static str {
+    match wiring {
+        WiringStatus::Executable => "executable",
+        WiringStatus::DeclaredOnly => "declared-only",
     }
+}
+
+fn dimension_name(dimension: CompatibilityDimension) -> &'static str {
+    match dimension {
+        CompatibilityDimension::Parse => "parse",
+        CompatibilityDimension::StaticSemantics => "static-semantics",
+        CompatibilityDimension::PureRuntime => "pure-runtime",
+        CompatibilityDimension::Effects => "effects",
+        CompatibilityDimension::Concurrency => "concurrency",
+        CompatibilityDimension::Presentation => "presentation",
+        CompatibilityDimension::Platform => "platform",
+        CompatibilityDimension::ResourceBehavior => "resource-behavior",
+    }
+}
+
+fn status_name(status: ClaimStatus) -> &'static str {
+    match status {
+        ClaimStatus::Exact => "exact",
+        ClaimStatus::Normalized => "normalized",
+        ClaimStatus::PlatformDependent => "platform-dependent",
+        ClaimStatus::DeliberateDivergence => "deliberate-divergence",
+        ClaimStatus::Unverified => "unverified",
+        ClaimStatus::NotApplicable => "not-applicable",
+    }
+}
+
+fn profile_name(profile: ExecutionProfile) -> &'static str {
+    match profile {
+        ExecutionProfile::Upstream => "upstream",
+        ExecutionProfile::Sandboxed => "sandboxed",
+    }
+}
+
+fn platform_name(platform: ClaimPlatform) -> &'static str {
+    match platform {
+        ClaimPlatform::All => "all",
+        ClaimPlatform::Linux => "linux",
+        ClaimPlatform::MacOs => "macos",
+        ClaimPlatform::Windows => "windows",
+    }
+}
+
+fn json_array<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let values = values
+        .into_iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
 }
 
 fn fixity_json(fixity: Option<Fixity>) -> String {

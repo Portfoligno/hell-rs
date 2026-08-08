@@ -156,3 +156,39 @@ fn structural_combinators_match_the_oracle_order_and_accumulator_quirks() {
         )
     );
 }
+
+#[test]
+fn shared_splits_and_combinatorial_producers_are_productive() {
+    let source = concat!(
+        "main = do\n",
+        "  let (spanPrefix, _spanSuffix) = List.span (\\_ -> Bool.True) $ List.repeat 1\n",
+        "  IO.print $ List.take 5 spanPrefix\n",
+        "  let (_selected, rejected) = List.partition (\\_ -> Bool.False) $ List.repeat 2\n",
+        "  IO.print $ List.take 5 rejected\n",
+        "  IO.print $ List.take 1 $ List.map (List.take 5) $ List.group $ List.repeat 3\n",
+        "  IO.print $ List.take 5 $ List.dropWhileEnd (Int.eq 0) $ List.repeat 4\n",
+        "  IO.print $ List.take 3 $ List.nubOrd $ List.cycle [1,2,3]\n",
+        "  IO.print $ List.take 1 $ List.scanr (\\x _ -> x) (Error.error \"seed\" :: Int) $ List.repeat 5\n",
+        "  IO.print $ List.length $ List.take 1 $ List.subsequences (Error.error \"subsequences input\" :: [Int])\n",
+        "  IO.print $ List.take 6 $ List.map (List.take 3) $ List.subsequences $ List.cycle [1,2,3]\n",
+        "  IO.print $ List.length $ List.take 1 $ List.permutations (Error.error \"permutations input\" :: [Int])\n",
+        "  IO.print $ List.take 6 $ List.map (List.take 3) $ List.permutations $ List.cycle [1,2,3]\n",
+        "  IO.print $ List.take 1 $ List.map (List.take 5) $ List.transpose $ List.repeat [6,7]\n",
+    );
+    assert_eq!(
+        run(source),
+        concat!(
+            "[1,1,1,1,1]\n",
+            "[2,2,2,2,2]\n",
+            "[[3,3,3,3,3]]\n",
+            "[4,4,4,4,4]\n",
+            "[1,2,3]\n",
+            "[5]\n",
+            "1\n",
+            "[[],[1],[2],[1,2],[3],[1,3]]\n",
+            "1\n",
+            "[[1,2,3],[2,1,3],[3,2,1],[2,3,1],[3,1,2],[1,3,2]]\n",
+            "[[6,6,6,6,6]]\n",
+        )
+    );
+}

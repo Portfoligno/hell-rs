@@ -7,12 +7,15 @@ host adapters, and the CLI behind separate crate boundaries.
 
 This is not yet a complete replacement for the pinned implementation. All
 355/355 registry entries now have executable compiler/runtime adapters, and the
-current compatibility matrix accepts 44/44 upstream examples with `--check`.
+current compiler smoke suite accepts 44/44 pinned upstream examples with
+`--check`. Wiring is not a semantic compatibility claim: the dimensioned
+compatibility report conservatively records behavior as unverified until a
+retained oracle-versus-candidate evidence record supports promotion.
 Records, user sums/cases, laziness regressions, global expansion, the core
 verification boundary, process/file/temp adapters, JSON, time, concurrency, and
 a bounded collection/type-class surface have direct regressions. Compatibility
-coverage is still incomplete: several newly executable adapters need broader
-differential edge-case, cancellation, and resource-limit coverage.
+coverage is still incomplete: executable adapters need broader differential
+edge-case, cancellation, platform, and resource-behavior evidence.
 
 The executable supports:
 
@@ -54,8 +57,13 @@ target/ci/hell-ci portability --report ci-out/portability-local.json
 Run release and stress gates:
 
 ```text
-target/ci/hell-ci nightly --report ci-out/nightly-local.json
+target/ci/hell-ci nightly --oracle /path/to/pinned/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --report ci-out/nightly-local.json
 ```
+
+The reviewed Linux amd64 oracle is the `hell-linux-amd64` asset from the
+upstream `2026-05-29` release. Its source, executable digest, and pinned build
+inputs are recorded in `crates/hell-ci/oracle/linux-amd64.toml`; verify the
+downloaded executable against that record before invoking the gate.
 
 On Windows, invoke the built driver directly as
 `target\ci\hell-ci.exe`, using the same subcommands and arguments.

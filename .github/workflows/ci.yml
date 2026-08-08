@@ -7,11 +7,31 @@ on:
 permissions:
   contents: read
 
+env:
+  HELL_SOURCE_COMMIT: ${{ github.sha }}
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  dependency-policy:
+    name: Dependency advisories and licenses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          arguments: --all-features
+
   verify:
     name: Verify / Linux
     runs-on: ubuntu-24.04
@@ -60,7 +80,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verify-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out/
+          path: ci-out
           if-no-files-found: ignore
           retention-days: 14
 
@@ -129,7 +149,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: portability-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out/
+          path: ci-out
           if-no-files-found: ignore
           retention-days: 14
 
@@ -198,7 +218,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: portability-windows-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out/
+          path: ci-out
           if-no-files-found: ignore
           retention-days: 14
 

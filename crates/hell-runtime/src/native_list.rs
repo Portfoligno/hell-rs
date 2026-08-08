@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::lazy_list::{Classifier, classify, drop_class, select_class, take_class};
 use crate::{
     Evaluator, ForceOutcome, ListCell, RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef,
     Value,
@@ -21,12 +22,11 @@ pub(crate) fn apply_native(
             implementation == "list_all",
         )
         .map(value),
-        "list_break" | "list_span" => span(
-            evaluator,
+        "list_break" | "list_span" => Ok(span(
             &arguments[0],
             &arguments[1],
             implementation == "list_break",
-        ),
+        )),
         "list_concat" => Ok(ForceOutcome::Alias(concat_lists(Arc::clone(&arguments[0])))),
         "list_concat_map" => Ok(ForceOutcome::Alias(concat_lists(map_to_lists(
             Arc::clone(&arguments[0]),
@@ -40,7 +40,10 @@ pub(crate) fn apply_native(
         ))),
         "list_drop" => drop_count(evaluator, &arguments[0], &arguments[1]),
         "list_drop_while" => drop_while(evaluator, &arguments[0], &arguments[1]),
-        "list_drop_while_end" => drop_while_end(evaluator, &arguments[0], &arguments[1]).map(value),
+        "list_drop_while_end" => Ok(ForceOutcome::Alias(drop_while_end(
+            Arc::clone(&arguments[0]),
+            Arc::clone(&arguments[1]),
+        ))),
         "list_elem" | "list_not_elem" => contains(
             evaluator,
             &arguments[0],
@@ -97,26 +100,33 @@ pub(crate) fn apply_native(
         "list_is_prefix_of" => prefix(evaluator, &arguments[0], &arguments[1]).map(value),
         "list_is_subsequence_of" => subsequence(evaluator, &arguments[0], &arguments[1]).map(value),
         "list_is_suffix_of" => suffix(evaluator, &arguments[0], &arguments[1]).map(value),
-        "list_nub_ord" => nub_ord(evaluator, &arguments[0]).map(value),
+        "list_nub_ord" => Ok(ForceOutcome::Alias(nub_ord(
+            Arc::clone(&arguments[0]),
+            SeenTree::default(),
+        ))),
         "list_null" => null(evaluator, &arguments[0]).map(value),
-        "list_partition" => partition(evaluator, &arguments[0], &arguments[1]),
-        "list_permutations" => permutations(evaluator, &arguments[0]).map(value),
+        "list_partition" => Ok(partition(&arguments[0], &arguments[1])),
+        "list_permutations" => Ok(ForceOutcome::Alias(permutations(Arc::clone(&arguments[0])))),
         "list_repeat" => Ok(ForceOutcome::Alias(repeat(Arc::clone(&arguments[0])))),
         "list_scanl_strict" => Ok(ForceOutcome::Alias(scanl(
             Arc::clone(&arguments[0]),
             Arc::clone(&arguments[1]),
             Arc::clone(&arguments[2]),
         ))),
-        "list_scanr" => scanr(evaluator, &arguments[0], &arguments[1], &arguments[2]),
+        "list_scanr" => Ok(ForceOutcome::Alias(scanr(
+            Arc::clone(&arguments[0]),
+            Arc::clone(&arguments[1]),
+            Arc::clone(&arguments[2]),
+        ))),
         "list_sort" => sort(evaluator, &arguments[0]).map(value),
         "list_split_at" => split_at(evaluator, &arguments[0], &arguments[1]),
-        "list_subsequences" => subsequences(evaluator, &arguments[0]).map(value),
+        "list_subsequences" => Ok(ForceOutcome::Alias(subsequences(Arc::clone(&arguments[0])))),
         "list_tails" => Ok(ForceOutcome::Alias(tails(Arc::clone(&arguments[0])))),
         "list_take_while" => Ok(ForceOutcome::Alias(take_while(
             Arc::clone(&arguments[0]),
             Arc::clone(&arguments[1]),
         ))),
-        "list_transpose" => transpose(evaluator, &arguments[0]).map(value),
+        "list_transpose" => Ok(ForceOutcome::Alias(transpose(Arc::clone(&arguments[0])))),
         "list_uncons" => uncons(evaluator, &arguments[0]).map(value),
         "list_unfoldr" => Ok(ForceOutcome::Alias(unfoldr(
             Arc::clone(&arguments[0]),
@@ -158,29 +168,17 @@ fn predicate_fold(
     }
 }
 
-fn span(
-    evaluator: &mut Evaluator,
-    predicate: &ThunkRef,
-    input: &ThunkRef,
-    invert: bool,
-) -> RuntimeResult<ForceOutcome> {
-    let mut prefix = Vec::new();
-    let mut suffix = Arc::clone(input);
-    loop {
-        match evaluator.force(&suffix)?.as_ref() {
-            Value::List(ListCell::Nil) => break,
-            Value::List(ListCell::Cons { head, tail }) => {
-                let matches = evaluator.force_bool(&apply1(predicate, head))?;
-                if matches == invert {
-                    break;
-                }
-                prefix.push(Arc::clone(head));
-                suffix = Arc::clone(tail);
-            }
-            _ => return Err(non_list("List.span/break")),
-        }
-    }
-    Ok(value(Value::Tuple(Arc::from([list_from(prefix), suffix]))))
+fn span(predicate: &ThunkRef, input: &ThunkRef, invert: bool) -> ForceOutcome {
+    let matching = !invert;
+    let classified = classify(
+        Classifier::Predicate(Arc::clone(predicate)),
+        Arc::clone(input),
+        "List.span/break",
+    );
+    value(Value::Tuple(Arc::from([
+        take_class(Arc::clone(&classified), matching, "List.span/break"),
+        drop_class(classified, matching, "List.span/break"),
+    ])))
 }
 
 fn map_to_lists(function: ThunkRef, input: ThunkRef) -> ThunkRef {
@@ -231,19 +229,28 @@ fn delete_by(function: ThunkRef, needle: ThunkRef, input: ThunkRef) -> ThunkRef 
     })
 }
 
-fn drop_while_end(
-    evaluator: &mut Evaluator,
-    predicate: &ThunkRef,
-    input: &ThunkRef,
-) -> RuntimeResult<Value> {
-    let mut items = evaluator.force_list_elements(input)?;
-    while let Some(last) = items.last() {
-        if !evaluator.force_bool(&apply1(predicate, last))? {
-            break;
+fn drop_while_end(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+        Value::List(ListCell::Cons { head, tail }) => {
+            let keep_tail = drop_while_end(Arc::clone(&predicate), Arc::clone(tail));
+            if !evaluator.force_bool(&apply1(&predicate, head))? {
+                return Ok(Arc::new(Value::List(ListCell::Cons {
+                    head: Arc::clone(head),
+                    tail: keep_tail,
+                })));
+            }
+            match evaluator.force(&keep_tail)?.as_ref() {
+                Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+                Value::List(ListCell::Cons { .. }) => Ok(Arc::new(Value::List(ListCell::Cons {
+                    head: Arc::clone(head),
+                    tail: keep_tail,
+                }))),
+                _ => Err(non_list("List.dropWhileEnd")),
+            }
         }
-        items.pop();
-    }
-    Ok(Value::List(list_cell_from(items)))
+        _ => Err(non_list("List.dropWhileEnd")),
+    })
 }
 
 fn foldr(function: ThunkRef, seed: ThunkRef, input: ThunkRef) -> ThunkRef {
@@ -262,29 +269,21 @@ fn group_by(function: Option<ThunkRef>, input: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
-            let first = Arc::clone(head);
-            let mut group = vec![Arc::clone(head)];
-            let mut suffix = Arc::clone(tail);
-            loop {
-                match evaluator.force(&suffix)?.as_ref() {
-                    Value::List(ListCell::Nil) => break,
-                    Value::List(ListCell::Cons { head, tail }) => {
-                        let matches = if let Some(function) = &function {
-                            evaluator.force_bool(&apply2(function, &first, head))?
-                        } else {
-                            evaluator.equal_values(&first, head)?
-                        };
-                        if !matches {
-                            break;
-                        }
-                        group.push(Arc::clone(head));
-                        suffix = Arc::clone(tail);
-                    }
-                    _ => return Err(non_list("List.group/groupBy")),
-                }
-            }
+            let classified = classify(
+                Classifier::Relation {
+                    first: Arc::clone(head),
+                    function: function.clone(),
+                },
+                Arc::clone(tail),
+                "List.group/groupBy",
+            );
+            let group_tail = take_class(Arc::clone(&classified), true, "List.group/groupBy");
+            let suffix = drop_class(classified, true, "List.group/groupBy");
             Ok(Arc::new(Value::List(ListCell::Cons {
-                head: list_from(group),
+                head: Thunk::evaluated(Value::List(ListCell::Cons {
+                    head: Arc::clone(head),
+                    tail: group_tail,
+                })),
                 tail: group_by(function.clone(), suffix),
             })))
         }
@@ -646,81 +645,269 @@ fn suffix(evaluator: &mut Evaluator, needle: &ThunkRef, input: &ThunkRef) -> Run
     Ok(Value::Bool(true))
 }
 
-fn nub_ord(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
-    let items = evaluator.force_list_elements(input)?;
-    let mut unique: Vec<ThunkRef> = Vec::new();
-    'items: for item in items {
-        for existing in &unique {
-            if evaluator.equal_values(&item, existing)? {
-                continue 'items;
+#[derive(Clone, Default)]
+struct SeenTree(Option<Arc<SeenNode>>);
+
+struct SeenNode {
+    item: ThunkRef,
+    left: SeenTree,
+    right: SeenTree,
+    height: u16,
+}
+
+impl SeenTree {
+    fn insert(&self, evaluator: &mut Evaluator, item: &ThunkRef) -> RuntimeResult<(Self, bool)> {
+        let Some(node) = &self.0 else {
+            return Ok((
+                Self::node(Arc::clone(item), Self::default(), Self::default()),
+                true,
+            ));
+        };
+        if evaluator.less_values(item, &node.item)? {
+            let (left, inserted) = node.left.insert(evaluator, item)?;
+            if !inserted {
+                return Ok((self.clone(), false));
+            }
+            return Ok((
+                Self::node(Arc::clone(&node.item), left, node.right.clone()).balanced(),
+                true,
+            ));
+        }
+        if evaluator.less_values(&node.item, item)? {
+            let (right, inserted) = node.right.insert(evaluator, item)?;
+            if !inserted {
+                return Ok((self.clone(), false));
+            }
+            return Ok((
+                Self::node(Arc::clone(&node.item), node.left.clone(), right).balanced(),
+                true,
+            ));
+        }
+        Ok((self.clone(), false))
+    }
+
+    fn node(item: ThunkRef, left: Self, right: Self) -> Self {
+        let height = left.height().max(right.height()).saturating_add(1);
+        Self(Some(Arc::new(SeenNode {
+            item,
+            left,
+            right,
+            height,
+        })))
+    }
+
+    fn height(&self) -> u16 {
+        self.0.as_ref().map_or(0, |node| node.height)
+    }
+
+    fn balanced(self) -> Self {
+        let Some(node) = &self.0 else {
+            return self;
+        };
+        let balance = i32::from(node.left.height()) - i32::from(node.right.height());
+        if balance > 1 {
+            let left = node
+                .left
+                .0
+                .as_ref()
+                .expect("left-heavy tree has a left node");
+            if left.right.height() > left.left.height() {
+                return Self::node(
+                    Arc::clone(&node.item),
+                    node.left.clone().rotate_left(),
+                    node.right.clone(),
+                )
+                .rotate_right();
+            }
+            return self.rotate_right();
+        }
+        if balance < -1 {
+            let right = node
+                .right
+                .0
+                .as_ref()
+                .expect("right-heavy tree has a right node");
+            if right.left.height() > right.right.height() {
+                return Self::node(
+                    Arc::clone(&node.item),
+                    node.left.clone(),
+                    node.right.clone().rotate_right(),
+                )
+                .rotate_left();
+            }
+            return self.rotate_left();
+        }
+        self
+    }
+
+    fn rotate_left(self) -> Self {
+        let node = self.0.as_ref().expect("left rotation has a root");
+        let right = node
+            .right
+            .0
+            .as_ref()
+            .expect("left rotation has a right node");
+        let left = Self::node(
+            Arc::clone(&node.item),
+            node.left.clone(),
+            right.left.clone(),
+        );
+        Self::node(Arc::clone(&right.item), left, right.right.clone())
+    }
+
+    fn rotate_right(self) -> Self {
+        let node = self.0.as_ref().expect("right rotation has a root");
+        let left = node
+            .left
+            .0
+            .as_ref()
+            .expect("right rotation has a left node");
+        let right = Self::node(
+            Arc::clone(&node.item),
+            left.right.clone(),
+            node.right.clone(),
+        );
+        Self::node(Arc::clone(&left.item), left.left.clone(), right)
+    }
+}
+
+fn nub_ord(input: ThunkRef, seen: SeenTree) -> ThunkRef {
+    Thunk::deferred(move |evaluator| {
+        let mut current = Arc::clone(&input);
+        let mut seen = seen.clone();
+        loop {
+            evaluator.ensure_not_cancelled()?;
+            match evaluator.force(&current)?.as_ref() {
+                Value::List(ListCell::Nil) => return Ok(Arc::new(Value::List(ListCell::Nil))),
+                Value::List(ListCell::Cons { head, tail }) => {
+                    let (next_seen, inserted) = seen.insert(evaluator, head)?;
+                    if inserted {
+                        return Ok(Arc::new(Value::List(ListCell::Cons {
+                            head: Arc::clone(head),
+                            tail: nub_ord(Arc::clone(tail), next_seen),
+                        })));
+                    }
+                    seen = next_seen;
+                    current = Arc::clone(tail);
+                }
+                _ => return Err(non_list("List.nubOrd")),
             }
         }
-        unique.push(item);
-    }
-    Ok(Value::List(list_cell_from(unique)))
+    })
 }
 
-fn partition(
-    evaluator: &mut Evaluator,
-    predicate: &ThunkRef,
-    input: &ThunkRef,
-) -> RuntimeResult<ForceOutcome> {
-    let items = evaluator.force_list_elements(input)?;
-    let mut matches = Vec::new();
-    let mut rejects = Vec::new();
-    for item in items {
-        if evaluator.force_bool(&apply1(predicate, &item))? {
-            matches.push(item);
-        } else {
-            rejects.push(item);
+fn partition(predicate: &ThunkRef, input: &ThunkRef) -> ForceOutcome {
+    let classified = classify(
+        Classifier::Predicate(Arc::clone(predicate)),
+        Arc::clone(input),
+        "List.partition",
+    );
+    value(Value::Tuple(Arc::from([
+        select_class(Arc::clone(&classified), true, "List.partition"),
+        select_class(classified, false, "List.partition"),
+    ])))
+}
+
+fn permutations(input: ThunkRef) -> ThunkRef {
+    let original = Arc::clone(&input);
+    Thunk::deferred(move |_| {
+        Ok(Arc::new(Value::List(ListCell::Cons {
+            head: Arc::clone(&original),
+            tail: permutation_stages(
+                Arc::clone(&input),
+                Thunk::evaluated(Value::List(ListCell::Nil)),
+            ),
+        })))
+    })
+}
+
+fn permutation_stages(input: ThunkRef, reversed_prefix: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+        Value::List(ListCell::Cons { head, tail }) => {
+            let stage = permutation_stage(
+                permutations(Arc::clone(&reversed_prefix)),
+                Arc::clone(head),
+                Arc::clone(tail),
+            );
+            let next_prefix = Thunk::evaluated(Value::List(ListCell::Cons {
+                head: Arc::clone(head),
+                tail: Arc::clone(&reversed_prefix),
+            }));
+            evaluator.force(&append_lazy(
+                stage,
+                permutation_stages(Arc::clone(tail), next_prefix),
+            ))
         }
-    }
-    Ok(value(Value::Tuple(Arc::from([
-        list_from(matches),
-        list_from(rejects),
-    ]))))
+        _ => Err(non_list("List.permutations")),
+    })
 }
 
-fn permutations(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
-    let items = evaluator.force_list_elements(input)?;
-    Ok(Value::List(list_cell_from(
-        permutations_ordered(&items)
-            .into_iter()
-            .map(list_from)
-            .collect(),
-    )))
+fn permutation_stage(prefixes: ThunkRef, item: ThunkRef, suffix: ThunkRef) -> ThunkRef {
+    Thunk::deferred(
+        move |evaluator| match evaluator.force(&prefixes)?.as_ref() {
+            Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+            Value::List(ListCell::Cons { head, tail }) => evaluator.force(&append_lazy(
+                interleave_nonfinal(
+                    Arc::clone(&item),
+                    Arc::clone(head),
+                    Arc::clone(&suffix),
+                    Vec::new(),
+                ),
+                permutation_stage(Arc::clone(tail), Arc::clone(&item), Arc::clone(&suffix)),
+            )),
+            _ => Err(non_list("List.permutations prefix stream")),
+        },
+    )
 }
 
-fn permutations_ordered(items: &[ThunkRef]) -> Vec<Vec<ThunkRef>> {
-    if items.is_empty() {
-        return vec![Vec::new()];
-    }
-    let mut output = vec![items.to_vec()];
-    output.extend(permutations_tail(items, &[]));
-    output
+fn interleave_nonfinal(
+    item: ThunkRef,
+    remaining: ThunkRef,
+    suffix: ThunkRef,
+    prefix: Vec<ThunkRef>,
+) -> ThunkRef {
+    Thunk::deferred(
+        move |evaluator| match evaluator.force(&remaining)?.as_ref() {
+            Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+            Value::List(ListCell::Cons { head, tail }) => {
+                let inserted = append_lazy(Arc::clone(&remaining), Arc::clone(&suffix));
+                let inserted = Thunk::evaluated(Value::List(ListCell::Cons {
+                    head: Arc::clone(&item),
+                    tail: inserted,
+                }));
+                let permutation = prefix.iter().rev().fold(inserted, |tail, head| {
+                    Thunk::evaluated(Value::List(ListCell::Cons {
+                        head: Arc::clone(head),
+                        tail,
+                    }))
+                });
+                let mut next_prefix = prefix.clone();
+                next_prefix.push(Arc::clone(head));
+                Ok(Arc::new(Value::List(ListCell::Cons {
+                    head: permutation,
+                    tail: interleave_nonfinal(
+                        Arc::clone(&item),
+                        Arc::clone(tail),
+                        Arc::clone(&suffix),
+                        next_prefix,
+                    ),
+                })))
+            }
+            _ => Err(non_list("List.permutations prefix")),
+        },
+    )
 }
 
-fn permutations_tail(items: &[ThunkRef], inserted: &[ThunkRef]) -> Vec<Vec<ThunkRef>> {
-    let Some((item, tail)) = items.split_first() else {
-        return Vec::new();
-    };
-    let mut next_inserted = Vec::with_capacity(inserted.len() + 1);
-    next_inserted.push(Arc::clone(item));
-    next_inserted.extend_from_slice(inserted);
-    let mut output = permutations_tail(tail, &next_inserted);
-    for permutation in permutations_ordered(inserted).into_iter().rev() {
-        let mut suffix = permutation.clone();
-        suffix.extend_from_slice(tail);
-        let mut interleaved = Vec::with_capacity(permutation.len());
-        for index in 0..permutation.len() {
-            let mut value = suffix.clone();
-            value.insert(index, Arc::clone(item));
-            interleaved.push(value);
-        }
-        interleaved.extend(output);
-        output = interleaved;
-    }
-    output
+fn append_lazy(left: ThunkRef, right: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&left)?.as_ref() {
+        Value::List(ListCell::Nil) => evaluator.force(&right),
+        Value::List(ListCell::Cons { head, tail }) => Ok(Arc::new(Value::List(ListCell::Cons {
+            head: Arc::clone(head),
+            tail: append_lazy(Arc::clone(tail), Arc::clone(&right)),
+        }))),
+        _ => Err(non_list("List append")),
+    })
 }
 
 fn scanl(function: ThunkRef, accumulator: ThunkRef, input: ThunkRef) -> ThunkRef {
@@ -752,37 +939,76 @@ fn scanl_tail(function: ThunkRef, accumulator: ThunkRef, input: ThunkRef) -> Thu
     })
 }
 
-fn scanr(
-    evaluator: &mut Evaluator,
-    function: &ThunkRef,
-    seed: &ThunkRef,
-    input: &ThunkRef,
-) -> RuntimeResult<ForceOutcome> {
-    let items = evaluator.force_list_elements(input)?;
-    let mut accumulator = Arc::clone(seed);
-    let mut results = vec![Arc::clone(seed)];
-    for item in items.iter().rev() {
-        accumulator = apply2(function, item, &accumulator);
-        results.push(Arc::clone(&accumulator));
-    }
-    results.reverse();
-    Ok(ForceOutcome::Alias(list_from(results)))
+fn scanr(function: ThunkRef, seed: ThunkRef, input: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Cons {
+            head: Arc::clone(&seed),
+            tail: Thunk::evaluated(Value::List(ListCell::Nil)),
+        }))),
+        Value::List(ListCell::Cons { head, tail }) => {
+            let rest = scanr(Arc::clone(&function), Arc::clone(&seed), Arc::clone(tail));
+            let function_for_head = Arc::clone(&function);
+            let item = Arc::clone(head);
+            let rest_for_head = Arc::clone(&rest);
+            let accumulated = Thunk::deferred(move |evaluator| {
+                let rest = evaluator.force(&rest_for_head)?;
+                let Value::List(ListCell::Cons { head, .. }) = rest.as_ref() else {
+                    return Err(RuntimeError::internal(
+                        "List.scanr recursive result was empty or malformed",
+                    ));
+                };
+                evaluator.force(&apply2(&function_for_head, &item, head))
+            });
+            Ok(Arc::new(Value::List(ListCell::Cons {
+                head: accumulated,
+                tail: rest,
+            })))
+        }
+        _ => Err(non_list("List.scanr")),
+    })
 }
 
 fn sort(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     let items = evaluator.force_list_elements(input)?;
-    let mut sorted: Vec<ThunkRef> = Vec::with_capacity(items.len());
-    for item in items {
-        let mut index = sorted.len();
-        for (candidate_index, candidate) in sorted.iter().enumerate() {
-            if evaluator.less_values(&item, candidate)? {
-                index = candidate_index;
-                break;
+    let mut runs = items
+        .into_iter()
+        .map(|item| vec![item])
+        .collect::<Vec<Vec<ThunkRef>>>();
+    while runs.len() > 1 {
+        evaluator.ensure_not_cancelled()?;
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
+        let mut current_runs = runs.into_iter();
+        while let Some(left) = current_runs.next() {
+            if let Some(right) = current_runs.next() {
+                merged.push(merge_sorted(evaluator, left, right)?);
+            } else {
+                merged.push(left);
             }
         }
-        sorted.insert(index, item);
+        runs = merged;
     }
-    Ok(Value::List(list_cell_from(sorted)))
+    Ok(Value::List(list_cell_from(runs.pop().unwrap_or_default())))
+}
+
+fn merge_sorted(
+    evaluator: &mut Evaluator,
+    left: Vec<ThunkRef>,
+    right: Vec<ThunkRef>,
+) -> RuntimeResult<Vec<ThunkRef>> {
+    let mut output = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some(left_item), Some(right_item)) = (left.peek(), right.peek()) {
+        evaluator.ensure_not_cancelled()?;
+        if evaluator.less_values(right_item, left_item)? {
+            output.push(right.next().expect("peeked right item exists"));
+        } else {
+            output.push(left.next().expect("peeked left item exists"));
+        }
+    }
+    output.extend(left);
+    output.extend(right);
+    Ok(output)
 }
 
 fn split_at(
@@ -807,23 +1033,64 @@ fn split_at(
     Ok(value(Value::Tuple(Arc::from([list_from(prefix), suffix]))))
 }
 
-fn subsequences(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
-    let items = evaluator.force_list_elements(input)?;
-    let mut subsets: Vec<Vec<ThunkRef>> = vec![Vec::new()];
-    for item in items {
-        let additions = subsets
-            .iter()
-            .map(|subset| {
-                let mut next = subset.clone();
-                next.push(Arc::clone(&item));
-                next
-            })
-            .collect::<Vec<_>>();
-        subsets.extend(additions);
-    }
-    Ok(Value::List(list_cell_from(
-        subsets.into_iter().map(list_from).collect(),
-    )))
+fn subsequences(input: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |_| {
+        Ok(Arc::new(Value::List(ListCell::Cons {
+            head: Thunk::evaluated(Value::List(ListCell::Nil)),
+            tail: non_empty_subsequences(Arc::clone(&input)),
+        })))
+    })
+}
+
+fn non_empty_subsequences(input: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+        Value::List(ListCell::Cons { head, tail }) => {
+            let single = Thunk::evaluated(Value::List(ListCell::Cons {
+                head: Arc::clone(head),
+                tail: Thunk::evaluated(Value::List(ListCell::Nil)),
+            }));
+            Ok(Arc::new(Value::List(ListCell::Cons {
+                head: single,
+                tail: subsequence_pairs(
+                    Arc::clone(head),
+                    non_empty_subsequences(Arc::clone(tail)),
+                    true,
+                ),
+            })))
+        }
+        _ => Err(non_list("List.subsequences")),
+    })
+}
+
+fn subsequence_pairs(item: ThunkRef, subsets: ThunkRef, emit_plain: bool) -> ThunkRef {
+    Thunk::deferred(move |evaluator| match evaluator.force(&subsets)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+        Value::List(ListCell::Cons { head, tail: _ }) if emit_plain => {
+            Ok(Arc::new(Value::List(ListCell::Cons {
+                head: Arc::clone(head),
+                tail: subsequence_pairs(Arc::clone(&item), Arc::clone(&subsets), false),
+            })))
+        }
+        Value::List(ListCell::Cons { head, tail }) => {
+            let item = Arc::clone(&item);
+            let prefixed_item = Arc::clone(&item);
+            let subset = Arc::clone(head);
+            let prefixed =
+                Thunk::deferred(move |evaluator| match evaluator.force(&subset)?.as_ref() {
+                    Value::List(_) => Ok(Arc::new(Value::List(ListCell::Cons {
+                        head: Arc::clone(&prefixed_item),
+                        tail: Arc::clone(&subset),
+                    }))),
+                    _ => Err(non_list("List.subsequences result")),
+                });
+            Ok(Arc::new(Value::List(ListCell::Cons {
+                head: prefixed,
+                tail: subsequence_pairs(Arc::clone(&item), Arc::clone(tail), true),
+            })))
+        }
+        _ => Err(non_list("List.subsequences")),
+    })
 }
 
 fn tails(input: ThunkRef) -> ThunkRef {
@@ -840,29 +1107,66 @@ fn tails(input: ThunkRef) -> ThunkRef {
     })
 }
 
-fn transpose(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
-    let mut rows = evaluator.force_list_elements(input)?;
-    let mut columns = Vec::new();
-    loop {
-        let mut heads = Vec::new();
-        let mut tails = Vec::new();
-        for row in rows {
-            match evaluator.force(&row)?.as_ref() {
-                Value::List(ListCell::Nil) => {}
-                Value::List(ListCell::Cons { head, tail }) => {
-                    heads.push(Arc::clone(head));
-                    tails.push(Arc::clone(tail));
-                }
-                _ => return Err(non_list("List.transpose row")),
+fn transpose(input: ThunkRef) -> ThunkRef {
+    let projected = project_rows(input);
+    Thunk::deferred(
+        move |evaluator| match evaluator.force(&projected)?.as_ref() {
+            Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+            Value::List(ListCell::Cons { .. }) => Ok(Arc::new(Value::List(ListCell::Cons {
+                head: project_field(Arc::clone(&projected), 0),
+                tail: transpose(project_field(Arc::clone(&projected), 1)),
+            }))),
+            _ => Err(non_list("List.transpose")),
+        },
+    )
+}
+
+fn project_rows(input: ThunkRef) -> ThunkRef {
+    Thunk::deferred(move |evaluator| {
+        let mut rows = Arc::clone(&input);
+        loop {
+            evaluator.ensure_not_cancelled()?;
+            match evaluator.force(&rows)?.as_ref() {
+                Value::List(ListCell::Nil) => return Ok(Arc::new(Value::List(ListCell::Nil))),
+                Value::List(ListCell::Cons {
+                    head: row,
+                    tail: remaining_rows,
+                }) => match evaluator.force(row)?.as_ref() {
+                    Value::List(ListCell::Nil) => rows = Arc::clone(remaining_rows),
+                    Value::List(ListCell::Cons { head, tail }) => {
+                        return Ok(Arc::new(Value::List(ListCell::Cons {
+                            head: Thunk::evaluated(Value::Tuple(
+                                [Arc::clone(head), Arc::clone(tail)].into(),
+                            )),
+                            tail: project_rows(Arc::clone(remaining_rows)),
+                        })));
+                    }
+                    _ => return Err(non_list("List.transpose row")),
+                },
+                _ => return Err(non_list("List.transpose")),
             }
         }
-        if heads.is_empty() {
-            break;
-        }
-        columns.push(list_from(heads));
-        rows = tails;
-    }
-    Ok(Value::List(list_cell_from(columns)))
+    })
+}
+
+fn project_field(projected: ThunkRef, index: usize) -> ThunkRef {
+    Thunk::deferred(
+        move |evaluator| match evaluator.force(&projected)?.as_ref() {
+            Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+            Value::List(ListCell::Cons { head, tail }) => match evaluator.force(head)?.as_ref() {
+                Value::Tuple(fields) if fields.len() == 2 => {
+                    Ok(Arc::new(Value::List(ListCell::Cons {
+                        head: Arc::clone(&fields[index]),
+                        tail: project_field(Arc::clone(tail), index),
+                    })))
+                }
+                _ => Err(RuntimeError::internal(
+                    "List.transpose produced malformed row projection",
+                )),
+            },
+            _ => Err(non_list("List.transpose")),
+        },
+    )
 }
 
 fn unfoldr(function: ThunkRef, seed: ThunkRef) -> ThunkRef {

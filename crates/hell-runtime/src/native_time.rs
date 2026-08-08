@@ -602,7 +602,7 @@ pub(super) fn apply_native(
         }
         "utc_time_get_current" => value(Value::Io(IoAction::new(|_, context| {
             Ok(Thunk::evaluated(Value::UtcTime(UtcTime::from_system_time(
-                context.current_time(),
+                context.current_time()?,
             ))))
         }))),
         "utc_time_iso8601_show" => evaluator

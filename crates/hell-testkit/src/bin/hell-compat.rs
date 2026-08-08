@@ -38,13 +38,13 @@ fn main() {
     if !gate.passed() {
         eprintln!(
             "compatibility gate failed: {} case(s), {} unexplained mismatch(es), {} Rust bug mismatch(es)",
-            gate.cases_run, gate.unexplained_mismatches, gate.rust_bug_mismatches
+            gate.differential_observations, gate.unexplained_mismatches, gate.rust_bug_mismatches
         );
         std::process::exit(1);
     }
     println!(
         "compatibility gate passed: {} deterministic cases",
-        gate.cases_run
+        gate.differential_observations
     );
 }
 

@@ -6,7 +6,7 @@ const REVIEWED_SNAPSHOT: &str = include_str!("../../../compat/upstream-2026-05-2
 fn api_markdown_is_sorted_and_manifest_complete() {
     let rendered = render_api_markdown();
     assert!(rendered.starts_with("# Hell 2026-05-29 API\n"));
-    assert_eq!(rendered.matches(" — compatibility: `").count(), 345);
+    assert_eq!(rendered.matches(" — wiring: `").count(), 345);
     assert_eq!(
         rendered.matches(" — `direct").count() + rendered.matches(" — `entail").count(),
         98

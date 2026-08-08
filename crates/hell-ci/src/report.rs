@@ -72,7 +72,13 @@ impl Report {
             program: Some(spec.display_program()),
             arguments: spec.display_arguments(),
             detail: if result.stdout_truncated || result.stderr_truncated {
-                Some("captured output was truncated to 1 MiB per stream".to_owned())
+                Some(format!(
+                    "bounded capture: stdout={} bytes sha256={}, stderr={} bytes sha256={}",
+                    result.stdout_bytes,
+                    result.stdout_sha256.hex(),
+                    result.stderr_bytes,
+                    result.stderr_sha256.hex()
+                ))
             } else {
                 None
             },

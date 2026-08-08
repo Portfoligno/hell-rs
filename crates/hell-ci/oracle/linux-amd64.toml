@@ -1,0 +1,21 @@
+schema_version = 1
+role = "upstream-oracle"
+platform = "linux-amd64"
+availability = "available"
+reported_version = "2026-05-29"
+upstream_repository = "https://github.com/chrisdone/hell"
+source_commit = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+compatibility_baseline_commit = "d4d028609ed46a560c62caea8c70e7e91d1afd29"
+release_tag = "2026-05-29"
+release_url = "https://github.com/chrisdone/hell/releases/tag/2026-05-29"
+asset_url = "https://github.com/chrisdone/hell/releases/download/2026-05-29/hell-linux-amd64"
+asset_sha256 = "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9"
+dependency_snapshot = "https://github.com/chrisdone/hell/blob/2026-05-29/flake.lock"
+nixpkgs_revision = "0726a0ecb6d4e08f6adced58726b95db924cef57"
+flake_utils_revision = "11707dc2f618dd54ca8739b309ec4fc024de578b"
+
+# GitHub's release metadata publishes the binary digest used above. The
+# upstream release does not publish a separate build-log artifact; therefore
+# the executable digest, pinned source commit, and pinned flake inputs are the
+# complete externally verifiable identity. Nightly hashes before execution and
+# fails closed on any mismatch.

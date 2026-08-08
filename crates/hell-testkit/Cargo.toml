@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+hell-platform = { path = "../hell-platform" }
+
 [dev-dependencies]
 hell-compiler = { path = "../hell-compiler" }
 hell-source = { path = "../hell-source" }

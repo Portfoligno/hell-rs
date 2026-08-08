@@ -21,11 +21,235 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
     check_workflows(root, &tracked, &mut failures);
     check_test_infrastructure(root, &tracked, &mut failures);
     check_environment_configuration(root, &tracked, &mut failures);
+    check_semantic_limit_inventory(root, &mut failures);
+    check_dependency_policy(root, &mut failures);
+    check_expected_mismatch_manifest(root, &mut failures);
     if failures.is_empty() {
         Ok(())
     } else {
         Err(failures.join("\n"))
     }
+}
+
+fn check_expected_mismatch_manifest(root: &Path, failures: &mut Vec<String>) {
+    let path = root.join("compat/expected-mismatches.toml");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            failures.push(format!("cannot read {}: {error}", path.display()));
+            return;
+        }
+    };
+    if !contents
+        .lines()
+        .any(|line| line.trim() == "schema_version = 1")
+        || !contents
+            .lines()
+            .any(|line| line.trim() == "baseline = \"2026-05-29\"")
+    {
+        failures.push("expected-mismatch manifest has the wrong schema or baseline".to_owned());
+    }
+    let entry_count = contents
+        .lines()
+        .filter(|line| line.trim() == "[[entry]]")
+        .count();
+    if entry_count == 0 && !contents.lines().any(|line| line.trim() == "entries = []") {
+        failures.push("empty expected-mismatch manifest must declare entries = []".to_owned());
+    }
+    if entry_count != 0 {
+        for required in [
+            "case = ",
+            "classification = ",
+            "claim = ",
+            "dimension = ",
+            "platform = ",
+            "profile = ",
+            "oracle_sha256 = ",
+            "candidate_sha256 = ",
+            "expires = ",
+            "rationale = ",
+        ] {
+            if contents
+                .lines()
+                .filter(|line| line.trim().starts_with(required))
+                .count()
+                != entry_count
+            {
+                failures.push(format!(
+                    "every expected mismatch must define exactly one {required}field"
+                ));
+            }
+        }
+    }
+}
+
+fn check_dependency_policy(root: &Path, failures: &mut Vec<String>) {
+    const PINNED_ACTION: &str =
+        "EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902";
+    let deny_path = root.join("deny.toml");
+    let deny = match fs::read_to_string(&deny_path) {
+        Ok(deny) => deny,
+        Err(error) => {
+            failures.push(format!("cannot read {}: {error}", deny_path.display()));
+            return;
+        }
+    };
+    for required in [
+        "unknown-registry = \"deny\"",
+        "unknown-git = \"deny\"",
+        "wildcards = \"deny\"",
+        "multiple-versions = \"deny\"",
+        "[advisories]",
+        "[licenses]",
+    ] {
+        if !deny.lines().any(|line| line.trim() == required) {
+            failures.push(format!("deny.toml is missing reviewed rule {required}"));
+        }
+    }
+    for workflow in [
+        root.join(".github/workflows/ci.yml"),
+        root.join(".github/workflows/nightly.yml"),
+    ] {
+        match fs::read_to_string(&workflow) {
+            Ok(contents) if contents.contains(PINNED_ACTION) => {}
+            Ok(_) => failures.push(format!(
+                "{} does not invoke the pinned dependency gate",
+                workflow.display()
+            )),
+            Err(error) => failures.push(format!("cannot read {}: {error}", workflow.display())),
+        }
+    }
+}
+
+fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
+    const REVIEWED: [(&str, &str); 6] = [
+        (
+            "crates/hell-runtime/src/native_http.rs",
+            "SANDBOX_SOCKET_TIMEOUT",
+        ),
+        (
+            "crates/hell-runtime/src/native_handle.rs",
+            "BLOCK_BUFFER_BYTES",
+        ),
+        ("crates/hell-http-host/src/lib.rs", "ENGINE_POLL_INTERVAL"),
+        ("crates/hell-http-host/src/lib.rs", "BODY_CHANNEL_CAPACITY"),
+        (
+            "crates/hell-http-host/src/lib.rs",
+            "HYPER_MINIMUM_BUFFER_SIZE",
+        ),
+        ("crates/hell-runtime/src/native_json.rs", "MAX_DEPTH"),
+    ];
+    let inventory_path = root.join("spec/runtime-profiles.md");
+    let inventory = match fs::read_to_string(&inventory_path) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            failures.push(format!(
+                "cannot read semantic-limit inventory {}: {error}",
+                inventory_path.display()
+            ));
+            return;
+        }
+    };
+    for (path, name) in REVIEWED {
+        let source_path = root.join(path);
+        let source = match fs::read_to_string(&source_path) {
+            Ok(source) => source,
+            Err(error) => {
+                failures.push(format!("cannot scan {}: {error}", source_path.display()));
+                continue;
+            }
+        };
+        if !source.contains(name) {
+            failures.push(format!(
+                "reviewed semantic limit {name} disappeared from {path}; update the inventory"
+            ));
+        }
+        if !inventory.contains(path) || !inventory.contains(name) {
+            failures.push(format!(
+                "semantic limit {path}:{name} is absent from spec/runtime-profiles.md"
+            ));
+        }
+    }
+    let mut sources = Vec::new();
+    for directory in [
+        "crates/hell-syntax/src",
+        "crates/hell-compiler/src",
+        "crates/hell-runtime/src",
+        "crates/hell-http-host/src",
+    ] {
+        collect_rust_sources(&root.join(directory), &mut sources, failures);
+    }
+    sources.sort();
+    for source_path in sources {
+        let source = match fs::read_to_string(&source_path) {
+            Ok(source) => source,
+            Err(error) => {
+                failures.push(format!("cannot scan {}: {error}", source_path.display()));
+                continue;
+            }
+        };
+        let relative = source_path
+            .strip_prefix(root)
+            .unwrap_or(&source_path)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        for name in semantic_constant_names(&source) {
+            let marker = format!("`{relative}`: `{name}`");
+            if !inventory.contains(&marker) {
+                failures.push(format!(
+                    "unreviewed semantic-limit candidate {relative}:{name}; classify it in spec/runtime-profiles.md"
+                ));
+            }
+        }
+    }
+}
+
+fn collect_rust_sources(directory: &Path, files: &mut Vec<PathBuf>, failures: &mut Vec<String>) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            failures.push(format!("cannot enumerate {}: {error}", directory.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(format!("cannot enumerate {}: {error}", directory.display()));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, files, failures);
+        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn semantic_constant_names(source: &str) -> impl Iterator<Item = &str> {
+    const INDICATORS: [&str; 7] = [
+        "MAX_",
+        "_LIMIT",
+        "_TIMEOUT",
+        "_CAPACITY",
+        "_BUFFER_BYTES",
+        "_STACK_BYTES",
+        "_RETRIES",
+    ];
+    source.lines().filter_map(|line| {
+        let code = line.split_once("//").map_or(line, |(code, _)| code);
+        let (_, declaration) = code.split_once("const ")?;
+        let (name, _) = declaration.split_once(':')?;
+        let name = name.trim();
+        (name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && INDICATORS.iter().any(|indicator| name.contains(indicator)))
+        .then_some(name)
+    })
 }
 
 fn check_checkout_attributes(root: &Path, failures: &mut Vec<String>) {
@@ -138,7 +362,14 @@ pub fn normalized_relative_path(value: &str) -> Result<PathBuf, String> {
 
 fn tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let output = Command::new("git")
-        .args(["ls-files", "-z"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ])
         .current_dir(root)
         .output()
         .map_err(|error| format!("git ls-files failed to start: {error}"))?;
@@ -153,6 +384,10 @@ fn tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
             String::from_utf8(value.to_vec())
                 .map(PathBuf::from)
                 .map_err(|_| "tracked path is not UTF-8".to_owned())
+        })
+        .filter(|path| {
+            path.as_ref()
+                .map_or(true, |path| !path.starts_with(".serena"))
         })
         .collect()
 }
@@ -268,7 +503,11 @@ fn check_workflow(path: &Path, text: &str, failures: &mut Vec<String>) {
         if yaml_key(entry, "shell").is_some() {
             failures.push(format!("workflow shell key is forbidden at {location}"));
         }
-        if yaml_key(entry, "env").is_some() {
+        let reviewed_source_commit = *original == "env:"
+            && lines
+                .get(index + 1)
+                .is_some_and(|line| *line == "  HELL_SOURCE_COMMIT: ${{ github.sha }}");
+        if yaml_key(entry, "env").is_some() && !reviewed_source_commit {
             failures.push(format!("workflow env key is forbidden at {location}"));
         }
         if yaml_key(entry, "pull_request").is_some()
@@ -688,6 +927,13 @@ mod tests {
         ] {
             assert!(!workflow(value).is_empty(), "accepted {value:?}");
         }
+    }
+
+    #[test]
+    fn only_the_reviewed_source_commit_workflow_binding_is_accepted() {
+        assert!(workflow("env:\n  HELL_SOURCE_COMMIT: ${{ github.sha }}\n").is_empty());
+        assert!(!workflow("env:\n  HELL_SOURCE_COMMIT: untrusted\n").is_empty());
+        assert!(!workflow("  env:\n    HELL_SOURCE_COMMIT: ${{ github.sha }}\n").is_empty());
     }
 
     #[test]

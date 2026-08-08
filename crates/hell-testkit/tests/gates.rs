@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use hell_testkit::{
     ClassifiedMismatch, DeterministicBytes, DeterministicUtf8, DifferentialCase,
-    DifferentialMismatch, DivergenceClass, MismatchKind, differential, release_gate,
+    DifferentialMismatch, Digest, DivergenceClass, EnvironmentProfile, ExecutableRole,
+    MismatchKind, differential, release_gate, verify_executable,
 };
 
 #[test]
@@ -22,10 +23,57 @@ fn deterministic_corpus_is_reproducible_and_bounded() {
 }
 
 #[test]
-fn identical_processes_pass_the_isolated_differential_gate() {
-    let executable = std::env::current_exe().expect("current test executable");
+fn process_capable_profile_requires_and_accepts_a_typed_helper_contract() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_hell-test-helper"));
+    let missing = DifferentialCase {
+        source: Arc::from("--version"),
+        environment_profile: EnvironmentProfile::ProcessCapable,
+        ..DifferentialCase::default()
+    };
+    let error = differential(&executable, &executable, &missing)
+        .expect_err("missing typed helper directory must fail closed");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let helper_directory =
+        std::env::temp_dir().join(format!("hell-process-capable-{}", std::process::id()));
+    std::fs::create_dir_all(&helper_directory).unwrap();
     let case = DifferentialCase {
-        source: Arc::from("main = IO.pure ()\n"),
+        source: Arc::from("--version"),
+        environment_profile: EnvironmentProfile::ProcessCapable,
+        process_helper_directory: Some(helper_directory.clone()),
+        ..DifferentialCase::default()
+    };
+    let report = differential(&executable, &executable, &case).unwrap();
+    assert!(report.agrees());
+    std::fs::remove_dir(helper_directory).unwrap();
+}
+
+#[test]
+fn wrong_digest_is_rejected_before_executable_is_invoked() {
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_hell-test-helper"));
+    let copied = std::env::temp_dir().join(format!("must-not-run-{}", std::process::id()));
+    let mut marker = copied.as_os_str().to_os_string();
+    marker.push(".invoked");
+    let marker = std::path::PathBuf::from(marker);
+    let _ = std::fs::remove_file(&copied);
+    let _ = std::fs::remove_file(&marker);
+    std::fs::copy(helper, &copied).expect("copy helper executable");
+    let result = verify_executable(
+        &copied,
+        ExecutableRole::Oracle,
+        Some(Digest([0; 32])),
+        "hell-test-helper-1",
+    );
+    assert!(result.is_err());
+    assert!(!marker.exists(), "wrong-digest executable was invoked");
+    std::fs::remove_file(copied).expect("remove copied helper");
+}
+
+#[test]
+fn identical_processes_pass_the_isolated_differential_gate() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_hell-test-helper"));
+    let case = DifferentialCase {
+        source: Arc::from("--version"),
         timeout: Duration::from_secs(2),
         ..DifferentialCase::default()
     };

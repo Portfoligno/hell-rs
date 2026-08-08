@@ -7,6 +7,18 @@ fn next_argument(arguments: &mut impl Iterator<Item = OsString>, name: &str) -> 
         .unwrap_or_else(|| panic!("missing {name} argument"))
 }
 
+#[allow(clippy::zombie_processes)]
+fn spawn_delayed_write(path: OsString, delay_millis: &str) -> std::process::Child {
+    // These operations intentionally exercise a descendant that the process
+    // supervisor, rather than the fixture parent, must reap or terminate.
+    std::process::Command::new(std::env::current_exe().expect("resolve fixture executable"))
+        .arg("delayed-write")
+        .arg(path)
+        .arg(delay_millis)
+        .spawn()
+        .expect("spawn fixture grandchild")
+}
+
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
     let operation = next_argument(&mut arguments, "operation");
@@ -37,6 +49,29 @@ fn main() {
                 .expect("exit code must be an integer");
             assert!(arguments.next().is_none(), "unexpected trailing argument");
             std::process::exit(code);
+        }
+        Some("delayed-write") => {
+            let path = next_argument(&mut arguments, "output path");
+            let delay_millis = next_argument(&mut arguments, "delay milliseconds")
+                .to_string_lossy()
+                .parse()
+                .expect("delay must be an integer");
+            assert!(arguments.next().is_none(), "unexpected trailing argument");
+            std::thread::sleep(std::time::Duration::from_millis(delay_millis));
+            std::fs::write(path, b"descendant survived").expect("write delayed marker");
+        }
+        Some("spawn-grandchild") => {
+            let path = next_argument(&mut arguments, "output path");
+            assert!(arguments.next().is_none(), "unexpected trailing argument");
+            #[allow(clippy::zombie_processes)]
+            let _grandchild = spawn_delayed_write(path, "400");
+            std::thread::sleep(std::time::Duration::from_mins(1));
+        }
+        Some("spawn-grandchild-exit") => {
+            let path = next_argument(&mut arguments, "output path");
+            assert!(arguments.next().is_none(), "unexpected trailing argument");
+            #[allow(clippy::zombie_processes)]
+            let _grandchild = spawn_delayed_write(path, "2000");
         }
         _ => panic!("unknown fixture operation: {}", operation.to_string_lossy()),
     }

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hell_core::{
     CaseBranch, ClassEvidence, Constant, CoreId, CoreKind, CoreNode, CoreProgram, Projection,
@@ -16,17 +17,155 @@ use hell_syntax::{
 };
 use hell_types::{ClosedTypeId, KindArena, TypeArena, TypeError, TypeId, TypeNode, Unifier};
 
-#[derive(Clone, Debug, Default)]
-pub struct CompileOptions {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompilerProfile {
+    Upstream,
+    Sandboxed,
+    DeterministicTest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit<T> {
+    Unlimited,
+    At(T),
+}
+
+impl<T: Copy> Limit<T> {
+    const fn value(self) -> Option<T> {
+        match self {
+            Self::Unlimited => None,
+            Self::At(value) => Some(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompilerLimits {
+    pub parser: hell_syntax::ParserLimits,
+    pub source_bytes: Limit<u64>,
+    pub tokens: Limit<u64>,
+    pub syntax_nodes: Limit<u64>,
+    pub nesting: Limit<u32>,
+    pub type_constraints: Limit<u64>,
+    pub core_nodes: Limit<u64>,
     pub max_expansion_depth: Option<usize>,
     pub max_elaborated_nodes: Option<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompilerConfig {
+    pub id: Arc<str>,
+    pub profile: CompilerProfile,
+    pub limits: CompilerLimits,
+    pub collect_stats: bool,
+}
+
+impl CompilerConfig {
+    #[must_use]
+    pub fn upstream() -> Self {
+        Self {
+            id: Arc::from("upstream"),
+            profile: CompilerProfile::Upstream,
+            limits: CompilerLimits {
+                parser: hell_syntax::ParserLimits::upstream(),
+                source_bytes: Limit::Unlimited,
+                tokens: Limit::Unlimited,
+                syntax_nodes: Limit::Unlimited,
+                nesting: Limit::Unlimited,
+                type_constraints: Limit::Unlimited,
+                core_nodes: Limit::Unlimited,
+                max_expansion_depth: None,
+                max_elaborated_nodes: None,
+            },
+            collect_stats: false,
+        }
+    }
+
+    #[must_use]
+    pub fn sandboxed() -> Self {
+        Self {
+            id: Arc::from("sandboxed"),
+            profile: CompilerProfile::Sandboxed,
+            limits: CompilerLimits {
+                parser: hell_syntax::ParserLimits::sandboxed(),
+                source_bytes: Limit::At(64 * 1024 * 1024),
+                tokens: Limit::At(1_000_000),
+                syntax_nodes: Limit::At(1_000_000),
+                nesting: Limit::At(64),
+                type_constraints: Limit::At(1_000_000),
+                core_nodes: Limit::At(1_000_000),
+                max_expansion_depth: Some(256),
+                max_elaborated_nodes: Some(1_000_000),
+            },
+            collect_stats: false,
+        }
+    }
+
+    #[must_use]
+    pub fn deterministic_test() -> Self {
+        let mut config = Self::sandboxed();
+        config.id = Arc::from("deterministic-test");
+        config.profile = CompilerProfile::DeterministicTest;
+        config
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CompilerStats {
+    enabled: bool,
     pub parsed_declarations: usize,
     pub elaborated_nodes: usize,
     pub global_expansions: usize,
+    pub timings: Vec<CompilerTiming>,
+}
+
+impl CompilerStats {
+    fn begin_run(&mut self) {
+        let enabled = self.enabled;
+        *self = Self {
+            enabled,
+            ..Self::default()
+        };
+    }
+
+    fn record_timing(&mut self, depth: u16, label: &'static str, started: Instant) {
+        self.record_elapsed(depth, label, started.elapsed());
+    }
+
+    fn record_elapsed(&mut self, depth: u16, label: &'static str, elapsed: Duration) {
+        if self.enabled {
+            self.timings.push(CompilerTiming {
+                depth,
+                label,
+                elapsed,
+            });
+        }
+    }
+
+    fn set_parsed_declarations(&mut self, declarations: usize) {
+        if self.enabled {
+            self.parsed_declarations = declarations;
+        }
+    }
+
+    fn record_elaborated_node(&mut self) {
+        if self.enabled {
+            self.elaborated_nodes += 1;
+        }
+    }
+
+    fn record_global_expansion(&mut self) {
+        if self.enabled {
+            self.global_expansions += 1;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompilerTiming {
+    pub depth: u16,
+    pub label: &'static str,
+    pub elapsed: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -34,7 +173,7 @@ pub struct CompilerSession {
     pub sources: SourceMap,
     pub kinds: KindArena,
     pub types: TypeArena,
-    pub options: CompileOptions,
+    pub config: CompilerConfig,
     pub stats: CompilerStats,
 }
 
@@ -44,12 +183,30 @@ impl Default for CompilerSession {
             sources: SourceMap::new(),
             kinds: KindArena::default(),
             types: TypeArena::default(),
-            options: CompileOptions {
-                max_expansion_depth: Some(256),
-                max_elaborated_nodes: Some(1_000_000),
-            },
+            config: CompilerConfig::sandboxed(),
             stats: CompilerStats::default(),
         }
+    }
+}
+
+impl CompilerSession {
+    /// Uses the compatibility profile without the sandbox parser nesting cap.
+    #[must_use]
+    pub fn upstream() -> Self {
+        Self {
+            config: CompilerConfig::upstream(),
+            ..Self::default()
+        }
+    }
+
+    /// Enables timing and counter collection for the next compilation.
+    pub fn enable_stats(&mut self) {
+        self.config.collect_stats = true;
+        self.stats.enabled = true;
+    }
+
+    fn record_timing(&mut self, depth: u16, label: &'static str, started: Instant) {
+        self.stats.record_timing(depth, label, started);
     }
 }
 
@@ -158,6 +315,15 @@ pub fn compile_file(
     session: &mut CompilerSession,
     path: &Path,
 ) -> Result<VerifiedProgram, DiagnosticBundle> {
+    compile_file_current(session, path)
+}
+
+fn compile_file_current(
+    session: &mut CompilerSession,
+    path: &Path,
+) -> Result<VerifiedProgram, DiagnosticBundle> {
+    session.stats.begin_run();
+    let started = Instant::now();
     let source = session.sources.read_file(path).map_err(|error| {
         let code = if error.kind() == std::io::ErrorKind::InvalidData {
             "H0002"
@@ -166,6 +332,7 @@ pub fn compile_file(
         };
         DiagnosticBundle(vec![Diagnostic::new(code, error.to_string(), None)])
     })?;
+    session.record_timing(1, "read_file", started);
     compile_source_file(session, &source)
 }
 
@@ -180,11 +347,21 @@ pub fn compile_source(
     name: impl Into<Arc<str>>,
     source: impl Into<Arc<str>>,
 ) -> Result<VerifiedProgram, DiagnosticBundle> {
+    let name = name.into();
     let source = source.into();
+    compile_source_current(session, &name, &source)
+}
+
+fn compile_source_current(
+    session: &mut CompilerSession,
+    name: &Arc<str>,
+    source: &Arc<str>,
+) -> Result<VerifiedProgram, DiagnosticBundle> {
+    session.stats.begin_run();
     let file = session
         .sources
         .add_bytes(
-            SourceName::Virtual(name.into()),
+            SourceName::Virtual(Arc::clone(name)),
             Arc::<[u8]>::from(source.as_bytes()),
         )
         .map_err(|error| {
@@ -193,12 +370,55 @@ pub fn compile_source(
     compile_source_file(session, &file)
 }
 
+fn compiler_limit_error(
+    operation: &str,
+    profile: &str,
+    configured: u64,
+    observed: u64,
+    span: impl Into<Option<Span>>,
+) -> DiagnosticBundle {
+    DiagnosticBundle(vec![Diagnostic::new(
+        "H0802",
+        format!(
+            "compiler resource limit exceeded: operation={operation} profile={profile} configured={configured} observed={observed}"
+        ),
+        span,
+    )])
+}
+
 #[allow(clippy::too_many_lines)]
 fn compile_source_file(
     session: &mut CompilerSession,
     source: &SourceFile,
 ) -> Result<VerifiedProgram, DiagnosticBundle> {
-    let parsed = hell_syntax::parse(source).map_err(|errors| {
+    let profile_id = Arc::clone(&session.config.id);
+    let profile = profile_id.as_ref();
+    let source_bytes = u64::try_from(source.bytes.len()).unwrap_or(u64::MAX);
+    if let Some(configured) = session.config.limits.source_bytes.value()
+        && source_bytes > configured
+    {
+        return Err(compiler_limit_error(
+            "read_source",
+            profile,
+            configured,
+            source_bytes,
+            source.eof_span(),
+        ));
+    }
+    let mut parser_limits = session.config.limits.parser;
+    parser_limits.profile_id = match session.config.profile {
+        CompilerProfile::Upstream => "upstream",
+        CompilerProfile::Sandboxed => "sandboxed",
+        CompilerProfile::DeterministicTest => "deterministic-test",
+    };
+    if let Some(configured) = session.config.limits.tokens.value() {
+        parser_limits.max_tokens = Some(usize::try_from(configured).unwrap_or(usize::MAX));
+    }
+    if let Some(configured) = session.config.limits.nesting.value() {
+        parser_limits.max_nesting_depth = Some(usize::try_from(configured).unwrap_or(usize::MAX));
+    }
+    let parse_started = Instant::now();
+    let parsed = hell_syntax::parse_with_limits(source, parser_limits).map_err(|errors| {
         DiagnosticBundle(
             errors
                 .into_iter()
@@ -206,12 +426,40 @@ fn compile_source_file(
                 .collect(),
         )
     })?;
-    session.stats.parsed_declarations = parsed.declarations.len();
+    let syntax_nodes = parsed
+        .declarations
+        .len()
+        .saturating_add(parsed.expressions.len())
+        .saturating_add(parsed.types.len());
+    let syntax_nodes = u64::try_from(syntax_nodes).unwrap_or(u64::MAX);
+    if let Some(configured) = session.config.limits.syntax_nodes.value()
+        && syntax_nodes > configured
+    {
+        return Err(compiler_limit_error(
+            "build_syntax",
+            profile,
+            configured,
+            syntax_nodes,
+            parsed.span,
+        ));
+    }
+    session.record_timing(1, "parse_module_with_mode", parse_started);
+    session
+        .stats
+        .set_parsed_declarations(parsed.declarations.len());
+    let resolve_started = Instant::now();
+    let desugar_started = Instant::now();
     let user_types = collect_user_types(&parsed)?;
     let globals = collect_globals(&parsed, &user_types)?;
     validate_all_names(&parsed, &globals, &user_types)?;
+    session.record_timing(1, "resolve_module", resolve_started);
+    session.record_timing(0, "parse", parse_started);
+    let desugar_elapsed = desugar_started.elapsed();
+    let cycle_started = Instant::now();
     reject_type_cycles(&parsed, &user_types)?;
     reject_cycles(&parsed, &globals)?;
+    session.record_timing(0, "cycle_detect", cycle_started);
+    session.stats.record_elapsed(0, "desugar", desugar_elapsed);
     let Some(main) = globals.get("main").copied() else {
         return Err(DiagnosticBundle(vec![Diagnostic::new(
             "H0701",
@@ -224,6 +472,7 @@ fn compile_source_file(
     // deterministic and preventing cross-program type identity leaks.
     session.kinds = KindArena::default();
     session.types = TypeArena::default();
+    let infer_started = Instant::now();
     let mut context = InferContext {
         parsed: &parsed,
         globals: &globals,
@@ -239,13 +488,23 @@ fn compile_source_file(
         record_wanteds: Vec::new(),
         temporary: Vec::new(),
         expansion_stack: Vec::new(),
+        preinferred: HashMap::new(),
+        preinferred_bindings: HashMap::new(),
+        worklist_bypass: HashSet::new(),
+        type_constraints: 0,
+        profile_id,
         stats: &mut session.stats,
-        options: &session.options,
+        limits: &session.config.limits,
     };
+    let elaborate_started = Instant::now();
     let root = context.expand_global(main, &mut Vec::new())?;
+    context
+        .stats
+        .record_timing(1, "elaborate", elaborate_started);
     let unit = context.types.constructor("()", KindArena::TYPE);
     let main_expected = context.types.io(unit, context.kinds);
 
+    let unify_started = Instant::now();
     for (selected, declared, wanted_span) in context.record_wanteds.clone() {
         let selected =
             context
@@ -275,7 +534,9 @@ fn compile_source_file(
             )]));
         }
     }
+    context.stats.record_timing(1, "unify", unify_started);
 
+    let zonk_started = Instant::now();
     let mut closed_types = Vec::with_capacity(context.temporary.len());
     let mut closed_by_type = HashMap::new();
     for temporary in &context.temporary {
@@ -447,9 +708,14 @@ fn compile_source_file(
         types: context.types.clone(),
         main_type,
     };
-    hell_core::verify(program).map_err(|error| {
+    context.stats.record_timing(1, "zonk", zonk_started);
+    context.stats.record_timing(0, "infer", infer_started);
+    let check_started = Instant::now();
+    let verified = hell_core::verify(program).map_err(|error| {
         DiagnosticBundle(vec![Diagnostic::new(error.code, error.message, error.span)])
-    })
+    })?;
+    context.stats.record_timing(0, "check", check_started);
+    Ok(verified)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -666,151 +932,76 @@ fn validate_expression(
     locals: &mut Vec<Arc<str>>,
     errors: &mut Vec<Diagnostic>,
 ) {
-    let expression = &parsed.expressions[id.0 as usize];
-    match expression {
-        Expr::Name(name, span) => {
-            if let Some(global) = name.strip_prefix("Main.") {
-                if !globals.contains_key(global) && !user_types.constructors.contains_key(global) {
-                    errors.push(Diagnostic::new(
-                        "H0402",
-                        format!("unknown global `{name}`"),
-                        *span,
-                    ));
-                }
-            } else if name.contains('.') || is_operator(name) {
-                if matches!(name.as_ref(), "Record.get" | "Record.set" | "Record.modify") {
-                    return;
-                }
-                match hell_builtins::lookup(name) {
-                    None => errors.push(Diagnostic::new(
-                        "H0403",
-                        format!("unknown primitive `{name}`"),
-                        *span,
-                    )),
-                    Some(spec) if spec.implementation.is_none() => errors.push(Diagnostic::new(
-                        "H0004",
-                        format!("primitive `{name}` is not available in this build"),
-                        *span,
-                    )),
-                    Some(_) => {}
-                }
-            } else if !locals.iter().rev().any(|local| local == name) {
-                let message = if globals.contains_key(name) {
-                    format!("global `{name}` must be referenced as `Main.{name}`")
-                } else if user_types.constructors.contains_key(name) {
-                    format!("constructor `{name}` must be qualified as `Main.{name}`")
-                } else {
-                    format!("unbound local `{name}`")
+    enum Work {
+        Expression(ExprId),
+        Type(TypeExprId),
+        RestoreLocals(usize),
+        DoNext {
+            expression: ExprId,
+            index: usize,
+        },
+        DoBind {
+            expression: ExprId,
+            index: usize,
+            pattern: BindingPattern,
+        },
+        CaseNext {
+            expression: ExprId,
+            index: usize,
+        },
+        CaseContinue {
+            expression: ExprId,
+            index: usize,
+            base: usize,
+        },
+    }
+
+    let mut work = vec![Work::Expression(id)];
+    while let Some(step) = work.pop() {
+        match step {
+            Work::Type(id) => validate_type(parsed, id, user_types, errors),
+            Work::RestoreLocals(base) => locals.truncate(base),
+            Work::DoNext { expression, index } => {
+                let Expr::Do { statements, .. } = &parsed.expressions[expression.0 as usize] else {
+                    unreachable!("do continuation references a do expression")
                 };
-                errors.push(Diagnostic::new("H0401", message, *span));
-            }
-        }
-        Expr::Literal(_, _) => {}
-        Expr::Apply {
-            function, argument, ..
-        } => {
-            validate_expression(parsed, *function, globals, user_types, locals, errors);
-            validate_expression(parsed, *argument, globals, user_types, locals, errors);
-        }
-        Expr::TypeApply {
-            function, argument, ..
-        } => {
-            validate_expression(parsed, *function, globals, user_types, locals, errors);
-            validate_type(parsed, *argument, user_types, errors);
-        }
-        Expr::Lambda {
-            parameters, body, ..
-        } => {
-            let base = locals.len();
-            for pattern in parameters {
-                push_pattern_names(pattern, locals, errors);
-            }
-            validate_expression(parsed, *body, globals, user_types, locals, errors);
-            locals.truncate(base);
-        }
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            for child in [condition, then_branch, else_branch] {
-                validate_expression(parsed, *child, globals, user_types, locals, errors);
-            }
-        }
-        Expr::Do { statements, .. } => {
-            let base = locals.len();
-            for statement in statements {
+                let Some(statement) = statements.get(index) else {
+                    continue;
+                };
                 match statement {
-                    DoStatement::Bind(pattern, expression, _)
-                    | DoStatement::Let(pattern, expression, _) => {
-                        validate_expression(
-                            parsed,
-                            *expression,
-                            globals,
-                            user_types,
-                            locals,
-                            errors,
-                        );
-                        push_pattern_names(pattern, locals, errors);
+                    DoStatement::Bind(pattern, child, _) | DoStatement::Let(pattern, child, _) => {
+                        work.push(Work::DoBind {
+                            expression,
+                            index: index + 1,
+                            pattern: pattern.clone(),
+                        });
+                        work.push(Work::Expression(*child));
                     }
-                    DoStatement::Then(expression, _) => {
-                        validate_expression(
-                            parsed,
-                            *expression,
-                            globals,
-                            user_types,
-                            locals,
-                            errors,
-                        );
+                    DoStatement::Then(child, _) => {
+                        work.push(Work::DoNext {
+                            expression,
+                            index: index + 1,
+                        });
+                        work.push(Work::Expression(*child));
                     }
                 }
             }
-            locals.truncate(base);
-        }
-        Expr::Tuple { elements, .. } | Expr::List { elements, .. } => {
-            for child in elements {
-                validate_expression(parsed, *child, globals, user_types, locals, errors);
+            Work::DoBind {
+                expression,
+                index,
+                pattern,
+            } => {
+                push_pattern_names(&pattern, locals, errors);
+                work.push(Work::DoNext { expression, index });
             }
-        }
-        Expr::RecordConstruction {
-            constructor,
-            fields,
-            span,
-        } => {
-            let known_user_record = constructor.strip_prefix("Main.").is_some_and(|name| {
-                matches!(
-                    user_types.constructors.get(name),
-                    Some(ConstructorOwner::Record { .. })
-                )
-            });
-            let known_fallback = hell_builtins::lookup(constructor).is_some();
-            if !known_user_record && !known_fallback {
-                errors.push(Diagnostic::new(
-                    "H0403",
-                    format!("unknown record-construction function `{constructor}`"),
-                    *span,
-                ));
-            }
-            let mut supplied = HashSet::new();
-            for field in fields {
-                if !supplied.insert(field.name.as_ref()) {
-                    errors.push(Diagnostic::new(
-                        "H0603",
-                        format!("duplicate record initializer `{}`", field.name),
-                        field.span,
-                    ));
-                }
-                validate_expression(parsed, field.value, globals, user_types, locals, errors);
-            }
-        }
-        Expr::Case {
-            scrutinee,
-            alternatives,
-            ..
-        } => {
-            validate_expression(parsed, *scrutinee, globals, user_types, locals, errors);
-            for alternative in alternatives {
+            Work::CaseNext { expression, index } => {
+                let Expr::Case { alternatives, .. } = &parsed.expressions[expression.0 as usize]
+                else {
+                    unreachable!("case continuation references a case expression")
+                };
+                let Some(alternative) = alternatives.get(index) else {
+                    continue;
+                };
                 let base = locals.len();
                 match &alternative.pattern {
                     CasePattern::UserConstructor { binder, .. } => {
@@ -823,20 +1014,155 @@ fn validate_expression(
                     }
                     CasePattern::Wildcard(_) => {}
                 }
-                validate_expression(
-                    parsed,
-                    alternative.expression,
-                    globals,
-                    user_types,
-                    locals,
-                    errors,
-                );
-                locals.truncate(base);
+                work.push(Work::CaseContinue {
+                    expression,
+                    index: index + 1,
+                    base,
+                });
+                work.push(Work::Expression(alternative.expression));
             }
-        }
-        Expr::Annotation { expression, ty, .. } => {
-            validate_expression(parsed, *expression, globals, user_types, locals, errors);
-            validate_type(parsed, *ty, user_types, errors);
+            Work::CaseContinue {
+                expression,
+                index,
+                base,
+            } => {
+                locals.truncate(base);
+                work.push(Work::CaseNext { expression, index });
+            }
+            Work::Expression(id) => match &parsed.expressions[id.0 as usize] {
+                Expr::Name(name, span) => {
+                    if let Some(global) = name.strip_prefix("Main.") {
+                        if !globals.contains_key(global)
+                            && !user_types.constructors.contains_key(global)
+                        {
+                            errors.push(Diagnostic::new(
+                                "H0402",
+                                format!("unknown global `{name}`"),
+                                *span,
+                            ));
+                        }
+                    } else if name.contains('.') || is_operator(name) {
+                        if matches!(name.as_ref(), "Record.get" | "Record.set" | "Record.modify") {
+                            continue;
+                        }
+                        match hell_builtins::lookup(name) {
+                            None => errors.push(Diagnostic::new(
+                                "H0403",
+                                format!("unknown primitive `{name}`"),
+                                *span,
+                            )),
+                            Some(spec) if spec.implementation.is_none() => {
+                                errors.push(Diagnostic::new(
+                                    "H0004",
+                                    format!("primitive `{name}` is not available in this build"),
+                                    *span,
+                                ));
+                            }
+                            Some(_) => {}
+                        }
+                    } else if !locals.iter().rev().any(|local| local == name) {
+                        let message = if globals.contains_key(name) {
+                            format!("global `{name}` must be referenced as `Main.{name}`")
+                        } else if user_types.constructors.contains_key(name) {
+                            format!("constructor `{name}` must be qualified as `Main.{name}`")
+                        } else {
+                            format!("unbound local `{name}`")
+                        };
+                        errors.push(Diagnostic::new("H0401", message, *span));
+                    }
+                }
+                Expr::Literal(_, _) => {}
+                Expr::Apply {
+                    function, argument, ..
+                } => {
+                    work.push(Work::Expression(*argument));
+                    work.push(Work::Expression(*function));
+                }
+                Expr::TypeApply {
+                    function, argument, ..
+                } => {
+                    work.push(Work::Type(*argument));
+                    work.push(Work::Expression(*function));
+                }
+                Expr::Lambda {
+                    parameters, body, ..
+                } => {
+                    let base = locals.len();
+                    for pattern in parameters {
+                        push_pattern_names(pattern, locals, errors);
+                    }
+                    work.push(Work::RestoreLocals(base));
+                    work.push(Work::Expression(*body));
+                }
+                Expr::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    work.push(Work::Expression(*else_branch));
+                    work.push(Work::Expression(*then_branch));
+                    work.push(Work::Expression(*condition));
+                }
+                Expr::Do { .. } => {
+                    let base = locals.len();
+                    work.push(Work::RestoreLocals(base));
+                    work.push(Work::DoNext {
+                        expression: id,
+                        index: 0,
+                    });
+                }
+                Expr::Tuple { elements, .. } | Expr::List { elements, .. } => {
+                    work.extend(elements.iter().rev().copied().map(Work::Expression));
+                }
+                Expr::RecordConstruction {
+                    constructor,
+                    fields,
+                    span,
+                } => {
+                    let known_user_record = constructor.strip_prefix("Main.").is_some_and(|name| {
+                        matches!(
+                            user_types.constructors.get(name),
+                            Some(ConstructorOwner::Record { .. })
+                        )
+                    });
+                    let known_fallback = hell_builtins::lookup(constructor).is_some();
+                    if !known_user_record && !known_fallback {
+                        errors.push(Diagnostic::new(
+                            "H0403",
+                            format!("unknown record-construction function `{constructor}`"),
+                            *span,
+                        ));
+                    }
+                    let mut supplied = HashSet::new();
+                    for field in fields {
+                        if !supplied.insert(field.name.as_ref()) {
+                            errors.push(Diagnostic::new(
+                                "H0603",
+                                format!("duplicate record initializer `{}`", field.name),
+                                field.span,
+                            ));
+                        }
+                    }
+                    work.extend(
+                        fields
+                            .iter()
+                            .rev()
+                            .map(|field| Work::Expression(field.value)),
+                    );
+                }
+                Expr::Case { scrutinee, .. } => {
+                    work.push(Work::CaseNext {
+                        expression: id,
+                        index: 0,
+                    });
+                    work.push(Work::Expression(*scrutinee));
+                }
+                Expr::Annotation { expression, ty, .. } => {
+                    work.push(Work::Type(*ty));
+                    work.push(Work::Expression(*expression));
+                }
+            },
         }
     }
 }
@@ -846,6 +1172,10 @@ fn push_pattern_names(
     locals: &mut Vec<Arc<str>>,
     errors: &mut Vec<Diagnostic>,
 ) {
+    let mut pattern = pattern;
+    while let BindingPattern::Annotated(inner, _, _) = pattern {
+        pattern = inner;
+    }
     match pattern {
         BindingPattern::Variable(name, _) => locals.push(Arc::clone(name)),
         BindingPattern::Wildcard(_) => locals.push("_".into()),
@@ -862,7 +1192,7 @@ fn push_pattern_names(
                 locals.push(Arc::clone(name));
             }
         }
-        BindingPattern::Annotated(inner, _, _) => push_pattern_names(inner, locals, errors),
+        BindingPattern::Annotated(_, _, _) => unreachable!("annotations were stripped above"),
     }
 }
 
@@ -872,26 +1202,25 @@ fn validate_type(
     user_types: &UserTypes,
     errors: &mut Vec<Diagnostic>,
 ) {
-    match &parsed.types[id.0 as usize] {
-        TypeExpr::Name(name, span) => {
-            if !is_public_type_name(name) && !user_types.by_name.contains_key(name) {
-                errors.push(Diagnostic::new(
-                    "H0404",
-                    format!("unknown or unavailable type `{name}`"),
-                    *span,
-                ));
+    let mut work = vec![id];
+    while let Some(id) = work.pop() {
+        match &parsed.types[id.0 as usize] {
+            TypeExpr::Name(name, span) => {
+                if !is_public_type_name(name) && !user_types.by_name.contains_key(name) {
+                    errors.push(Diagnostic::new(
+                        "H0404",
+                        format!("unknown or unavailable type `{name}`"),
+                        *span,
+                    ));
+                }
             }
-        }
-        TypeExpr::Unit(_) | TypeExpr::Promoted(_, _) => {}
-        TypeExpr::List(item, _) => validate_type(parsed, *item, user_types, errors),
-        TypeExpr::Tuple(items, _) => {
-            for item in items {
-                validate_type(parsed, *item, user_types, errors);
+            TypeExpr::Unit(_) | TypeExpr::Promoted(_, _) => {}
+            TypeExpr::List(item, _) => work.push(*item),
+            TypeExpr::Tuple(items, _) => work.extend(items.iter().rev().copied()),
+            TypeExpr::Function(left, right, _) | TypeExpr::Apply(left, right, _) => {
+                work.push(*right);
+                work.push(*left);
             }
-        }
-        TypeExpr::Function(left, right, _) | TypeExpr::Apply(left, right, _) => {
-            validate_type(parsed, *left, user_types, errors);
-            validate_type(parsed, *right, user_types, errors);
         }
     }
 }
@@ -903,23 +1232,22 @@ fn reject_type_cycles(parsed: &ParsedFile, user_types: &UserTypes) -> Result<(),
         user_types: &UserTypes,
         output: &mut Vec<usize>,
     ) {
-        match &parsed.types[id.0 as usize] {
-            TypeExpr::Name(name, _) => {
-                if let Some(index) = user_types.by_name.get(name) {
-                    output.push(*index);
+        let mut work = vec![id];
+        while let Some(id) = work.pop() {
+            match &parsed.types[id.0 as usize] {
+                TypeExpr::Name(name, _) => {
+                    if let Some(index) = user_types.by_name.get(name) {
+                        output.push(*index);
+                    }
                 }
-            }
-            TypeExpr::List(item, _) => collect(parsed, *item, user_types, output),
-            TypeExpr::Tuple(items, _) => {
-                for item in items {
-                    collect(parsed, *item, user_types, output);
+                TypeExpr::List(item, _) => work.push(*item),
+                TypeExpr::Tuple(items, _) => work.extend(items.iter().rev().copied()),
+                TypeExpr::Function(left, right, _) | TypeExpr::Apply(left, right, _) => {
+                    work.push(*right);
+                    work.push(*left);
                 }
+                TypeExpr::Unit(_) | TypeExpr::Promoted(_, _) => {}
             }
-            TypeExpr::Function(left, right, _) | TypeExpr::Apply(left, right, _) => {
-                collect(parsed, *left, user_types, output);
-                collect(parsed, *right, user_types, output);
-            }
-            TypeExpr::Unit(_) | TypeExpr::Promoted(_, _) => {}
         }
     }
     let dependencies: Vec<Vec<usize>> = user_types
@@ -1033,69 +1361,66 @@ fn collect_dependencies(
     globals: &HashMap<Arc<str>, usize>,
     output: &mut Vec<usize>,
 ) {
-    match &parsed.expressions[id.0 as usize] {
-        Expr::Name(name, _) => {
-            if let Some(global) = name.strip_prefix("Main.")
-                && let Some(index) = globals.get(global)
-            {
-                output.push(*index);
+    let mut work = vec![id];
+    while let Some(id) = work.pop() {
+        match &parsed.expressions[id.0 as usize] {
+            Expr::Name(name, _) => {
+                if let Some(global) = name.strip_prefix("Main.")
+                    && let Some(index) = globals.get(global)
+                {
+                    output.push(*index);
+                }
             }
-        }
-        Expr::Apply {
-            function, argument, ..
-        } => {
-            collect_dependencies(parsed, *function, globals, output);
-            collect_dependencies(parsed, *argument, globals, output);
-        }
-        Expr::TypeApply { function, .. }
-        | Expr::Annotation {
-            expression: function,
-            ..
-        } => {
-            collect_dependencies(parsed, *function, globals, output);
-        }
-        Expr::Lambda { body, .. } => collect_dependencies(parsed, *body, globals, output),
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            for child in [condition, then_branch, else_branch] {
-                collect_dependencies(parsed, *child, globals, output);
+            Expr::Apply {
+                function, argument, ..
+            } => {
+                work.push(*argument);
+                work.push(*function);
             }
-        }
-        Expr::Do { statements, .. } => {
-            for statement in statements {
-                let child = match statement {
+            Expr::TypeApply { function, .. }
+            | Expr::Annotation {
+                expression: function,
+                ..
+            }
+            | Expr::Lambda { body: function, .. } => work.push(*function),
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                work.push(*else_branch);
+                work.push(*then_branch);
+                work.push(*condition);
+            }
+            Expr::Do { statements, .. } => {
+                work.extend(statements.iter().rev().map(|statement| match statement {
                     DoStatement::Bind(_, child, _)
                     | DoStatement::Let(_, child, _)
-                    | DoStatement::Then(child, _) => child,
-                };
-                collect_dependencies(parsed, *child, globals, output);
+                    | DoStatement::Then(child, _) => *child,
+                }));
             }
-        }
-        Expr::Tuple { elements, .. } | Expr::List { elements, .. } => {
-            for child in elements {
-                collect_dependencies(parsed, *child, globals, output);
+            Expr::Tuple { elements, .. } | Expr::List { elements, .. } => {
+                work.extend(elements.iter().rev().copied());
             }
-        }
-        Expr::RecordConstruction { fields, .. } => {
-            for field in fields {
-                collect_dependencies(parsed, field.value, globals, output);
+            Expr::RecordConstruction { fields, .. } => {
+                work.extend(fields.iter().rev().map(|field| field.value));
             }
-        }
-        Expr::Case {
-            scrutinee,
-            alternatives,
-            ..
-        } => {
-            collect_dependencies(parsed, *scrutinee, globals, output);
-            for alternative in alternatives {
-                collect_dependencies(parsed, alternative.expression, globals, output);
+            Expr::Case {
+                scrutinee,
+                alternatives,
+                ..
+            } => {
+                work.extend(
+                    alternatives
+                        .iter()
+                        .rev()
+                        .map(|alternative| alternative.expression),
+                );
+                work.push(*scrutinee);
             }
+            Expr::Literal(_, _) => {}
         }
-        Expr::Literal(_, _) => {}
     }
 }
 
@@ -1391,11 +1716,65 @@ struct InferContext<'a> {
     record_wanteds: Vec<(TypeId, TypeId, Span)>,
     temporary: Vec<TemporaryNode>,
     expansion_stack: Vec<usize>,
+    preinferred: HashMap<ExprId, VecDeque<Inferred>>,
+    preinferred_bindings: HashMap<ExprId, VecDeque<Vec<TypeId>>>,
+    worklist_bypass: HashSet<ExprId>,
+    type_constraints: u64,
+    profile_id: Arc<str>,
     stats: &'a mut CompilerStats,
-    options: &'a CompileOptions,
+    limits: &'a CompilerLimits,
 }
 
 impl InferContext<'_> {
+    fn charge_type_constraint(&mut self, span: Span) -> Result<(), DiagnosticBundle> {
+        self.type_constraints = self.type_constraints.saturating_add(1);
+        if let Some(configured) = self.limits.type_constraints.value()
+            && self.type_constraints > configured
+        {
+            return Err(compiler_limit_error(
+                "solve_type_constraint",
+                &self.profile_id,
+                configured,
+                self.type_constraints,
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn put_preinferred(&mut self, id: ExprId, inferred: Inferred) {
+        self.preinferred.entry(id).or_default().push_back(inferred);
+    }
+
+    fn take_preinferred(&mut self, id: ExprId) -> Option<Inferred> {
+        let queue = self.preinferred.get_mut(&id)?;
+        let inferred = queue.pop_front();
+        if queue.is_empty() {
+            self.preinferred.remove(&id);
+        }
+        inferred
+    }
+
+    fn peek_preinferred(&self, id: ExprId) -> Option<Inferred> {
+        self.preinferred.get(&id)?.front().cloned()
+    }
+
+    fn put_preinferred_bindings(&mut self, id: ExprId, bindings: Vec<TypeId>) {
+        self.preinferred_bindings
+            .entry(id)
+            .or_default()
+            .push_back(bindings);
+    }
+
+    fn take_preinferred_bindings(&mut self, id: ExprId) -> Option<Vec<TypeId>> {
+        let queue = self.preinferred_bindings.get_mut(&id)?;
+        let bindings = queue.pop_front();
+        if queue.is_empty() {
+            self.preinferred_bindings.remove(&id);
+        }
+        bindings
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn type_diagnostic(
         &self,
@@ -1429,26 +1808,49 @@ impl InferContext<'_> {
         span: Span,
         kind: TemporaryKind,
     ) -> Result<CoreId, DiagnosticBundle> {
+        let observed = u64::try_from(self.temporary.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if let Some(configured) = self.limits.core_nodes.value()
+            && observed > configured
+        {
+            return Err(compiler_limit_error(
+                "elaborate_core",
+                &self.profile_id,
+                configured,
+                observed,
+                span,
+            ));
+        }
         if self
-            .options
+            .limits
             .max_elaborated_nodes
             .is_some_and(|limit| self.temporary.len() >= limit)
         {
             return Err(DiagnosticBundle(vec![Diagnostic::new(
                 "H0407",
-                "global expansion exceeded the configured node budget",
+                format!(
+                    "global expansion exceeded the configured node budget: operation=elaborate_core profile={} configured={} observed={}",
+                    self.profile_id,
+                    self.limits
+                        .max_elaborated_nodes
+                        .expect("finite elaborated-node limit checked"),
+                    self.temporary.len().saturating_add(1)
+                ),
                 span,
             )]));
         }
         let id = CoreId(u32::try_from(self.temporary.len()).map_err(|_| {
-            DiagnosticBundle(vec![Diagnostic::new(
-                "H0802",
-                "core node limit exceeded",
+            compiler_limit_error(
+                "allocate_core_id",
+                &self.profile_id,
+                u64::from(u32::MAX),
+                u64::try_from(self.temporary.len()).unwrap_or(u64::MAX),
                 span,
-            )])
+            )
         })?);
         self.temporary.push(TemporaryNode { ty, span, kind });
-        self.stats.elaborated_nodes += 1;
+        self.stats.record_elaborated_node();
         Ok(id)
     }
 
@@ -1457,36 +1859,60 @@ impl InferContext<'_> {
         index: usize,
         locals: &mut Vec<Local>,
     ) -> Result<Inferred, DiagnosticBundle> {
-        if self
-            .options
-            .max_expansion_depth
-            .is_some_and(|limit| self.expansion_stack.len() >= limit)
-        {
-            return Err(DiagnosticBundle(vec![Diagnostic::new(
-                "H0407",
-                "global expansion depth exceeded",
-                self.parsed.declarations[index].span(),
-            )]));
-        }
-        self.expansion_stack.push(index);
-        self.stats.global_expansions += 1;
-        let Declaration::Value(declaration) = &self.parsed.declarations[index] else {
-            return Err(DiagnosticBundle(vec![Diagnostic::new(
-                "H9000",
-                "global symbol did not point to a value declaration",
-                self.parsed.declarations[index].span(),
-            )]));
+        let mut index = index;
+        let mut aliases = Vec::new();
+        let result = loop {
+            if self
+                .limits
+                .max_expansion_depth
+                .is_some_and(|limit| self.expansion_stack.len() >= limit)
+            {
+                return Err(DiagnosticBundle(vec![Diagnostic::new(
+                    "H0407",
+                    format!(
+                        "global expansion depth exceeded: operation=expand_global profile={} configured={} observed={}",
+                        self.profile_id,
+                        self.limits
+                            .max_expansion_depth
+                            .expect("finite expansion limit checked"),
+                        self.expansion_stack.len().saturating_add(1)
+                    ),
+                    self.parsed.declarations[index].span(),
+                )]));
+            }
+            self.expansion_stack.push(index);
+            self.stats.record_global_expansion();
+            let Declaration::Value(declaration) = &self.parsed.declarations[index] else {
+                return Err(DiagnosticBundle(vec![Diagnostic::new(
+                    "H9000",
+                    "global symbol did not point to a value declaration",
+                    self.parsed.declarations[index].span(),
+                )]));
+            };
+            aliases.push((declaration.annotation, declaration.span));
+            let Expr::Name(name, _) = &self.parsed.expressions[declaration.value.0 as usize] else {
+                break self.infer_expr(declaration.value, locals)?;
+            };
+            let Some(global) = name.strip_prefix("Main.") else {
+                break self.infer_expr(declaration.value, locals)?;
+            };
+            let Some(next) = self.globals.get(global).copied() else {
+                break self.infer_expr(declaration.value, locals)?;
+            };
+            index = next;
         };
-        let result = self.infer_expr(declaration.value, locals)?;
-        if let Some(annotation) = declaration.annotation {
-            let annotation = self.lower_type(annotation)?;
-            self.unifier
-                .unify(self.types, self.kinds, result.ty, annotation)
-                .map_err(|error| {
-                    self.type_diagnostic(error, declaration.span, Some(annotation), Some(result.ty))
-                })?;
+        for (annotation, span) in aliases.into_iter().rev() {
+            if let Some(annotation) = annotation {
+                let annotation = self.lower_type(annotation)?;
+                self.charge_type_constraint(span)?;
+                self.unifier
+                    .unify(self.types, self.kinds, result.ty, annotation)
+                    .map_err(|error| {
+                        self.type_diagnostic(error, span, Some(annotation), Some(result.ty))
+                    })?;
+            }
+            self.expansion_stack.pop();
         }
-        self.expansion_stack.pop();
         Ok(result)
     }
 
@@ -1496,6 +1922,29 @@ impl InferContext<'_> {
         id: ExprId,
         locals: &mut Vec<Local>,
     ) -> Result<Inferred, DiagnosticBundle> {
+        if let Some(inferred) = self.take_preinferred(id) {
+            if let Some(prepared) = self.take_preinferred_bindings(id) {
+                let actual = locals
+                    .get(locals.len().saturating_sub(prepared.len())..)
+                    .expect("prepared case bindings fit the local scope");
+                for (prepared, actual) in prepared.into_iter().zip(actual) {
+                    let span = self.parsed.expressions[id.0 as usize].span();
+                    self.charge_type_constraint(span)?;
+                    self.unifier
+                        .unify(self.types, self.kinds, prepared, actual.ty)
+                        .map_err(|error| {
+                            self.type_diagnostic(
+                                error,
+                                self.parsed.expressions[id.0 as usize].span(),
+                                Some(actual.ty),
+                                Some(prepared),
+                            )
+                        })?;
+                }
+            }
+            return Ok(inferred);
+        }
+        let worklist_bypass = self.worklist_bypass.remove(&id);
         if let Some(intrinsic) = self.infer_record_intrinsic(id, locals)? {
             return Ok(intrinsic);
         }
@@ -1504,67 +1953,56 @@ impl InferContext<'_> {
             Expr::Name(name, span) => self.infer_name(&name, span, locals),
             Expr::Literal(literal, span) => self.infer_literal(literal, span),
             Expr::Apply {
-                function,
-                argument,
-                span,
-            } => {
-                let function = self.infer_expr(function, locals)?;
-                let argument = self.infer_expr(argument, locals)?;
-                let result = self.unifier.fresh(self.types, KindArena::TYPE);
-                let expected = self.types.function(argument.ty, result);
-                self.unifier
-                    .unify(self.types, self.kinds, function.ty, expected)
-                    .map_err(|error| {
-                        self.type_diagnostic(error, span, Some(expected), Some(function.ty))
-                    })?;
-                let node = self.alloc(
-                    result,
-                    span,
-                    TemporaryKind::Apply {
-                        function: function.node,
-                        argument: argument.node,
-                    },
-                )?;
-                Ok(Inferred {
-                    node,
-                    ty: result,
-                    span,
-                    visible: Vec::new(),
-                    visible_used: 0,
-                })
-            }
+                function: _,
+                argument: _,
+                span: _,
+            } => self.infer_application_tree(id, locals),
             Expr::TypeApply {
                 function,
                 argument,
                 span,
             } => {
-                let mut function = self.infer_expr(function, locals)?;
-                let Some((binder, kind)) = function.visible.get(function.visible_used).copied()
-                else {
-                    return Err(DiagnosticBundle(vec![Diagnostic::new(
-                        "H0505",
-                        "visible type application has no remaining binder",
-                        span,
-                    )]));
-                };
-                let explicit = self.lower_type(argument)?;
-                let actual_kind = self
-                    .types
-                    .kind_of(self.kinds, explicit, |meta| self.unifier.meta_kind(meta))
-                    .map_err(|error| self.type_diagnostic(error, span, None, None))?;
-                if actual_kind != kind {
-                    return Err(DiagnosticBundle(vec![Diagnostic::new(
-                        "H0506",
-                        "visible type argument has the wrong kind",
-                        span,
-                    )]));
+                let mut applications = vec![(argument, span)];
+                let mut head = function;
+                while let Expr::TypeApply {
+                    function,
+                    argument,
+                    span,
+                } = self.parsed.expressions[head.0 as usize]
+                {
+                    applications.push((argument, span));
+                    head = function;
                 }
-                self.unifier
-                    .unify(self.types, self.kinds, binder, explicit)
-                    .map_err(|error| {
-                        self.type_diagnostic(error, span, Some(binder), Some(explicit))
-                    })?;
-                function.visible_used += 1;
+                let mut function = self.infer_expr(head, locals)?;
+                for (argument, span) in applications.into_iter().rev() {
+                    let Some((binder, kind)) = function.visible.get(function.visible_used).copied()
+                    else {
+                        return Err(DiagnosticBundle(vec![Diagnostic::new(
+                            "H0505",
+                            "visible type application has no remaining binder",
+                            span,
+                        )]));
+                    };
+                    let explicit = self.lower_type(argument)?;
+                    let actual_kind = self
+                        .types
+                        .kind_of(self.kinds, explicit, |meta| self.unifier.meta_kind(meta))
+                        .map_err(|error| self.type_diagnostic(error, span, None, None))?;
+                    if actual_kind != kind {
+                        return Err(DiagnosticBundle(vec![Diagnostic::new(
+                            "H0506",
+                            "visible type argument has the wrong kind",
+                            span,
+                        )]));
+                    }
+                    self.charge_type_constraint(span)?;
+                    self.unifier
+                        .unify(self.types, self.kinds, binder, explicit)
+                        .map_err(|error| {
+                            self.type_diagnostic(error, span, Some(binder), Some(explicit))
+                        })?;
+                    function.visible_used += 1;
+                }
                 Ok(function)
             }
             Expr::Lambda {
@@ -1573,30 +2011,46 @@ impl InferContext<'_> {
                 span,
             } => {
                 let base = locals.len();
-                let mut parameter_types = Vec::new();
-                for parameter in &parameters {
-                    let ty = self.bind_pattern(parameter, locals)?;
-                    parameter_types.push(ty);
+                let mut groups = vec![(parameters, span)];
+                let mut body = body;
+                while let Expr::Lambda {
+                    parameters,
+                    body: nested_body,
+                    span,
+                } = self.parsed.expressions[body.0 as usize].clone()
+                {
+                    groups.push((parameters, span));
+                    body = nested_body;
+                }
+                let mut group_types = Vec::with_capacity(groups.len());
+                for (parameters, _) in &groups {
+                    let mut parameter_types = Vec::with_capacity(parameters.len());
+                    for parameter in parameters {
+                        parameter_types.push(self.bind_pattern(parameter, locals)?);
+                    }
+                    group_types.push(parameter_types);
                 }
                 let mut result = self.infer_expr(body, locals)?;
                 locals.truncate(base);
-                for parameter_type in parameter_types.into_iter().rev() {
-                    let ty = self.types.function(parameter_type, result.ty);
-                    let node = self.alloc(
-                        ty,
-                        span,
-                        TemporaryKind::Lambda {
-                            parameter_type,
-                            body: result.node,
-                        },
-                    )?;
-                    result = Inferred {
-                        node,
-                        ty,
-                        span,
-                        visible: Vec::new(),
-                        visible_used: 0,
-                    };
+                for ((_, span), parameter_types) in groups.into_iter().zip(group_types).rev() {
+                    for parameter_type in parameter_types.into_iter().rev() {
+                        let ty = self.types.function(parameter_type, result.ty);
+                        let node = self.alloc(
+                            ty,
+                            span,
+                            TemporaryKind::Lambda {
+                                parameter_type,
+                                body: result.node,
+                            },
+                        )?;
+                        result = Inferred {
+                            node,
+                            ty,
+                            span,
+                            visible: Vec::new(),
+                            visible_used: 0,
+                        };
+                    }
                 }
                 Ok(result)
             }
@@ -1606,6 +2060,9 @@ impl InferContext<'_> {
                 else_branch,
                 span,
             } => {
+                if !worklist_bypass {
+                    return self.infer_expression_tree(id, locals);
+                }
                 let builtin = self.infer_name("Bool.bool", span, locals)?;
                 let else_branch = self.infer_expr(else_branch, locals)?;
                 let then_branch = self.infer_expr(then_branch, locals)?;
@@ -1614,13 +2071,22 @@ impl InferContext<'_> {
                 let applied_true = self.apply_inferred(applied_false, then_branch, span)?;
                 self.apply_inferred(applied_true, condition, span)
             }
-            Expr::Do { statements, span } => self.infer_do(&statements, span, locals),
+            Expr::Do { statements, span } => {
+                if worklist_bypass {
+                    self.infer_do(&statements, span, locals)
+                } else {
+                    self.infer_expression_tree(id, locals)
+                }
+            }
             Expr::Case {
-                scrutinee,
-                alternatives,
-                span,
-            } => self.infer_case(scrutinee, &alternatives, span, locals),
+                scrutinee: _,
+                alternatives: _,
+                span: _,
+            } => self.infer_case_tree(id, locals),
             Expr::Tuple { elements, span } => {
+                if !worklist_bypass {
+                    return self.infer_expression_tree(id, locals);
+                }
                 let mut nodes = Vec::new();
                 let mut types = Vec::new();
                 for element in elements {
@@ -1645,10 +2111,14 @@ impl InferContext<'_> {
                 })
             }
             Expr::List { elements, span } => {
+                if !worklist_bypass {
+                    return self.infer_expression_tree(id, locals);
+                }
                 let item = self.unifier.fresh(self.types, KindArena::TYPE);
                 let mut nodes = Vec::new();
                 for element in elements {
                     let element = self.infer_expr(element, locals)?;
+                    self.charge_type_constraint(span)?;
                     self.unifier
                         .unify(self.types, self.kinds, item, element.ty)
                         .map_err(|error| {
@@ -1673,17 +2143,21 @@ impl InferContext<'_> {
                 })
             }
             Expr::RecordConstruction {
-                constructor,
-                fields,
-                span,
-            } => self.infer_record_construction(&constructor, &fields, span, locals),
+                constructor: _,
+                fields: _,
+                span: _,
+            } => self.infer_record_tree(id, locals),
             Expr::Annotation {
                 expression,
                 ty,
                 span,
             } => {
+                if !worklist_bypass {
+                    return self.infer_expression_tree(id, locals);
+                }
                 let expression = self.infer_expr(expression, locals)?;
                 let annotation = self.lower_type(ty)?;
+                self.charge_type_constraint(span)?;
                 self.unifier
                     .unify(self.types, self.kinds, expression.ty, annotation)
                     .map_err(|error| {
@@ -1692,6 +2166,420 @@ impl InferContext<'_> {
                 Ok(expression)
             }
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn infer_expression_tree(
+        &mut self,
+        root: ExprId,
+        locals: &[Local],
+    ) -> Result<Inferred, DiagnosticBundle> {
+        enum Work {
+            Infer {
+                id: ExprId,
+                locals: Vec<Local>,
+                prepared: Vec<TypeId>,
+            },
+            Finish {
+                id: ExprId,
+                locals: Vec<Local>,
+                prepared: Vec<TypeId>,
+            },
+            DoNext {
+                id: ExprId,
+                statements: Arc<[DoStatement]>,
+                index: usize,
+                base: usize,
+                root_locals: Vec<Local>,
+                locals: Vec<Local>,
+                prepared: Vec<TypeId>,
+            },
+            DoAfter {
+                id: ExprId,
+                statements: Arc<[DoStatement]>,
+                index: usize,
+                base: usize,
+                root_locals: Vec<Local>,
+                locals: Vec<Local>,
+                prepared: Vec<TypeId>,
+            },
+        }
+
+        let mut work = vec![Work::Infer {
+            id: root,
+            locals: locals.to_owned(),
+            prepared: Vec::new(),
+        }];
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Infer {
+                    id,
+                    mut locals,
+                    prepared,
+                } => {
+                    let expression = self.parsed.expressions[id.0 as usize].clone();
+                    let mut children = Vec::new();
+                    match expression {
+                        Expr::If {
+                            condition,
+                            then_branch,
+                            else_branch,
+                            ..
+                        } => {
+                            children.push((else_branch, locals.clone(), prepared.clone()));
+                            children.push((then_branch, locals.clone(), prepared.clone()));
+                            children.push((condition, locals.clone(), prepared.clone()));
+                        }
+                        Expr::Tuple { elements, .. } | Expr::List { elements, .. } => {
+                            children.extend(
+                                elements
+                                    .into_iter()
+                                    .map(|child| (child, locals.clone(), prepared.clone())),
+                            );
+                        }
+                        Expr::Annotation { expression, .. } => {
+                            children.push((expression, locals.clone(), prepared.clone()));
+                        }
+                        Expr::Do { statements, .. } => {
+                            let base = locals.len();
+                            work.push(Work::DoNext {
+                                id,
+                                statements: statements.into(),
+                                index: 0,
+                                base,
+                                root_locals: locals.clone(),
+                                locals,
+                                prepared,
+                            });
+                            continue;
+                        }
+                        _ => {
+                            let inferred = self.infer_expr(id, &mut locals)?;
+                            if !prepared.is_empty() {
+                                self.put_preinferred_bindings(id, prepared);
+                            }
+                            self.put_preinferred(id, inferred);
+                            continue;
+                        }
+                    }
+                    work.push(Work::Finish {
+                        id,
+                        locals,
+                        prepared,
+                    });
+                    work.extend(children.into_iter().rev().map(|(id, locals, prepared)| {
+                        Work::Infer {
+                            id,
+                            locals,
+                            prepared,
+                        }
+                    }));
+                }
+                Work::Finish {
+                    id,
+                    mut locals,
+                    prepared,
+                } => {
+                    self.worklist_bypass.insert(id);
+                    let inferred = self.infer_expr(id, &mut locals)?;
+                    if !prepared.is_empty() {
+                        self.put_preinferred_bindings(id, prepared);
+                    }
+                    self.put_preinferred(id, inferred);
+                }
+                Work::DoNext {
+                    id,
+                    statements,
+                    index,
+                    base,
+                    root_locals,
+                    locals,
+                    prepared,
+                } => {
+                    let Some(statement) = statements.get(index) else {
+                        work.push(Work::Finish {
+                            id,
+                            locals: root_locals,
+                            prepared,
+                        });
+                        continue;
+                    };
+                    let expression = match statement {
+                        DoStatement::Then(expression, _)
+                        | DoStatement::Let(_, expression, _)
+                        | DoStatement::Bind(_, expression, _) => *expression,
+                    };
+                    let bindings = locals[base..].iter().map(|local| local.ty).collect();
+                    work.push(Work::DoAfter {
+                        id,
+                        statements,
+                        index,
+                        base,
+                        root_locals,
+                        locals: locals.clone(),
+                        prepared,
+                    });
+                    work.push(Work::Infer {
+                        id: expression,
+                        locals,
+                        prepared: bindings,
+                    });
+                }
+                Work::DoAfter {
+                    id,
+                    statements,
+                    index,
+                    base,
+                    root_locals,
+                    mut locals,
+                    prepared,
+                } => {
+                    let statement = &statements[index];
+                    let (pattern, expression, span, is_bind) = match statement {
+                        DoStatement::Then(expression, span) => (None, *expression, *span, false),
+                        DoStatement::Let(pattern, expression, span) => {
+                            (Some(pattern), *expression, *span, false)
+                        }
+                        DoStatement::Bind(pattern, expression, span) => {
+                            (Some(pattern), *expression, *span, true)
+                        }
+                    };
+                    if let Some(pattern) = pattern {
+                        let value = self
+                            .peek_preinferred(expression)
+                            .expect("do statement expression inferred");
+                        let parameter_type = self.bind_pattern(pattern, &mut locals)?;
+                        let expected = if is_bind {
+                            let constructor_kind = self.kinds.intern(hell_types::KindNode::Arrow(
+                                KindArena::TYPE,
+                                KindArena::TYPE,
+                            ));
+                            let constructor = self.unifier.fresh(self.types, constructor_kind);
+                            self.types.apply(constructor, parameter_type)
+                        } else {
+                            parameter_type
+                        };
+                        self.unifier
+                            .unify(self.types, self.kinds, value.ty, expected)
+                            .map_err(|error| {
+                                self.type_diagnostic(error, span, Some(expected), Some(value.ty))
+                            })?;
+                    }
+                    work.push(Work::DoNext {
+                        id,
+                        statements,
+                        index: index + 1,
+                        base,
+                        root_locals,
+                        locals,
+                        prepared,
+                    });
+                }
+            }
+        }
+        Ok(self
+            .take_preinferred(root)
+            .expect("expression root inferred"))
+    }
+
+    fn infer_application_tree(
+        &mut self,
+        root: ExprId,
+        locals: &mut Vec<Local>,
+    ) -> Result<Inferred, DiagnosticBundle> {
+        enum Work {
+            Infer(ExprId),
+            Apply(Span),
+        }
+
+        let mut work = vec![Work::Infer(root)];
+        let mut inferred = Vec::new();
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Infer(id) => {
+                    if let Some(intrinsic) = self.infer_record_intrinsic(id, locals)? {
+                        inferred.push(intrinsic);
+                        continue;
+                    }
+                    match self.parsed.expressions[id.0 as usize] {
+                        Expr::Apply {
+                            function,
+                            argument,
+                            span,
+                        } => {
+                            work.push(Work::Apply(span));
+                            work.push(Work::Infer(argument));
+                            work.push(Work::Infer(function));
+                        }
+                        _ => inferred.push(self.infer_expr(id, locals)?),
+                    }
+                }
+                Work::Apply(span) => {
+                    let argument = inferred.pop().expect("application argument inferred");
+                    let function = inferred.pop().expect("application function inferred");
+                    inferred.push(self.apply_inferred(function, argument, span)?);
+                }
+            }
+        }
+        Ok(inferred.pop().expect("application root inferred"))
+    }
+
+    fn infer_record_tree(
+        &mut self,
+        root: ExprId,
+        locals: &mut [Local],
+    ) -> Result<Inferred, DiagnosticBundle> {
+        enum Work {
+            Infer(ExprId),
+            Finish(ExprId),
+        }
+
+        let mut task_locals = locals.to_owned();
+        let mut work = vec![Work::Infer(root)];
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Infer(id) => {
+                    let Expr::RecordConstruction { fields, .. } =
+                        &self.parsed.expressions[id.0 as usize]
+                    else {
+                        let inferred = self.infer_expr(id, &mut task_locals)?;
+                        self.put_preinferred(id, inferred);
+                        continue;
+                    };
+                    work.push(Work::Finish(id));
+                    work.extend(fields.iter().rev().map(|field| Work::Infer(field.value)));
+                }
+                Work::Finish(id) => {
+                    let Expr::RecordConstruction {
+                        constructor,
+                        fields,
+                        span,
+                    } = self.parsed.expressions[id.0 as usize].clone()
+                    else {
+                        unreachable!("record continuation references a record")
+                    };
+                    let inferred = self.infer_record_construction(
+                        &constructor,
+                        &fields,
+                        span,
+                        &mut task_locals,
+                    )?;
+                    self.put_preinferred(id, inferred);
+                }
+            }
+        }
+        Ok(self.take_preinferred(root).expect("record root inferred"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn infer_case_tree(
+        &mut self,
+        root: ExprId,
+        locals: &[Local],
+    ) -> Result<Inferred, DiagnosticBundle> {
+        enum Work {
+            Infer(ExprId, Vec<Local>),
+            Finish(ExprId, Vec<Local>),
+        }
+
+        let mut work = vec![Work::Infer(root, locals.to_owned())];
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Infer(id, mut task_locals) => {
+                    let Expr::Case {
+                        scrutinee,
+                        alternatives,
+                        ..
+                    } = self.parsed.expressions[id.0 as usize].clone()
+                    else {
+                        let inferred = self.infer_expr(id, &mut task_locals)?;
+                        self.put_preinferred(id, inferred);
+                        continue;
+                    };
+                    let primitive = alternatives.iter().any(|alternative| {
+                        matches!(
+                            alternative.pattern,
+                            CasePattern::PrimitiveConstructor { .. }
+                        )
+                    });
+                    let primitive_constructor_count = alternatives
+                        .iter()
+                        .find_map(|alternative| {
+                            let CasePattern::PrimitiveConstructor { name, .. } =
+                                &alternative.pattern
+                            else {
+                                return None;
+                            };
+                            primitive_case_constructor(name).map(|(_, _, _, count)| count)
+                        })
+                        .unwrap_or(1);
+                    let explicit_primitive_count = alternatives
+                        .iter()
+                        .filter(|alternative| {
+                            matches!(
+                                alternative.pattern,
+                                CasePattern::PrimitiveConstructor { .. }
+                            )
+                        })
+                        .count();
+                    work.push(Work::Finish(id, task_locals.clone()));
+                    let mut branches = Vec::with_capacity(alternatives.len());
+                    for alternative in &alternatives {
+                        let mut branch_locals = task_locals.clone();
+                        let names: Vec<Arc<str>> = match &alternative.pattern {
+                            CasePattern::UserConstructor {
+                                binder: Some(binder),
+                                ..
+                            } => vec![Arc::clone(binder)],
+                            CasePattern::PrimitiveConstructor { binders, .. } => binders.clone(),
+                            CasePattern::Wildcard(_)
+                            | CasePattern::UserConstructor { binder: None, .. } => Vec::new(),
+                        };
+                        let mut prepared = Vec::with_capacity(names.len());
+                        for name in names {
+                            let ty = self.unifier.fresh(self.types, KindArena::TYPE);
+                            branch_locals.push(Local {
+                                name,
+                                ty,
+                                slot: local_slot_count(&branch_locals),
+                                projection: Projection::Identity,
+                            });
+                            prepared.push(ty);
+                        }
+                        if !prepared.is_empty() {
+                            self.put_preinferred_bindings(alternative.expression, prepared);
+                        }
+                        let repeats = if primitive
+                            && matches!(alternative.pattern, CasePattern::Wildcard(_))
+                        {
+                            primitive_constructor_count.saturating_sub(explicit_primitive_count)
+                        } else {
+                            1
+                        };
+                        for _ in 0..repeats {
+                            branches
+                                .push(Work::Infer(alternative.expression, branch_locals.clone()));
+                        }
+                    }
+                    work.extend(branches.into_iter().rev());
+                    work.push(Work::Infer(scrutinee, task_locals));
+                }
+                Work::Finish(id, mut task_locals) => {
+                    let Expr::Case {
+                        scrutinee,
+                        alternatives,
+                        span,
+                    } = self.parsed.expressions[id.0 as usize].clone()
+                    else {
+                        unreachable!("case continuation references a case")
+                    };
+                    let inferred =
+                        self.infer_case(scrutinee, &alternatives, span, &mut task_locals)?;
+                    self.put_preinferred(id, inferred);
+                }
+            }
+        }
+        Ok(self.take_preinferred(root).expect("case root inferred"))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1846,6 +2734,7 @@ impl InferContext<'_> {
             ),
             "Record.set" => {
                 let value = self.infer_expr(arguments[0], locals)?;
+                self.charge_type_constraint(span)?;
                 self.unifier
                     .unify(self.types, self.kinds, field_type, value.ty)
                     .map_err(|error| {
@@ -1868,6 +2757,7 @@ impl InferContext<'_> {
             "Record.modify" => {
                 let function = self.infer_expr(arguments[0], locals)?;
                 let expected = self.types.function(field_type, field_type);
+                self.charge_type_constraint(span)?;
                 self.unifier
                     .unify(self.types, self.kinds, expected, function.ty)
                     .map_err(|error| {
@@ -1978,6 +2868,7 @@ impl InferContext<'_> {
             let expected_type = self.lower_type(field.ty)?;
             let supplied_field = supplied[field.name.as_ref()];
             let inferred = self.infer_expr(supplied_field.value, locals)?;
+            self.charge_type_constraint(supplied_field.span)?;
             self.unifier
                 .unify(self.types, self.kinds, inferred.ty, expected_type)
                 .map_err(|error| {
@@ -2152,6 +3043,7 @@ impl InferContext<'_> {
         let scrutinee_expected = self
             .types
             .constructor(Arc::clone(&definition.qualified_name), KindArena::TYPE);
+        self.charge_type_constraint(span)?;
         self.unifier
             .unify(self.types, self.kinds, scrutinee.ty, scrutinee_expected)
             .map_err(|error| {
@@ -2264,6 +3156,7 @@ impl InferContext<'_> {
             }
             let branch = self.infer_expr(alternative.expression, locals)?;
             locals.truncate(base);
+            self.charge_type_constraint(alternative.span)?;
             self.unifier
                 .unify(self.types, self.kinds, result_type, branch.ty)
                 .map_err(|error| {
@@ -2282,6 +3175,7 @@ impl InferContext<'_> {
         }
         let default = if let Some(alternative) = wildcard {
             let branch = self.infer_expr(alternative.expression, locals)?;
+            self.charge_type_constraint(alternative.span)?;
             self.unifier
                 .unify(self.types, self.kinds, result_type, branch.ty)
                 .map_err(|error| {
@@ -2532,6 +3426,7 @@ impl InferContext<'_> {
     ) -> Result<Inferred, DiagnosticBundle> {
         let result = self.unifier.fresh(self.types, KindArena::TYPE);
         let expected = self.types.function(argument.ty, result);
+        self.charge_type_constraint(span)?;
         self.unifier
             .unify(self.types, self.kinds, function.ty, expected)
             .map_err(|error| {
@@ -2561,125 +3456,169 @@ impl InferContext<'_> {
         span: Span,
         locals: &mut Vec<Local>,
     ) -> Result<Inferred, DiagnosticBundle> {
-        #[allow(clippy::too_many_lines)]
-        fn lower(
-            context: &mut InferContext<'_>,
-            statements: &[DoStatement],
-            span: Span,
-            locals: &mut Vec<Local>,
-        ) -> Result<Inferred, DiagnosticBundle> {
-            let Some((first, rest)) = statements.split_first() else {
-                return Err(DiagnosticBundle(vec![Diagnostic::new(
-                    "H0210",
-                    "empty do block",
-                    span,
-                )]));
-            };
-            if rest.is_empty()
-                && let DoStatement::Then(expression, _) = first
-            {
-                return context.infer_expr(*expression, locals);
-            }
-            match first {
+        enum Frame {
+            Then {
+                action: Inferred,
+                span: Span,
+            },
+            Let {
+                value: Inferred,
+                parameter_type: TypeId,
+                locals_base: usize,
+                span: Span,
+            },
+            Bind {
+                action: Inferred,
+                parameter_type: TypeId,
+                locals_base: usize,
+                span: Span,
+            },
+        }
+
+        let Some((last, prefix)) = statements.split_last() else {
+            return Err(DiagnosticBundle(vec![Diagnostic::new(
+                "H0210",
+                "empty do block",
+                span,
+            )]));
+        };
+        let mut frames = Vec::with_capacity(prefix.len());
+        for statement in prefix {
+            match statement {
                 DoStatement::Then(expression, statement_span) => {
-                    let action = context.infer_expr(*expression, locals)?;
-                    let rest = lower(context, rest, span, locals)?;
-                    let then = context.infer_name("Monad.then", *statement_span, locals)?;
-                    let applied = context.apply_inferred(then, action, *statement_span)?;
-                    context.apply_inferred(applied, rest, *statement_span)
+                    frames.push(Frame::Then {
+                        action: self.infer_expr(*expression, locals)?,
+                        span: *statement_span,
+                    });
                 }
                 DoStatement::Let(pattern, expression, statement_span) => {
-                    let value = context.infer_expr(*expression, locals)?;
-                    let base = locals.len();
-                    let parameter_type = context.bind_pattern(pattern, locals)?;
-                    context
-                        .unifier
-                        .unify(context.types, context.kinds, parameter_type, value.ty)
+                    let value = self.infer_expr(*expression, locals)?;
+                    let locals_base = locals.len();
+                    let parameter_type = self.bind_pattern(pattern, locals)?;
+                    self.charge_type_constraint(*statement_span)?;
+                    self.unifier
+                        .unify(self.types, self.kinds, parameter_type, value.ty)
                         .map_err(|error| {
-                            context.type_diagnostic(
+                            self.type_diagnostic(
                                 error,
                                 *statement_span,
                                 Some(parameter_type),
                                 Some(value.ty),
                             )
                         })?;
-                    let body = lower(context, rest, span, locals)?;
-                    locals.truncate(base);
-                    let function_type = context.types.function(parameter_type, body.ty);
-                    let lambda = context.alloc(
-                        function_type,
-                        *statement_span,
-                        TemporaryKind::Lambda {
-                            parameter_type,
-                            body: body.node,
-                        },
-                    )?;
-                    context.apply_inferred(
-                        Inferred {
-                            node: lambda,
-                            ty: function_type,
-                            span: *statement_span,
-                            visible: Vec::new(),
-                            visible_used: 0,
-                        },
+                    frames.push(Frame::Let {
                         value,
-                        *statement_span,
-                    )
+                        parameter_type,
+                        locals_base,
+                        span: *statement_span,
+                    });
                 }
                 DoStatement::Bind(pattern, expression, statement_span) => {
-                    let action = context.infer_expr(*expression, locals)?;
-                    let base = locals.len();
-                    let parameter_type = context.bind_pattern(pattern, locals)?;
-                    // The continuation body is inferred before the desugared
-                    // `Monad.bind` application. Relate its local binder to the
-                    // action's constructor now so record selection and other
-                    // type-directed intrinsics see the same evidence that the
-                    // eventual bind application will enforce.
-                    let constructor_kind = context.kinds.intern(hell_types::KindNode::Arrow(
+                    let action = self.infer_expr(*expression, locals)?;
+                    let locals_base = locals.len();
+                    let parameter_type = self.bind_pattern(pattern, locals)?;
+                    let constructor_kind = self.kinds.intern(hell_types::KindNode::Arrow(
                         KindArena::TYPE,
                         KindArena::TYPE,
                     ));
-                    let constructor = context.unifier.fresh(context.types, constructor_kind);
-                    let expected_action = context.types.apply(constructor, parameter_type);
-                    context
-                        .unifier
-                        .unify(context.types, context.kinds, action.ty, expected_action)
+                    let constructor = self.unifier.fresh(self.types, constructor_kind);
+                    let expected_action = self.types.apply(constructor, parameter_type);
+                    self.charge_type_constraint(*statement_span)?;
+                    self.unifier
+                        .unify(self.types, self.kinds, action.ty, expected_action)
                         .map_err(|error| {
-                            context.type_diagnostic(
+                            self.type_diagnostic(
                                 error,
                                 *statement_span,
                                 Some(expected_action),
                                 Some(action.ty),
                             )
                         })?;
-                    let body = lower(context, rest, span, locals)?;
-                    locals.truncate(base);
-                    let function_type = context.types.function(parameter_type, body.ty);
-                    let lambda = context.alloc(
+                    frames.push(Frame::Bind {
+                        action,
+                        parameter_type,
+                        locals_base,
+                        span: *statement_span,
+                    });
+                }
+            }
+        }
+        let DoStatement::Then(expression, _) = last else {
+            return Err(DiagnosticBundle(vec![Diagnostic::new(
+                "H0210",
+                "a do block must end with an expression",
+                span,
+            )]));
+        };
+        let mut body = self.infer_expr(*expression, locals)?;
+        for frame in frames.into_iter().rev() {
+            match frame {
+                Frame::Then { action, span } => {
+                    let then = self.infer_name("Monad.then", span, locals)?;
+                    let applied = self.apply_inferred(then, action, span)?;
+                    body = self.apply_inferred(applied, body, span)?;
+                }
+                Frame::Let {
+                    value,
+                    parameter_type,
+                    locals_base,
+                    span,
+                } => {
+                    locals.truncate(locals_base);
+                    let function_type = self.types.function(parameter_type, body.ty);
+                    let lambda = self.alloc(
                         function_type,
-                        *statement_span,
+                        span,
                         TemporaryKind::Lambda {
                             parameter_type,
                             body: body.node,
                         },
                     )?;
-                    let bind = context.infer_name("Monad.bind", *statement_span, locals)?;
-                    let bind = context.apply_inferred(bind, action, *statement_span)?;
-                    context.apply_inferred(
+                    body = self.apply_inferred(
+                        Inferred {
+                            node: lambda,
+                            ty: function_type,
+                            span,
+                            visible: Vec::new(),
+                            visible_used: 0,
+                        },
+                        value,
+                        span,
+                    )?;
+                }
+                Frame::Bind {
+                    action,
+                    parameter_type,
+                    locals_base,
+                    span,
+                } => {
+                    locals.truncate(locals_base);
+                    let function_type = self.types.function(parameter_type, body.ty);
+                    let lambda = self.alloc(
+                        function_type,
+                        span,
+                        TemporaryKind::Lambda {
+                            parameter_type,
+                            body: body.node,
+                        },
+                    )?;
+                    let bind = self.infer_name("Monad.bind", span, locals)?;
+                    let bind = self.apply_inferred(bind, action, span)?;
+                    body = self.apply_inferred(
                         bind,
                         Inferred {
                             node: lambda,
                             ty: function_type,
-                            span: *statement_span,
+                            span,
                             visible: Vec::new(),
                             visible_used: 0,
                         },
-                        *statement_span,
-                    )
+                        span,
+                    )?;
                 }
             }
         }
-        lower(self, statements, span, locals)
+        Ok(body)
     }
 
     fn bind_pattern(
@@ -2731,6 +3670,7 @@ impl InferContext<'_> {
                 let base = locals.len();
                 let inferred = self.bind_pattern(inner, locals)?;
                 let annotation = self.lower_type(*annotation)?;
+                self.charge_type_constraint(*span)?;
                 self.unifier
                     .unify(self.types, self.kinds, inferred, annotation)
                     .map_err(|error| {
@@ -4735,56 +5675,91 @@ impl InferContext<'_> {
     }
 
     fn lower_type(&mut self, id: TypeExprId) -> Result<TypeId, DiagnosticBundle> {
-        let ty = self.parsed.types[id.0 as usize].clone();
-        Ok(match ty {
-            TypeExpr::Name(name, span) => {
-                let kind = if let Some(arity) = public_type_arity(&name) {
-                    let mut kind = KindArena::TYPE;
-                    for _ in 0..arity {
-                        kind = self
-                            .kinds
-                            .intern(hell_types::KindNode::Arrow(KindArena::TYPE, kind));
+        enum Work {
+            Parse(TypeExprId),
+            FinishList,
+            FinishTuple(usize),
+            FinishFunction,
+            FinishApply(Span),
+        }
+
+        let mut work = vec![Work::Parse(id)];
+        let mut output = Vec::new();
+        while let Some(step) = work.pop() {
+            match step {
+                Work::Parse(id) => match self.parsed.types[id.0 as usize].clone() {
+                    TypeExpr::Name(name, span) => {
+                        let kind = if let Some(arity) = public_type_arity(&name) {
+                            let mut kind = KindArena::TYPE;
+                            for _ in 0..arity {
+                                kind = self
+                                    .kinds
+                                    .intern(hell_types::KindNode::Arrow(KindArena::TYPE, kind));
+                            }
+                            kind
+                        } else if self.user_types.by_name.contains_key(&name) {
+                            KindArena::TYPE
+                        } else {
+                            return Err(DiagnosticBundle(vec![Diagnostic::new(
+                                "H0404",
+                                format!("unknown type `{name}`"),
+                                span,
+                            )]));
+                        };
+                        output.push(self.types.constructor(name, kind));
                     }
-                    kind
-                } else if self.user_types.by_name.contains_key(&name) {
-                    KindArena::TYPE
-                } else {
-                    return Err(DiagnosticBundle(vec![Diagnostic::new(
-                        "H0404",
-                        format!("unknown type `{name}`"),
-                        span,
-                    )]));
-                };
-                self.types.constructor(name, kind)
+                    TypeExpr::Unit(_) => {
+                        output.push(self.types.constructor("()", KindArena::TYPE));
+                    }
+                    TypeExpr::List(item, _) => {
+                        work.push(Work::FinishList);
+                        work.push(Work::Parse(item));
+                    }
+                    TypeExpr::Tuple(items, _) => {
+                        work.push(Work::FinishTuple(items.len()));
+                        work.extend(items.into_iter().rev().map(Work::Parse));
+                    }
+                    TypeExpr::Function(argument, result, _) => {
+                        work.push(Work::FinishFunction);
+                        work.push(Work::Parse(result));
+                        work.push(Work::Parse(argument));
+                    }
+                    TypeExpr::Apply(function, argument, span) => {
+                        work.push(Work::FinishApply(span));
+                        work.push(Work::Parse(argument));
+                        work.push(Work::Parse(function));
+                    }
+                    TypeExpr::Promoted(value, _) => {
+                        output.push(self.types.intern(TypeNode::Symbol(value)));
+                    }
+                },
+                Work::FinishList => {
+                    let item = output.pop().expect("list type item was lowered");
+                    output.push(self.types.list(item, self.kinds));
+                }
+                Work::FinishTuple(count) => {
+                    let items = output.split_off(output.len() - count);
+                    output.push(self.types.tuple(&items, self.kinds));
+                }
+                Work::FinishFunction => {
+                    let result = output.pop().expect("function result type was lowered");
+                    let argument = output.pop().expect("function argument type was lowered");
+                    output.push(self.types.function(argument, result));
+                }
+                Work::FinishApply(span) => {
+                    let argument = output.pop().expect("type application argument was lowered");
+                    let function = output.pop().expect("type application function was lowered");
+                    let result = self.types.apply(function, argument);
+                    self.types
+                        .kind_of(self.kinds, result, |meta| self.unifier.meta_kind(meta))
+                        .map_err(|error| self.type_diagnostic(error, span, None, None))?;
+                    output.push(result);
+                }
             }
-            TypeExpr::Unit(_) => self.types.constructor("()", KindArena::TYPE),
-            TypeExpr::List(item, _) => {
-                let item = self.lower_type(item)?;
-                self.types.list(item, self.kinds)
-            }
-            TypeExpr::Tuple(items, _) => {
-                let items = items
-                    .into_iter()
-                    .map(|item| self.lower_type(item))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.types.tuple(&items, self.kinds)
-            }
-            TypeExpr::Function(argument, result, _) => {
-                let argument = self.lower_type(argument)?;
-                let result = self.lower_type(result)?;
-                self.types.function(argument, result)
-            }
-            TypeExpr::Apply(function, argument, span) => {
-                let function = self.lower_type(function)?;
-                let argument = self.lower_type(argument)?;
-                let result = self.types.apply(function, argument);
-                self.types
-                    .kind_of(self.kinds, result, |meta| self.unifier.meta_kind(meta))
-                    .map_err(|error| self.type_diagnostic(error, span, None, None))?;
-                result
-            }
-            TypeExpr::Promoted(value, _) => self.types.intern(TypeNode::Symbol(value)),
-        })
+        }
+        Ok(output
+            .pop()
+            .expect("iterative type lowering produced a value"))
     }
 }
 
@@ -4804,19 +5779,28 @@ fn has_semigroup_instance(types: &TypeArena, ty: TypeId) -> bool {
     has_instance(types, hell_builtins::TypeClass::Semigroup, ty)
 }
 
-fn has_instance(types: &TypeArena, class: hell_builtins::TypeClass, mut ty: TypeId) -> bool {
-    let mut arguments = Vec::new();
-    while let TypeNode::Apply(function, argument) = types.get(ty) {
-        arguments.push(*argument);
-        ty = *function;
+fn has_instance(types: &TypeArena, class: hell_builtins::TypeClass, ty: TypeId) -> bool {
+    let mut work = vec![ty];
+    while let Some(mut ty) = work.pop() {
+        let mut arguments = Vec::new();
+        while let TypeNode::Apply(function, argument) = types.get(ty) {
+            arguments.push(*argument);
+            ty = *function;
+        }
+        arguments.reverse();
+        let TypeNode::Constructor { name, .. } = types.get(ty) else {
+            return false;
+        };
+        let Some(instance) = hell_builtins::instance(class, name) else {
+            return false;
+        };
+        if usize::from(instance.resolution.head_arity()) != arguments.len() {
+            return false;
+        }
+        let premise_count = usize::from(instance.resolution.premise_count());
+        work.extend(arguments.into_iter().take(premise_count).rev());
     }
-    arguments.reverse();
-    let TypeNode::Constructor { name, .. } = types.get(ty) else {
-        return false;
-    };
-    hell_builtins::resolve_instance(class, name, arguments.len(), |index| {
-        has_instance(types, class, arguments[index])
-    })
+    true
 }
 
 fn parse_wrapping_int(raw: &str) -> Option<i64> {

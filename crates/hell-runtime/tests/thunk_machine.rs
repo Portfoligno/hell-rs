@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use hell_compiler::{CompilerSession, compile_source};
 use hell_core::ExecutableProgram;
+use hell_runtime::scope::CancelReason;
 use hell_runtime::{Evaluator, RuntimeError, RuntimeErrorKind, Thunk, ThunkRef, Value};
 
 fn executable(source: &str) -> Arc<ExecutableProgram> {
@@ -52,6 +53,7 @@ fn concurrent_waiters_share_one_failed_evaluation() {
         code: "H0901",
         kind: RuntimeErrorKind::UserError,
         message: "shared failure".into(),
+        suppressed: Arc::from([]),
     });
     let operation_failure = Arc::clone(&failure);
     let thunk = Thunk::deferred(move |_| {
@@ -165,4 +167,60 @@ fn configured_machine_frame_limit_is_a_structured_error() {
     assert_eq!(first.code, "H0803");
     assert_eq!(first.kind, RuntimeErrorKind::ResourceLimit);
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn cancelling_a_blocked_waiter_preserves_the_shared_thunk_result() {
+    let program = executable("main = IO.pure ()\n");
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+    let thunk = Thunk::deferred(move |_| {
+        entered_sender.send(()).unwrap();
+        release_receiver.lock().unwrap().recv().unwrap();
+        Ok(Arc::new(Value::Int(42)))
+    });
+
+    let owner = {
+        let program = Arc::clone(&program);
+        let thunk = Arc::clone(&thunk);
+        std::thread::spawn(move || Evaluator::new(program).force(&thunk).unwrap())
+    };
+    entered_receiver.recv().unwrap();
+
+    let waiter = Evaluator::new(Arc::clone(&program));
+    let cancellation = waiter.cancellation_handle();
+    let waiting_thunk = Arc::clone(&thunk);
+    let waiter = std::thread::spawn(move || {
+        let mut waiter = waiter;
+        waiter.force(&waiting_thunk).unwrap_err()
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    cancellation.cancel(CancelReason::UserInterrupt);
+    assert_eq!(waiter.join().unwrap().kind, RuntimeErrorKind::Cancelled);
+
+    release_sender.send(()).unwrap();
+    let owner_result = owner.join().unwrap();
+    let retained = Evaluator::new(program).force(&thunk).unwrap();
+    assert!(Arc::ptr_eq(&owner_result, &retained));
+}
+
+#[test]
+fn embedding_cancellation_interrupts_a_running_pure_evaluator_loop() {
+    let program = executable("main = IO.pure ()\n");
+    let thunk = Thunk::deferred(|evaluator| {
+        loop {
+            evaluator.cancellation_handle().check()?;
+            std::hint::spin_loop();
+        }
+    });
+    let evaluator = Evaluator::new(program);
+    let cancellation = evaluator.cancellation_handle();
+    let worker = std::thread::spawn(move || {
+        let mut evaluator = evaluator;
+        evaluator.force(&thunk).unwrap_err()
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    cancellation.cancel(CancelReason::UserInterrupt);
+    assert_eq!(worker.join().unwrap().kind, RuntimeErrorKind::Cancelled);
 }

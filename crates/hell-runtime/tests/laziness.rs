@@ -322,6 +322,52 @@ fn process_descriptions_execute_fresh_with_capture_streams_and_capabilities() {
 }
 
 #[test]
+fn process_timeout_terminates_the_entire_descendant_tree() {
+    let directory =
+        std::env::temp_dir().join(format!("hell-rs-process-tree-{}", std::process::id()));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    let source = concat!(
+        "main = do\n",
+        "  helpers <- Environment.getArgs\n",
+        "  Monad.forM_ helpers \\helper -> do\n",
+        "    _result <- Timeout.timeout 100000 $ Process.runProcess_ $\n",
+        "      Process.setStdout Process.nullStream $\n",
+        "      Process.setStderr Process.nullStream $\n",
+        "      Process.proc helper [\"spawn-grandchild\", \"grandchild-marker\"]\n",
+        "    Concurrent.threadDelay 600000\n",
+    );
+    assert_eq!(
+        run_in_with_args(source, process_fixture_arguments(), directory.clone(), true).unwrap(),
+        ""
+    );
+    assert!(!directory.join("grandchild-marker").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn process_capture_closes_descendants_after_the_leader_exits() {
+    let directory =
+        std::env::temp_dir().join(format!("hell-rs-process-exit-tree-{}", std::process::id()));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    let source = concat!(
+        "main = do\n",
+        "  helpers <- Environment.getArgs\n",
+        "  Monad.forM_ helpers \\helper -> do\n",
+        "    _result <- ByteString.readProcess $\n",
+        "      Process.proc helper [\"spawn-grandchild-exit\", \"grandchild-marker\"]\n",
+        "    Concurrent.threadDelay 600000\n",
+    );
+    assert_eq!(
+        run_in_with_args(source, process_fixture_arguments(), directory.clone(), true).unwrap(),
+        ""
+    );
+    assert!(!directory.join("grandchild-marker").exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn buffering_modes_and_null_handle_reads_are_real_io_actions() {
     assert_eq!(
         run(concat!(

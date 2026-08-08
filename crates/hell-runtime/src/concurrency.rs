@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -6,40 +5,8 @@ use super::{
     Evaluator, IoAction, ListCell, PrimitiveFamily, PrimitiveVariantValue, RuntimeContext,
     RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef, Value, list_from_values,
 };
-
-#[derive(Clone, Debug)]
-pub(super) struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-    parent: Option<Arc<Self>>,
-}
-
-impl CancellationToken {
-    pub(super) fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            parent: None,
-        }
-    }
-
-    pub(super) fn child(&self) -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            parent: Some(Arc::new(self.clone())),
-        }
-    }
-
-    pub(super) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-            || self
-                .parent
-                .as_ref()
-                .is_some_and(|parent| parent.is_cancelled())
-    }
-}
+pub(super) use crate::scope::{CancelReason, CancellationToken};
+use crate::scope::{ChildScopePolicy, ExecutionScope, ScopeGuard, TaskHandle};
 
 pub(super) fn thread_delay(delay: ThunkRef) -> IoAction {
     IoAction::new(move |evaluator, _| {
@@ -57,11 +24,13 @@ pub(super) fn thread_delay(delay: ThunkRef) -> IoAction {
             if now >= deadline {
                 return Ok(Thunk::evaluated(Value::Unit));
             }
-            std::thread::sleep(
+            if evaluator.cancellation.wait_timeout(
                 deadline
                     .saturating_duration_since(now)
                     .min(Duration::from_millis(2)),
-            );
+            ) {
+                return Err(RuntimeError::cancelled());
+            }
         }
     })
 }
@@ -78,30 +47,50 @@ pub(super) fn timeout(delay: ThunkRef, action: ThunkRef) -> IoAction {
             return Ok(Thunk::evaluated(Value::Maybe(Some(result))));
         }
 
-        let cancellation = evaluator.child_cancellation();
-        let mut child = evaluator.fork_with_cancellation(cancellation.clone());
-        let context = context.clone();
+        let deadline_duration = Duration::from_micros(microseconds.cast_unsigned());
+        let deadline = Instant::now()
+            .checked_add(deadline_duration)
+            .ok_or_else(|| RuntimeError::internal("timeout deadline overflowed"))?;
+        let parent = current_scope(evaluator);
+        let child_scope = parent
+            .child(ChildScopePolicy {
+                deadline: Some(deadline),
+            })?
+            .guard();
+        let mut child = evaluator.fork_with_scope((*child_scope).clone());
+        let worker_context = context.clone();
         let action = Arc::clone(&action);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let result = run_thunk_caught(&action, &mut child, &context);
-            let _ignored = sender.send(result);
-        });
-        let waited = receiver.recv_timeout(Duration::from_micros(microseconds.cast_unsigned()));
-        match waited {
-            Ok(result) => {
-                join_worker(worker)?;
-                result.map(|value| Thunk::evaluated(Value::Maybe(Some(value))))
+        let worker =
+            child_scope.spawn(move |_| run_thunk_caught(&action, &mut child, &worker_context))?;
+        loop {
+            if let Err(error) = evaluator.ensure_not_cancelled() {
+                child_scope.cancel(&CancelReason::ParentCancelled);
+                child_scope.close_with_primary(Some(error))?;
+                unreachable!("closing with a primary error always returns that error")
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                cancellation.cancel();
-                join_worker(worker)?;
-                Ok(Thunk::evaluated(Value::Maybe(None)))
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                child_scope.cancel(&CancelReason::Timeout);
+                child_scope.close()?;
+                return Ok(Thunk::evaluated(Value::Maybe(None)));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                cancellation.cancel();
-                join_worker(worker)?;
-                Err(RuntimeError::internal("timeout worker disconnected"))
+            match worker.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(Ok(value)) => {
+                    child_scope.close()?;
+                    return Ok(Thunk::evaluated(Value::Maybe(Some(value))));
+                }
+                Ok(Err(error)) => {
+                    child_scope.close_with_primary(Some(error))?;
+                    unreachable!("closing with a primary error always returns that error")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    child_scope.cancel(&CancelReason::SiblingFailed);
+                    child_scope.close_with_primary(Some(RuntimeError::internal(
+                        "timeout worker disconnected",
+                    )))?;
+                    unreachable!("closing with a primary error always returns that error")
+                }
             }
         }
     })
@@ -124,39 +113,64 @@ enum PairMode {
 fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
     IoAction::new(move |evaluator, context| {
         evaluator.ensure_not_cancelled()?;
-        let cancellation = evaluator.child_cancellation();
-        let mut left_evaluator = evaluator.fork_with_cancellation(cancellation.clone());
-        let mut right_evaluator = evaluator.fork_with_cancellation(cancellation.clone());
+        let pair_scope = current_scope(evaluator)
+            .child(ChildScopePolicy::default())?
+            .guard();
+        let left_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
+        let right_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
+        let mut left_evaluator = evaluator.fork_with_scope((*left_scope).clone());
+        let mut right_evaluator = evaluator.fork_with_scope((*right_scope).clone());
         let left_context = context.clone();
         let right_context = context.clone();
         let left = Arc::clone(&left);
         let right = Arc::clone(&right);
         let (sender, receiver) = mpsc::channel();
         let left_sender = sender.clone();
-        let left_worker = std::thread::spawn(move || {
+        let left_worker = left_scope.spawn(move |_| {
             let result = run_thunk_caught(&left, &mut left_evaluator, &left_context);
             let _ignored = left_sender.send((0_usize, result));
+            Ok(())
         });
-        let right_worker = std::thread::spawn(move || {
+        if let Err(error) = left_worker {
+            close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+            unreachable!("closing scopes with a primary error returns the error")
+        }
+        let right_worker = right_scope.spawn(move |_| {
             let result = run_thunk_caught(&right, &mut right_evaluator, &right_context);
             let _ignored = sender.send((1_usize, result));
+            Ok(())
         });
-
-        let first = receiver
-            .recv()
-            .map_err(|_| RuntimeError::internal("parallel action workers disconnected"))?;
-        if matches!(mode, PairMode::Race) || first.1.is_err() {
-            cancellation.cancel();
+        if let Err(error) = right_worker {
+            close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+            unreachable!("closing scopes with a primary error returns the error")
         }
-        let second = receiver
-            .recv()
-            .map_err(|_| RuntimeError::internal("parallel action workers disconnected"))?;
-        join_worker(left_worker)?;
-        join_worker(right_worker)?;
+
+        let first = match recv_parallel_result(&receiver, evaluator) {
+            Ok(result) => result,
+            Err(error) => {
+                pair_scope.cancel(&CancelReason::ParentCancelled);
+                close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+                unreachable!("closing scopes with a primary error returns the error")
+            }
+        };
+        if matches!(mode, PairMode::Race) || first.1.is_err() {
+            let loser = if first.0 == 0 {
+                &right_scope
+            } else {
+                &left_scope
+            };
+            let reason = if matches!(mode, PairMode::Race) {
+                CancelReason::RaceLost
+            } else {
+                CancelReason::SiblingFailed
+            };
+            loser.cancel(&reason);
+        }
 
         match mode {
             PairMode::Race => {
                 let (index, result) = first;
+                close_pair_scopes(pair_scope, left_scope, right_scope, result.as_ref().err())?;
                 result.map(|payload| {
                     Thunk::evaluated(Value::PrimitiveVariant(PrimitiveVariantValue {
                         family: PrimitiveFamily::Either,
@@ -166,11 +180,28 @@ fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
                 })
             }
             PairMode::Both => {
+                if let Err(error) = first.1 {
+                    close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+                    unreachable!("closing scopes with a primary error returns the error")
+                }
+                let second = match recv_parallel_result(&receiver, evaluator) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        pair_scope.cancel(&CancelReason::ParentCancelled);
+                        close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+                        unreachable!("closing scopes with a primary error returns the error")
+                    }
+                };
+                if let Err(error) = second.1 {
+                    close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+                    unreachable!("closing scopes with a primary error returns the error")
+                }
                 let mut results: [Option<ThunkRef>; 2] = [None, None];
-                let first_value = first.1?;
-                let second_value = second.1?;
+                let first_value = first.1.expect("parallel error handled above");
+                let second_value = second.1.expect("parallel error handled above");
                 results[first.0] = Some(first_value);
                 results[second.0] = Some(second_value);
+                close_pair_scopes(pair_scope, left_scope, right_scope, None)?;
                 let left = results[0].take().expect("left parallel result installed");
                 let right = results[1].take().expect("right parallel result installed");
                 Ok(Thunk::evaluated(Value::Tuple([left, right].into())))
@@ -179,28 +210,94 @@ fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
     })
 }
 
+fn recv_parallel_result(
+    receiver: &mpsc::Receiver<(usize, RuntimeResult<ThunkRef>)>,
+    evaluator: &Evaluator,
+) -> RuntimeResult<(usize, RuntimeResult<ThunkRef>)> {
+    loop {
+        evaluator.ensure_not_cancelled()?;
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(result) => return Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(RuntimeError::internal(
+                    "parallel action workers disconnected",
+                ));
+            }
+        }
+    }
+}
+
+fn close_pair_scopes(
+    pair: ScopeGuard,
+    left: ScopeGuard,
+    right: ScopeGuard,
+    primary: Option<&Arc<RuntimeError>>,
+) -> RuntimeResult<()> {
+    let mut cleanup_errors = Vec::new();
+    for scope in [right, left, pair] {
+        if let Err(error) = scope.close() {
+            cleanup_errors.push(error);
+        }
+    }
+    if let Some(primary) = primary {
+        let mut suppressed = primary.suppressed.to_vec();
+        suppressed.extend(cleanup_errors);
+        return Err(Arc::new(RuntimeError {
+            code: primary.code,
+            kind: primary.kind.clone(),
+            message: Arc::clone(&primary.message),
+            suppressed: suppressed.into(),
+        }));
+    }
+    let mut cleanup_errors = cleanup_errors.into_iter();
+    let Some(primary) = cleanup_errors.next() else {
+        return Ok(());
+    };
+    let mut suppressed = primary.suppressed.to_vec();
+    suppressed.extend(cleanup_errors);
+    Err(Arc::new(RuntimeError {
+        code: primary.code,
+        kind: primary.kind.clone(),
+        message: Arc::clone(&primary.message),
+        suppressed: suppressed.into(),
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) -> IoAction {
     IoAction::new(move |evaluator, context| {
         evaluator.ensure_not_cancelled()?;
-        let cancellation = evaluator.child_cancellation();
+        let pool_scope = current_scope(evaluator)
+            .child(ChildScopePolicy::default())?
+            .guard();
+        let cancellation = pool_scope.cancellation().clone();
         let worker_count = evaluator.concurrent_action_limit();
         let queue_capacity = worker_count.saturating_mul(2).max(1);
         let (job_sender, job_receiver) = mpsc::sync_channel(queue_capacity);
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let (result_sender, result_receiver) = mpsc::channel();
 
-        let mut producer_evaluator = evaluator.fork_with_cancellation(cancellation.clone());
-        let producer_cancellation = cancellation.clone();
+        let mut producer_evaluator = evaluator.fork_with_scope((*pool_scope).clone());
         let producer = {
             let list = Arc::clone(&list);
-            std::thread::spawn(move || {
+            pool_scope.spawn(move |task_scope| {
                 produce_jobs(
                     &mut producer_evaluator,
                     list,
                     &job_sender,
-                    &producer_cancellation,
+                    task_scope.cancellation(),
                 )
             })
+        };
+        let producer = match producer {
+            Ok(producer) => producer,
+            Err(error) => {
+                pool_scope.close_with_primary(Some(error))?;
+                unreachable!(
+                    "closing a failed pool with its primary error always returns the error"
+                )
+            }
         };
 
         let mut workers = Vec::with_capacity(worker_count);
@@ -210,19 +307,21 @@ pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) 
             let callback = Arc::clone(&callback);
             let context = context.clone();
             let worker_cancellation = cancellation.clone();
-            let mut worker_evaluator =
-                evaluator.fork_with_cancellation(worker_cancellation.clone());
-            workers.push(std::thread::spawn(move || {
+            let mut worker_evaluator = evaluator.fork_with_scope((*pool_scope).clone());
+            let worker = pool_scope.spawn(move |task_scope| {
                 loop {
+                    task_scope.safepoint()?;
                     if worker_cancellation.is_cancelled() {
                         break;
                     }
                     let job = receiver
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    let Ok((index, item)) = job else {
-                        break;
+                        .recv_timeout(Duration::from_millis(10));
+                    let (index, item) = match job {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     let result = run_callback(&callback, item, &mut worker_evaluator, &context);
                     let failed = result.is_err();
@@ -230,34 +329,73 @@ pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) 
                         break;
                     }
                     if failed {
-                        worker_cancellation.cancel();
+                        worker_cancellation.cancel(CancelReason::SiblingFailed);
                         break;
                     }
                 }
-            }));
+                Ok(())
+            });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    pool_scope.close_with_primary(Some(error))?;
+                    unreachable!(
+                        "closing a failed pool with its primary error always returns the error"
+                    )
+                }
+            }
         }
         drop(job_receiver);
         drop(result_sender);
 
         let mut values = Vec::new();
         let mut first_error = None;
-        for (index, result) in result_receiver {
-            match result {
-                Ok(value) => values.push((index, value)),
-                Err(error) => {
-                    cancellation.cancel();
-                    first_error.get_or_insert(error);
-                }
+        loop {
+            if let Err(error) = evaluator.ensure_not_cancelled() {
+                pool_scope.cancel(&CancelReason::ParentCancelled);
+                pool_scope.close_with_primary(Some(error))?;
+                unreachable!(
+                    "closing a failed pool with its primary error always returns the error"
+                )
+            }
+            match result_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok((index, result)) => match result {
+                    Ok(value) => values.push((index, value)),
+                    Err(error) => {
+                        pool_scope.cancel(&CancelReason::SiblingFailed);
+                        first_error.get_or_insert(error);
+                    }
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        let input_count = join_producer(producer)?;
-        for worker in workers {
-            join_worker(worker)?;
-        }
         if let Some(error) = first_error {
-            return Err(error);
+            pool_scope.close_with_primary(Some(error))?;
+            unreachable!("closing a failed pool with its primary error always returns the error")
         }
-        let count = input_count?;
+
+        let cleanup_window = pool_scope.cleanup_window();
+        let input_count =
+            match recv_finished_task(&producer, "pooled input producer", cleanup_window) {
+                Ok(count) => count,
+                Err(error) => {
+                    pool_scope.close_with_primary(Some(error))?;
+                    unreachable!(
+                        "closing a failed pool with its primary error always returns the error"
+                    )
+                }
+            };
+        for worker in &workers {
+            if let Err(error) = recv_finished_task(worker, "pooled worker", cleanup_window) {
+                pool_scope.close_with_primary(Some(error))?;
+                unreachable!(
+                    "closing a failed pool with its primary error always returns the error"
+                )
+            }
+        }
+        pool_scope.close()?;
+        let count = input_count;
         values.sort_unstable_by_key(|(index, _)| *index);
         if values.len() != count {
             return Err(RuntimeError::internal(
@@ -272,6 +410,44 @@ pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) 
             ))
         }
     })
+}
+
+fn recv_finished_task<T>(
+    task: &TaskHandle<T>,
+    label: &str,
+    cleanup_window: Duration,
+) -> RuntimeResult<T> {
+    match task.recv_timeout(cleanup_window) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(RuntimeError::internal(format!(
+            "CancellationStalled: {label} did not publish its completed result"
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(RuntimeError::internal(format!(
+            "{label} disconnected without a result"
+        ))),
+    }
+}
+
+fn send_job(
+    sender: &mpsc::SyncSender<(usize, ThunkRef)>,
+    cancellation: &CancellationToken,
+    mut job: (usize, ThunkRef),
+) -> RuntimeResult<()> {
+    loop {
+        cancellation.check()?;
+        match sender.try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(returned)) => {
+                job = returned;
+                if cancellation.wait_timeout(Duration::from_millis(2)) {
+                    return Err(RuntimeError::cancelled());
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(RuntimeError::cancelled());
+            }
+        }
+    }
 }
 
 fn produce_jobs(
@@ -289,9 +465,7 @@ fn produce_jobs(
         match evaluator.force(&current)?.as_ref() {
             Value::List(ListCell::Nil) => return Ok(index),
             Value::List(ListCell::Cons { head, tail }) => {
-                sender
-                    .send((index, Arc::clone(head)))
-                    .map_err(|_| RuntimeError::cancelled())?;
+                send_job(sender, cancellation, (index, Arc::clone(head)))?;
                 index = index
                     .checked_add(1)
                     .ok_or_else(|| RuntimeError::resource_limit("pooled input is too large"))?;
@@ -333,6 +507,10 @@ fn run_caught(
     })
 }
 
+fn current_scope(evaluator: &Evaluator) -> ExecutionScope {
+    evaluator.execution_scope().clone()
+}
+
 fn run_thunk_caught(
     action: &ThunkRef,
     evaluator: &mut Evaluator,
@@ -348,18 +526,4 @@ fn run_thunk_caught(
             "panic crossed a concurrent IO action boundary",
         ))
     })
-}
-
-fn join_worker(worker: std::thread::JoinHandle<()>) -> RuntimeResult<()> {
-    worker
-        .join()
-        .map_err(|_| RuntimeError::panic_contained("concurrent IO worker panicked"))
-}
-
-fn join_producer(
-    producer: std::thread::JoinHandle<RuntimeResult<usize>>,
-) -> RuntimeResult<RuntimeResult<usize>> {
-    producer
-        .join()
-        .map_err(|_| RuntimeError::panic_contained("pooled input producer panicked"))
 }

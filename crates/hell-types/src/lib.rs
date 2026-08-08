@@ -194,126 +194,172 @@ impl TypeArena {
     ///
     /// Returns a kind mismatch, invalid application, or escaped-bound error
     /// when the type is not well-kinded.
+    #[allow(clippy::missing_panics_doc)]
     pub fn kind_of(
         &self,
         kinds: &KindArena,
         ty: TypeId,
         meta_kinds: impl Fn(MetaId) -> KindId + Copy,
     ) -> Result<KindId, TypeError> {
-        match self.get(ty) {
-            TypeNode::Meta(meta) => Ok(meta_kinds(*meta)),
-            TypeNode::Bound(_) => Err(TypeError::Internal("unsubstituted bound type".into())),
-            TypeNode::Constructor { kind, .. } => Ok(*kind),
-            TypeNode::Function(argument, result) => {
-                let argument_kind = self.kind_of(kinds, *argument, meta_kinds)?;
-                let result_kind = self.kind_of(kinds, *result, meta_kinds)?;
-                if argument_kind != KindArena::TYPE {
-                    return Err(TypeError::KindMismatch {
-                        expected: KindArena::TYPE,
-                        actual: argument_kind,
-                    });
+        enum Work {
+            Visit(TypeId),
+            Function,
+            Row,
+            Apply,
+        }
+
+        let mut work = vec![Work::Visit(ty)];
+        let mut results = Vec::new();
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Visit(ty) => match self.get(ty) {
+                    TypeNode::Meta(meta) => results.push(meta_kinds(*meta)),
+                    TypeNode::Bound(_) => {
+                        return Err(TypeError::Internal("unsubstituted bound type".into()));
+                    }
+                    TypeNode::Constructor { kind, .. } => results.push(*kind),
+                    TypeNode::Function(argument, result) => {
+                        work.push(Work::Function);
+                        work.push(Work::Visit(*result));
+                        work.push(Work::Visit(*argument));
+                    }
+                    TypeNode::Symbol(_) => results.push(KindArena::SYMBOL),
+                    TypeNode::RowNil => results.push(KindArena::ROW),
+                    TypeNode::RowCons { field, tail, .. } => {
+                        work.push(Work::Row);
+                        work.push(Work::Visit(*tail));
+                        work.push(Work::Visit(*field));
+                    }
+                    TypeNode::Apply(function, argument) => {
+                        work.push(Work::Apply);
+                        work.push(Work::Visit(*argument));
+                        work.push(Work::Visit(*function));
+                    }
+                },
+                Work::Function => {
+                    let result = results.pop().expect("function result kind computed");
+                    let argument = results.pop().expect("function argument kind computed");
+                    if argument != KindArena::TYPE {
+                        return Err(TypeError::KindMismatch {
+                            expected: KindArena::TYPE,
+                            actual: argument,
+                        });
+                    }
+                    if result != KindArena::TYPE {
+                        return Err(TypeError::KindMismatch {
+                            expected: KindArena::TYPE,
+                            actual: result,
+                        });
+                    }
+                    results.push(KindArena::TYPE);
                 }
-                if result_kind != KindArena::TYPE {
-                    return Err(TypeError::KindMismatch {
-                        expected: KindArena::TYPE,
-                        actual: result_kind,
-                    });
+                Work::Row => {
+                    let tail = results.pop().expect("row tail kind computed");
+                    let field = results.pop().expect("row field kind computed");
+                    if field != KindArena::TYPE {
+                        return Err(TypeError::KindMismatch {
+                            expected: KindArena::TYPE,
+                            actual: field,
+                        });
+                    }
+                    if tail != KindArena::ROW {
+                        return Err(TypeError::KindMismatch {
+                            expected: KindArena::ROW,
+                            actual: tail,
+                        });
+                    }
+                    results.push(KindArena::ROW);
                 }
-                Ok(KindArena::TYPE)
-            }
-            TypeNode::Symbol(_) => Ok(KindArena::SYMBOL),
-            TypeNode::RowNil => Ok(KindArena::ROW),
-            TypeNode::RowCons { field, tail, .. } => {
-                let field_kind = self.kind_of(kinds, *field, meta_kinds)?;
-                let tail_kind = self.kind_of(kinds, *tail, meta_kinds)?;
-                if field_kind != KindArena::TYPE {
-                    return Err(TypeError::KindMismatch {
-                        expected: KindArena::TYPE,
-                        actual: field_kind,
-                    });
-                }
-                if tail_kind != KindArena::ROW {
-                    return Err(TypeError::KindMismatch {
-                        expected: KindArena::ROW,
-                        actual: tail_kind,
-                    });
-                }
-                Ok(KindArena::ROW)
-            }
-            TypeNode::Apply(function, argument) => {
-                let function_kind = self.kind_of(kinds, *function, meta_kinds)?;
-                let argument_kind = self.kind_of(kinds, *argument, meta_kinds)?;
-                match kinds.get(function_kind) {
-                    KindNode::Arrow(expected, result) if *expected == argument_kind => Ok(*result),
-                    KindNode::Arrow(expected, _) => Err(TypeError::KindMismatch {
-                        expected: *expected,
-                        actual: argument_kind,
-                    }),
-                    _ => Err(TypeError::NotATypeConstructor(function_kind)),
+                Work::Apply => {
+                    let argument = results.pop().expect("type argument kind computed");
+                    let function = results.pop().expect("type function kind computed");
+                    match kinds.get(function) {
+                        KindNode::Arrow(expected, result) if *expected == argument => {
+                            results.push(*result);
+                        }
+                        KindNode::Arrow(expected, _) => {
+                            return Err(TypeError::KindMismatch {
+                                expected: *expected,
+                                actual: argument,
+                            });
+                        }
+                        _ => return Err(TypeError::NotATypeConstructor(function)),
+                    }
                 }
             }
         }
+        Ok(results.pop().expect("root kind computed"))
     }
 
     #[must_use]
     pub fn display(&self, ty: TypeId) -> String {
-        fn go(arena: &TypeArena, ty: TypeId, precedence: u8, out: &mut String) {
-            match arena.get(ty) {
-                TypeNode::Meta(id) => write!(out, "t{}", id.0).expect("writing to String"),
-                TypeNode::Bound(id) => write!(out, "a{id}").expect("writing to String"),
-                TypeNode::Constructor { name, .. } => out.push_str(name),
-                TypeNode::Symbol(value) => {
-                    out.push('"');
-                    out.push_str(value);
-                    out.push('"');
-                }
-                TypeNode::RowNil => out.push_str("{}"),
-                TypeNode::RowCons { label, field, tail } => {
-                    out.push('{');
-                    out.push_str(label);
-                    out.push_str(" :: ");
-                    go(arena, *field, 0, out);
-                    if !matches!(arena.get(*tail), TypeNode::RowNil) {
-                        out.push_str(", ..");
+        enum Work {
+            Visit(TypeId, u8),
+            Text(&'static str),
+            Character(char),
+        }
+
+        let mut result = String::new();
+        let mut work = vec![Work::Visit(ty, 0)];
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Text(text) => result.push_str(text),
+                Work::Character(character) => result.push(character),
+                Work::Visit(ty, precedence) => match self.get(ty) {
+                    TypeNode::Meta(id) => {
+                        write!(result, "t{}", id.0).expect("writing to String");
                     }
-                    out.push('}');
-                }
-                TypeNode::Function(argument, result) => {
-                    let paren = precedence > 0;
-                    if paren {
-                        out.push('(');
+                    TypeNode::Bound(id) => {
+                        write!(result, "a{id}").expect("writing to String");
                     }
-                    go(arena, *argument, 1, out);
-                    out.push_str(" -> ");
-                    go(arena, *result, 0, out);
-                    if paren {
-                        out.push(')');
+                    TypeNode::Constructor { name, .. } => result.push_str(name),
+                    TypeNode::Symbol(value) => {
+                        result.push('"');
+                        result.push_str(value);
+                        result.push('"');
                     }
-                }
-                TypeNode::Apply(function, argument) => {
-                    if let TypeNode::Constructor { name, .. } = arena.get(*function)
-                        && name.as_ref() == "[]"
-                    {
-                        out.push('[');
-                        go(arena, *argument, 0, out);
-                        out.push(']');
-                        return;
+                    TypeNode::RowNil => result.push_str("{}"),
+                    TypeNode::RowCons { label, field, tail } => {
+                        result.push('{');
+                        result.push_str(label);
+                        result.push_str(" :: ");
+                        work.push(Work::Character('}'));
+                        if !matches!(self.get(*tail), TypeNode::RowNil) {
+                            work.push(Work::Text(", .."));
+                        }
+                        work.push(Work::Visit(*field, 0));
                     }
-                    let paren = precedence > 1;
-                    if paren {
-                        out.push('(');
+                    TypeNode::Function(argument, function_result) => {
+                        let parenthesized = precedence > 0;
+                        if parenthesized {
+                            result.push('(');
+                            work.push(Work::Character(')'));
+                        }
+                        work.push(Work::Visit(*function_result, 0));
+                        work.push(Work::Text(" -> "));
+                        work.push(Work::Visit(*argument, 1));
                     }
-                    go(arena, *function, 1, out);
-                    out.push(' ');
-                    go(arena, *argument, 2, out);
-                    if paren {
-                        out.push(')');
+                    TypeNode::Apply(function, argument) => {
+                        if let TypeNode::Constructor { name, .. } = self.get(*function)
+                            && name.as_ref() == "[]"
+                        {
+                            result.push('[');
+                            work.push(Work::Character(']'));
+                            work.push(Work::Visit(*argument, 0));
+                            continue;
+                        }
+                        let parenthesized = precedence > 1;
+                        if parenthesized {
+                            result.push('(');
+                            work.push(Work::Character(')'));
+                        }
+                        work.push(Work::Visit(*argument, 2));
+                        work.push(Work::Character(' '));
+                        work.push(Work::Visit(*function, 1));
                     }
-                }
+                },
             }
         }
-        let mut result = String::new();
-        go(self, ty, 0, &mut result);
         result
     }
 }
@@ -347,6 +393,7 @@ struct MetaVar {
 #[derive(Clone, Debug, Default)]
 pub struct Unifier {
     metas: Vec<MetaVar>,
+    zonked: HashMap<TypeId, TypeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +428,7 @@ impl Unifier {
     ///
     /// Panics if more than `u32::MAX` metavariables are allocated.
     pub fn fresh(&mut self, arena: &mut TypeArena, kind: KindId) -> TypeId {
+        self.zonked.clear();
         let id = MetaId(u32::try_from(self.metas.len()).expect("metavariable overflow"));
         self.metas.push(MetaVar {
             kind,
@@ -395,29 +443,43 @@ impl Unifier {
     }
 
     fn prune(&mut self, arena: &mut TypeArena, ty: TypeId) -> TypeId {
-        let TypeNode::Meta(meta) = arena.get(ty).clone() else {
-            return ty;
-        };
-        let Some(bound) = self.metas[meta.0 as usize].binding else {
-            return ty;
-        };
-        let pruned = self.prune(arena, bound);
-        self.metas[meta.0 as usize].binding = Some(pruned);
-        pruned
+        let mut current = ty;
+        let mut path = Vec::new();
+        while let TypeNode::Meta(meta) = arena.get(current).clone() {
+            let Some(bound) = self.metas[meta.0 as usize].binding else {
+                break;
+            };
+            path.push(meta);
+            current = bound;
+        }
+        for meta in path {
+            self.metas[meta.0 as usize].binding = Some(current);
+        }
+        current
     }
 
     fn occurs(&mut self, arena: &mut TypeArena, needle: MetaId, ty: TypeId) -> bool {
-        let ty = self.prune(arena, ty);
-        match arena.get(ty).clone() {
-            TypeNode::Meta(meta) => meta == needle,
-            TypeNode::Apply(left, right) | TypeNode::Function(left, right) => {
-                self.occurs(arena, needle, left) || self.occurs(arena, needle, right)
+        let mut work = vec![ty];
+        let mut visited = HashSet::new();
+        while let Some(ty) = work.pop() {
+            let ty = self.prune(arena, ty);
+            if !visited.insert(ty) {
+                continue;
             }
-            TypeNode::RowCons { field, tail, .. } => {
-                self.occurs(arena, needle, field) || self.occurs(arena, needle, tail)
+            match arena.get(ty).clone() {
+                TypeNode::Meta(meta) if meta == needle => return true,
+                TypeNode::Apply(left, right) | TypeNode::Function(left, right) => {
+                    work.push(right);
+                    work.push(left);
+                }
+                TypeNode::RowCons { field, tail, .. } => {
+                    work.push(tail);
+                    work.push(field);
+                }
+                _ => {}
             }
-            _ => false,
         }
+        false
     }
 
     /// Unifies two well-kinded types.
@@ -433,37 +495,41 @@ impl Unifier {
         left: TypeId,
         right: TypeId,
     ) -> Result<(), TypeError> {
-        let left = self.prune(arena, left);
-        let right = self.prune(arena, right);
-        if left == right {
-            return Ok(());
-        }
-        match (arena.get(left).clone(), arena.get(right).clone()) {
-            (TypeNode::Meta(meta), _) => self.bind(arena, kinds, meta, right),
-            (_, TypeNode::Meta(meta)) => self.bind(arena, kinds, meta, left),
-            (TypeNode::Function(a1, b1), TypeNode::Function(a2, b2))
-            | (TypeNode::Apply(a1, b1), TypeNode::Apply(a2, b2)) => {
-                self.unify(arena, kinds, a1, a2)?;
-                self.unify(arena, kinds, b1, b2)
+        let mut work = vec![(left, right)];
+        while let Some((left, right)) = work.pop() {
+            let left = self.prune(arena, left);
+            let right = self.prune(arena, right);
+            if left == right {
+                continue;
             }
-            (
-                TypeNode::RowCons {
-                    label: l1,
-                    field: f1,
-                    tail: t1,
-                },
-                TypeNode::RowCons {
-                    label: l2,
-                    field: f2,
-                    tail: t2,
-                },
-            ) if l1 == l2 => {
-                self.unify(arena, kinds, f1, f2)?;
-                self.unify(arena, kinds, t1, t2)
+            match (arena.get(left).clone(), arena.get(right).clone()) {
+                (TypeNode::Meta(meta), _) => self.bind(arena, kinds, meta, right)?,
+                (_, TypeNode::Meta(meta)) => self.bind(arena, kinds, meta, left)?,
+                (TypeNode::Function(a1, b1), TypeNode::Function(a2, b2))
+                | (TypeNode::Apply(a1, b1), TypeNode::Apply(a2, b2)) => {
+                    work.push((b1, b2));
+                    work.push((a1, a2));
+                }
+                (
+                    TypeNode::RowCons {
+                        label: l1,
+                        field: f1,
+                        tail: t1,
+                    },
+                    TypeNode::RowCons {
+                        label: l2,
+                        field: f2,
+                        tail: t2,
+                    },
+                ) if l1 == l2 => {
+                    work.push((t1, t2));
+                    work.push((f1, f2));
+                }
+                (left_node, right_node) if left_node == right_node => {}
+                _ => return Err(TypeError::Mismatch { left, right }),
             }
-            (l, r) if l == r => Ok(()),
-            _ => Err(TypeError::Mismatch { left, right }),
         }
+        Ok(())
     }
 
     fn bind(
@@ -481,6 +547,7 @@ impl Unifier {
         if expected != actual {
             return Err(TypeError::KindMismatch { expected, actual });
         }
+        self.zonked.clear();
         self.metas[meta.0 as usize].binding = Some(ty);
         Ok(())
     }
@@ -491,46 +558,86 @@ impl Unifier {
     ///
     /// Returns an ambiguity, escaped-bound, or cyclic-type error when a closed
     /// type cannot be produced.
+    #[allow(clippy::missing_panics_doc)]
     pub fn zonk(&mut self, arena: &mut TypeArena, ty: TypeId) -> Result<ClosedTypeId, TypeError> {
-        fn go(
-            unifier: &mut Unifier,
-            arena: &mut TypeArena,
-            ty: TypeId,
-            visiting: &mut HashSet<TypeId>,
-        ) -> Result<TypeId, TypeError> {
-            let ty = unifier.prune(arena, ty);
-            if !visiting.insert(ty) {
-                return Ok(ty);
-            }
-            let node = arena.get(ty).clone();
-            let result = match node {
-                TypeNode::Meta(meta) => return Err(TypeError::Ambiguous(meta)),
-                TypeNode::Bound(_) => {
-                    return Err(TypeError::Internal(
-                        "bound type escaped scheme instantiation".into(),
-                    ));
-                }
-                TypeNode::Apply(left, right) => {
-                    let left = go(unifier, arena, left, visiting)?;
-                    let right = go(unifier, arena, right, visiting)?;
-                    arena.apply(left, right)
-                }
-                TypeNode::Function(left, right) => {
-                    let left = go(unifier, arena, left, visiting)?;
-                    let right = go(unifier, arena, right, visiting)?;
-                    arena.function(left, right)
-                }
-                TypeNode::RowCons { label, field, tail } => {
-                    let field = go(unifier, arena, field, visiting)?;
-                    let tail = go(unifier, arena, tail, visiting)?;
-                    arena.intern(TypeNode::RowCons { label, field, tail })
-                }
-                _ => ty,
-            };
-            visiting.remove(&ty);
-            Ok(result)
+        enum Work {
+            Visit(TypeId),
+            Apply(TypeId),
+            Function(TypeId),
+            Row(TypeId, Arc<str>),
         }
-        go(self, arena, ty, &mut HashSet::new()).map(ClosedTypeId)
+
+        let mut work = vec![Work::Visit(ty)];
+        let mut results = Vec::new();
+        let mut visiting = HashSet::new();
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Visit(ty) => {
+                    let ty = self.prune(arena, ty);
+                    if let Some(zonked) = self.zonked.get(&ty).copied() {
+                        results.push(zonked);
+                        continue;
+                    }
+                    if !visiting.insert(ty) {
+                        results.push(ty);
+                        continue;
+                    }
+                    match arena.get(ty).clone() {
+                        TypeNode::Meta(meta) => return Err(TypeError::Ambiguous(meta)),
+                        TypeNode::Bound(_) => {
+                            return Err(TypeError::Internal(
+                                "bound type escaped scheme instantiation".into(),
+                            ));
+                        }
+                        TypeNode::Apply(left, right) => {
+                            work.push(Work::Apply(ty));
+                            work.push(Work::Visit(right));
+                            work.push(Work::Visit(left));
+                        }
+                        TypeNode::Function(left, right) => {
+                            work.push(Work::Function(ty));
+                            work.push(Work::Visit(right));
+                            work.push(Work::Visit(left));
+                        }
+                        TypeNode::RowCons { label, field, tail } => {
+                            work.push(Work::Row(ty, label));
+                            work.push(Work::Visit(tail));
+                            work.push(Work::Visit(field));
+                        }
+                        _ => {
+                            visiting.remove(&ty);
+                            self.zonked.insert(ty, ty);
+                            results.push(ty);
+                        }
+                    }
+                }
+                Work::Apply(original) => {
+                    let right = results.pop().expect("type argument zonked");
+                    let left = results.pop().expect("type function zonked");
+                    visiting.remove(&original);
+                    let zonked = arena.apply(left, right);
+                    self.zonked.insert(original, zonked);
+                    results.push(zonked);
+                }
+                Work::Function(original) => {
+                    let right = results.pop().expect("function result zonked");
+                    let left = results.pop().expect("function argument zonked");
+                    visiting.remove(&original);
+                    let zonked = arena.function(left, right);
+                    self.zonked.insert(original, zonked);
+                    results.push(zonked);
+                }
+                Work::Row(original, label) => {
+                    let tail = results.pop().expect("row tail zonked");
+                    let field = results.pop().expect("row field zonked");
+                    visiting.remove(&original);
+                    let zonked = arena.intern(TypeNode::RowCons { label, field, tail });
+                    self.zonked.insert(original, zonked);
+                    results.push(zonked);
+                }
+            }
+        }
+        Ok(ClosedTypeId(results.pop().expect("root type zonked")))
     }
 }
 
@@ -564,4 +671,54 @@ pub enum EvidencePlan {
         implementation: InstanceImplementationId,
         premises: Arc<[EvidencePlan]>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_type_operations_use_heap_worklists() {
+        const DEPTH: usize = 8_192;
+        let kinds = KindArena::default();
+        let mut types = TypeArena::default();
+        let unit = types.constructor("()", KindArena::TYPE);
+        let mut left = unit;
+        let mut right = unit;
+        for _ in 0..DEPTH {
+            left = types.function(unit, left);
+            right = types.function(unit, right);
+        }
+
+        assert_eq!(
+            types.kind_of(&kinds, left, |_| KindArena::TYPE).unwrap(),
+            KindArena::TYPE
+        );
+        let displayed = types.display(left);
+        assert!(displayed.starts_with("() -> "));
+        assert!(displayed.ends_with("()"));
+        let mut unifier = Unifier::default();
+        unifier.unify(&mut types, &kinds, left, right).unwrap();
+        let meta = unifier.fresh(&mut types, KindArena::TYPE);
+        unifier.unify(&mut types, &kinds, meta, left).unwrap();
+        assert_eq!(unifier.zonk(&mut types, meta).unwrap().raw(), left);
+    }
+
+    #[test]
+    fn deep_occurs_failure_remains_structured() {
+        const DEPTH: usize = 8_192;
+        let kinds = KindArena::default();
+        let mut types = TypeArena::default();
+        let mut unifier = Unifier::default();
+        let meta = unifier.fresh(&mut types, KindArena::TYPE);
+        let unit = types.constructor("()", KindArena::TYPE);
+        let mut recursive = meta;
+        for _ in 0..DEPTH {
+            recursive = types.function(unit, recursive);
+        }
+        assert!(matches!(
+            unifier.unify(&mut types, &kinds, meta, recursive),
+            Err(TypeError::Occurs { .. })
+        ));
+    }
 }

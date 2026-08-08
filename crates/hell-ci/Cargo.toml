@@ -10,7 +10,9 @@ name = "hell-ci"
 path = "src/main.rs"
 
 [dependencies]
+hell-builtins = { path = "../hell-builtins" }
 hell-compiler = { path = "../hell-compiler" }
+hell-docgen = { path = "../hell-docgen" }
 hell-source = { path = "../hell-source" }
 hell-syntax = { path = "../hell-syntax" }
 hell-testkit = { path = "../hell-testkit" }

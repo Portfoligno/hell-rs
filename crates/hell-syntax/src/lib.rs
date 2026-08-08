@@ -85,6 +85,14 @@ impl SyntaxError {
             span,
         }
     }
+
+    fn resource(code: &'static str, message: impl Into<Arc<str>>, span: Span) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            span,
+        }
+    }
 }
 
 impl fmt::Display for SyntaxError {
@@ -937,12 +945,40 @@ struct Parser {
     expressions: Vec<Expr>,
     types: Vec<TypeExpr>,
     errors: Vec<SyntaxError>,
-    nesting_depth: usize,
 }
 
-// Bound recursive descent with the same deterministic resource policy on every
-// target. The token preflight enforces this before parser frames accumulate.
-const MAX_PARSER_DEPTH: usize = 64;
+/// Resource policy for parsing one source file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ParserLimits {
+    /// Stable profile label included in resource diagnostics.
+    pub profile_id: &'static str,
+    /// Maximum lexer tokens, including layout and end-of-file tokens.
+    pub max_tokens: Option<usize>,
+    /// Maximum nested delimiter/grammar depth, or no semantic limit.
+    pub max_nesting_depth: Option<usize>,
+}
+
+impl ParserLimits {
+    /// Conservative limits for parsing untrusted source.
+    #[must_use]
+    pub const fn sandboxed() -> Self {
+        Self {
+            profile_id: "sandboxed",
+            max_tokens: Some(1_000_000),
+            max_nesting_depth: Some(64),
+        }
+    }
+
+    /// Compatibility policy without the sandbox's semantic nesting cap.
+    #[must_use]
+    pub const fn upstream() -> Self {
+        Self {
+            profile_id: "upstream",
+            max_tokens: None,
+            max_nesting_depth: None,
+        }
+    }
+}
 
 impl Parser {
     fn alloc_expr(&mut self, expression: Expr) -> ExprId {
@@ -1224,199 +1260,762 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_expression(&mut self, minimum_precedence: u8) -> Result<ExprId, SyntaxError> {
-        let mut left = self.parse_prefix()?;
-        loop {
-            if self.eat(|kind| matches!(kind, TokenKind::At)).is_some() {
-                let ty = if let TokenKind::Text(value) = self.current().kind.clone() {
+        enum Work {
+            ParseExpression(u8),
+            ParsePrefix,
+            AfterPrefix(u8),
+            ResumeExpression {
+                left: ExprId,
+                minimum_precedence: u8,
+            },
+            FinishApplication {
+                function: ExprId,
+                minimum_precedence: u8,
+            },
+            FinishOperator {
+                left: ExprId,
+                operator: Arc<str>,
+                operator_span: Span,
+                minimum_precedence: u8,
+            },
+            FinishLambda {
+                start: Span,
+                parameters: Vec<BindingPattern>,
+            },
+            AfterIfCondition(Span),
+            AfterIfThen {
+                start: Span,
+                condition: ExprId,
+            },
+            FinishIf {
+                start: Span,
+                condition: ExprId,
+                then_branch: ExprId,
+            },
+            AfterCaseScrutinee(Span),
+            CaseNext {
+                start: Span,
+                scrutinee: ExprId,
+                alternatives: Vec<CaseAlternative>,
+            },
+            FinishCaseAlternative {
+                start: Span,
+                scrutinee: ExprId,
+                alternatives: Vec<CaseAlternative>,
+                pattern: CasePattern,
+            },
+            DoNext {
+                start: Span,
+                statements: Vec<DoStatement>,
+            },
+            FinishDoLet {
+                start: Span,
+                statements: Vec<DoStatement>,
+                pattern: BindingPattern,
+                statement_start: Span,
+            },
+            FinishDoBind {
+                start: Span,
+                statements: Vec<DoStatement>,
+                pattern: BindingPattern,
+            },
+            FinishDoThen {
+                start: Span,
+                statements: Vec<DoStatement>,
+            },
+            ListAfterElement {
+                start: Span,
+                elements: Vec<ExprId>,
+            },
+            RecordNext {
+                constructor: Arc<str>,
+                start: Span,
+                fields: Vec<RecordFieldExpr>,
+            },
+            FinishRecordField {
+                constructor: Arc<str>,
+                start: Span,
+                fields: Vec<RecordFieldExpr>,
+                name: Arc<str>,
+                field_span: Span,
+                pun: bool,
+            },
+            FinishParenthesized {
+                start: Span,
+                remaining: Vec<Span>,
+            },
+            ContinueParenthesizedTuple {
+                start: Span,
+                remaining: Vec<Span>,
+                elements: Vec<ExprId>,
+            },
+        }
+
+        let mut work = vec![Work::ParseExpression(minimum_precedence)];
+        let mut output = None;
+        while let Some(step) = work.pop() {
+            match step {
+                Work::ParseExpression(minimum_precedence) => {
+                    work.push(Work::AfterPrefix(minimum_precedence));
+                    work.push(Work::ParsePrefix);
+                }
+                Work::ParsePrefix => {
                     let token = self.bump();
-                    self.alloc_type(TypeExpr::Promoted(value, token.span))
-                } else {
-                    self.parse_type_atom()?
-                };
-                let span = self.expressions[left.0 as usize]
-                    .span()
-                    .join(self.types[ty.0 as usize].span());
-                left = self.alloc_expr(Expr::TypeApply {
-                    function: left,
-                    argument: ty,
-                    span,
-                });
-                continue;
+                    match token.kind {
+                        TokenKind::Backslash => {
+                            let mut parameters = Vec::new();
+                            while !matches!(self.current().kind, TokenKind::Arrow | TokenKind::Eof)
+                            {
+                                parameters.push(self.parse_pattern()?);
+                            }
+                            if parameters.is_empty() {
+                                return Err(SyntaxError::parse(
+                                    "lambda must bind a parameter",
+                                    token.span,
+                                ));
+                            }
+                            if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_none() {
+                                return Err(self.expected("`->`"));
+                            }
+                            work.push(Work::FinishLambda {
+                                start: token.span,
+                                parameters,
+                            });
+                            work.push(Work::ParseExpression(0));
+                        }
+                        TokenKind::KwIf => {
+                            work.push(Work::AfterIfCondition(token.span));
+                            work.push(Work::ParseExpression(0));
+                        }
+                        TokenKind::KwCase => {
+                            work.push(Work::AfterCaseScrutinee(token.span));
+                            work.push(Work::ParseExpression(0));
+                        }
+                        TokenKind::KwDo => {
+                            if self
+                                .eat(|kind| {
+                                    matches!(kind, TokenKind::VirtualLBrace | TokenKind::LBrace)
+                                })
+                                .is_none()
+                            {
+                                return Err(self.expected("do statement block"));
+                            }
+                            work.push(Work::DoNext {
+                                start: token.span,
+                                statements: Vec::new(),
+                            });
+                        }
+                        TokenKind::Qualified(name)
+                            if matches!(self.current().kind, TokenKind::LBrace) =>
+                        {
+                            self.bump();
+                            work.push(Work::RecordNext {
+                                constructor: name,
+                                start: token.span,
+                                fields: Vec::new(),
+                            });
+                        }
+                        TokenKind::Lower(name)
+                        | TokenKind::Upper(name)
+                        | TokenKind::Qualified(name)
+                        | TokenKind::Operator(name) => {
+                            output = Some(self.alloc_expr(Expr::Name(name, token.span)));
+                        }
+                        TokenKind::Integer(value) => {
+                            output = Some(
+                                self.alloc_expr(Expr::Literal(Literal::Integer(value), token.span)),
+                            );
+                        }
+                        TokenKind::Fraction(value) => {
+                            output = Some(
+                                self.alloc_expr(Expr::Literal(Literal::Double(value), token.span)),
+                            );
+                        }
+                        TokenKind::Character(value) => {
+                            output =
+                                Some(self.alloc_expr(Expr::Literal(
+                                    Literal::Character(value),
+                                    token.span,
+                                )));
+                        }
+                        TokenKind::Text(value) => {
+                            output = Some(
+                                self.alloc_expr(Expr::Literal(Literal::Text(value), token.span)),
+                            );
+                        }
+                        TokenKind::LBracket => {
+                            if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RBracket))
+                            {
+                                output = Some(self.alloc_expr(Expr::List {
+                                    elements: Vec::new(),
+                                    span: token.span.join(end.span),
+                                }));
+                            } else {
+                                work.push(Work::ListAfterElement {
+                                    start: token.span,
+                                    elements: Vec::new(),
+                                });
+                                work.push(Work::ParseExpression(0));
+                            }
+                        }
+                        TokenKind::LParen => {
+                            let mut starts = vec![token.span];
+                            while matches!(self.current().kind, TokenKind::LParen) {
+                                starts.push(self.bump().span);
+                            }
+                            let start = starts.pop().expect("opening parenthesis exists");
+                            if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RParen)) {
+                                let expression = self
+                                    .alloc_expr(Expr::Literal(Literal::Unit, start.join(end.span)));
+                                if let Some(outer) = starts.pop() {
+                                    work.push(Work::FinishParenthesized {
+                                        start: outer,
+                                        remaining: starts,
+                                    });
+                                    work.push(Work::ResumeExpression {
+                                        left: expression,
+                                        minimum_precedence: 0,
+                                    });
+                                } else {
+                                    output = Some(expression);
+                                }
+                            } else {
+                                work.push(Work::FinishParenthesized {
+                                    start,
+                                    remaining: starts,
+                                });
+                                work.push(Work::ParseExpression(0));
+                            }
+                        }
+                        _ => {
+                            return Err(SyntaxError::parse("expected expression", token.span));
+                        }
+                    }
+                }
+                Work::AfterPrefix(minimum_precedence) => {
+                    let left = output.take().expect("expression prefix produced a value");
+                    work.push(Work::ResumeExpression {
+                        left,
+                        minimum_precedence,
+                    });
+                }
+                Work::ResumeExpression {
+                    mut left,
+                    minimum_precedence,
+                } => loop {
+                    if self.eat(|kind| matches!(kind, TokenKind::At)).is_some() {
+                        let ty = if let TokenKind::Text(value) = self.current().kind.clone() {
+                            let token = self.bump();
+                            self.alloc_type(TypeExpr::Promoted(value, token.span))
+                        } else {
+                            self.parse_type_atom()?
+                        };
+                        let span = self.expressions[left.0 as usize]
+                            .span()
+                            .join(self.types[ty.0 as usize].span());
+                        left = self.alloc_expr(Expr::TypeApply {
+                            function: left,
+                            argument: ty,
+                            span,
+                        });
+                        continue;
+                    }
+                    if starts_expression_atom(&self.current().kind) {
+                        work.push(Work::FinishApplication {
+                            function: left,
+                            minimum_precedence,
+                        });
+                        work.push(Work::ParsePrefix);
+                        break;
+                    }
+                    let TokenKind::Operator(operator) = self.current().kind.clone() else {
+                        if minimum_precedence == 0
+                            && self
+                                .eat(|kind| matches!(kind, TokenKind::DoubleColon))
+                                .is_some()
+                        {
+                            let ty = self.parse_type()?;
+                            let span = self.expressions[left.0 as usize]
+                                .span()
+                                .join(self.types[ty.0 as usize].span());
+                            left = self.alloc_expr(Expr::Annotation {
+                                expression: left,
+                                ty,
+                                span,
+                            });
+                        }
+                        output = Some(left);
+                        break;
+                    };
+                    let (precedence, right_associative) = fixity(&operator).ok_or_else(|| {
+                        SyntaxError::parse(
+                            format!("unsupported operator `{operator}`"),
+                            self.current().span,
+                        )
+                    })?;
+                    if precedence < minimum_precedence {
+                        output = Some(left);
+                        break;
+                    }
+                    let operator_span = self.bump().span;
+                    work.push(Work::FinishOperator {
+                        left,
+                        operator,
+                        operator_span,
+                        minimum_precedence,
+                    });
+                    work.push(Work::ParseExpression(if right_associative {
+                        precedence
+                    } else {
+                        precedence.saturating_add(1)
+                    }));
+                    break;
+                },
+                Work::FinishApplication {
+                    function,
+                    minimum_precedence,
+                } => {
+                    let argument = output.take().expect("function argument produced a value");
+                    let span = self.expressions[function.0 as usize]
+                        .span()
+                        .join(self.expressions[argument.0 as usize].span());
+                    let expression = self.alloc_expr(Expr::Apply {
+                        function,
+                        argument,
+                        span,
+                    });
+                    work.push(Work::ResumeExpression {
+                        left: expression,
+                        minimum_precedence,
+                    });
+                }
+                Work::FinishOperator {
+                    left,
+                    operator,
+                    operator_span,
+                    minimum_precedence,
+                } => {
+                    let right = output
+                        .take()
+                        .expect("operator right operand produced a value");
+                    let op = self.alloc_expr(Expr::Name(operator, operator_span));
+                    let op_left_span = self.expressions[left.0 as usize]
+                        .span()
+                        .join(self.expressions[op.0 as usize].span());
+                    let applied_left = self.alloc_expr(Expr::Apply {
+                        function: op,
+                        argument: left,
+                        span: op_left_span,
+                    });
+                    let span = self.expressions[left.0 as usize]
+                        .span()
+                        .join(self.expressions[right.0 as usize].span());
+                    let expression = self.alloc_expr(Expr::Apply {
+                        function: applied_left,
+                        argument: right,
+                        span,
+                    });
+                    work.push(Work::ResumeExpression {
+                        left: expression,
+                        minimum_precedence,
+                    });
+                }
+                Work::FinishLambda { start, parameters } => {
+                    let body = output.take().expect("lambda body produced a value");
+                    let span = start.join(self.expressions[body.0 as usize].span());
+                    output = Some(self.alloc_expr(Expr::Lambda {
+                        parameters,
+                        body,
+                        span,
+                    }));
+                }
+                Work::AfterIfCondition(start) => {
+                    let condition = output.take().expect("if condition produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::KwThen)).is_none() {
+                        return Err(self.expected("`then`"));
+                    }
+                    work.push(Work::AfterIfThen { start, condition });
+                    work.push(Work::ParseExpression(0));
+                }
+                Work::AfterIfThen { start, condition } => {
+                    let then_branch = output.take().expect("then branch produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::KwElse)).is_none() {
+                        return Err(self.expected("`else`"));
+                    }
+                    work.push(Work::FinishIf {
+                        start,
+                        condition,
+                        then_branch,
+                    });
+                    work.push(Work::ParseExpression(0));
+                }
+                Work::FinishIf {
+                    start,
+                    condition,
+                    then_branch,
+                } => {
+                    let else_branch = output.take().expect("else branch produced a value");
+                    let span = start.join(self.expressions[else_branch.0 as usize].span());
+                    output = Some(self.alloc_expr(Expr::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                        span,
+                    }));
+                }
+                Work::AfterCaseScrutinee(start) => {
+                    let scrutinee = output.take().expect("case scrutinee produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::KwOf)).is_none() {
+                        return Err(self.expected("`of`"));
+                    }
+                    if self
+                        .eat(|kind| matches!(kind, TokenKind::VirtualLBrace | TokenKind::LBrace))
+                        .is_none()
+                    {
+                        return Err(self.expected("case alternative block"));
+                    }
+                    work.push(Work::CaseNext {
+                        start,
+                        scrutinee,
+                        alternatives: Vec::new(),
+                    });
+                }
+                Work::CaseNext {
+                    start,
+                    scrutinee,
+                    alternatives,
+                } => {
+                    while self
+                        .eat(|kind| {
+                            matches!(kind, TokenKind::VirtualSemicolon | TokenKind::Semicolon)
+                        })
+                        .is_some()
+                    {}
+                    if matches!(
+                        self.current().kind,
+                        TokenKind::VirtualRBrace | TokenKind::RBrace | TokenKind::RParen
+                    ) {
+                        let end = if matches!(self.current().kind, TokenKind::RParen) {
+                            let span = self.current().span;
+                            self.discard_deferred_layout_close();
+                            span
+                        } else {
+                            self.bump().span
+                        };
+                        if alternatives.is_empty() {
+                            return Err(SyntaxError::parse("empty case block", start.join(end)));
+                        }
+                        output = Some(self.alloc_expr(Expr::Case {
+                            scrutinee,
+                            alternatives,
+                            span: start.join(end),
+                        }));
+                    } else {
+                        if matches!(self.current().kind, TokenKind::Eof) {
+                            return Err(self.expected("end of case block"));
+                        }
+                        let pattern = self.parse_case_pattern()?;
+                        if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_none() {
+                            return Err(self.expected("`->` in case alternative"));
+                        }
+                        work.push(Work::FinishCaseAlternative {
+                            start,
+                            scrutinee,
+                            alternatives,
+                            pattern,
+                        });
+                        work.push(Work::ParseExpression(0));
+                    }
+                }
+                Work::FinishCaseAlternative {
+                    start,
+                    scrutinee,
+                    mut alternatives,
+                    pattern,
+                } => {
+                    let expression = output.take().expect("case branch produced a value");
+                    let span = pattern
+                        .span()
+                        .join(self.expressions[expression.0 as usize].span());
+                    alternatives.push(CaseAlternative {
+                        pattern,
+                        expression,
+                        span,
+                    });
+                    work.push(Work::CaseNext {
+                        start,
+                        scrutinee,
+                        alternatives,
+                    });
+                }
+                Work::DoNext { start, statements } => {
+                    while self
+                        .eat(|kind| {
+                            matches!(kind, TokenKind::VirtualSemicolon | TokenKind::Semicolon)
+                        })
+                        .is_some()
+                    {}
+                    if matches!(
+                        self.current().kind,
+                        TokenKind::VirtualRBrace | TokenKind::RBrace | TokenKind::RParen
+                    ) {
+                        let end = if matches!(self.current().kind, TokenKind::RParen) {
+                            let span = self.current().span;
+                            self.discard_deferred_layout_close();
+                            span
+                        } else {
+                            self.bump().span
+                        };
+                        if statements.is_empty() {
+                            return Err(SyntaxError::parse("empty do block", start.join(end)));
+                        }
+                        if !matches!(statements.last(), Some(DoStatement::Then(_, _))) {
+                            return Err(SyntaxError::parse(
+                                "the final do statement must be an expression",
+                                start.join(end),
+                            ));
+                        }
+                        output = Some(self.alloc_expr(Expr::Do {
+                            statements,
+                            span: start.join(end),
+                        }));
+                    } else {
+                        if matches!(self.current().kind, TokenKind::Eof) {
+                            return Err(self.expected("end of do block"));
+                        }
+                        if let Some(let_token) = self.eat(|kind| matches!(kind, TokenKind::KwLet)) {
+                            let pattern = self.parse_pattern()?;
+                            if self.eat(|kind| matches!(kind, TokenKind::Equals)).is_none() {
+                                return Err(self.expected("`=` in do let"));
+                            }
+                            work.push(Work::FinishDoLet {
+                                start,
+                                statements,
+                                pattern,
+                                statement_start: let_token.span,
+                            });
+                            work.push(Work::ParseExpression(0));
+                        } else {
+                            let saved = self.at;
+                            if let Ok(pattern) = self.parse_pattern()
+                                && self
+                                    .eat(|kind| matches!(kind, TokenKind::BindArrow))
+                                    .is_some()
+                            {
+                                work.push(Work::FinishDoBind {
+                                    start,
+                                    statements,
+                                    pattern,
+                                });
+                                work.push(Work::ParseExpression(0));
+                            } else {
+                                self.at = saved;
+                                work.push(Work::FinishDoThen { start, statements });
+                                work.push(Work::ParseExpression(0));
+                            }
+                        }
+                    }
+                }
+                Work::FinishDoLet {
+                    start,
+                    mut statements,
+                    pattern,
+                    statement_start,
+                } => {
+                    let expression = output.take().expect("do let expression produced a value");
+                    let span = statement_start.join(self.expressions[expression.0 as usize].span());
+                    statements.push(DoStatement::Let(pattern, expression, span));
+                    work.push(Work::DoNext { start, statements });
+                }
+                Work::FinishDoBind {
+                    start,
+                    mut statements,
+                    pattern,
+                } => {
+                    let expression = output.take().expect("do bind expression produced a value");
+                    let span =
+                        pattern_span(&pattern).join(self.expressions[expression.0 as usize].span());
+                    statements.push(DoStatement::Bind(pattern, expression, span));
+                    work.push(Work::DoNext { start, statements });
+                }
+                Work::FinishDoThen {
+                    start,
+                    mut statements,
+                } => {
+                    let expression = output.take().expect("do expression produced a value");
+                    let span = self.expressions[expression.0 as usize].span();
+                    statements.push(DoStatement::Then(expression, span));
+                    work.push(Work::DoNext { start, statements });
+                }
+                Work::ListAfterElement {
+                    start,
+                    mut elements,
+                } => {
+                    elements.push(output.take().expect("list element produced a value"));
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::ListAfterElement { start, elements });
+                        work.push(Work::ParseExpression(0));
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RBracket) {
+                            return Err(SyntaxError::parse("expected `]`", end.span));
+                        }
+                        output = Some(self.alloc_expr(Expr::List {
+                            elements,
+                            span: start.join(end.span),
+                        }));
+                    }
+                }
+                Work::RecordNext {
+                    constructor,
+                    start,
+                    fields,
+                } => {
+                    if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RBrace)) {
+                        output = Some(self.alloc_expr(Expr::RecordConstruction {
+                            constructor,
+                            fields,
+                            span: start.join(end.span),
+                        }));
+                    } else {
+                        let field_token = self.bump();
+                        let TokenKind::Lower(name) = field_token.kind else {
+                            return Err(SyntaxError::parse(
+                                "record initializer labels must be unqualified lowercase names",
+                                field_token.span,
+                            ));
+                        };
+                        let pun = self.eat(|kind| matches!(kind, TokenKind::Equals)).is_none();
+                        work.push(Work::FinishRecordField {
+                            constructor,
+                            start,
+                            fields,
+                            name: Arc::clone(&name),
+                            field_span: field_token.span,
+                            pun,
+                        });
+                        if pun {
+                            output = Some(self.alloc_expr(Expr::Name(name, field_token.span)));
+                        } else {
+                            work.push(Work::ParseExpression(0));
+                        }
+                    }
+                }
+                Work::FinishRecordField {
+                    constructor,
+                    start,
+                    mut fields,
+                    name,
+                    field_span,
+                    pun,
+                } => {
+                    let value = output.take().expect("record field produced a value");
+                    fields.push(RecordFieldExpr {
+                        name,
+                        value,
+                        pun,
+                        span: field_span.join(self.expressions[value.0 as usize].span()),
+                    });
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::RecordNext {
+                            constructor,
+                            start,
+                            fields,
+                        });
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RBrace) {
+                            return Err(SyntaxError::parse(
+                                "expected `}` in record construction",
+                                end.span,
+                            ));
+                        }
+                        output = Some(self.alloc_expr(Expr::RecordConstruction {
+                            constructor,
+                            fields,
+                            span: start.join(end.span),
+                        }));
+                    }
+                }
+                Work::FinishParenthesized {
+                    start,
+                    mut remaining,
+                } => {
+                    let first = output
+                        .take()
+                        .expect("parenthesized expression produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::ContinueParenthesizedTuple {
+                            start,
+                            remaining,
+                            elements: vec![first],
+                        });
+                        work.push(Work::ParseExpression(0));
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RParen) {
+                            return Err(SyntaxError::parse("expected `)`", end.span));
+                        }
+                        if let Some(outer) = remaining.pop() {
+                            work.push(Work::FinishParenthesized {
+                                start: outer,
+                                remaining,
+                            });
+                            work.push(Work::ResumeExpression {
+                                left: first,
+                                minimum_precedence: 0,
+                            });
+                        } else {
+                            output = Some(first);
+                        }
+                    }
+                }
+                Work::ContinueParenthesizedTuple {
+                    start,
+                    mut remaining,
+                    mut elements,
+                } => {
+                    elements.push(output.take().expect("tuple element produced a value"));
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::ContinueParenthesizedTuple {
+                            start,
+                            remaining,
+                            elements,
+                        });
+                        work.push(Work::ParseExpression(0));
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RParen)
+                            || !(2..=4).contains(&elements.len())
+                        {
+                            return Err(SyntaxError::parse(
+                                "tuple arity must be two through four",
+                                start.join(end.span),
+                            ));
+                        }
+                        let expression = self.alloc_expr(Expr::Tuple {
+                            elements,
+                            span: start.join(end.span),
+                        });
+                        if let Some(outer) = remaining.pop() {
+                            work.push(Work::FinishParenthesized {
+                                start: outer,
+                                remaining,
+                            });
+                            work.push(Work::ResumeExpression {
+                                left: expression,
+                                minimum_precedence: 0,
+                            });
+                        } else {
+                            output = Some(expression);
+                        }
+                    }
+                }
             }
-            if starts_expression_atom(&self.current().kind) {
-                let argument = self.parse_prefix()?;
-                let span = self.expressions[left.0 as usize]
-                    .span()
-                    .join(self.expressions[argument.0 as usize].span());
-                left = self.alloc_expr(Expr::Apply {
-                    function: left,
-                    argument,
-                    span,
-                });
-                continue;
-            }
-            let TokenKind::Operator(operator) = self.current().kind.clone() else {
-                break;
-            };
-            let (precedence, right_associative) = fixity(&operator).ok_or_else(|| {
-                SyntaxError::parse(
-                    format!("unsupported operator `{operator}`"),
-                    self.current().span,
-                )
-            })?;
-            if precedence < minimum_precedence {
-                break;
-            }
-            let operator_token = self.bump();
-            let right = self.parse_expression(if right_associative {
-                precedence
-            } else {
-                precedence.saturating_add(1)
-            })?;
-            let op = self.alloc_expr(Expr::Name(operator, operator_token.span));
-            let op_left_span = self.expressions[left.0 as usize]
-                .span()
-                .join(self.expressions[op.0 as usize].span());
-            let applied_left = self.alloc_expr(Expr::Apply {
-                function: op,
-                argument: left,
-                span: op_left_span,
-            });
-            let span = self.expressions[left.0 as usize]
-                .span()
-                .join(self.expressions[right.0 as usize].span());
-            left = self.alloc_expr(Expr::Apply {
-                function: applied_left,
-                argument: right,
-                span,
-            });
         }
-        if minimum_precedence == 0
-            && self
-                .eat(|kind| matches!(kind, TokenKind::DoubleColon))
-                .is_some()
-        {
-            let ty = self.parse_type()?;
-            let span = self.expressions[left.0 as usize]
-                .span()
-                .join(self.types[ty.0 as usize].span());
-            left = self.alloc_expr(Expr::Annotation {
-                expression: left,
-                ty,
-                span,
-            });
-        }
-        Ok(left)
-    }
-
-    fn parse_prefix(&mut self) -> Result<ExprId, SyntaxError> {
-        match self.current().kind {
-            TokenKind::Backslash => self.parse_lambda(),
-            TokenKind::KwIf => self.parse_if(),
-            TokenKind::KwDo => self.parse_do(),
-            TokenKind::KwCase => self.parse_case(),
-            _ => self.parse_atom(),
-        }
-    }
-
-    fn parse_lambda(&mut self) -> Result<ExprId, SyntaxError> {
-        let start = self.bump().span;
-        let mut parameters = Vec::new();
-        while !matches!(self.current().kind, TokenKind::Arrow | TokenKind::Eof) {
-            parameters.push(self.parse_pattern()?);
-        }
-        if parameters.is_empty() {
-            return Err(SyntaxError::parse("lambda must bind a parameter", start));
-        }
-        if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_none() {
-            return Err(self.expected("`->`"));
-        }
-        let body = self.parse_expression(0)?;
-        let span = start.join(self.expressions[body.0 as usize].span());
-        Ok(self.alloc_expr(Expr::Lambda {
-            parameters,
-            body,
-            span,
-        }))
-    }
-
-    fn parse_if(&mut self) -> Result<ExprId, SyntaxError> {
-        let start = self.bump().span;
-        let condition = self.parse_expression(0)?;
-        if self.eat(|kind| matches!(kind, TokenKind::KwThen)).is_none() {
-            return Err(self.expected("`then`"));
-        }
-        let then_branch = self.parse_expression(0)?;
-        if self.eat(|kind| matches!(kind, TokenKind::KwElse)).is_none() {
-            return Err(self.expected("`else`"));
-        }
-        let else_branch = self.parse_expression(0)?;
-        let span = start.join(self.expressions[else_branch.0 as usize].span());
-        Ok(self.alloc_expr(Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-            span,
-        }))
-    }
-
-    fn parse_case(&mut self) -> Result<ExprId, SyntaxError> {
-        let start = self.bump().span;
-        let scrutinee = self.parse_expression(0)?;
-        if self.eat(|kind| matches!(kind, TokenKind::KwOf)).is_none() {
-            return Err(self.expected("`of`"));
-        }
-        if self
-            .eat(|kind| matches!(kind, TokenKind::VirtualLBrace | TokenKind::LBrace))
-            .is_none()
-        {
-            return Err(self.expected("case alternative block"));
-        }
-        let mut alternatives = Vec::new();
-        loop {
-            while self
-                .eat(|kind| matches!(kind, TokenKind::VirtualSemicolon | TokenKind::Semicolon))
-                .is_some()
-            {}
-            if matches!(
-                self.current().kind,
-                TokenKind::VirtualRBrace | TokenKind::RBrace | TokenKind::RParen
-            ) {
-                break;
-            }
-            if matches!(self.current().kind, TokenKind::Eof) {
-                return Err(self.expected("end of case block"));
-            }
-            let pattern = self.parse_case_pattern()?;
-            if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_none() {
-                return Err(self.expected("`->` in case alternative"));
-            }
-            let expression = self.parse_expression(0)?;
-            let alternative_span = pattern
-                .span()
-                .join(self.expressions[expression.0 as usize].span());
-            alternatives.push(CaseAlternative {
-                pattern,
-                expression,
-                span: alternative_span,
-            });
-        }
-        let end = if matches!(self.current().kind, TokenKind::RParen) {
-            let span = self.current().span;
-            self.discard_deferred_layout_close();
-            span
-        } else {
-            self.bump().span
-        };
-        if alternatives.is_empty() {
-            return Err(SyntaxError::parse("empty case block", start.join(end)));
-        }
-        Ok(self.alloc_expr(Expr::Case {
-            scrutinee,
-            alternatives,
-            span: start.join(end),
-        }))
+        Ok(output.expect("iterative expression parser produced a value"))
     }
 
     fn parse_case_pattern(&mut self) -> Result<CasePattern, SyntaxError> {
@@ -1450,80 +2049,6 @@ impl Parser {
             }
             _ => Err(SyntaxError::parse("unsupported case pattern", token.span)),
         }
-    }
-
-    fn parse_do(&mut self) -> Result<ExprId, SyntaxError> {
-        let start = self.bump().span;
-        if self
-            .eat(|kind| matches!(kind, TokenKind::VirtualLBrace | TokenKind::LBrace))
-            .is_none()
-        {
-            return Err(self.expected("do statement block"));
-        }
-        let mut statements = Vec::new();
-        loop {
-            while self
-                .eat(|kind| matches!(kind, TokenKind::VirtualSemicolon | TokenKind::Semicolon))
-                .is_some()
-            {}
-            if matches!(
-                self.current().kind,
-                TokenKind::VirtualRBrace | TokenKind::RBrace | TokenKind::RParen
-            ) {
-                break;
-            }
-            if matches!(self.current().kind, TokenKind::Eof) {
-                return Err(self.expected("end of do block"));
-            }
-            if let Some(let_token) = self.eat(|kind| matches!(kind, TokenKind::KwLet)) {
-                let pattern = self.parse_pattern()?;
-                if self.eat(|kind| matches!(kind, TokenKind::Equals)).is_none() {
-                    return Err(self.expected("`=` in do let"));
-                }
-                let expression = self.parse_expression(0)?;
-                let statement_span = let_token
-                    .span
-                    .join(self.expressions[expression.0 as usize].span());
-                statements.push(DoStatement::Let(pattern, expression, statement_span));
-                continue;
-            }
-            let saved = self.at;
-            if let Ok(pattern) = self.parse_pattern()
-                && self
-                    .eat(|kind| matches!(kind, TokenKind::BindArrow))
-                    .is_some()
-            {
-                let expression = self.parse_expression(0)?;
-                let statement_span =
-                    pattern_span(&pattern).join(self.expressions[expression.0 as usize].span());
-                statements.push(DoStatement::Bind(pattern, expression, statement_span));
-                continue;
-            }
-            self.at = saved;
-            let expression = self.parse_expression(0)?;
-            let expression_span = self.expressions[expression.0 as usize].span();
-            statements.push(DoStatement::Then(expression, expression_span));
-        }
-        let end = if matches!(self.current().kind, TokenKind::RParen) {
-            let span = self.current().span;
-            self.discard_deferred_layout_close();
-            span
-        } else {
-            self.bump().span
-        };
-        if statements.is_empty() {
-            return Err(SyntaxError::parse("empty do block", start.join(end)));
-        }
-        if !matches!(statements.last(), Some(DoStatement::Then(_, _))) {
-            return Err(SyntaxError::parse(
-                "the final do statement must be an expression",
-                start.join(end),
-            ));
-        }
-        Ok(self.alloc_expr(Expr::Do {
-            statements,
-            span: start.join(end),
-        }))
     }
 
     fn parse_pattern(&mut self) -> Result<BindingPattern, SyntaxError> {
@@ -1611,235 +2136,162 @@ impl Parser {
         Ok(pattern)
     }
 
-    fn parse_atom(&mut self) -> Result<ExprId, SyntaxError> {
-        let token = self.bump();
-        match token.kind {
-            TokenKind::Qualified(name) if matches!(self.current().kind, TokenKind::LBrace) => {
-                self.parse_record_construction(name, token.span)
-            }
-            TokenKind::Lower(name)
-            | TokenKind::Upper(name)
-            | TokenKind::Qualified(name)
-            | TokenKind::Operator(name) => Ok(self.alloc_expr(Expr::Name(name, token.span))),
-            TokenKind::Integer(value) => {
-                Ok(self.alloc_expr(Expr::Literal(Literal::Integer(value), token.span)))
-            }
-            TokenKind::Fraction(value) => {
-                Ok(self.alloc_expr(Expr::Literal(Literal::Double(value), token.span)))
-            }
-            TokenKind::Character(value) => {
-                Ok(self.alloc_expr(Expr::Literal(Literal::Character(value), token.span)))
-            }
-            TokenKind::Text(value) => {
-                Ok(self.alloc_expr(Expr::Literal(Literal::Text(value), token.span)))
-            }
-            TokenKind::LParen => self.parse_parenthesized(token.span),
-            TokenKind::LBracket => self.parse_list(token.span),
-            TokenKind::KwDo => {
-                self.at -= 1;
-                self.parse_do()
-            }
-            TokenKind::KwIf => {
-                self.at -= 1;
-                self.parse_if()
-            }
-            TokenKind::KwCase => {
-                self.at -= 1;
-                self.parse_case()
-            }
-            _ => Err(SyntaxError::parse("expected expression", token.span)),
-        }
-    }
-
-    fn parse_record_construction(
-        &mut self,
-        constructor: Arc<str>,
-        start: Span,
-    ) -> Result<ExprId, SyntaxError> {
-        self.bump();
-        let mut fields = Vec::new();
-        while !matches!(self.current().kind, TokenKind::RBrace) {
-            let field_token = self.bump();
-            let TokenKind::Lower(name) = field_token.kind else {
-                return Err(SyntaxError::parse(
-                    "record initializer labels must be unqualified lowercase names",
-                    field_token.span,
-                ));
-            };
-            let (value, pun) = if self.eat(|kind| matches!(kind, TokenKind::Equals)).is_some() {
-                (self.parse_expression(0)?, false)
-            } else {
-                (
-                    self.alloc_expr(Expr::Name(Arc::clone(&name), field_token.span)),
-                    true,
-                )
-            };
-            let field_span = field_token
-                .span
-                .join(self.expressions[value.0 as usize].span());
-            fields.push(RecordFieldExpr {
-                name,
-                value,
-                pun,
-                span: field_span,
-            });
-            if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                break;
-            }
-        }
-        let end = self.bump();
-        if !matches!(end.kind, TokenKind::RBrace) {
-            return Err(SyntaxError::parse(
-                "expected `}` in record construction",
-                end.span,
-            ));
-        }
-        Ok(self.alloc_expr(Expr::RecordConstruction {
-            constructor,
-            fields,
-            span: start.join(end.span),
-        }))
-    }
-
-    fn parse_parenthesized(&mut self, start: Span) -> Result<ExprId, SyntaxError> {
-        if self.nesting_depth >= MAX_PARSER_DEPTH {
-            return Err(SyntaxError::resource_limit(
-                "parser nesting limit exceeded",
-                start,
-            ));
-        }
-        self.nesting_depth += 1;
-        let result = self.parse_parenthesized_inner(start);
-        self.nesting_depth -= 1;
-        result
-    }
-
-    fn parse_parenthesized_inner(&mut self, start: Span) -> Result<ExprId, SyntaxError> {
-        if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RParen)) {
-            return Ok(self.alloc_expr(Expr::Literal(Literal::Unit, start.join(end.span))));
-        }
-        let first = self.parse_expression(0)?;
-        if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
-            let mut elements = vec![first];
-            loop {
-                elements.push(self.parse_expression(0)?);
-                if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    break;
-                }
-            }
-            let end = self.bump();
-            if !matches!(end.kind, TokenKind::RParen) {
-                return Err(SyntaxError::parse("expected `)`", end.span));
-            }
-            if !(2..=4).contains(&elements.len()) {
-                return Err(SyntaxError::parse(
-                    "tuple arity must be two through four",
-                    start.join(end.span),
-                ));
-            }
-            return Ok(self.alloc_expr(Expr::Tuple {
-                elements,
-                span: start.join(end.span),
-            }));
-        }
-        let end = self.bump();
-        if !matches!(end.kind, TokenKind::RParen) {
-            return Err(SyntaxError::parse("expected `)`", end.span));
-        }
-        Ok(first)
-    }
-
-    fn parse_list(&mut self, start: Span) -> Result<ExprId, SyntaxError> {
-        let mut elements = Vec::new();
-        if !matches!(self.current().kind, TokenKind::RBracket) {
-            loop {
-                elements.push(self.parse_expression(0)?);
-                if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    break;
-                }
-            }
-        }
-        let end = self.bump();
-        if !matches!(end.kind, TokenKind::RBracket) {
-            return Err(SyntaxError::parse("expected `]`", end.span));
-        }
-        Ok(self.alloc_expr(Expr::List {
-            elements,
-            span: start.join(end.span),
-        }))
-    }
-
     fn parse_type(&mut self) -> Result<TypeExprId, SyntaxError> {
-        let left = self.parse_type_application()?;
-        if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_some() {
-            let right = self.parse_type()?;
-            let span = self.types[left.0 as usize]
-                .span()
-                .join(self.types[right.0 as usize].span());
-            Ok(self.alloc_type(TypeExpr::Function(left, right, span)))
-        } else {
-            Ok(left)
-        }
-    }
-
-    fn parse_type_application(&mut self) -> Result<TypeExprId, SyntaxError> {
-        let mut left = self.parse_type_atom()?;
-        while starts_type_atom(&self.current().kind) {
-            let right = self.parse_type_atom()?;
-            let span = self.types[left.0 as usize]
-                .span()
-                .join(self.types[right.0 as usize].span());
-            left = self.alloc_type(TypeExpr::Apply(left, right, span));
-        }
-        Ok(left)
+        self.parse_type_iterative(TypeParseEntry::Type)
     }
 
     fn parse_type_atom(&mut self) -> Result<TypeExprId, SyntaxError> {
-        let token = self.bump();
-        match token.kind {
-            TokenKind::Upper(name) | TokenKind::Qualified(name) => {
-                Ok(self.alloc_type(TypeExpr::Name(name, token.span)))
-            }
-            TokenKind::Text(value) => Ok(self.alloc_type(TypeExpr::Promoted(value, token.span))),
-            TokenKind::LBracket => {
-                let item = self.parse_type()?;
-                let end = self.bump();
-                if !matches!(end.kind, TokenKind::RBracket) {
-                    return Err(SyntaxError::parse("expected `]` in type", end.span));
-                }
-                Ok(self.alloc_type(TypeExpr::List(item, token.span.join(end.span))))
-            }
-            TokenKind::LParen => {
-                if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RParen)) {
-                    return Ok(self.alloc_type(TypeExpr::Unit(token.span.join(end.span))));
-                }
-                let first = self.parse_type()?;
-                if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    let end = self.bump();
-                    if !matches!(end.kind, TokenKind::RParen) {
-                        return Err(SyntaxError::parse("expected `)` in type", end.span));
-                    }
-                    return Ok(first);
-                }
-                let mut items = vec![first];
-                loop {
-                    items.push(self.parse_type()?);
-                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                        break;
-                    }
-                }
-                let end = self.bump();
-                if !matches!(end.kind, TokenKind::RParen) || !(2..=4).contains(&items.len()) {
-                    return Err(SyntaxError::parse(
-                        "tuple type arity must be two through four",
-                        token.span.join(end.span),
-                    ));
-                }
-                Ok(self.alloc_type(TypeExpr::Tuple(items, token.span.join(end.span))))
-            }
-            _ => Err(SyntaxError::parse("expected concrete monotype", token.span)),
-        }
+        self.parse_type_iterative(TypeParseEntry::Atom)
     }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_type_iterative(&mut self, entry: TypeParseEntry) -> Result<TypeExprId, SyntaxError> {
+        enum Work {
+            ParseType,
+            ParseApplication,
+            ParseAtom,
+            AfterTypeApplication,
+            ContinueApplication,
+            CombineApplication(TypeExprId),
+            FinishFunction(TypeExprId),
+            FinishList(Span),
+            FinishParenthesized(Span),
+            ContinueTuple { start: Span, items: Vec<TypeExprId> },
+        }
+
+        let mut work = vec![match entry {
+            TypeParseEntry::Type => Work::ParseType,
+            TypeParseEntry::Atom => Work::ParseAtom,
+        }];
+        let mut output = None;
+        while let Some(step) = work.pop() {
+            match step {
+                Work::ParseType => {
+                    work.push(Work::AfterTypeApplication);
+                    work.push(Work::ParseApplication);
+                }
+                Work::AfterTypeApplication => {
+                    let left = output.take().expect("type application produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::Arrow)).is_some() {
+                        work.push(Work::FinishFunction(left));
+                        work.push(Work::ParseType);
+                    } else {
+                        output = Some(left);
+                    }
+                }
+                Work::FinishFunction(left) => {
+                    let right = output
+                        .take()
+                        .expect("function result type produced a value");
+                    let span = self.types[left.0 as usize]
+                        .span()
+                        .join(self.types[right.0 as usize].span());
+                    output = Some(self.alloc_type(TypeExpr::Function(left, right, span)));
+                }
+                Work::ParseApplication => {
+                    work.push(Work::ContinueApplication);
+                    work.push(Work::ParseAtom);
+                }
+                Work::ContinueApplication => {
+                    let left = output.take().expect("type atom produced a value");
+                    if starts_type_atom(&self.current().kind) {
+                        work.push(Work::CombineApplication(left));
+                        work.push(Work::ParseAtom);
+                    } else {
+                        output = Some(left);
+                    }
+                }
+                Work::CombineApplication(left) => {
+                    let right = output.take().expect("type argument produced a value");
+                    let span = self.types[left.0 as usize]
+                        .span()
+                        .join(self.types[right.0 as usize].span());
+                    output = Some(self.alloc_type(TypeExpr::Apply(left, right, span)));
+                    work.push(Work::ContinueApplication);
+                }
+                Work::ParseAtom => {
+                    let token = self.bump();
+                    match token.kind {
+                        TokenKind::Upper(name) | TokenKind::Qualified(name) => {
+                            output = Some(self.alloc_type(TypeExpr::Name(name, token.span)));
+                        }
+                        TokenKind::Text(value) => {
+                            output = Some(self.alloc_type(TypeExpr::Promoted(value, token.span)));
+                        }
+                        TokenKind::LBracket => {
+                            work.push(Work::FinishList(token.span));
+                            work.push(Work::ParseType);
+                        }
+                        TokenKind::LParen => {
+                            if let Some(end) = self.eat(|kind| matches!(kind, TokenKind::RParen)) {
+                                output = Some(
+                                    self.alloc_type(TypeExpr::Unit(token.span.join(end.span))),
+                                );
+                            } else {
+                                work.push(Work::FinishParenthesized(token.span));
+                                work.push(Work::ParseType);
+                            }
+                        }
+                        _ => {
+                            return Err(SyntaxError::parse(
+                                "expected concrete monotype",
+                                token.span,
+                            ));
+                        }
+                    }
+                }
+                Work::FinishList(start) => {
+                    let item = output.take().expect("list item type produced a value");
+                    let end = self.bump();
+                    if !matches!(end.kind, TokenKind::RBracket) {
+                        return Err(SyntaxError::parse("expected `]` in type", end.span));
+                    }
+                    output = Some(self.alloc_type(TypeExpr::List(item, start.join(end.span))));
+                }
+                Work::FinishParenthesized(start) => {
+                    let first = output.take().expect("parenthesized type produced a value");
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::ContinueTuple {
+                            start,
+                            items: vec![first],
+                        });
+                        work.push(Work::ParseType);
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RParen) {
+                            return Err(SyntaxError::parse("expected `)` in type", end.span));
+                        }
+                        output = Some(first);
+                    }
+                }
+                Work::ContinueTuple { start, mut items } => {
+                    items.push(output.take().expect("tuple item type produced a value"));
+                    if self.eat(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                        work.push(Work::ContinueTuple { start, items });
+                        work.push(Work::ParseType);
+                    } else {
+                        let end = self.bump();
+                        if !matches!(end.kind, TokenKind::RParen) || !(2..=4).contains(&items.len())
+                        {
+                            return Err(SyntaxError::parse(
+                                "tuple type arity must be two through four",
+                                start.join(end.span),
+                            ));
+                        }
+                        output =
+                            Some(self.alloc_type(TypeExpr::Tuple(items, start.join(end.span))));
+                    }
+                }
+            }
+        }
+        Ok(output.expect("iterative type parser produced a value"))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TypeParseEntry {
+    Type,
+    Atom,
 }
 
 fn pattern_span(pattern: &BindingPattern) -> Span {
@@ -1897,29 +2349,70 @@ fn fixity(operator: &str) -> Option<(u8, bool)> {
 ///
 /// Returns every lexical error, or the parser errors recovered at declaration boundaries.
 pub fn parse(source: &SourceFile) -> Result<ParsedFile, Vec<SyntaxError>> {
+    parse_with_limits(source, ParserLimits::sandboxed())
+}
+
+/// Parses one normalized Hell source file with explicit resource limits.
+///
+/// # Errors
+///
+/// Returns every lexical error, or parser errors recovered at declaration boundaries.
+pub fn parse_with_limits(
+    source: &SourceFile,
+    limits: ParserLimits,
+) -> Result<ParsedFile, Vec<SyntaxError>> {
+    parse_on_current_thread(source, limits)
+}
+
+fn parse_on_current_thread(
+    source: &SourceFile,
+    limits: ParserLimits,
+) -> Result<ParsedFile, Vec<SyntaxError>> {
     let tokens = lex(source)?;
-    reject_excessive_delimiter_nesting(&tokens)?;
+    if limits
+        .max_tokens
+        .is_some_and(|configured| tokens.len() > configured)
+    {
+        return Err(vec![SyntaxError::resource(
+            "H0802",
+            format!(
+                "token budget exceeded: operation=parse_tokens profile={} configured={} observed={}",
+                limits.profile_id,
+                limits.max_tokens.expect("finite token limit checked"),
+                tokens.len()
+            ),
+            source.eof_span(),
+        )]);
+    }
+    reject_excessive_delimiter_nesting(&tokens, limits.max_nesting_depth, limits.profile_id)?;
     Parser {
         tokens,
         at: 0,
         expressions: Vec::new(),
         types: Vec::new(),
         errors: Vec::new(),
-        nesting_depth: 0,
     }
     .parse()
 }
 
-fn reject_excessive_delimiter_nesting(tokens: &[Token]) -> Result<(), Vec<SyntaxError>> {
+fn reject_excessive_delimiter_nesting(
+    tokens: &[Token],
+    max_nesting_depth: Option<usize>,
+    profile_id: &str,
+) -> Result<(), Vec<SyntaxError>> {
     // Reject unsafe input before recursive descent accumulates parser frames.
     // The parser's own guard remains the grammar-level backstop.
     let mut depth = 0_usize;
     for token in tokens {
         match token.kind {
             TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
-                if depth >= MAX_PARSER_DEPTH {
+                if max_nesting_depth.is_some_and(|limit| depth >= limit) {
                     return Err(vec![SyntaxError::resource_limit(
-                        "parser nesting limit exceeded",
+                        format!(
+                            "parser nesting limit exceeded: operation=parse_nesting profile={profile_id} configured={} observed={}",
+                            max_nesting_depth.expect("finite nesting limit checked"),
+                            depth.saturating_add(1)
+                        ),
                         token.span,
                     )]);
                 }
@@ -1940,7 +2433,7 @@ mod tests {
 
     use hell_source::{SourceFile, SourceMap};
 
-    use super::{MAX_PARSER_DEPTH, parse};
+    use super::{ParserLimits, parse, parse_with_limits};
 
     fn nested_application_source(delimiter_depth: usize) -> Arc<SourceFile> {
         let application_depth = delimiter_depth
@@ -1956,14 +2449,100 @@ mod tests {
 
     #[test]
     fn parser_accepts_the_depth_limit_and_rejects_the_next_level() {
-        let at_limit = nested_application_source(MAX_PARSER_DEPTH);
+        let limit = ParserLimits::sandboxed()
+            .max_nesting_depth
+            .expect("sandboxed parsing has a nesting limit");
+        let at_limit = nested_application_source(limit);
         parse(&at_limit).expect("the configured parser depth limit must remain accepted");
 
-        let beyond_limit = nested_application_source(MAX_PARSER_DEPTH + 1);
+        let beyond_limit = nested_application_source(limit + 1);
         let errors =
             parse(&beyond_limit).expect_err("input beyond the parser depth limit must be rejected");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "H0801");
-        assert_eq!(errors[0].message.as_ref(), "parser nesting limit exceeded");
+        assert_eq!(
+            errors[0].message.as_ref(),
+            "parser nesting limit exceeded: operation=parse_nesting profile=sandboxed configured=64 observed=65"
+        );
+    }
+
+    #[test]
+    fn token_limit_reports_profile_operation_and_amounts() {
+        let source = SourceMap::new().add_text("tokens.hell", "main = IO.pure ()\n");
+        let limits = ParserLimits {
+            max_tokens: Some(1),
+            ..ParserLimits::sandboxed()
+        };
+        let errors = parse_with_limits(&source, limits).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "H0802");
+        let message = errors[0].message.as_ref();
+        assert!(message.contains("operation=parse_tokens"));
+        assert!(message.contains("profile=sandboxed"));
+        assert!(message.contains("configured=1"));
+        assert!(message.contains("observed="));
+    }
+
+    #[test]
+    fn upstream_policy_accepts_source_beyond_the_sandbox_limit() {
+        let source = nested_application_source(4_096);
+        parse_with_limits(&source, ParserLimits::upstream())
+            .expect("upstream parsing must not apply the sandbox nesting limit");
+    }
+
+    fn generated_source(expression: &str) -> Arc<SourceFile> {
+        SourceMap::new().add_text("deep-generated.hell", format!("main = {expression}\n"))
+    }
+
+    #[test]
+    fn upstream_parser_uses_heap_worklists_for_deep_expression_families() {
+        let depth = 2_048;
+        let cases = [
+            format!("{}(){}", "[".repeat(depth), "]".repeat(depth)),
+            format!("({}{})", "\\value -> ".repeat(depth), "()"),
+            format!(
+                "{}(){}",
+                "case True of { _ -> ".repeat(depth),
+                " }".repeat(depth)
+            ),
+            format!("{}IO.pure (){}", "do { ".repeat(depth), " }".repeat(depth)),
+            format!(
+                "{}(){}",
+                "Main.Record { field = ".repeat(depth),
+                " }".repeat(depth)
+            ),
+        ];
+        for expression in cases {
+            parse_with_limits(&generated_source(&expression), ParserLimits::upstream())
+                .expect("deep generated expression must parse without native-stack growth");
+        }
+    }
+
+    #[test]
+    fn upstream_parser_uses_heap_worklists_for_deep_types_and_reports_eof() {
+        let depth = 4_096;
+        let nested_list_type = format!("{}(){}", "[".repeat(depth), "]".repeat(depth));
+        let source = SourceMap::new().add_text(
+            "deep-type.hell",
+            format!("value :: {nested_list_type} = ()\nmain = IO.pure ()\n"),
+        );
+        parse_with_limits(&source, ParserLimits::upstream())
+            .expect("deep list type must parse without native-stack growth");
+
+        let arrow_type = format!("{}()", "() -> ".repeat(depth));
+        let source = SourceMap::new().add_text(
+            "deep-arrow.hell",
+            format!("value :: {arrow_type} = ()\nmain = IO.pure ()\n"),
+        );
+        parse_with_limits(&source, ParserLimits::upstream())
+            .expect("deep function type must parse without native-stack growth");
+
+        let malformed_expression = format!("{}()", "[".repeat(depth));
+        let malformed = generated_source(&malformed_expression);
+        let errors = parse_with_limits(&malformed, ParserLimits::upstream())
+            .expect_err("unterminated deep list must remain a structural parse failure");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "H0200");
+        assert_eq!(errors[0].span, malformed.eof_span());
     }
 }

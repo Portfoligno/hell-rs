@@ -29,11 +29,88 @@ pub enum Visibility {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Compatibility {
+pub enum WiringStatus {
+    Executable,
+    DeclaredOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompatibilityDimension {
+    Parse,
+    StaticSemantics,
+    PureRuntime,
+    Effects,
+    Concurrency,
+    Presentation,
+    Platform,
+    ResourceBehavior,
+}
+
+impl CompatibilityDimension {
+    pub const ALL: [Self; 8] = [
+        Self::Parse,
+        Self::StaticSemantics,
+        Self::PureRuntime,
+        Self::Effects,
+        Self::Concurrency,
+        Self::Presentation,
+        Self::Platform,
+        Self::ResourceBehavior,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClaimStatus {
     Exact,
     Normalized,
     PlatformDependent,
-    Pending,
+    DeliberateDivergence,
+    Unverified,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExecutionProfile {
+    Upstream,
+    Sandboxed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClaimPlatform {
+    All,
+    Linux,
+    MacOs,
+    Windows,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DimensionClaim {
+    pub dimension: CompatibilityDimension,
+    pub status: ClaimStatus,
+    pub profiles: &'static [ExecutionProfile],
+    pub platforms: &'static [ClaimPlatform],
+    pub evidence: &'static [&'static str],
+    pub normalizers: &'static [&'static str],
+    pub rationale: Option<&'static str>,
+    pub issue: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompatibilityClaim {
+    pub builtin: BuiltinId,
+    pub baseline: &'static str,
+    pub dimensions: [DimensionClaim; CompatibilityDimension::ALL.len()],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimValidationError {
+    RegistryLength,
+    BuiltinOrder,
+    MissingEvidence,
+    InvalidEvidence,
+    MissingScope,
+    MissingNormalizer,
+    MissingRationale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +137,7 @@ pub struct BuiltinSpec {
     pub arity: u8,
     pub demand: &'static [Demand],
     pub fixity: Option<Fixity>,
-    pub compatibility: Compatibility,
+    pub wiring: WiringStatus,
     /// The manifest class whose evidence must be attached to this primitive.
     pub type_class: Option<TypeClass>,
     /// `None` means the language name is accounted for but its adapter is not
@@ -370,18 +447,8 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
             "async_pooled_for_",
         ),
         "Text.eq" => ("Text -> Text -> Bool", 2, TWO_WHNF, "text_eq"),
-        "Text.all" => (
-            "(Char -> Bool) -> Text -> Bool",
-            2,
-            &[Demand::Lazy, Demand::Whnf],
-            "text_all",
-        ),
-        "Text.any" => (
-            "(Char -> Bool) -> Text -> Bool",
-            2,
-            &[Demand::Lazy, Demand::Whnf],
-            "text_any",
-        ),
+        "Text.all" => ("(Char -> Bool) -> Text -> Bool", 2, TWO_LAZY, "text_all"),
+        "Text.any" => ("(Char -> Bool) -> Text -> Bool", 2, TWO_LAZY, "text_any"),
         "Text.breakOn" => ("Text -> Text -> (Text, Text)", 2, TWO_WHNF, "text_break_on"),
         "Text.concat" => ("[Text] -> Text", 1, WHNF, "text_concat"),
         "Text.getLine" => ("IO Text", 0, &[], "text_get_line"),
@@ -566,7 +633,7 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
             &[Demand::Lazy, Demand::Whnf],
             "list_partition",
         ),
-        "List.permutations" => ("forall a. [a] -> [[a]]", 1, WHNF, "list_permutations"),
+        "List.permutations" => ("forall a. [a] -> [[a]]", 1, LAZY, "list_permutations"),
         "List.scanl'" => (
             "forall a b. (b -> a -> b) -> b -> [a] -> [b]",
             3,
@@ -586,7 +653,7 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
             TWO_WHNF,
             "list_split_at",
         ),
-        "List.subsequences" => ("forall a. [a] -> [[a]]", 1, WHNF, "list_subsequences"),
+        "List.subsequences" => ("forall a. [a] -> [[a]]", 1, LAZY, "list_subsequences"),
         "List.tails" => ("forall a. [a] -> [[a]]", 1, WHNF, "list_tails"),
         "List.transpose" => ("forall a. [[a]] -> [[a]]", 1, WHNF, "list_transpose"),
         "List.unfoldr" => (
@@ -1391,10 +1458,10 @@ pub fn registry() -> &'static [BuiltinSpec] {
                     arity: executable.map_or(0, |entry| entry.1),
                     demand: executable.map_or(&[], |entry| entry.2),
                     fixity: operator_fixity(name),
-                    compatibility: if executable.is_some() {
-                        Compatibility::Exact
+                    wiring: if executable.is_some() {
+                        WiringStatus::Executable
                     } else {
-                        Compatibility::Pending
+                        WiringStatus::DeclaredOnly
                     },
                     type_class: builtin_type_class(name),
                     implementation: executable.map(|entry| entry.3),
@@ -1402,6 +1469,101 @@ pub fn registry() -> &'static [BuiltinSpec] {
             })
             .collect()
     })
+}
+
+const SUPPORTED_PROFILES: &[ExecutionProfile] =
+    &[ExecutionProfile::Upstream, ExecutionProfile::Sandboxed];
+const ALL_PLATFORMS: &[ClaimPlatform] = &[ClaimPlatform::All];
+
+fn unverified_dimension(dimension: CompatibilityDimension) -> DimensionClaim {
+    DimensionClaim {
+        dimension,
+        status: ClaimStatus::Unverified,
+        profiles: SUPPORTED_PROFILES,
+        platforms: ALL_PLATFORMS,
+        evidence: &[],
+        normalizers: &[],
+        rationale: Some("No current pinned-oracle evidence has been published for this dimension."),
+        issue: Some("COMPAT-EVIDENCE"),
+    }
+}
+
+/// Returns the conservative, dimensioned compatibility claim for every term.
+///
+/// Wiring and semantic equivalence are deliberately independent. Until a
+/// retained pinned-oracle evidence record is available, executable terms stay
+/// `Unverified` in every observable dimension.
+#[must_use]
+pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
+    static CLAIMS: OnceLock<Vec<CompatibilityClaim>> = OnceLock::new();
+    CLAIMS.get_or_init(|| {
+        registry()
+            .iter()
+            .map(|spec| CompatibilityClaim {
+                builtin: spec.id,
+                baseline: LANGUAGE_VERSION,
+                dimensions: CompatibilityDimension::ALL.map(unverified_dimension),
+            })
+            .collect()
+    })
+}
+
+#[must_use]
+pub fn compatibility_claim(id: BuiltinId) -> Option<&'static CompatibilityClaim> {
+    compatibility_claims().get(usize::from(id.0))
+}
+
+/// Validates the fail-closed promotion invariants for compatibility claims.
+///
+/// Development snapshots may contain `Unverified` claims. Evidence-bearing
+/// statuses may not omit their evidence or normalization/rationale metadata.
+///
+/// # Errors
+///
+/// Returns the first structural or fail-closed promotion violation.
+pub fn validate_compatibility_claims(
+    claims: &[CompatibilityClaim],
+) -> Result<(), ClaimValidationError> {
+    if claims.len() != registry().len() {
+        return Err(ClaimValidationError::RegistryLength);
+    }
+    for (index, claim) in claims.iter().enumerate() {
+        if usize::from(claim.builtin.0) != index {
+            return Err(ClaimValidationError::BuiltinOrder);
+        }
+        for dimension in &claim.dimensions {
+            if dimension.profiles.is_empty() || dimension.platforms.is_empty() {
+                return Err(ClaimValidationError::MissingScope);
+            }
+            if matches!(
+                dimension.status,
+                ClaimStatus::Exact | ClaimStatus::Normalized
+            ) && dimension.evidence.is_empty()
+            {
+                return Err(ClaimValidationError::MissingEvidence);
+            }
+            if dimension.status == ClaimStatus::Normalized && dimension.normalizers.is_empty() {
+                return Err(ClaimValidationError::MissingNormalizer);
+            }
+            if dimension.status == ClaimStatus::DeliberateDivergence
+                && dimension.rationale.is_none_or(str::is_empty)
+            {
+                return Err(ClaimValidationError::MissingRationale);
+            }
+            if matches!(
+                dimension.status,
+                ClaimStatus::Exact | ClaimStatus::Normalized
+            ) && (dimension
+                .evidence
+                .iter()
+                .any(|reference| reference.strip_prefix("differential:").is_none())
+                || dimension.platforms.contains(&ClaimPlatform::All))
+            {
+                return Err(ClaimValidationError::InvalidEvidence);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[must_use]

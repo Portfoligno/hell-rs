@@ -24,6 +24,21 @@ fn main() {
             }
             return;
         }
+        Some("write-snapshot") => {
+            let Some(path) = arguments.next() else {
+                usage();
+            };
+            if arguments.next().is_some() {
+                usage();
+            }
+            std::fs::write(path, hell_docgen::render_compatibility_json()).unwrap_or_else(
+                |error| {
+                    eprintln!("could not write reviewed snapshot: {error}");
+                    std::process::exit(2);
+                },
+            );
+            return;
+        }
         _ => {
             usage();
         }
@@ -32,6 +47,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: hell-docgen [api|snapshot|check-snapshot FILE]");
+    eprintln!("usage: hell-docgen [api|snapshot|check-snapshot FILE|write-snapshot FILE]");
     std::process::exit(2);
 }
