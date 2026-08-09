@@ -85,6 +85,7 @@ pub struct EvidenceSummary<'a> {
     pub required_platform_skips: usize,
     pub leaked_resources: usize,
     pub dependency_failures: usize,
+    pub promotion_ready: bool,
 }
 
 /// Writes a digested run summary and the two verified executable identities.
@@ -155,6 +156,12 @@ pub fn write_evidence_summary(root: &Path, evidence: &EvidenceSummary<'_>) -> st
     write!(summary, "{}", evidence.leaked_resources).expect("writing to String cannot fail");
     summary.push_str(",\n  \"dependencyFailures\": ");
     write!(summary, "{}", evidence.dependency_failures).expect("writing to String cannot fail");
+    summary.push_str(",\n  \"promotionReady\": ");
+    summary.push_str(if evidence.promotion_ready {
+        "true"
+    } else {
+        "false"
+    });
     summary.push_str("\n}\n");
     let digest = sha256_bytes(summary.as_bytes()).hex();
     write_atomic(&root.join("summary.json"), summary.as_bytes())?;

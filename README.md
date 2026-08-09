@@ -60,6 +60,22 @@ Run release and stress gates:
 target/ci/hell-ci nightly --oracle /path/to/pinned/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --report ci-out/nightly-local.json
 ```
 
+The nightly command validates and retains one evidence shard. Its shard summary
+records `promotionReady: false` because no single platform can establish global
+readiness. Missing reviewed claim mappings and required platform records remain
+truthful counters without becoming collection failures. Build, differential,
+policy, resource, and dependency failures still fail the command.
+
+After all three native shard artifacts have been retained and reviewed, apply
+the distinct fail-closed promotion gate explicitly:
+
+```text
+target/ci/hell-ci promotion-gate --input ci-out/native-shards --report ci-out/promotion-gate.json
+```
+
+This command revalidates the shard digests and provenance and fails until the
+merged evidence records no missing claim mappings or required platform skips.
+
 The reviewed Linux amd64 oracle is the `hell-linux-amd64` asset from the
 upstream `2026-05-29` release. Its source, executable digest, and pinned build
 inputs are recorded in `crates/hell-ci/oracle/linux-amd64.toml`; verify the

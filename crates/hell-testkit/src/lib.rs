@@ -318,18 +318,32 @@ pub struct ReleaseGateReport {
 }
 
 impl ReleaseGateReport {
+    /// Whether evidence collection completed without an implementation,
+    /// harness, policy, resource, or dependency failure.
     #[must_use]
-    pub fn passed(&self) -> bool {
+    pub fn collection_passed(&self) -> bool {
         self.differential_observations >= self.minimum_differential_observations
             && self.harness_failures == 0
             && self.unexpected_timeouts == 0
             && self.unexplained_mismatches == 0
             && self.rust_bug_mismatches == 0
             && self.stale_exact_claims == 0
-            && self.missing_evidence_references == 0
-            && self.required_platform_skips == 0
             && self.leaked_resources == 0
             && self.dependency_failures == 0
+    }
+
+    /// Whether validated evidence is also ready for a compatibility promotion.
+    #[must_use]
+    pub fn promotion_ready(&self) -> bool {
+        self.collection_passed()
+            && self.missing_evidence_references == 0
+            && self.required_platform_skips == 0
+    }
+
+    /// Applies the fail-closed promotion gate.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.promotion_ready()
     }
 }
 
@@ -598,11 +612,7 @@ fn observe_source(
         .stderr
         .complete
         .ok_or_else(|| std::io::Error::other("stderr exceeded the normalization capture bound"))?;
-    let mut stderr = replace_all(
-        &stderr,
-        sandbox.path.to_string_lossy().as_bytes(),
-        b"<SANDBOX>",
-    );
+    let mut stderr = scrub_diagnostic_paths(&stderr, &sandbox.path, &script);
     for (from, to) in &case.normalization.stderr_replacements {
         stderr = replace_all(&stderr, from, to);
     }
@@ -630,8 +640,40 @@ fn observe_source(
     })
 }
 
+fn scrub_diagnostic_paths(stderr: &[u8], sandbox: &Path, script: &Path) -> Vec<u8> {
+    let sandbox = sandbox.to_string_lossy();
+    let script = script.to_string_lossy();
+    scrub_diagnostic_path_bytes(stderr, sandbox.as_bytes(), script.as_bytes())
+}
+
+fn scrub_diagnostic_path_bytes(stderr: &[u8], sandbox: &[u8], script: &[u8]) -> Vec<u8> {
+    let mut scrubbed = stderr.to_vec();
+    if let Some(escaped_script) = haskell_show_escaped_windows_path(script) {
+        let mut quoted_script = Vec::new();
+        quoted_script.push(b'"');
+        quoted_script.extend_from_slice(&escaped_script);
+        quoted_script.push(b'"');
+        scrubbed = replace_all(&scrubbed, &quoted_script, b"\"<SANDBOX>\\main.hell\"");
+    }
+    replace_all(&scrubbed, sandbox, b"<SANDBOX>")
+}
+
+fn haskell_show_escaped_windows_path(path: &[u8]) -> Option<Vec<u8>> {
+    path.contains(&b'\\').then(|| {
+        let mut escaped = Vec::new();
+        for byte in path {
+            if *byte == b'\\' {
+                escaped.push(b'\\');
+            }
+            escaped.push(*byte);
+        }
+        escaped
+    })
+}
+
 fn parse_diagnostic_observation(stderr: &[u8]) -> std::io::Result<DiagnosticObservation> {
-    const SCRIPT_MARKER: &str = "<SANDBOX>/main.hell";
+    const SANDBOX_MARKER: &str = "<SANDBOX>";
+    const SCRIPT_NAME: &str = "main.hell";
     let text = std::str::from_utf8(stderr)
         .map_err(|_| std::io::Error::other("check diagnostic was not UTF-8"))?;
     let phase = if text.contains("Parse error:") || text.contains("error[H02") {
@@ -640,8 +682,14 @@ fn parse_diagnostic_observation(stderr: &[u8]) -> std::io::Result<DiagnosticObse
         DiagnosticPhase::StaticSemantics
     };
     let remainder = text
-        .split(SCRIPT_MARKER)
-        .nth(1)
+        .split(SANDBOX_MARKER)
+        .skip(1)
+        .find_map(|remainder| {
+            remainder
+                .strip_prefix('/')
+                .or_else(|| remainder.strip_prefix('\\'))
+                .and_then(|path| path.strip_prefix(SCRIPT_NAME))
+        })
         .ok_or_else(|| std::io::Error::other("check diagnostic did not identify main.hell"))?;
     let (line, column) = if let Some(location) = remainder.strip_prefix(':') {
         let mut fields = location.split(':');
@@ -1154,29 +1202,105 @@ impl Iterator for DeterministicUtf8 {
 
 #[cfg(test)]
 mod diagnostic_tests {
-    use super::{DiagnosticObservation, DiagnosticPhase, parse_diagnostic_observation};
+    use super::{
+        DiagnosticObservation, DiagnosticPhase, parse_diagnostic_observation,
+        scrub_diagnostic_path_bytes,
+    };
 
     #[test]
-    fn oracle_and_candidate_diagnostics_reduce_to_the_same_structure() {
-        let oracle_parse = b"hell: Parse error: <SANDBOX>/main.hell:2:1: Parse error: ;\n";
-        let candidate_parse = b"<SANDBOX>/main.hell:2:1: error[H0200]: expected expression\n";
-        let oracle_static = b"hell: Invalid variable: Qual (SrcSpanInfo {srcInfoSpan = SrcSpan \"<SANDBOX>/main.hell\" 1 17 1 33})\n";
-        let candidate_static =
-            b"<SANDBOX>/main.hell:1:17: error[H0402]: unknown global `Main.missingName`\n";
+    fn diagnostic_path_scrubbing_handles_exact_windows_show_quoting_only() {
+        let sandbox = br"C:\work\sandbox";
+        let script = br"C:\work\sandbox\main.hell";
+        let escaped = br#"SrcSpan "C:\\work\\sandbox\\main.hell" 1 17 1 33"#;
+        let scrubbed = scrub_diagnostic_path_bytes(escaped, sandbox, script);
+        assert_eq!(scrubbed, br#"SrcSpan "<SANDBOX>\main.hell" 1 17 1 33"#);
         assert_eq!(
-            parse_diagnostic_observation(oracle_parse).expect("oracle parse diagnostic"),
-            parse_diagnostic_observation(candidate_parse).expect("candidate parse diagnostic")
-        );
-        assert_eq!(
-            parse_diagnostic_observation(oracle_static).expect("oracle static diagnostic"),
-            parse_diagnostic_observation(candidate_static).expect("candidate static diagnostic")
-        );
-        assert_eq!(
-            parse_diagnostic_observation(candidate_static).expect("structured diagnostic"),
+            parse_diagnostic_observation(&scrubbed).expect("scrubbed Show diagnostic"),
             DiagnosticObservation {
                 phase: DiagnosticPhase::StaticSemantics,
                 line: 1,
                 column: 17,
+            }
+        );
+        assert_eq!(
+            scrub_diagnostic_path_bytes(
+                br"C:\work\sandbox\main.hell:1:17: error[H0402]",
+                sandbox,
+                script,
+            ),
+            br"<SANDBOX>\main.hell:1:17: error[H0402]"
+        );
+
+        for near_match in [
+            br#"SrcSpan "C:\\work\\sandbox\\main.hellish" 1 17"#.as_slice(),
+            br#"SrcSpan "C:\\work\\sandbox-other\\main.hell" 1 17"#.as_slice(),
+            br"unquoted C:\\work\\sandbox\\main.hell 1 17".as_slice(),
+        ] {
+            assert_eq!(
+                scrub_diagnostic_path_bytes(near_match, sandbox, script),
+                near_match
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_and_candidate_diagnostics_reduce_to_the_same_structure() {
+        let parse_diagnostics: [&[u8]; 4] = [
+            b"hell: Parse error: <SANDBOX>/main.hell:2:1: Parse error: ;\n",
+            b"<SANDBOX>/main.hell:2:1: error[H0200]: expected expression\n",
+            b"hell: Parse error: <SANDBOX>\\main.hell:2:1: Parse error: ;\n",
+            b"<SANDBOX>\\main.hell:2:1: error[H0200]: expected expression\n",
+        ];
+        for diagnostic in parse_diagnostics {
+            assert_eq!(
+                parse_diagnostic_observation(diagnostic).expect("parse diagnostic"),
+                DiagnosticObservation {
+                    phase: DiagnosticPhase::Parse,
+                    line: 2,
+                    column: 1,
+                }
+            );
+        }
+
+        let static_diagnostics: [&[u8]; 4] = [
+            b"hell: Invalid variable: Qual (SrcSpanInfo {srcInfoSpan = SrcSpan \"<SANDBOX>/main.hell\" 1 17 1 33})\n",
+            b"<SANDBOX>/main.hell:1:17: error[H0402]: unknown global `Main.missingName`\n",
+            b"hell: Invalid variable: Qual (SrcSpanInfo {srcInfoSpan = SrcSpan \"<SANDBOX>\\main.hell\" 1 17 1 33})\n",
+            b"<SANDBOX>\\main.hell:1:17: error[H0402]: unknown global `Main.missingName`\n",
+        ];
+        for diagnostic in static_diagnostics {
+            assert_eq!(
+                parse_diagnostic_observation(diagnostic).expect("static diagnostic"),
+                DiagnosticObservation {
+                    phase: DiagnosticPhase::StaticSemantics,
+                    line: 1,
+                    column: 17,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_script_marker_rejects_near_match_paths() {
+        for diagnostic in [
+            b"<SANDBOX>main.hell:1:1: error[H0200]".as_slice(),
+            b"<SANDBOX>//main.hell:1:1: error[H0200]".as_slice(),
+            b"<SANDBOX>\\\\main.hell:1:1: error[H0200]".as_slice(),
+            b"<SANDBOX>/other/main.hell:1:1: error[H0200]".as_slice(),
+            b"<SANDBOX>\\other\\main.hell:1:1: error[H0200]".as_slice(),
+            b"<SANDBOX>/main.hellish:1:1: error[H0200]".as_slice(),
+        ] {
+            assert!(parse_diagnostic_observation(diagnostic).is_err());
+        }
+        assert_eq!(
+            parse_diagnostic_observation(
+                b"noise <SANDBOX>wrong <SANDBOX>\\main.hell:3:4: error[H0200]"
+            )
+            .expect("later exact marker"),
+            DiagnosticObservation {
+                phase: DiagnosticPhase::Parse,
+                line: 3,
+                column: 4,
             }
         );
     }

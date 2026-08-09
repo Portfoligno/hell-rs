@@ -578,8 +578,6 @@ fn keep_alive_reuses_connections_and_drains_unconsumed_request_bodies() {
                 "Content-Length: 4\r\n",
                 "Content-Length: 4\r\n\r\n",
                 "DATA",
-                "GET /second HTTP/1.1\r\n",
-                "Host: localhost\r\n\r\n",
             )
             .as_bytes(),
         )
@@ -591,6 +589,9 @@ fn keep_alive_reuses_connections_and_drains_unconsumed_request_bodies() {
             .windows(b"Connection: close".len())
             .any(|window| { window.eq_ignore_ascii_case(b"Connection: close") })
     );
+    stream
+        .write_all(b"GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
     let second = read_response(&mut stream);
     assert_eq!(response_body(&second), b"two");
     finish(worker, &receiver);
@@ -622,13 +623,15 @@ fn chunked_extensions_and_trailers_preserve_exact_body_bytes() {
                 "4;name=value\r\nDATA\r\n",
                 "3\r\nxyz\r\n",
                 "0\r\nX-Trailer: yes\r\n\r\n",
-                "GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             )
             .as_bytes(),
         )
         .unwrap();
     let first = read_response(&mut stream);
     assert_eq!(response_body(&first), b"DATAxyz");
+    stream
+        .write_all(b"GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
     let second = read_response(&mut stream);
     assert_eq!(response_body(&second), b"");
     finish(worker, &receiver);

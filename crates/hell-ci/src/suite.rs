@@ -9,7 +9,7 @@ use hell_compiler::{CompilerConfig, CompilerSession};
 use hell_source::{SourceMap, SourceName};
 use hell_testkit::{
     ClassifiedMismatch, DeterministicBytes, DeterministicUtf8, DifferentialCase, Digest,
-    EvidenceSummary, ExecutableIdentity, ExecutableRole, ReleaseGateInput,
+    EvidenceSummary, ExecutableIdentity, ExecutableRole, ReleaseGateInput, ReleaseGateReport,
     committed_differential_cases, differential_with_identities, evaluate_release_gate,
     generated_typed_cases, retain_mismatch_bundle, retain_observation_bundle, sha256_bytes,
     sha256_file, verify_executable, write_evidence_summary,
@@ -26,6 +26,28 @@ pub enum FailureKind {
     Child,
     Fixture,
     Io,
+}
+
+#[derive(Debug)]
+struct SuiteFailure {
+    kind: FailureKind,
+    detail: String,
+}
+
+impl SuiteFailure {
+    fn fixture(detail: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::Fixture,
+            detail: detail.into(),
+        }
+    }
+
+    fn io(action: &str, path: &Path, error: &std::io::Error) -> Self {
+        Self {
+            kind: FailureKind::Io,
+            detail: format!("cannot {action} {}: {error}", path.display()),
+        }
+    }
 }
 
 pub fn policy_suite(root: &Path, report: &mut Report) -> Result<(), FailureKind> {
@@ -153,7 +175,12 @@ pub fn nightly(
     report.check("executable-identities", started.elapsed(), Ok(()));
 
     let started = Instant::now();
-    let differential = run_differential_corpus(root, &identities, failures)?;
+    let differential = checked_suite_result(
+        report,
+        "differential-evidence",
+        started,
+        run_differential_corpus(root, &identities, failures),
+    )?;
     report.check(
         "committed-and-generated-differential",
         started.elapsed(),
@@ -199,18 +226,32 @@ pub fn nightly(
         },
         1_024,
     );
-    let gate_result = gate.passed().then_some(()).ok_or_else(|| {
-        format!(
-            "release gate failed: differential={}, candidate-stress={}, unexplained={}, rust bugs={}",
-            gate.differential_observations,
-            stress_observations,
-            gate.unexplained_mismatches,
-            gate.rust_bug_mismatches
-        )
-    });
-    let gate_passed = gate_result.is_ok();
-    report.check("release-gate", started.elapsed(), gate_result);
-    gate_passed.then_some(()).ok_or(FailureKind::Fixture)
+    let collection_result = gate
+        .collection_passed()
+        .then_some(())
+        .ok_or_else(|| evidence_collection_failure(&gate, stress_observations));
+    let collection_passed = collection_result.is_ok();
+    report.check(
+        "evidence-collection-gate",
+        started.elapsed(),
+        collection_result,
+    );
+    collection_passed.then_some(()).ok_or(FailureKind::Fixture)
+}
+
+fn evidence_collection_failure(gate: &ReleaseGateReport, stress_observations: usize) -> String {
+    format!(
+        "evidence collection failed: differential={}, candidate-stress={}, harness={}, timeouts={}, unexplained={}, rust bugs={}, stale claims={}, leaks={}, dependency failures={}",
+        gate.differential_observations,
+        stress_observations,
+        gate.harness_failures,
+        gate.unexpected_timeouts,
+        gate.unexplained_mismatches,
+        gate.rust_bug_mismatches,
+        gate.stale_exact_claims,
+        gate.leaked_resources,
+        gate.dependency_failures,
+    )
 }
 
 /// Builds a pinned upstream oracle from source and emits one native evidence shard.
@@ -233,8 +274,17 @@ pub fn native_oracle_shard(
             .arguments(["rev-parse", "HEAD"])
             .current_directory(source),
     )?;
-    let observed_commit =
-        String::from_utf8(source_identity.stdout).map_err(|_| FailureKind::Fixture)?;
+    let observed_commit = String::from_utf8(source_identity.stdout).map_err(|error| {
+        report.check(
+            "oracle-source-commit",
+            Duration::ZERO,
+            Err(format!(
+                "upstream source commit from {} is not UTF-8: {error}",
+                source.display()
+            )),
+        );
+        FailureKind::Fixture
+    })?;
     if observed_commit.trim() != SOURCE_COMMIT {
         report.check(
             "oracle-source-commit",
@@ -269,19 +319,21 @@ pub fn native_oracle_shard(
     )?;
     let artifact_root = failures.parent().unwrap_or_else(|| Path::new("."));
     let oracle_directory = artifact_root.join("oracle").join(platform);
-    fs::create_dir_all(&oracle_directory).map_err(|_| FailureKind::Io)?;
+    let started = Instant::now();
+    io_or_report(
+        report,
+        "oracle-output-directory",
+        started,
+        "create oracle output directory",
+        &oracle_directory,
+        fs::create_dir_all(&oracle_directory),
+    )?;
     let build = observed_command(
         root,
         report,
         failures,
         "oracle-source-build",
-        CommandSpec::new("stack", Duration::from_mins(45))
-            .argument("--stack-yaml")
-            .argument(stack_yaml.as_os_str())
-            .arguments(["build", "--install-ghc", "--locked", "--copy-bins"])
-            .argument("--local-bin-path")
-            .argument(oracle_directory.as_os_str())
-            .current_directory(source),
+        stack_oracle_build_command(&stack_yaml, &oracle_directory),
     )?;
     let compiler_identity = observed_command(
         root,
@@ -291,8 +343,7 @@ pub fn native_oracle_shard(
         CommandSpec::new("stack", Duration::from_mins(5))
             .argument("--stack-yaml")
             .argument(stack_yaml.as_os_str())
-            .arguments(["exec", "--", "ghc", "--info"])
-            .current_directory(source),
+            .arguments(["exec", "--", "ghc", "--info"]),
     )?;
     let dependency_identity = observed_command(
         root,
@@ -302,44 +353,78 @@ pub fn native_oracle_shard(
         CommandSpec::new("stack", Duration::from_mins(5))
             .argument("--stack-yaml")
             .argument(stack_yaml.as_os_str())
-            .arguments(["ls", "dependencies"])
-            .current_directory(source),
+            .arguments(["ls", "dependencies"]),
     )?;
     let executable_name = if cfg!(windows) { "hell.exe" } else { "hell" };
     let oracle = oracle_directory.join(executable_name);
-    let oracle_sha256 = sha256_file(&oracle).map_err(|_| FailureKind::Io)?;
-    let resolver = fs::read(&stack_lock).map_err(|_| FailureKind::Io)?;
-    write_oracle_build_record(
-        artifact_root,
-        platform,
-        SOURCE_COMMIT,
-        &source_tree_identity,
-        &resolver,
-        oracle_sha256,
-        &stack_identity,
-        &compiler_identity,
-        &dependency_identity,
-        &build,
+    let started = Instant::now();
+    let oracle_sha256 = io_or_report(
+        report,
+        "oracle-binary-digest",
+        started,
+        "hash oracle binary",
+        &oracle,
+        sha256_file(&oracle),
+    )?;
+    let started = Instant::now();
+    let resolver = io_or_report(
+        report,
+        "oracle-resolver-lock-read",
+        started,
+        "read oracle resolver lock",
+        &stack_lock,
+        fs::read(&stack_lock),
+    )?;
+    let started = Instant::now();
+    checked_suite_result(
+        report,
+        "oracle-build-provenance",
+        started,
+        write_oracle_build_record(
+            artifact_root,
+            platform,
+            SOURCE_COMMIT,
+            &source_tree_identity,
+            &resolver,
+            oracle_sha256,
+            &stack_identity,
+            &compiler_identity,
+            &dependency_identity,
+            &build,
+        ),
     )?;
 
     if !build_candidate(root, report, failures, "release") {
         return Err(FailureKind::Child);
     }
-    let identities = verify_nightly_identities(root, &oracle, oracle_sha256)
-        .map_err(|_| FailureKind::Fixture)?;
-    let differential = run_differential_corpus(root, &identities, failures)?;
+    let started = Instant::now();
+    let identities = checked_suite_result(
+        report,
+        "oracle-identities",
+        started,
+        verify_nightly_identities(root, &oracle, oracle_sha256).map_err(SuiteFailure::fixture),
+    )?;
+    let started = Instant::now();
+    let differential = checked_suite_result(
+        report,
+        "native-differential-evidence",
+        started,
+        run_differential_corpus(root, &identities, failures),
+    )?;
     let passed = differential.harness_failures == 0
         && differential.unexpected_timeouts == 0
-        && differential.mismatches.is_empty();
+        && differential.mismatches.is_empty()
+        && differential.stale_exact_claims == 0;
     report.check(
         "native-oracle-differential-shard",
         Duration::ZERO,
         passed.then_some(()).ok_or_else(|| {
             format!(
-                "harness={}, timeouts={}, mismatches={}",
+                "harness={}, timeouts={}, mismatches={}, staleExactClaims={}",
                 differential.harness_failures,
                 differential.unexpected_timeouts,
-                differential.mismatches.len()
+                differential.mismatches.len(),
+                differential.stale_exact_claims
             )
         }),
     );
@@ -348,7 +433,41 @@ pub fn native_oracle_shard(
 
 /// Verifies the identities and content digests of required native shards.
 #[allow(clippy::too_many_lines)]
-pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), FailureKind> {
+pub fn merge_native_shards(
+    root: &Path,
+    input: &Path,
+    report: &mut Report,
+) -> Result<(), FailureKind> {
+    validate_and_merge_native_shards(root, input, report, false)
+}
+
+/// Revalidates every native shard and applies the fail-closed promotion gate.
+pub fn promotion_gate(root: &Path, input: &Path, report: &mut Report) -> Result<(), FailureKind> {
+    let started = Instant::now();
+    let retained_manifest = read_digested_merged_manifest(input).and_then(|manifest| {
+        (json_usize_field(&manifest, "validatedShardCount") == Some(3))
+            .then_some(())
+            .ok_or_else(|| "retained manifest does not bind three validated shards".to_owned())
+    });
+    let retained_manifest_passed = retained_manifest.is_ok();
+    report.check(
+        "retained-merged-manifest",
+        started.elapsed(),
+        retained_manifest,
+    );
+    if !retained_manifest_passed {
+        return Err(FailureKind::Fixture);
+    }
+    validate_and_merge_native_shards(root, input, report, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_and_merge_native_shards(
+    root: &Path,
+    input: &Path,
+    report: &mut Report,
+    require_promotion: bool,
+) -> Result<(), FailureKind> {
     const SHARDS: [(&str, &str, bool); 3] = [
         ("linux-amd64", "linux-x86_64", false),
         ("macos-arm64", "macos-aarch64", true),
@@ -359,88 +478,161 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
     let mut merged = String::from("{\n  \"schemaVersion\": 1,\n  \"shards\": [\n");
     let mut candidate_source_commit = None::<String>;
     let mut compatibility_snapshot_sha256 = None::<String>;
+    let expected_missing_claims = missing_claim_evidence();
+    let expected_platform_skips = required_platform_skips(root);
+    let mut validated_shards = 0_usize;
     for (index, (label, host_platform, source_built)) in SHARDS.iter().enumerate() {
         let directory = input.join(label);
         let summary_path = directory.join("summary.json");
-        let summary = fs::read_to_string(&summary_path).map_err(|_| FailureKind::Io)?;
+        let summary = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read",
+            &summary_path,
+            fs::read_to_string(&summary_path),
+        )?;
         let expected_platform = format!("\"platform\": \"{host_platform}\"");
         if !summary.contains(&expected_platform) {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err(format!("{label} summary has the wrong platform identity")),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                format!("expected platform identity {host_platform}"),
+            ));
         }
         let summary_digest = sha256_bytes(summary.as_bytes());
         for field in [
             "mismatches",
             "unexpectedTimeouts",
             "staleExactClaims",
-            "missingEvidenceReferences",
             "leakedResources",
             "dependencyFailures",
         ] {
             if json_usize_field(&summary, field) != Some(0) {
-                report.check(
-                    "merge-native-shards",
-                    started.elapsed(),
-                    Err(format!("{label} summary has a nonzero or missing {field}")),
-                );
-                return Err(FailureKind::Fixture);
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &summary_path,
+                    format!("field {field} is missing, malformed, or nonzero"),
+                ));
             }
         }
+        let missing_claims = json_usize_field(&summary, "missingEvidenceReferences");
+        if missing_claims != Some(expected_missing_claims) {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                format!(
+                    "field missingEvidenceReferences is {missing_claims:?}; expected {expected_missing_claims}"
+                ),
+            ));
+        }
+        let platform_skips = json_usize_field(&summary, "requiredPlatformSkips");
+        if platform_skips != Some(expected_platform_skips) {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                format!(
+                    "field requiredPlatformSkips is {platform_skips:?}; expected {expected_platform_skips}"
+                ),
+            ));
+        }
+        if json_bool_field(&summary, "promotionReady") != Some(false) {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                "field promotionReady must be false until global validation",
+            ));
+        }
         if json_bool_field(&summary, "repositoryPolicyPassed") != Some(true) {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err(format!("{label} summary did not pass repository policy")),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                "field repositoryPolicyPassed must be true",
+            ));
         }
         if json_usize_field(&summary, "generatedDifferentialObservations")
             .is_none_or(|count| count < 1_024)
             || json_usize_field(&summary, "committedDifferentialObservations")
                 .is_none_or(|count| count == 0)
         {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err(format!(
-                    "{label} summary has insufficient differential observations"
-                )),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                "generatedDifferentialObservations or committedDifferentialObservations is missing, malformed, or insufficient",
+            ));
         }
-        let digest_record =
-            fs::read_to_string(directory.join("summary.sha256")).map_err(|_| FailureKind::Io)?;
-        let recorded_digest = digest_record
-            .split_whitespace()
-            .next()
-            .ok_or(FailureKind::Fixture)?;
+        let summary_digest_path = directory.join("summary.sha256");
+        let digest_record = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read summary digest",
+            &summary_digest_path,
+            fs::read_to_string(&summary_digest_path),
+        )?;
+        let recorded_digest = digest_record.split_whitespace().next().ok_or_else(|| {
+            merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_digest_path,
+                "summary digest record is empty",
+            )
+        })?;
         if recorded_digest != summary_digest.hex() {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err(format!("{label} summary digest is invalid")),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_digest_path,
+                "summary digest does not match summary.json",
+            ));
         }
-        let claim_index = directory.join("evidence/claim-index.json");
-        let claim_index_contents = fs::read_to_string(&claim_index).map_err(|_| FailureKind::Io)?;
-        let claim_index_digest = sha256_file(&claim_index).map_err(|_| FailureKind::Io)?;
+        let claim_index = directory.join("evidence").join("claim-index.json");
+        let claim_index_contents = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read claim evidence index",
+            &claim_index,
+            fs::read_to_string(&claim_index),
+        )?;
+        let claim_index_digest = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "hash claim evidence index",
+            &claim_index,
+            sha256_file(&claim_index),
+        )?;
         if !summary.contains(&format!(
             "\"claimEvidenceIndexSha256\": \"{}\"",
             claim_index_digest.hex()
         )) {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err(format!(
-                    "{label} claim evidence index is not bound by its summary"
-                )),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                format!(
+                    "field claimEvidenceIndexSha256 does not bind {}",
+                    claim_index.display()
+                ),
+            ));
         }
         for (field, expected) in [
             ("candidateSourceCommit", &mut candidate_source_commit),
@@ -449,16 +641,23 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
                 &mut compatibility_snapshot_sha256,
             ),
         ] {
-            let observed =
-                json_string_field(&claim_index_contents, field).ok_or(FailureKind::Fixture)?;
+            let observed = required_merge_string_field(
+                report,
+                label,
+                started,
+                &claim_index,
+                &claim_index_contents,
+                field,
+            )?;
             if let Some(expected) = expected {
                 if expected != observed {
-                    report.check(
-                        "merge-native-shards",
-                        started.elapsed(),
-                        Err(format!("native shards disagree on {field}")),
-                    );
-                    return Err(FailureKind::Fixture);
+                    return Err(merge_fixture_failure(
+                        report,
+                        label,
+                        started,
+                        &claim_index,
+                        format!("field {field} disagrees with an earlier native shard"),
+                    ));
                 }
             } else {
                 *expected = Some(observed.to_owned());
@@ -466,29 +665,45 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
         }
         if *source_built {
             let build_path = directory.join(format!("oracle-build-{label}.json"));
-            let build = fs::read_to_string(&build_path).map_err(|_| FailureKind::Io)?;
+            let build = io_or_report(
+                report,
+                format!("merge-{label}"),
+                started,
+                "read oracle build record",
+                &build_path,
+                fs::read_to_string(&build_path),
+            )?;
             let build_digest = sha256_bytes(build.as_bytes()).hex();
-            let recorded_build_digest = fs::read_to_string(
-                directory.join(format!("oracle-build-{label}.sha256")),
-            )
-            .map_err(|_| FailureKind::Io)?;
+            let build_digest_path = directory.join(format!("oracle-build-{label}.sha256"));
+            let recorded_build_digest = io_or_report(
+                report,
+                format!("merge-{label}"),
+                started,
+                "read oracle build record digest",
+                &build_digest_path,
+                fs::read_to_string(&build_digest_path),
+            )?;
             if recorded_build_digest.split_whitespace().next() != Some(build_digest.as_str()) {
-                report.check(
-                    "merge-native-shards",
-                    started.elapsed(),
-                    Err(format!("{label} build provenance record digest is invalid")),
-                );
-                return Err(FailureKind::Fixture);
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &build_digest_path,
+                    format!("digest does not bind {}", build_path.display()),
+                ));
             }
             if !build.contains(&format!("\"platform\": \"{label}\""))
                 || !build.contains(&format!("\"sourceCommit\": \"{SOURCE_COMMIT}\""))
             {
-                report.check(
-                    "merge-native-shards",
-                    started.elapsed(),
-                    Err(format!("{label} build provenance is invalid")),
-                );
-                return Err(FailureKind::Fixture);
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &build_path,
+                    format!(
+                        "platform or sourceCommit field does not match {label}/{SOURCE_COMMIT}"
+                    ),
+                ));
             }
             let provenance = directory.join("oracle-provenance").join(label);
             for (field, relative) in [
@@ -501,17 +716,35 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
                 ("buildStdoutRetainedSha256", "build.stdout"),
                 ("buildStderrRetainedSha256", "build.stderr"),
             ] {
-                let expected = json_string_field(&build, field).ok_or(FailureKind::Fixture)?;
-                let observed = sha256_file(&provenance.join(relative))
-                    .map_err(|_| FailureKind::Io)?
-                    .hex();
+                let expected = required_merge_string_field(
+                    report,
+                    label,
+                    started,
+                    &build_path,
+                    &build,
+                    field,
+                )?;
+                let provenance_path = provenance.join(relative);
+                let observed = io_or_report(
+                    report,
+                    format!("merge-{label}"),
+                    started,
+                    "hash oracle provenance artifact",
+                    &provenance_path,
+                    sha256_file(&provenance_path),
+                )?
+                .hex();
                 if expected != observed {
-                    report.check(
-                        "merge-native-shards",
-                        started.elapsed(),
-                        Err(format!("{label} provenance digest {field} is invalid")),
-                    );
-                    return Err(FailureKind::Fixture);
+                    return Err(merge_fixture_failure(
+                        report,
+                        label,
+                        started,
+                        &build_path,
+                        format!(
+                            "field {field} does not match {}",
+                            provenance_path.display()
+                        ),
+                    ));
                 }
             }
             let executable_name = if label.starts_with("windows-") {
@@ -519,28 +752,46 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
             } else {
                 "hell"
             };
-            let expected = json_string_field(&build, "binarySha256")
-                .ok_or(FailureKind::Fixture)?;
-            let observed = sha256_file(&directory.join("oracle").join(label).join(executable_name))
-                .map_err(|_| FailureKind::Io)?
-                .hex();
+            let expected = required_merge_string_field(
+                report,
+                label,
+                started,
+                &build_path,
+                &build,
+                "binarySha256",
+            )?;
+            let oracle_binary = directory.join("oracle").join(label).join(executable_name);
+            let observed = io_or_report(
+                report,
+                format!("merge-{label}"),
+                started,
+                "hash oracle binary",
+                &oracle_binary,
+                sha256_file(&oracle_binary),
+            )?
+            .hex();
             if expected != observed {
-                report.check(
-                    "merge-native-shards",
-                    started.elapsed(),
-                    Err(format!("{label} oracle binary digest is invalid")),
-                );
-                return Err(FailureKind::Fixture);
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &build_path,
+                    format!(
+                        "field binarySha256 does not match {}",
+                        oracle_binary.display()
+                    ),
+                ));
             }
         } else if !summary.contains(
             "\"oracleSha256\": \"5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9\"",
         ) {
-            report.check(
-                "merge-native-shards",
-                started.elapsed(),
-                Err("linux-amd64 shard has the wrong content-addressed oracle".to_owned()),
-            );
-            return Err(FailureKind::Fixture);
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                "field oracleSha256 does not match the reviewed Linux oracle",
+            ));
         }
         if index != 0 {
             merged.push_str(",\n");
@@ -550,24 +801,96 @@ pub fn merge_native_shards(input: &Path, report: &mut Report) -> Result<(), Fail
         merged.push_str("\", \"summarySha256\": \"");
         merged.push_str(&summary_digest.hex());
         merged.push_str("\" }");
+        validated_shards = validated_shards.saturating_add(1);
     }
-    let missing_claims = missing_claim_evidence();
-    merged.push_str("\n  ],\n  \"promotionReady\": ");
-    merged.push_str(if missing_claims == 0 { "true" } else { "false" });
+    let platform_evidence_complete = validated_shards == SHARDS.len();
+    let promotion_ready =
+        expected_missing_claims == 0 && expected_platform_skips == 0 && platform_evidence_complete;
+    merged.push_str("\n  ],\n  \"validatedShardCount\": ");
+    write!(merged, "{validated_shards}").expect("writing to String cannot fail");
+    merged.push_str(",\n  \"promotionReady\": ");
+    merged.push_str(if promotion_ready { "true" } else { "false" });
     merged.push_str(",\n  \"missingClaimEvidence\": ");
-    merged.push_str(&missing_claims.to_string());
-    merged.push_str(",\n  \"requiredPlatformSkips\": 0");
-    merged.push_str(",\n  \"platformEvidenceComplete\": true");
-    merged.push_str("\n}\n");
-    fs::create_dir_all(input).map_err(|_| FailureKind::Io)?;
-    fs::write(input.join("merged-native-shards.json"), merged).map_err(|_| FailureKind::Io)?;
-    let promotion_ready = missing_claims == 0;
-    let result = promotion_ready.then_some(()).ok_or_else(|| {
-        format!("native evidence is incomplete for {missing_claims} compatibility dimensions")
+    merged.push_str(&expected_missing_claims.to_string());
+    merged.push_str(",\n  \"requiredPlatformSkips\": ");
+    merged.push_str(&expected_platform_skips.to_string());
+    merged.push_str(",\n  \"platformEvidenceComplete\": ");
+    merged.push_str(if platform_evidence_complete {
+        "true"
+    } else {
+        "false"
     });
-    let passed = result.is_ok();
-    report.check("merge-native-shards", started.elapsed(), result);
-    passed.then_some(()).ok_or(FailureKind::Fixture)
+    merged.push_str("\n}\n");
+    io_or_report(
+        report,
+        "merged-manifest-retention",
+        started,
+        "create merged manifest directory",
+        input,
+        fs::create_dir_all(input),
+    )?;
+    let merged_path = input.join("merged-native-shards.json");
+    io_or_report(
+        report,
+        "merged-manifest-retention",
+        started,
+        "write merged manifest",
+        &merged_path,
+        fs::write(&merged_path, merged.as_bytes()),
+    )?;
+    let merged_digest = sha256_bytes(merged.as_bytes()).hex();
+    let merged_digest_path = input.join("merged-native-shards.sha256");
+    io_or_report(
+        report,
+        "merged-manifest-retention",
+        started,
+        "write merged manifest digest",
+        &merged_digest_path,
+        fs::write(
+            &merged_digest_path,
+            format!("{merged_digest}  merged-native-shards.json\n"),
+        ),
+    )?;
+    if require_promotion {
+        let result = validate_merged_promotion(input);
+        let passed = result.is_ok();
+        report.check("promotion-gate", started.elapsed(), result);
+        passed.then_some(()).ok_or(FailureKind::Fixture)
+    } else {
+        report.check("merge-native-shards", started.elapsed(), Ok(()));
+        Ok(())
+    }
+}
+
+fn validate_merged_promotion(input: &Path) -> Result<(), String> {
+    let manifest = read_digested_merged_manifest(input)?;
+    if json_usize_field(&manifest, "validatedShardCount") != Some(3) {
+        return Err("promotion requires exactly three validated native shards".to_owned());
+    }
+    if json_usize_field(&manifest, "missingClaimEvidence") != Some(0)
+        || json_usize_field(&manifest, "requiredPlatformSkips") != Some(0)
+        || json_bool_field(&manifest, "platformEvidenceComplete") != Some(true)
+        || json_bool_field(&manifest, "promotionReady") != Some(true)
+    {
+        return Err("merged native evidence is not promotion-ready".to_owned());
+    }
+    Ok(())
+}
+
+fn read_digested_merged_manifest(input: &Path) -> Result<String, String> {
+    let manifest_path = input.join("merged-native-shards.json");
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read merged manifest: {error}"))?;
+    let digest_record = fs::read_to_string(input.join("merged-native-shards.sha256"))
+        .map_err(|error| format!("cannot read merged manifest digest: {error}"))?;
+    let recorded_digest = digest_record
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "merged manifest digest is empty".to_owned())?;
+    if recorded_digest != sha256_bytes(manifest.as_bytes()).hex() {
+        return Err("merged manifest digest is invalid".to_owned());
+    }
+    Ok(manifest)
 }
 
 fn json_string_field<'a>(document: &'a str, field: &str) -> Option<&'a str> {
@@ -606,6 +929,94 @@ fn json_bool_field(document: &str, field: &str) -> Option<bool> {
     })
 }
 
+fn merge_fixture_failure(
+    report: &mut Report,
+    label: &str,
+    started: Instant,
+    path: &Path,
+    detail: impl Into<String>,
+) -> FailureKind {
+    report.check(
+        format!("merge-{label}"),
+        started.elapsed(),
+        Err(format!("{}: {}", path.display(), detail.into())),
+    );
+    FailureKind::Fixture
+}
+
+fn required_merge_string_field<'a>(
+    report: &mut Report,
+    label: &str,
+    started: Instant,
+    path: &Path,
+    document: &'a str,
+    field: &str,
+) -> Result<&'a str, FailureKind> {
+    json_string_field(document, field).ok_or_else(|| {
+        merge_fixture_failure(
+            report,
+            label,
+            started,
+            path,
+            format!("missing or malformed string field {field}"),
+        )
+    })
+}
+
+fn stack_oracle_build_command(stack_yaml: &Path, oracle_directory: &Path) -> CommandSpec {
+    CommandSpec::new("stack", Duration::from_mins(45))
+        .argument("--stack-yaml")
+        .argument(stack_yaml.as_os_str())
+        .arguments(["--lock-file", "error-on-write"])
+        .arguments(["build", "--install-ghc", "--copy-bins"])
+        .argument("--local-bin-path")
+        .argument(oracle_directory.as_os_str())
+}
+
+fn io_or_report<T>(
+    report: &mut Report,
+    name: impl Into<String>,
+    started: Instant,
+    action: &str,
+    path: &Path,
+    result: std::io::Result<T>,
+) -> Result<T, FailureKind> {
+    result.map_err(|error| {
+        report.check(
+            name,
+            started.elapsed(),
+            Err(SuiteFailure::io(action, path, &error).detail),
+        );
+        FailureKind::Io
+    })
+}
+
+fn evidence_io<T>(
+    action: &str,
+    path: &Path,
+    result: std::io::Result<T>,
+) -> Result<T, SuiteFailure> {
+    result.map_err(|error| SuiteFailure::io(action, path, &error))
+}
+
+fn checked_suite_result<T>(
+    report: &mut Report,
+    name: &str,
+    started: Instant,
+    result: Result<T, SuiteFailure>,
+) -> Result<T, FailureKind> {
+    match result {
+        Ok(value) => {
+            report.check(name, started.elapsed(), Ok(()));
+            Ok(value)
+        }
+        Err(failure) => {
+            report.check(name, started.elapsed(), Err(failure.detail));
+            Err(failure.kind)
+        }
+    }
+}
+
 fn observed_command(
     root: &Path,
     report: &mut Report,
@@ -642,7 +1053,7 @@ fn observed_command(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_oracle_build_record(
     artifact_root: &Path,
     platform: &str,
@@ -654,20 +1065,30 @@ fn write_oracle_build_record(
     compiler: &CommandResult,
     dependencies: &CommandResult,
     build: &CommandResult,
-) -> Result<(), FailureKind> {
+) -> Result<(), SuiteFailure> {
     let provenance = artifact_root.join("oracle-provenance").join(platform);
-    fs::create_dir_all(&provenance).map_err(|_| FailureKind::Io)?;
+    evidence_io(
+        "create oracle provenance directory",
+        &provenance,
+        fs::create_dir_all(&provenance),
+    )?;
     let platform_identity = format!(
         "platform={platform}\nos={}\narch={}\n",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    fs::write(
-        provenance.join("platform.txt"),
-        platform_identity.as_bytes(),
-    )
-    .map_err(|_| FailureKind::Io)?;
-    fs::write(provenance.join("resolver.lock"), resolver).map_err(|_| FailureKind::Io)?;
+    let platform_path = provenance.join("platform.txt");
+    evidence_io(
+        "write oracle platform identity",
+        &platform_path,
+        fs::write(&platform_path, platform_identity.as_bytes()),
+    )?;
+    let resolver_path = provenance.join("resolver.lock");
+    evidence_io(
+        "write oracle resolver lock",
+        &resolver_path,
+        fs::write(&resolver_path, resolver),
+    )?;
     for (name, command) in [
         ("source-tree", source_tree),
         ("stack", stack),
@@ -675,10 +1096,18 @@ fn write_oracle_build_record(
         ("dependencies", dependencies),
         ("build", build),
     ] {
-        fs::write(provenance.join(format!("{name}.stdout")), &command.stdout)
-            .map_err(|_| FailureKind::Io)?;
-        fs::write(provenance.join(format!("{name}.stderr")), &command.stderr)
-            .map_err(|_| FailureKind::Io)?;
+        let stdout_path = provenance.join(format!("{name}.stdout"));
+        evidence_io(
+            "write oracle command stdout",
+            &stdout_path,
+            fs::write(&stdout_path, &command.stdout),
+        )?;
+        let stderr_path = provenance.join(format!("{name}.stderr"));
+        evidence_io(
+            "write oracle command stderr",
+            &stderr_path,
+            fs::write(&stderr_path, &command.stderr),
+        )?;
     }
     let record = format!(
         concat!(
@@ -730,13 +1159,21 @@ fn write_oracle_build_record(
         !build.stderr_truncated,
     );
     let path = artifact_root.join(format!("oracle-build-{platform}.json"));
-    fs::write(&path, record.as_bytes()).map_err(|_| FailureKind::Io)?;
+    evidence_io(
+        "write oracle build record",
+        &path,
+        fs::write(&path, record.as_bytes()),
+    )?;
     let digest = sha256_bytes(record.as_bytes()).hex();
-    fs::write(
-        artifact_root.join(format!("oracle-build-{platform}.sha256")),
-        format!("{digest}  oracle-build-{platform}.json\n"),
+    let digest_path = artifact_root.join(format!("oracle-build-{platform}.sha256"));
+    evidence_io(
+        "write oracle build record digest",
+        &digest_path,
+        fs::write(
+            &digest_path,
+            format!("{digest}  oracle-build-{platform}.json\n"),
+        ),
     )
-    .map_err(|_| FailureKind::Io)
 }
 
 pub fn examples(
@@ -1010,11 +1447,12 @@ fn verify_nightly_identities(
     Ok(NightlyIdentities { oracle, candidate })
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_differential_corpus(
     root: &Path,
     identities: &NightlyIdentities,
     failures: &Path,
-) -> Result<DifferentialCorpusResult, FailureKind> {
+) -> Result<DifferentialCorpusResult, SuiteFailure> {
     const CASES: usize = 1_024;
     const SEED: u64 = 0x4845_4c4c_2026;
     let artifact_root = failures.parent().unwrap_or_else(|| Path::new("."));
@@ -1057,45 +1495,62 @@ fn run_differential_corpus(
         )?;
     }
     let corpus_sha256 = sha256_bytes(&corpus_bytes);
-    let compatibility_snapshot_sha256 =
-        sha256_file(&root.join("compat/upstream-2026-05-29.json")).map_err(|_| FailureKind::Io)?;
-    let dependency_lock_sha256 =
-        sha256_file(&root.join("Cargo.lock")).map_err(|_| FailureKind::Io)?;
-    let expected_mismatch_manifest_sha256 =
-        sha256_file(&root.join("compat/expected-mismatches.toml")).map_err(|_| FailureKind::Io)?;
+    let compatibility_snapshot = root.join("compat/upstream-2026-05-29.json");
+    let compatibility_snapshot_sha256 = evidence_io(
+        "hash compatibility snapshot",
+        &compatibility_snapshot,
+        sha256_file(&compatibility_snapshot),
+    )?;
+    let dependency_lock = root.join("Cargo.lock");
+    let dependency_lock_sha256 = evidence_io(
+        "hash Cargo dependency lock",
+        &dependency_lock,
+        sha256_file(&dependency_lock),
+    )?;
+    let expected_mismatch_manifest = root.join("compat/expected-mismatches.toml");
+    let expected_mismatch_manifest_sha256 = evidence_io(
+        "hash expected mismatch manifest",
+        &expected_mismatch_manifest,
+        sha256_file(&expected_mismatch_manifest),
+    )?;
     let platform_skips = required_platform_skips(root);
     let leaked_resources = measured_resource_leaks();
     let dependency_failures = measured_dependency_failures();
+    let missing_evidence_references = missing_claim_evidence();
     let (claim_evidence_index_sha256, stale_exact_claims) = write_claim_evidence_index(
         artifact_root,
         compatibility_snapshot_sha256,
         &identities.oracle,
         &identities.candidate,
     )?;
-    write_evidence_summary(
+    evidence_io(
+        "retain evidence summary and executable identities under",
         artifact_root,
-        &EvidenceSummary {
-            oracle: &identities.oracle,
-            candidate: &identities.candidate,
-            corpus_seed: SEED,
-            committed_observations: committed.len(),
-            generated_observations: generated.len(),
-            corpus_sha256,
-            mismatches: mismatches.len(),
-            unexpected_timeouts,
-            stale_exact_claims,
-            missing_evidence_references: missing_claim_evidence(),
-            compatibility_snapshot_sha256,
-            claim_evidence_index_sha256,
-            dependency_lock_sha256,
-            expected_mismatch_manifest_sha256,
-            repository_policy_passed: true,
-            required_platform_skips: platform_skips,
-            leaked_resources,
-            dependency_failures,
-        },
-    )
-    .map_err(|_| FailureKind::Io)?;
+        write_evidence_summary(
+            artifact_root,
+            &EvidenceSummary {
+                oracle: &identities.oracle,
+                candidate: &identities.candidate,
+                corpus_seed: SEED,
+                committed_observations: committed.len(),
+                generated_observations: generated.len(),
+                corpus_sha256,
+                mismatches: mismatches.len(),
+                unexpected_timeouts,
+                stale_exact_claims,
+                missing_evidence_references,
+                compatibility_snapshot_sha256,
+                claim_evidence_index_sha256,
+                dependency_lock_sha256,
+                expected_mismatch_manifest_sha256,
+                repository_policy_passed: true,
+                required_platform_skips: platform_skips,
+                leaked_resources,
+                dependency_failures,
+                promotion_ready: false,
+            },
+        ),
+    )?;
     Ok(DifferentialCorpusResult {
         committed_observations: committed.len(),
         generated_observations: generated.len(),
@@ -1106,12 +1561,13 @@ fn run_differential_corpus(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_claim_evidence_index(
     artifact_root: &Path,
     compatibility_snapshot_sha256: Digest,
     oracle: &ExecutableIdentity,
     candidate: &ExecutableIdentity,
-) -> Result<(Digest, usize), FailureKind> {
+) -> Result<(Digest, usize), SuiteFailure> {
     let observations = artifact_root.join("evidence/observations");
     let index_path = artifact_root.join("evidence/claim-index.json");
     let candidate_source_commit = candidate
@@ -1123,7 +1579,13 @@ fn write_claim_evidence_index(
                 .iter()
                 .find_map(|line| line.strip_prefix("source commit "))
         })
-        .ok_or(FailureKind::Fixture)?;
+        .ok_or_else(|| {
+            SuiteFailure::fixture(format!(
+                "candidate identity {} has no source commit for claim evidence index {}",
+                candidate.path.display(),
+                index_path.display()
+            ))
+        })?;
     let mut output = format!(
         concat!(
             "{{\n  \"schemaVersion\": 1,\n",
@@ -1146,7 +1608,13 @@ fn write_claim_evidence_index(
     for claim in hell_builtins::compatibility_claims() {
         let builtin = hell_builtins::registry()
             .get(usize::from(claim.builtin.0))
-            .ok_or(FailureKind::Fixture)?;
+            .ok_or_else(|| {
+                SuiteFailure::fixture(format!(
+                    "claim evidence index {} references missing builtin registry index {}",
+                    index_path.display(),
+                    claim.builtin.0
+                ))
+            })?;
         for dimension in &claim.dimensions {
             if !matches!(
                 dimension.status,
@@ -1167,18 +1635,10 @@ fn write_claim_evidence_index(
                     directory.join("candidate/observation.json"),
                 ];
                 let mut bundle = Vec::with_capacity(paths.len() * 32);
-                let mut complete = true;
                 for path in paths {
-                    if let Ok(digest) = sha256_file(&path) {
-                        bundle.extend_from_slice(&digest.0);
-                    } else {
-                        complete = false;
-                        break;
-                    }
-                }
-                if !complete {
-                    stale = stale.saturating_add(1);
-                    continue;
+                    let digest =
+                        evidence_io("hash referenced claim evidence", &path, sha256_file(&path))?;
+                    bundle.extend_from_slice(&digest.0);
                 }
                 let bundle_sha256 = sha256_bytes(&bundle);
                 if written != 0 {
@@ -1204,10 +1664,22 @@ fn write_claim_evidence_index(
     }
     output.push_str("\n  ]\n}\n");
     if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| FailureKind::Io)?;
+        evidence_io(
+            "create claim evidence index directory",
+            parent,
+            fs::create_dir_all(parent),
+        )?;
     }
-    fs::write(&index_path, output.as_bytes()).map_err(|_| FailureKind::Io)?;
-    let digest = sha256_file(&index_path).map_err(|_| FailureKind::Io)?;
+    evidence_io(
+        "write claim evidence index",
+        &index_path,
+        fs::write(&index_path, output.as_bytes()),
+    )?;
+    let digest = evidence_io(
+        "hash claim evidence index",
+        &index_path,
+        sha256_file(&index_path),
+    )?;
     Ok((digest, stale))
 }
 
@@ -1231,20 +1703,37 @@ fn compare_case(
     mismatch_root: &Path,
     observation_root: &Path,
     mismatches: &mut Vec<ClassifiedMismatch>,
-) -> Result<usize, FailureKind> {
+) -> Result<usize, SuiteFailure> {
     const FAILURE_CAP: usize = 32;
     let comparison = differential_with_identities(&identities.oracle, &identities.candidate, case)
         .map_err(|error| {
-            let _ = fs::create_dir_all(failures);
-            let _ = fs::write(
-                failures.join(format!("{}.harness.txt", case.id)),
-                error.to_string(),
-            );
-            FailureKind::Fixture
+            let failure_path = failures.join(format!("{}.harness.txt", case.id));
+            let retention = fs::create_dir_all(failures)
+                .and_then(|()| fs::write(&failure_path, error.to_string()));
+            let retention_detail = retention.err().map_or_else(String::new, |io_error| {
+                format!(
+                    "; cannot retain harness failure {}: {io_error}",
+                    failure_path.display()
+                )
+            });
+            SuiteFailure::fixture(format!(
+                "differential comparison failed for case {}: {error}{retention_detail}",
+                case.id
+            ))
         })?;
-    retain_observation_bundle(observation_root, case, &comparison).map_err(|_| FailureKind::Io)?;
+    let observation_path = observation_root.join(case.id.as_ref());
+    evidence_io(
+        &format!("retain differential observation for case {} at", case.id),
+        &observation_path,
+        retain_observation_bundle(observation_root, case, &comparison),
+    )?;
     if !comparison.mismatches.is_empty() && mismatches.len() < FAILURE_CAP {
-        retain_mismatch_bundle(mismatch_root, case, &comparison).map_err(|_| FailureKind::Io)?;
+        let mismatch_path = mismatch_root.join(case.id.as_ref());
+        evidence_io(
+            &format!("retain differential mismatch for case {} at", case.id),
+            &mismatch_path,
+            retain_mismatch_bundle(mismatch_root, case, &comparison),
+        )?;
     }
     for mismatch in comparison.mismatches {
         mismatches.push(ClassifiedMismatch {
@@ -1313,8 +1802,77 @@ pub fn failures_directory(report_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    static SANDBOX_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestSandbox {
+        path: PathBuf,
+    }
+
+    impl TestSandbox {
+        fn create(name: &str) -> Self {
+            let sequence = SANDBOX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "hell-ci-suite-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestSandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    }
+
+    fn linux_summary(root: &Path, claim_index_sha256: &str) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"platform\": \"linux-x86_64\",\n",
+                "  \"oracleSha256\": \"5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9\",\n",
+                "  \"mismatches\": 0,\n",
+                "  \"unexpectedTimeouts\": 0,\n",
+                "  \"staleExactClaims\": 0,\n",
+                "  \"leakedResources\": 0,\n",
+                "  \"dependencyFailures\": 0,\n",
+                "  \"missingEvidenceReferences\": {},\n",
+                "  \"requiredPlatformSkips\": {},\n",
+                "  \"promotionReady\": false,\n",
+                "  \"repositoryPolicyPassed\": true,\n",
+                "  \"generatedDifferentialObservations\": 1024,\n",
+                "  \"committedDifferentialObservations\": 1,\n",
+                "  \"claimEvidenceIndexSha256\": \"{}\"\n",
+                "}}\n"
+            ),
+            missing_claim_evidence(),
+            required_platform_skips(root),
+            claim_index_sha256,
+        )
+    }
+
+    fn write_linux_summary(root: &Path, input: &Path, claim_index_sha256: &str) -> PathBuf {
+        let directory = input.join("linux-amd64");
+        fs::create_dir_all(&directory).unwrap();
+        let summary = linux_summary(root, claim_index_sha256);
+        fs::write(directory.join("summary.json"), &summary).unwrap();
+        let digest = sha256_bytes(summary.as_bytes()).hex();
+        fs::write(
+            directory.join("summary.sha256"),
+            format!("{digest}  summary.json\n"),
+        )
+        .unwrap();
+        directory
+    }
 
     #[test]
     fn promotion_candidates_remain_unverified_until_native_evidence_is_retained() {
@@ -1330,5 +1888,139 @@ mod tests {
                 .all(|dimension| dimension.status == ClaimStatus::Unverified),
             "native shard artifacts must be retained before claim promotion"
         );
+    }
+
+    #[test]
+    fn unreviewed_claims_are_recorded_without_becoming_collection_failures() {
+        let missing = missing_claim_evidence();
+        assert_eq!(missing, 2_840);
+        let gate = evaluate_release_gate(
+            &ReleaseGateInput {
+                differential_observations: 1_024,
+                candidate_stress_cases: 0,
+                harness_failures: 0,
+                unexpected_timeouts: 0,
+                mismatches: &[],
+                stale_exact_claims: 0,
+                missing_evidence_references: missing,
+                required_platform_skips: 2,
+                leaked_resources: 0,
+                dependency_failures: 0,
+            },
+            1_024,
+        );
+        assert!(gate.collection_passed());
+        assert!(!gate.promotion_ready());
+    }
+
+    #[test]
+    fn stack_build_uses_the_pinned_lock_without_cabal_flags() {
+        let spec = stack_oracle_build_command(
+            Path::new("upstream/stack.yaml"),
+            Path::new("artifacts/oracle"),
+        );
+        assert!(spec.current_directory.is_none());
+        assert_eq!(
+            spec.display_arguments(),
+            [
+                "--stack-yaml",
+                "upstream/stack.yaml",
+                "--lock-file",
+                "error-on-write",
+                "build",
+                "--install-ghc",
+                "--copy-bins",
+                "--local-bin-path",
+                "artifacts/oracle",
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_failure_detail_is_retained_in_the_structured_report() {
+        let mut report = Report::new("native-oracle-shard");
+        let result = checked_suite_result::<()>(
+            &mut report,
+            "oracle-identities",
+            Instant::now(),
+            Err(SuiteFailure::fixture(
+                "candidate identity has no build-info payload",
+            )),
+        );
+        assert_eq!(result, Err(FailureKind::Fixture));
+        assert!(report.failures.iter().any(|failure| {
+            failure.contains("oracle-identities")
+                && failure.contains("candidate identity has no build-info payload")
+        }));
+    }
+
+    #[test]
+    fn merge_reports_missing_summary_path_and_io_error() {
+        let sandbox = TestSandbox::create("missing-summary");
+        let root = repository_root();
+        let summary = sandbox.path.join("linux-amd64").join("summary.json");
+        let mut report = Report::new("merge-native-shards");
+        let result = merge_native_shards(&root, &sandbox.path, &mut report);
+        assert_eq!(result, Err(FailureKind::Io));
+        assert!(report.failures.iter().any(|failure| {
+            failure.contains("merge-linux-amd64")
+                && failure.contains("cannot read")
+                && failure.contains(&summary.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn merge_reports_an_empty_summary_digest() {
+        let sandbox = TestSandbox::create("empty-summary-digest");
+        let root = repository_root();
+        let directory = write_linux_summary(&root, &sandbox.path, "unused");
+        let digest_path = directory.join("summary.sha256");
+        fs::write(&digest_path, b"").unwrap();
+        let mut report = Report::new("merge-native-shards");
+        let result = merge_native_shards(&root, &sandbox.path, &mut report);
+        assert_eq!(result, Err(FailureKind::Fixture));
+        assert!(report.failures.iter().any(|failure| {
+            failure.contains("merge-linux-amd64")
+                && failure.contains("summary digest record is empty")
+                && failure.contains(&digest_path.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn merge_reports_missing_claim_index_identity_field() {
+        let sandbox = TestSandbox::create("missing-claim-field");
+        let root = repository_root();
+        let claim_contents = "{\n  \"compatibilitySnapshotSha256\": \"snapshot\"\n}\n";
+        let claim_digest = sha256_bytes(claim_contents.as_bytes()).hex();
+        let directory = write_linux_summary(&root, &sandbox.path, &claim_digest);
+        let claim_path = directory.join("evidence").join("claim-index.json");
+        fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
+        fs::write(&claim_path, claim_contents).unwrap();
+        let mut report = Report::new("merge-native-shards");
+        let result = merge_native_shards(&root, &sandbox.path, &mut report);
+        assert_eq!(result, Err(FailureKind::Fixture));
+        assert!(report.failures.iter().any(|failure| {
+            failure.contains("merge-linux-amd64")
+                && failure.contains("candidateSourceCommit")
+                && failure.contains(&claim_path.display().to_string())
+        }));
+    }
+
+    #[test]
+    fn retention_io_failure_preserves_operation_path_and_error() {
+        let sandbox = TestSandbox::create("retention-io");
+        let blocker = sandbox.path.join("not-a-directory");
+        fs::write(&blocker, b"block").unwrap();
+        let target = blocker.join("summary.json");
+        let failure = evidence_io(
+            "retain evidence summary",
+            &target,
+            fs::write(&target, b"evidence"),
+        )
+        .unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Io);
+        assert!(failure.detail.contains("retain evidence summary"));
+        assert!(failure.detail.contains(&target.display().to_string()));
+        assert!(failure.detail.len() > "cannot retain evidence summary".len());
     }
 }

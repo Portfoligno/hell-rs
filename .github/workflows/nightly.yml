@@ -3,6 +3,12 @@ name: Nightly
 on:
   push:
   workflow_dispatch:
+    inputs:
+      require_promotion:
+        description: Apply the fail-closed promotion gate to merged evidence
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,8 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  release-gates:
-    name: Release gates / Linux
+  evidence-collection-linux:
+    name: Evidence collection / Linux
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -68,7 +74,7 @@ jobs:
       - name: Make upstream oracle executable
         run: chmod +x target/oracle/hell
 
-      - name: Run release and stress gates
+      - name: Collect Linux release and stress evidence
         run: ./target/ci/hell-ci nightly --oracle target/oracle/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --report ci-out/nightly.json
 
       - name: Upload nightly report
@@ -117,6 +123,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Install pinned Stack
+        id: setup-stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+
       - name: Restore Cargo and Stack caches
         id: native-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -125,12 +139,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.stack
+            ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
-          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+            target/release
+            target/oracle-source/.stack-work
+          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
           restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-
+            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
+            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
@@ -155,9 +171,11 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.stack
+            ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
-          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+            target/release
+            target/oracle-source/.stack-work
+          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
 
   native-oracle-windows:
     name: Native oracle shard / Windows amd64
@@ -179,6 +197,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Install pinned Stack
+        id: setup-stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+
       - name: Restore Cargo and Stack caches
         id: native-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -187,12 +213,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.stack
+            ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
-          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+            target/release
+            target/oracle-source/.stack-work
+          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
           restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-
+            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
+            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
@@ -217,13 +245,15 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.stack
+            ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
-          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/hell.cabal') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+            target/release
+            target/oracle-source/.stack-work
+          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
 
   merge-native-evidence:
     name: Merge native oracle evidence / Linux
-    needs: [release-gates, native-oracle-macos, native-oracle-windows]
+    needs: [evidence-collection-linux, native-oracle-macos, native-oracle-windows]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -233,6 +263,29 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Restore Cargo download cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Restore merge compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-
+            v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
 
       - name: Download native macOS evidence
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -266,3 +319,65 @@ jobs:
           path: ci-out/native-shards
           if-no-files-found: error
           retention-days: 30
+
+      - name: Save Cargo download cache
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+
+      - name: Save merge compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && hashFiles('target/**') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+
+  promotion-gate:
+    name: Promotion gate / Linux
+    needs: merge-native-evidence
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_promotion }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Restore Cargo download cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Restore merge compilation cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-
+
+      - name: Download merged native evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: native-oracle-merged
+          path: ci-out/native-shards
+
+      - name: Build CI driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+
+      - name: Require promotion-ready evidence
+        run: ./target/ci/hell-ci promotion-gate --input ci-out/native-shards --report ci-out/promotion-gate.json

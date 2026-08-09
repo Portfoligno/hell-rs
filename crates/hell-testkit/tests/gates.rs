@@ -113,3 +113,28 @@ fn release_gate_requires_volume_and_explanations() {
     assert_eq!(report.rust_bug_mismatches, 1);
     assert!(!report.passed());
 }
+
+#[test]
+fn pending_review_blocks_promotion_without_failing_collection() {
+    let report = hell_testkit::evaluate_release_gate(
+        &hell_testkit::ReleaseGateInput {
+            differential_observations: 1_024,
+            candidate_stress_cases: 1_024,
+            harness_failures: 0,
+            unexpected_timeouts: 0,
+            mismatches: &[],
+            stale_exact_claims: 0,
+            missing_evidence_references: 2_840,
+            required_platform_skips: 2,
+            leaked_resources: 0,
+            dependency_failures: 0,
+        },
+        1_024,
+    );
+    assert!(report.collection_passed());
+    assert!(!report.promotion_ready());
+    assert!(
+        !report.passed(),
+        "the promotion gate must remain fail-closed"
+    );
+}

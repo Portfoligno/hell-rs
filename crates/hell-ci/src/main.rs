@@ -36,6 +36,10 @@ enum Invocation {
         report: PathBuf,
         input: PathBuf,
     },
+    PromotionGate {
+        report: PathBuf,
+        input: PathBuf,
+    },
     Examples {
         profile: String,
         report: PathBuf,
@@ -43,7 +47,7 @@ enum Invocation {
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci promotion-gate --input PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH"
 }
 
 #[allow(clippy::too_many_lines)]
@@ -211,6 +215,18 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 input: input.ok_or_else(|| "merge-native-shards requires --input".to_owned())?,
             })
         }
+        "promotion-gate"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none() =>
+        {
+            Ok(Invocation::PromotionGate {
+                report,
+                input: input.ok_or_else(|| "promotion-gate requires --input".to_owned())?,
+            })
+        }
         "examples"
             if oracle.is_none()
                 && oracle_sha256.is_none()
@@ -257,6 +273,7 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Nightly { report, .. } => ("nightly", report),
         Invocation::NativeOracleShard { report, .. } => ("native-oracle-shard", report),
         Invocation::MergeNativeShards { report, .. } => ("merge-native-shards", report),
+        Invocation::PromotionGate { report, .. } => ("promotion-gate", report),
         Invocation::Examples { report, .. } => ("examples", report),
     };
     let mut report = Report::new(suite_name);
@@ -274,12 +291,19 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
             source, platform, ..
         } => suite::native_oracle_shard(root, &mut report, &failures, source, platform),
         Invocation::MergeNativeShards { input, .. } => {
-            suite::merge_native_shards(input, &mut report)
+            suite::merge_native_shards(root, input, &mut report)
         }
+        Invocation::PromotionGate { input, .. } => suite::promotion_gate(root, input, &mut report),
         Invocation::Examples { profile, .. } => {
             suite::examples(root, &mut report, &failures, profile)
         }
     };
+    let suite_passed = finalize_suite_result(result, &mut report);
+    if !suite_passed {
+        for line in report_failure_lines(&report) {
+            eprintln!("{line}");
+        }
+    }
     if let Err(error) = report.write(report_path) {
         eprintln!("cannot write report {}: {error}", report_path.display());
         return ExitCode::from(40);
@@ -287,16 +311,37 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
     println!(
         "{}: {}; report: {}",
         suite_name,
-        if report.passed() { "passed" } else { "failed" },
+        if suite_passed { "passed" } else { "failed" },
         report_path.display()
     );
     match result {
-        Ok(()) if report.passed() => ExitCode::SUCCESS,
+        Ok(()) if suite_passed => ExitCode::SUCCESS,
         Ok(()) | Err(FailureKind::Fixture) => ExitCode::from(30),
         Err(FailureKind::Policy) => ExitCode::from(10),
         Err(FailureKind::Child) => ExitCode::from(20),
         Err(FailureKind::Io) => ExitCode::from(40),
     }
+}
+
+fn finalize_suite_result(result: Result<(), FailureKind>, report: &mut Report) -> bool {
+    if let Err(error) = result
+        && report.passed()
+    {
+        report.check(
+            "suite-result",
+            std::time::Duration::ZERO,
+            Err(format!("suite returned an unreported {error:?} failure")),
+        );
+    }
+    result.is_ok() && report.passed()
+}
+
+fn report_failure_lines(report: &Report) -> impl Iterator<Item = String> + '_ {
+    report
+        .failures
+        .iter()
+        .enumerate()
+        .map(|(index, failure)| format!("failure[{index}]: {failure:?}"))
 }
 
 #[cfg(test)]
@@ -363,6 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn promotion_gate_requires_retained_native_shards() {
+        assert!(parse(["promotion-gate", "--report", "out.json"].map(OsString::from)).is_err());
+        assert!(matches!(
+            parse(
+                [
+                    "promotion-gate",
+                    "--input",
+                    "native-shards",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::PromotionGate { .. })
+        ));
+    }
+
+    #[test]
     fn nightly_workflow_matches_the_reviewed_oracle_record() {
         const DIGEST: &str = "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9";
         const URL: &str =
@@ -373,5 +436,45 @@ mod tests {
         assert!(record.contains(URL));
         assert!(workflow.contains(DIGEST));
         assert!(workflow.contains(URL));
+    }
+
+    #[test]
+    fn unreported_suite_error_forces_failed_console_and_json_status() {
+        let mut report = Report::new("synthetic");
+        assert!(!finalize_suite_result(Err(FailureKind::Io), &mut report));
+        assert!(!report.passed());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("suite-result") && failure.contains("Io"))
+        );
+        assert_eq!(
+            report_failure_lines(&report).collect::<Vec<_>>(),
+            ["failure[0]: \"suite-result: suite returned an unreported Io failure\""]
+        );
+    }
+
+    #[test]
+    fn stderr_failure_lines_are_ordered_escaped_and_not_duplicated() {
+        let mut report = Report::new("synthetic");
+        report.check(
+            "merge-linux-amd64",
+            std::time::Duration::ZERO,
+            Err("cannot read C:\\native\\summary.json\naccess denied".to_owned()),
+        );
+        report.check(
+            "merge-windows-amd64",
+            std::time::Duration::ZERO,
+            Err("missing binarySha256".to_owned()),
+        );
+        assert!(!finalize_suite_result(Ok(()), &mut report));
+        assert_eq!(
+            report_failure_lines(&report).collect::<Vec<_>>(),
+            [
+                "failure[0]: \"merge-linux-amd64: cannot read C:\\\\native\\\\summary.json\\naccess denied\"",
+                "failure[1]: \"merge-windows-amd64: missing binarySha256\"",
+            ]
+        );
     }
 }
