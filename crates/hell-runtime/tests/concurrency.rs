@@ -140,26 +140,6 @@ fn pooled_worker_count_has_a_public_execution_override() {
 }
 
 #[test]
-fn failure_cancels_a_peer_delay_without_waiting_for_its_deadline() {
-    let started = Instant::now();
-    let (result, output) = run_result(
-        "failing = Text.putStrLn (Error.error \"boom\" :: Text)\n\
-         waiting = Concurrent.threadDelay 5000000\n\
-         main = do\n\
-           Async.concurrently Main.failing Main.waiting\n\
-           IO.pure ()\n",
-    );
-    let error = result.unwrap_err();
-    assert_eq!(error.message.as_ref(), "boom");
-    assert_eq!(output, "");
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "peer cancellation took {:?}",
-        started.elapsed()
-    );
-}
-
-#[test]
 fn a_right_hand_failure_is_not_replaced_by_peer_cancellation() {
     let started = Instant::now();
     let (result, output) = run_result(concat!(

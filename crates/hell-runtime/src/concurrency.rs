@@ -111,6 +111,15 @@ enum PairMode {
 }
 
 fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
+    parallel_pair_with_cancellation_observer(left, right, mode, || {})
+}
+
+fn parallel_pair_with_cancellation_observer(
+    left: ThunkRef,
+    right: ThunkRef,
+    mode: PairMode,
+    observe_cancellation: impl Fn() + Send + Sync + 'static,
+) -> IoAction {
     IoAction::new(move |evaluator, context| {
         evaluator.ensure_not_cancelled()?;
         let pair_scope = current_scope(evaluator)
@@ -164,6 +173,7 @@ fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
             } else {
                 CancelReason::SiblingFailed
             };
+            observe_cancellation();
             loser.cancel(&reason);
         }
 
@@ -526,4 +536,102 @@ fn run_thunk_caught(
             "panic crossed a concurrent IO action boundary",
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    use hell_compiler::{CompilerSession, compile_source};
+
+    use super::{CancelReason, PairMode, parallel_pair_with_cancellation_observer, thread_delay};
+    use crate::{
+        Evaluator, IoAction, RuntimeContext, RuntimeError, RuntimeErrorKind, Thunk, Value,
+    };
+
+    #[test]
+    fn failure_cancels_a_peer_delay_without_waiting_for_its_deadline() {
+        let program = compile_source(
+            &mut CompilerSession::default(),
+            "concurrent-cancellation.hell",
+            "main = IO.pure ()\n",
+        )
+        .expect("cancellation harness compiles");
+        let mut evaluator = Evaluator::new(Arc::new(program.executable().clone()));
+        let context = RuntimeContext::new(Vec::new(), Vec::new());
+        let (failure_ready_sender, failure_ready_receiver) = mpsc::sync_channel(0);
+        let failure_ready_receiver = Arc::new(Mutex::new(failure_ready_receiver));
+        let (delay_ready_sender, delay_ready_receiver) = mpsc::sync_channel(0);
+        let delay_ready_receiver = Arc::new(Mutex::new(delay_ready_receiver));
+        let cancellation_started = Arc::new(OnceLock::new());
+        let waiting_cancellation = Arc::new(OnceLock::new());
+
+        let branch_delay_ready_receiver = Arc::clone(&delay_ready_receiver);
+        let branch_waiting_cancellation = Arc::clone(&waiting_cancellation);
+        let failure = Thunk::evaluated(Value::Io(IoAction::new(move |_, _| {
+            failure_ready_sender.send(()).map_err(|_| {
+                RuntimeError::internal("cancellation test waiting branch disconnected")
+            })?;
+            let cancellation = branch_delay_ready_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .map_err(|_| {
+                    RuntimeError::internal("cancellation test waiting branch disconnected")
+                })?;
+            branch_waiting_cancellation
+                .set(cancellation)
+                .expect("waiting branch records its cancellation handle once");
+            Err(Arc::new(RuntimeError {
+                code: "H0901",
+                kind: RuntimeErrorKind::UserError,
+                message: "boom".into(),
+                suppressed: Arc::from([]),
+            }))
+        })));
+
+        let branch_failure_ready_receiver = Arc::clone(&failure_ready_receiver);
+        let waiting = Thunk::evaluated(Value::Io(IoAction::new(move |evaluator, context| {
+            branch_failure_ready_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .map_err(|_| {
+                    RuntimeError::internal("cancellation test failing branch disconnected")
+                })?;
+            delay_ready_sender
+                .send(evaluator.cancellation_handle())
+                .map_err(|_| {
+                    RuntimeError::internal("cancellation test failing branch disconnected")
+                })?;
+            thread_delay(Thunk::evaluated(Value::Int(5_000_000))).run(evaluator, context)
+        })));
+        let observed_cancellation_started = Arc::clone(&cancellation_started);
+        let error =
+            parallel_pair_with_cancellation_observer(failure, waiting, PairMode::Both, move || {
+                observed_cancellation_started
+                    .set(Instant::now())
+                    .expect("peer cancellation is observed once");
+            })
+            .run(&mut evaluator, &context)
+            .expect_err("failing branch remains the primary error");
+        let started = cancellation_started
+            .get()
+            .expect("peer cancellation was observed");
+        let waiting_cancellation = waiting_cancellation
+            .get()
+            .expect("waiting branch reached the five-second delay");
+        assert_eq!(error.message.as_ref(), "boom");
+        assert_eq!(
+            waiting_cancellation.reason(),
+            Some(CancelReason::SiblingFailed)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "peer cancellation took {:?}; cancellation reason: {:?}",
+            started.elapsed(),
+            waiting_cancellation.reason()
+        );
+    }
 }

@@ -442,6 +442,16 @@ impl TaskGroup {
             .insert(record.id, record);
     }
 
+    fn mark_finished(&self, finished: &AtomicBool) {
+        let _state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        finished.store(true, Ordering::Release);
+        self.state.1.notify_all();
+    }
+
     #[must_use]
     pub fn live_count(&self) -> usize {
         self.state
@@ -870,7 +880,7 @@ impl ExecutionScope {
         let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
         let finished = Arc::new(AtomicBool::new(false));
         let worker_finished = Arc::clone(&finished);
-        let group = Arc::clone(&self.inner.tasks.state);
+        let group = self.inner.tasks.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name(format!("hell-scope-task-{}", id.0))
@@ -890,8 +900,7 @@ impl ExecutionScope {
                     }),
                 };
                 drop(permit);
-                worker_finished.store(true, Ordering::Release);
-                group.1.notify_all();
+                group.mark_finished(&worker_finished);
                 let _ignored = sender.send(result);
             });
         let worker = match worker {
