@@ -1,7 +1,9 @@
-schema_version = 1
+schema_version = 2
 role = "upstream-oracle"
 platform = "linux-amd64"
 availability = "available"
+oracle_kind = "release-asset"
+review_state = "accepted"
 reported_version = "2026-05-29"
 upstream_repository = "https://github.com/chrisdone/hell"
 source_commit = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"

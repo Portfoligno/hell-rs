@@ -78,7 +78,7 @@ const ROUND: [u32; 64] = [
     0xc671_78f2,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Digest(pub [u8; 32]);
 
 impl Digest {

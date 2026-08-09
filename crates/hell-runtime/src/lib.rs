@@ -4572,6 +4572,20 @@ mod capability_policy_tests {
         assert!(context.require_network("Http.run").is_ok());
         assert!(!context.policy.capabilities.network_external);
     }
+
+    #[test]
+    fn evidence_audit_counts_generic_resources_and_finalizers() {
+        let snapshot = scope::ScopeSnapshot {
+            child_scopes: 0,
+            live_tasks: 0,
+            resources: 1,
+            finalizers: 1,
+            budget: budget::BudgetSnapshot::default(),
+        };
+        let audit = evidence_resource_audit_contents(&snapshot, 0);
+        assert!(audit.contains("\"handles\": 2"));
+        assert!(!audit.contains("\"handles\": 0"));
+    }
 }
 
 fn error_with_suppressed(
@@ -5245,7 +5259,8 @@ pub fn run_main(program: VerifiedProgram, context: RuntimeContext) -> RuntimeRes
     if let Some(max_concurrent_actions) = context.max_concurrent_actions {
         evaluator = evaluator.with_max_concurrent_actions(max_concurrent_actions);
     }
-    let root_scope = evaluator.execution_scope().clone().guard();
+    let audit_scope = evaluator.execution_scope().clone();
+    let root_scope = audit_scope.clone().guard();
     let body = (|| {
         let main = evaluator.root_thunk();
         let action = evaluator.force_io(&main)?;
@@ -5257,27 +5272,89 @@ pub fn run_main(program: VerifiedProgram, context: RuntimeContext) -> RuntimeRes
             )),
         }
     })();
-    match body {
-        Ok(()) => {
-            let report = root_scope.close()?;
-            let after = &report.after;
-            let budget = &after.budget;
-            if after.child_scopes != 0
-                || after.live_tasks != 0
-                || after.resources != 0
-                || after.finalizers != 0
-                || budget.live_tasks != 0
-                || budget.live_handles != 0
-                || budget.live_processes != 0
-                || budget.live_http_connections != 0
-                || budget.live_temp_resources != 0
-            {
-                return Err(RuntimeError::cancellation_stalled(format!(
-                    "execution scope did not return to its resource baseline: {after:?}"
-                )));
-            }
-            Ok(())
-        }
+    let body_error = body.as_ref().err().cloned();
+    let body_suppressed = body_error
+        .as_ref()
+        .map_or(0, |error| error.suppressed.len());
+    let outcome = match body {
+        Ok(()) => root_scope.close().map(|_| ()),
         Err(error) => root_scope.close_with_primary(Some(error)).map(|_| ()),
+    };
+    let after = audit_scope.snapshot();
+    let cleanup_failures = outcome.as_ref().err().map_or(0, |error| {
+        if body_error.is_some() {
+            error.suppressed.len().saturating_sub(body_suppressed)
+        } else {
+            1_usize.saturating_add(error.suppressed.len())
+        }
+    });
+    write_evidence_resource_audit(&after, cleanup_failures)?;
+    let budget = &after.budget;
+    let leaked = after.child_scopes != 0
+        || after.live_tasks != 0
+        || after.resources != 0
+        || after.finalizers != 0
+        || budget.live_tasks != 0
+        || budget.live_handles != 0
+        || budget.live_processes != 0
+        || budget.live_http_connections != 0
+        || budget.live_temp_resources != 0;
+    match outcome {
+        Ok(()) if !leaked => Ok(()),
+        Ok(()) => Err(RuntimeError::cancellation_stalled(format!(
+            "execution scope did not return to its resource baseline: {after:?}"
+        ))),
+        Err(error) => Err(error),
     }
+}
+
+fn write_evidence_resource_audit(
+    snapshot: &scope::ScopeSnapshot,
+    cleanup_failures: usize,
+) -> RuntimeResult<()> {
+    let Some(path) = std::env::var_os("HELL_EVIDENCE_RESOURCE_AUDIT").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let contents = evidence_resource_audit_contents(snapshot, cleanup_failures);
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, contents.as_bytes()).map_err(|error| {
+        RuntimeError::internal(format!("cannot write evidence resource audit: {error}"))
+    })?;
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        RuntimeError::internal(format!("cannot retain evidence resource audit: {error}"))
+    })
+}
+
+fn evidence_resource_audit_contents(
+    snapshot: &scope::ScopeSnapshot,
+    cleanup_failures: usize,
+) -> String {
+    let budget = &snapshot.budget;
+    let tasks = snapshot
+        .child_scopes
+        .saturating_add(snapshot.live_tasks)
+        .saturating_add(usize::try_from(budget.live_tasks).unwrap_or(usize::MAX));
+    let handles = usize::try_from(budget.live_handles)
+        .unwrap_or(usize::MAX)
+        .saturating_add(snapshot.resources)
+        .saturating_add(snapshot.finalizers);
+    let processes = usize::try_from(budget.live_processes).unwrap_or(usize::MAX);
+    let http_bodies = usize::try_from(budget.live_http_connections).unwrap_or(usize::MAX);
+    let temporary_resources = usize::try_from(budget.live_temp_resources).unwrap_or(usize::MAX);
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schemaVersion\": 1,\n",
+            "  \"tasks\": {},\n",
+            "  \"handles\": {},\n",
+            "  \"processes\": {},\n",
+            "  \"httpBodies\": {},\n",
+            "  \"temporaryResources\": {},\n",
+            "  \"cleanupFailures\": {}\n",
+            "}}\n"
+        ),
+        tasks, handles, processes, http_bodies, temporary_resources, cleanup_failures,
+    )
 }

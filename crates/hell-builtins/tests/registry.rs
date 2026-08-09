@@ -1,10 +1,45 @@
 use std::collections::HashSet;
 
 use hell_builtins::{
-    ClaimStatus, ClaimValidationError, CompatibilityDimension, INTERNAL_NAME_COUNT, INTERNAL_NAMES,
-    PUBLIC_NAME_COUNT, UNIQUE_NAME_COUNT, Visibility, WiringStatus, compatibility_claims, registry,
+    ClaimPlatform, ClaimStatus, ClaimValidationError, CompatibilityDimension, ExecutionProfile,
+    INTERNAL_NAME_COUNT, INTERNAL_NAMES, NormalizerId, PUBLIC_NAME_COUNT, ScopedClaim,
+    UNIQUE_NAME_COUNT, Visibility, WiringStatus, compatibility_claims, registry,
     validate_compatibility_claims,
 };
+
+const UPSTREAM: &[ExecutionProfile] = &[ExecutionProfile::Upstream];
+const NATIVE_PLATFORMS: &[ClaimPlatform] = &[
+    ClaimPlatform::Linux,
+    ClaimPlatform::MacOs,
+    ClaimPlatform::Windows,
+];
+const EXACT_MISSING_EVIDENCE: &[ScopedClaim] = &[ScopedClaim {
+    status: ClaimStatus::Exact,
+    profiles: UPSTREAM,
+    platforms: NATIVE_PLATFORMS,
+    evidence: &[],
+    normalizers: &[],
+    rationale: None,
+    issue: None,
+}];
+const NORMALIZED_MISSING_NORMALIZER: &[ScopedClaim] = &[ScopedClaim {
+    status: ClaimStatus::Normalized,
+    profiles: UPSTREAM,
+    platforms: NATIVE_PLATFORMS,
+    evidence: &["differential:case-evidence-v1"],
+    normalizers: &[],
+    rationale: Some("Reviewed presentation-only variation."),
+    issue: None,
+}];
+const DIVERGENCE_MISSING_RATIONALE: &[ScopedClaim] = &[ScopedClaim {
+    status: ClaimStatus::DeliberateDivergence,
+    profiles: UPSTREAM,
+    platforms: NATIVE_PLATFORMS,
+    evidence: &["differential:case-evidence-v1"],
+    normalizers: &[],
+    rationale: None,
+    issue: Some("COMPAT-DIVERGENCE"),
+}];
 
 #[test]
 fn pinned_registry_counts_and_names_are_unique() {
@@ -25,22 +60,19 @@ fn pinned_registry_counts_and_names_are_unique() {
 #[test]
 fn evidence_bearing_promotions_fail_closed() {
     let mut claims = compatibility_claims().to_vec();
-    claims[0].dimensions[0].status = ClaimStatus::Exact;
+    claims[0].dimensions[0].scopes = EXACT_MISSING_EVIDENCE;
     assert_eq!(
         validate_compatibility_claims(&claims),
         Err(ClaimValidationError::MissingEvidence)
     );
 
-    claims[0].dimensions[0].status = ClaimStatus::Normalized;
-    claims[0].dimensions[0].evidence = &["case-evidence-v1"];
+    claims[0].dimensions[0].scopes = NORMALIZED_MISSING_NORMALIZER;
     assert_eq!(
         validate_compatibility_claims(&claims),
         Err(ClaimValidationError::MissingNormalizer)
     );
 
-    claims[0].dimensions[0].status = ClaimStatus::DeliberateDivergence;
-    claims[0].dimensions[0].normalizers = &[];
-    claims[0].dimensions[0].rationale = None;
+    claims[0].dimensions[0].scopes = DIVERGENCE_MISSING_RATIONALE;
     assert_eq!(
         validate_compatibility_claims(&claims),
         Err(ClaimValidationError::MissingRationale)
@@ -83,7 +115,81 @@ fn executable_does_not_imply_exact() {
         claim
             .dimensions
             .iter()
-            .all(|dimension| dimension.status == ClaimStatus::Unverified)
+            .flat_map(|dimension| dimension.scopes.iter())
+            .all(|scope| scope.status == ClaimStatus::Unverified)
+    );
+}
+
+#[test]
+fn claim_dimensions_and_references_are_canonical() {
+    const BAD_REFERENCE: &[ScopedClaim] = &[ScopedClaim {
+        status: ClaimStatus::Exact,
+        profiles: UPSTREAM,
+        platforms: NATIVE_PLATFORMS,
+        evidence: &["differential:../escape"],
+        normalizers: &[],
+        rationale: None,
+        issue: None,
+    }];
+    let mut claims = compatibility_claims().to_vec();
+    claims[0].dimensions.swap(0, 1);
+    assert_eq!(
+        validate_compatibility_claims(&claims),
+        Err(ClaimValidationError::DimensionOrder)
+    );
+    let mut claims = compatibility_claims().to_vec();
+    claims[0].dimensions[0].scopes = BAD_REFERENCE;
+    assert_eq!(
+        validate_compatibility_claims(&claims),
+        Err(ClaimValidationError::InvalidEvidence)
+    );
+}
+
+#[test]
+fn claim_scopes_reject_overlap_and_duplicate_normalizers() {
+    const OVERLAPPING: &[ScopedClaim] = &[
+        ScopedClaim {
+            status: ClaimStatus::Unverified,
+            profiles: UPSTREAM,
+            platforms: &[ClaimPlatform::All],
+            evidence: &[],
+            normalizers: &[],
+            rationale: Some("Pending evidence."),
+            issue: Some("COMPAT-EVIDENCE"),
+        },
+        ScopedClaim {
+            status: ClaimStatus::Unverified,
+            profiles: UPSTREAM,
+            platforms: &[ClaimPlatform::Linux],
+            evidence: &[],
+            normalizers: &[],
+            rationale: Some("Pending evidence."),
+            issue: Some("COMPAT-EVIDENCE"),
+        },
+    ];
+    const DUPLICATE_NORMALIZERS: &[ScopedClaim] = &[ScopedClaim {
+        status: ClaimStatus::Normalized,
+        profiles: UPSTREAM,
+        platforms: NATIVE_PLATFORMS,
+        evidence: &["differential:case-evidence-v1"],
+        normalizers: &[
+            NormalizerId::DiagnosticPathSeparatorV1,
+            NormalizerId::DiagnosticPathSeparatorV1,
+        ],
+        rationale: Some("Reviewed presentation-only variation."),
+        issue: None,
+    }];
+    let mut claims = compatibility_claims().to_vec();
+    claims[0].dimensions[0].scopes = OVERLAPPING;
+    assert_eq!(
+        validate_compatibility_claims(&claims),
+        Err(ClaimValidationError::OverlappingScope)
+    );
+    let mut claims = compatibility_claims().to_vec();
+    claims[0].dimensions[0].scopes = DUPLICATE_NORMALIZERS;
+    assert_eq!(
+        validate_compatibility_claims(&claims),
+        Err(ClaimValidationError::MissingNormalizer)
     );
 }
 

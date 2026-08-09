@@ -9,13 +9,40 @@ use std::time::Duration;
 
 fn main() -> ExitCode {
     mark_forbidden_invocation();
-    match run(std::env::args_os().skip(1).collect()) {
+    let run_result = run(std::env::args_os().skip(1).collect());
+    let audit_result = write_resource_audit_if_requested();
+    let result = match run_result {
+        Ok(()) => audit_result,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(2)
         }
     }
+}
+
+fn write_resource_audit_if_requested() -> Result<(), String> {
+    let Some(path) = std::env::var_os("HELL_EVIDENCE_RESOURCE_AUDIT").map(PathBuf::from) else {
+        return Ok(());
+    };
+    fs::write(
+        path,
+        concat!(
+            "{\n",
+            "  \"schemaVersion\": 1,\n",
+            "  \"tasks\": 0,\n",
+            "  \"handles\": 0,\n",
+            "  \"processes\": 0,\n",
+            "  \"httpBodies\": 0,\n",
+            "  \"temporaryResources\": 0,\n",
+            "  \"cleanupFailures\": 0\n",
+            "}\n"
+        ),
+    )
+    .map_err(|error| format!("cannot write fixture resource audit: {error}"))
 }
 
 fn mark_forbidden_invocation() {

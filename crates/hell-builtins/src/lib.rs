@@ -2,6 +2,7 @@
 
 use std::sync::OnceLock;
 
+mod compatibility;
 mod manifest;
 
 pub use manifest::{
@@ -15,6 +16,9 @@ pub const UPSTREAM_COMMIT: &str = "d4d028609ed46a560c62caea8c70e7e91d1afd29";
 pub const UPSTREAM_SOURCE_SHA256: &str =
     "6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9";
 pub const UPSTREAM_EXAMPLE_COUNT: usize = 44;
+/// Updated only alongside the strictly parsed committed promotion policy.
+pub const PROMOTION_POLICY_SHA256: &str =
+    "34a03fd2db8156c938b441403c7837557fccf046a3cfaa647b645ee08ce30d74";
 pub const PUBLIC_NAME_COUNT: usize = 345;
 pub const INTERNAL_NAME_COUNT: usize = 10;
 pub const UNIQUE_NAME_COUNT: usize = PUBLIC_NAME_COUNT + INTERNAL_NAME_COUNT;
@@ -57,6 +61,20 @@ impl CompatibilityDimension {
         Self::Platform,
         Self::ResourceBehavior,
     ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::StaticSemantics => "static-semantics",
+            Self::PureRuntime => "pure-runtime",
+            Self::Effects => "effects",
+            Self::Concurrency => "concurrency",
+            Self::Presentation => "presentation",
+            Self::Platform => "platform",
+            Self::ResourceBehavior => "resource-behavior",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +93,16 @@ pub enum ExecutionProfile {
     Sandboxed,
 }
 
+impl ExecutionProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Sandboxed => "sandboxed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClaimPlatform {
     All,
@@ -84,15 +112,44 @@ pub enum ClaimPlatform {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DimensionClaim {
-    pub dimension: CompatibilityDimension,
+pub enum NormalizerId {
+    DiagnosticSandboxPathV1,
+    DiagnosticPathSeparatorV1,
+    StderrFixtureRootV1,
+}
+
+impl NormalizerId {
+    pub const ALL: [Self; 3] = [
+        Self::DiagnosticSandboxPathV1,
+        Self::DiagnosticPathSeparatorV1,
+        Self::StderrFixtureRootV1,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiagnosticSandboxPathV1 => "diagnostic-sandbox-path-v1",
+            Self::DiagnosticPathSeparatorV1 => "diagnostic-path-separator-v1",
+            Self::StderrFixtureRootV1 => "stderr-fixture-root-v1",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopedClaim {
     pub status: ClaimStatus,
     pub profiles: &'static [ExecutionProfile],
     pub platforms: &'static [ClaimPlatform],
     pub evidence: &'static [&'static str],
-    pub normalizers: &'static [&'static str],
+    pub normalizers: &'static [NormalizerId],
     pub rationale: Option<&'static str>,
     pub issue: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DimensionClaim {
+    pub dimension: CompatibilityDimension,
+    pub scopes: &'static [ScopedClaim],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,11 +163,24 @@ pub struct CompatibilityClaim {
 pub enum ClaimValidationError {
     RegistryLength,
     BuiltinOrder,
+    Baseline,
+    DimensionOrder,
     MissingEvidence,
     InvalidEvidence,
     MissingScope,
     MissingNormalizer,
     MissingRationale,
+    MissingIssue,
+    DuplicateProfile,
+    DuplicatePlatform,
+    DuplicateEvidence,
+    OverlappingScope,
+    InvalidStatusMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DifferentialReference<'a> {
+    pub case_id: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1474,17 +1544,20 @@ pub fn registry() -> &'static [BuiltinSpec] {
 const SUPPORTED_PROFILES: &[ExecutionProfile] =
     &[ExecutionProfile::Upstream, ExecutionProfile::Sandboxed];
 const ALL_PLATFORMS: &[ClaimPlatform] = &[ClaimPlatform::All];
+const UNVERIFIED_SCOPES: &[ScopedClaim] = &[ScopedClaim {
+    status: ClaimStatus::Unverified,
+    profiles: SUPPORTED_PROFILES,
+    platforms: ALL_PLATFORMS,
+    evidence: &[],
+    normalizers: &[],
+    rationale: Some("No current pinned-oracle evidence has been published for this dimension."),
+    issue: Some("COMPAT-EVIDENCE"),
+}];
 
 fn unverified_dimension(dimension: CompatibilityDimension) -> DimensionClaim {
     DimensionClaim {
         dimension,
-        status: ClaimStatus::Unverified,
-        profiles: SUPPORTED_PROFILES,
-        platforms: ALL_PLATFORMS,
-        evidence: &[],
-        normalizers: &[],
-        rationale: Some("No current pinned-oracle evidence has been published for this dimension."),
-        issue: Some("COMPAT-EVIDENCE"),
+        scopes: UNVERIFIED_SCOPES,
     }
 }
 
@@ -1499,10 +1572,24 @@ pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
     CLAIMS.get_or_init(|| {
         registry()
             .iter()
-            .map(|spec| CompatibilityClaim {
-                builtin: spec.id,
-                baseline: LANGUAGE_VERSION,
-                dimensions: CompatibilityDimension::ALL.map(unverified_dimension),
+            .map(|spec| {
+                let mut dimensions = CompatibilityDimension::ALL.map(unverified_dimension);
+                for replacement in compatibility::OVERRIDES
+                    .iter()
+                    .filter(|replacement| replacement.builtin == spec.name)
+                {
+                    if let Some(slot) = CompatibilityDimension::ALL
+                        .iter()
+                        .position(|dimension| *dimension == replacement.dimension)
+                    {
+                        dimensions[slot].scopes = replacement.scopes;
+                    }
+                }
+                CompatibilityClaim {
+                    builtin: spec.id,
+                    baseline: LANGUAGE_VERSION,
+                    dimensions,
+                }
             })
             .collect()
     })
@@ -1531,39 +1618,169 @@ pub fn validate_compatibility_claims(
         if usize::from(claim.builtin.0) != index {
             return Err(ClaimValidationError::BuiltinOrder);
         }
-        for dimension in &claim.dimensions {
-            if dimension.profiles.is_empty() || dimension.platforms.is_empty() {
-                return Err(ClaimValidationError::MissingScope);
+        if claim.baseline != LANGUAGE_VERSION {
+            return Err(ClaimValidationError::Baseline);
+        }
+        for (slot, dimension) in claim.dimensions.iter().enumerate() {
+            if dimension.dimension != CompatibilityDimension::ALL[slot] {
+                return Err(ClaimValidationError::DimensionOrder);
             }
-            if matches!(
-                dimension.status,
-                ClaimStatus::Exact | ClaimStatus::Normalized
-            ) && dimension.evidence.is_empty()
-            {
-                return Err(ClaimValidationError::MissingEvidence);
-            }
-            if dimension.status == ClaimStatus::Normalized && dimension.normalizers.is_empty() {
-                return Err(ClaimValidationError::MissingNormalizer);
-            }
-            if dimension.status == ClaimStatus::DeliberateDivergence
-                && dimension.rationale.is_none_or(str::is_empty)
-            {
-                return Err(ClaimValidationError::MissingRationale);
-            }
-            if matches!(
-                dimension.status,
-                ClaimStatus::Exact | ClaimStatus::Normalized
-            ) && (dimension
-                .evidence
+            validate_scopes(dimension.scopes)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_scopes(scopes: &[ScopedClaim]) -> Result<(), ClaimValidationError> {
+    if scopes.is_empty() {
+        return Err(ClaimValidationError::MissingScope);
+    }
+    for (index, scope) in scopes.iter().enumerate() {
+        validate_scope(scope)?;
+        for other in &scopes[..index] {
+            if scope
+                .profiles
                 .iter()
-                .any(|reference| reference.strip_prefix("differential:").is_none())
-                || dimension.platforms.contains(&ClaimPlatform::All))
+                .any(|profile| other.profiles.contains(profile))
+                && scope
+                    .platforms
+                    .iter()
+                    .any(|platform| platforms_overlap(*platform, other.platforms))
             {
-                return Err(ClaimValidationError::InvalidEvidence);
+                return Err(ClaimValidationError::OverlappingScope);
             }
         }
     }
     Ok(())
+}
+
+fn validate_scope(scope: &ScopedClaim) -> Result<(), ClaimValidationError> {
+    if scope.profiles.is_empty() || scope.platforms.is_empty() {
+        return Err(ClaimValidationError::MissingScope);
+    }
+    if has_duplicates(scope.profiles) {
+        return Err(ClaimValidationError::DuplicateProfile);
+    }
+    if has_duplicates(scope.platforms)
+        || (scope.platforms.contains(&ClaimPlatform::All) && scope.platforms.len() != 1)
+    {
+        return Err(ClaimValidationError::DuplicatePlatform);
+    }
+    if has_duplicates(scope.evidence) {
+        return Err(ClaimValidationError::DuplicateEvidence);
+    }
+    if has_duplicates(scope.normalizers) {
+        return Err(ClaimValidationError::MissingNormalizer);
+    }
+    if scope
+        .evidence
+        .iter()
+        .any(|reference| parse_differential_reference(reference).is_err())
+    {
+        return Err(ClaimValidationError::InvalidEvidence);
+    }
+    let rationale_missing = scope.rationale.is_none_or(str::is_empty);
+    let issue_missing = scope.issue.is_none_or(str::is_empty);
+    let explicit_platforms = !scope.platforms.contains(&ClaimPlatform::All);
+    match scope.status {
+        ClaimStatus::Exact => {
+            if scope.evidence.is_empty() {
+                return Err(ClaimValidationError::MissingEvidence);
+            }
+            if !scope.normalizers.is_empty() || !explicit_platforms {
+                return Err(ClaimValidationError::InvalidStatusMetadata);
+            }
+        }
+        ClaimStatus::Normalized => {
+            if scope.evidence.is_empty() {
+                return Err(ClaimValidationError::MissingEvidence);
+            }
+            if scope.normalizers.is_empty() {
+                return Err(ClaimValidationError::MissingNormalizer);
+            }
+            if rationale_missing {
+                return Err(ClaimValidationError::MissingRationale);
+            }
+            if !explicit_platforms {
+                return Err(ClaimValidationError::InvalidStatusMetadata);
+            }
+        }
+        ClaimStatus::PlatformDependent | ClaimStatus::DeliberateDivergence => {
+            if scope.evidence.is_empty() {
+                return Err(ClaimValidationError::MissingEvidence);
+            }
+            if rationale_missing {
+                return Err(ClaimValidationError::MissingRationale);
+            }
+            if issue_missing {
+                return Err(ClaimValidationError::MissingIssue);
+            }
+            if !explicit_platforms {
+                return Err(ClaimValidationError::InvalidStatusMetadata);
+            }
+        }
+        ClaimStatus::Unverified => {
+            if !scope.evidence.is_empty() || !scope.normalizers.is_empty() {
+                return Err(ClaimValidationError::InvalidStatusMetadata);
+            }
+            if rationale_missing {
+                return Err(ClaimValidationError::MissingRationale);
+            }
+            if issue_missing {
+                return Err(ClaimValidationError::MissingIssue);
+            }
+        }
+        ClaimStatus::NotApplicable => {
+            if !scope.evidence.is_empty() || !scope.normalizers.is_empty() {
+                return Err(ClaimValidationError::InvalidStatusMetadata);
+            }
+            if rationale_missing {
+                return Err(ClaimValidationError::MissingRationale);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_duplicates<T: PartialEq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
+}
+
+fn platforms_overlap(platform: ClaimPlatform, others: &[ClaimPlatform]) -> bool {
+    platform == ClaimPlatform::All
+        || others.contains(&ClaimPlatform::All)
+        || others.contains(&platform)
+}
+
+/// Parses one canonical, path-safe retained differential reference.
+///
+/// # Errors
+///
+/// Returns [`ClaimValidationError::InvalidEvidence`] for an unknown prefix or
+/// an unsafe/empty case identifier.
+pub fn parse_differential_reference(
+    reference: &str,
+) -> Result<DifferentialReference<'_>, ClaimValidationError> {
+    let case_id = reference
+        .strip_prefix("differential:")
+        .ok_or(ClaimValidationError::InvalidEvidence)?;
+    validate_case_id(case_id)
+        .then_some(DifferentialReference { case_id })
+        .ok_or(ClaimValidationError::InvalidEvidence)
+}
+
+/// Whether a differential case identifier is canonical and path-safe.
+#[must_use]
+pub fn validate_case_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 #[must_use]

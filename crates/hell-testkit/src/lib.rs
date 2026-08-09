@@ -16,8 +16,12 @@ use std::time::{Duration, Instant};
 
 use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
 
+pub use hell_builtins::NormalizerId;
+use hell_builtins::{CompatibilityDimension, ExecutionProfile};
+
 pub use artifact::{
-    EvidenceSummary, retain_mismatch_bundle, retain_observation_bundle, write_evidence_summary,
+    EvidenceSummary, retain_mismatch_bundle, retain_observation_bundle, verify_observation_bundle,
+    verify_observation_bundle_for_case, write_evidence_summary,
 };
 pub use corpus::{
     GeneratedCase, GeneratedType, committed_differential_cases, generated_typed_cases,
@@ -64,6 +68,30 @@ pub struct OutputNormalization {
     pub normalize_path_separators: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceTarget {
+    pub builtin: Arc<str>,
+    pub dimension: CompatibilityDimension,
+}
+
+impl EvidenceTarget {
+    #[must_use]
+    pub fn new(builtin: impl Into<Arc<str>>, dimension: CompatibilityDimension) -> Self {
+        Self {
+            builtin: builtin.into(),
+            dimension,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimEvidenceDescriptor {
+    pub profile: ExecutionProfile,
+    pub harness_normalizers: Vec<NormalizerId>,
+    pub claim_normalizers: Vec<NormalizerId>,
+    pub targets: Vec<EvidenceTarget>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DifferentialCase {
     pub id: Arc<str>,
@@ -76,6 +104,8 @@ pub struct DifferentialCase {
     pub environment_profile: EnvironmentProfile,
     pub process_helper_directory: Option<PathBuf>,
     pub mode: DifferentialMode,
+    /// `None` keeps stress/ad-hoc cases ineligible for promotion references.
+    pub claim_evidence: Option<ClaimEvidenceDescriptor>,
 }
 
 impl Default for DifferentialCase {
@@ -91,6 +121,7 @@ impl Default for DifferentialCase {
             environment_profile: EnvironmentProfile::Explicit,
             process_helper_directory: None,
             mode: DifferentialMode::Run,
+            claim_evidence: None,
         }
     }
 }
@@ -248,6 +279,131 @@ pub struct Observation {
     pub timed_out: bool,
     pub diagnostic: Option<DiagnosticObservation>,
     pub filesystem: Vec<FilesystemEntry>,
+    pub harness_normalizers: Vec<NormalizerId>,
+    pub claim_normalizers: Vec<NormalizerId>,
+    pub resource_audit: Option<ResourceAudit>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceAudit {
+    pub tasks: usize,
+    pub handles: usize,
+    pub processes: usize,
+    pub http_bodies: usize,
+    pub temporary_resources: usize,
+    pub cleanup_failures: usize,
+}
+
+impl ResourceAudit {
+    #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.tasks
+            .saturating_add(self.handles)
+            .saturating_add(self.processes)
+            .saturating_add(self.http_bodies)
+            .saturating_add(self.temporary_resources)
+            .saturating_add(self.cleanup_failures)
+    }
+}
+
+/// Validates the committed promotion-eligible case catalog before execution.
+///
+/// # Errors
+///
+/// Returns a precise catalog error for unsafe or duplicate identifiers,
+/// unknown targets, duplicate targets, empty eligibility declarations, or an
+/// obviously incompatible check-only/runtime target.
+pub fn validate_evidence_catalog(cases: &[DifferentialCase]) -> Result<(), String> {
+    for (index, case) in cases.iter().enumerate() {
+        if !hell_builtins::validate_case_id(&case.id) {
+            return Err(format!("unsafe differential case identifier {:?}", case.id));
+        }
+        if cases[..index].iter().any(|other| other.id == case.id) {
+            return Err(format!(
+                "duplicate differential case identifier {:?}",
+                case.id
+            ));
+        }
+        let Some(descriptor) = &case.claim_evidence else {
+            continue;
+        };
+        if descriptor.targets.is_empty() {
+            return Err(format!(
+                "claim-eligible case {:?} has no evidence targets",
+                case.id
+            ));
+        }
+        if has_duplicate_values(&descriptor.harness_normalizers)
+            || has_duplicate_values(&descriptor.claim_normalizers)
+        {
+            return Err(format!(
+                "claim-eligible case {:?} repeats a normalizer",
+                case.id
+            ));
+        }
+        if !case.normalization.stderr_replacements.is_empty() {
+            return Err(format!(
+                "claim-eligible case {:?} uses unversioned stderr replacements",
+                case.id
+            ));
+        }
+        if descriptor.harness_normalizers != applied_harness_normalizers()
+            || descriptor.claim_normalizers != applied_claim_normalizers(case)
+        {
+            return Err(format!(
+                "claim-eligible case {:?} normalizer declaration does not match execution",
+                case.id
+            ));
+        }
+        for (target_index, target) in descriptor.targets.iter().enumerate() {
+            if hell_builtins::lookup(&target.builtin).is_none() {
+                return Err(format!(
+                    "case {:?} targets unknown builtin {:?}",
+                    case.id, target.builtin
+                ));
+            }
+            if descriptor.targets[..target_index].contains(target) {
+                return Err(format!(
+                    "case {:?} repeats target {:?}/{:?}",
+                    case.id, target.builtin, target.dimension
+                ));
+            }
+            if case.mode == DifferentialMode::Check
+                && matches!(
+                    target.dimension,
+                    CompatibilityDimension::PureRuntime
+                        | CompatibilityDimension::Effects
+                        | CompatibilityDimension::Concurrency
+                        | CompatibilityDimension::ResourceBehavior
+                )
+            {
+                return Err(format!(
+                    "check-only case {:?} cannot target runtime dimension {:?}",
+                    case.id, target.dimension
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_duplicate_values<T: PartialEq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
+}
+
+fn applied_harness_normalizers() -> Vec<NormalizerId> {
+    vec![NormalizerId::DiagnosticSandboxPathV1]
+}
+
+fn applied_claim_normalizers(case: &DifferentialCase) -> Vec<NormalizerId> {
+    if case.normalization.normalize_path_separators {
+        vec![NormalizerId::DiagnosticPathSeparatorV1]
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +581,7 @@ pub fn evaluate_release_gate(
 /// configured bound.
 pub fn run(executable: &Path, script: &Path, case: &DifferentialCase) -> std::io::Result<Output> {
     let working_directory = script.parent().unwrap_or_else(|| Path::new("."));
-    let captured = capture_process(executable, script, working_directory, case)?;
+    let captured = capture_process(executable, script, working_directory, case, None)?;
     if captured.timed_out {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -607,7 +763,25 @@ fn observe_source(
     let sandbox = Sandbox::new(label)?;
     let script = sandbox.path.join("main.hell");
     fs::write(&script, case.source.as_bytes())?;
-    let captured = capture_process(&identity.path, &script, &sandbox.path, case)?;
+    let resource_audit_path = (identity.role == ExecutableRole::Candidate
+        && case.mode == DifferentialMode::Run)
+        .then(|| sandbox.path.join("candidate-resource-audit.json"));
+    let captured = capture_process(
+        &identity.path,
+        &script,
+        &sandbox.path,
+        case,
+        resource_audit_path.as_deref(),
+    )?;
+    let resource_audit = resource_audit_path
+        .as_ref()
+        .map(|path| {
+            let bytes = fs::read(path)?;
+            let audit = parse_resource_audit(&bytes)?;
+            fs::remove_file(path)?;
+            Ok::<ResourceAudit, std::io::Error>(audit)
+        })
+        .transpose()?;
     let stderr = captured
         .stderr
         .complete
@@ -637,7 +811,63 @@ fn observe_source(
         timed_out: captured.timed_out,
         diagnostic,
         filesystem: snapshot_filesystem(&sandbox.path)?,
+        harness_normalizers: applied_harness_normalizers(),
+        claim_normalizers: applied_claim_normalizers(case),
+        resource_audit,
     })
+}
+
+fn parse_resource_audit(bytes: &[u8]) -> std::io::Result<ResourceAudit> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| std::io::Error::other("candidate resource audit was not UTF-8"))?;
+    let expected_fields = [
+        "tasks",
+        "handles",
+        "processes",
+        "httpBodies",
+        "temporaryResources",
+        "cleanupFailures",
+    ];
+    if json_usize_line(text, "schemaVersion") != Some(1) {
+        return Err(std::io::Error::other(
+            "candidate resource audit has an unsupported schema",
+        ));
+    }
+    let nonempty = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "{" && *line != "}")
+        .count();
+    if nonempty != expected_fields.len() + 1 {
+        return Err(std::io::Error::other(
+            "candidate resource audit contains missing or unknown fields",
+        ));
+    }
+    let values = expected_fields
+        .map(|field| json_usize_line(text, field))
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| std::io::Error::other("candidate resource audit has a malformed field"))?;
+    Ok(ResourceAudit {
+        tasks: values[0],
+        handles: values[1],
+        processes: values[2],
+        http_bodies: values[3],
+        temporary_resources: values[4],
+        cleanup_failures: values[5],
+    })
+}
+
+fn json_usize_line(document: &str, field: &str) -> Option<usize> {
+    let prefix = format!("\"{field}\": ");
+    let mut values = document.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .map(|value| value.strip_suffix(',').unwrap_or(value))
+            .and_then(|value| value.parse().ok())
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 fn scrub_diagnostic_paths(stderr: &[u8], sandbox: &Path, script: &Path) -> Vec<u8> {
@@ -904,6 +1134,7 @@ fn capture_process(
     script: &Path,
     working_directory: &Path,
     case: &DifferentialCase,
+    resource_audit_path: Option<&Path>,
 ) -> std::io::Result<CapturedProcess> {
     let mut command = Command::new(executable);
     match case.mode {
@@ -940,6 +1171,9 @@ fn capture_process(
         EnvironmentProfile::Explicit => {
             command.envs(case.environment.iter().cloned());
         }
+    }
+    if let Some(path) = resource_audit_path {
+        command.env("HELL_EVIDENCE_RESOURCE_AUDIT", path);
     }
     command.current_dir(working_directory);
     let captured = run_supervised_command(&mut command, &case.stdin, case.timeout)?;
@@ -1303,5 +1537,72 @@ mod diagnostic_tests {
                 column: 4,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_catalog_tests {
+    use super::*;
+
+    fn eligible_case() -> DifferentialCase {
+        DifferentialCase {
+            id: "catalog-case".into(),
+            claim_evidence: Some(ClaimEvidenceDescriptor {
+                profile: ExecutionProfile::Upstream,
+                harness_normalizers: vec![NormalizerId::DiagnosticSandboxPathV1],
+                claim_normalizers: Vec::new(),
+                targets: vec![EvidenceTarget::new(
+                    hell_builtins::registry()[0].name,
+                    CompatibilityDimension::PureRuntime,
+                )],
+            }),
+            ..DifferentialCase::default()
+        }
+    }
+
+    #[test]
+    fn generated_and_ad_hoc_cases_are_ineligible_by_default() {
+        assert!(DifferentialCase::default().claim_evidence.is_none());
+        assert!(validate_evidence_catalog(&[DifferentialCase::default()]).is_ok());
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_and_duplicate_targets() {
+        let mut unknown = eligible_case();
+        unknown.claim_evidence.as_mut().unwrap().targets[0].builtin = "Missing.builtin".into();
+        assert!(validate_evidence_catalog(&[unknown]).is_err());
+
+        let mut duplicate = eligible_case();
+        let target = duplicate.claim_evidence.as_ref().unwrap().targets[0].clone();
+        duplicate
+            .claim_evidence
+            .as_mut()
+            .unwrap()
+            .targets
+            .push(target);
+        assert!(validate_evidence_catalog(&[duplicate]).is_err());
+    }
+
+    #[test]
+    fn catalog_rejects_normalizer_and_execution_scope_mismatches() {
+        let mut normalizer = eligible_case();
+        normalizer
+            .claim_evidence
+            .as_mut()
+            .unwrap()
+            .harness_normalizers
+            .clear();
+        assert!(validate_evidence_catalog(&[normalizer]).is_err());
+
+        let mut check_only = eligible_case();
+        check_only.mode = DifferentialMode::Check;
+        assert!(validate_evidence_catalog(&[check_only]).is_err());
+
+        let mut unversioned = eligible_case();
+        unversioned
+            .normalization
+            .stderr_replacements
+            .push((b"from".to_vec(), b"to".to_vec()));
+        assert!(validate_evidence_catalog(&[unversioned]).is_err());
     }
 }

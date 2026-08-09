@@ -107,6 +107,12 @@ pub fn render_compatibility_json() -> String {
     .expect("writing to String");
     writeln!(
         output,
+        "  \"promotionPolicySha256\": \"{}\",",
+        hell_builtins::PROMOTION_POLICY_SHA256
+    )
+    .expect("writing to String");
+    writeln!(
+        output,
         "  \"counts\": {{ \"publicTerms\": {}, \"internalTerms\": {}, \"typeConstructors\": {}, \"classes\": {}, \"instances\": {}, \"upstreamExamples\": {} }},",
         hell_builtins::PUBLIC_NAME_COUNT,
         hell_builtins::INTERNAL_NAME_COUNT,
@@ -181,15 +187,28 @@ pub fn render_compatibility_json() -> String {
         for (claim_index, dimension) in claim.dimensions.iter().enumerate() {
             writeln!(
                 output,
-                "      {{ \"dimension\": \"{}\", \"status\": \"{}\", \"profiles\": {}, \"platforms\": {}, \"evidence\": {}, \"normalizers\": {}, \"rationale\": {}, \"issue\": {} }}{}",
+                "      {{ \"dimension\": \"{}\", \"scopes\": [",
                 dimension_name(dimension.dimension),
-                status_name(dimension.status),
-                json_array(dimension.profiles.iter().copied().map(profile_name)),
-                json_array(dimension.platforms.iter().copied().map(platform_name)),
-                json_array(dimension.evidence.iter().copied()),
-                json_array(dimension.normalizers.iter().copied()),
-                optional_json_string(dimension.rationale),
-                optional_json_string(dimension.issue),
+            )
+            .expect("writing to String");
+            for (scope_index, scope) in dimension.scopes.iter().enumerate() {
+                writeln!(
+                    output,
+                    "        {{ \"status\": \"{}\", \"profiles\": {}, \"platforms\": {}, \"evidence\": {}, \"normalizers\": {}, \"rationale\": {}, \"issue\": {} }}{}",
+                    status_name(scope.status),
+                    json_array(scope.profiles.iter().copied().map(profile_name)),
+                    json_array(scope.platforms.iter().copied().map(platform_name)),
+                    json_array(scope.evidence.iter().copied()),
+                    json_array(scope.normalizers.iter().map(|normalizer| normalizer.as_str())),
+                    optional_json_string(scope.rationale),
+                    optional_json_string(scope.issue),
+                    comma(scope_index, dimension.scopes.len())
+                )
+                .expect("writing to String");
+            }
+            writeln!(
+                output,
+                "      ] }}{}",
                 comma(claim_index, claim.dimensions.len())
             )
             .expect("writing to String");

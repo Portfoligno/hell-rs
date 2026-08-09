@@ -1,7 +1,10 @@
 mod command;
 mod fixtures;
+mod oracle_record;
 mod policy;
+mod promotion_policy;
 mod report;
+mod strict_toml;
 mod suite;
 
 use std::ffi::OsString;
@@ -26,11 +29,13 @@ enum Invocation {
         report: PathBuf,
         oracle: PathBuf,
         oracle_sha256: Digest,
+        dependency_attestation: PathBuf,
     },
     NativeOracleShard {
         report: PathBuf,
         source: PathBuf,
         platform: String,
+        dependency_attestation: PathBuf,
     },
     MergeNativeShards {
         report: PathBuf,
@@ -39,6 +44,16 @@ enum Invocation {
     PromotionGate {
         report: PathBuf,
         input: PathBuf,
+        explain: bool,
+    },
+    DependencyAttestation {
+        report: PathBuf,
+        output: PathBuf,
+    },
+    PromotionWorklist {
+        report: PathBuf,
+        output: PathBuf,
+        profile: String,
     },
     Examples {
         profile: String,
@@ -47,7 +62,7 @@ enum Invocation {
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci promotion-gate --input PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci promotion-worklist --profile upstream --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci promotion-gate --input PATH --report PATH [--explain]\n       hell-ci examples --profile ci|release --report PATH"
 }
 
 #[allow(clippy::too_many_lines)]
@@ -65,11 +80,20 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     let mut source = None;
     let mut platform = None;
     let mut input = None;
+    let mut output = None;
+    let mut dependency_attestation = None;
+    let mut explain = false;
     while let Some(flag) = arguments.next() {
         let flag = flag
             .into_string()
             .map_err(|_| "option name must be UTF-8".to_owned())?;
         match flag.as_str() {
+            "--explain" => {
+                if explain {
+                    return Err("--explain was provided more than once".to_owned());
+                }
+                explain = true;
+            }
             "--report" => {
                 if report.is_some() {
                     return Err("--report was provided more than once".to_owned());
@@ -145,6 +169,25 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                         .ok_or_else(|| "--input requires PATH".to_owned())?,
                 ));
             }
+            "--output" => {
+                if output.is_some() {
+                    return Err("--output was provided more than once".to_owned());
+                }
+                output = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--output requires PATH".to_owned())?,
+                ));
+            }
+            "--dependency-attestation" => {
+                if dependency_attestation.is_some() {
+                    return Err("--dependency-attestation was provided more than once".to_owned());
+                }
+                dependency_attestation =
+                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
+                        "--dependency-attestation requires PATH".to_owned()
+                    })?));
+            }
             _ => return Err(format!("unknown option {flag}\n{}", usage())),
         }
     }
@@ -156,7 +199,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
-                && input.is_none() =>
+                && input.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
         {
             Ok(Invocation::Policy { report })
         }
@@ -166,7 +212,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
-                && input.is_none() =>
+                && input.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
         {
             Ok(Invocation::Verify { report })
         }
@@ -176,31 +225,82 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
-                && input.is_none() =>
+                && input.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
         {
             Ok(Invocation::Portability { report })
         }
+        "dependency-attestation"
+            if profile.is_none()
+                && oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
+        {
+            Ok(Invocation::DependencyAttestation {
+                report,
+                output: output
+                    .ok_or_else(|| "dependency-attestation requires --output PATH".to_owned())?,
+            })
+        }
+        "promotion-worklist"
+            if oracle.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
+        {
+            Ok(Invocation::PromotionWorklist {
+                report,
+                output: output
+                    .ok_or_else(|| "promotion-worklist requires --output PATH".to_owned())?,
+                profile: match profile.as_deref() {
+                    Some("upstream") => "upstream".to_owned(),
+                    Some(value) => return Err(format!("invalid promotion profile {value:?}")),
+                    None => return Err("promotion-worklist requires --profile upstream".to_owned()),
+                },
+            })
+        }
         "nightly"
-            if profile.is_none() && source.is_none() && platform.is_none() && input.is_none() =>
+            if profile.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none()
+                && output.is_none()
+                && !explain =>
         {
             Ok(Invocation::Nightly {
                 report,
                 oracle: oracle.ok_or_else(|| "nightly requires --oracle PATH".to_owned())?,
                 oracle_sha256: oracle_sha256
                     .ok_or_else(|| "nightly requires --oracle-sha256 HEX".to_owned())?,
+                dependency_attestation: dependency_attestation
+                    .ok_or_else(|| "nightly requires --dependency-attestation PATH".to_owned())?,
             })
         }
         "native-oracle-shard"
             if profile.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
-                && input.is_none() =>
+                && input.is_none()
+                && output.is_none()
+                && !explain =>
         {
             Ok(Invocation::NativeOracleShard {
                 report,
                 source: source.ok_or_else(|| "native-oracle-shard requires --source".to_owned())?,
                 platform: platform
                     .ok_or_else(|| "native-oracle-shard requires --platform".to_owned())?,
+                dependency_attestation: dependency_attestation.ok_or_else(|| {
+                    "native-oracle-shard requires --dependency-attestation PATH".to_owned()
+                })?,
             })
         }
         "merge-native-shards"
@@ -208,7 +308,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
-                && platform.is_none() =>
+                && platform.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
         {
             Ok(Invocation::MergeNativeShards {
                 report,
@@ -220,11 +323,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
-                && platform.is_none() =>
+                && platform.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none() =>
         {
             Ok(Invocation::PromotionGate {
                 report,
                 input: input.ok_or_else(|| "promotion-gate requires --input".to_owned())?,
+                explain,
             })
         }
         "examples"
@@ -232,7 +338,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
-                && input.is_none() =>
+                && input.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && !explain =>
         {
             Ok(Invocation::Examples {
                 profile: match profile.as_deref() {
@@ -265,6 +374,7 @@ fn main() -> ExitCode {
     run(&invocation, &root)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(invocation: &Invocation, root: &Path) -> ExitCode {
     let (suite_name, report_path) = match invocation {
         Invocation::Policy { report } => ("policy", report),
@@ -274,6 +384,8 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::NativeOracleShard { report, .. } => ("native-oracle-shard", report),
         Invocation::MergeNativeShards { report, .. } => ("merge-native-shards", report),
         Invocation::PromotionGate { report, .. } => ("promotion-gate", report),
+        Invocation::DependencyAttestation { report, .. } => ("dependency-attestation", report),
+        Invocation::PromotionWorklist { report, .. } => ("promotion-worklist", report),
         Invocation::Examples { report, .. } => ("examples", report),
     };
     let mut report = Report::new(suite_name);
@@ -285,15 +397,41 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Nightly {
             oracle,
             oracle_sha256,
+            dependency_attestation,
             ..
-        } => suite::nightly(root, &mut report, &failures, oracle, *oracle_sha256),
+        } => suite::nightly(
+            root,
+            &mut report,
+            &failures,
+            oracle,
+            *oracle_sha256,
+            dependency_attestation,
+        ),
         Invocation::NativeOracleShard {
-            source, platform, ..
-        } => suite::native_oracle_shard(root, &mut report, &failures, source, platform),
+            source,
+            platform,
+            dependency_attestation,
+            ..
+        } => suite::native_oracle_shard(
+            root,
+            &mut report,
+            &failures,
+            source,
+            platform,
+            dependency_attestation,
+        ),
         Invocation::MergeNativeShards { input, .. } => {
             suite::merge_native_shards(root, input, &mut report)
         }
-        Invocation::PromotionGate { input, .. } => suite::promotion_gate(root, input, &mut report),
+        Invocation::PromotionGate { input, explain, .. } => {
+            suite::promotion_gate(root, input, *explain, &mut report)
+        }
+        Invocation::DependencyAttestation { output, .. } => {
+            suite::dependency_attestation(root, output, &mut report)
+        }
+        Invocation::PromotionWorklist {
+            output, profile, ..
+        } => suite::promotion_worklist(root, output, profile, &mut report),
         Invocation::Examples { profile, .. } => {
             suite::examples(root, &mut report, &failures, profile)
         }
@@ -307,6 +445,31 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
     if let Err(error) = report.write(report_path) {
         eprintln!("cannot write report {}: {error}", report_path.display());
         return ExitCode::from(40);
+    }
+    if matches!(invocation, Invocation::PromotionGate { .. }) {
+        let report_bytes = match std::fs::read(report_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "cannot hash promotion report {}: {error}",
+                    report_path.display()
+                );
+                return ExitCode::from(40);
+            }
+        };
+        let digest = hell_testkit::sha256_bytes(&report_bytes).hex();
+        let Some(name) = report_path.file_name().and_then(|name| name.to_str()) else {
+            eprintln!("promotion report name must be UTF-8");
+            return ExitCode::from(40);
+        };
+        let digest_path = report_path.with_extension("sha256");
+        if let Err(error) = std::fs::write(&digest_path, format!("{digest}  {name}\n")) {
+            eprintln!(
+                "cannot write promotion report digest {}: {error}",
+                digest_path.display()
+            );
+            return ExitCode::from(40);
+        }
     }
     println!(
         "{}: {}; report: {}",
@@ -376,6 +539,8 @@ mod tests {
                     "oracle",
                     "--oracle-sha256",
                     &digest,
+                    "--dependency-attestation",
+                    "dependency-policy.json",
                     "--report",
                     "out.json",
                 ]
@@ -398,6 +563,8 @@ mod tests {
                     "upstream",
                     "--platform",
                     "macos-arm64",
+                    "--dependency-attestation",
+                    "dependency-policy.json",
                     "--report",
                     "out.json",
                 ]
@@ -423,6 +590,41 @@ mod tests {
             ),
             Ok(Invocation::PromotionGate { .. })
         ));
+    }
+
+    #[test]
+    fn promotion_gate_writes_a_digested_report_without_mutating_retained_input() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let sandbox =
+            std::env::temp_dir().join(format!("hell-promotion-gate-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir(&sandbox).unwrap();
+        let manifest = "{\n  \"validatedShardCount\": 3\n}\n";
+        std::fs::write(sandbox.join("merged-native-shards.json"), manifest).unwrap();
+        let manifest_digest = hell_testkit::sha256_bytes(manifest.as_bytes()).hex();
+        std::fs::write(
+            sandbox.join("merged-native-shards.sha256"),
+            format!("{manifest_digest}  merged-native-shards.json\n"),
+        )
+        .unwrap();
+        let report = sandbox.join("promotion-gate.json");
+        let invocation = Invocation::PromotionGate {
+            input: sandbox.clone(),
+            explain: true,
+            report: report.clone(),
+        };
+        let _ = run(&invocation, &root);
+        assert_eq!(
+            std::fs::read_to_string(sandbox.join("merged-native-shards.json")).unwrap(),
+            manifest
+        );
+        let report_bytes = std::fs::read(&report).unwrap();
+        let expected = hell_testkit::sha256_bytes(&report_bytes).hex();
+        let recorded = std::fs::read_to_string(report.with_extension("sha256")).unwrap();
+        assert_eq!(recorded, format!("{expected}  promotion-gate.json\n"));
+        std::fs::remove_dir_all(sandbox).unwrap();
     }
 
     #[test]

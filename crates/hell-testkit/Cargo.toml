@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
 hell-platform = { version = "0.1.0", path = "../hell-platform" }
 
 [dev-dependencies]

@@ -68,6 +68,9 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Retain dependency policy attestation
+        run: ./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation-report.json
+
       - name: Download content-addressed upstream oracle
         run: curl --fail --location --tlsv1.2 --create-dirs --output target/oracle/hell https://github.com/chrisdone/hell/releases/download/2026-05-29/hell-linux-amd64
 
@@ -75,7 +78,7 @@ jobs:
         run: chmod +x target/oracle/hell
 
       - name: Collect Linux release and stress evidence
-        run: ./target/ci/hell-ci nightly --oracle target/oracle/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --report ci-out/nightly.json
+        run: ./target/ci/hell-ci nightly --oracle target/oracle/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
 
       - name: Upload nightly report
         if: ${{ always() }}
@@ -148,11 +151,20 @@ jobs:
             v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
             v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
 
+      - name: Check dependency advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          arguments: --all-features
+
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Retain dependency policy attestation
+        run: ./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation-report.json
+
       - name: Build pinned oracle and run native shard
-        run: ./target/ci/hell-ci native-oracle-shard --source target/oracle-source --platform macos-arm64 --report ci-out/shards/macos-arm64/report.json
+        run: ./target/ci/hell-ci native-oracle-shard --source target/oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/shards/macos-arm64/report.json
 
       - name: Upload native macOS evidence
         if: ${{ always() }}
@@ -222,11 +234,20 @@ jobs:
             v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
             v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
 
+      - name: Check dependency advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          arguments: --all-features
+
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Retain dependency policy attestation
+        run: .\target\ci\hell-ci.exe dependency-attestation --output ci-out\dependency-policy.json --report ci-out\dependency-attestation-report.json
+
       - name: Build pinned oracle and run native shard
-        run: .\target\ci\hell-ci.exe native-oracle-shard --source target\oracle-source --platform windows-amd64 --report ci-out\shards\windows-amd64\report.json
+        run: .\target\ci\hell-ci.exe native-oracle-shard --source target\oracle-source --platform windows-amd64 --dependency-attestation ci-out\dependency-policy.json --report ci-out\shards\windows-amd64\report.json
 
       - name: Upload native Windows evidence
         if: ${{ always() }}
@@ -340,7 +361,8 @@ jobs:
   promotion-gate:
     name: Promotion gate / Linux
     needs: merge-native-evidence
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_promotion }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_promotion && needs.merge-native-evidence.result == 'success' }}
+    environment: compatibility-promotion
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -381,3 +403,16 @@ jobs:
 
       - name: Require promotion-ready evidence
         run: ./target/ci/hell-ci promotion-gate --input ci-out/native-shards --report ci-out/promotion-gate.json
+
+      - name: Upload promotion report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci-out/promotion-gate.json
+            ci-out/promotion-gate.sha256
+            ci-out/native-shards/merged-native-shards.json
+            ci-out/native-shards/merged-native-shards.sha256
+          if-no-files-found: error
+          retention-days: 30

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9,15 +10,18 @@ use hell_compiler::{CompilerConfig, CompilerSession};
 use hell_source::{SourceMap, SourceName};
 use hell_testkit::{
     ClassifiedMismatch, DeterministicBytes, DeterministicUtf8, DifferentialCase, Digest,
-    EvidenceSummary, ExecutableIdentity, ExecutableRole, ReleaseGateInput, ReleaseGateReport,
-    committed_differential_cases, differential_with_identities, evaluate_release_gate,
-    generated_typed_cases, retain_mismatch_bundle, retain_observation_bundle, sha256_bytes,
-    sha256_file, verify_executable, write_evidence_summary,
+    DivergenceClass, EvidenceSummary, ExecutableIdentity, ExecutableRole, ReleaseGateInput,
+    ReleaseGateReport, committed_differential_cases, differential_with_identities,
+    evaluate_release_gate, generated_typed_cases, retain_mismatch_bundle,
+    retain_observation_bundle, sha256_bytes, sha256_file, validate_evidence_catalog,
+    verify_executable, verify_observation_bundle_for_case, write_evidence_summary,
 };
 
 use crate::command::{CommandResult, CommandSpec};
 use crate::fixtures;
+use crate::oracle_record;
 use crate::policy;
+use crate::promotion_policy;
 use crate::report::Report;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +61,9 @@ pub fn policy_suite(root: &Path, report: &mut Report) -> Result<(), FailureKind>
             hell_builtins::validate_compatibility_claims(hell_builtins::compatibility_claims())
                 .map_err(|error| format!("compatibility claims are invalid: {error:?}"))
         })
+        .and_then(|()| promotion_policy::load(root).map(|_| ()))
+        .and_then(|()| promotion_policy::load_review(root).map(|_| ()))
+        .and_then(|()| oracle_record::load_all(root).map(|_| ()))
         .and_then(|()| {
             let path = root.join("compat/upstream-2026-05-29.json");
             let expected = fs::read_to_string(&path)
@@ -71,6 +78,224 @@ pub fn policy_suite(root: &Path, report: &mut Report) -> Result<(), FailureKind>
     let passed = result.is_ok();
     report.check("repository-policy", started.elapsed(), result);
     passed.then_some(()).ok_or(FailureKind::Policy)
+}
+
+/// Writes a dependency-policy success attestation after the pinned external
+/// dependency gate has completed successfully.
+pub fn dependency_attestation(
+    root: &Path,
+    output: &Path,
+    report: &mut Report,
+) -> Result<(), FailureKind> {
+    let started = Instant::now();
+    let result = (|| {
+        let source_commit = std::env::var("HELL_SOURCE_COMMIT")
+            .map_err(|_| "HELL_SOURCE_COMMIT is required for dependency attestation".to_owned())?;
+        promotion_policy::require_git_sha(&source_commit, "dependency attestation source commit")?;
+        let cargo_lock = root.join("Cargo.lock");
+        let lock_sha256 = sha256_file(&cargo_lock)
+            .map_err(|error| format!("cannot hash {}: {error}", cargo_lock.display()))?;
+        let contents = dependency_attestation_json(&source_commit, lock_sha256);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        fs::write(output, contents.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
+        let digest = sha256_bytes(contents.as_bytes()).hex();
+        let digest_path = output.with_extension("sha256");
+        let name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "dependency attestation output name must be UTF-8".to_owned())?;
+        fs::write(&digest_path, format!("{digest}  {name}\n"))
+            .map_err(|error| format!("cannot write {}: {error}", digest_path.display()))
+    })();
+    let passed = result.is_ok();
+    report.check("dependency-attestation", started.elapsed(), result);
+    passed.then_some(()).ok_or(FailureKind::Fixture)
+}
+
+/// Emits a deterministic reviewer worklist without modifying claim source.
+pub fn promotion_worklist(
+    root: &Path,
+    output: &Path,
+    profile: &str,
+    report: &mut Report,
+) -> Result<(), FailureKind> {
+    let started = Instant::now();
+    let result = (|| {
+        if profile != "upstream" {
+            return Err(format!(
+                "unsupported promotion worklist profile {profile:?}"
+            ));
+        }
+        let policy = promotion_policy::load(root)?;
+        if policy.required_profiles != [hell_builtins::ExecutionProfile::Upstream] {
+            return Err("promotion worklist profile disagrees with policy".to_owned());
+        }
+        let mut csv = String::from(
+            "builtin,visibility,scheme,arity,implementation,dimension,profile,platforms,current_status,applicability_decision,proposed_status,proposed_references,proposed_normalizers,rationale,issue,catalog_target_exists,observed_on_linux,observed_on_macos,observed_on_windows,reviewer_notes\n",
+        );
+        for (spec, claim) in hell_builtins::registry()
+            .iter()
+            .zip(hell_builtins::compatibility_claims())
+        {
+            for dimension in &claim.dimensions {
+                for scope in dimension.scopes.iter().filter(|scope| {
+                    scope
+                        .profiles
+                        .contains(&hell_builtins::ExecutionProfile::Upstream)
+                }) {
+                    let platforms = scope
+                        .platforms
+                        .iter()
+                        .map(|platform| claim_platform_name(*platform))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let evidence = scope.evidence.join(";");
+                    let normalizers = scope
+                        .normalizers
+                        .iter()
+                        .map(|normalizer| normalizer.as_str())
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let fields = [
+                        spec.name.to_owned(),
+                        format!("{:?}", spec.visibility),
+                        spec.scheme.unwrap_or_default().to_owned(),
+                        spec.arity.to_string(),
+                        spec.implementation.unwrap_or_default().to_owned(),
+                        dimension.dimension.as_str().to_owned(),
+                        profile.to_owned(),
+                        platforms,
+                        claim_status_name(scope.status).to_owned(),
+                        String::new(),
+                        String::new(),
+                        evidence,
+                        normalizers,
+                        scope.rationale.unwrap_or_default().to_owned(),
+                        scope.issue.unwrap_or_default().to_owned(),
+                        "false".to_owned(),
+                        "false".to_owned(),
+                        "false".to_owned(),
+                        "false".to_owned(),
+                        String::new(),
+                    ];
+                    csv.push_str(
+                        &fields
+                            .iter()
+                            .map(|field| csv_field(field))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                    csv.push('\n');
+                }
+            }
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        fs::write(output, csv)
+            .map_err(|error| format!("cannot write {}: {error}", output.display()))
+    })();
+    let passed = result.is_ok();
+    report.check("promotion-worklist", started.elapsed(), result);
+    passed.then_some(()).ok_or(FailureKind::Fixture)
+}
+
+fn csv_field(field: &str) -> String {
+    let escaped = field.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn dependency_attestation_json(source_commit: &str, cargo_lock_sha256: Digest) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schemaVersion\": 1,\n",
+            "  \"workflow\": \"nightly.yml\",\n",
+            "  \"candidateSourceCommit\": {:?},\n",
+            "  \"cargoLockSha256\": {:?},\n",
+            "  \"result\": \"passed\"\n",
+            "}}\n"
+        ),
+        source_commit,
+        cargo_lock_sha256.hex(),
+    )
+}
+
+fn retain_dependency_attestation(
+    _root: &Path,
+    input: &Path,
+    artifact_root: &Path,
+    dependency_lock_sha256: Digest,
+    candidate: &ExecutableIdentity,
+) -> Result<Digest, SuiteFailure> {
+    let candidate_source_commit = candidate
+        .build_info
+        .as_ref()
+        .and_then(|build_info| {
+            build_info
+                .lines
+                .iter()
+                .find_map(|line| line.strip_prefix("source commit "))
+        })
+        .ok_or_else(|| SuiteFailure::fixture("candidate has no source commit for attestation"))?;
+    let expected = dependency_attestation_json(candidate_source_commit, dependency_lock_sha256);
+    let observed = evidence_io(
+        "read dependency policy attestation",
+        input,
+        fs::read_to_string(input),
+    )?;
+    if observed != expected {
+        return Err(SuiteFailure::fixture(format!(
+            "dependency policy attestation {} does not match the candidate and Cargo.lock",
+            input.display()
+        )));
+    }
+    let digest = sha256_bytes(observed.as_bytes());
+    let digest_path = input.with_extension("sha256");
+    let input_name = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SuiteFailure::fixture("dependency attestation name is not UTF-8"))?;
+    let expected_digest = format!("{}  {input_name}\n", digest.hex());
+    let observed_digest = evidence_io(
+        "read dependency policy attestation digest",
+        &digest_path,
+        fs::read_to_string(&digest_path),
+    )?;
+    if observed_digest != expected_digest {
+        return Err(SuiteFailure::fixture(format!(
+            "dependency policy attestation digest {} is invalid",
+            digest_path.display()
+        )));
+    }
+    let retained = artifact_root.join("evidence/dependency-policy-attestation.json");
+    let retained_digest = artifact_root.join("evidence/dependency-policy-attestation.sha256");
+    if let Some(parent) = retained.parent() {
+        evidence_io(
+            "create dependency attestation evidence directory",
+            parent,
+            fs::create_dir_all(parent),
+        )?;
+    }
+    evidence_io(
+        "retain dependency policy attestation",
+        &retained,
+        fs::write(&retained, observed.as_bytes()),
+    )?;
+    evidence_io(
+        "retain dependency policy attestation digest",
+        &retained_digest,
+        fs::write(
+            &retained_digest,
+            format!("{}  dependency-policy-attestation.json\n", digest.hex()),
+        ),
+    )?;
+    Ok(digest)
 }
 
 pub fn verify(root: &Path, report: &mut Report, failures: &Path) -> Result<(), FailureKind> {
@@ -132,6 +357,7 @@ pub fn nightly(
     failures: &Path,
     oracle: &Path,
     oracle_sha256: Digest,
+    dependency_attestation: &Path,
 ) -> Result<(), FailureKind> {
     policy_suite(root, report)?;
     if !workspace_tests(root, report, failures, "release") {
@@ -179,7 +405,7 @@ pub fn nightly(
         report,
         "differential-evidence",
         started,
-        run_differential_corpus(root, &identities, failures),
+        run_differential_corpus(root, &identities, failures, dependency_attestation),
     )?;
     report.check(
         "committed-and-generated-differential",
@@ -221,8 +447,8 @@ pub fn nightly(
             stale_exact_claims: differential.stale_exact_claims,
             missing_evidence_references: missing_claim_evidence(),
             required_platform_skips: required_platform_skips(root),
-            leaked_resources: measured_resource_leaks(),
-            dependency_failures: measured_dependency_failures(),
+            leaked_resources: differential.resource_failures,
+            dependency_failures: differential.dependency_failures,
         },
         1_024,
     );
@@ -262,6 +488,7 @@ pub fn native_oracle_shard(
     failures: &Path,
     source: &Path,
     platform: &str,
+    dependency_attestation: &Path,
 ) -> Result<(), FailureKind> {
     const SOURCE_COMMIT: &str = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff";
     policy_suite(root, report)?;
@@ -409,22 +636,32 @@ pub fn native_oracle_shard(
         report,
         "native-differential-evidence",
         started,
-        run_differential_corpus(root, &identities, failures),
+        run_differential_corpus(root, &identities, failures, dependency_attestation),
     )?;
+    let unacceptable_mismatches = differential
+        .mismatches
+        .iter()
+        .filter(|mismatch| {
+            mismatch.classification != Some(DivergenceClass::DeliberateDivergence)
+                || mismatch.explanation.trim().is_empty()
+        })
+        .count();
     let passed = differential.harness_failures == 0
         && differential.unexpected_timeouts == 0
-        && differential.mismatches.is_empty()
-        && differential.stale_exact_claims == 0;
+        && unacceptable_mismatches == 0
+        && differential.stale_exact_claims == 0
+        && differential.resource_failures == 0;
     report.check(
         "native-oracle-differential-shard",
         Duration::ZERO,
         passed.then_some(()).ok_or_else(|| {
             format!(
-                "harness={}, timeouts={}, mismatches={}, staleExactClaims={}",
+                "harness={}, timeouts={}, unacceptableMismatches={}, staleExactClaims={}, resourceFailures={}",
                 differential.harness_failures,
                 differential.unexpected_timeouts,
-                differential.mismatches.len(),
-                differential.stale_exact_claims
+                unacceptable_mismatches,
+                differential.stale_exact_claims,
+                differential.resource_failures
             )
         }),
     );
@@ -442,7 +679,12 @@ pub fn merge_native_shards(
 }
 
 /// Revalidates every native shard and applies the fail-closed promotion gate.
-pub fn promotion_gate(root: &Path, input: &Path, report: &mut Report) -> Result<(), FailureKind> {
+pub fn promotion_gate(
+    root: &Path,
+    input: &Path,
+    explain: bool,
+    report: &mut Report,
+) -> Result<(), FailureKind> {
     let started = Instant::now();
     let retained_manifest = read_digested_merged_manifest(input).and_then(|manifest| {
         (json_usize_field(&manifest, "validatedShardCount") == Some(3))
@@ -458,7 +700,50 @@ pub fn promotion_gate(root: &Path, input: &Path, report: &mut Report) -> Result<
     if !retained_manifest_passed {
         return Err(FailureKind::Fixture);
     }
+    if explain {
+        let explanation = explain_merged_promotion(input);
+        report.check("promotion-gate-explain", started.elapsed(), explanation);
+    }
     validate_and_merge_native_shards(root, input, report, true)
+}
+
+fn explain_merged_promotion(input: &Path) -> Result<(), String> {
+    let manifest = read_digested_merged_manifest(input)?;
+    let mut failures = Vec::new();
+    for (field, expected) in [
+        ("validatedShardCount", 3),
+        ("missingClaimEvidence", 0),
+        ("requiredPlatformSkips", 0),
+        ("irrelevantClaimReferences", 0),
+        ("profileEvidenceMismatches", 0),
+        ("platformEvidenceMismatches", 0),
+        ("normalizerEvidenceMismatches", 0),
+        ("invalidApplicabilityClaims", 0),
+        ("invalidPlatformRecords", 0),
+        ("platformProvenanceMismatches", 0),
+    ] {
+        let observed = json_usize_field(&manifest, field);
+        if observed != Some(expected) {
+            failures.push(format!("{field}={observed:?}, expected {expected}"));
+        }
+    }
+    for field in ["platformEvidenceComplete", "promotionReady"] {
+        let observed = json_bool_field(&manifest, field);
+        if observed != Some(true) {
+            failures.push(format!("{field}={observed:?}, expected true"));
+        }
+    }
+    if json_string_array_field(&manifest, "requiredProfiles") != Some(vec!["upstream"])
+        || json_usize_field(&manifest, "unverifiedOutOfScopeClaims").is_none()
+        || json_usize_field(&manifest, "reviewedExpectedDivergences").is_none()
+    {
+        failures.push("promotion scope visibility fields are missing or invalid".to_owned());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -475,11 +760,47 @@ fn validate_and_merge_native_shards(
     ];
     const SOURCE_COMMIT: &str = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff";
     let started = Instant::now();
-    let mut merged = String::from("{\n  \"schemaVersion\": 1,\n  \"shards\": [\n");
+    let promotion_policy = promotion_policy::load(root).map_err(|detail| {
+        report.check("promotion-policy", started.elapsed(), Err(detail));
+        FailureKind::Fixture
+    })?;
+    report.check("promotion-policy", started.elapsed(), Ok(()));
+    let review = promotion_policy::load_review(root).map_err(|detail| {
+        report.check("promotion-review", started.elapsed(), Err(detail));
+        FailureKind::Fixture
+    })?;
+    if require_promotion {
+        review.require_accepted().map_err(|detail| {
+            report.check("promotion-review", started.elapsed(), Err(detail));
+            FailureKind::Fixture
+        })?;
+    }
+    report.check("promotion-review", started.elapsed(), Ok(()));
+    let oracle_records = oracle_record::load_all(root).map_err(|detail| {
+        report.check("reviewed-oracle-records", started.elapsed(), Err(detail));
+        FailureKind::Fixture
+    })?;
+    report.check("reviewed-oracle-records", started.elapsed(), Ok(()));
+    let mut merged = String::from("{\n  \"schemaVersion\": 2,\n  \"shards\": [\n");
     let mut candidate_source_commit = None::<String>;
     let mut compatibility_snapshot_sha256 = None::<String>;
+    let mut common_summary_fields = BTreeMap::<String, String>::new();
     let expected_missing_claims = missing_claim_evidence();
     let expected_platform_skips = required_platform_skips(root);
+    let expected_out_of_scope_claims =
+        unverified_out_of_scope_claims(&promotion_policy.required_profiles);
+    let current_dependency_lock_sha256 =
+        sha256_file(&root.join("Cargo.lock")).map_err(|error| {
+            report.check(
+                "merge-current-source-identities",
+                started.elapsed(),
+                Err(format!("cannot hash Cargo.lock: {error}")),
+            );
+            FailureKind::Io
+        })?;
+    let current_catalog = reviewed_corpus_catalog_json(&committed_differential_cases());
+    let current_catalog_sha256 = sha256_bytes(current_catalog.as_bytes()).hex();
+    let mut reviewed_expected_divergences = 0_usize;
     let mut validated_shards = 0_usize;
     for (index, (label, host_platform, source_built)) in SHARDS.iter().enumerate() {
         let directory = input.join(label);
@@ -507,6 +828,11 @@ fn validate_and_merge_native_shards(
             "mismatches",
             "unexpectedTimeouts",
             "staleExactClaims",
+            "irrelevantClaimReferences",
+            "profileEvidenceMismatches",
+            "platformEvidenceMismatches",
+            "normalizerEvidenceMismatches",
+            "failedClaimObservations",
             "leakedResources",
             "dependencyFailures",
         ] {
@@ -532,6 +858,30 @@ fn validate_and_merge_native_shards(
                 ),
             ));
         }
+        if json_usize_field(&summary, "unverifiedOutOfScopeClaims")
+            != Some(expected_out_of_scope_claims)
+            || json_string_array_field(&summary, "requiredProfiles") != Some(vec!["upstream"])
+        {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &summary_path,
+                "promotion profile scope or out-of-scope count is invalid",
+            ));
+        }
+        let shard_expected_divergences = json_usize_field(&summary, "reviewedExpectedDivergences")
+            .ok_or_else(|| {
+                merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &summary_path,
+                    "reviewedExpectedDivergences is missing or malformed",
+                )
+            })?;
+        reviewed_expected_divergences =
+            reviewed_expected_divergences.saturating_add(shard_expected_divergences);
         let platform_skips = json_usize_field(&summary, "requiredPlatformSkips");
         if platform_skips != Some(expected_platform_skips) {
             return Err(merge_fixture_failure(
@@ -561,6 +911,21 @@ fn validate_and_merge_native_shards(
                 &summary_path,
                 "field repositoryPolicyPassed must be true",
             ));
+        }
+        for (field, expected) in [
+            ("observationBundleSchemaVersion", 2),
+            ("claimIndexSchemaVersion", 2),
+            ("oracleRecordSchemaVersion", 2),
+        ] {
+            if json_usize_field(&summary, field) != Some(expected) {
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &summary_path,
+                    format!("field {field} must be schema version {expected}"),
+                ));
+            }
         }
         if json_usize_field(&summary, "generatedDifferentialObservations")
             .is_none_or(|count| count < 1_024)
@@ -634,6 +999,49 @@ fn validate_and_merge_native_shards(
                 ),
             ));
         }
+        if json_usize_field(&claim_index_contents, "schemaVersion") != Some(2)
+            || json_string_field(&claim_index_contents, "profile") != Some("upstream")
+            || json_string_field(&claim_index_contents, "platform") != Some(label)
+        {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &claim_index,
+                "claim evidence index schema/profile/platform is invalid",
+            ));
+        }
+        for field in [
+            "missingBundles",
+            "irrelevantReferences",
+            "profileMismatches",
+            "platformMismatches",
+            "normalizerMismatches",
+            "failedObservations",
+        ] {
+            if json_usize_field(&claim_index_contents, field) != Some(0) {
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &claim_index,
+                    format!("claim index field {field} is missing, malformed, or nonzero"),
+                ));
+            }
+        }
+        if let Err(detail) = validate_claim_index_contents(
+            &claim_index_contents,
+            &directory.join("evidence/observations"),
+            label,
+        ) {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &claim_index,
+                detail,
+            ));
+        }
         for (field, expected) in [
             ("candidateSourceCommit", &mut candidate_source_commit),
             (
@@ -662,6 +1070,131 @@ fn validate_and_merge_native_shards(
             } else {
                 *expected = Some(observed.to_owned());
             }
+        }
+        for field in ["promotionPolicySha256", "reviewedCorpusCatalogSha256"] {
+            let observed = required_merge_string_field(
+                report,
+                label,
+                started,
+                &claim_index,
+                &claim_index_contents,
+                field,
+            )?;
+            if field == "promotionPolicySha256" && observed != promotion_policy.sha256.hex() {
+                return Err(merge_fixture_failure(
+                    report,
+                    label,
+                    started,
+                    &claim_index,
+                    "claim index does not bind the committed promotion policy",
+                ));
+            }
+            bind_common_field(&mut common_summary_fields, field, observed).map_err(|detail| {
+                merge_fixture_failure(report, label, started, &claim_index, detail)
+            })?;
+        }
+        for field in [
+            "promotionPolicySha256",
+            "reviewedCorpusCatalogSha256",
+            "promotionReviewSha256",
+            "dependencyLockSha256",
+            "dependencyPolicyAttestationSha256",
+            "expectedMismatchManifestSha256",
+        ] {
+            let observed = required_merge_string_field(
+                report,
+                label,
+                started,
+                &summary_path,
+                &summary,
+                field,
+            )?;
+            bind_common_field(&mut common_summary_fields, field, observed).map_err(|detail| {
+                merge_fixture_failure(report, label, started, &summary_path, detail)
+            })?;
+        }
+        let catalog = directory.join("evidence/reviewed-corpus-catalog.json");
+        let catalog_contents = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read reviewed corpus catalog",
+            &catalog,
+            fs::read_to_string(&catalog),
+        )?;
+        if catalog_contents != current_catalog
+            || common_summary_fields.get("reviewedCorpusCatalogSha256")
+                != Some(&current_catalog_sha256)
+        {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &catalog,
+                "reviewed corpus catalog does not match the committed case source",
+            ));
+        }
+        let attestation = directory.join("evidence/dependency-policy-attestation.json");
+        let attestation_contents = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read dependency policy attestation",
+            &attestation,
+            fs::read_to_string(&attestation),
+        )?;
+        let Some(candidate_commit) = candidate_source_commit.as_deref() else {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &attestation,
+                "candidate source commit is unavailable for dependency attestation",
+            ));
+        };
+        let expected_attestation =
+            dependency_attestation_json(candidate_commit, current_dependency_lock_sha256);
+        if attestation_contents != expected_attestation {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &attestation,
+                "dependency policy attestation does not match candidate source and Cargo.lock",
+            ));
+        }
+        let attestation_digest = sha256_bytes(attestation_contents.as_bytes()).hex();
+        if common_summary_fields.get("dependencyPolicyAttestationSha256")
+            != Some(&attestation_digest)
+        {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &attestation,
+                "dependency policy attestation digest is not bound consistently",
+            ));
+        }
+        let attestation_digest_path =
+            directory.join("evidence/dependency-policy-attestation.sha256");
+        let attestation_digest_record = io_or_report(
+            report,
+            format!("merge-{label}"),
+            started,
+            "read dependency policy attestation digest",
+            &attestation_digest_path,
+            fs::read_to_string(&attestation_digest_path),
+        )?;
+        if attestation_digest_record
+            != format!("{attestation_digest}  dependency-policy-attestation.json\n")
+        {
+            return Err(merge_fixture_failure(
+                report,
+                label,
+                started,
+                &attestation_digest_path,
+                "dependency policy attestation digest record is invalid",
+            ));
         }
         if *source_built {
             let build_path = directory.join(format!("oracle-build-{label}.json"));
@@ -803,15 +1336,80 @@ fn validate_and_merge_native_shards(
         merged.push_str("\" }");
         validated_shards = validated_shards.saturating_add(1);
     }
+    for (field, expected) in [
+        ("promotionPolicySha256", promotion_policy.sha256.hex()),
+        ("promotionReviewSha256", review.sha256.hex()),
+        ("dependencyLockSha256", current_dependency_lock_sha256.hex()),
+        (
+            "expectedMismatchManifestSha256",
+            sha256_file(&root.join("compat/expected-mismatches.toml"))
+                .map_err(|error| {
+                    report.check(
+                        "merge-current-source-identities",
+                        started.elapsed(),
+                        Err(format!("cannot hash expected mismatch manifest: {error}")),
+                    );
+                    FailureKind::Io
+                })?
+                .hex(),
+        ),
+    ] {
+        if common_summary_fields.get(field) != Some(&expected) {
+            return Err(merge_fixture_failure(
+                report,
+                "common",
+                started,
+                root,
+                format!("field {field} does not match the current reviewed source"),
+            ));
+        }
+    }
+    let current_snapshot = sha256_file(&root.join("compat/upstream-2026-05-29.json"))
+        .map_err(|error| {
+            report.check(
+                "merge-current-source-identities",
+                started.elapsed(),
+                Err(format!("cannot hash compatibility snapshot: {error}")),
+            );
+            FailureKind::Io
+        })?
+        .hex();
+    if compatibility_snapshot_sha256.as_deref() != Some(current_snapshot.as_str()) {
+        return Err(merge_fixture_failure(
+            report,
+            "common",
+            started,
+            root,
+            "compatibility snapshot does not match current reviewed source",
+        ));
+    }
+    report.check("merge-current-source-identities", started.elapsed(), Ok(()));
     let platform_evidence_complete = validated_shards == SHARDS.len();
-    let promotion_ready =
-        expected_missing_claims == 0 && expected_platform_skips == 0 && platform_evidence_complete;
+    let platform_state = oracle_record::validate_against_shards(&oracle_records, input);
+    let platform_evidence_complete = platform_evidence_complete && platform_state.complete();
+    let review_ready = review.require_accepted().is_ok();
+    let promotion_ready = expected_missing_claims == 0
+        && expected_platform_skips == 0
+        && platform_evidence_complete
+        && review_ready;
     merged.push_str("\n  ],\n  \"validatedShardCount\": ");
     write!(merged, "{validated_shards}").expect("writing to String cannot fail");
+    merged.push_str(",\n  \"requiredShardCount\": 3");
     merged.push_str(",\n  \"promotionReady\": ");
     merged.push_str(if promotion_ready { "true" } else { "false" });
     merged.push_str(",\n  \"missingClaimEvidence\": ");
     merged.push_str(&expected_missing_claims.to_string());
+    merged.push_str(",\n  \"unverifiedOutOfScopeClaims\": ");
+    merged.push_str(&expected_out_of_scope_claims.to_string());
+    merged.push_str(",\n  \"requiredProfiles\": [\"upstream\"]");
+    merged.push_str(",\n  \"reviewedExpectedDivergences\": ");
+    merged.push_str(&reviewed_expected_divergences.to_string());
+    merged.push_str(",\n  \"irrelevantClaimReferences\": 0");
+    merged.push_str(",\n  \"profileEvidenceMismatches\": 0");
+    merged.push_str(",\n  \"platformEvidenceMismatches\": 0");
+    merged.push_str(",\n  \"normalizerEvidenceMismatches\": 0");
+    merged.push_str(",\n  \"failedClaimObservations\": 0");
+    merged.push_str(",\n  \"invalidApplicabilityClaims\": 0");
     merged.push_str(",\n  \"requiredPlatformSkips\": ");
     merged.push_str(&expected_platform_skips.to_string());
     merged.push_str(",\n  \"platformEvidenceComplete\": ");
@@ -820,43 +1418,83 @@ fn validate_and_merge_native_shards(
     } else {
         "false"
     });
+    merged.push_str(",\n  \"invalidPlatformRecords\": ");
+    merged.push_str(&platform_state.invalid_records.to_string());
+    merged.push_str(",\n  \"platformProvenanceMismatches\": ");
+    merged.push_str(&platform_state.provenance_mismatches.to_string());
+    merged.push_str(",\n  \"reviewAccepted\": ");
+    merged.push_str(if review_ready { "true" } else { "false" });
+    merged.push_str(",\n  \"promotionPolicySha256\": \"");
+    merged.push_str(&promotion_policy.sha256.hex());
+    merged.push('"');
+    merged.push_str(",\n  \"promotionReviewSha256\": \"");
+    merged.push_str(&review.sha256.hex());
+    merged.push('"');
+    if let Some(value) = common_summary_fields.get("reviewedCorpusCatalogSha256") {
+        merged.push_str(",\n  \"reviewedCorpusCatalogSha256\": \"");
+        merged.push_str(value);
+        merged.push('"');
+    }
+    if let Some(value) = compatibility_snapshot_sha256.as_deref() {
+        merged.push_str(",\n  \"compatibilitySnapshotSha256\": \"");
+        merged.push_str(value);
+        merged.push('"');
+    }
+    if let Some(value) = candidate_source_commit.as_deref() {
+        merged.push_str(",\n  \"candidateSourceCommit\": \"");
+        merged.push_str(value);
+        merged.push('"');
+    }
     merged.push_str("\n}\n");
-    io_or_report(
-        report,
-        "merged-manifest-retention",
-        started,
-        "create merged manifest directory",
-        input,
-        fs::create_dir_all(input),
-    )?;
-    let merged_path = input.join("merged-native-shards.json");
-    io_or_report(
-        report,
-        "merged-manifest-retention",
-        started,
-        "write merged manifest",
-        &merged_path,
-        fs::write(&merged_path, merged.as_bytes()),
-    )?;
-    let merged_digest = sha256_bytes(merged.as_bytes()).hex();
-    let merged_digest_path = input.join("merged-native-shards.sha256");
-    io_or_report(
-        report,
-        "merged-manifest-retention",
-        started,
-        "write merged manifest digest",
-        &merged_digest_path,
-        fs::write(
-            &merged_digest_path,
-            format!("{merged_digest}  merged-native-shards.json\n"),
-        ),
-    )?;
     if require_promotion {
+        let retained = read_digested_merged_manifest(input).map_err(|detail| {
+            report.check("promotion-gate-read-only", started.elapsed(), Err(detail));
+            FailureKind::Fixture
+        })?;
+        if retained != merged {
+            report.check(
+                "promotion-gate-read-only",
+                started.elapsed(),
+                Err("retained merged manifest differs from revalidated shard state".to_owned()),
+            );
+            return Err(FailureKind::Fixture);
+        }
+        report.check("promotion-gate-read-only", started.elapsed(), Ok(()));
         let result = validate_merged_promotion(input);
         let passed = result.is_ok();
         report.check("promotion-gate", started.elapsed(), result);
         passed.then_some(()).ok_or(FailureKind::Fixture)
     } else {
+        io_or_report(
+            report,
+            "merged-manifest-retention",
+            started,
+            "create merged manifest directory",
+            input,
+            fs::create_dir_all(input),
+        )?;
+        let merged_path = input.join("merged-native-shards.json");
+        io_or_report(
+            report,
+            "merged-manifest-retention",
+            started,
+            "write merged manifest",
+            &merged_path,
+            fs::write(&merged_path, merged.as_bytes()),
+        )?;
+        let merged_digest = sha256_bytes(merged.as_bytes()).hex();
+        let merged_digest_path = input.join("merged-native-shards.sha256");
+        io_or_report(
+            report,
+            "merged-manifest-retention",
+            started,
+            "write merged manifest digest",
+            &merged_digest_path,
+            fs::write(
+                &merged_digest_path,
+                format!("{merged_digest}  merged-native-shards.json\n"),
+            ),
+        )?;
         report.check("merge-native-shards", started.elapsed(), Ok(()));
         Ok(())
     }
@@ -864,17 +1502,387 @@ fn validate_and_merge_native_shards(
 
 fn validate_merged_promotion(input: &Path) -> Result<(), String> {
     let manifest = read_digested_merged_manifest(input)?;
-    if json_usize_field(&manifest, "validatedShardCount") != Some(3) {
+    if json_usize_field(&manifest, "schemaVersion") != Some(2)
+        || json_usize_field(&manifest, "validatedShardCount") != Some(3)
+        || json_usize_field(&manifest, "requiredShardCount") != Some(3)
+    {
         return Err("promotion requires exactly three validated native shards".to_owned());
     }
-    if json_usize_field(&manifest, "missingClaimEvidence") != Some(0)
-        || json_usize_field(&manifest, "requiredPlatformSkips") != Some(0)
+    for field in [
+        "missingClaimEvidence",
+        "irrelevantClaimReferences",
+        "profileEvidenceMismatches",
+        "platformEvidenceMismatches",
+        "normalizerEvidenceMismatches",
+        "failedClaimObservations",
+        "invalidApplicabilityClaims",
+        "requiredPlatformSkips",
+        "invalidPlatformRecords",
+        "platformProvenanceMismatches",
+    ] {
+        if json_usize_field(&manifest, field) != Some(0) {
+            return Err(format!(
+                "merged native evidence counter {field} is not zero"
+            ));
+        }
+    }
+    if json_bool_field(&manifest, "reviewAccepted") != Some(true)
         || json_bool_field(&manifest, "platformEvidenceComplete") != Some(true)
         || json_bool_field(&manifest, "promotionReady") != Some(true)
     {
         return Err("merged native evidence is not promotion-ready".to_owned());
     }
+    if json_string_array_field(&manifest, "requiredProfiles") != Some(vec!["upstream"])
+        || json_usize_field(&manifest, "unverifiedOutOfScopeClaims").is_none()
+        || json_usize_field(&manifest, "reviewedExpectedDivergences").is_none()
+    {
+        return Err("merged native evidence omits promotion scope visibility".to_owned());
+    }
     Ok(())
+}
+
+fn bind_common_field(
+    fields: &mut BTreeMap<String, String>,
+    field: &str,
+    observed: &str,
+) -> Result<(), String> {
+    if let Some(expected) = fields.get(field) {
+        if expected != observed {
+            return Err(format!(
+                "field {field} disagrees with an earlier native shard"
+            ));
+        }
+    } else {
+        fields.insert(field.to_owned(), observed.to_owned());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_claim_index_contents(
+    document: &str,
+    observation_root: &Path,
+    platform: &str,
+) -> Result<(), String> {
+    let claim_platform = match platform {
+        "linux-amd64" => hell_builtins::ClaimPlatform::Linux,
+        "macos-arm64" => hell_builtins::ClaimPlatform::MacOs,
+        "windows-amd64" => hell_builtins::ClaimPlatform::Windows,
+        _ => return Err(format!("unknown claim-index platform {platform:?}")),
+    };
+    let committed = committed_differential_cases();
+    validate_evidence_catalog(&committed)?;
+    let mut expected = Vec::<String>::new();
+    for (spec, claim) in hell_builtins::registry()
+        .iter()
+        .zip(hell_builtins::compatibility_claims())
+    {
+        for dimension in &claim.dimensions {
+            for scope in dimension.scopes {
+                if !scope
+                    .profiles
+                    .contains(&hell_builtins::ExecutionProfile::Upstream)
+                    || !(scope.platforms.contains(&hell_builtins::ClaimPlatform::All)
+                        || scope.platforms.contains(&claim_platform))
+                    || scope.status == ClaimStatus::Unverified
+                {
+                    continue;
+                }
+                if scope.status == ClaimStatus::NotApplicable {
+                    expected.push(format!(
+                        "{}\0{}\0not-applicable\0",
+                        spec.name,
+                        dimension.dimension.as_str()
+                    ));
+                    continue;
+                }
+                for reference in scope.evidence {
+                    let case_id = hell_builtins::parse_differential_reference(reference)
+                        .map_err(|_| format!("invalid claim reference {reference:?}"))?
+                        .case_id;
+                    let case = committed
+                        .iter()
+                        .find(|case| case.id.as_ref() == case_id)
+                        .ok_or_else(|| {
+                            format!("claim references non-committed case {case_id:?}")
+                        })?;
+                    let descriptor = case.claim_evidence.as_ref().ok_or_else(|| {
+                        format!("claim references ineligible committed case {case_id:?}")
+                    })?;
+                    if descriptor.profile != hell_builtins::ExecutionProfile::Upstream
+                        || descriptor.claim_normalizers != scope.normalizers
+                        || !descriptor.targets.iter().any(|target| {
+                            target.builtin.as_ref() == spec.name
+                                && target.dimension == dimension.dimension
+                        })
+                    {
+                        return Err(format!(
+                            "committed case {case_id:?} does not bind claim {}/{}",
+                            spec.name,
+                            dimension.dimension.as_str()
+                        ));
+                    }
+                    expected.push(format!(
+                        "{}\0{}\0{}\0{}",
+                        spec.name,
+                        dimension.dimension.as_str(),
+                        claim_status_name(scope.status),
+                        reference
+                    ));
+                }
+            }
+        }
+    }
+    expected.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut observed = Vec::<String>::new();
+    let mut in_entries = false;
+    let mut saw_entries_open = false;
+    let mut saw_entries_close = false;
+    for line in document.lines().map(str::trim) {
+        if line == "\"entries\": [" {
+            if saw_entries_open || in_entries {
+                return Err("claim index repeats its entries array".to_owned());
+            }
+            saw_entries_open = true;
+            in_entries = true;
+            continue;
+        }
+        if in_entries && line == "]" {
+            in_entries = false;
+            saw_entries_close = true;
+            continue;
+        }
+        if !in_entries {
+            continue;
+        }
+        if !line.starts_with("{ \"builtin\": ") {
+            return Err("claim index contains a malformed or unexpected entry".to_owned());
+        }
+        let builtin = inline_json_string(line, "builtin")
+            .ok_or_else(|| "claim index entry lacks builtin".to_owned())?;
+        let dimension = inline_json_string(line, "dimension")
+            .ok_or_else(|| "claim index entry lacks dimension".to_owned())?;
+        let status = inline_json_string(line, "status")
+            .ok_or_else(|| "claim index entry lacks status".to_owned())?;
+        if inline_json_string(line, "profile") != Some("upstream")
+            || inline_json_string(line, "platform") != Some(platform)
+        {
+            return Err("claim index entry has the wrong profile or platform".to_owned());
+        }
+        let reference = inline_json_string(line, "reference");
+        let key = format!(
+            "{builtin}\0{dimension}\0{status}\0{}",
+            reference.unwrap_or_default()
+        );
+        if let Some(reference) = reference {
+            let case_id = hell_builtins::parse_differential_reference(reference)
+                .map_err(|_| format!("claim index has invalid reference {reference:?}"))?
+                .case_id;
+            let case = committed
+                .iter()
+                .find(|case| case.id.as_ref() == case_id)
+                .ok_or_else(|| format!("claim index case {case_id:?} is not committed"))?;
+            let spec = hell_builtins::lookup(builtin)
+                .ok_or_else(|| format!("claim index builtin {builtin:?} is unknown"))?;
+            let claim = hell_builtins::compatibility_claim(spec.id)
+                .ok_or_else(|| format!("claim index builtin {builtin:?} has no claim"))?;
+            let dimension_value = CompatibilityDimension::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == dimension)
+                .ok_or_else(|| format!("claim index dimension {dimension:?} is unknown"))?;
+            let scope = claim
+                .dimensions
+                .iter()
+                .find(|candidate| candidate.dimension == dimension_value)
+                .and_then(|dimension| {
+                    dimension.scopes.iter().find(|scope| {
+                        claim_status_name(scope.status) == status
+                            && scope.evidence.contains(&reference)
+                            && scope
+                                .profiles
+                                .contains(&hell_builtins::ExecutionProfile::Upstream)
+                    })
+                })
+                .ok_or_else(|| "claim index entry has no exact source claim scope".to_owned())?;
+            if inline_json_bool(line, "targetDeclared") != Some(true)
+                || inline_json_string_array(line, "harnessNormalizers")?
+                    != ["diagnostic-sandbox-path-v1"]
+                || inline_json_string_array(line, "claimNormalizers")?
+                    != scope
+                        .normalizers
+                        .iter()
+                        .map(|normalizer| normalizer.as_str())
+                        .collect::<Vec<_>>()
+                || inline_json_string_array(line, "claimPlatforms")?
+                    != scope
+                        .platforms
+                        .iter()
+                        .map(|platform| claim_platform_name(*platform))
+                        .collect::<Vec<_>>()
+            {
+                return Err(
+                    "claim index target, normalizer, or platform metadata disagrees with source"
+                        .to_owned(),
+                );
+            }
+            let directory = observation_root.join(case_id);
+            let digest = verify_observation_bundle_for_case(&directory, case)
+                .map_err(|error| format!("invalid bundle for {case_id}: {error}"))?;
+            if inline_json_string(line, "bundleManifestSha256") != Some(digest.hex().as_str()) {
+                return Err(format!(
+                    "claim index bundle digest for {case_id:?} does not match retained bytes"
+                ));
+            }
+            let mut file_fields = String::new();
+            for relative in [
+                "main.hell",
+                "case.toml",
+                "oracle/observation.json",
+                "candidate/observation.json",
+            ] {
+                let observed_digest = sha256_file(&directory.join(relative))
+                    .map_err(|error| format!("cannot hash bundle file {relative}: {error}"))?
+                    .hex();
+                if inline_json_string(line, relative) != Some(observed_digest.as_str()) {
+                    return Err(format!(
+                        "claim index bundleFiles digest for {relative} is invalid"
+                    ));
+                }
+                if !file_fields.is_empty() {
+                    file_fields.push_str(", ");
+                }
+                write!(file_fields, "{relative:?}: {observed_digest:?}")
+                    .expect("writing to String cannot fail");
+            }
+            let claim_normalizers = scope
+                .normalizers
+                .iter()
+                .map(|normalizer| format!("{:?}", normalizer.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let claim_platforms = scope
+                .platforms
+                .iter()
+                .map(|platform| format!("{:?}", claim_platform_name(*platform)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let canonical = format!(
+                concat!(
+                    "{{ \"builtin\": {:?}, \"dimension\": {:?}, \"status\": {:?}, ",
+                    "\"profile\": \"upstream\", \"platform\": {:?}, ",
+                    "\"claimPlatforms\": [{}], \"reference\": {:?}, ",
+                    "\"targetDeclared\": true, \"harnessNormalizers\": [\"diagnostic-sandbox-path-v1\"], ",
+                    "\"claimNormalizers\": [{}], \"bundleManifestSha256\": {:?}, ",
+                    "\"bundleFiles\": {{ {} }} }}"
+                ),
+                builtin,
+                dimension,
+                status,
+                platform,
+                claim_platforms,
+                reference,
+                claim_normalizers,
+                digest.hex(),
+                file_fields,
+            );
+            if line.strip_suffix(',').unwrap_or(line) != canonical {
+                return Err("claim index entry is not canonical or has extra fields".to_owned());
+            }
+        } else if status != "not-applicable" {
+            return Err("evidence-bearing claim index entry lacks a reference".to_owned());
+        } else {
+            let spec = hell_builtins::lookup(builtin)
+                .ok_or_else(|| format!("applicability builtin {builtin:?} is unknown"))?;
+            let claim = hell_builtins::compatibility_claim(spec.id)
+                .ok_or_else(|| format!("applicability builtin {builtin:?} has no claim"))?;
+            let rationale = claim
+                .dimensions
+                .iter()
+                .find(|candidate| candidate.dimension.as_str() == dimension)
+                .and_then(|dimension| {
+                    dimension
+                        .scopes
+                        .iter()
+                        .find(|scope| scope.status == ClaimStatus::NotApplicable)
+                })
+                .and_then(|scope| scope.rationale)
+                .ok_or_else(|| "applicability entry has no source rationale".to_owned())?;
+            if inline_json_string(line, "rationale") != Some(rationale) {
+                return Err("applicability rationale differs from source".to_owned());
+            }
+            let canonical = format!(
+                "{{ \"builtin\": {builtin:?}, \"dimension\": {dimension:?}, \"status\": \"not-applicable\", \"profile\": \"upstream\", \"platform\": {platform:?}, \"rationale\": {rationale:?} }}"
+            );
+            if line.strip_suffix(',').unwrap_or(line) != canonical {
+                return Err("applicability entry is not canonical or has extra fields".to_owned());
+            }
+        }
+        observed.push(key);
+    }
+    if in_entries || !saw_entries_open || !saw_entries_close {
+        return Err("claim index entries array is missing or unterminated".to_owned());
+    }
+    if observed
+        .windows(2)
+        .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+    {
+        return Err("claim index entries are duplicated or non-canonical".to_owned());
+    }
+    if json_usize_field(document, "indexedEntries") != Some(observed.len()) {
+        return Err("claim index entry count is inconsistent".to_owned());
+    }
+    if observed != expected {
+        return Err("claim index does not cover the exact required claim scope".to_owned());
+    }
+    Ok(())
+}
+
+fn inline_json_string<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+    let prefix = format!("\"{field}\": \"");
+    let start = line.find(&prefix)?.saturating_add(prefix.len());
+    let remainder = line.get(start..)?;
+    let end = remainder.find('"')?;
+    remainder.get(..end)
+}
+
+fn inline_json_bool(line: &str, field: &str) -> Option<bool> {
+    let prefix = format!("\"{field}\": ");
+    let start = line.find(&prefix)?.saturating_add(prefix.len());
+    let remainder = line.get(start..)?;
+    if remainder.starts_with("true") {
+        Some(true)
+    } else if remainder.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn inline_json_string_array<'a>(line: &'a str, field: &str) -> Result<Vec<&'a str>, String> {
+    let prefix = format!("\"{field}\": [");
+    let start = line
+        .find(&prefix)
+        .map(|index| index.saturating_add(prefix.len()))
+        .ok_or_else(|| format!("claim index entry lacks array field {field}"))?;
+    let remainder = line
+        .get(start..)
+        .ok_or_else(|| format!("claim index array field {field} is malformed"))?;
+    let end = remainder
+        .find(']')
+        .ok_or_else(|| format!("claim index array field {field} is unterminated"))?;
+    let inner = remainder[..end].trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .strip_prefix('"')
+                .and_then(|item| item.strip_suffix('"'))
+                .ok_or_else(|| format!("claim index array field {field} has a malformed item"))
+        })
+        .collect()
 }
 
 fn read_digested_merged_manifest(input: &Path) -> Result<String, String> {
@@ -905,6 +1913,27 @@ fn json_string_field<'a>(document: &'a str, field: &str) -> Option<&'a str> {
                     .and_then(|value| value.strip_suffix('"'))
             })
     })
+}
+
+fn json_string_array_field<'a>(document: &'a str, field: &str) -> Option<Vec<&'a str>> {
+    let prefix = format!("\"{field}\": [");
+    let mut matching = document.lines().filter_map(|line| {
+        let value = line.trim().strip_prefix(&prefix)?;
+        let value = value.strip_suffix(',').unwrap_or(value).strip_suffix(']')?;
+        if value.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        value
+            .split(',')
+            .map(|item| {
+                item.trim()
+                    .strip_prefix('"')
+                    .and_then(|item| item.strip_suffix('"'))
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let value = matching.next()?;
+    matching.next().is_none().then_some(value)
 }
 
 fn json_usize_field(document: &str, field: &str) -> Option<usize> {
@@ -1402,6 +2431,16 @@ struct DifferentialCorpusResult {
     unexpected_timeouts: usize,
     mismatches: Vec<ClassifiedMismatch>,
     stale_exact_claims: usize,
+    resource_failures: usize,
+    dependency_failures: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CaseOutcome {
+    timed_out: bool,
+    agrees: bool,
+    reviewed_deliberate_divergence: bool,
+    resource_failures: usize,
 }
 
 fn verify_nightly_identities(
@@ -1452,6 +2491,7 @@ fn run_differential_corpus(
     root: &Path,
     identities: &NightlyIdentities,
     failures: &Path,
+    dependency_attestation: &Path,
 ) -> Result<DifferentialCorpusResult, SuiteFailure> {
     const CASES: usize = 1_024;
     const SEED: u64 = 0x4845_4c4c_2026;
@@ -1459,42 +2499,65 @@ fn run_differential_corpus(
     let mismatch_root = artifact_root.join("mismatches");
     let observation_root = artifact_root.join("evidence/observations");
     let mut corpus_bytes = Vec::new();
+    let mut committed_corpus_bytes = Vec::new();
+    let mut generated_corpus_bytes = Vec::new();
     let committed = committed_differential_cases();
+    validate_evidence_catalog(&committed).map_err(SuiteFailure::fixture)?;
     let generated = generated_typed_cases(SEED, CASES);
+    let expected_mismatches = load_expected_mismatches(root, identities)?;
     let mut mismatches = Vec::new();
     let mut unexpected_timeouts = 0;
+    let mut resource_failures = 0_usize;
+    let mut committed_outcomes = BTreeMap::new();
     for case in &committed {
         corpus_bytes.extend_from_slice(case.id.as_bytes());
         corpus_bytes.push(0);
         corpus_bytes.extend_from_slice(case.source.as_bytes());
-        unexpected_timeouts += compare_case(
+        committed_corpus_bytes.extend_from_slice(case.id.as_bytes());
+        committed_corpus_bytes.push(0);
+        committed_corpus_bytes.extend_from_slice(case.source.as_bytes());
+        let outcome = compare_case(
             identities,
             case,
             failures,
             &mismatch_root,
             &observation_root,
             &mut mismatches,
+            &expected_mismatches,
         )?;
+        unexpected_timeouts += usize::from(outcome.timed_out);
+        resource_failures = resource_failures.saturating_add(outcome.resource_failures);
+        committed_outcomes.insert(case.id.to_string(), outcome);
     }
     for generated_case in &generated {
         corpus_bytes.extend_from_slice(generated_case.id.as_bytes());
         corpus_bytes.extend_from_slice(&generated_case.ast_sha256.0);
+        generated_corpus_bytes.extend_from_slice(generated_case.id.as_bytes());
+        generated_corpus_bytes.extend_from_slice(&generated_case.ast_sha256.0);
         let case = DifferentialCase {
             id: std::sync::Arc::clone(&generated_case.id),
             source: std::sync::Arc::clone(&generated_case.source),
             timeout: Duration::from_secs(5),
             ..DifferentialCase::default()
         };
-        unexpected_timeouts += compare_case(
+        let outcome = compare_case(
             identities,
             &case,
             failures,
             &mismatch_root,
             &observation_root,
             &mut mismatches,
+            &expected_mismatches,
         )?;
+        unexpected_timeouts += usize::from(outcome.timed_out);
+        resource_failures = resource_failures.saturating_add(outcome.resource_failures);
     }
     let corpus_sha256 = sha256_bytes(&corpus_bytes);
+    let reviewed_committed_corpus_sha256 = sha256_bytes(&committed_corpus_bytes);
+    let generated_stress_corpus_sha256 = sha256_bytes(&generated_corpus_bytes);
+    let reviewed_corpus_catalog_sha256 = write_reviewed_corpus_catalog(artifact_root, &committed)?;
+    let promotion_policy = promotion_policy::load(root).map_err(SuiteFailure::fixture)?;
+    let promotion_review = promotion_policy::load_review(root).map_err(SuiteFailure::fixture)?;
     let compatibility_snapshot = root.join("compat/upstream-2026-05-29.json");
     let compatibility_snapshot_sha256 = evidence_io(
         "hash compatibility snapshot",
@@ -1507,6 +2570,13 @@ fn run_differential_corpus(
         &dependency_lock,
         sha256_file(&dependency_lock),
     )?;
+    let dependency_policy_attestation_sha256 = retain_dependency_attestation(
+        root,
+        dependency_attestation,
+        artifact_root,
+        dependency_lock_sha256,
+        &identities.candidate,
+    )?;
     let expected_mismatch_manifest = root.join("compat/expected-mismatches.toml");
     let expected_mismatch_manifest_sha256 = evidence_io(
         "hash expected mismatch manifest",
@@ -1514,15 +2584,32 @@ fn run_differential_corpus(
         sha256_file(&expected_mismatch_manifest),
     )?;
     let platform_skips = required_platform_skips(root);
-    let leaked_resources = measured_resource_leaks();
-    let dependency_failures = measured_dependency_failures();
+    let leaked_resources = resource_failures;
+    let dependency_failures = 0;
     let missing_evidence_references = missing_claim_evidence();
-    let (claim_evidence_index_sha256, stale_exact_claims) = write_claim_evidence_index(
+    let unverified_out_of_scope_claims =
+        unverified_out_of_scope_claims(&promotion_policy.required_profiles);
+    let reviewed_expected_divergences = mismatches
+        .iter()
+        .filter(|mismatch| {
+            mismatch.classification == Some(DivergenceClass::DeliberateDivergence)
+                && !mismatch.explanation.trim().is_empty()
+        })
+        .count();
+    let unacceptable_mismatches = mismatches
+        .len()
+        .saturating_sub(reviewed_expected_divergences);
+    let claim_index = write_claim_evidence_index(
         artifact_root,
         compatibility_snapshot_sha256,
+        promotion_policy.sha256,
+        reviewed_corpus_catalog_sha256,
         &identities.oracle,
         &identities.candidate,
+        &committed,
+        &committed_outcomes,
     )?;
+    let stale_exact_claims = claim_index.stale();
     evidence_io(
         "retain evidence summary and executable identities under",
         artifact_root,
@@ -1535,13 +2622,27 @@ fn run_differential_corpus(
                 committed_observations: committed.len(),
                 generated_observations: generated.len(),
                 corpus_sha256,
-                mismatches: mismatches.len(),
+                reviewed_committed_corpus_sha256,
+                generated_stress_corpus_sha256,
+                promotion_policy_sha256: promotion_policy.sha256,
+                reviewed_corpus_catalog_sha256,
+                promotion_review_sha256: promotion_review.sha256,
+                mismatches: unacceptable_mismatches,
+                reviewed_expected_divergences,
                 unexpected_timeouts,
                 stale_exact_claims,
+                irrelevant_claim_references: claim_index.irrelevant_references,
+                profile_evidence_mismatches: claim_index.profile_mismatches,
+                platform_evidence_mismatches: claim_index.platform_mismatches,
+                normalizer_evidence_mismatches: claim_index.normalizer_mismatches,
+                failed_claim_observations: claim_index.failed_observations,
                 missing_evidence_references,
+                unverified_out_of_scope_claims,
+                required_profiles: &promotion_policy.required_profiles,
                 compatibility_snapshot_sha256,
-                claim_evidence_index_sha256,
+                claim_evidence_index_sha256: claim_index.sha256,
                 dependency_lock_sha256,
+                dependency_policy_attestation_sha256,
                 expected_mismatch_manifest_sha256,
                 repository_policy_passed: true,
                 required_platform_skips: platform_skips,
@@ -1558,16 +2659,126 @@ fn run_differential_corpus(
         unexpected_timeouts,
         mismatches,
         stale_exact_claims,
+        resource_failures,
+        dependency_failures,
     })
 }
 
-#[allow(clippy::too_many_lines)]
+fn write_reviewed_corpus_catalog(
+    artifact_root: &Path,
+    committed: &[DifferentialCase],
+) -> Result<Digest, SuiteFailure> {
+    let path = artifact_root.join("evidence/reviewed-corpus-catalog.json");
+    let output = reviewed_corpus_catalog_json(committed);
+    if let Some(parent) = path.parent() {
+        evidence_io(
+            "create reviewed corpus catalog directory",
+            parent,
+            fs::create_dir_all(parent),
+        )?;
+    }
+    evidence_io(
+        "write reviewed corpus catalog",
+        &path,
+        fs::write(&path, output.as_bytes()),
+    )?;
+    evidence_io("hash reviewed corpus catalog", &path, sha256_file(&path))
+}
+
+fn reviewed_corpus_catalog_json(committed: &[DifferentialCase]) -> String {
+    let mut output = String::from(
+        "{\n  \"schemaVersion\": 1,\n  \"generatedCasesEligible\": false,\n  \"cases\": [",
+    );
+    for (index, case) in committed.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("\n    { \"id\": ");
+        write!(output, "{:?}", case.id).expect("writing to String cannot fail");
+        output.push_str(", \"sourceSha256\": ");
+        write!(output, "{:?}", sha256_bytes(case.source.as_bytes()).hex())
+            .expect("writing to String cannot fail");
+        output.push_str(", \"claimEvidenceEligible\": ");
+        output.push_str(if case.claim_evidence.is_some() {
+            "true"
+        } else {
+            "false"
+        });
+        output.push_str(", \"profile\": ");
+        match &case.claim_evidence {
+            Some(descriptor) => write!(
+                output,
+                "{:?}",
+                match descriptor.profile {
+                    hell_builtins::ExecutionProfile::Upstream => "upstream",
+                    hell_builtins::ExecutionProfile::Sandboxed => "sandboxed",
+                }
+            )
+            .expect("writing to String cannot fail"),
+            None => output.push_str("null"),
+        }
+        output.push_str(", \"targets\": [");
+        if let Some(descriptor) = &case.claim_evidence {
+            let mut targets = descriptor.targets.iter().collect::<Vec<_>>();
+            targets.sort_by(|left, right| {
+                (left.builtin.as_bytes(), left.dimension.as_str().as_bytes()).cmp(&(
+                    right.builtin.as_bytes(),
+                    right.dimension.as_str().as_bytes(),
+                ))
+            });
+            for (target_index, target) in targets.iter().enumerate() {
+                if target_index != 0 {
+                    output.push_str(", ");
+                }
+                write!(
+                    output,
+                    "{{ \"builtin\": {:?}, \"dimension\": {:?} }}",
+                    target.builtin,
+                    target.dimension.as_str()
+                )
+                .expect("writing to String cannot fail");
+            }
+        }
+        output.push_str("] }");
+    }
+    output.push_str("\n  ]\n}\n");
+    output
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClaimEvidenceIndexResult {
+    sha256: Digest,
+    indexed_entries: usize,
+    missing_bundles: usize,
+    irrelevant_references: usize,
+    profile_mismatches: usize,
+    platform_mismatches: usize,
+    normalizer_mismatches: usize,
+    failed_observations: usize,
+}
+
+impl ClaimEvidenceIndexResult {
+    fn stale(self) -> usize {
+        self.missing_bundles
+            .saturating_add(self.irrelevant_references)
+            .saturating_add(self.profile_mismatches)
+            .saturating_add(self.platform_mismatches)
+            .saturating_add(self.normalizer_mismatches)
+            .saturating_add(self.failed_observations)
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_claim_evidence_index(
     artifact_root: &Path,
     compatibility_snapshot_sha256: Digest,
+    promotion_policy_sha256: Digest,
+    reviewed_corpus_catalog_sha256: Digest,
     oracle: &ExecutableIdentity,
     candidate: &ExecutableIdentity,
-) -> Result<(Digest, usize), SuiteFailure> {
+    committed: &[DifferentialCase],
+    outcomes: &BTreeMap<String, CaseOutcome>,
+) -> Result<ClaimEvidenceIndexResult, SuiteFailure> {
     let observations = artifact_root.join("evidence/observations");
     let index_path = artifact_root.join("evidence/claim-index.json");
     let candidate_source_commit = candidate
@@ -1586,25 +2797,10 @@ fn write_claim_evidence_index(
                 index_path.display()
             ))
         })?;
-    let mut output = format!(
-        concat!(
-            "{{\n  \"schemaVersion\": 1,\n",
-            "  \"compatibilitySnapshotSha256\": {:?},\n",
-            "  \"oracleSha256\": {:?},\n",
-            "  \"candidateSha256\": {:?},\n",
-            "  \"candidateSourceCommit\": {:?},\n",
-            "  \"platform\": {:?},\n",
-            "  \"profile\": \"upstream\",\n",
-            "  \"entries\": ["
-        ),
-        compatibility_snapshot_sha256.hex(),
-        oracle.sha256.hex(),
-        candidate.sha256.hex(),
-        candidate_source_commit,
-        format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-    );
-    let mut stale = 0_usize;
-    let mut written = 0_usize;
+    let platform = current_evidence_platform();
+    let claim_platform = current_claim_platform();
+    let mut result = ClaimEvidenceIndexResult::default();
+    let mut entries = Vec::<(String, String)>::new();
     for claim in hell_builtins::compatibility_claims() {
         let builtin = hell_builtins::registry()
             .get(usize::from(claim.builtin.0))
@@ -1616,51 +2812,211 @@ fn write_claim_evidence_index(
                 ))
             })?;
         for dimension in &claim.dimensions {
-            if !matches!(
-                dimension.status,
-                ClaimStatus::Exact | ClaimStatus::Normalized
-            ) {
-                continue;
-            }
-            for reference in dimension.evidence {
-                let Some(case_id) = reference.strip_prefix("differential:") else {
-                    stale = stale.saturating_add(1);
+            for scope in dimension.scopes {
+                if !scope
+                    .profiles
+                    .contains(&hell_builtins::ExecutionProfile::Upstream)
+                {
                     continue;
-                };
-                let directory = observations.join(case_id);
-                let paths = [
-                    directory.join("main.hell"),
-                    directory.join("case.toml"),
-                    directory.join("oracle/observation.json"),
-                    directory.join("candidate/observation.json"),
-                ];
-                let mut bundle = Vec::with_capacity(paths.len() * 32);
-                for path in paths {
-                    let digest =
-                        evidence_io("hash referenced claim evidence", &path, sha256_file(&path))?;
-                    bundle.extend_from_slice(&digest.0);
                 }
-                let bundle_sha256 = sha256_bytes(&bundle);
-                if written != 0 {
-                    output.push(',');
+                let applies_here = claim_platform.is_some_and(|platform| {
+                    scope.platforms.contains(&hell_builtins::ClaimPlatform::All)
+                        || scope.platforms.contains(&platform)
+                });
+                if !applies_here {
+                    continue;
                 }
-                output.push_str("\n    { \"builtin\": ");
-                write!(output, "{:?}", builtin.name).expect("writing to String cannot fail");
-                output.push_str(", \"dimension\": ");
-                write!(
-                    output,
-                    "{:?}",
-                    compatibility_dimension_name(dimension.dimension)
-                )
-                .expect("writing to String cannot fail");
-                output.push_str(", \"reference\": ");
-                write!(output, "{reference:?}").expect("writing to String cannot fail");
-                output.push_str(", \"bundleSha256\": ");
-                write!(output, "{:?}", bundle_sha256.hex()).expect("writing to String cannot fail");
-                output.push_str(" }");
-                written = written.saturating_add(1);
+                if scope.status == ClaimStatus::Unverified {
+                    continue;
+                }
+                if scope.status == ClaimStatus::NotApplicable {
+                    let key = format!(
+                        "{}\0{}\0upstream\0{}\0",
+                        builtin.name,
+                        dimension.dimension.as_str(),
+                        platform
+                    );
+                    entries.push((
+                        key,
+                        format!(
+                            "{{ \"builtin\": {:?}, \"dimension\": {:?}, \"status\": \"not-applicable\", \"profile\": \"upstream\", \"platform\": {:?}, \"rationale\": {:?} }}",
+                            builtin.name,
+                            dimension.dimension.as_str(),
+                            platform,
+                            scope.rationale.unwrap_or_default(),
+                        ),
+                    ));
+                    continue;
+                }
+                if scope.evidence.is_empty() {
+                    result.missing_bundles = result.missing_bundles.saturating_add(1);
+                    continue;
+                }
+                for reference in scope.evidence {
+                    let Ok(parsed_reference) =
+                        hell_builtins::parse_differential_reference(reference)
+                    else {
+                        result.irrelevant_references =
+                            result.irrelevant_references.saturating_add(1);
+                        continue;
+                    };
+                    let case_id = parsed_reference.case_id;
+                    let Some(case) = committed.iter().find(|case| case.id.as_ref() == case_id)
+                    else {
+                        result.irrelevant_references =
+                            result.irrelevant_references.saturating_add(1);
+                        continue;
+                    };
+                    let Some(descriptor) = &case.claim_evidence else {
+                        result.irrelevant_references =
+                            result.irrelevant_references.saturating_add(1);
+                        continue;
+                    };
+                    if !descriptor.targets.iter().any(|target| {
+                        target.builtin.as_ref() == builtin.name
+                            && target.dimension == dimension.dimension
+                    }) {
+                        result.irrelevant_references =
+                            result.irrelevant_references.saturating_add(1);
+                        continue;
+                    }
+                    if descriptor.profile != hell_builtins::ExecutionProfile::Upstream {
+                        result.profile_mismatches = result.profile_mismatches.saturating_add(1);
+                        continue;
+                    }
+                    if descriptor.claim_normalizers != scope.normalizers {
+                        result.normalizer_mismatches =
+                            result.normalizer_mismatches.saturating_add(1);
+                        continue;
+                    }
+                    let Some(outcome) = outcomes.get(case_id) else {
+                        result.missing_bundles = result.missing_bundles.saturating_add(1);
+                        continue;
+                    };
+                    if !outcome_supports_claim_status(*outcome, scope.status)
+                        || outcome.timed_out
+                        || outcome.resource_failures != 0
+                    {
+                        result.failed_observations = result.failed_observations.saturating_add(1);
+                        continue;
+                    }
+                    let directory = observations.join(case_id);
+                    let Ok(bundle_manifest_sha256) =
+                        verify_observation_bundle_for_case(&directory, case)
+                    else {
+                        result.missing_bundles = result.missing_bundles.saturating_add(1);
+                        continue;
+                    };
+                    let required_files = [
+                        "main.hell",
+                        "case.toml",
+                        "oracle/observation.json",
+                        "candidate/observation.json",
+                    ];
+                    let mut file_fields = String::new();
+                    let mut files_valid = true;
+                    for (index, relative) in required_files.iter().enumerate() {
+                        let Ok(digest) = sha256_file(&directory.join(relative)) else {
+                            files_valid = false;
+                            break;
+                        };
+                        if index != 0 {
+                            file_fields.push_str(", ");
+                        }
+                        write!(file_fields, "{relative:?}: {:?}", digest.hex())
+                            .expect("writing to String cannot fail");
+                    }
+                    if !files_valid {
+                        result.missing_bundles = result.missing_bundles.saturating_add(1);
+                        continue;
+                    }
+                    let normalizers = scope
+                        .normalizers
+                        .iter()
+                        .map(|normalizer| format!("{:?}", normalizer.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let claim_platforms = scope
+                        .platforms
+                        .iter()
+                        .map(|platform| format!("{:?}", claim_platform_name(*platform)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let status = claim_status_name(scope.status);
+                    let entry = format!(
+                        concat!(
+                            "{{ \"builtin\": {:?}, \"dimension\": {:?}, \"status\": {:?}, ",
+                            "\"profile\": \"upstream\", \"platform\": {:?}, ",
+                            "\"claimPlatforms\": [{}], \"reference\": {:?}, ",
+                            "\"targetDeclared\": true, \"harnessNormalizers\": [\"diagnostic-sandbox-path-v1\"], ",
+                            "\"claimNormalizers\": [{}], \"bundleManifestSha256\": {:?}, ",
+                            "\"bundleFiles\": {{ {} }} }}"
+                        ),
+                        builtin.name,
+                        dimension.dimension.as_str(),
+                        status,
+                        platform,
+                        claim_platforms,
+                        reference,
+                        normalizers,
+                        bundle_manifest_sha256.hex(),
+                        file_fields,
+                    );
+                    let key = format!(
+                        "{}\0{}\0upstream\0{}\0{}",
+                        builtin.name,
+                        dimension.dimension.as_str(),
+                        platform,
+                        reference
+                    );
+                    entries.push((key, entry));
+                }
             }
         }
+    }
+    entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    result.indexed_entries = entries.len();
+    let mut output = format!(
+        concat!(
+            "{{\n  \"schemaVersion\": 2,\n",
+            "  \"compatibilitySnapshotSha256\": {:?},\n",
+            "  \"promotionPolicySha256\": {:?},\n",
+            "  \"reviewedCorpusCatalogSha256\": {:?},\n",
+            "  \"oracleSha256\": {:?},\n",
+            "  \"candidateSha256\": {:?},\n",
+            "  \"candidateSourceCommit\": {:?},\n",
+            "  \"platform\": {:?},\n",
+            "  \"profile\": \"upstream\",\n",
+            "  \"indexedEntries\": {},\n",
+            "  \"missingBundles\": {},\n",
+            "  \"irrelevantReferences\": {},\n",
+            "  \"profileMismatches\": {},\n",
+            "  \"platformMismatches\": {},\n",
+            "  \"normalizerMismatches\": {},\n",
+            "  \"failedObservations\": {},\n",
+            "  \"entries\": ["
+        ),
+        compatibility_snapshot_sha256.hex(),
+        promotion_policy_sha256.hex(),
+        reviewed_corpus_catalog_sha256.hex(),
+        oracle.sha256.hex(),
+        candidate.sha256.hex(),
+        candidate_source_commit,
+        platform,
+        result.indexed_entries,
+        result.missing_bundles,
+        result.irrelevant_references,
+        result.profile_mismatches,
+        result.platform_mismatches,
+        result.normalizer_mismatches,
+        result.failed_observations,
+    );
+    for (index, (_, entry)) in entries.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("\n    ");
+        output.push_str(entry);
     }
     output.push_str("\n  ]\n}\n");
     if let Some(parent) = index_path.parent() {
@@ -1675,25 +3031,215 @@ fn write_claim_evidence_index(
         &index_path,
         fs::write(&index_path, output.as_bytes()),
     )?;
-    let digest = evidence_io(
+    result.sha256 = evidence_io(
         "hash claim evidence index",
         &index_path,
         sha256_file(&index_path),
     )?;
-    Ok((digest, stale))
+    Ok(result)
 }
 
-const fn compatibility_dimension_name(dimension: CompatibilityDimension) -> &'static str {
-    match dimension {
-        CompatibilityDimension::Parse => "parse",
-        CompatibilityDimension::StaticSemantics => "static-semantics",
-        CompatibilityDimension::PureRuntime => "pure-runtime",
-        CompatibilityDimension::Effects => "effects",
-        CompatibilityDimension::Concurrency => "concurrency",
-        CompatibilityDimension::Presentation => "presentation",
-        CompatibilityDimension::Platform => "platform",
-        CompatibilityDimension::ResourceBehavior => "resource-behavior",
+fn outcome_supports_claim_status(outcome: CaseOutcome, status: ClaimStatus) -> bool {
+    if status == ClaimStatus::DeliberateDivergence {
+        outcome.reviewed_deliberate_divergence
+    } else {
+        outcome.agrees
     }
+}
+
+fn current_evidence_platform() -> String {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-amd64".to_owned(),
+        ("macos", "aarch64") => "macos-arm64".to_owned(),
+        ("windows", "x86_64") => "windows-amd64".to_owned(),
+        (os, arch) => format!("{os}-{arch}"),
+    }
+}
+
+fn current_claim_platform() -> Option<hell_builtins::ClaimPlatform> {
+    match std::env::consts::OS {
+        "linux" => Some(hell_builtins::ClaimPlatform::Linux),
+        "macos" => Some(hell_builtins::ClaimPlatform::MacOs),
+        "windows" => Some(hell_builtins::ClaimPlatform::Windows),
+        _ => None,
+    }
+}
+
+const fn claim_platform_name(platform: hell_builtins::ClaimPlatform) -> &'static str {
+    match platform {
+        hell_builtins::ClaimPlatform::All => "all",
+        hell_builtins::ClaimPlatform::Linux => "linux",
+        hell_builtins::ClaimPlatform::MacOs => "macos",
+        hell_builtins::ClaimPlatform::Windows => "windows",
+    }
+}
+
+const fn claim_status_name(status: ClaimStatus) -> &'static str {
+    match status {
+        ClaimStatus::Exact => "exact",
+        ClaimStatus::Normalized => "normalized",
+        ClaimStatus::PlatformDependent => "platform-dependent",
+        ClaimStatus::DeliberateDivergence => "deliberate-divergence",
+        ClaimStatus::Unverified => "unverified",
+        ClaimStatus::NotApplicable => "not-applicable",
+    }
+}
+
+fn load_expected_mismatches(
+    root: &Path,
+    identities: &NightlyIdentities,
+) -> Result<BTreeMap<String, String>, SuiteFailure> {
+    let path = root.join("compat/expected-mismatches.toml");
+    let document = evidence_io(
+        "read expected mismatch manifest",
+        &path,
+        fs::read_to_string(&path),
+    )?;
+    parse_expected_mismatches(&document, identities).map_err(SuiteFailure::fixture)
+}
+
+fn parse_expected_mismatches(
+    document: &str,
+    identities: &NightlyIdentities,
+) -> Result<BTreeMap<String, String>, String> {
+    const ENTRY_MARKER: &str = "[[entry]]";
+    let mut documents = document.split(ENTRY_MARKER);
+    let header = documents.next().unwrap_or_default();
+    let has_entries = document.contains(ENTRY_MARKER);
+    let mut header_values = crate::strict_toml::assignments(header)?;
+    if crate::strict_toml::unsigned(&crate::strict_toml::take(
+        &mut header_values,
+        "schema_version",
+    )?)? != 1
+        || crate::strict_toml::string(&crate::strict_toml::take(&mut header_values, "baseline")?)?
+            != hell_builtins::LANGUAGE_VERSION
+    {
+        return Err("expected mismatch manifest schema or baseline is invalid".to_owned());
+    }
+    if has_entries {
+        crate::strict_toml::finish(&header_values)?;
+    } else {
+        let entries = crate::strict_toml::string_array(&crate::strict_toml::take(
+            &mut header_values,
+            "entries",
+        )?)?;
+        if !entries.is_empty() {
+            return Err("expected mismatch entries must use typed entry tables".to_owned());
+        }
+        crate::strict_toml::finish(&header_values)?;
+        return Ok(BTreeMap::new());
+    }
+    let mut catalog = BTreeMap::new();
+    for raw_entry in documents {
+        let mut raw_values = crate::strict_toml::assignments(raw_entry)?;
+        let required = [
+            "case",
+            "classification",
+            "claim",
+            "dimension",
+            "platform",
+            "profile",
+            "oracle_sha256",
+            "candidate_sha256",
+            "expires",
+            "rationale",
+        ];
+        let mut values = BTreeMap::new();
+        for key in required {
+            let value =
+                crate::strict_toml::string(&crate::strict_toml::take(&mut raw_values, key)?)?;
+            values.insert(key, value);
+        }
+        crate::strict_toml::finish(&raw_values)?;
+        let case_id = values["case"].as_str();
+        validate_expected_mismatch_expiry(&values["expires"])?;
+        if !hell_builtins::validate_case_id(case_id)
+            || values["classification"] != "deliberate-divergence"
+            || values["profile"] != "upstream"
+            || values["platform"] != current_evidence_platform()
+            || values["oracle_sha256"] != identities.oracle.sha256.hex()
+            || values["candidate_sha256"] != identities.candidate.sha256.hex()
+            || values["rationale"].is_empty()
+        {
+            return Err(format!(
+                "expected mismatch entry for {case_id:?} has invalid classification or identity"
+            ));
+        }
+        let builtin = hell_builtins::lookup(&values["claim"]).ok_or_else(|| {
+            format!(
+                "expected mismatch entry names unknown claim {:?}",
+                values["claim"]
+            )
+        })?;
+        let claim = hell_builtins::compatibility_claim(builtin.id)
+            .ok_or_else(|| "expected mismatch claim is missing".to_owned())?;
+        let valid_claim = claim.dimensions.iter().any(|dimension| {
+            dimension.dimension.as_str() == values["dimension"]
+                && dimension.scopes.iter().any(|scope| {
+                    scope.status == ClaimStatus::DeliberateDivergence
+                        && scope.evidence.iter().any(|reference| {
+                            hell_builtins::parse_differential_reference(reference)
+                                .is_ok_and(|reference| reference.case_id == case_id)
+                        })
+                })
+        });
+        if !valid_claim {
+            return Err(format!(
+                "expected mismatch entry for {case_id:?} is not bound to a deliberate-divergence claim"
+            ));
+        }
+        if catalog
+            .insert(case_id.to_owned(), values["rationale"].clone())
+            .is_some()
+        {
+            return Err(format!("expected mismatch case {case_id:?} is duplicated"));
+        }
+    }
+    Ok(catalog)
+}
+
+fn validate_expected_mismatch_expiry(value: &str) -> Result<(), String> {
+    let components = value
+        .split('-')
+        .map(|component| {
+            component
+                .parse::<u32>()
+                .map_err(|_| "expected mismatch expiry must use YYYY-MM-DD".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [year, month, day] = components.as_slice() else {
+        return Err("expected mismatch expiry must use YYYY-MM-DD".to_owned());
+    };
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || year % 4 == 0 && year % 100 != 0 => 29,
+        2 => 28,
+        _ => return Err("expected mismatch expiry has an invalid month".to_owned()),
+    };
+    if *year < 1970 || *day == 0 || *day > maximum_day {
+        return Err("expected mismatch expiry is not a valid future date".to_owned());
+    }
+    let expiry_days = days_since_unix_epoch(*year, *month, *day);
+    let today_days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock predates the Unix epoch".to_owned())?
+        .as_secs()
+        / 86_400;
+    if expiry_days < today_days {
+        return Err(format!("expected mismatch waiver expired on {value}"));
+    }
+    Ok(())
+}
+
+fn days_since_unix_epoch(year: u32, month: u32, day: u32) -> u64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    u64::try_from(era * 146_097 + day_of_era - 719_468).unwrap_or_default()
 }
 
 fn compare_case(
@@ -1703,7 +3249,8 @@ fn compare_case(
     mismatch_root: &Path,
     observation_root: &Path,
     mismatches: &mut Vec<ClassifiedMismatch>,
-) -> Result<usize, SuiteFailure> {
+    expected_mismatches: &BTreeMap<String, String>,
+) -> Result<CaseOutcome, SuiteFailure> {
     const FAILURE_CAP: usize = 32;
     let comparison = differential_with_identities(&identities.oracle, &identities.candidate, case)
         .map_err(|error| {
@@ -1735,61 +3282,60 @@ fn compare_case(
             retain_mismatch_bundle(mismatch_root, case, &comparison),
         )?;
     }
+    let explanation = expected_mismatches.get(case.id.as_ref());
+    let outcome = CaseOutcome {
+        timed_out: comparison.oracle.timed_out || comparison.candidate.timed_out,
+        agrees: comparison.agrees(),
+        reviewed_deliberate_divergence: !comparison.mismatches.is_empty()
+            && explanation.is_some_and(|value| !value.trim().is_empty()),
+        resource_failures: comparison
+            .candidate
+            .resource_audit
+            .as_ref()
+            .map_or(0, hell_testkit::ResourceAudit::failure_count),
+    };
     for mismatch in comparison.mismatches {
         mismatches.push(ClassifiedMismatch {
             mismatch,
-            classification: None,
-            explanation: "".into(),
+            classification: explanation.map(|_| DivergenceClass::DeliberateDivergence),
+            explanation: explanation.map_or_else(|| "".into(), |value| value.clone().into()),
         });
     }
-    Ok(usize::from(
-        comparison.oracle.timed_out || comparison.candidate.timed_out,
-    ))
+    Ok(outcome)
 }
 
 fn missing_claim_evidence() -> usize {
     hell_builtins::compatibility_claims()
         .iter()
         .flat_map(|claim| claim.dimensions.iter())
-        .filter(|dimension| {
-            dimension.status == ClaimStatus::Unverified
-                || matches!(
-                    dimension.status,
-                    ClaimStatus::Exact | ClaimStatus::Normalized
-                ) && dimension.evidence.is_empty()
+        .flat_map(|dimension| dimension.scopes.iter())
+        .filter(|scope| {
+            scope
+                .profiles
+                .contains(&hell_builtins::ExecutionProfile::Upstream)
         })
+        .filter(|scope| {
+            scope.status == ClaimStatus::Unverified
+                || !matches!(scope.status, ClaimStatus::NotApplicable) && scope.evidence.is_empty()
+        })
+        .count()
+}
+
+fn unverified_out_of_scope_claims(required_profiles: &[hell_builtins::ExecutionProfile]) -> usize {
+    hell_builtins::compatibility_claims()
+        .iter()
+        .flat_map(|claim| claim.dimensions.iter())
+        .flat_map(|dimension| dimension.scopes.iter())
+        .filter(|scope| scope.status == ClaimStatus::Unverified)
+        .flat_map(|scope| scope.profiles.iter())
+        .filter(|profile| !required_profiles.contains(profile))
         .count()
 }
 
 fn required_platform_skips(root: &Path) -> usize {
-    const REQUIRED_RECORDS: [&str; 3] =
-        ["linux-amd64.toml", "macos-arm64.toml", "windows-amd64.toml"];
-    REQUIRED_RECORDS
-        .iter()
-        .filter(|record| {
-            let path = root.join("crates/hell-ci/oracle").join(record);
-            fs::read_to_string(path).map_or(true, |contents| {
-                contents.lines().find_map(|line| {
-                    line.strip_prefix("availability = \"")
-                        .and_then(|value| value.strip_suffix('"'))
-                }) != Some("available")
-            })
-        })
-        .count()
-}
-
-fn measured_resource_leaks() -> usize {
-    // Every successful candidate execution closes its root ExecutionScope and
-    // fails if task, handle, process, HTTP, or temporary-resource counters do
-    // not return to the recorded baseline.
-    0
-}
-
-fn measured_dependency_failures() -> usize {
-    // Both CI and nightly execute the pinned cargo-deny action before this
-    // suite. A failed advisory/license/source/bans check prevents the evidence
-    // summary and release gate from being reached.
-    0
+    oracle_record::load_all(root).map_or(promotion_policy::RequiredPlatform::ALL.len(), |records| {
+        oracle_record::state_without_shards(&records).unavailable
+    })
 }
 
 pub fn failures_directory(report_path: &Path) -> PathBuf {
@@ -1838,25 +3384,45 @@ mod tests {
         format!(
             concat!(
                 "{{\n",
+                "  \"schemaVersion\": 2,\n",
+                "  \"observationBundleSchemaVersion\": 2,\n",
+                "  \"claimIndexSchemaVersion\": 2,\n",
+                "  \"oracleRecordSchemaVersion\": 2,\n",
                 "  \"platform\": \"linux-x86_64\",\n",
                 "  \"oracleSha256\": \"5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9\",\n",
                 "  \"mismatches\": 0,\n",
+                "  \"reviewedExpectedDivergences\": 0,\n",
                 "  \"unexpectedTimeouts\": 0,\n",
                 "  \"staleExactClaims\": 0,\n",
+                "  \"irrelevantClaimReferences\": 0,\n",
+                "  \"profileEvidenceMismatches\": 0,\n",
+                "  \"platformEvidenceMismatches\": 0,\n",
+                "  \"normalizerEvidenceMismatches\": 0,\n",
+                "  \"failedClaimObservations\": 0,\n",
                 "  \"leakedResources\": 0,\n",
                 "  \"dependencyFailures\": 0,\n",
                 "  \"missingEvidenceReferences\": {},\n",
+                "  \"unverifiedOutOfScopeClaims\": {},\n",
+                "  \"requiredProfiles\": [\"upstream\"],\n",
                 "  \"requiredPlatformSkips\": {},\n",
                 "  \"promotionReady\": false,\n",
                 "  \"repositoryPolicyPassed\": true,\n",
                 "  \"generatedDifferentialObservations\": 1024,\n",
                 "  \"committedDifferentialObservations\": 1,\n",
-                "  \"claimEvidenceIndexSha256\": \"{}\"\n",
+                "  \"claimEvidenceIndexSha256\": \"{}\",\n",
+                "  \"promotionPolicySha256\": \"{}\",\n",
+                "  \"reviewedCorpusCatalogSha256\": \"catalog\",\n",
+                "  \"promotionReviewSha256\": \"review\",\n",
+                "  \"dependencyLockSha256\": \"lock\",\n",
+                "  \"dependencyPolicyAttestationSha256\": \"attestation\",\n",
+                "  \"expectedMismatchManifestSha256\": \"mismatches\"\n",
                 "}}\n"
             ),
             missing_claim_evidence(),
+            unverified_out_of_scope_claims(&[hell_builtins::ExecutionProfile::Upstream]),
             required_platform_skips(root),
             claim_index_sha256,
+            hell_builtins::PROMOTION_POLICY_SHA256,
         )
     }
 
@@ -1885,7 +3451,8 @@ mod tests {
             hell_builtins::compatibility_claims()
                 .iter()
                 .flat_map(|claim| claim.dimensions.iter())
-                .all(|dimension| dimension.status == ClaimStatus::Unverified),
+                .flat_map(|dimension| dimension.scopes.iter())
+                .all(|scope| scope.status == ClaimStatus::Unverified),
             "native shard artifacts must be retained before claim promotion"
         );
     }
@@ -1990,12 +3557,35 @@ mod tests {
     fn merge_reports_missing_claim_index_identity_field() {
         let sandbox = TestSandbox::create("missing-claim-field");
         let root = repository_root();
-        let claim_contents = "{\n  \"compatibilitySnapshotSha256\": \"snapshot\"\n}\n";
+        let claim_contents = format!(
+            concat!(
+                "{{\n",
+                "  \"schemaVersion\": 2,\n",
+                "  \"compatibilitySnapshotSha256\": \"snapshot\",\n",
+                "  \"promotionPolicySha256\": \"{}\",\n",
+                "  \"reviewedCorpusCatalogSha256\": \"catalog\",\n",
+                "  \"oracleSha256\": \"oracle\",\n",
+                "  \"candidateSha256\": \"candidate\",\n",
+                "  \"platform\": \"linux-amd64\",\n",
+                "  \"profile\": \"upstream\",\n",
+                "  \"indexedEntries\": 0,\n",
+                "  \"missingBundles\": 0,\n",
+                "  \"irrelevantReferences\": 0,\n",
+                "  \"profileMismatches\": 0,\n",
+                "  \"platformMismatches\": 0,\n",
+                "  \"normalizerMismatches\": 0,\n",
+                "  \"failedObservations\": 0,\n",
+                "  \"entries\": [\n",
+                "  ]\n",
+                "}}\n"
+            ),
+            hell_builtins::PROMOTION_POLICY_SHA256,
+        );
         let claim_digest = sha256_bytes(claim_contents.as_bytes()).hex();
         let directory = write_linux_summary(&root, &sandbox.path, &claim_digest);
         let claim_path = directory.join("evidence").join("claim-index.json");
         fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
-        fs::write(&claim_path, claim_contents).unwrap();
+        fs::write(&claim_path, &claim_contents).unwrap();
         let mut report = Report::new("merge-native-shards");
         let result = merge_native_shards(&root, &sandbox.path, &mut report);
         assert_eq!(result, Err(FailureKind::Fixture));
@@ -2022,5 +3612,156 @@ mod tests {
         assert!(failure.detail.contains("retain evidence summary"));
         assert!(failure.detail.contains(&target.display().to_string()));
         assert!(failure.detail.len() > "cannot retain evidence summary".len());
+    }
+
+    #[test]
+    fn dependency_attestation_is_bound_to_candidate_and_lockfile() {
+        let sandbox = TestSandbox::create("dependency-attestation");
+        let input = sandbox.path.join("dependency-policy.json");
+        let artifact_root = sandbox.path.join("artifact");
+        let lock_digest = sha256_bytes(b"lockfile");
+        let source_commit = hell_builtins::UPSTREAM_COMMIT;
+        let contents = dependency_attestation_json(source_commit, lock_digest);
+        fs::write(&input, &contents).unwrap();
+        let digest = sha256_bytes(contents.as_bytes()).hex();
+        fs::write(
+            input.with_extension("sha256"),
+            format!("{digest}  dependency-policy.json\n"),
+        )
+        .unwrap();
+        let candidate = ExecutableIdentity {
+            path: PathBuf::from("candidate"),
+            sha256: Digest::default(),
+            reported_version: hell_builtins::LANGUAGE_VERSION.into(),
+            build_info: Some(hell_testkit::BuildInfo {
+                lines: vec![format!("source commit {source_commit}").into()].into(),
+            }),
+            role: hell_testkit::ExecutableRole::Candidate,
+        };
+        assert!(
+            retain_dependency_attestation(
+                &repository_root(),
+                &input,
+                &artifact_root,
+                lock_digest,
+                &candidate,
+            )
+            .is_ok()
+        );
+        fs::write(&input, contents.replace("\"passed\"", "\"failed\"")).unwrap();
+        assert!(
+            retain_dependency_attestation(
+                &repository_root(),
+                &input,
+                &artifact_root,
+                lock_digest,
+                &candidate,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn claim_index_rejects_malformed_and_wrong_profile_entries() {
+        assert!(
+            validate_claim_index_contents(
+                "{\n  \"indexedEntries\": 0\n}\n",
+                Path::new("unused"),
+                "linux-amd64"
+            )
+            .is_err()
+        );
+        let malformed = concat!(
+            "{\n",
+            "  \"indexedEntries\": 1,\n",
+            "  \"entries\": [\n",
+            "    { \"unexpected\": true }\n",
+            "  ]\n",
+            "}\n"
+        );
+        assert!(
+            validate_claim_index_contents(malformed, Path::new("unused"), "linux-amd64").is_err()
+        );
+        let wrong_profile = concat!(
+            "{\n",
+            "  \"indexedEntries\": 1,\n",
+            "  \"entries\": [\n",
+            "    { \"builtin\": \"unused\", \"dimension\": \"parse\", \"status\": \"exact\", \"profile\": \"sandboxed\", \"platform\": \"linux-amd64\" }\n",
+            "  ]\n",
+            "}\n"
+        );
+        assert!(
+            validate_claim_index_contents(wrong_profile, Path::new("unused"), "linux-amd64")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deliberate_divergence_requires_reviewed_expected_mismatch_evidence() {
+        let unexplained = CaseOutcome {
+            agrees: false,
+            reviewed_deliberate_divergence: false,
+            ..CaseOutcome::default()
+        };
+        assert!(!outcome_supports_claim_status(
+            unexplained,
+            ClaimStatus::DeliberateDivergence
+        ));
+        let reviewed = CaseOutcome {
+            reviewed_deliberate_divergence: true,
+            ..unexplained
+        };
+        assert!(outcome_supports_claim_status(
+            reviewed,
+            ClaimStatus::DeliberateDivergence
+        ));
+        assert!(!outcome_supports_claim_status(reviewed, ClaimStatus::Exact));
+    }
+
+    #[test]
+    fn expected_mismatch_manifest_rejects_header_tampering_and_expired_waivers() {
+        let identity = |role| ExecutableIdentity {
+            path: PathBuf::from("fixture"),
+            sha256: sha256_bytes(match role {
+                ExecutableRole::Oracle => b"oracle",
+                ExecutableRole::Candidate => b"candidate",
+            }),
+            reported_version: hell_builtins::LANGUAGE_VERSION.into(),
+            build_info: None,
+            role,
+        };
+        let identities = NightlyIdentities {
+            oracle: identity(ExecutableRole::Oracle),
+            candidate: identity(ExecutableRole::Candidate),
+        };
+        let valid =
+            fs::read_to_string(repository_root().join("compat/expected-mismatches.toml")).unwrap();
+        assert!(parse_expected_mismatches(&valid, &identities).is_ok());
+        assert!(
+            parse_expected_mismatches(&format!("{valid}unknown_top_level = true\n"), &identities)
+                .is_err()
+        );
+        let expired = format!(
+            concat!(
+                "schema_version = 1\n",
+                "baseline = \"2026-05-29\"\n",
+                "[[entry]]\n",
+                "case = \"expired-case\"\n",
+                "classification = \"deliberate-divergence\"\n",
+                "claim = \"unknown\"\n",
+                "dimension = \"parse\"\n",
+                "platform = {:?}\n",
+                "profile = \"upstream\"\n",
+                "oracle_sha256 = {:?}\n",
+                "candidate_sha256 = {:?}\n",
+                "expires = \"1970-01-01\"\n",
+                "rationale = \"reviewed fixture\"\n"
+            ),
+            current_evidence_platform(),
+            identities.oracle.sha256.hex(),
+            identities.candidate.sha256.hex(),
+        );
+        let error = parse_expected_mismatches(&expired, &identities).unwrap_err();
+        assert!(error.contains("expired"));
     }
 }
