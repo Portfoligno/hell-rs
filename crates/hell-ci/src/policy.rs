@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CACHE_SHA: &str = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+const CARGO_DENY_ACTION: &str =
+    "EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902";
+const CARGO_DENY_INSTALL: &str = "run: cargo install cargo-deny --locked --version 0.20.2";
+const CARGO_DENY_CHECK: &str = "run: cargo deny --all-features check all";
 
 pub fn check_repository(root: &Path) -> Result<(), String> {
     let tracked = tracked_files(root)?;
@@ -84,8 +88,6 @@ fn check_expected_mismatch_manifest(root: &Path, failures: &mut Vec<String>) {
 }
 
 fn check_dependency_policy(root: &Path, failures: &mut Vec<String>) {
-    const PINNED_ACTION: &str =
-        "EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902";
     let deny_path = root.join("deny.toml");
     let deny = match fs::read_to_string(&deny_path) {
         Ok(deny) => deny,
@@ -111,7 +113,7 @@ fn check_dependency_policy(root: &Path, failures: &mut Vec<String>) {
         root.join(".github/workflows/nightly.yml"),
     ] {
         match fs::read_to_string(&workflow) {
-            Ok(contents) if contents.contains(PINNED_ACTION) => {}
+            Ok(contents) if contents.contains(CARGO_DENY_ACTION) => {}
             Ok(_) => failures.push(format!(
                 "{} does not invoke the pinned dependency gate",
                 workflow.display()
@@ -119,6 +121,86 @@ fn check_dependency_policy(root: &Path, failures: &mut Vec<String>) {
             Err(error) => failures.push(format!("cannot read {}: {error}", workflow.display())),
         }
     }
+    let nightly_path = root.join(".github/workflows/nightly.yml");
+    match fs::read_to_string(&nightly_path) {
+        Ok(contents) => {
+            check_native_dependency_job(
+                &contents,
+                "native-oracle-macos",
+                "runs-on: macos-15",
+                failures,
+            );
+            check_native_dependency_job(
+                &contents,
+                "native-oracle-windows",
+                "runs-on: windows-2025",
+                failures,
+            );
+        }
+        Err(error) => failures.push(format!("cannot read {}: {error}", nightly_path.display())),
+    }
+}
+
+fn check_native_dependency_job(
+    workflow: &str,
+    job: &str,
+    runner: &str,
+    failures: &mut Vec<String>,
+) {
+    let Some(lines) = workflow_job_lines(workflow, job) else {
+        failures.push(format!("nightly workflow is missing native job {job}"));
+        return;
+    };
+    for required in [runner, CARGO_DENY_INSTALL, CARGO_DENY_CHECK] {
+        if lines
+            .iter()
+            .filter(|line| workflow_entry(line) == required)
+            .count()
+            != 1
+        {
+            failures.push(format!(
+                "nightly native job {job} must contain exactly one {required}"
+            ));
+        }
+    }
+    if lines.iter().any(|line| line.contains(CARGO_DENY_ACTION)) {
+        failures.push(format!(
+            "nightly native job {job} uses the Linux-only cargo-deny action"
+        ));
+    }
+    let install = lines
+        .iter()
+        .position(|line| workflow_entry(line) == CARGO_DENY_INSTALL);
+    let check = lines
+        .iter()
+        .position(|line| workflow_entry(line) == CARGO_DENY_CHECK);
+    if !matches!((install, check), (Some(install), Some(check)) if install < check) {
+        failures.push(format!(
+            "nightly native job {job} must install cargo-deny before invoking it"
+        ));
+    }
+}
+
+fn workflow_job_lines<'a>(workflow: &'a str, job: &str) -> Option<Vec<&'a str>> {
+    let header = format!("  {job}:");
+    let mut lines = workflow.lines();
+    lines.find(|line| *line == header)?;
+    Some(
+        lines
+            .take_while(|line| {
+                let Some(remainder) = line.strip_prefix("  ") else {
+                    return true;
+                };
+                remainder.chars().next().is_none_or(char::is_whitespace)
+                    || !remainder.ends_with(':')
+            })
+            .collect(),
+    )
+}
+
+fn workflow_entry(line: &str) -> &str {
+    let line = line.trim();
+    line.strip_prefix("- ").unwrap_or(line)
 }
 
 fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
@@ -934,6 +1016,37 @@ mod tests {
         assert!(workflow("env:\n  HELL_SOURCE_COMMIT: ${{ github.sha }}\n").is_empty());
         assert!(!workflow("env:\n  HELL_SOURCE_COMMIT: untrusted\n").is_empty());
         assert!(!workflow("  env:\n    HELL_SOURCE_COMMIT: ${{ github.sha }}\n").is_empty());
+    }
+
+    #[test]
+    fn native_dependency_gate_is_portable_pinned_and_ordered() {
+        let job = "jobs:\n  native-oracle-macos:\n    runs-on: macos-15\n    steps:\n      - run: cargo install cargo-deny --locked --version 0.20.2\n      - run: cargo deny --all-features check all\n  merge:\n    runs-on: ubuntu-24.04\n";
+        let mut failures = Vec::new();
+        check_native_dependency_job(
+            job,
+            "native-oracle-macos",
+            "runs-on: macos-15",
+            &mut failures,
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        for invalid in [
+            "jobs:\n  native-oracle-macos:\n    runs-on: macos-15\n    steps:\n      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902\n      - run: cargo deny --all-features check all\n",
+            "jobs:\n  native-oracle-macos:\n    runs-on: macos-15\n    steps:\n      - run: cargo deny --all-features check all\n      - run: cargo install cargo-deny --locked --version 0.20.2\n",
+            "jobs:\n  native-oracle-macos:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo install cargo-deny --locked --version 0.20.2\n      - run: cargo deny --all-features check all\n",
+        ] {
+            let mut failures = Vec::new();
+            check_native_dependency_job(
+                invalid,
+                "native-oracle-macos",
+                "runs-on: macos-15",
+                &mut failures,
+            );
+            assert!(
+                !failures.is_empty(),
+                "accepted invalid native dependency job"
+            );
+        }
     }
 
     #[test]

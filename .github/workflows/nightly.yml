@@ -142,20 +142,23 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
             target/release
             target/oracle-source/.stack-work
-          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
           restore-keys: |
-            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
-            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
+            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
+            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-
+
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: Check dependency advisories, licenses, bans, and sources
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
-        with:
-          command: check
-          arguments: --all-features
+        run: cargo deny --all-features check all
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
@@ -183,11 +186,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
             target/release
             target/oracle-source/.stack-work
-          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
 
   native-oracle-windows:
     name: Native oracle shard / Windows amd64
@@ -225,20 +231,23 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
             target/release
             target/oracle-source/.stack-work
-          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
           restore-keys: |
-            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
-            v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
+            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
+            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-
+
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: Check dependency advisories, licenses, bans, and sources
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
-        with:
-          command: check
-          arguments: --all-features
+        run: cargo deny --all-features check all
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
@@ -266,11 +275,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ${{ steps.setup-stack.outputs.stack-root }}
             target/ci
             target/release
             target/oracle-source/.stack-work
-          key: v3-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
 
   merge-native-evidence:
     name: Merge native oracle evidence / Linux
