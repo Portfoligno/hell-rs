@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hell_core::{
-    CaseBranch, ClassEvidence, Constant, CoreId, CoreKind, CoreNode, CoreProgram, Projection,
-    RecordFieldLayout, RecordLayout, VariantConstructorLayout, VariantLayout, VerifiedProgram,
+    CaseBranch, ClassEvidence, CompilerBuiltinEvidence, Constant, CoreId, CoreKind, CoreNode,
+    CoreProgram, InstanceEvidencePlan, InstanceEvidencePlanId, Projection, RecordFieldLayout,
+    RecordLayout, VariantConstructorLayout, VariantLayout, VerifiedProgram,
 };
 use hell_source::{SourceFile, SourceMap, SourceName, Span};
 use hell_syntax::{
@@ -491,6 +492,12 @@ fn compile_source_file(
         preinferred: HashMap::new(),
         preinferred_bindings: HashMap::new(),
         worklist_bypass: HashSet::new(),
+        #[cfg(feature = "compat-tracing")]
+        parsed_builtins: HashSet::new(),
+        #[cfg(feature = "compat-tracing")]
+        resolved_builtins: HashSet::new(),
+        #[cfg(feature = "compat-tracing")]
+        specialized_builtins: HashSet::new(),
         type_constraints: 0,
         profile_id,
         stats: &mut session.stats,
@@ -692,6 +699,31 @@ fn compile_source_file(
             )]));
         }
     }
+    let mut instance_evidence = InstanceEvidencePlans::default();
+    for temporary in &context.temporary {
+        let TemporaryKind::Builtin {
+            evidence: Some((class, head)),
+            ..
+        } = temporary.kind
+        else {
+            continue;
+        };
+        let closed_head = closed_by_type[&head].raw();
+        if instance_evidence
+            .retain(context.types, class, closed_head)
+            .is_none()
+        {
+            return Err(DiagnosticBundle(vec![Diagnostic::new(
+                "H0507",
+                format!(
+                    "no `{}` instance evidence for `{}`",
+                    class.as_str(),
+                    context.types.display(closed_head)
+                ),
+                temporary.span,
+            )]));
+        }
+    }
     let nodes = context
         .temporary
         .iter()
@@ -699,7 +731,10 @@ fn compile_source_file(
         .map(|(temporary, ty)| CoreNode {
             ty,
             span: temporary.span,
-            kind: temporary.kind.clone().close(&closed_by_type),
+            kind: temporary
+                .kind
+                .clone()
+                .close(&closed_by_type, &instance_evidence.identities),
         })
         .collect();
     let program = CoreProgram {
@@ -707,6 +742,8 @@ fn compile_source_file(
         nodes,
         types: context.types.clone(),
         main_type,
+        instance_evidence: instance_evidence.plans,
+        compiler_evidence: compiler_builtin_evidence(&context),
     };
     context.stats.record_timing(1, "zonk", zonk_started);
     context.stats.record_timing(0, "infer", infer_started);
@@ -716,6 +753,95 @@ fn compile_source_file(
     })?;
     context.stats.record_timing(0, "check", check_started);
     Ok(verified)
+}
+
+#[cfg(feature = "compat-tracing")]
+fn compiler_builtin_evidence(context: &InferContext<'_>) -> CompilerBuiltinEvidence {
+    let mut parsed = context.parsed_builtins.clone();
+    let mut resolved = context.resolved_builtins.clone();
+    let mut specialized = context.specialized_builtins.clone();
+    for node in &context.temporary {
+        retain_generated_builtin_evidence(&node.kind, &mut parsed);
+        retain_generated_builtin_evidence(&node.kind, &mut resolved);
+        retain_generated_builtin_evidence(&node.kind, &mut specialized);
+    }
+    CompilerBuiltinEvidence {
+        parsed: sorted_builtin_ids(&parsed),
+        resolved: sorted_builtin_ids(&resolved),
+        specialized: sorted_builtin_ids(&specialized),
+    }
+}
+
+#[cfg(feature = "compat-tracing")]
+fn retain_generated_builtin_evidence(
+    kind: &TemporaryKind,
+    evidence: &mut HashSet<hell_builtins::BuiltinId>,
+) {
+    let mut retain = |name| {
+        evidence.insert(
+            hell_builtins::lookup(name)
+                .expect("generated builtin is registered")
+                .id,
+        );
+    };
+    match kind {
+        TemporaryKind::Tuple { elements } => match elements.len() {
+            2 => retain("Tuple.(,)"),
+            3 => retain("Tuple.(,,)"),
+            4 => retain("Tuple.(,,,)"),
+            _ => {}
+        },
+        TemporaryKind::Record { fields, .. } => {
+            retain("hell:Hell.NilR");
+            if !fields.is_empty() {
+                retain("hell:Hell.ConsR");
+            }
+        }
+        TemporaryKind::RecordGet { .. } => retain("Record.get"),
+        TemporaryKind::RecordSet { .. } => retain("Record.set"),
+        TemporaryKind::RecordModify { .. } => retain("Record.modify"),
+        TemporaryKind::Variant {
+            constructor_index,
+            payload,
+            ..
+        } => {
+            retain("hell:Hell.LeftV");
+            if *constructor_index != 0 {
+                retain("hell:Hell.RightV");
+            }
+            retain("hell:Hell.Tagged");
+            if payload.is_none() {
+                retain("hell:Hell.Nullary");
+            }
+        }
+        TemporaryKind::Case {
+            branches, default, ..
+        } => {
+            retain("hell:Hell.NilA");
+            if !branches.is_empty() {
+                retain("hell:Hell.ConsA");
+            }
+            if default.is_some() {
+                retain("hell:Hell.WildA");
+            }
+            retain("hell:Hell.runAccessor");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn compiler_builtin_evidence(_context: &InferContext<'_>) -> CompilerBuiltinEvidence {
+    CompilerBuiltinEvidence::default()
+}
+
+#[cfg(feature = "compat-tracing")]
+fn sorted_builtin_ids(
+    builtins: &HashSet<hell_builtins::BuiltinId>,
+) -> Vec<hell_builtins::BuiltinId> {
+    let mut builtins = builtins.iter().copied().collect::<Vec<_>>();
+    builtins.sort_by_key(|builtin| builtin.0);
+    builtins
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1546,7 +1672,11 @@ struct TemporaryCaseBranch {
 }
 
 impl TemporaryKind {
-    fn close(&self, closed: &HashMap<TypeId, ClosedTypeId>) -> CoreKind {
+    fn close(
+        &self,
+        closed: &HashMap<TypeId, ClosedTypeId>,
+        evidence_plans: &HashMap<(hell_builtins::TypeClass, TypeId), InstanceEvidencePlanId>,
+    ) -> CoreKind {
         match self {
             Self::BoundVar {
                 de_bruijn,
@@ -1572,6 +1702,7 @@ impl TemporaryKind {
                 evidence: evidence.map(|(class, head)| ClassEvidence {
                     class,
                     head: closed[&head],
+                    plan: evidence_plans[&(class, closed[&head].raw())],
                 }),
             },
             Self::Tuple { elements } => CoreKind::Tuple {
@@ -1719,6 +1850,12 @@ struct InferContext<'a> {
     preinferred: HashMap<ExprId, VecDeque<Inferred>>,
     preinferred_bindings: HashMap<ExprId, VecDeque<Vec<TypeId>>>,
     worklist_bypass: HashSet<ExprId>,
+    #[cfg(feature = "compat-tracing")]
+    parsed_builtins: HashSet<hell_builtins::BuiltinId>,
+    #[cfg(feature = "compat-tracing")]
+    resolved_builtins: HashSet<hell_builtins::BuiltinId>,
+    #[cfg(feature = "compat-tracing")]
+    specialized_builtins: HashSet<hell_builtins::BuiltinId>,
     type_constraints: u64,
     profile_id: Arc<str>,
     stats: &'a mut CompilerStats,
@@ -3848,6 +3985,8 @@ impl InferContext<'_> {
                 span,
             )])
         })?;
+        #[cfg(feature = "compat-tracing")]
+        self.parsed_builtins.insert(spec.id);
         if spec.implementation.is_none() {
             return Err(DiagnosticBundle(vec![Diagnostic::new(
                 "H0004",
@@ -3855,6 +3994,8 @@ impl InferContext<'_> {
                 span,
             )]));
         }
+        #[cfg(feature = "compat-tracing")]
+        self.resolved_builtins.insert(spec.id);
         let int = self.types.constructor("Int", KindArena::TYPE);
         let integer = self.types.constructor("Integer", KindArena::TYPE);
         let bool_ = self.types.constructor("Bool", KindArena::TYPE);
@@ -5589,6 +5730,8 @@ impl InferContext<'_> {
                 evidence,
             },
         )?;
+        #[cfg(feature = "compat-tracing")]
+        self.specialized_builtins.insert(spec.id);
         Ok(Inferred {
             node,
             ty,
@@ -5779,28 +5922,93 @@ fn has_semigroup_instance(types: &TypeArena, ty: TypeId) -> bool {
     has_instance(types, hell_builtins::TypeClass::Semigroup, ty)
 }
 
-fn has_instance(types: &TypeArena, class: hell_builtins::TypeClass, ty: TypeId) -> bool {
-    let mut work = vec![ty];
-    while let Some(mut ty) = work.pop() {
-        let mut arguments = Vec::new();
-        while let TypeNode::Apply(function, argument) = types.get(ty) {
-            arguments.push(*argument);
-            ty = *function;
+#[derive(Default)]
+struct InstanceEvidencePlans {
+    plans: Vec<InstanceEvidencePlan>,
+    identities: HashMap<(hell_builtins::TypeClass, TypeId), InstanceEvidencePlanId>,
+}
+
+impl InstanceEvidencePlans {
+    fn retain(
+        &mut self,
+        types: &TypeArena,
+        class: hell_builtins::TypeClass,
+        root: TypeId,
+    ) -> Option<InstanceEvidencePlanId> {
+        enum Work {
+            Enter(TypeId),
+            Leave(TypeId),
         }
-        arguments.reverse();
-        let TypeNode::Constructor { name, .. } = types.get(ty) else {
-            return false;
-        };
-        let Some(instance) = hell_builtins::instance(class, name) else {
-            return false;
-        };
-        if usize::from(instance.resolution.head_arity()) != arguments.len() {
-            return false;
+        let mut work = vec![Work::Enter(root)];
+        let mut active = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Leave(head) => {
+                    let (target, arguments) = instance_head(types, head)?;
+                    let instance = hell_builtins::instance(class, target)?;
+                    let premise_count = usize::from(instance.resolution.premise_count());
+                    let premises = arguments
+                        .iter()
+                        .take(premise_count)
+                        .map(|premise| self.identities.get(&(class, *premise)).copied())
+                        .collect::<Option<Vec<_>>>()?;
+                    let plan = InstanceEvidencePlanId(u32::try_from(self.plans.len()).ok()?);
+                    self.plans.push(InstanceEvidencePlan {
+                        class,
+                        head,
+                        resolution: instance.resolution,
+                        premises: premises.into(),
+                    });
+                    self.identities.insert((class, head), plan);
+                    if !active.remove(&head) {
+                        return None;
+                    }
+                }
+                Work::Enter(head) => {
+                    if self.identities.contains_key(&(class, head)) {
+                        continue;
+                    }
+                    if !active.insert(head) {
+                        return None;
+                    }
+                    let (target, arguments) = instance_head(types, head)?;
+                    let instance = hell_builtins::instance(class, target)?;
+                    let premise_count = usize::from(instance.resolution.premise_count());
+                    if usize::from(instance.resolution.head_arity()) != arguments.len() {
+                        return None;
+                    }
+                    work.push(Work::Leave(head));
+                    work.extend(
+                        arguments
+                            .into_iter()
+                            .take(premise_count)
+                            .rev()
+                            .map(Work::Enter),
+                    );
+                }
+            }
         }
-        let premise_count = usize::from(instance.resolution.premise_count());
-        work.extend(arguments.into_iter().take(premise_count).rev());
+        self.identities.get(&(class, root)).copied()
     }
-    true
+}
+
+fn instance_head(types: &TypeArena, mut ty: TypeId) -> Option<(&str, Vec<TypeId>)> {
+    let mut arguments = Vec::new();
+    while let TypeNode::Apply(function, argument) = types.get(ty) {
+        arguments.push(*argument);
+        ty = *function;
+    }
+    arguments.reverse();
+    let TypeNode::Constructor { name, .. } = types.get(ty) else {
+        return None;
+    };
+    Some((name, arguments))
+}
+
+fn has_instance(types: &TypeArena, class: hell_builtins::TypeClass, ty: TypeId) -> bool {
+    InstanceEvidencePlans::default()
+        .retain(types, class, ty)
+        .is_some()
 }
 
 fn parse_wrapping_int(raw: &str) -> Option<i64> {

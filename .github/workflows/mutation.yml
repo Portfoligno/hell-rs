@@ -1,0 +1,161 @@
+name: Assurance mutation evidence
+
+on:
+  schedule:
+    - cron: "41 3 * * 2"
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        type: string
+        required: true
+      issued_at:
+        type: string
+        required: true
+      require_review:
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  execute:
+    if: ${{ github.event_name == 'schedule' || inputs.require_review }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload-subject.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload-subject.outputs.artifact-digest }}
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore mutation compilation
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/mutation.yml') }}
+      - name: Build assurance driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Execute exact assurance mutant catalog
+        run: ./target/ci/hell-ci mutation run --output ci-out/mutation/mutation-score.pending.json --github-dispatch-inputs
+      - name: Upload exact mutation review subject
+        id: upload-subject
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ephemeralEvidence-mutation-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/mutation
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save mutation compilation
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/mutation.yml') }}
+
+  review:
+    needs: execute
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.require_review) }}
+    environment: assurance-mutation-review
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out trusted current mutation review automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore Cargo downloads
+        id: review-cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore mutation compilation
+        id: review-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/mutation.yml') }}
+      - name: Build trusted assurance driver before loading review credentials
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Load protected SSH review key
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.MUTATION_REVIEW_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore signer
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Download exact mutation review subject after building the verifier
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.execute.outputs.artifact_id }}
+          path: ci-out/mutation
+      - name: Retain stable protected mutation reviewer authorization
+        env:
+          GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
+        run: ./target/ci/hell-ci review-authorization --input ci-out/mutation/mutation-score.pending.json --output ci-out/mutation/authorization.json --role mutation-reviewer --category mutation-final --github-dispatch-inputs
+      - name: Prepare exact mutation review packet
+        run: ./target/ci/hell-ci review-packet --input ci-out/mutation/mutation-score.pending.json --from ci-out/mutation/authorization.json --output ci-out/mutation/mutation-review-packet.json --role mutation-reviewer --decision accept --github-dispatch-inputs
+      - name: Attach SSH and Sigstore review signatures
+        run: ./target/ci/hell-ci review-sign --input ci-out/mutation/mutation-review-packet.json --output ci-out/mutation/mutation-review.dsse.json --role mutation-reviewer --decision accept --policy ci-out/mutation/reviewer.allowed_signers
+      - name: Finalize signed mutation report
+        run: ./target/ci/hell-ci mutation finalize --input ci-out/mutation/mutation-score.pending.json --from ci-out/mutation/mutation-review.dsse.json --output ci-out/mutation/mutation-score.json --policy ci-out/mutation/reviewer.allowed_signers
+      - name: Upload immutable mutation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-mutation-evidence
+          path: ci-out/mutation
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.review-cargo-cache.outcome == 'success' && steps.review-cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save mutation compilation
+        if: ${{ always() && steps.review-target-cache.outcome == 'success' && steps.review-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: assurance-mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/mutation.yml') }}

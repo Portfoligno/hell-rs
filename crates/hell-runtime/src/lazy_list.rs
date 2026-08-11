@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::{Evaluator, ListCell, RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef, Value};
+#[cfg(not(feature = "compat-tracing"))]
+use crate::Suspension;
+use crate::{Evaluator, ListCell, RuntimeError, RuntimeResult, Thunk, ThunkRef, Value};
 
 #[derive(Clone)]
 pub(crate) enum Classifier {
@@ -14,13 +16,13 @@ pub(crate) enum Classifier {
 }
 
 impl Classifier {
-    fn decision(&self, item: &ThunkRef) -> ThunkRef {
+    fn decision(&self, evaluator: &Evaluator, item: &ThunkRef) -> ThunkRef {
         match self {
-            Self::Predicate(function) => apply1(function, item),
+            Self::Predicate(function) => predicate_callback(evaluator, function, item),
             Self::Relation {
                 first,
                 function: Some(function),
-            } => apply2(function, first, item),
+            } => relation_callback(evaluator, function, first, item),
             Self::Relation {
                 first,
                 function: None,
@@ -37,6 +39,59 @@ impl Classifier {
     }
 }
 
+#[cfg(feature = "compat-tracing")]
+fn relation_callback(
+    evaluator: &Evaluator,
+    function: &ThunkRef,
+    first: &ThunkRef,
+    item: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(function),
+            &[Arc::clone(first), Arc::clone(item)],
+            0,
+            "relation",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn relation_callback(
+    _evaluator: &Evaluator,
+    function: &ThunkRef,
+    first: &ThunkRef,
+    item: &ThunkRef,
+) -> ThunkRef {
+    apply2(function, first, item)
+}
+
+#[cfg(feature = "compat-tracing")]
+fn predicate_callback(
+    evaluator: &Evaluator,
+    predicate: &ThunkRef,
+    argument: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(predicate),
+            &[Arc::clone(argument)],
+            0,
+            "predicate",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn predicate_callback(
+    _evaluator: &Evaluator,
+    predicate: &ThunkRef,
+    argument: &ThunkRef,
+) -> ThunkRef {
+    apply1(predicate, argument)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
 pub(crate) fn apply1(function: &ThunkRef, argument: &ThunkRef) -> ThunkRef {
     Thunk::suspended(Suspension::Apply {
         function: Arc::clone(function),
@@ -44,6 +99,7 @@ pub(crate) fn apply1(function: &ThunkRef, argument: &ThunkRef) -> ThunkRef {
     })
 }
 
+#[cfg(not(feature = "compat-tracing"))]
 pub(crate) fn apply2(function: &ThunkRef, first: &ThunkRef, second: &ThunkRef) -> ThunkRef {
     Thunk::suspended(Suspension::Apply {
         function: apply1(function, first),
@@ -62,7 +118,7 @@ pub(crate) fn classify(
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
-            let decision = classifier.decision(head);
+            let decision = classifier.decision(evaluator, head);
             let entry = Thunk::evaluated(Value::Tuple(
                 [decision, Arc::clone(head), Arc::clone(&input)].into(),
             ));

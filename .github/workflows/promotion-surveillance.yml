@@ -1,0 +1,549 @@
+name: Promotion surveillance
+
+on:
+  push:
+  schedule:
+    - cron: "23 5 * * 3"
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact newly activated candidate
+        required: true
+        type: string
+      assurance_epoch_sha256:
+        description: Exact newly activated assurance epoch
+        required: true
+        type: string
+      activation_run_id:
+        description: Evidence custody activation run ID
+        required: true
+        type: string
+      activation_run_attempt:
+        description: Evidence custody activation run attempt
+        required: true
+        type: string
+      activation_correlation_sha256:
+        description: Signed dual-activation correlation digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promotion-surveillance-current-state
+  cancel-in-progress: false
+
+jobs:
+  retrieve-active:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: primary-worm
+            environment: custody-primary-surveillance
+            runner-label: custody-primary-retrieval
+            role-variable: CUSTODY_PRIMARY_SURVEILLANCE_ROLE
+            region-variable: CUSTODY_PRIMARY_REGION
+          - provider: secondary-worm
+            environment: custody-secondary-surveillance
+            runner-label: custody-secondary-retrieval
+            role-variable: CUSTODY_SECONDARY_SURVEILLANCE_ROLE
+            region-variable: CUSTODY_SECONDARY_REGION
+    environment: ${{ matrix.environment }}
+    runs-on:
+      - self-hosted
+      - ${{ matrix.runner-label }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out surveillance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore surveillance Cargo dependencies
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-retrieve-cargo-v1-${{ matrix.provider }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore surveillance retrieval target
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-retrieve-target-v1-${{ matrix.provider }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
+      - name: Build surveillance driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Configure protected read-only provider identity
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars[matrix.role-variable] }}
+          aws-region: ${{ vars[matrix.region-variable] }}
+      - name: Install pinned maintenance signature verifier
+        if: ${{ always() }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Retrieve exact active immutable package or retain typed failure
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieve
+      - name: Load protected primary surveillance signer
+        if: ${{ always() && matrix.provider == 'primary-worm' }}
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CUSTODY_PRIMARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
+      - name: Load protected secondary surveillance signer
+        if: ${{ always() && matrix.provider == 'secondary-worm' }}
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CUSTODY_SECONDARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
+      - name: Prepare exact signed primary provider observation packet
+        if: ${{ always() && matrix.provider == 'primary-worm' }}
+        run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieval-packet-primary
+      - name: Prepare exact signed secondary provider observation packet
+        if: ${{ always() && matrix.provider == 'secondary-worm' }}
+        run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieval-packet-secondary
+      - name: Sign exact provider observation
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci review-sign --input ci-out/custody-maintenance/provider-observation-packet.json --output ci-out/custody-maintenance/provider-observation.dsse.json --role custody-provider --decision accept --policy compat/reviews.allowed_signers
+      - name: Upload exact provider surveillance input
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ephemeralEvidence-active-${{ matrix.provider }}
+          path: ci-out/custody-maintenance
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save surveillance Cargo dependencies
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-retrieve-cargo-v1-${{ matrix.provider }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save surveillance retrieval target
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-retrieve-target-v1-${{ matrix.provider }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
+
+  execute-active-subject:
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.retrieve-active.result == 'success' }}
+    needs: retrieve-active
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted current surveillance harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build current unprivileged harness before subject materialization
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Build current unprivileged process helper before subject materialization
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Download primary active provider evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          name: ephemeralEvidence-active-primary-worm
+          path: ci-out/active-primary
+      - name: Download secondary active provider evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          name: ephemeralEvidence-active-secondary-worm
+          path: ci-out/active-secondary
+      - name: Install pinned signature verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Derive exact signed active subject without credentials
+        id: active
+        run: ./target/ci/hell-ci surveillance-ops workflow-compare-active
+      - name: Check out exact active candidate as isolated subject data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.active.outputs.candidate }}
+          path: ci-work/active-subject
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build exact active subject executable without credentials
+        working-directory: ci-work/active-subject
+        run: cargo build --locked --release --package hell-cli --bin hell
+      - name: Retain exact active-subject dependency facts
+        working-directory: ci-work/active-subject
+        run: ../../target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation.json
+      - name: Retain signed active Linux oracle bytes for subject execution
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle ci-work/active-subject/ci-out/linux-release-oracle
+      - name: Retain signed active Linux oracle provider facts
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-provider.json ci-work/active-subject/ci-out/linux-release-provider.json
+      - name: Retain signed active Linux oracle receipt
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-receipt.json ci-work/active-subject/ci-out/linux-release-oracle-receipt.json
+      - name: Retain signed active Linux oracle acquisition attestation
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-acquisition.dsse.json ci-work/active-subject/ci-out/linux-release-oracle-acquisition.dsse.json
+      - name: Execute active subject through current retained harness
+        working-directory: ci-work/active-subject
+        run: ../../target/ci/hell-ci nightly-surveillance-subject --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
+      - name: Execute active subject mutation catalog without credentials
+        working-directory: ci-work/active-subject
+        run: ../../target/ci/hell-ci mutation run-surveillance --output ci-out/mutation/mutation-score.pending.json --github-dispatch-inputs
+      - name: Retain exact active mutation catalog authority
+        run: install -D ci-work/active-subject/compat/mutants.toml ci-work/active-subject/ci-out/subject-policy/compat/mutants.toml
+      - name: Retain exact active mutation threshold authority
+        run: install -D ci-work/active-subject/compat/mutation-policy.toml ci-work/active-subject/ci-out/subject-policy/compat/mutation-policy.toml
+      - name: Retain the exact executed active binary
+        run: install -D ci-work/active-subject/target/release/hell ci-work/active-subject/ci-out/candidate/hell
+      - name: Upload immutable active subject execution
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ephemeralEvidence-active-subject-execution
+          path: ci-work/active-subject/ci-out
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-and-transition:
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    needs:
+      - retrieve-active
+      - execute-active-subject
+    permissions:
+      actions: write
+      contents: read
+      id-token: write
+      issues: write
+    environment: promotion-surveillance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      public_report_exposes_current_state: ${{ steps.objective.outputs.public_report_exposes_current_state }}
+      require_signed_governance_action: ${{ steps.objective.outputs.require_signed_governance_action }}
+      transition_artifact_id: ${{ steps.upload-transition.outputs.artifact-id }}
+    steps:
+      - name: Check out surveillance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore surveillance Cargo dependencies
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-cargo-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore surveillance target
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-target-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
+      - name: Download primary active provider evidence
+        continue-on-error: true
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          name: ephemeralEvidence-active-primary-worm
+          path: ci-out/active-primary
+      - name: Download secondary active provider evidence
+        continue-on-error: true
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          name: ephemeralEvidence-active-secondary-worm
+          path: ci-out/active-secondary
+      - name: Download exact active subject execution by immutable artifact ID
+        continue-on-error: true
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          artifact-ids: ${{ needs.execute-active-subject.outputs.artifact_id }}
+          path: ci-out/surveillance/active-subject
+      - name: Install pinned signature verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Build surveillance driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Build trusted current process helper before subject download
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Retain exact current governance source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-retain-current-governance
+      - name: Verify two active signed provider contexts
+        id: active
+        continue-on-error: true
+        run: ./target/ci/hell-ci surveillance-ops workflow-compare-active
+      - name: Reverify exact provider-selected active subject execution
+        continue-on-error: true
+        env:
+          ACTIVE_SUBJECT_ARTIFACT_ID: ${{ needs.execute-active-subject.outputs.artifact_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-active-subject-selection
+      - name: Reverify stable public state against both provider heads
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}
+        run: ./target/ci/hell-ci custody-ops workflow-observe-public-transition
+      - name: Retain current dynamic assurance epoch
+        continue-on-error: true
+        run: ./target/ci/hell-ci evidence-epoch write --output ci-out/assurance-epoch.json
+      - name: Verify repository assurance, revocations, and divergence expiry
+        continue-on-error: true
+        run: ./target/ci/hell-ci assurance-verify --output ci-out/surveillance/assurance-policy.json
+      - name: Use exact active-subject differential result
+        continue-on-error: true
+        run: cp ci-out/surveillance/active-subject/nightly.json ci-out/surveillance/nightly.json
+      - name: Derive exact regression impact from retained mismatch evidence
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-impact
+      - name: Reverify and synchronize linked divergence issue summaries
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-divergence-issues
+      - name: Dispatch exact active-candidate native provenance rebuild
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-dispatch-native-provenance
+      - name: Select exact current reviewed native provenance
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-native-provenance
+      - name: Use exact replayed active-subject mutation result
+        continue-on-error: true
+        run: cp -a ci-out/surveillance/active-subject/mutation ci-out/surveillance/mutation
+      - name: Derive objective component-bound surveillance result
+        if: ${{ always() }}
+        id: objective
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-objective
+      - name: Derive fail-closed promotion state transition
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-observe
+      - name: Load protected surveillance state signer
+        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SURVEILLANCE_STATE_SSH_PRIVATE_KEY }}
+      - name: Prepare exact transition review packet
+        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
+        run: ./target/ci/hell-ci custody-ops workflow-transition-packet
+      - name: Sign exact promotion state transition
+        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
+        run: ./target/ci/hell-ci review-sign --input ci-out/surveillance/promotion-transition-packet.json --output ci-out/surveillance/promotion-transition.dsse.json --role custody-reviewer --decision accept --policy ci-out/surveillance/current-governance-source/compat/reviews.allowed_signers
+      - name: Verify signed promotion state transition
+        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
+        run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy ci-out/surveillance/current-governance-source/compat/reviews.allowed_signers --role custody-reviewer
+      - name: Upload surveillance transition and objective inputs
+        id: upload-transition
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-surveillance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/surveillance
+          if-no-files-found: error
+          retention-days: 30
+      - name: Require current promoted state
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci surveillance-ops require-promoted --input ci-out/surveillance/promotion-transition.json
+      - name: Save surveillance Cargo dependencies
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-cargo-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save surveillance target
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-target-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
+
+  publish-current-state:
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.verify-and-transition.outputs.public_report_exposes_current_state == 'true' }}
+    needs: verify-and-transition
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: primary-worm
+            environment: custody-primary-state-publication
+            runner-label: custody-primary-activation
+            role-variable: CUSTODY_PRIMARY_STATE_PUBLICATION_ROLE
+            region-variable: CUSTODY_PRIMARY_REGION
+          - provider: secondary-worm
+            environment: custody-secondary-state-publication
+            runner-label: custody-secondary-activation
+            role-variable: CUSTODY_SECONDARY_STATE_PUBLICATION_ROLE
+            region-variable: CUSTODY_SECONDARY_REGION
+    environment: ${{ matrix.environment }}
+    runs-on:
+      - self-hosted
+      - ${{ matrix.runner-label }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out surveillance source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build state publication driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download signed surveillance transition
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-and-transition.outputs.transition_artifact_id }}
+          path: ci-out/surveillance
+      - name: Install pinned state signature verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify transition before provider publication
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy compat/reviews.allowed_signers --role custody-reviewer
+      - name: Configure protected state publication identity
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars[matrix.role-variable] }}
+          aws-region: ${{ vars[matrix.region-variable] }}
+      - name: Publish exact signed current state immutably
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci custody-ops workflow-publish-transition
+
+  publish-public-report:
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.verify-and-transition.outputs.public_report_exposes_current_state == 'true' && needs.publish-current-state.result == 'success' }}
+    needs:
+      - verify-and-transition
+      - publish-current-state
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    environment: compatibility-public-report-publication
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out trusted public report publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted public report publisher
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download signed surveillance transition for public report
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-and-transition.outputs.transition_artifact_id }}
+          path: ci-out/surveillance
+      - name: Install pinned public report signature verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify transition before public publication
+        run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy compat/reviews.allowed_signers --role custody-reviewer
+      - name: Verify exact immutable public source artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PUBLIC_REPORT_SOURCE_ARTIFACT_ID: ${{ needs.verify-and-transition.outputs.transition_artifact_id }}
+        run: ./target/ci/hell-ci custody-ops workflow-verify-public-source-artifact
+      - name: Configure protected public report identity
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_ROLE }}
+          aws-region: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_REGION }}
+      - name: Publish and anonymously reverify stable public current state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PUBLIC_COMPATIBILITY_REPORT_BUCKET: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BUCKET }}
+          PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}
+          PUBLIC_REPORT_SOURCE_ARTIFACT_ID: ${{ needs.verify-and-transition.outputs.transition_artifact_id }}
+        run: ./target/ci/hell-ci custody-ops workflow-publish-public-transition
+      - name: Retain public report publication receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-public-current-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci-out/surveillance/public-report-publication.json
+            ci-out/surveillance/public-current-state.json
+            ci-out/surveillance/public-current-state-packet.json
+            ci-out/surveillance/public-current-state.dsse.json
+            ci-out/surveillance/public-current-state-publication.json
+            ci-out/surveillance/public-compatibility-report.md
+            ci-out/surveillance/public-accepted-divergences.json
+            ci-out/surveillance/public-public-release-statement.json
+            ci-out/public-source-selection
+          if-no-files-found: error
+          retention-days: 30
+
+  incident-alert:
+    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.verify-and-transition.result != 'success' || (needs.verify-and-transition.outputs.public_report_exposes_current_state == 'true' && (needs.publish-current-state.result != 'success' || needs.publish-public-report.result != 'success'))) }}
+    needs:
+      - verify-and-transition
+      - publish-current-state
+      - publish-public-report
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out incident adapter source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore incident adapter Cargo dependencies
+        id: incident-cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-incident-cargo-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore incident adapter target
+        id: incident-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-incident-target-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
+      - name: Build typed incident adapter
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Upsert promotion surveillance incident
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci surveillance-ops workflow-alert
+      - name: Save incident adapter Cargo dependencies
+        if: ${{ always() && steps.incident-cargo-cache.outcome == 'success' && steps.incident-cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: promotion-surveillance-incident-cargo-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save incident adapter target
+        if: ${{ always() && steps.incident-target-cache.outcome == 'success' && steps.incident-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: promotion-surveillance-incident-target-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}

@@ -139,7 +139,7 @@ fn supplied_example_43_takes_all_three_response_branches() {
         available_port()
     ));
     std::fs::create_dir_all(directory.join("docs")).unwrap();
-    std::fs::write(directory.join("docs/readme.md"), b"example file\n").unwrap();
+    std::fs::write(directory.join("docs").join("readme.md"), b"example file\n").unwrap();
     let (worker, receiver) = start_server_with_limit(&source, directory.clone(), 3);
 
     let present = exchange(
@@ -162,7 +162,7 @@ fn supplied_example_43_takes_all_three_response_branches() {
     assert_eq!(response_body(&file), b"example file\n");
 
     finish(worker, &receiver);
-    std::fs::remove_file(directory.join("docs/readme.md")).unwrap();
+    std::fs::remove_file(directory.join("docs").join("readme.md")).unwrap();
     std::fs::remove_dir(directory.join("docs")).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }
@@ -934,6 +934,26 @@ fn timed_cancellation_wakes_a_partial_request_body_read() {
         .expect("timed cancellation woke the partial HTTP request body")
         .unwrap();
     worker.join().unwrap();
+}
+
+#[test]
+fn blocked_body_test_detects_removed_process_stream_cancellation() {
+    let executable = std::env::current_exe().expect("HTTP integration test executable exists");
+    let output = std::process::Command::new(executable)
+        .env("HELL_ASSURANCE_MUTANT_ID", "process-stream-cancellation")
+        .args([
+            "--exact",
+            "timed_cancellation_wakes_a_partial_request_body_read",
+            "--nocapture",
+        ])
+        .output()
+        .expect("activated HTTP cancellation test starts");
+    assert!(
+        !output.status.success(),
+        "activated process-stream cancellation mutant survived: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

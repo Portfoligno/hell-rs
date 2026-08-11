@@ -186,15 +186,22 @@ pub enum HostHandle {
         handle: Arc<FileHandle>,
         /// Whether a process adapter closes the shared handle after use.
         close_after_process: bool,
+        /// Adapter responsible for the requested close lifecycle.
+        process_close_builtin: Option<u16>,
     },
 }
 
 impl HostHandle {
-    pub(crate) fn with_process_close(&self, close_after_process: bool) -> Self {
+    pub(crate) fn with_process_close(
+        &self,
+        close_after_process: bool,
+        process_close_builtin: Option<u16>,
+    ) -> Self {
         match self {
             Self::File { handle, .. } => Self::File {
                 handle: Arc::clone(handle),
                 close_after_process,
+                process_close_builtin,
             },
             value => value.clone(),
         }

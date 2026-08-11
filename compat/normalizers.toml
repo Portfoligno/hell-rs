@@ -1,0 +1,36 @@
+schema_version = 1
+state = "review-required"
+typed_only = true
+require_idempotence = true
+require_protected_field_invariance = true
+require_shadow_diff = true
+require_mutation_suite = true
+exact_claims_allow_normalizers = false
+
+[[normalizer]]
+id = "diagnostic-sandbox-path-v1"
+variant = "DiagnosticSandboxPathV1"
+implementation = "diagnostic_sandbox_path_v1"
+version = 1
+allowed_dimensions = ["presentation"]
+allowed_fields = ["diagnostic.paths[*]", "stderr.path_tokens[*]"]
+forbidden_fields = ["stdout", "diagnostic.code", "diagnostic.line", "diagnostic.column", "filesystem", "resourceAudit", "status", "semanticTrace", "taskEvents"]
+idempotent = true
+max_changed_values = 32
+max_removed_bytes = 4096
+requires_platforms = ["linux", "macos", "windows"]
+mutation_suite = "normalizer-path-safety-v1"
+
+[[normalizer]]
+id = "diagnostic-path-separator-v1"
+variant = "DiagnosticPathSeparatorV1"
+implementation = "diagnostic_path_separator_v1"
+version = 1
+allowed_dimensions = ["presentation"]
+allowed_fields = ["diagnostic.paths[*]", "stderr.path_tokens[*]"]
+forbidden_fields = ["stdout", "diagnostic.code", "diagnostic.line", "diagnostic.column", "filesystem", "resourceAudit", "status", "semanticTrace", "taskEvents"]
+idempotent = true
+max_changed_values = 32
+max_removed_bytes = 0
+requires_platforms = ["linux", "macos", "windows"]
+mutation_suite = "normalizer-path-safety-v1"

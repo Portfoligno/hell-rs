@@ -1,0 +1,1 @@
+main = IO.print $ Alternative.optional (Maybe.Just 3 :: Maybe Int)

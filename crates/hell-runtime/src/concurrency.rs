@@ -1,27 +1,56 @@
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "compat-tracing")]
+use super::RuntimeErrorKind;
+#[cfg(not(feature = "compat-tracing"))]
+use super::Suspension;
 use super::{
-    Evaluator, IoAction, ListCell, PrimitiveFamily, PrimitiveVariantValue, RuntimeContext,
-    RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef, Value, list_from_values,
+    BuiltinId, Evaluator, IoAction, ListCell, PrimitiveFamily, PrimitiveVariantValue,
+    RuntimeContext, RuntimeError, RuntimeResult, Thunk, ThunkRef, Value, list_from_values,
 };
+#[cfg(feature = "compat-tracing")]
+use crate::AdapterCausalIdentity;
 pub(super) use crate::scope::{CancelReason, CancellationToken};
 use crate::scope::{ChildScopePolicy, ExecutionScope, ScopeGuard, TaskHandle};
 
-pub(super) fn thread_delay(delay: ThunkRef) -> IoAction {
+pub(super) fn thread_delay(builtin: BuiltinId, delay: ThunkRef) -> IoAction {
     IoAction::new(move |evaluator, _| {
-        let microseconds = evaluator.force_int(&delay)?;
+        #[cfg(not(feature = "compat-tracing"))]
+        let _ = builtin;
+        #[cfg(feature = "compat-tracing")]
+        let task = evaluator.record_task_started(builtin)?;
+        let microseconds = match evaluator.force_int(&delay) {
+            Ok(microseconds) => microseconds,
+            Err(error) => {
+                #[cfg(feature = "compat-tracing")]
+                evaluator.record_task_terminal(builtin, task, "failed")?;
+                return Err(error);
+            }
+        };
         if microseconds <= 0 {
+            #[cfg(feature = "compat-tracing")]
+            evaluator.record_task_terminal(builtin, task, "completed")?;
             return Ok(Thunk::evaluated(Value::Unit));
         }
         let duration = Duration::from_micros(microseconds.cast_unsigned());
-        let deadline = Instant::now()
-            .checked_add(duration)
-            .ok_or_else(|| RuntimeError::internal("thread delay duration overflowed"))?;
+        let Some(deadline) = Instant::now().checked_add(duration) else {
+            #[cfg(feature = "compat-tracing")]
+            evaluator.record_task_terminal(builtin, task, "failed")?;
+            return Err(RuntimeError::internal("thread delay duration overflowed"));
+        };
         loop {
+            #[cfg(feature = "compat-tracing")]
+            if let Err(error) = evaluator.ensure_not_cancelled() {
+                evaluator.record_task_terminal(builtin, task, "cancelled")?;
+                return Err(error);
+            }
+            #[cfg(not(feature = "compat-tracing"))]
             evaluator.ensure_not_cancelled()?;
             let now = Instant::now();
             if now >= deadline {
+                #[cfg(feature = "compat-tracing")]
+                evaluator.record_task_terminal(builtin, task, "completed")?;
                 return Ok(Thunk::evaluated(Value::Unit));
             }
             if evaluator.cancellation.wait_timeout(
@@ -29,14 +58,18 @@ pub(super) fn thread_delay(delay: ThunkRef) -> IoAction {
                     .saturating_duration_since(now)
                     .min(Duration::from_millis(2)),
             ) {
+                #[cfg(feature = "compat-tracing")]
+                evaluator.record_task_terminal(builtin, task, "cancelled")?;
                 return Err(RuntimeError::cancelled());
             }
         }
     })
 }
 
-pub(super) fn timeout(delay: ThunkRef, action: ThunkRef) -> IoAction {
+pub(super) fn timeout(builtin: BuiltinId, delay: ThunkRef, action: ThunkRef) -> IoAction {
     IoAction::new(move |evaluator, context| {
+        #[cfg(not(feature = "compat-tracing"))]
+        let _ = builtin;
         let microseconds = evaluator.force_int(&delay)?;
         if microseconds == 0 {
             return Ok(Thunk::evaluated(Value::Maybe(None)));
@@ -58,6 +91,12 @@ pub(super) fn timeout(delay: ThunkRef, action: ThunkRef) -> IoAction {
             })?
             .guard();
         let mut child = evaluator.fork_with_scope((*child_scope).clone());
+        #[cfg(feature = "compat-tracing")]
+        let task = evaluator.record_task_started(builtin)?;
+        #[cfg(feature = "compat-tracing")]
+        {
+            child.current_evidence_task = (task != 0).then_some(task);
+        }
         let worker_context = context.clone();
         let action = Arc::clone(&action);
         let worker =
@@ -65,27 +104,37 @@ pub(super) fn timeout(delay: ThunkRef, action: ThunkRef) -> IoAction {
         loop {
             if let Err(error) = evaluator.ensure_not_cancelled() {
                 child_scope.cancel(&CancelReason::ParentCancelled);
+                #[cfg(feature = "compat-tracing")]
+                evaluator.record_task_terminal(builtin, task, "cancelled")?;
                 child_scope.close_with_primary(Some(error))?;
                 unreachable!("closing with a primary error always returns that error")
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 child_scope.cancel(&CancelReason::Timeout);
+                #[cfg(feature = "compat-tracing")]
+                evaluator.record_task_terminal(builtin, task, "cancelled")?;
                 child_scope.close()?;
                 return Ok(Thunk::evaluated(Value::Maybe(None)));
             }
             match worker.recv_timeout(remaining.min(Duration::from_millis(10))) {
                 Ok(Ok(value)) => {
+                    #[cfg(feature = "compat-tracing")]
+                    evaluator.record_task_terminal(builtin, task, "completed")?;
                     child_scope.close()?;
                     return Ok(Thunk::evaluated(Value::Maybe(Some(value))));
                 }
                 Ok(Err(error)) => {
+                    #[cfg(feature = "compat-tracing")]
+                    evaluator.record_task_terminal(builtin, task, "failed")?;
                     child_scope.close_with_primary(Some(error))?;
                     unreachable!("closing with a primary error always returns that error")
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     child_scope.cancel(&CancelReason::SiblingFailed);
+                    #[cfg(feature = "compat-tracing")]
+                    evaluator.record_task_terminal(builtin, task, "cancelled")?;
                     child_scope.close_with_primary(Some(RuntimeError::internal(
                         "timeout worker disconnected",
                     )))?;
@@ -96,12 +145,12 @@ pub(super) fn timeout(delay: ThunkRef, action: ThunkRef) -> IoAction {
     })
 }
 
-pub(super) fn concurrently(left: ThunkRef, right: ThunkRef) -> IoAction {
-    parallel_pair(left, right, PairMode::Both)
+pub(super) fn concurrently(builtin: BuiltinId, left: ThunkRef, right: ThunkRef) -> IoAction {
+    parallel_pair(builtin, left, right, PairMode::Both)
 }
 
-pub(super) fn race(left: ThunkRef, right: ThunkRef) -> IoAction {
-    parallel_pair(left, right, PairMode::Race)
+pub(super) fn race(builtin: BuiltinId, left: ThunkRef, right: ThunkRef) -> IoAction {
+    parallel_pair(builtin, left, right, PairMode::Race)
 }
 
 #[derive(Clone, Copy)]
@@ -110,33 +159,128 @@ enum PairMode {
     Race,
 }
 
-fn parallel_pair(left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
-    parallel_pair_with_cancellation_observer(left, right, mode, || {})
+#[derive(Default)]
+struct PairPreparationGate {
+    state: Mutex<PairPreparationState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct PairPreparationState {
+    arrived: u8,
+    aborted: bool,
+}
+
+impl PairPreparationGate {
+    fn arrive_and_wait(&self) -> RuntimeResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::internal("pair preparation gate was poisoned"))?;
+        state.arrived = state.arrived.saturating_add(1);
+        self.ready.notify_all();
+        while state.arrived != 2 && !state.aborted {
+            state = self
+                .ready
+                .wait(state)
+                .map_err(|_| RuntimeError::internal("pair preparation gate was poisoned"))?;
+        }
+        if state.aborted {
+            Err(RuntimeError::internal("parallel pair preparation aborted"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn abort(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.aborted = true;
+            self.ready.notify_all();
+        }
+    }
+}
+
+type PreparedPair = (ScopeGuard, ScopeGuard, Evaluator, Evaluator, u64, u64);
+
+fn prepare_pair(
+    evaluator: &mut Evaluator,
+    pair_scope: &ScopeGuard,
+    builtin: BuiltinId,
+) -> RuntimeResult<PreparedPair> {
+    let left_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
+    let right_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
+    let mut left_evaluator = evaluator.fork_with_scope((*left_scope).clone());
+    let mut right_evaluator = evaluator.fork_with_scope((*right_scope).clone());
+    #[cfg(feature = "compat-tracing")]
+    let left_task = evaluator.record_task_started(builtin)?;
+    #[cfg(not(feature = "compat-tracing"))]
+    let left_task = 0;
+    #[cfg(feature = "compat-tracing")]
+    let right_task = evaluator.record_task_started(builtin)?;
+    #[cfg(not(feature = "compat-tracing"))]
+    let right_task = 0;
+    #[cfg(feature = "compat-tracing")]
+    {
+        left_evaluator.current_evidence_task = (left_task != 0).then_some(left_task);
+        right_evaluator.current_evidence_task = (right_task != 0).then_some(right_task);
+    }
+    #[cfg(not(feature = "compat-tracing"))]
+    {
+        let _ = (
+            &mut left_evaluator,
+            &mut right_evaluator,
+            builtin,
+            left_task,
+            right_task,
+        );
+    }
+    Ok((
+        left_scope,
+        right_scope,
+        left_evaluator,
+        right_evaluator,
+        left_task,
+        right_task,
+    ))
+}
+
+fn parallel_pair(builtin: BuiltinId, left: ThunkRef, right: ThunkRef, mode: PairMode) -> IoAction {
+    parallel_pair_with_cancellation_observer(builtin, left, right, mode, || {})
 }
 
 fn parallel_pair_with_cancellation_observer(
+    builtin: BuiltinId,
     left: ThunkRef,
     right: ThunkRef,
     mode: PairMode,
     observe_cancellation: impl Fn() + Send + Sync + 'static,
 ) -> IoAction {
     IoAction::new(move |evaluator, context| {
+        #[cfg(not(feature = "compat-tracing"))]
+        let _ = builtin;
         evaluator.ensure_not_cancelled()?;
         let pair_scope = current_scope(evaluator)
             .child(ChildScopePolicy::default())?
             .guard();
-        let left_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
-        let right_scope = pair_scope.child(ChildScopePolicy::default())?.guard();
-        let mut left_evaluator = evaluator.fork_with_scope((*left_scope).clone());
-        let mut right_evaluator = evaluator.fork_with_scope((*right_scope).clone());
+        let (
+            left_scope,
+            right_scope,
+            mut left_evaluator,
+            mut right_evaluator,
+            left_task,
+            right_task,
+        ) = prepare_pair(evaluator, &pair_scope, builtin)?;
         let left_context = context.clone();
         let right_context = context.clone();
         let left = Arc::clone(&left);
         let right = Arc::clone(&right);
+        let preparation_gate = Arc::new(PairPreparationGate::default());
         let (sender, receiver) = mpsc::channel();
         let left_sender = sender.clone();
+        let left_gate = Arc::clone(&preparation_gate);
         let left_worker = left_scope.spawn(move |_| {
-            let result = run_thunk_caught(&left, &mut left_evaluator, &left_context);
+            let result =
+                run_pair_thunk_caught(&left, &mut left_evaluator, &left_context, &left_gate);
             let _ignored = left_sender.send((0_usize, result));
             Ok(())
         });
@@ -144,12 +288,15 @@ fn parallel_pair_with_cancellation_observer(
             close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
             unreachable!("closing scopes with a primary error returns the error")
         }
+        let right_gate = Arc::clone(&preparation_gate);
         let right_worker = right_scope.spawn(move |_| {
-            let result = run_thunk_caught(&right, &mut right_evaluator, &right_context);
+            let result =
+                run_pair_thunk_caught(&right, &mut right_evaluator, &right_context, &right_gate);
             let _ignored = sender.send((1_usize, result));
             Ok(())
         });
         if let Err(error) = right_worker {
+            preparation_gate.abort();
             close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
             unreachable!("closing scopes with a primary error returns the error")
         }
@@ -162,6 +309,16 @@ fn parallel_pair_with_cancellation_observer(
                 unreachable!("closing scopes with a primary error returns the error")
             }
         };
+        #[cfg(feature = "compat-tracing")]
+        evaluator.record_task_terminal(
+            builtin,
+            if first.0 == 0 { left_task } else { right_task },
+            if first.1.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        )?;
         if matches!(mode, PairMode::Race) || first.1.is_err() {
             let loser = if first.0 == 0 {
                 &right_scope
@@ -175,49 +332,83 @@ fn parallel_pair_with_cancellation_observer(
             };
             observe_cancellation();
             loser.cancel(&reason);
+            #[cfg(feature = "compat-tracing")]
+            evaluator.record_task_terminal(
+                builtin,
+                if first.0 == 0 { right_task } else { left_task },
+                "cancelled",
+            )?;
         }
 
-        match mode {
-            PairMode::Race => {
-                let (index, result) = first;
-                close_pair_scopes(pair_scope, left_scope, right_scope, result.as_ref().err())?;
-                result.map(|payload| {
-                    Thunk::evaluated(Value::PrimitiveVariant(PrimitiveVariantValue {
-                        family: PrimitiveFamily::Either,
-                        constructor_index: u8::try_from(index).expect("race side is 0 or 1"),
-                        payloads: Arc::from([payload]),
-                    }))
-                })
-            }
-            PairMode::Both => {
-                if let Err(error) = first.1 {
-                    close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
-                    unreachable!("closing scopes with a primary error returns the error")
-                }
-                let second = match recv_parallel_result(&receiver, evaluator) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        pair_scope.cancel(&CancelReason::ParentCancelled);
-                        close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
-                        unreachable!("closing scopes with a primary error returns the error")
-                    }
-                };
-                if let Err(error) = second.1 {
-                    close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
-                    unreachable!("closing scopes with a primary error returns the error")
-                }
-                let mut results: [Option<ThunkRef>; 2] = [None, None];
-                let first_value = first.1.expect("parallel error handled above");
-                let second_value = second.1.expect("parallel error handled above");
-                results[first.0] = Some(first_value);
-                results[second.0] = Some(second_value);
-                close_pair_scopes(pair_scope, left_scope, right_scope, None)?;
-                let left = results[0].take().expect("left parallel result installed");
-                let right = results[1].take().expect("right parallel result installed");
-                Ok(Thunk::evaluated(Value::Tuple([left, right].into())))
-            }
-        }
+        finish_parallel_pair(
+            mode,
+            (pair_scope, left_scope, right_scope),
+            evaluator,
+            &receiver,
+            first,
+            (builtin, left_task, right_task),
+        )
     })
+}
+
+type ParallelResult = (usize, RuntimeResult<ThunkRef>);
+
+fn finish_parallel_pair(
+    mode: PairMode,
+    scopes: (ScopeGuard, ScopeGuard, ScopeGuard),
+    evaluator: &mut Evaluator,
+    receiver: &mpsc::Receiver<ParallelResult>,
+    first: ParallelResult,
+    trace: (BuiltinId, u64, u64),
+) -> RuntimeResult<ThunkRef> {
+    let (pair_scope, left_scope, right_scope) = scopes;
+    let (builtin, left_task, right_task) = trace;
+    if matches!(mode, PairMode::Race) {
+        let (index, result) = first;
+        close_pair_scopes(pair_scope, left_scope, right_scope, result.as_ref().err())?;
+        return result.map(|payload| {
+            Thunk::evaluated(Value::PrimitiveVariant(PrimitiveVariantValue {
+                family: PrimitiveFamily::Either,
+                constructor_index: u8::try_from(index).expect("race side is 0 or 1"),
+                payloads: Arc::from([payload]),
+            }))
+        });
+    }
+    if let Err(error) = first.1 {
+        close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+        unreachable!("closing scopes with a primary error returns the error")
+    }
+    let second = match recv_parallel_result(receiver, evaluator) {
+        Ok(result) => result,
+        Err(error) => {
+            pair_scope.cancel(&CancelReason::ParentCancelled);
+            close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+            unreachable!("closing scopes with a primary error returns the error")
+        }
+    };
+    #[cfg(feature = "compat-tracing")]
+    evaluator.record_task_terminal(
+        builtin,
+        if second.0 == 0 { left_task } else { right_task },
+        if second.1.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    )?;
+    #[cfg(not(feature = "compat-tracing"))]
+    let _ = (builtin, left_task, right_task);
+    if let Err(error) = second.1 {
+        close_pair_scopes(pair_scope, left_scope, right_scope, Some(&error))?;
+        unreachable!("closing scopes with a primary error returns the error")
+    }
+    let mut results: [Option<ThunkRef>; 2] = [None, None];
+    results[first.0] = Some(first.1.expect("parallel error handled above"));
+    results[second.0] = Some(second.1.expect("parallel error handled above"));
+    close_pair_scopes(pair_scope, left_scope, right_scope, None)?;
+    let left = results[0].take().expect("left parallel result installed");
+    let right = results[1].take().expect("right parallel result installed");
+    Ok(Thunk::evaluated(Value::Tuple([left, right].into())))
 }
 
 fn recv_parallel_result(
@@ -275,8 +466,17 @@ fn close_pair_scopes(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) -> IoAction {
+pub(super) fn pooled(
+    builtin: BuiltinId,
+    callback: ThunkRef,
+    list: ThunkRef,
+    discard_results: bool,
+    callback_argument: u16,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> IoAction {
     IoAction::new(move |evaluator, context| {
+        #[cfg(not(feature = "compat-tracing"))]
+        let _ = builtin;
         evaluator.ensure_not_cancelled()?;
         let pool_scope = current_scope(evaluator)
             .child(ChildScopePolicy::default())?
@@ -328,12 +528,68 @@ pub(super) fn pooled(callback: ThunkRef, list: ThunkRef, discard_results: bool) 
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .recv_timeout(Duration::from_millis(10));
-                    let (index, item) = match job {
+                    let (index, evidence_task, item) = match job {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
-                    let result = run_callback(&callback, item, &mut worker_evaluator, &context);
+                    #[cfg(not(feature = "compat-tracing"))]
+                    let _ = evidence_task;
+                    #[cfg(feature = "compat-tracing")]
+                    {
+                        let logical_invocation = u64::try_from(index)
+                            .map_err(|_| RuntimeError::internal("pooled input index exceeds u64"))?
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                RuntimeError::internal("pooled input ordinal overflowed")
+                            })?;
+                        worker_evaluator.register_pooled_task_ordinal(
+                            builtin,
+                            evidence_task,
+                            logical_invocation,
+                        )?;
+                        worker_evaluator.record_task_started_with_id(builtin, evidence_task)?;
+                        worker_evaluator.current_evidence_task =
+                            (evidence_task != 0).then_some(evidence_task);
+                    }
+                    if worker_cancellation.is_cancelled() {
+                        #[cfg(feature = "compat-tracing")]
+                        {
+                            worker_evaluator.record_task_terminal(
+                                builtin,
+                                evidence_task,
+                                "cancelled",
+                            )?;
+                        }
+                        break;
+                    }
+                    let result = run_callback(
+                        PooledCallbackRequest {
+                            callback: &callback,
+                            item,
+                            callback_argument,
+                            #[cfg(feature = "compat-tracing")]
+                            parent: callback_parent,
+                            #[cfg(feature = "compat-tracing")]
+                            logical_invocation: u64::try_from(index)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(1),
+                            #[cfg(feature = "compat-tracing")]
+                            logical_task: evidence_task,
+                        },
+                        &mut worker_evaluator,
+                        &context,
+                    );
+                    #[cfg(feature = "compat-tracing")]
+                    {
+                        let lifecycle = match &result {
+                            Ok(_) => "completed",
+                            Err(error) if error.kind == RuntimeErrorKind::Cancelled => "cancelled",
+                            Err(_) => "failed",
+                        };
+                        worker_evaluator.record_task_terminal(builtin, evidence_task, lifecycle)?;
+                        worker_evaluator.current_evidence_task = None;
+                    }
                     let failed = result.is_err();
                     if sender.send((index, result)).is_err() {
                         break;
@@ -439,9 +695,9 @@ fn recv_finished_task<T>(
 }
 
 fn send_job(
-    sender: &mpsc::SyncSender<(usize, ThunkRef)>,
+    sender: &mpsc::SyncSender<(usize, u64, ThunkRef)>,
     cancellation: &CancellationToken,
-    mut job: (usize, ThunkRef),
+    mut job: (usize, u64, ThunkRef),
 ) -> RuntimeResult<()> {
     loop {
         cancellation.check()?;
@@ -463,7 +719,7 @@ fn send_job(
 fn produce_jobs(
     evaluator: &mut Evaluator,
     list: ThunkRef,
-    sender: &mpsc::SyncSender<(usize, ThunkRef)>,
+    sender: &mpsc::SyncSender<(usize, u64, ThunkRef)>,
     cancellation: &CancellationToken,
 ) -> RuntimeResult<usize> {
     let mut current = list;
@@ -475,7 +731,15 @@ fn produce_jobs(
         match evaluator.force(&current)?.as_ref() {
             Value::List(ListCell::Nil) => return Ok(index),
             Value::List(ListCell::Cons { head, tail }) => {
-                send_job(sender, cancellation, (index, Arc::clone(head)))?;
+                #[cfg(feature = "compat-tracing")]
+                let evidence_task = evaluator.allocate_evidence_task()?;
+                #[cfg(not(feature = "compat-tracing"))]
+                let evidence_task = 0;
+                send_job(
+                    sender,
+                    cancellation,
+                    (index, evidence_task, Arc::clone(head)),
+                )?;
                 index = index
                     .checked_add(1)
                     .ok_or_else(|| RuntimeError::resource_limit("pooled input is too large"))?;
@@ -486,16 +750,39 @@ fn produce_jobs(
     }
 }
 
-fn run_callback(
-    callback: &ThunkRef,
+struct PooledCallbackRequest<'a> {
+    callback: &'a ThunkRef,
     item: ThunkRef,
+    callback_argument: u16,
+    #[cfg(feature = "compat-tracing")]
+    parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")]
+    logical_invocation: u64,
+    #[cfg(feature = "compat-tracing")]
+    logical_task: u64,
+}
+
+fn run_callback(
+    request: PooledCallbackRequest<'_>,
     evaluator: &mut Evaluator,
     context: &RuntimeContext,
 ) -> RuntimeResult<ThunkRef> {
     evaluator.ensure_not_cancelled()?;
+    #[cfg(feature = "compat-tracing")]
+    let application = Evaluator::pooled_callback_application(
+        request.parent,
+        Arc::clone(request.callback),
+        request.item,
+        request.callback_argument,
+        request.logical_invocation,
+        request.logical_task,
+    );
+    #[cfg(not(feature = "compat-tracing"))]
+    let _ = request.callback_argument;
+    #[cfg(not(feature = "compat-tracing"))]
     let application = Thunk::suspended(Suspension::Apply {
-        function: Arc::clone(callback),
-        argument: item,
+        function: Arc::clone(request.callback),
+        argument: request.item,
     });
     let action = evaluator.force_io(&application)?;
     run_caught(&action, evaluator, context)
@@ -536,6 +823,34 @@ fn run_thunk_caught(
             "panic crossed a concurrent IO action boundary",
         ))
     })
+}
+
+fn run_pair_thunk_caught(
+    action: &ThunkRef,
+    evaluator: &mut Evaluator,
+    context: &RuntimeContext,
+    preparation_gate: &PairPreparationGate,
+) -> RuntimeResult<ThunkRef> {
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        evaluator.ensure_not_cancelled()?;
+        evaluator.force_io(action)
+    }));
+    preparation_gate.arrive_and_wait()?;
+    match prepared {
+        Ok(Ok(action)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evaluator.ensure_not_cancelled()?;
+            action.run(evaluator, context)
+        }))
+        .unwrap_or_else(|_| {
+            Err(RuntimeError::panic_contained(
+                "panic crossed a concurrent IO action boundary",
+            ))
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(RuntimeError::panic_contained(
+            "panic crossed a concurrent IO action preparation boundary",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -605,17 +920,28 @@ mod tests {
                 .map_err(|_| {
                     RuntimeError::internal("cancellation test failing branch disconnected")
                 })?;
-            thread_delay(Thunk::evaluated(Value::Int(5_000_000))).run(evaluator, context)
+            thread_delay(
+                hell_builtins::lookup("Concurrent.threadDelay")
+                    .expect("thread delay builtin")
+                    .id,
+                Thunk::evaluated(Value::Int(5_000_000)),
+            )
+            .run(evaluator, context)
         })));
         let observed_cancellation_started = Arc::clone(&cancellation_started);
-        let error =
-            parallel_pair_with_cancellation_observer(failure, waiting, PairMode::Both, move || {
+        let error = parallel_pair_with_cancellation_observer(
+            hell_builtins::BuiltinId(0),
+            failure,
+            waiting,
+            PairMode::Both,
+            move || {
                 observed_cancellation_started
                     .set(Instant::now())
                     .expect("peer cancellation is observed once");
-            })
-            .run(&mut evaluator, &context)
-            .expect_err("failing branch remains the primary error");
+            },
+        )
+        .run(&mut evaluator, &context)
+        .expect_err("failing branch remains the primary error");
         let started = cancellation_started
             .get()
             .expect("peer cancellation was observed");

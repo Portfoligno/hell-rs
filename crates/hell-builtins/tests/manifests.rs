@@ -149,3 +149,15 @@ fn instance_manifest_is_the_exact_closed_world_snapshot() {
     );
     assert_eq!(snapshot_for("FoldCase"), "Text:direct0|ByteString:direct0");
 }
+
+#[test]
+fn every_constrained_builtin_has_one_registry_owned_instance_head_projection() {
+    for spec in hell_builtins::registry() {
+        assert_eq!(
+            spec.type_class.is_some(),
+            hell_builtins::instance_head_projection(spec.name).is_some(),
+            "instance-head projection inventory disagrees for {}",
+            spec.name
+        );
+    }
+}

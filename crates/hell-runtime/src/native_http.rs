@@ -107,7 +107,7 @@ pub(crate) fn apply_native(
             ))
         }),
         "http_request_headers" => request(evaluator, &arguments[0]).map(|request| {
-            let headers = request
+            let mut headers = request
                 .headers
                 .iter()
                 .map(|(name, value)| {
@@ -126,7 +126,10 @@ pub(crate) fn apply_native(
                         .into(),
                     ))
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if crate::semantic_mutant_active("http-duplicate-header-collapse") {
+                headers.truncate(2);
+            }
             ForceOutcome::Alias(list_from_values(headers))
         }),
         "http_query_string" => request(evaluator, &arguments[0]).map(|request| {
@@ -264,6 +267,7 @@ struct RuntimeHttpApplication {
 
 struct ScopedHttpServer {
     cancellation: HostCancellation,
+    cancellation_requested: AtomicBool,
     closed: Arc<AtomicBool>,
 }
 
@@ -273,11 +277,18 @@ impl ScopedResource for ScopedHttpServer {
     }
 
     fn request_cancel(&self, _reason: &CancelReason) {
-        self.cancellation.cancel();
+        self.cancellation_requested.store(true, Ordering::Release);
+        if !crate::semantic_mutant_active("process-stream-cancellation") {
+            self.cancellation.cancel();
+        }
     }
 
     fn close(&self) -> RuntimeResult<()> {
-        self.cancellation.cancel();
+        let mutated_cancel_path = crate::semantic_mutant_active("process-stream-cancellation")
+            && self.cancellation_requested.load(Ordering::Acquire);
+        if !mutated_cancel_path {
+            self.cancellation.cancel();
+        }
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -374,6 +385,7 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
         let host_shutdown = HostCancellation::new();
         let server_resource = evaluator.execution_scope().register(ScopedHttpServer {
             cancellation: host_shutdown.clone(),
+            cancellation_requested: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
         })?;
         let first_error = Arc::new(Mutex::new(None));
@@ -389,6 +401,7 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
         });
         let limits = &context.policy.limits;
         let connection_budget = Arc::clone(&context.budget);
+        let cancellation_propagates = !crate::semantic_mutant_active("process-stream-cancellation");
         let config = ServerConfig {
             port,
             loopback_only: !context.policy.capabilities.network_external,
@@ -407,7 +420,8 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
             graceful_shutdown: context.policy.cancellation.graceful_shutdown,
             request_limit: context.http_request_limit,
             shutdown_requested: Arc::new(move || {
-                shutdown_cancellation.is_cancelled() || host_shutdown.is_cancelled()
+                cancellation_propagates
+                    && (shutdown_cancellation.is_cancelled() || host_shutdown.is_cancelled())
             }),
             acquire_connection: Arc::new(move || {
                 connection_budget

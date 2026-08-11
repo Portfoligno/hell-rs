@@ -1,0 +1,11 @@
+schema_version = 1
+state = "review-required"
+repository = "Portfoligno/hell-rs"
+repository_id = "REVIEW_REQUIRED"
+workflow = ".github/workflows/nightly.yml"
+minimum_acquisitions = 2
+minimum_trust_domains = 2
+required_channel_classes = ["github-actions-api", "external-versioned-object"]
+require_workflow_identity = true
+require_candidate_commit = true
+require_public_attestation_when_available = true

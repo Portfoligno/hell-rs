@@ -1,0 +1,2 @@
+# REVIEW_REQUIRED: replace with the dedicated protected-environment A public key.
+assurance-transport-probe-a:probe-a ssh-ed25519 AAAA

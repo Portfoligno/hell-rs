@@ -1,16 +1,4 @@
-//! Reviewed compatibility overrides.
+//! Compatibility claims are generated from the canonical `compat/claims` catalog.
 //!
-//! Promotion tooling may render a worklist, but it never writes this module.
-//! The table intentionally remains empty until retained evidence and native
-//! provenance have completed independent review.
-
-use crate::{CompatibilityDimension, ScopedClaim};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ClaimOverride {
-    pub builtin: &'static str,
-    pub dimension: CompatibilityDimension,
-    pub scopes: &'static [ScopedClaim],
-}
-
-pub(crate) const OVERRIDES: &[ClaimOverride] = &[];
+//! This tracked marker remains so repository-policy scans retain the historical
+//! source path without reintroducing a parallel Rust override table.

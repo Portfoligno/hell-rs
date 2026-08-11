@@ -1,0 +1,46 @@
+schema_version = 2
+baseline = "2026-05-29"
+
+[default_scope]
+profiles = ["upstream", "sandboxed"]
+platforms = ["linux", "macos", "windows"]
+status = "unverified"
+evidence = []
+normalizers = []
+obligations = []
+applicability_rule = "catalog-default-review-required"
+rationale = "No reviewed semantic evidence is committed."
+issue = "COMPAT-EVIDENCE"
+review_group = ""
+
+reviewed semantic evidence is committed."
+issue = "COMPAT-EVIDENCE"
+review_group = ""
+
+[[claim]]
+builtin = "Bool.bool"
+dimension = "pure-runtime"
+
+[[claim.scope]]
+profiles = ["upstream"]
+platforms = ["linux", "macos", "windows"]
+status = "unverified"
+evidence = []
+normalizers = []
+obligations = ["adapter-success", "lazy-boundary", "conditional-selected", "conditional-unselected", "typed-result", "constructor-eliminator"]
+applicability_rule = "implemented-runtime-adapter"
+rationale = "The committed cases declare Bool.bool adapter, demand-boundary, typed-restted."
+issue = "COMPAT-EVIDENCE"
+review_group = "bool-conditional-v1"
+
+[[claim.scope]]
+profiles = ["sandboxed"]
+platforms = ["linux", "macos", "windows"]
+status = "unverified"
+evidence = []
+normalizers = []
+obligations = []
+applicability_rule = "sandboxed-profile-review-required"
+rationale = "Sandbox policy is a distinct compatibility scope and has no reviewed retained evidence."
+issue = "COMPAT-EVIDENCE"
+review_group = ""

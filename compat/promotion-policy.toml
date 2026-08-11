@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 baseline = "2026-05-29"
 required_profiles = ["upstream"]
 required_platforms = ["linux-amd64", "macos-arm64", "windows-amd64"]
@@ -15,3 +15,46 @@ required_dimensions = [
 minimum_generated_observations = 1024
 require_committed_observations = true
 allow_generated_claim_references = false
+required_records = [
+  "artifactAuthenticity",
+  "claimCoverage",
+  "custody",
+  "divergence",
+  "mutation",
+  "normalizerAudit",
+  "oracleProvenanceMacos",
+  "oracleProvenanceWindows",
+  "residualRisk",
+  "reviewRoleGraph",
+]
+required_blockers = [
+  "ambiguousClaimScopes",
+  "failedCustodyScrubs",
+  "residualRiskPolicyFailures",
+  "reviewIndependenceFailures",
+  "semanticCoverageGaps",
+  "staleEvidenceEpochs",
+  "statusEvidenceMismatches",
+  "unapprovedDivergences",
+  "undetectedCriticalMutants",
+  "unmappedReviewStatements",
+  "unreviewedOracleProvenance",
+  "unsafeNormalizers",
+  "untrustedAcquisitionReceipts",
+  "unverifiedCustodyReceipts",
+]
+require_collection_epoch = true
+require_artifact_authenticity = true
+require_claim_coverage = true
+require_normalizer_audit = true
+require_divergence_review = true
+require_residual_risk_review = true
+require_mutation_sensitivity = true
+require_independent_oracle_rebuilds = true
+require_exercised_oracle_binding = true
+require_two_provider_custody = true
+require_current_custody_scrub = true
+require_review_role_graph = true
+require_dual_signatures = true
+require_exact_proposal_approval = true
+require_zero_blockers = true

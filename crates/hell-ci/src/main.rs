@@ -1,11 +1,42 @@
+mod assurance;
+mod catalog_lock;
+mod collection_authority_ops;
 mod command;
+mod custody_ops;
 mod fixtures;
+mod fuzz_surfaces;
+mod offline_review_ops;
+mod oracle_ops;
 mod oracle_record;
 mod policy;
 mod promotion_policy;
+mod release_oracle;
 mod report;
 mod strict_toml;
 mod suite;
+mod surveillance_impact;
+mod surveillance_ops;
+#[cfg(test)]
+mod synthetic_promotion;
+mod worklist_encoding;
+
+const _: fn(&[u8]) -> Result<(), String> = assurance::fuzz_admit_acquisition_receipt;
+const _: fn(&[u8]) -> Result<(), String> = assurance::fuzz_admit_evidence_graph_merge;
+const _: fn(&[u8]) -> Result<(), String> = assurance::fuzz_admit_provenance_record;
+const _: fn(&[u8]) -> Result<(), String> = assurance::fuzz_admit_review_graph;
+const _: fn(&[u8]) -> Result<(), String> = assurance::fuzz_admit_dsse_envelope;
+const _: fn() -> Result<Vec<u8>, String> = assurance::fuzz_evidence_graph_seed;
+const _: fn(&[u8]) -> Result<(), String> = custody_ops::fuzz_admit_custody_receipt;
+
+#[cfg(feature = "mutation-testing")]
+pub(crate) fn assurance_control_mutant_active(id: &str) -> bool {
+    std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref() == Ok(id)
+}
+
+#[cfg(not(feature = "mutation-testing"))]
+pub(crate) const fn assurance_control_mutant_active(_id: &str) -> bool {
+    false
+}
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -30,6 +61,8 @@ enum Invocation {
         oracle: PathBuf,
         oracle_sha256: Digest,
         dependency_attestation: PathBuf,
+        require_signed_acquisition: bool,
+        surveillance_subject: bool,
     },
     NativeOracleShard {
         report: PathBuf,
@@ -44,6 +77,10 @@ enum Invocation {
     PromotionGate {
         report: PathBuf,
         input: PathBuf,
+        proposal: PathBuf,
+        expect_source: String,
+        expect_epoch: String,
+        expect_proposal: String,
         explain: bool,
     },
     DependencyAttestation {
@@ -54,6 +91,9 @@ enum Invocation {
         report: PathBuf,
         output: PathBuf,
         profile: String,
+        format: String,
+        only: String,
+        group_by: String,
     },
     Examples {
         profile: String,
@@ -62,7 +102,7 @@ enum Invocation {
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci promotion-worklist --profile upstream --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci promotion-gate --input PATH --report PATH [--explain]\n       hell-ci examples --profile ci|release --report PATH"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci promotion-worklist --profile upstream --format csv|json|html --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci nightly-exploratory --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci nightly-surveillance-subject --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci merge-native-shards --input PATH --report PATH\n       hell-ci promotion-gate --input PATH --proposal PATH --expect-source SHA --expect-epoch SHA256 --expect-proposal SHA256 --report PATH [--explain]\n       hell-ci examples --profile ci|release --report PATH"
 }
 
 #[allow(clippy::too_many_lines)]
@@ -75,6 +115,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         .map_err(|_| "subcommand must be UTF-8".to_owned())?;
     let mut report = None;
     let mut profile = None;
+    let mut format = None;
     let mut oracle = None;
     let mut oracle_sha256 = None;
     let mut source = None;
@@ -82,12 +123,25 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     let mut input = None;
     let mut output = None;
     let mut dependency_attestation = None;
+    let mut proposal = None;
+    let mut expect_source = None;
+    let mut expect_epoch = None;
+    let mut expect_proposal = None;
+    let mut github_dispatch_inputs = false;
     let mut explain = false;
+    let mut only = None;
+    let mut group_by = None;
     while let Some(flag) = arguments.next() {
         let flag = flag
             .into_string()
             .map_err(|_| "option name must be UTF-8".to_owned())?;
         match flag.as_str() {
+            "--github-dispatch-inputs" => {
+                if github_dispatch_inputs {
+                    return Err("--github-dispatch-inputs was provided more than once".to_owned());
+                }
+                github_dispatch_inputs = true;
+            }
             "--explain" => {
                 if explain {
                     return Err("--explain was provided more than once".to_owned());
@@ -114,6 +168,42 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                         .ok_or_else(|| "--profile requires ci or release".to_owned())?
                         .into_string()
                         .map_err(|_| "profile must be UTF-8".to_owned())?,
+                );
+            }
+            "--format" => {
+                if format.is_some() {
+                    return Err("--format was provided more than once".to_owned());
+                }
+                format = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--format requires csv, json, or html".to_owned())?
+                        .into_string()
+                        .map_err(|_| "format must be UTF-8".to_owned())?,
+                );
+            }
+            "--only" => {
+                if only.is_some() {
+                    return Err("--only was provided more than once".to_owned());
+                }
+                only = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--only requires ambiguous".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--only must be UTF-8".to_owned())?,
+                );
+            }
+            "--group-by" => {
+                if group_by.is_some() {
+                    return Err("--group-by was provided more than once".to_owned());
+                }
+                group_by = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--group-by requires assurance-equivalence".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--group-by must be UTF-8".to_owned())?,
                 );
             }
             "--oracle" => {
@@ -188,13 +278,66 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                         "--dependency-attestation requires PATH".to_owned()
                     })?));
             }
+            "--proposal" => {
+                if proposal.is_some() {
+                    return Err("--proposal was provided more than once".to_owned());
+                }
+                proposal = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--proposal requires PATH".to_owned())?,
+                ));
+            }
+            "--expect-source" => {
+                if expect_source.is_some() {
+                    return Err("--expect-source was provided more than once".to_owned());
+                }
+                expect_source = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--expect-source requires SHA".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--expect-source must be UTF-8".to_owned())?,
+                );
+            }
+            "--expect-epoch" => {
+                if expect_epoch.is_some() {
+                    return Err("--expect-epoch was provided more than once".to_owned());
+                }
+                expect_epoch = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--expect-epoch requires SHA-256".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--expect-epoch must be UTF-8".to_owned())?,
+                );
+            }
+            "--expect-proposal" => {
+                if expect_proposal.is_some() {
+                    return Err("--expect-proposal was provided more than once".to_owned());
+                }
+                expect_proposal = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--expect-proposal requires SHA-256".to_owned())?
+                        .into_string()
+                        .map_err(|_| "--expect-proposal must be UTF-8".to_owned())?,
+                );
+            }
             _ => return Err(format!("unknown option {flag}\n{}", usage())),
         }
+    }
+    if github_dispatch_inputs && command != "promotion-gate" {
+        return Err("--github-dispatch-inputs is valid only for promotion-gate".to_owned());
+    }
+    if command != "promotion-worklist" && (only.is_some() || group_by.is_some()) {
+        return Err("--only and --group-by are valid only for promotion-worklist".to_owned());
     }
     let report = report.ok_or_else(|| "--report is required".to_owned())?;
     match command.as_str() {
         "policy"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
@@ -202,12 +345,17 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && input.is_none()
                 && output.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::Policy { report })
         }
         "verify"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
@@ -215,12 +363,17 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && input.is_none()
                 && output.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::Verify { report })
         }
         "portability"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
@@ -228,18 +381,27 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && input.is_none()
                 && output.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::Portability { report })
         }
         "dependency-attestation"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
                 && input.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::DependencyAttestation {
@@ -255,6 +417,10 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && platform.is_none()
                 && input.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::PromotionWorklist {
@@ -266,14 +432,34 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                     Some(value) => return Err(format!("invalid promotion profile {value:?}")),
                     None => return Err("promotion-worklist requires --profile upstream".to_owned()),
                 },
+                format: match format.as_deref() {
+                    Some("csv" | "json" | "html") => format.expect("format was matched"),
+                    Some(value) => return Err(format!("invalid worklist format {value:?}")),
+                    None => "csv".to_owned(),
+                },
+                only: match only.as_deref() {
+                    Some("ambiguous") => "ambiguous".to_owned(),
+                    Some(value) => return Err(format!("invalid worklist filter {value:?}")),
+                    None => "all".to_owned(),
+                },
+                group_by: match group_by.as_deref() {
+                    Some("assurance-equivalence") => "assurance-equivalence".to_owned(),
+                    Some(value) => return Err(format!("invalid worklist grouping {value:?}")),
+                    None => "builtin".to_owned(),
+                },
             })
         }
-        "nightly"
+        "nightly" | "nightly-exploratory" | "nightly-surveillance-subject"
             if profile.is_none()
+                && format.is_none()
                 && source.is_none()
                 && platform.is_none()
                 && input.is_none()
                 && output.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::Nightly {
@@ -283,14 +469,21 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                     .ok_or_else(|| "nightly requires --oracle-sha256 HEX".to_owned())?,
                 dependency_attestation: dependency_attestation
                     .ok_or_else(|| "nightly requires --dependency-attestation PATH".to_owned())?,
+                require_signed_acquisition: command == "nightly",
+                surveillance_subject: command == "nightly-surveillance-subject",
             })
         }
         "native-oracle-shard"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && input.is_none()
                 && output.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::NativeOracleShard {
@@ -305,12 +498,17 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         }
         "merge-native-shards"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
                 && output.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::MergeNativeShards {
@@ -320,6 +518,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         }
         "promotion-gate"
             if profile.is_none()
+                && format.is_none()
                 && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
@@ -327,20 +526,45 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && output.is_none()
                 && dependency_attestation.is_none() =>
         {
+            let (expect_source, expect_epoch, expect_proposal) = if github_dispatch_inputs {
+                if expect_source.is_some() || expect_epoch.is_some() || expect_proposal.is_some() {
+                    return Err(
+                        "dispatch event decoding cannot be combined with explicit expectations"
+                            .to_owned(),
+                    );
+                }
+                let (source, epoch, proposal) = assurance::github_dispatch_inputs()?;
+                (Some(source), Some(epoch), Some(proposal))
+            } else {
+                (expect_source, expect_epoch, expect_proposal)
+            };
             Ok(Invocation::PromotionGate {
                 report,
                 input: input.ok_or_else(|| "promotion-gate requires --input".to_owned())?,
+                proposal: proposal
+                    .ok_or_else(|| "promotion-gate requires --proposal".to_owned())?,
+                expect_source: expect_source
+                    .ok_or_else(|| "promotion-gate requires --expect-source".to_owned())?,
+                expect_epoch: expect_epoch
+                    .ok_or_else(|| "promotion-gate requires --expect-epoch".to_owned())?,
+                expect_proposal: expect_proposal
+                    .ok_or_else(|| "promotion-gate requires --expect-proposal".to_owned())?,
                 explain,
             })
         }
         "examples"
-            if oracle.is_none()
+            if format.is_none()
+                && oracle.is_none()
                 && oracle_sha256.is_none()
                 && source.is_none()
                 && platform.is_none()
                 && input.is_none()
                 && output.is_none()
                 && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
                 && !explain =>
         {
             Ok(Invocation::Examples {
@@ -357,18 +581,61 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
 }
 
 fn main() -> ExitCode {
-    let invocation = match parse(std::env::args_os().skip(1)) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(2);
-        }
-    };
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let root = match std::env::current_dir() {
         Ok(root) => root,
         Err(error) => {
             eprintln!("cannot determine repository root: {error}");
             return ExitCode::from(40);
+        }
+    };
+    if assurance::recognizes(&arguments) {
+        return assurance::run_cli(&root, &arguments);
+    }
+    for adapter in [
+        (
+            collection_authority_ops::recognizes as fn(&[OsString]) -> bool,
+            collection_authority_ops::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+        (
+            oracle_ops::recognizes as fn(&[OsString]) -> bool,
+            oracle_ops::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+        (
+            custody_ops::recognizes as fn(&[OsString]) -> bool,
+            custody_ops::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+        (
+            offline_review_ops::recognizes as fn(&[OsString]) -> bool,
+            offline_review_ops::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+        (
+            surveillance_ops::recognizes as fn(&[OsString]) -> bool,
+            surveillance_ops::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+        (
+            release_oracle::recognizes as fn(&[OsString]) -> bool,
+            release_oracle::run as fn(&[OsString]) -> Result<String, String>,
+        ),
+    ] {
+        if adapter.0(&arguments) {
+            return match adapter.1(&arguments) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+    let invocation = match parse(arguments) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
         }
     };
     run(&invocation, &root)
@@ -398,15 +665,39 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
             oracle,
             oracle_sha256,
             dependency_attestation,
+            require_signed_acquisition,
+            surveillance_subject,
             ..
-        } => suite::nightly(
-            root,
-            &mut report,
-            &failures,
-            oracle,
-            *oracle_sha256,
-            dependency_attestation,
-        ),
+        } => {
+            if *surveillance_subject {
+                suite::nightly_surveillance_subject(
+                    root,
+                    &mut report,
+                    &failures,
+                    oracle,
+                    *oracle_sha256,
+                    dependency_attestation,
+                )
+            } else if *require_signed_acquisition {
+                suite::nightly(
+                    root,
+                    &mut report,
+                    &failures,
+                    oracle,
+                    *oracle_sha256,
+                    dependency_attestation,
+                )
+            } else {
+                suite::nightly_exploratory(
+                    root,
+                    &mut report,
+                    &failures,
+                    oracle,
+                    *oracle_sha256,
+                    dependency_attestation,
+                )
+            }
+        }
         Invocation::NativeOracleShard {
             source,
             platform,
@@ -423,15 +714,44 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::MergeNativeShards { input, .. } => {
             suite::merge_native_shards(root, input, &mut report)
         }
-        Invocation::PromotionGate { input, explain, .. } => {
-            suite::promotion_gate(root, input, *explain, &mut report)
+        Invocation::PromotionGate {
+            input,
+            proposal,
+            expect_source,
+            expect_epoch,
+            expect_proposal,
+            explain,
+            ..
+        } => {
+            if let Err(detail) = assurance::validate_promotion_dispatch(
+                root,
+                input,
+                proposal,
+                expect_source,
+                expect_epoch,
+                expect_proposal,
+            ) {
+                report.check(
+                    "promotion-dispatch-binding",
+                    std::time::Duration::ZERO,
+                    Err(detail),
+                );
+                Err(FailureKind::Policy)
+            } else {
+                suite::promotion_gate(root, input, *explain, &mut report)
+            }
         }
         Invocation::DependencyAttestation { output, .. } => {
             suite::dependency_attestation(root, output, &mut report)
         }
         Invocation::PromotionWorklist {
-            output, profile, ..
-        } => suite::promotion_worklist(root, output, profile, &mut report),
+            output,
+            profile,
+            format,
+            only,
+            group_by,
+            ..
+        } => suite::promotion_worklist(root, output, profile, format, only, group_by, &mut report),
         Invocation::Examples { profile, .. } => {
             suite::examples(root, &mut report, &failures, profile)
         }
@@ -548,6 +868,47 @@ mod tests {
             ),
             Ok(Invocation::Nightly { .. })
         ));
+        assert!(matches!(
+            parse(
+                [
+                    "nightly-exploratory",
+                    "--oracle",
+                    "oracle",
+                    "--oracle-sha256",
+                    &digest,
+                    "--dependency-attestation",
+                    "dependency-policy.json",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::Nightly {
+                require_signed_acquisition: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(
+                [
+                    "nightly-surveillance-subject",
+                    "--oracle",
+                    "oracle",
+                    "--oracle-sha256",
+                    &digest,
+                    "--dependency-attestation",
+                    "dependency-policy.json",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::Nightly {
+                require_signed_acquisition: false,
+                surveillance_subject: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -583,6 +944,14 @@ mod tests {
                     "promotion-gate",
                     "--input",
                     "native-shards",
+                    "--proposal",
+                    "proposal.json",
+                    "--expect-source",
+                    "1111111111111111111111111111111111111111",
+                    "--expect-epoch",
+                    "2222222222222222222222222222222222222222222222222222222222222222",
+                    "--expect-proposal",
+                    "3333333333333333333333333333333333333333333333333333333333333333",
                     "--report",
                     "out.json",
                 ]
@@ -610,8 +979,21 @@ mod tests {
         )
         .unwrap();
         let report = sandbox.join("promotion-gate.json");
+        let source = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
         let invocation = Invocation::PromotionGate {
             input: sandbox.clone(),
+            proposal: sandbox.join("missing-proposal.json"),
+            expect_source: source.trim().to_owned(),
+            expect_epoch: hell_testkit::sha256_bytes(b"wrong epoch").hex(),
+            expect_proposal: hell_testkit::sha256_bytes(b"wrong proposal").hex(),
             explain: true,
             report: report.clone(),
         };
@@ -637,7 +1019,12 @@ mod tests {
         assert!(record.contains(DIGEST));
         assert!(record.contains(URL));
         assert!(workflow.contains(DIGEST));
-        assert!(workflow.contains(URL));
+        assert!(workflow.contains(
+            "run: ./target/ci/hell-ci release-oracle acquire --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json"
+        ));
+        assert!(workflow.contains(
+            "run: ./target/ci/hell-ci release-oracle attest --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json --attestation ci-out/linux-release-oracle-acquisition.dsse.json"
+        ));
     }
 
     #[test]

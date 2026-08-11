@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 
 use hell_compiler::{CompilerSession, compile_source};
@@ -84,6 +85,36 @@ fn wildcard_parameter_still_occupies_a_lazy_environment_slot() {
         run("main = IO.print $ (\\x _ -> x) 1 (Error.error \"boom\" :: Int)\n"),
         "1\n"
     );
+}
+
+#[test]
+fn io_pure_does_not_force_an_ignored_result() {
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  _ <- IO.pure (Error.error \"undemanded pure\" :: Int)\n",
+            "  Text.putStr \"after\"\n",
+        )),
+        "after"
+    );
+}
+
+fn run_io_pure_laziness_test(mutant: Option<&str>) -> ExitStatus {
+    let mut command = Command::new(std::env::current_exe().expect("laziness test executable"));
+    command
+        .arg("io_pure_does_not_force_an_ignored_result")
+        .arg("--exact")
+        .env_remove("HELL_ASSURANCE_MUTANT_ID");
+    if let Some(mutant) = mutant {
+        command.env("HELL_ASSURANCE_MUTANT_ID", mutant);
+    }
+    command.status().expect("nested laziness test runs")
+}
+
+#[test]
+fn io_pure_eager_force_mutant_is_detected() {
+    assert!(run_io_pure_laziness_test(None).success());
+    assert!(!run_io_pure_laziness_test(Some("io-pure-force-argument")).success());
 }
 
 #[test]
@@ -482,6 +513,38 @@ fn scoped_temp_resources_and_explicit_file_handles_cleanup_and_preserve_bytes() 
     assert!(!temp_file.exists());
     assert!(!process_temp_file.exists());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn scoped_temporary_resources_are_deleted_before_runtime_completion() {
+    let directory =
+        std::env::temp_dir().join(format!("hell-rs-temp-cleanup-{}", std::process::id()));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    let source = concat!(
+        "main = do\n",
+        "  Temp.withSystemTempDirectory \"hell-rs-cleanup-directory\" \\path ->\n",
+        "    Text.putStrLn path\n",
+        "  Temp.withSystemTempFile \"hell-rs-cleanup-file\" \\path handle -> do\n",
+        "    Text.hPutStr handle \"retained bytes\"\n",
+        "    Text.putStrLn path\n",
+    );
+    let output = run_in(source, directory.clone(), true).unwrap();
+    let paths = output.lines().map(PathBuf::from).collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2);
+    let retained = paths.iter().filter(|path| path.exists()).count();
+    for path in &paths {
+        if path.is_dir() {
+            let _removed = std::fs::remove_dir_all(path);
+        } else {
+            let _removed = std::fs::remove_file(path);
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+    assert_eq!(
+        retained, 0,
+        "scoped temporary resources leaked after runtime completion"
+    );
 }
 
 #[test]

@@ -72,6 +72,21 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Verify fail-closed assurance policy
+        run: ./target/ci/hell-ci assurance-verify --output ci-out/assurance-policy.json
+
+      - name: Verify applicability derivation
+        run: ./target/ci/hell-ci applicability verify
+
+      - name: Verify descriptor-v3 case catalog
+        run: ./target/ci/hell-ci case-catalog verify
+
+      - name: Verify typed normalizer catalog
+        run: ./target/ci/hell-ci normalizer-audit verify
+
+      - name: Verify divergence-v2 catalog
+        run: ./target/ci/hell-ci divergence-verify verify
+
       - name: Run Linux verification suite
         run: ./target/ci/hell-ci verify --report ci-out/verify-linux.json
 

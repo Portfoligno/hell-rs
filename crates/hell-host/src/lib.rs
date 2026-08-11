@@ -74,7 +74,14 @@ mod tests {
         )];
         let services = HostServices::from_environment(environment);
         #[cfg(not(windows))]
-        assert_eq!(services.home_directory(), Some(PathBuf::from("/host/home")));
+        assert_eq!(
+            services.home_directory(),
+            Some(
+                PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+                    .join("host")
+                    .join("home")
+            )
+        );
         #[cfg(windows)]
         assert_eq!(
             services.home_directory(),

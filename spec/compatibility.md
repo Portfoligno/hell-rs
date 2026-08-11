@@ -33,3 +33,9 @@ extra artifact, provenance mismatch, dependency-attestation mismatch, or any
 typed evidence failure keeps promotion unavailable. An accepted pre-gate
 review requests fresh evidence and does not claim that the later explicit gate
 already passed.
+
+The assurance epoch, review boundaries, durable custody process, bounded public
+report, and post-promotion `at-risk`/revocation operations are specified in
+[`promotion-assurance.md`](promotion-assurance.md). Generated compatibility
+language must expose residual corpus and scope limits; it cannot describe finite
+three-platform evidence as universal equivalence.

@@ -100,6 +100,9 @@ fn wrapped_program(mut types: TypeArena, name: &str, internal_type: TypeId) -> C
         ],
         types,
         main_type: io_unit,
+        instance_evidence: Vec::new(),
+        #[cfg(feature = "compat-tracing")]
+        compiler_evidence: hell_core::CompilerBuiltinEvidence::default(),
     }
 }
 

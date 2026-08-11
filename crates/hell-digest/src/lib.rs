@@ -1,4 +1,5 @@
-//! Small dependency-free streaming SHA-256 used for retained evidence.
+//! Small dependency-free streaming SHA-256 used for retained evidence and
+//! build-time assurance catalog bindings.
 
 const INITIAL: [u32; 8] = [
     0x6a09_e667,
@@ -86,12 +87,13 @@ impl Digest {
     ///
     /// # Errors
     ///
-    /// Returns an error when `hex` is not exactly 64 hexadecimal digits.
+    /// Returns an error when `hex` does not have the width implied by the
+    /// digest storage type or contains a non-hexadecimal digit.
     pub fn from_hex(hex: &str) -> Result<Self, &'static str> {
-        if hex.len() != 64 {
-            return Err("SHA-256 must contain exactly 64 hexadecimal digits");
-        }
         let mut bytes = [0_u8; 32];
+        if hex.len() != bytes.len().saturating_mul(2) {
+            return Err("SHA-256 has the wrong hexadecimal width");
+        }
         for (target, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
             *target = (nibble(pair[0])? << 4) | nibble(pair[1])?;
         }
@@ -127,6 +129,8 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
+    /// Creates an empty streaming SHA-256 state.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: INITIAL,
@@ -136,6 +140,12 @@ impl Sha256 {
         }
     }
 
+    /// Adds bytes to this streaming digest.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed-size chunking invariant in the standard
+    /// library's `split_at` implementation is violated.
     pub fn update(&mut self, mut bytes: &[u8]) {
         self.total_bytes = self
             .total_bytes
@@ -164,6 +174,8 @@ impl Sha256 {
         self.block_len = bytes.len();
     }
 
+    /// Finalizes and returns the SHA-256 digest.
+    #[must_use]
     pub fn finish(mut self) -> Digest {
         let bit_len = self.total_bytes.wrapping_mul(8);
         self.block[self.block_len] = 0x80;
@@ -183,6 +195,12 @@ impl Sha256 {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         Digest(output)
+    }
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

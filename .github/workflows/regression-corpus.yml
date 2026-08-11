@@ -1,0 +1,458 @@
+name: Reviewed regression corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Prepare a minimized proposal or promote a signed reviewed package
+        required: true
+        type: choice
+        options: [prepare, review, promote, integrate, automatic]
+      template_case_id:
+        description: Exact reviewed committed case whose claim descriptor scopes the reproducer
+        required: true
+        type: string
+      issue:
+        description: Stable provider-kind:number issue reference
+        required: true
+        type: string
+      category:
+        description: Typed compatibility mismatch category
+        required: true
+        type: choice
+        options: [semantic-mismatch, presentation-mismatch, platform-mismatch, resource-mismatch]
+      subject_provider_context:
+        description: Canonical JSON exact provider context for regression-subject artifact
+        required: true
+        type: string
+      proposal_provider_context:
+        description: Canonical JSON exact provider context for verified proposal artifact
+        required: true
+        type: string
+      review_provider_context:
+        description: Canonical JSON exact provider context for signed review artifact
+        required: true
+        type: string
+      generated_case_id:
+        description: Exact scheduled generated mismatch identity for automatic processing
+        required: false
+        default: ''
+        type: string
+      batch_id:
+        description: Exact scheduled nightly run ID authorizing an automatic batch
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reviewed-regression-corpus-${{ inputs.action == 'automatic' && format('{0}-{1}', inputs.issue, inputs.generated_case_id) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.action == 'prepare' || inputs.action == 'automatic') }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out trusted current regression automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted regression driver before receiving subject bytes
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Acquire and verify exact unprivileged regression execution subject
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.subject_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/regression-subject.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/regression-subject --artifact ci-out/regression-subject-selection
+      - name: Execute and deterministically minimize exact regression
+        env:
+          REGRESSION_CATEGORY: ${{ inputs.category }}
+          REGRESSION_GENERATED_CASE: ${{ inputs.generated_case_id }}
+          REGRESSION_ISSUE: ${{ inputs.issue }}
+          REGRESSION_TEMPLATE_CASE: ${{ inputs.template_case_id }}
+        run: ./target/ci/hell-ci regression-import prepare --input ci-in/regression-subject/claim-coverage.json --program ci-in/regression-subject/program.hell --from ci-in/regression-subject/oracle --to ci-in/regression-subject/candidate --expected "$REGRESSION_TEMPLATE_CASE" --issue "$REGRESSION_ISSUE" --category "$REGRESSION_CATEGORY" --artifact ci-out/regression-subject-selection --output ci-out/regression-package
+      - name: Replay and verify every minimized regression attempt
+        run: ./target/ci/hell-ci regression-import verify --input ci-out/regression-package
+      - name: Retain exact regression proposal directory digest
+        id: digest
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/regression-package
+      - name: Upload immutable regression proposal package
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-package
+          if-no-files-found: error
+          retention-days: 30
+
+  seal-review-subject:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'review' }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted current unprivileged regression replay automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted unprivileged regression replay driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Acquire exact immutable regression proposal package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.proposal_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-out/regression-sealed/package --artifact ci-out/regression-sealed/proposal-selection
+      - name: Replay every exact regression minimization attempt without protected credentials
+        run: ./target/ci/hell-ci regression-import verify --input ci-out/regression-sealed/package
+      - name: Bind review subject to exact package and provider selection
+        run: ./target/ci/hell-ci regression-import review-subject --input ci-out/regression-sealed/package --artifact ci-out/regression-sealed/proposal-selection --output ci-out/regression-sealed/review-subject.json
+      - name: Retain exact sealed review-subject directory digest
+        id: digest
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/regression-sealed
+      - name: Upload immutable replayed regression review subject
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-sealed
+          if-no-files-found: error
+          retention-days: 30
+
+  review:
+    needs: seal-review-subject
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'review' && needs.seal-review-subject.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    environment: compatibility-claim-review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted current regression review automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted regression reviewer before loading credentials
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download exact sealed unprivileged replay subject
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.seal-review-subject.outputs.artifact_id }}
+          path: ci-in/regression-sealed
+      - name: Reverify immutable sealed review-subject provider facts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.seal-review-subject.outputs.artifact_id }}
+          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.seal-review-subject.outputs.directory_sha256 }}
+          REGRESSION_PROVIDER_EVENT: workflow_dispatch
+          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
+          REGRESSION_PROVIDER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
+          REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-sealed --output ci-out/regression-sealed-selection
+      - name: Load protected claim reviewer SSH key
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier and signer
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Retain current regression reviewer authorization
+        env:
+          GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
+        run: ./target/ci/hell-ci review-authorization --input ci-in/regression-sealed/review-subject.json --output ci-out/regression-review/authorization.json --role regression-reviewer --category regression-final --github-dispatch-inputs
+      - name: Create exact regression review packet
+        run: ./target/ci/hell-ci review-packet --input ci-in/regression-sealed/review-subject.json --from ci-out/regression-review/authorization.json --output ci-out/regression-review/review-packet.json --role regression-reviewer --decision accept --github-dispatch-inputs
+      - name: Sign exact regression review packet
+        run: ./target/ci/hell-ci review-sign --input ci-out/regression-review/review-packet.json --output ci-out/regression-review/review.dsse.json --role regression-reviewer --decision accept --policy ci-out/regression-review/reviewer.allowed_signers
+      - name: Retain exact reviewed subject beside signatures
+        run: install -m 0644 ci-in/regression-sealed/review-subject.json ci-out/regression-review/review-subject.json
+      - name: Upload immutable dynamically authorized regression review
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-review
+          if-no-files-found: error
+          retention-days: 30
+
+  promote:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'promote' }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out trusted current regression promotion automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted regression verifier before receiving reviewed bytes
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Acquire exact verified regression proposal package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.proposal_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/regression-package --artifact ci-out/regression-package-selection
+      - name: Acquire exact dynamically authorized signed claim review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.review_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/regression-review --artifact ci-out/regression-review-selection
+      - name: Reverify package and promote signed reviewed corpus descriptor
+        run: ./target/ci/hell-ci regression-import promote --input ci-in/regression-package --from ci-in/regression-review/review-subject.json --to ci-out/regression-review-selection --artifact ci-out/regression-package-selection --proposal ci-in/regression-review/review.dsse.json --policy ci-in/regression-review/reviewer.allowed_signers --output ci-out/promoted-regression.json
+      - name: Upload immutable reviewed corpus entry
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reviewed-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out
+          if-no-files-found: error
+          retention-days: 90
+
+  integrate:
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'integrate' }}
+    permissions:
+      actions: read
+      contents: write
+    environment: compatibility-regression-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted current controlled integration automation and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build trusted structural regression integrator
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Acquire exact reviewed regression promotion artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.subject_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/reviewed-regression --artifact ci-out/reviewed-regression-selection
+      - name: Configure protected GitHub commit authentication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth setup-git
+      - name: Reconcile, commit, and push the reviewed delta against exact current main
+        run: ./target/ci/hell-ci regression-import integrate-current-main --input ci-in/reviewed-regression --artifact ci-out/reviewed-regression-selection
+
+  seal-review-subject-automatic:
+    needs: prepare
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'automatic' && needs.prepare.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted automatic unprivileged review automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted automatic unprivileged review driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download exact automatic proposal package
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: ci-out/regression-sealed/package
+      - name: Reverify automatic proposal provider without credentials
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.prepare.outputs.directory_sha256 }}
+          REGRESSION_PROVIDER_EVENT: workflow_dispatch
+          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
+          REGRESSION_PROVIDER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
+          REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import select-subject --input ci-out/regression-sealed/package --output ci-out/regression-sealed/proposal-selection
+      - name: Replay automatic minimization before protected review
+        run: ./target/ci/hell-ci regression-import verify --input ci-out/regression-sealed/package
+      - name: Bind automatic review subject to exact package and provider
+        run: ./target/ci/hell-ci regression-import review-subject --input ci-out/regression-sealed/package --artifact ci-out/regression-sealed/proposal-selection --output ci-out/regression-sealed/review-subject.json
+      - name: Retain automatic sealed subject directory digest
+        id: digest
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/regression-sealed
+      - name: Upload immutable automatic sealed review subject
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-sealed
+          if-no-files-found: error
+          retention-days: 30
+
+  review-automatic:
+    needs: seal-review-subject-automatic
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'automatic' && needs.seal-review-subject-automatic.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    environment: compatibility-claim-review
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted automatic protected review automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted automatic protected reviewer
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download exact automatic sealed unprivileged subject
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.seal-review-subject-automatic.outputs.artifact_id }}
+          path: ci-in/regression-sealed
+      - name: Structurally reverify automatic sealed provider facts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.seal-review-subject-automatic.outputs.artifact_id }}
+          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.seal-review-subject-automatic.outputs.directory_sha256 }}
+          REGRESSION_PROVIDER_EVENT: workflow_dispatch
+          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
+          REGRESSION_PROVIDER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
+          REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-sealed --output ci-out/regression-sealed-selection
+      - name: Load protected automatic claim reviewer SSH key
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned automatic Sigstore signer
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Retain current automatic regression reviewer authorization
+        env:
+          GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
+        run: ./target/ci/hell-ci review-authorization --input ci-in/regression-sealed/review-subject.json --output ci-out/regression-review/authorization.json --role regression-reviewer --category regression-final --github-dispatch-inputs
+      - name: Create exact automatic regression review packet
+        run: ./target/ci/hell-ci review-packet --input ci-in/regression-sealed/review-subject.json --from ci-out/regression-review/authorization.json --output ci-out/regression-review/review-packet.json --role regression-reviewer --decision accept --github-dispatch-inputs
+      - name: Sign exact automatic regression review packet
+        run: ./target/ci/hell-ci review-sign --input ci-out/regression-review/review-packet.json --output ci-out/regression-review/review.dsse.json --role regression-reviewer --decision accept --policy ci-out/regression-review/reviewer.allowed_signers
+      - name: Retain automatic reviewed subject beside signatures
+        run: install -m 0644 ci-in/regression-sealed/review-subject.json ci-out/regression-review/review-subject.json
+      - name: Retain automatic signed review directory digest
+        id: digest
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/regression-review
+      - name: Upload immutable automatic signed review
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-review
+          if-no-files-found: error
+          retention-days: 30
+
+  promote-automatic:
+    needs: [prepare, review-automatic]
+    if: ${{ github.ref == 'refs/heads/main' && inputs.action == 'automatic' && needs.prepare.result == 'success' && needs.review-automatic.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out trusted automatic promotion automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted automatic promotion verifier
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download exact automatic proposal
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: ci-in/regression-package
+      - name: Download exact automatic signed review
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.review-automatic.outputs.artifact_id }}
+          path: ci-in/regression-review
+      - name: Reverify automatic proposal provider
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.prepare.outputs.directory_sha256 }}
+          REGRESSION_PROVIDER_EVENT: workflow_dispatch
+          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
+          REGRESSION_PROVIDER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
+          REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-package --output ci-out/regression-package-selection
+      - name: Reverify automatic signed review provider
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.review-automatic.outputs.artifact_id }}
+          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.review-automatic.outputs.directory_sha256 }}
+          REGRESSION_PROVIDER_EVENT: workflow_dispatch
+          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
+          REGRESSION_PROVIDER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
+          REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
+        run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-review --output ci-out/regression-review-selection
+      - name: Promote exact automatic signed regression
+        run: ./target/ci/hell-ci regression-import promote --input ci-in/regression-package --from ci-in/regression-review/review-subject.json --to ci-out/regression-review-selection --artifact ci-out/regression-package-selection --proposal ci-in/regression-review/review.dsse.json --policy ci-in/regression-review/reviewer.allowed_signers --output ci-out/promoted-regression.json
+      - name: Retain automatic reviewed promotion directory digest
+        id: digest
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out
+      - name: Upload immutable automatic reviewed corpus entry
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reviewed-regression-${{ inputs.batch_id }}-${{ inputs.generated_case_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out
+          if-no-files-found: error
+          retention-days: 90

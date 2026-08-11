@@ -77,6 +77,10 @@ impl TempResource {
         result
     }
 
+    pub(crate) fn disarm_without_cleanup_for_mutation(mut self) {
+        self.armed = false;
+    }
+
     fn remove(&self) -> io::Result<()> {
         let mut last_error = None;
         for _ in 0..=self.delete_retries {

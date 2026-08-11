@@ -1,0 +1,2 @@
+# OpenSSH allowed-signers policy for promotion assurance reviews.
+# REVIEW_REQUIRED: add independently controlled role-qualified principals and public keys.

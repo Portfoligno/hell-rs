@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 4,
+  "caseId": "int-plus-boundary-positive-value",
+  "assuranceEpochSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "profile": "ineligible",
+  "processHelperPath": null,
+  "processHelperSha256": null,
+  "files": {
+    "candidate/observation.json": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+#[cfg(not(feature = "compat-tracing"))]
+use crate::Suspension;
 use crate::lazy_list::{Classifier, classify, drop_class, select_class, take_class};
 use crate::{
-    Evaluator, ForceOutcome, ListCell, RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef,
-    Value,
+    Evaluator, ForceOutcome, ListCell, RuntimeError, RuntimeResult, Thunk, ThunkRef, Value,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -21,7 +22,13 @@ pub(crate) fn apply_native(
             &arguments[1],
             implementation == "list_all",
         )
-        .map(value),
+        .map(|result| {
+            if implementation == "list_all" && crate::semantic_mutant_active("all-constant-true") {
+                value(Value::Bool(true))
+            } else {
+                value(result)
+            }
+        }),
         "list_break" | "list_span" => Ok(span(
             &arguments[0],
             &arguments[1],
@@ -157,7 +164,8 @@ fn predicate_fold(
         match evaluator.force(&list)?.as_ref() {
             Value::List(ListCell::Nil) => return Ok(Value::Bool(all)),
             Value::List(ListCell::Cons { head, tail }) => {
-                let matches = evaluator.force_bool(&apply1(predicate, head))?;
+                let matches =
+                    evaluator.force_bool(&predicate_callback(evaluator, predicate, head))?;
                 if matches != all {
                     return Ok(Value::Bool(!all));
                 }
@@ -166,6 +174,31 @@ fn predicate_fold(
             _ => return Err(non_list("List.all/any")),
         }
     }
+}
+
+#[cfg(feature = "compat-tracing")]
+fn predicate_callback(
+    evaluator: &Evaluator,
+    predicate: &ThunkRef,
+    argument: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(predicate),
+            &[Arc::clone(argument)],
+            0,
+            "predicate",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn predicate_callback(
+    _evaluator: &Evaluator,
+    predicate: &ThunkRef,
+    argument: &ThunkRef,
+) -> ThunkRef {
+    apply1(predicate, argument)
 }
 
 fn span(predicate: &ThunkRef, input: &ThunkRef, invert: bool) -> ForceOutcome {
@@ -185,11 +218,23 @@ fn map_to_lists(function: ThunkRef, input: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => Ok(Arc::new(Value::List(ListCell::Cons {
-            head: apply1(&function, head),
+            head: concat_map_callback(evaluator, &function, head),
             tail: map_to_lists(Arc::clone(&function), Arc::clone(tail)),
         }))),
         _ => Err(non_list("List.concatMap")),
     })
+}
+
+#[cfg(feature = "compat-tracing")]
+fn concat_map_callback(evaluator: &Evaluator, function: &ThunkRef, item: &ThunkRef) -> ThunkRef {
+    evaluator
+        .callback_application(Arc::clone(function), &[Arc::clone(item)], 0, "element")
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn concat_map_callback(_evaluator: &Evaluator, function: &ThunkRef, item: &ThunkRef) -> ThunkRef {
+    apply1(function, item)
 }
 
 fn cycle(input: ThunkRef) -> ThunkRef {
@@ -216,7 +261,7 @@ fn delete_by(function: ThunkRef, needle: ThunkRef, input: ThunkRef) -> ThunkRef 
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
-            if evaluator.force_bool(&apply2(&function, &needle, head))? {
+            if evaluator.force_bool(&delete_by_callback(evaluator, &function, &needle, head))? {
                 evaluator.force(tail)
             } else {
                 Ok(Arc::new(Value::List(ListCell::Cons {
@@ -229,12 +274,39 @@ fn delete_by(function: ThunkRef, needle: ThunkRef, input: ThunkRef) -> ThunkRef 
     })
 }
 
+#[cfg(feature = "compat-tracing")]
+fn delete_by_callback(
+    evaluator: &Evaluator,
+    function: &ThunkRef,
+    needle: &ThunkRef,
+    item: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(function),
+            &[Arc::clone(needle), Arc::clone(item)],
+            0,
+            "relation",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn delete_by_callback(
+    _evaluator: &Evaluator,
+    function: &ThunkRef,
+    needle: &ThunkRef,
+    item: &ThunkRef,
+) -> ThunkRef {
+    apply2(function, needle, item)
+}
+
 fn drop_while_end(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
             let keep_tail = drop_while_end(Arc::clone(&predicate), Arc::clone(tail));
-            if !evaluator.force_bool(&apply1(&predicate, head))? {
+            if !evaluator.force_bool(&predicate_callback(evaluator, &predicate, head))? {
                 return Ok(Arc::new(Value::List(ListCell::Cons {
                     head: Arc::clone(head),
                     tail: keep_tail,
@@ -256,13 +328,39 @@ fn drop_while_end(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
 fn foldr(function: ThunkRef, seed: ThunkRef, input: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => evaluator.force(&seed),
-        Value::List(ListCell::Cons { head, tail }) => evaluator.force(&apply2(
-            &function,
-            head,
-            &foldr(Arc::clone(&function), Arc::clone(&seed), Arc::clone(tail)),
-        )),
+        Value::List(ListCell::Cons { head, tail }) => {
+            let rest = foldr(Arc::clone(&function), Arc::clone(&seed), Arc::clone(tail));
+            evaluator.force(&foldr_callback(evaluator, &function, head, &rest))
+        }
         _ => Err(non_list("List.foldr")),
     })
+}
+
+#[cfg(feature = "compat-tracing")]
+fn foldr_callback(
+    evaluator: &Evaluator,
+    function: &ThunkRef,
+    item: &ThunkRef,
+    accumulator: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(function),
+            &[Arc::clone(item), Arc::clone(accumulator)],
+            0,
+            "fold",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn foldr_callback(
+    _evaluator: &Evaluator,
+    function: &ThunkRef,
+    item: &ThunkRef,
+    accumulator: &ThunkRef,
+) -> ThunkRef {
+    apply2(function, item, accumulator)
 }
 
 fn group_by(function: Option<ThunkRef>, input: ThunkRef) -> ThunkRef {
@@ -277,6 +375,8 @@ fn group_by(function: Option<ThunkRef>, input: ThunkRef) -> ThunkRef {
                 Arc::clone(tail),
                 "List.group/groupBy",
             );
+            #[cfg(feature = "compat-tracing")]
+            evaluator.register_current_adapter_child(&classified)?;
             let group_tail = take_class(Arc::clone(&classified), true, "List.group/groupBy");
             let suffix = drop_class(classified, true, "List.group/groupBy");
             Ok(Arc::new(Value::List(ListCell::Cons {
@@ -406,7 +506,7 @@ fn drop_while(
         match evaluator.force(&list)?.as_ref() {
             Value::List(ListCell::Nil) => return Ok(ForceOutcome::Alias(list)),
             Value::List(ListCell::Cons { head, tail }) => {
-                if !evaluator.force_bool(&apply1(predicate, head))? {
+                if !evaluator.force_bool(&predicate_callback(evaluator, predicate, head))? {
                     return Ok(ForceOutcome::Alias(list));
                 }
                 list = Arc::clone(tail);
@@ -443,7 +543,7 @@ fn find(evaluator: &mut Evaluator, predicate: &ThunkRef, input: &ThunkRef) -> Ru
         match evaluator.force(&list)?.as_ref() {
             Value::List(ListCell::Nil) => return Ok(Value::Maybe(None)),
             Value::List(ListCell::Cons { head, tail }) => {
-                if evaluator.force_bool(&apply1(predicate, head))? {
+                if evaluator.force_bool(&predicate_callback(evaluator, predicate, head))? {
                     return Ok(Value::Maybe(Some(Arc::clone(head))));
                 }
                 list = Arc::clone(tail);
@@ -466,7 +566,7 @@ fn find_index(
             Value::List(ListCell::Nil) => return Ok(Value::Maybe(None)),
             Value::List(ListCell::Cons { head, tail }) => {
                 let matches = if let Some(predicate) = predicate {
-                    evaluator.force_bool(&apply1(predicate, head))?
+                    evaluator.force_bool(&predicate_callback(evaluator, predicate, head))?
                 } else {
                     evaluator.equal_values(needle.expect("needle provided"), head)?
                 };
@@ -495,7 +595,7 @@ fn matching_indices(
                 Value::List(ListCell::Nil) => return Ok(Arc::new(Value::List(ListCell::Nil))),
                 Value::List(ListCell::Cons { head, tail }) => {
                     let matches = if let Some(predicate) = &predicate {
-                        evaluator.force_bool(&apply1(predicate, head))?
+                        evaluator.force_bool(&predicate_callback(evaluator, predicate, head))?
                     } else {
                         evaluator.equal_values(needle.as_ref().expect("needle provided"), head)?
                     };
@@ -527,7 +627,7 @@ fn filter(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
             match evaluator.force(&list)?.as_ref() {
                 Value::List(ListCell::Nil) => return Ok(Arc::new(Value::List(ListCell::Nil))),
                 Value::List(ListCell::Cons { head, tail }) => {
-                    if evaluator.force_bool(&apply1(&predicate, head))? {
+                    if evaluator.force_bool(&predicate_callback(evaluator, &predicate, head))? {
                         return Ok(Arc::new(Value::List(ListCell::Cons {
                             head: Arc::clone(head),
                             tail: filter(Arc::clone(&predicate), Arc::clone(tail)),
@@ -648,11 +748,14 @@ fn suffix(evaluator: &mut Evaluator, needle: &ThunkRef, input: &ThunkRef) -> Run
 #[derive(Clone, Default)]
 struct SeenTree(Option<Arc<SeenNode>>);
 
+const SEEN_TREE_DELTA: usize = 3;
+const SEEN_TREE_RATIO: usize = 2;
+
 struct SeenNode {
     item: ThunkRef,
     left: SeenTree,
     right: SeenTree,
-    height: u16,
+    size: usize,
 }
 
 impl SeenTree {
@@ -663,6 +766,12 @@ impl SeenTree {
                 true,
             ));
         };
+        // Match containers' `Set` comparison: equality is checked first, then
+        // less-than, and every remaining (including incomparable NaN) value is
+        // routed right as greater.
+        if evaluator.equal_values(item, &node.item)? {
+            return Ok((self.clone(), false));
+        }
         if evaluator.less_values(item, &node.item)? {
             let (left, inserted) = node.left.insert(evaluator, item)?;
             if !inserted {
@@ -673,45 +782,46 @@ impl SeenTree {
                 true,
             ));
         }
-        if evaluator.less_values(&node.item, item)? {
-            let (right, inserted) = node.right.insert(evaluator, item)?;
-            if !inserted {
-                return Ok((self.clone(), false));
-            }
-            return Ok((
-                Self::node(Arc::clone(&node.item), node.left.clone(), right).balanced(),
-                true,
-            ));
+        let (right, inserted) = node.right.insert(evaluator, item)?;
+        if !inserted {
+            return Ok((self.clone(), false));
         }
-        Ok((self.clone(), false))
+        Ok((
+            Self::node(Arc::clone(&node.item), node.left.clone(), right).balanced(),
+            true,
+        ))
     }
 
     fn node(item: ThunkRef, left: Self, right: Self) -> Self {
-        let height = left.height().max(right.height()).saturating_add(1);
+        let size = left.size().saturating_add(right.size()).saturating_add(1);
         Self(Some(Arc::new(SeenNode {
             item,
             left,
             right,
-            height,
+            size,
         })))
     }
 
-    fn height(&self) -> u16 {
-        self.0.as_ref().map_or(0, |node| node.height)
+    fn size(&self) -> usize {
+        self.0.as_ref().map_or(0, |node| node.size)
     }
 
     fn balanced(self) -> Self {
         let Some(node) = &self.0 else {
             return self;
         };
-        let balance = i32::from(node.left.height()) - i32::from(node.right.height());
-        if balance > 1 {
+        let left_size = node.left.size();
+        let right_size = node.right.size();
+        if left_size.saturating_add(right_size) <= 1 {
+            return self;
+        }
+        if left_size > SEEN_TREE_DELTA.saturating_mul(right_size) {
             let left = node
                 .left
                 .0
                 .as_ref()
-                .expect("left-heavy tree has a left node");
-            if left.right.height() > left.left.height() {
+                .expect("left-heavy size-balanced tree has a left node");
+            if left.right.size() >= SEEN_TREE_RATIO.saturating_mul(left.left.size()) {
                 return Self::node(
                     Arc::clone(&node.item),
                     node.left.clone().rotate_left(),
@@ -721,13 +831,13 @@ impl SeenTree {
             }
             return self.rotate_right();
         }
-        if balance < -1 {
+        if right_size > SEEN_TREE_DELTA.saturating_mul(left_size) {
             let right = node
                 .right
                 .0
                 .as_ref()
-                .expect("right-heavy tree has a right node");
-            if right.left.height() > right.right.height() {
+                .expect("right-heavy size-balanced tree has a right node");
+            if right.left.size() >= SEEN_TREE_RATIO.saturating_mul(right.right.size()) {
                 return Self::node(
                     Arc::clone(&node.item),
                     node.left.clone(),
@@ -927,7 +1037,7 @@ fn scanl_tail(function: ThunkRef, accumulator: ThunkRef, input: ThunkRef) -> Thu
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
-            let next = apply2(&function, &accumulator, head);
+            let next = scan_callback(evaluator, &function, &accumulator, head);
             let forced = evaluator.force(&next)?;
             let next = Thunk::evaluated(forced.as_ref().clone());
             Ok(Arc::new(Value::List(ListCell::Cons {
@@ -957,7 +1067,7 @@ fn scanr(function: ThunkRef, seed: ThunkRef, input: ThunkRef) -> ThunkRef {
                         "List.scanr recursive result was empty or malformed",
                     ));
                 };
-                evaluator.force(&apply2(&function_for_head, &item, head))
+                evaluator.force(&scan_callback(evaluator, &function_for_head, &item, head))
             });
             Ok(Arc::new(Value::List(ListCell::Cons {
                 head: accumulated,
@@ -968,12 +1078,36 @@ fn scanr(function: ThunkRef, seed: ThunkRef, input: ThunkRef) -> ThunkRef {
     })
 }
 
+#[cfg(feature = "compat-tracing")]
+fn scan_callback(
+    evaluator: &Evaluator,
+    function: &ThunkRef,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(function),
+            &[Arc::clone(left), Arc::clone(right)],
+            0,
+            "scan",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn scan_callback(
+    _evaluator: &Evaluator,
+    function: &ThunkRef,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> ThunkRef {
+    apply2(function, left, right)
+}
+
 fn sort(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     let items = evaluator.force_list_elements(input)?;
-    let mut runs = items
-        .into_iter()
-        .map(|item| vec![item])
-        .collect::<Vec<Vec<ThunkRef>>>();
+    let mut runs = natural_sort_runs(evaluator, items)?;
     while runs.len() > 1 {
         evaluator.ensure_not_cancelled()?;
         let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
@@ -990,6 +1124,45 @@ fn sort(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     Ok(Value::List(list_cell_from(runs.pop().unwrap_or_default())))
 }
 
+fn natural_sort_runs(
+    evaluator: &mut Evaluator,
+    items: Vec<ThunkRef>,
+) -> RuntimeResult<Vec<Vec<ThunkRef>>> {
+    let mut remaining = items.into_iter().peekable();
+    let mut runs = Vec::new();
+    while let Some(first) = remaining.next() {
+        let Some(second) = remaining.next() else {
+            runs.push(vec![first]);
+            break;
+        };
+        let descending = greater_than(evaluator, &first, &second)?;
+        let mut run = vec![first];
+        let mut current = second;
+        while let Some(next) = remaining.peek() {
+            let next_descending = greater_than(evaluator, &current, next)?;
+            if next_descending != descending {
+                break;
+            }
+            run.push(current);
+            current = remaining.next().expect("peeked sort item exists");
+        }
+        run.push(current);
+        if descending {
+            run.reverse();
+        }
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
+fn greater_than(
+    evaluator: &mut Evaluator,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> RuntimeResult<bool> {
+    Ok(!evaluator.equal_values(left, right)? && !evaluator.less_values(left, right)?)
+}
+
 fn merge_sorted(
     evaluator: &mut Evaluator,
     left: Vec<ThunkRef>,
@@ -1000,7 +1173,7 @@ fn merge_sorted(
     let mut right = right.into_iter().peekable();
     while let (Some(left_item), Some(right_item)) = (left.peek(), right.peek()) {
         evaluator.ensure_not_cancelled()?;
-        if evaluator.less_values(right_item, left_item)? {
+        if greater_than(evaluator, left_item, right_item)? {
             output.push(right.next().expect("peeked right item exists"));
         } else {
             output.push(left.next().expect("peeked left item exists"));
@@ -1171,7 +1344,7 @@ fn project_field(projected: ThunkRef, index: usize) -> ThunkRef {
 
 fn unfoldr(function: ThunkRef, seed: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| {
-        let step = evaluator.force(&apply1(&function, &seed))?;
+        let step = evaluator.force(&unfoldr_callback(evaluator, &function, &seed))?;
         match step.as_ref() {
             Value::Maybe(None) => Ok(Arc::new(Value::List(ListCell::Nil))),
             Value::Maybe(Some(pair)) => match evaluator.force(pair)?.as_ref() {
@@ -1197,6 +1370,18 @@ fn unfoldr(function: ThunkRef, seed: ThunkRef) -> ThunkRef {
     })
 }
 
+#[cfg(feature = "compat-tracing")]
+fn unfoldr_callback(evaluator: &Evaluator, function: &ThunkRef, seed: &ThunkRef) -> ThunkRef {
+    evaluator
+        .callback_application(Arc::clone(function), std::slice::from_ref(seed), 0, "seed")
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn unfoldr_callback(_evaluator: &Evaluator, function: &ThunkRef, seed: &ThunkRef) -> ThunkRef {
+    apply1(function, seed)
+}
+
 fn null(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     match evaluator.force(input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Value::Bool(true)),
@@ -1218,7 +1403,7 @@ fn take_while(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&input)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
-            if evaluator.force_bool(&apply1(&predicate, head))? {
+            if evaluator.force_bool(&predicate_callback(evaluator, &predicate, head))? {
                 Ok(Arc::new(Value::List(ListCell::Cons {
                     head: Arc::clone(head),
                     tail: take_while(Arc::clone(&predicate), Arc::clone(tail)),
@@ -1260,7 +1445,7 @@ fn zip_with(function: ThunkRef, left: ThunkRef, right: ThunkRef) -> ThunkRef {
                 head: right_head,
                 tail: right_tail,
             }) => Ok(Arc::new(Value::List(ListCell::Cons {
-                head: apply2(&function, left_head, right_head),
+                head: zip_with_callback(evaluator, &function, left_head, right_head),
                 tail: zip_with(
                     Arc::clone(&function),
                     Arc::clone(left_tail),
@@ -1270,6 +1455,33 @@ fn zip_with(function: ThunkRef, left: ThunkRef, right: ThunkRef) -> ThunkRef {
             _ => Err(non_list("List.zipWith")),
         }
     })
+}
+
+#[cfg(feature = "compat-tracing")]
+fn zip_with_callback(
+    evaluator: &Evaluator,
+    function: &ThunkRef,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> ThunkRef {
+    evaluator
+        .callback_application(
+            Arc::clone(function),
+            &[Arc::clone(left), Arc::clone(right)],
+            0,
+            "element",
+        )
+        .unwrap_or_else(Thunk::failed_without_admission)
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+fn zip_with_callback(
+    _evaluator: &Evaluator,
+    function: &ThunkRef,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> ThunkRef {
+    apply2(function, left, right)
 }
 
 fn list_from(mut values: Vec<ThunkRef>) -> ThunkRef {
@@ -1288,6 +1500,7 @@ fn list_cell_from(values: Vec<ThunkRef>) -> ListCell {
     })
 }
 
+#[cfg(not(feature = "compat-tracing"))]
 fn apply1(function: &ThunkRef, argument: &ThunkRef) -> ThunkRef {
     Thunk::suspended(Suspension::Apply {
         function: Arc::clone(function),
@@ -1295,6 +1508,7 @@ fn apply1(function: &ThunkRef, argument: &ThunkRef) -> ThunkRef {
     })
 }
 
+#[cfg(not(feature = "compat-tracing"))]
 fn apply2(function: &ThunkRef, first: &ThunkRef, second: &ThunkRef) -> ThunkRef {
     Thunk::suspended(Suspension::Apply {
         function: apply1(function, first),

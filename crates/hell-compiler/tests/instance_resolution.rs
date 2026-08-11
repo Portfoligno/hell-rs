@@ -1,7 +1,54 @@
+use hell_builtins::{InstanceResolution, TypeClass};
 use hell_compiler::{CompilerSession, compile_source};
+use hell_core::CoreKind;
 
 fn compile(source: &str) -> Result<(), hell_compiler::DiagnosticBundle> {
     compile_source(&mut CompilerSession::default(), "instances.hell", source).map(|_| ())
+}
+
+#[test]
+fn compiler_retains_nested_branching_and_duplicate_sibling_evidence_plans() {
+    let program = compile_source(
+        &mut CompilerSession::default(),
+        "instance-plans.hell",
+        concat!(
+            "main = IO.print ",
+            "(Either.Left (Maybe.Just 1) :: Either (Maybe Int) (Int, Int))\n",
+        ),
+    )
+    .expect("nested registered evidence should resolve");
+    let executable = program.executable();
+    let print = hell_builtins::lookup("IO.print").unwrap().id;
+    let evidence = executable
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind {
+            CoreKind::Builtin {
+                builtin,
+                evidence: Some(evidence),
+            } if builtin == print => Some(evidence),
+            _ => None,
+        })
+        .expect("IO.print retains its Show evidence");
+    assert_eq!(evidence.class, TypeClass::Show);
+    let plans = executable.instance_evidence_plans();
+    let root = &plans[evidence.plan.0 as usize];
+    assert_eq!(
+        executable.types().display(root.head),
+        "Either (Maybe Int) ((,) Int Int)"
+    );
+    assert_eq!(root.resolution, InstanceResolution::Entail(2));
+    let maybe = &plans[root.premises[0].0 as usize];
+    let tuple = &plans[root.premises[1].0 as usize];
+    assert_eq!(executable.types().display(maybe.head), "Maybe Int");
+    assert_eq!(maybe.resolution, InstanceResolution::Entail(1));
+    assert_eq!(executable.types().display(tuple.head), "(,) Int Int");
+    assert_eq!(tuple.resolution, InstanceResolution::Entail(2));
+    assert_eq!(maybe.premises[0], tuple.premises[0]);
+    assert_eq!(tuple.premises[0], tuple.premises[1]);
+    let integer = &plans[tuple.premises[0].0 as usize];
+    assert_eq!(executable.types().display(integer.head), "Int");
+    assert_eq!(integer.resolution, InstanceResolution::Direct(0));
 }
 
 #[test]

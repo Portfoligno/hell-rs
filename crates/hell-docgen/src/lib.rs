@@ -289,6 +289,177 @@ pub fn render_release_environment(environment: &ReleaseEnvironment<'_>) -> Strin
     output
 }
 
+/// Content used to generate the public, bounded compatibility statement for a
+/// promotion record.
+///
+/// Counts are claim scope cells, not builtin names or executed test cases. The
+/// caller supplies already-validated promotion data; rendering cannot turn an
+/// unreviewed proposal into an accepted record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedCompatibilityReport<'a> {
+    pub baseline: &'a str,
+    pub candidate_commit: &'a str,
+    pub assurance_epoch_sha256: &'a str,
+    pub promotion_state: &'a str,
+    pub profiles: &'a [&'a str],
+    pub platforms: &'a [&'a str],
+    pub toolchains: &'a [&'a str],
+    pub runner_identities: &'a [&'a str],
+    pub exact_cells: usize,
+    pub normalized_cells: usize,
+    pub platform_dependent_cells: usize,
+    pub deliberate_divergence_cells: usize,
+    pub unverified_cells: usize,
+    pub out_of_scope_cells: usize,
+    pub missing_obligations: usize,
+    pub undetected_critical_mutants: usize,
+    pub residual_risk_tier: &'a str,
+    pub custody_state: &'a str,
+    pub open_compatibility_issues: &'a [&'a str],
+    pub accepted_divergences: &'a [AcceptedDivergence<'a>],
+}
+
+/// One explicitly accepted divergence exposed by the bounded public report.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AcceptedDivergence<'a> {
+    pub id: &'a str,
+    pub scope: &'a str,
+    pub expires_at: &'a str,
+}
+
+/// Renders compatibility language whose scope cannot exceed its source record.
+///
+/// The output always states the finite-corpus limitation and exposes unresolved
+/// scope, semantic, mutation, and custody gaps. Lists are sorted so the same
+/// structured record renders identically on every platform.
+///
+/// # Errors
+///
+/// Returns the offending field label when external text could escape a
+/// Markdown code span, or when the promoted-cell subtotal overflows.
+pub fn render_bounded_compatibility_report(
+    report: &BoundedCompatibilityReport<'_>,
+) -> Result<String, &'static str> {
+    for (label, value) in [
+        ("baseline", report.baseline),
+        ("candidate commit", report.candidate_commit),
+        ("assurance epoch", report.assurance_epoch_sha256),
+        ("promotion state", report.promotion_state),
+        ("residual-risk tier", report.residual_risk_tier),
+        ("custody state", report.custody_state),
+    ] {
+        validate_markdown_atom(value, label)?;
+    }
+    for (label, values) in [
+        ("profile", report.profiles),
+        ("platform", report.platforms),
+        ("toolchain", report.toolchains),
+        ("runner identity", report.runner_identities),
+        ("compatibility issue", report.open_compatibility_issues),
+    ] {
+        for value in values {
+            validate_markdown_atom(value, label)?;
+        }
+    }
+    for divergence in report.accepted_divergences {
+        for (label, value) in [
+            ("divergence ID", divergence.id),
+            ("divergence scope", divergence.scope),
+            ("divergence expiry", divergence.expires_at),
+        ] {
+            validate_markdown_atom(value, label)?;
+        }
+    }
+    let mut profiles = report.profiles.to_vec();
+    profiles.sort_unstable();
+    profiles.dedup();
+    let mut platforms = report.platforms.to_vec();
+    platforms.sort_unstable();
+    platforms.dedup();
+    let mut toolchains = report.toolchains.to_vec();
+    toolchains.sort_unstable();
+    toolchains.dedup();
+    let mut runner_identities = report.runner_identities.to_vec();
+    runner_identities.sort_unstable();
+    runner_identities.dedup();
+    let mut issues = report.open_compatibility_issues.to_vec();
+    issues.sort_unstable();
+    issues.dedup();
+    let mut divergences = report.accepted_divergences.to_vec();
+    divergences.sort_unstable();
+    divergences.dedup();
+
+    let promoted_cells = promoted_cells(report)?;
+    let mut output = format!(
+        "# Bounded compatibility report\n\n- promotion state: `{}`\n- Hell baseline: `{}`\n- candidate commit: `{}`\n- assurance epoch SHA-256: `{}`\n- tested profiles: `{}`\n- tested platforms: `{}`\n- recorded toolchain evidence digests: `{}`\n- attested runner identities: `{}`\n- custody state: `{}`\n- residual-risk tier: `{}`\n\n## Claim scope cells\n\n- promoted: `{promoted_cells}`\n- exact: `{}`\n- normalized: `{}`\n- platform-dependent: `{}`\n- deliberate divergence: `{}`\n- unverified: `{}`\n- out of scope: `{}`\n\n## Visible confidence gaps\n\n- missing mandatory obligations: `{}`\n- undetected critical mutants: `{}`\n",
+        report.promotion_state,
+        report.baseline,
+        report.candidate_commit,
+        report.assurance_epoch_sha256,
+        profiles.join(", "),
+        platforms.join(", "),
+        toolchains.join(", "),
+        runner_identities.join(", "),
+        report.custody_state,
+        report.residual_risk_tier,
+        report.exact_cells,
+        report.normalized_cells,
+        report.platform_dependent_cells,
+        report.deliberate_divergence_cells,
+        report.unverified_cells,
+        report.out_of_scope_cells,
+        report.missing_obligations,
+        report.undetected_critical_mutants,
+    );
+    output.push_str("- open compatibility issues:");
+    if issues.is_empty() {
+        output.push_str(" `0`\n");
+    } else {
+        writeln!(output, " `{}`", issues.len()).expect("writing to String");
+        for issue in issues {
+            writeln!(output, "  - `{issue}`").expect("writing to String");
+        }
+    }
+    output.push_str("\n## Accepted deliberate divergences\n\n");
+    if divergences.is_empty() {
+        output.push_str("None.\n");
+    } else {
+        for divergence in divergences {
+            writeln!(
+                output,
+                "- `{}` — scope `{}` — expires `{}`",
+                divergence.id, divergence.scope, divergence.expires_at
+            )
+            .expect("writing to String");
+        }
+    }
+    output.push_str(
+        "\nThis is reviewed, corpus-backed evidence for only the profiles, platforms, attested runner identities, toolchain evidence digests, and claim cells listed above. It is not proof of universal equivalence for untested inputs, runners, environments, platform versions, profiles, or future revisions.\n",
+    );
+    Ok(output)
+}
+
+fn promoted_cells(report: &BoundedCompatibilityReport<'_>) -> Result<usize, &'static str> {
+    report
+        .exact_cells
+        .checked_add(report.normalized_cells)
+        .and_then(|count| count.checked_add(report.platform_dependent_cells))
+        .and_then(|count| count.checked_add(report.deliberate_divergence_cells))
+        .ok_or("claim cell count overflow")
+}
+
+fn validate_markdown_atom(value: &str, label: &'static str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character == '`' || character.is_control())
+    {
+        Err(label)
+    } else {
+        Ok(())
+    }
+}
+
 fn visibility_name(visibility: Visibility) -> &'static str {
     match visibility {
         Visibility::Public => "public",

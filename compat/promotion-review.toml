@@ -2,7 +2,7 @@
 # Keep `state = "pending"` and native records unavailable until reviewers have
 # downloaded, independently hashed, unpacked, and validated the retained data.
 
-schema_version = 1
+schema_version = 2
 state = "pending"
 baseline = "2026-05-29"
 required_profile = "upstream"
@@ -41,11 +41,16 @@ macos_oracle_binary_sha256 = "REVIEW_REQUIRED"
 windows_build_record_sha256 = "REVIEW_REQUIRED"
 windows_oracle_binary_sha256 = "REVIEW_REQUIRED"
 
-[acceptance]
-claims_reviewed = false
-normalizers_reviewed = false
-macos_provenance_reviewed = false
-windows_provenance_reviewed = false
-durable_copy_completed = false
+[statements]
+artifact_trust = "REVIEW_REQUIRED"
+claim_review = "REVIEW_REQUIRED"
+normalizer_review = "REVIEW_REQUIRED"
+macos_platform_review = "REVIEW_REQUIRED"
+windows_platform_review = "REVIEW_REQUIRED"
+custody_review = "REVIEW_REQUIRED"
+residual_risk_review = "REVIEW_REQUIRED"
+promotion_authorization = "REVIEW_REQUIRED"
+
+[gate]
 fresh_collection_required = true
 explicit_promotion_passed = false

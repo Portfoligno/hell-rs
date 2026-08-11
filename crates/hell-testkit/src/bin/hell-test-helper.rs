@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
@@ -74,15 +75,10 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         println!("hell-test-helper {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if command == "echo-stdin" {
-        ensure_empty(arguments)?;
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        std::io::stdout()
-            .write_all(&bytes)
-            .map_err(|error| error.to_string())?;
+    if run_profile_observer(&command, &mut arguments)? {
+        return Ok(());
+    }
+    if run_output_command(&command, &mut arguments)?.is_some() {
         return Ok(());
     }
     if command == "emit" {
@@ -124,6 +120,31 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         fs::write(path, b"descendant survived\n").map_err(|error| error.to_string())?;
         return Ok(());
     }
+    if command == "assert-current-dir-name" {
+        let expected = arguments
+            .next()
+            .ok_or_else(|| "assert-current-dir-name requires NAME".to_owned())?;
+        ensure_empty(arguments)?;
+        let current = std::env::current_dir().map_err(|error| error.to_string())?;
+        if current.file_name() != Some(expected.as_os_str()) {
+            return Err(format!(
+                "current directory {} differs from expected name {}",
+                current.display(),
+                PathBuf::from(expected).display()
+            ));
+        }
+        return Ok(());
+    }
+    if run_environment_command(&command, &mut arguments)? {
+        return Ok(());
+    }
+    if command == "fail" {
+        ensure_empty(arguments)?;
+        return Err("reviewed helper failure".to_owned());
+    }
+    if run_http_command(&command, &mut arguments)?.is_some() {
+        return Ok(());
+    }
     if command == "spawn-grandchild" {
         return spawn_marker_child(arguments, true);
     }
@@ -134,6 +155,155 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         "unknown helper subcommand {}",
         command.to_string_lossy()
     ))
+}
+
+fn run_environment_command(
+    command: &OsString,
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<bool, String> {
+    if command != "assert-env" {
+        return Ok(false);
+    }
+    let name = arguments
+        .next()
+        .ok_or_else(|| "assert-env requires NAME".to_owned())?;
+    let expected = arguments
+        .next()
+        .ok_or_else(|| "assert-env requires VALUE".to_owned())?;
+    ensure_empty(arguments)?;
+    if std::env::var_os(&name).as_ref() != Some(&expected) {
+        return Err(format!(
+            "environment variable {} differs from the reviewed value",
+            name.to_string_lossy()
+        ));
+    }
+    Ok(true)
+}
+
+fn run_profile_observer(
+    command: &OsString,
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<bool, String> {
+    if command != "--execution-profile" {
+        return Ok(false);
+    }
+    let profile = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| matches!(value.as_str(), "upstream" | "sandboxed"))
+        .ok_or_else(|| "execution profile fixture requires a typed profile".to_owned())?;
+    let mode_or_script = arguments
+        .next()
+        .ok_or_else(|| "execution profile fixture requires a script".to_owned())?;
+    if mode_or_script == "--check" {
+        arguments
+            .next()
+            .ok_or_else(|| "execution profile check requires a script".to_owned())?;
+    }
+    ensure_empty(arguments)?;
+    println!("{profile}");
+    Ok(true)
+}
+
+fn run_output_command(
+    command: &OsString,
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<Option<()>, String> {
+    let bytes = if command == "echo-stdin" {
+        ensure_empty(arguments)?;
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        bytes
+    } else if command == "emit-hex" {
+        let encoded = arguments
+            .next()
+            .ok_or_else(|| "emit-hex requires HEX".to_owned())?;
+        ensure_empty(arguments)?;
+        decode_hex(&encoded.to_string_lossy())?
+    } else {
+        return Ok(None);
+    };
+    std::io::stdout()
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(()))
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("emit-hex requires an even number of hexadecimal digits".to_owned());
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_digit(pair[0])?;
+            let low = hex_digit(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("emit-hex received a non-hexadecimal digit".to_owned()),
+    }
+}
+
+fn run_http_command(
+    command: &OsString,
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<Option<()>, String> {
+    if command == "available-http-port" {
+        ensure_empty(arguments)?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        println!("{port}");
+        return Ok(Some(()));
+    }
+    if command == "disconnect-http-stream" {
+        let port = parse_u16(arguments.next(), "PORT")?;
+        ensure_empty(arguments)?;
+        disconnect_http_stream(port)?;
+        return Ok(Some(()));
+    }
+    Ok(None)
+}
+
+fn disconnect_http_stream(port: u16) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("cannot connect to HTTP fixture: {error}")),
+        }
+    };
+    stream
+        .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .map_err(|error| error.to_string())?;
+    let mut response = [0_u8; 256];
+    let read = stream
+        .read(&mut response)
+        .map_err(|error| error.to_string())?;
+    if read == 0 || !response[..read].starts_with(b"HTTP/1.1 200 OK\r\n") {
+        return Err("HTTP fixture did not receive the streaming response head".into());
+    }
+    stream
+        .shutdown(Shutdown::Both)
+        .map_err(|error| error.to_string())?;
+    std::thread::sleep(Duration::from_millis(100));
+    Ok(())
 }
 
 fn spawn_marker_child(
@@ -185,6 +355,15 @@ fn parse_usize(value: Option<OsString>, name: &str) -> Result<usize, String> {
         .map_err(|_| format!("{name} must be UTF-8"))?
         .parse()
         .map_err(|_| format!("{name} must be an unsigned integer"))
+}
+
+fn parse_u16(value: Option<OsString>, name: &str) -> Result<u16, String> {
+    value
+        .ok_or_else(|| format!("missing {name}"))?
+        .into_string()
+        .map_err(|_| format!("{name} must be UTF-8"))?
+        .parse()
+        .map_err(|_| format!("{name} must be a network port"))
 }
 
 fn ensure_empty(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {

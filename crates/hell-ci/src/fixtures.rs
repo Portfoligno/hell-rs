@@ -89,7 +89,7 @@ pub fn validate_inventory(root: &Path) -> Result<(), String> {
 
     let baseline = fs::read_to_string(root.join("baseline.toml"))
         .map_err(|error| format!("cannot read baseline.toml: {error}"))?;
-    let compatibility = fs::read_to_string(root.join("compat/upstream-2026-05-29.json"))
+    let compatibility = fs::read_to_string(root.join("compat").join("upstream-2026-05-29.json"))
         .map_err(|error| format!("cannot read compatibility snapshot: {error}"))?;
     for expected in [UPSTREAM_COMMIT, LANGUAGE_VERSION, SOURCE_SHA256] {
         if !baseline.contains(expected) || !compatibility.contains(expected) {
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn manifest_has_exactly_the_pinned_cases() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         validate_inventory(&root).unwrap();
     }
 

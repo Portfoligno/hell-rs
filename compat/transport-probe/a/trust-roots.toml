@@ -1,0 +1,8 @@
+schema_version = 1
+state = "review-required"
+github_oidc_issuer = "https://token.actions.githubusercontent.com"
+repository = "Portfoligno/hell-rs"
+trusted_workflow_ref = "refs/heads/main"
+transport_probe_a_workflow = ".github/workflows/assurance-transport-signer-a.yml"
+transport_probe_b_workflow = ".github/workflows/assurance-transport-signer-b.yml"
+required_signature_types = ["sigstore", "ssh"]

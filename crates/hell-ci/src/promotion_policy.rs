@@ -37,10 +37,42 @@ pub(crate) struct PromotionPolicy {
     pub(crate) minimum_generated_observations: usize,
     pub(crate) require_committed_observations: bool,
     pub(crate) allow_generated_claim_references: bool,
+    pub(crate) required_records: Vec<String>,
+    pub(crate) required_blockers: Vec<String>,
 }
 
+pub(crate) const REQUIRED_RECORDS: &[&str] = &[
+    "artifactAuthenticity",
+    "claimCoverage",
+    "custody",
+    "divergence",
+    "mutation",
+    "normalizerAudit",
+    "oracleProvenanceMacos",
+    "oracleProvenanceWindows",
+    "residualRisk",
+    "reviewRoleGraph",
+];
+
+pub(crate) const REQUIRED_BLOCKERS: &[&str] = &[
+    "ambiguousClaimScopes",
+    "failedCustodyScrubs",
+    "residualRiskPolicyFailures",
+    "reviewIndependenceFailures",
+    "semanticCoverageGaps",
+    "staleEvidenceEpochs",
+    "statusEvidenceMismatches",
+    "unapprovedDivergences",
+    "undetectedCriticalMutants",
+    "unmappedReviewStatements",
+    "unreviewedOracleProvenance",
+    "unsafeNormalizers",
+    "untrustedAcquisitionReceipts",
+    "unverifiedCustodyReceipts",
+];
+
 pub(crate) fn load(root: &Path) -> Result<PromotionPolicy, String> {
-    let path = root.join("compat/promotion-policy.toml");
+    let path = root.join("compat").join("promotion-policy.toml");
     let bytes =
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let sha256 = sha256_bytes(&bytes);
@@ -59,7 +91,7 @@ fn parse_policy(bytes: &[u8], sha256: Digest) -> Result<PromotionPolicy, String>
     let document =
         std::str::from_utf8(bytes).map_err(|_| "promotion policy is not UTF-8".to_owned())?;
     let mut values = strict_toml::assignments(document)?;
-    require_unsigned(&mut values, "schema_version", 1)?;
+    require_unsigned(&mut values, "schema_version", 2)?;
     require_string(&mut values, "baseline", hell_builtins::LANGUAGE_VERSION)?;
     let required_profiles = take_array(&mut values, "required_profiles")?
         .into_iter()
@@ -99,6 +131,9 @@ fn parse_policy(bytes: &[u8], sha256: Digest) -> Result<PromotionPolicy, String>
         &mut values,
         "allow_generated_claim_references",
     )?)?;
+    let required_records = take_array(&mut values, "required_records")?;
+    let required_blockers = take_array(&mut values, "required_blockers")?;
+    require_assurance_gates(&mut values)?;
     strict_toml::finish(&values)?;
     if required_profiles != [ExecutionProfile::Upstream] {
         return Err(
@@ -113,12 +148,13 @@ fn parse_policy(bytes: &[u8], sha256: Digest) -> Result<PromotionPolicy, String>
             "promotion policy must require all compatibility dimensions in order".to_owned(),
         );
     }
-    if minimum_generated_observations < 1_024
-        || !require_committed_observations
-        || allow_generated_claim_references
-    {
-        return Err("promotion policy weakens the reviewed corpus requirements".to_owned());
-    }
+    validate_policy_strength(
+        minimum_generated_observations,
+        require_committed_observations,
+        allow_generated_claim_references,
+        &required_records,
+        &required_blockers,
+    )?;
     Ok(PromotionPolicy {
         sha256,
         required_profiles,
@@ -127,7 +163,54 @@ fn parse_policy(bytes: &[u8], sha256: Digest) -> Result<PromotionPolicy, String>
         minimum_generated_observations,
         require_committed_observations,
         allow_generated_claim_references,
+        required_records,
+        required_blockers,
     })
+}
+
+fn require_assurance_gates(values: &mut BTreeMap<String, String>) -> Result<(), String> {
+    for key in [
+        "require_collection_epoch",
+        "require_artifact_authenticity",
+        "require_claim_coverage",
+        "require_normalizer_audit",
+        "require_divergence_review",
+        "require_residual_risk_review",
+        "require_mutation_sensitivity",
+        "require_independent_oracle_rebuilds",
+        "require_exercised_oracle_binding",
+        "require_two_provider_custody",
+        "require_current_custody_scrub",
+        "require_review_role_graph",
+        "require_dual_signatures",
+        "require_exact_proposal_approval",
+        "require_zero_blockers",
+    ] {
+        require_true(values, key)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_strength(
+    minimum_generated_observations: usize,
+    require_committed_observations: bool,
+    allow_generated_claim_references: bool,
+    required_records: &[String],
+    required_blockers: &[String],
+) -> Result<(), String> {
+    if minimum_generated_observations < 1_024
+        || !require_committed_observations
+        || allow_generated_claim_references
+    {
+        return Err("promotion policy weakens the reviewed corpus requirements".to_owned());
+    }
+    if required_records != REQUIRED_RECORDS || required_blockers != REQUIRED_BLOCKERS {
+        return Err(
+            "promotion policy does not name the complete canonical record and blocker sets"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,11 +224,13 @@ pub(crate) struct PromotionReview {
     pub(crate) state: ReviewState,
     pub(crate) sha256: Digest,
     pub(crate) inner_digests: BTreeMap<String, String>,
-    pub(crate) acceptance: BTreeMap<String, bool>,
+    pub(crate) statement_refs: BTreeMap<String, String>,
+    pub(crate) fresh_collection_required: bool,
+    pub(crate) explicit_promotion_passed: bool,
 }
 
 pub(crate) fn load_review(root: &Path) -> Result<PromotionReview, String> {
-    let path = root.join("compat/promotion-review.toml");
+    let path = root.join("compat").join("promotion-review.toml");
     let bytes =
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     parse_review(&bytes)
@@ -156,12 +241,17 @@ fn parse_review(bytes: &[u8]) -> Result<PromotionReview, String> {
     let document = std::str::from_utf8(bytes)
         .map_err(|_| "promotion review record is not UTF-8".to_owned())?;
     let mut values = strict_toml::assignments(document)?;
-    require_unsigned(&mut values, "schema_version", 1)?;
+    require_unsigned(&mut values, "schema_version", 2)?;
     require_string(&mut values, "baseline", hell_builtins::LANGUAGE_VERSION)?;
     require_string(&mut values, "required_profile", "upstream")?;
     let state = match strict_toml::string(&strict_toml::take(&mut values, "state")?)?.as_str() {
         "pending" => ReviewState::Pending,
-        "accepted" => ReviewState::Accepted,
+        "accepted" => {
+            return Err(
+                "tracked promotion review cannot be accepted: signed reviews are external proposal outputs"
+                    .to_owned(),
+            );
+        }
         value => return Err(format!("unknown promotion review state {value:?}")),
     };
     let review_issue = strict_toml::string(&strict_toml::take(&mut values, "review_issue")?)?;
@@ -229,66 +319,71 @@ fn parse_review(bytes: &[u8]) -> Result<PromotionReview, String> {
         }
         inner_digests.insert(key.to_owned(), value);
     }
-    let acceptance_keys = [
-        "claims_reviewed",
-        "normalizers_reviewed",
-        "macos_provenance_reviewed",
-        "windows_provenance_reviewed",
-        "durable_copy_completed",
-        "fresh_collection_required",
-        "explicit_promotion_passed",
+    let statement_keys = [
+        "artifact_trust",
+        "claim_review",
+        "normalizer_review",
+        "macos_platform_review",
+        "windows_platform_review",
+        "custody_review",
+        "residual_risk_review",
+        "promotion_authorization",
     ];
-    let mut acceptance = BTreeMap::new();
-    for key in acceptance_keys {
-        let value = strict_toml::boolean(&strict_toml::take(
+    let mut statement_refs = BTreeMap::new();
+    for key in statement_keys {
+        let value = strict_toml::string(&strict_toml::take(
             &mut values,
-            &format!("acceptance.{key}"),
+            &format!("statements.{key}"),
         )?)?;
-        acceptance.insert(key.to_owned(), value);
+        if state == ReviewState::Pending {
+            if value != "REVIEW_REQUIRED" {
+                return Err(format!(
+                    "pending review statement {key} must remain REVIEW_REQUIRED"
+                ));
+            }
+        } else {
+            require_digest_reference(&value, key)?;
+        }
+        statement_refs.insert(key.to_owned(), value);
     }
+    let fresh_collection_required = strict_toml::boolean(&strict_toml::take(
+        &mut values,
+        "gate.fresh_collection_required",
+    )?)?;
+    let explicit_promotion_passed = strict_toml::boolean(&strict_toml::take(
+        &mut values,
+        "gate.explicit_promotion_passed",
+    )?)?;
     strict_toml::finish(&values)?;
-    if state == ReviewState::Pending
-        && (acceptance
-            .iter()
-            .any(|(key, value)| key != "fresh_collection_required" && *value)
-            || acceptance.get("fresh_collection_required") != Some(&true))
-    {
-        return Err("pending promotion review contains accepted decisions".to_owned());
+    if !fresh_collection_required || explicit_promotion_passed {
+        return Err(
+            "pre-gate review must require fresh collection and cannot claim a gate pass".to_owned(),
+        );
     }
     Ok(PromotionReview {
         state,
         sha256: sha256_bytes(bytes),
         inner_digests,
-        acceptance,
+        statement_refs,
+        fresh_collection_required,
+        explicit_promotion_passed,
     })
 }
 
 impl PromotionReview {
     pub(crate) fn require_accepted(&self) -> Result<(), String> {
-        if self.state != ReviewState::Accepted {
-            return Err("promotion review record is still pending".to_owned());
-        }
-        for key in [
-            "claims_reviewed",
-            "normalizers_reviewed",
-            "macos_provenance_reviewed",
-            "windows_provenance_reviewed",
-            "durable_copy_completed",
-        ] {
-            if self.acceptance.get(key) != Some(&true) {
-                return Err(format!("promotion review acceptance {key} is false"));
-            }
-        }
-        if self.acceptance.get("fresh_collection_required") != Some(&true)
-            || self.acceptance.get("explicit_promotion_passed") != Some(&false)
-        {
-            return Err(
-                "pre-gate review must require fresh collection and must not claim a gate pass"
-                    .to_owned(),
-            );
-        }
-        Ok(())
+        Err(format!(
+            "tracked bootstrap review in state {:?} never authorizes promotion; the explicit gate resolves external, proposal-bound signed records",
+            self.state
+        ))
     }
+}
+
+fn require_digest_reference(value: &str, label: &str) -> Result<(), String> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("{label} is not a sha256: content reference"))?;
+    require_digest(digest, label)
 }
 
 fn take_array(values: &mut BTreeMap<String, String>, key: &str) -> Result<Vec<String>, String> {
@@ -326,6 +421,13 @@ fn require_unsigned(
     (observed == expected)
         .then_some(())
         .ok_or_else(|| format!("{key} must be {expected}, observed {observed}"))
+}
+
+fn require_true(values: &mut BTreeMap<String, String>, key: &str) -> Result<(), String> {
+    let observed = strict_toml::boolean(&strict_toml::take(values, key)?)?;
+    observed
+        .then_some(())
+        .ok_or_else(|| format!("{key} must remain true"))
 }
 
 pub(crate) fn require_digest(value: &str, label: &str) -> Result<(), String> {
@@ -369,6 +471,8 @@ mod tests {
         assert_eq!(policy.required_dimensions, CompatibilityDimension::ALL);
         assert!(policy.require_committed_observations);
         assert!(!policy.allow_generated_claim_references);
+        assert_eq!(policy.required_records, REQUIRED_RECORDS);
+        assert_eq!(policy.required_blockers, REQUIRED_BLOCKERS);
 
         let review = load_review(&root).expect("strict pending review");
         assert_eq!(review.state, ReviewState::Pending);
@@ -377,7 +481,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_duplicates_unknown_keys_and_weaker_corpus_rules() {
-        let bytes = fs::read(root().join("compat/promotion-policy.toml")).unwrap();
+        let bytes = fs::read(root().join("compat").join("promotion-policy.toml")).unwrap();
         let document = String::from_utf8(bytes).unwrap();
         let digest = sha256_bytes(document.as_bytes());
         for invalid in [
@@ -390,6 +494,11 @@ mod tests {
                 "minimum_generated_observations = 1",
             ),
             format!("{document}unknown_policy_key = true\n"),
+            document.replace(
+                "require_exact_proposal_approval = true",
+                "require_exact_proposal_approval = false",
+            ),
+            document.replace("  \"reviewRoleGraph\",\n", ""),
         ] {
             assert!(parse_policy(invalid.as_bytes(), digest).is_err());
         }
@@ -397,7 +506,7 @@ mod tests {
 
     #[test]
     fn review_rejects_placeholders_in_accepted_state_and_circular_pass_claims() {
-        let bytes = fs::read(root().join("compat/promotion-review.toml")).unwrap();
+        let bytes = fs::read(root().join("compat").join("promotion-review.toml")).unwrap();
         let pending = String::from_utf8(bytes).unwrap();
         let accepted_with_placeholders =
             pending.replace("state = \"pending\"", "state = \"accepted\"");
@@ -407,24 +516,30 @@ mod tests {
             state: ReviewState::Accepted,
             sha256: Digest::default(),
             inner_digests: BTreeMap::new(),
-            acceptance: [
-                ("claims_reviewed", true),
-                ("normalizers_reviewed", true),
-                ("macos_provenance_reviewed", true),
-                ("windows_provenance_reviewed", true),
-                ("durable_copy_completed", true),
-                ("fresh_collection_required", true),
-                ("explicit_promotion_passed", false),
+            statement_refs: [
+                "artifact_trust",
+                "claim_review",
+                "normalizer_review",
+                "macos_platform_review",
+                "windows_platform_review",
+                "custody_review",
+                "residual_risk_review",
+                "promotion_authorization",
             ]
             .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
+            .map(|key| {
+                (
+                    key.to_owned(),
+                    format!("sha256:{}", sha256_bytes(key.as_bytes()).hex()),
+                )
+            })
             .collect(),
+            fresh_collection_required: true,
+            explicit_promotion_passed: false,
         };
-        assert!(review.require_accepted().is_ok());
+        assert!(review.require_accepted().is_err());
         let mut circular = review;
-        circular
-            .acceptance
-            .insert("explicit_promotion_passed".to_owned(), true);
+        circular.explicit_promotion_passed = true;
         assert!(circular.require_accepted().is_err());
         assert!(require_digest(&"0".repeat(sha256_bytes(&[]).hex().len()), "digest").is_err());
         assert!(

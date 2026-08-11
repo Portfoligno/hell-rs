@@ -63,6 +63,21 @@ pub struct CaseBranch {
 pub struct ClassEvidence {
     pub class: TypeClass,
     pub head: ClosedTypeId,
+    pub plan: InstanceEvidencePlanId,
+}
+
+/// Index of one compiler-retained class-instance evidence plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InstanceEvidencePlanId(pub u32);
+
+/// One immutable node in the exact class-instance evidence graph selected by
+/// the compiler for a constrained primitive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceEvidencePlan {
+    pub class: TypeClass,
+    pub head: TypeId,
+    pub resolution: hell_builtins::InstanceResolution,
+    pub premises: Arc<[InstanceEvidencePlanId]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +152,15 @@ pub struct CoreProgram {
     pub nodes: Vec<CoreNode>,
     pub types: TypeArena,
     pub main_type: ClosedTypeId,
+    pub instance_evidence: Vec<InstanceEvidencePlan>,
+    pub compiler_evidence: CompilerBuiltinEvidence,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompilerBuiltinEvidence {
+    pub parsed: Vec<BuiltinId>,
+    pub resolved: Vec<BuiltinId>,
+    pub specialized: Vec<BuiltinId>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +169,9 @@ pub struct ExecutableProgram {
     nodes: Arc<[CoreNode]>,
     types: Arc<TypeArena>,
     main_type: ClosedTypeId,
+    instance_evidence: Arc<[InstanceEvidencePlan]>,
+    #[cfg(feature = "compat-tracing")]
+    compiler_evidence: CompilerBuiltinEvidence,
 }
 
 /// The only program handle accepted by `hell-runtime`. Its fields are private;
@@ -185,6 +212,24 @@ impl ExecutableProgram {
     #[must_use]
     pub const fn main_type(&self) -> ClosedTypeId {
         self.main_type
+    }
+
+    #[must_use]
+    pub fn instance_evidence(&self, id: InstanceEvidencePlanId) -> Option<&InstanceEvidencePlan> {
+        self.instance_evidence.get(id.0 as usize)
+    }
+
+    #[must_use]
+    pub fn instance_evidence_plans(&self) -> &[InstanceEvidencePlan] {
+        &self.instance_evidence
+    }
+
+    /// Builtins whose source names were parsed, resolved to registry IDs, and
+    /// retained in the independently verified typed core.
+    #[must_use]
+    #[cfg(feature = "compat-tracing")]
+    pub const fn compiler_evidence(&self) -> &CompilerBuiltinEvidence {
+        &self.compiler_evidence
     }
 }
 
@@ -630,7 +675,13 @@ pub fn verify(program: CoreProgram) -> Result<VerifiedProgram, VerificationError
                     (None, None) => {}
                     (Some(expected), Some(actual))
                         if expected == actual.class
-                            && has_instance(&program.types, actual.class, actual.head.raw()) => {}
+                            && builtin_instance_head(&program.types, spec.name, node.ty.raw())
+                                == Some(actual.head.raw())
+                            && validate_instance_evidence_plan(
+                                &program.types,
+                                &program.instance_evidence,
+                                *actual,
+                            ) => {}
                     _ => {
                         return Err(VerificationError::at(
                             id,
@@ -920,6 +971,14 @@ pub fn verify(program: CoreProgram) -> Result<VerifiedProgram, VerificationError
             "program root differs from declared main type",
         ));
     }
+    if !instance_evidence_inventory_is_exact(&program) {
+        let root = &program.nodes[program.root.0 as usize];
+        return Err(VerificationError::at(
+            program.root,
+            root,
+            "class-instance evidence inventory is noncanonical or contains unused plans",
+        ));
+    }
     let TypeNode::Apply(io, unit) = program.types.get(program.main_type.raw()) else {
         let root = &program.nodes[program.root.0 as usize];
         return Err(VerificationError::at(
@@ -938,17 +997,175 @@ pub fn verify(program: CoreProgram) -> Result<VerifiedProgram, VerificationError
             "main is not `IO ()`",
         ));
     }
+    #[cfg(feature = "compat-tracing")]
+    validate_compiler_evidence(&program)?;
     Ok(VerifiedProgram {
         executable: Arc::new(ExecutableProgram {
             root: program.root,
             nodes: program.nodes.into(),
             types: Arc::new(program.types),
             main_type: program.main_type,
+            instance_evidence: program.instance_evidence.into(),
+            #[cfg(feature = "compat-tracing")]
+            compiler_evidence: program.compiler_evidence,
         }),
     })
 }
 
-fn has_instance(types: &TypeArena, class: TypeClass, mut ty: TypeId) -> bool {
+#[cfg(feature = "compat-tracing")]
+fn validate_compiler_evidence(program: &CoreProgram) -> Result<(), VerificationError> {
+    let mut present = program
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            CoreKind::Builtin { builtin, .. } => Some(builtin),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for node in &program.nodes {
+        let mut retain = |name| {
+            if let Some(spec) = hell_builtins::lookup(name) {
+                present.push(spec.id);
+            }
+        };
+        match &node.kind {
+            CoreKind::Tuple { elements } => match elements.len() {
+                2 => retain("Tuple.(,)"),
+                3 => retain("Tuple.(,,)"),
+                4 => retain("Tuple.(,,,)"),
+                _ => {}
+            },
+            CoreKind::Record { fields, .. } => {
+                retain("hell:Hell.NilR");
+                if !fields.is_empty() {
+                    retain("hell:Hell.ConsR");
+                }
+            }
+            CoreKind::RecordGet { .. } => retain("Record.get"),
+            CoreKind::RecordSet { .. } => retain("Record.set"),
+            CoreKind::RecordModify { .. } => retain("Record.modify"),
+            CoreKind::Variant {
+                constructor_index,
+                payload,
+                ..
+            } => {
+                retain("hell:Hell.LeftV");
+                if *constructor_index != 0 {
+                    retain("hell:Hell.RightV");
+                }
+                retain("hell:Hell.Tagged");
+                if payload.is_none() {
+                    retain("hell:Hell.Nullary");
+                }
+            }
+            CoreKind::Case {
+                branches, default, ..
+            } => {
+                retain("hell:Hell.NilA");
+                if !branches.is_empty() {
+                    retain("hell:Hell.ConsA");
+                }
+                if default.is_some() {
+                    retain("hell:Hell.WildA");
+                }
+                retain("hell:Hell.runAccessor");
+            }
+            _ => {}
+        }
+    }
+    for evidence in [
+        &program.compiler_evidence.parsed,
+        &program.compiler_evidence.resolved,
+        &program.compiler_evidence.specialized,
+    ] {
+        if evidence.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || evidence.iter().any(|builtin| !present.contains(builtin))
+        {
+            let root = &program.nodes[program.root.0 as usize];
+            return Err(VerificationError::at(
+                program.root,
+                root,
+                "compiler builtin evidence is unsorted or not retained in typed core",
+            ));
+        }
+    }
+    if program.compiler_evidence.parsed != program.compiler_evidence.resolved
+        || program.compiler_evidence.resolved != program.compiler_evidence.specialized
+    {
+        let root = &program.nodes[program.root.0 as usize];
+        return Err(VerificationError::at(
+            program.root,
+            root,
+            "compiler builtin phase evidence is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_instance_evidence_plan(
+    types: &TypeArena,
+    plans: &[InstanceEvidencePlan],
+    evidence: ClassEvidence,
+) -> bool {
+    plans
+        .get(evidence.plan.0 as usize)
+        .is_some_and(|root| root.class == evidence.class && root.head == evidence.head.raw())
+        && validate_instance_evidence_graph(types, plans, evidence.plan).is_some()
+}
+
+fn validate_instance_evidence_graph(
+    types: &TypeArena,
+    plans: &[InstanceEvidencePlan],
+    root: InstanceEvidencePlanId,
+) -> Option<std::collections::BTreeSet<InstanceEvidencePlanId>> {
+    enum Work {
+        Enter(InstanceEvidencePlanId),
+        Leave(InstanceEvidencePlanId),
+    }
+    let mut work = vec![Work::Enter(root)];
+    let mut active = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Leave(id) => {
+                if !active.remove(&id) {
+                    return None;
+                }
+            }
+            Work::Enter(id) => {
+                if active.contains(&id) {
+                    return None;
+                }
+                if visited.contains(&id) {
+                    continue;
+                }
+                let plan = plans.get(id.0 as usize)?;
+                let (target, arguments) = instance_head(types, plan.head)?;
+                let instance = hell_builtins::instance(plan.class, target)?;
+                let premise_count = usize::from(instance.resolution.premise_count());
+                if plan.resolution != instance.resolution
+                    || usize::from(instance.resolution.head_arity()) != arguments.len()
+                    || plan.premises.len() != premise_count
+                {
+                    return None;
+                }
+                for (index, premise) in plan.premises.iter().copied().enumerate() {
+                    let child = plans.get(premise.0 as usize)?;
+                    if child.class != plan.class || child.head != arguments[index] {
+                        return None;
+                    }
+                }
+                active.insert(id);
+                visited.insert(id);
+                work.push(Work::Leave(id));
+                work.extend(plan.premises.iter().rev().copied().map(Work::Enter));
+            }
+        }
+    }
+    Some(visited)
+}
+
+fn instance_head(types: &TypeArena, mut ty: TypeId) -> Option<(&str, Vec<TypeId>)> {
     let mut arguments = Vec::new();
     while let TypeNode::Apply(function, argument) = types.get(ty) {
         arguments.push(*argument);
@@ -956,11 +1173,75 @@ fn has_instance(types: &TypeArena, class: TypeClass, mut ty: TypeId) -> bool {
     }
     arguments.reverse();
     let TypeNode::Constructor { name, .. } = types.get(ty) else {
-        return false;
+        return None;
     };
-    hell_builtins::resolve_instance(class, name, arguments.len(), |index| {
-        has_instance(types, class, arguments[index])
-    })
+    Some((name, arguments))
+}
+
+fn builtin_instance_head(types: &TypeArena, name: &str, ty: TypeId) -> Option<TypeId> {
+    use hell_builtins::InstanceHeadProjection::{
+        ApplyArgument, ApplyFunction, FunctionArgument, FunctionResult,
+    };
+    let mut current = ty;
+    for projection in hell_builtins::instance_head_projection(name)? {
+        current = match projection {
+            FunctionArgument(index) => function_type_parts(types, current)
+                .0
+                .get(usize::from(*index))
+                .copied()?,
+            FunctionResult => function_type_parts(types, current).1,
+            ApplyFunction => match types.get(current) {
+                TypeNode::Apply(function, _) => *function,
+                _ => return None,
+            },
+            ApplyArgument => match types.get(current) {
+                TypeNode::Apply(_, argument) => *argument,
+                _ => return None,
+            },
+        };
+    }
+    Some(current)
+}
+
+fn function_type_parts(types: &TypeArena, mut ty: TypeId) -> (Vec<TypeId>, TypeId) {
+    let mut arguments = Vec::new();
+    while let TypeNode::Function(argument, result) = types.get(ty) {
+        arguments.push(*argument);
+        ty = *result;
+    }
+    (arguments, ty)
+}
+
+fn instance_evidence_inventory_is_exact(program: &CoreProgram) -> bool {
+    let mut roots = program.nodes.iter().filter_map(|node| match node.kind {
+        CoreKind::Builtin {
+            evidence: Some(evidence),
+            ..
+        } => Some(evidence.plan),
+        _ => None,
+    });
+    let Some(first) = roots.next() else {
+        return program.instance_evidence.is_empty();
+    };
+    let mut reachable =
+        validate_instance_evidence_graph(&program.types, &program.instance_evidence, first)
+            .unwrap_or_default();
+    for root in roots {
+        let Some(nodes) =
+            validate_instance_evidence_graph(&program.types, &program.instance_evidence, root)
+        else {
+            return false;
+        };
+        reachable.extend(nodes);
+    }
+    if reachable.len() != program.instance_evidence.len() {
+        return false;
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    program
+        .instance_evidence
+        .iter()
+        .all(|plan| identities.insert((plan.class, plan.head)))
 }
 
 fn builtin_type_is_plausible(types: &TypeArena, name: &str, ty: TypeId) -> bool {
@@ -1036,5 +1317,21 @@ fn builtin_type_is_plausible(types: &TypeArena, name: &str, ty: TypeId) -> bool 
             }
             actual_arity == expected_arity
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_evidence_tests {
+    use super::*;
+    use hell_types::KindArena;
+
+    #[test]
+    fn constrained_builtin_projection_selects_the_instantiated_head() {
+        let mut types = TypeArena::default();
+        let int = types.constructor("Int", KindArena::TYPE);
+        let boolean = types.constructor("Bool", KindArena::TYPE);
+        let tail = types.function(int, boolean);
+        let eq = types.function(int, tail);
+        assert_eq!(builtin_instance_head(&types, "Eq.eq", eq), Some(int));
     }
 }

@@ -1,0 +1,99 @@
+name: Package externally authored claim applicability decisions
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        type: string
+        required: true
+      decision_source_sha:
+        description: Exact commit containing compat/reviews/claim-applicability-decisions.json
+        type: string
+        required: true
+      native_run_id:
+        type: string
+        required: true
+      native_run_attempt:
+        type: string
+        required: true
+      native_artifact_id:
+        type: string
+        required: true
+      native_package_sha256:
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact externally authored decisions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.decision_source_sha }}
+          path: decision-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: claim-applicability-decisions-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore decision compilation
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: claim-applicability-decisions-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/claim-applicability-decisions.yml') }}
+      - name: Download exact native evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.native_run_id }}
+          artifact-ids: ${{ inputs.native_artifact_id }}
+          path: ci-out/evidence/native
+      - name: Build decision packager
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Derive exact source claim coverage
+        run: ./target/ci/hell-ci case-coverage report --input ci-out/evidence/native --output ci-out/evidence/claim-decisions/source/claim-coverage.details.json
+      - name: Package externally authored decisions and provider facts
+        run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs
+      - name: Upload immutable claim decisions
+        id: upload-decisions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-claim-applicability-decisions
+          path: ci-out/evidence/claim-decisions
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: claim-applicability-decisions-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save decision compilation
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: claim-applicability-decisions-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/claim-applicability-decisions.yml') }}

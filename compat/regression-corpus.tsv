@@ -1,0 +1,2 @@
+schema_version	2
+columns	case_id	template_case_id	source_hex	source_sha256	candidate_commit	assurance_epoch_sha256	package_sha256	proposal_sha256	review_sha256	bundle_sha256	targets_hex	proof_path	proof_manifest_sha256

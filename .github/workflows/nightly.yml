@@ -2,34 +2,70 @@ name: Nightly
 
 on:
   push:
+  schedule:
+    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
       require_promotion:
         description: Apply the fail-closed promotion gate to merged evidence
-        required: false
+        required: true
         type: boolean
         default: false
+      candidate_sha:
+        description: Exact candidate commit to promote
+        required: true
+        type: string
+      assurance_epoch_sha256:
+        description: Exact collection assurance epoch
+        required: true
+        type: string
+      promotion_proposal_sha256:
+        description: Exact reviewed promotion proposal digest
+        required: true
+        type: string
+      proposal_run_id:
+        description: Immutable run containing the reviewed proposal package
+        required: true
+        type: string
+      proposal_run_attempt:
+        description: Exact reviewed proposal workflow run attempt
+        required: true
+        type: string
+      proposal_artifact_id:
+        description: Immutable approved-proposal provider artifact ID
+        required: true
+        type: string
+      proposal_package_sha256:
+        description: Expected canonical approved-proposal directory SHA-256
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
-  HELL_SOURCE_COMMIT: ${{ github.sha }}
+  HELL_SOURCE_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
 
 concurrency:
   group: nightly-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  evidence-collection-linux:
-    name: Evidence collection / Linux
+  linux-acquisition-subject:
+    name: Linux release acquisition subject
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload-subject.outputs.artifact-id }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    if: ${{ github.event_name == 'push' || !inputs.require_promotion }}
     steps:
-      - name: Check out source
+      - name: Check out candidate acquisition subject source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Restore Cargo download cache
@@ -50,11 +86,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/nightly.yml') }}
 
       - name: Resolve pinned Rust toolchain
         run: rustup show active-toolchain
@@ -68,26 +100,27 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Reverify durable committed regression proofs and current revocations
+        run: ./target/ci/hell-ci regression-import verify-committed
+
+      - name: Prove targeted divergence prototype production roundtrip
+        run: cargo test --locked --package hell-ci --all-features assurance::tests::divergence_prototype_successful_patch_runs_and_replays_end_to_end -- --ignored --exact
+
       - name: Retain dependency policy attestation
         run: ./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation-report.json
 
-      - name: Download content-addressed upstream oracle
-        run: curl --fail --location --tlsv1.2 --create-dirs --output target/oracle/hell https://github.com/chrisdone/hell/releases/download/2026-05-29/hell-linux-amd64
+      - name: Acquire and retain pinned Linux release oracle identity
+        run: ./target/ci/hell-ci release-oracle acquire --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json
 
-      - name: Make upstream oracle executable
-        run: chmod +x target/oracle/hell
-
-      - name: Collect Linux release and stress evidence
-        run: ./target/ci/hell-ci nightly --oracle target/oracle/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
-
-      - name: Upload nightly report
+      - name: Upload untrusted Linux acquisition subject
+        id: upload-subject
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-acquisition-subject-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out
-          if-no-files-found: ignore
-          retention-days: 30
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Save Cargo download cache
         if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
@@ -104,16 +137,191 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/nightly.yml') }}
+
+  sign-linux-acquisition:
+    needs: linux-acquisition-subject
+    if: ${{ github.ref == 'refs/heads/main' && needs.linux-acquisition-subject.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    environment: linux-release-acquisition-signing
+    outputs:
+      artifact_id: ${{ steps.upload-signed.outputs.artifact-id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out trusted current acquisition signer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build trusted acquisition signer before receiving subject bytes
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Download exact Linux acquisition subject
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.linux-acquisition-subject.outputs.artifact_id }}
+          path: ci-out
+      - name: Install pinned Sigstore signer
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign exact verified Linux release acquisition
+        run: ./target/ci/hell-ci release-oracle attest --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json --attestation ci-out/linux-release-oracle-acquisition.dsse.json
+      - name: Upload immutable signed Linux acquisition
+        id: upload-signed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-acquisition-signed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out
+          if-no-files-found: error
+          retention-days: 30
+
+  evidence-collection-linux:
+    name: Evidence collection / Linux
+    needs: sign-linux-acquisition
+    if: ${{ needs.sign-linux-acquisition.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact candidate for unprivileged execution
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build candidate evidence driver without protected credentials
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Build candidate differential process helper without protected credentials
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Run bounded CI assurance semantic robustness targets
+        run: cargo test --locked --package hell-ci --all-features --bin hell-ci fuzz_target
+      - name: Run bounded testkit semantic robustness targets
+        run: cargo test --locked --package hell-testkit --all-features --lib semantic_fuzz_target
+      - name: Run exact build-time catalog parser robustness targets
+        run: cargo test --locked --manifest-path crates/hell-ci/fuzz/Cargo.toml --test catalog_semantics
+      - name: Install pinned nightly fuzzing toolchain
+        run: rustup toolchain install nightly-2026-07-31 --profile minimal
+      - name: Install pinned coverage-guided cargo-fuzz driver
+        run: cargo +nightly-2026-07-31 install cargo-fuzz --version 0.13.2 --locked
+      - name: Copy reviewed fuzz seeds into isolated writable campaign directories
+        run: ./target/ci/hell-ci fuzz-corpus prepare --input crates/hell-ci/fuzz/corpus --output ci-out/fuzz-corpora --to ci-out/fuzz-artifacts
+      - name: Fuzz exact claim catalog admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz claim_toml ci-out/fuzz-corpora/claim_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/claim_toml/
+      - name: Fuzz exact normalizer catalog admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_toml ci-out/fuzz-corpora/normalizer_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_toml/
+      - name: Fuzz exact divergence catalog admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz divergence_toml ci-out/fuzz-corpora/divergence_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/divergence_toml/
+      - name: Fuzz DSSE envelope byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz dsse_envelope ci-out/fuzz-corpora/dsse_envelope -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/dsse_envelope/
+      - name: Fuzz acquisition receipt byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz acquisition_receipt ci-out/fuzz-corpora/acquisition_receipt -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/acquisition_receipt/
+      - name: Fuzz observation bundle manifest byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz observation_bundle_manifest ci-out/fuzz-corpora/observation_bundle_manifest -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/observation_bundle_manifest/
+      - name: Fuzz provenance record byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz provenance_record ci-out/fuzz-corpora/provenance_record -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/provenance_record/
+      - name: Fuzz custody manifest byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz custody_receipt ci-out/fuzz-corpora/custody_receipt -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/custody_receipt/
+      - name: Fuzz normalizer replay idempotence
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_replay ci-out/fuzz-corpora/normalizer_replay -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_replay/
+      - name: Fuzz worklist escaping
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz worklist_escaping ci-out/fuzz-corpora/worklist_escaping -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/worklist_escaping/
+      - name: Fuzz semantic observation trace admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz semantic_trace ci-out/fuzz-corpora/semantic_trace -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/semantic_trace/
+      - name: Fuzz review graph byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz review_graph ci-out/fuzz-corpora/review_graph -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/review_graph/
+      - name: Fuzz final evidence graph merge byte admission
+        run: cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz evidence_graph_merge ci-out/fuzz-corpora/evidence_graph_merge -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/evidence_graph_merge/
+      - name: Verify fuzzing left committed seed corpora unchanged
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci fuzz-corpus verify-clean --input crates/hell-ci/fuzz/corpus
+      - name: Retain evolving semantic fuzz corpora
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semantic-fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/fuzz-corpora
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain semantic fuzz crash artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semantic-fuzz-crashes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/fuzz-artifacts
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Download exact trusted signed Linux acquisition
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.sign-linux-acquisition.outputs.artifact_id }}
+          path: ci-out
+      - name: Collect Linux release and stress evidence
+        run: ./target/ci/hell-ci nightly --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
+      - name: Minimize every scheduled generated mismatch as unreviewed non-claim evidence
+        if: ${{ always() && github.event_name == 'schedule' }}
+        run: ./target/ci/hell-ci regression-import explore-generated --input ci-out --output ci-out/regression-exploration
+      - name: Attempt exact reviewed Linux implementation prototypes
+        run: ./target/ci/hell-ci divergence-prototype run --input ci-out --program compat/divergence-prototypes.json
+      - name: Upload nightly report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out
+          if-no-files-found: ignore
+          retention-days: 30
+
+  branch-evidence-collection-linux:
+    name: Unprivileged branch evidence collection / Linux
+    needs: linux-acquisition-subject
+    if: ${{ github.event_name == 'push' && github.ref != 'refs/heads/main' && needs.linux-acquisition-subject.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact branch candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build unprivileged branch evidence driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Build unprivileged branch process helper
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Download exact unsigned Linux acquisition subject
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.linux-acquisition-subject.outputs.artifact_id }}
+          path: ci-out
+      - name: Collect explicitly non-promotable branch Linux evidence
+        run: ./target/ci/hell-ci nightly-exploratory --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
+      - name: Upload unprivileged branch Linux evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-branch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out
+          if-no-files-found: error
+          retention-days: 14
 
   native-oracle-macos:
     name: Native oracle shard / macOS arm64
     runs-on: macos-15
     timeout-minutes: 90
+    if: ${{ github.event_name == 'push' || !inputs.require_promotion }}
     steps:
       - name: Check out candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -122,7 +330,7 @@ jobs:
         with:
           repository: chrisdone/hell
           ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
-          path: target/oracle-source
+          path: ci-work/oracle-source
           fetch-depth: 1
           persist-credentials: false
 
@@ -134,8 +342,8 @@ jobs:
           stack-no-global: true
           stack-version: 3.11.1
 
-      - name: Restore Cargo and Stack caches
-        id: native-cache
+      - name: Restore Cargo dependency cache
+        id: native-cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -145,14 +353,34 @@ jobs:
             ~/.cargo/bin/cargo-deny
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-            ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-
+
+      - name: Restore Stack dependency cache
+        id: native-stack-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
+
+      - name: Restore Stack build cache
+        id: native-stack-work-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-work/oracle-source/.stack-work
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-work-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
+
+      - name: Restore native compilation cache
+        id: native-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
             target/ci
             target/release
-            target/oracle-source/.stack-work
-          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
-          restore-keys: |
-            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
-            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
 
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --locked --version 0.20.2
@@ -163,11 +391,17 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Build differential process helper
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+
       - name: Retain dependency policy attestation
         run: ./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation-report.json
 
       - name: Build pinned oracle and run native shard
-        run: ./target/ci/hell-ci native-oracle-shard --source target/oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/shards/macos-arm64/report.json
+        run: ./target/ci/hell-ci native-oracle-shard --source ci-work/oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/shards/macos-arm64/report.json
+
+      - name: Attempt exact reviewed macOS implementation prototypes
+        run: ./target/ci/hell-ci divergence-prototype run --input ci-out/shards/macos-arm64 --program compat/divergence-prototypes.json
 
       - name: Upload native macOS evidence
         if: ${{ always() }}
@@ -178,8 +412,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Save Cargo and Stack caches
-        if: ${{ always() && steps.native-cache.outcome == 'success' && steps.native-cache.outputs.cache-hit != 'true' }}
+      - name: Save Cargo dependency cache
+        if: ${{ always() && steps.native-cargo-cache.outcome == 'success' && steps.native-cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -189,20 +423,41 @@ jobs:
             ~/.cargo/bin/cargo-deny
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-            ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+
+      - name: Save Stack dependency cache
+        if: ${{ always() && steps.native-stack-cache.outcome == 'success' && steps.native-stack-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**') }}
+
+      - name: Save Stack build cache
+        if: ${{ always() && steps.native-stack-work-cache.outcome == 'success' && steps.native-stack-work-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-work/oracle-source/.stack-work
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-work-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
+
+      - name: Save native compilation cache
+        if: ${{ always() && steps.native-target-cache.outcome == 'success' && steps.native-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
             target/ci
             target/release
-            target/oracle-source/.stack-work
-          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
 
   native-oracle-windows:
     name: Native oracle shard / Windows amd64
     runs-on: windows-2025
     timeout-minutes: 90
+    if: ${{ github.event_name == 'push' || !inputs.require_promotion }}
     steps:
       - name: Check out candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -211,7 +466,7 @@ jobs:
         with:
           repository: chrisdone/hell
           ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
-          path: target/oracle-source
+          path: ci-work/oracle-source
           fetch-depth: 1
           persist-credentials: false
 
@@ -223,8 +478,8 @@ jobs:
           stack-no-global: true
           stack-version: 3.11.1
 
-      - name: Restore Cargo and Stack caches
-        id: native-cache
+      - name: Restore Cargo dependency cache
+        id: native-cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -234,14 +489,34 @@ jobs:
             ~/.cargo/bin/cargo-deny.exe
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-            ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-
+
+      - name: Restore Stack dependency cache
+        id: native-stack-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**') }}
+          restore-keys: |
+            v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-
+
+      - name: Restore Stack build cache
+        id: native-stack-work-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-work/oracle-source/.stack-work
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-work-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
+
+      - name: Restore native compilation cache
+        id: native-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
             target/ci
             target/release
-            target/oracle-source/.stack-work
-          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
-          restore-keys: |
-            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-
-            v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
 
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --locked --version 0.20.2
@@ -252,11 +527,17 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Build differential process helper
+        run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+
       - name: Retain dependency policy attestation
         run: .\target\ci\hell-ci.exe dependency-attestation --output ci-out\dependency-policy.json --report ci-out\dependency-attestation-report.json
 
       - name: Build pinned oracle and run native shard
-        run: .\target\ci\hell-ci.exe native-oracle-shard --source target\oracle-source --platform windows-amd64 --dependency-attestation ci-out\dependency-policy.json --report ci-out\shards\windows-amd64\report.json
+        run: .\target\ci\hell-ci.exe native-oracle-shard --source ci-work\oracle-source --platform windows-amd64 --dependency-attestation ci-out\dependency-policy.json --report ci-out\shards\windows-amd64\report.json
+
+      - name: Attempt exact reviewed Windows implementation prototypes
+        run: .\target\ci\hell-ci.exe divergence-prototype run --input ci-out\shards\windows-amd64 --program compat\divergence-prototypes.json
 
       - name: Upload native Windows evidence
         if: ${{ always() }}
@@ -267,8 +548,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Save Cargo and Stack caches
-        if: ${{ always() && steps.native-cache.outcome == 'success' && steps.native-cache.outputs.cache-hit != 'true' }}
+      - name: Save Cargo dependency cache
+        if: ${{ always() && steps.native-cargo-cache.outcome == 'success' && steps.native-cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -278,22 +559,46 @@ jobs:
             ~/.cargo/bin/cargo-deny.exe
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-            ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+
+      - name: Save Stack dependency cache
+        if: ${{ always() && steps.native-stack-cache.outcome == 'success' && steps.native-stack-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup-stack.outputs.stack-root }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-native-oracle-${{ hashFiles('ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**') }}
+
+      - name: Save Stack build cache
+        if: ${{ always() && steps.native-stack-work-cache.outcome == 'success' && steps.native-stack-work-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-work/oracle-source/.stack-work
+          key: v2-${{ runner.os }}-${{ runner.arch }}-stack-work-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
+
+      - name: Save native compilation cache
+        if: ${{ always() && steps.native-target-cache.outcome == 'success' && steps.native-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
             target/ci
             target/release
-            target/oracle-source/.stack-work
-          key: v4-${{ runner.os }}-${{ runner.arch }}-cargo-deny-0.20.2-stack-3.11.1-native-oracle-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'target/oracle-source/stack.yaml', 'target/oracle-source/stack.yaml.lock', 'target/oracle-source/package.yaml', 'target/oracle-source/hell.cabal', 'target/oracle-source/src/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-oracle-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/nightly.yml') }}
 
   merge-native-evidence:
     name: Merge native oracle evidence / Linux
     needs: [evidence-collection-linux, native-oracle-macos, native-oracle-windows]
-    if: ${{ always() }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.require_promotion) }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Check out candidate source
+      - name: Check out trusted current merge automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -316,9 +621,6 @@ jobs:
         with:
           path: target
           key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-nightly-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
 
       - name: Download native macOS evidence
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -343,6 +645,20 @@ jobs:
 
       - name: Verify and merge native shards
         run: ./target/ci/hell-ci merge-native-shards --input ci-out/native-shards --report ci-out/native-shards/merge-report.json
+
+      - name: Write assurance epoch manifest
+        run: ./target/ci/hell-ci evidence-epoch write --output ci-out/native-shards/assurance-epoch.json
+
+      - name: Prepare fail-closed promotion proposal
+        run: ./target/ci/hell-ci promotion-proposal --input ci-out/native-shards --output ci-out/native-shards/promotion-proposal.json
+
+      - name: Prepare exact merged artifact public-attestation subject
+        run: ./target/ci/hell-ci artifact-acquire prepare-provider-attestation --input ci-out/native-shards --output ci-out/native-shards/provider-attestation-subject.json --artifact native-oracle-merged
+
+      - name: Publish signed merged artifact provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ci-out/native-shards/provider-attestation-subject.json
 
       - name: Upload merged native evidence
         if: ${{ always() }}
@@ -370,21 +686,62 @@ jobs:
           path: target
           key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
 
+  branch-merge-native-evidence:
+    name: Unprivileged branch three-platform merge validation
+    needs: [branch-evidence-collection-linux, native-oracle-macos, native-oracle-windows]
+    if: ${{ always() && github.event_name == 'push' && github.ref != 'refs/heads/main' }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact branch candidate merge implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download branch macOS evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: native-oracle-macos-arm64
+          path: ci-out/native-shards/macos-arm64
+      - name: Download branch Linux evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: nightly-branch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/native-shards/linux-amd64
+      - name: Download branch Windows evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: native-oracle-windows-amd64
+          path: ci-out/native-shards/windows-amd64
+      - name: Build unprivileged branch merge verifier
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Validate the exact three-platform branch merge without promotion output
+        run: ./target/ci/hell-ci merge-native-shards --input ci-out/native-shards --report ci-out/native-shards/merge-report.json
+
   promotion-gate:
     name: Promotion gate / Linux
     needs: merge-native-evidence
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_promotion && needs.merge-native-evidence.result == 'success' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.require_promotion }}
+    permissions:
+      actions: read
+      contents: read
     environment: compatibility-promotion
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Check out candidate source
+      - name: Check out trusted current promotion-gate automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Restore Cargo download cache
+        id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -397,24 +754,47 @@ jobs:
             v2-${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Restore merge compilation cache
+        id: target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-
 
       - name: Download merged native evidence
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          name: native-oracle-merged
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.proposal_run_id }}
+          artifact-ids: ${{ inputs.proposal_artifact_id }}
           path: ci-out/native-shards
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Reverify durable regression signatures and current governance revocations
+        run: ./target/ci/hell-ci regression-import verify-committed-structural
+
+      - name: Verify exact approved-proposal provider object
+        run: ./target/ci/hell-ci surveillance-ops workflow-verify-approved-source
+
       - name: Require promotion-ready evidence
-        run: ./target/ci/hell-ci promotion-gate --input ci-out/native-shards --report ci-out/promotion-gate.json
+        run: ./target/ci/hell-ci promotion-gate --input ci-out/native-shards --proposal ci-out/native-shards/promotion-proposal.json --github-dispatch-inputs --report ci-out/promotion-gate.json
+
+      - name: Generate bounded public compatibility report
+        run: ./target/ci/hell-ci compatibility-report --proposal ci-out/native-shards/promotion-proposal.json --output ci-out/compatibility-report.md
+
+      - name: Assemble exact final promotion record
+        run: ./target/ci/hell-ci surveillance-ops workflow-final-record
+
+      - name: Upload final record for protected durable custody
+        id: final-record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: promotion-record
+          path: ci-out/promotion-record
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload promotion report
         if: ${{ always() }}
@@ -424,7 +804,26 @@ jobs:
           path: |
             ci-out/promotion-gate.json
             ci-out/promotion-gate.sha256
+            ci-out/compatibility-report.md
+            ci-out/compatibility-report.sha256
             ci-out/native-shards/merged-native-shards.json
             ci-out/native-shards/merged-native-shards.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Save Cargo download cache
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+
+      - name: Save merge compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && hashFiles('target/**') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: v2-${{ runner.os }}-${{ runner.arch }}-native-merge-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', '.github/workflows/nightly.yml') }}

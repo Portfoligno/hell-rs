@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use hell_builtins::ExecutionProfile;
 use hell_compiler::{CompilerSession, DiagnosticBundle, compile_file};
 use hell_core::VerifiedProgram;
 
@@ -12,10 +13,12 @@ enum Command {
     Check {
         file: PathBuf,
         compiler_stats: bool,
+        profile: ExecutionProfile,
     },
     Run {
         file: PathBuf,
         arguments: Vec<OsString>,
+        profile: ExecutionProfile,
     },
 }
 
@@ -33,14 +36,19 @@ fn usage_summary() -> &'static str {
 }
 
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let mut arguments = arguments.into_iter();
+    let mut arguments = arguments.into_iter().peekable();
+    let profile = parse_execution_profile(&mut arguments)?;
     let Some(first) = arguments.next() else {
+        if profile != ExecutionProfile::Upstream {
+            return Err("--execution-profile requires a script or --check".into());
+        }
         return Ok(Command::Version);
     };
     if !first.to_string_lossy().starts_with('-') {
         return Ok(Command::Run {
             file: first.into(),
             arguments: arguments.collect(),
+            profile,
         });
     }
 
@@ -61,6 +69,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         return Ok(Command::Run {
             file: file.into(),
             arguments: remaining.collect(),
+            profile,
         });
     }
 
@@ -108,7 +117,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         }
     }
     if let Some(command) = terminal {
-        if check.is_some() || compiler_stats {
+        if check.is_some() || compiler_stats || profile != ExecutionProfile::Upstream {
             return Err("help, version, and build info do not accept other options".into());
         }
         return Ok(command);
@@ -117,7 +126,38 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
     Ok(Command::Check {
         file,
         compiler_stats,
+        profile,
     })
+}
+
+fn parse_execution_profile(
+    arguments: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
+) -> Result<ExecutionProfile, String> {
+    let Some(first) = arguments.peek() else {
+        return Ok(ExecutionProfile::Upstream);
+    };
+    let value = if first == "--execution-profile" {
+        arguments.next();
+        arguments
+            .next()
+            .ok_or_else(|| "--execution-profile requires upstream or sandboxed".to_owned())?
+            .into_string()
+            .map_err(|_| "execution profile must be UTF-8".to_owned())?
+    } else if let Some(value) = first
+        .to_str()
+        .and_then(|value| value.strip_prefix("--execution-profile="))
+    {
+        let value = value.to_owned();
+        arguments.next();
+        value
+    } else {
+        return Ok(ExecutionProfile::Upstream);
+    };
+    match value.as_str() {
+        "upstream" => Ok(ExecutionProfile::Upstream),
+        "sandboxed" => Ok(ExecutionProfile::Sandboxed),
+        _ => Err(format!("unknown execution profile {value:?}")),
+    }
 }
 
 fn run(command: Command) -> Result<(), RunFailure> {
@@ -152,13 +192,23 @@ fn run(command: Command) -> Result<(), RunFailure> {
         Command::Check {
             file,
             compiler_stats,
-        } => compile_path(&file, compiler_stats)
+            profile,
+        } => compile_path(&file, compiler_stats, profile)
             .map(|_| ())
             .map_err(RunFailure::Message),
-        Command::Run { file, arguments } => {
-            let program = compile_path(&file, false).map_err(RunFailure::Message)?;
-            let platform = hell_platform::PlatformContext::process(arguments)
+        Command::Run {
+            file,
+            arguments,
+            profile,
+        } => {
+            let program = compile_path(&file, false, profile).map_err(RunFailure::Message)?;
+            let mut platform = hell_platform::PlatformContext::process(arguments)
                 .map_err(|error| RunFailure::Message(error.to_string()))?;
+            if profile == ExecutionProfile::Sandboxed {
+                platform.runtime = platform
+                    .runtime
+                    .with_policy(hell_runtime::policy::RuntimePolicy::sandboxed());
+            }
             hell_runtime::run_main(program, platform.runtime).map_err(|error| match error.kind {
                 hell_runtime::RuntimeErrorKind::Exit(status) => RunFailure::Exit(status),
                 _ => RunFailure::Message(error.to_string()),
@@ -167,8 +217,15 @@ fn run(command: Command) -> Result<(), RunFailure> {
     }
 }
 
-fn compile_path(file: &std::path::Path, compiler_stats: bool) -> Result<VerifiedProgram, String> {
-    let mut session = CompilerSession::upstream();
+fn compile_path(
+    file: &std::path::Path,
+    compiler_stats: bool,
+    profile: ExecutionProfile,
+) -> Result<VerifiedProgram, String> {
+    let mut session = match profile {
+        ExecutionProfile::Upstream => CompilerSession::upstream(),
+        ExecutionProfile::Sandboxed => CompilerSession::default(),
+    };
     if compiler_stats {
         session.enable_stats();
     }
@@ -230,7 +287,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse, usage};
+    use super::{Command, ExecutionProfile, parse, usage};
     use std::ffi::OsString;
 
     #[test]
@@ -282,10 +339,37 @@ mod tests {
     #[test]
     fn option_separator_allows_a_dash_prefixed_script_path() {
         let command = parse(["--", "--script.hell", "argument"].map(OsString::from)).unwrap();
-        let Command::Run { file, arguments } = command else {
+        let Command::Run {
+            file, arguments, ..
+        } = command
+        else {
             panic!("the option separator must select script execution");
         };
         assert_eq!(file, std::path::PathBuf::from("--script.hell"));
         assert_eq!(arguments, vec![OsString::from("argument")]);
+    }
+
+    #[test]
+    fn execution_profile_is_explicit_and_precedes_the_script_invocation() {
+        let command = parse(
+            [
+                "--execution-profile=sandboxed",
+                "--",
+                "main.hell",
+                "argument",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        let Command::Run {
+            profile, arguments, ..
+        } = command
+        else {
+            panic!("profiled invocation must select script execution");
+        };
+        assert_eq!(profile, ExecutionProfile::Sandboxed);
+        assert_eq!(arguments, [OsString::from("argument")]);
+        assert!(parse(["--execution-profile=unknown", "main.hell"].map(OsString::from)).is_err());
+        assert!(parse(["--execution-profile=sandboxed", "--version"].map(OsString::from)).is_err());
     }
 }

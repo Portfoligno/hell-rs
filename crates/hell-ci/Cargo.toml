@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+mutation-testing = []
+
 [[bin]]
 name = "hell-ci"
 path = "src/main.rs"
@@ -13,6 +16,7 @@ path = "src/main.rs"
 hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
 hell-docgen = { version = "0.1.0", path = "../hell-docgen" }
+hell-runtime = { version = "0.1.0", path = "../hell-runtime" }
 hell-source = { version = "0.1.0", path = "../hell-source" }
 hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 hell-testkit = { version = "0.1.0", path = "../hell-testkit" }

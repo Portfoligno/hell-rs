@@ -1,0 +1,8 @@
+schema_version = 2
+baseline = "2026-05-29"
+state = "none-accepted"
+require_exact_scope = true
+require_mismatch_fingerprint = true
+require_expiry = true
+require_impact_approvals = true
+allow_wildcards = false

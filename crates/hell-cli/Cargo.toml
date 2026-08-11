@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+compat-tracing = [
+  "hell-compiler/compat-tracing",
+  "hell-core/compat-tracing",
+  "hell-runtime/compat-tracing",
+]
+
 [[bin]]
 name = "hell"
 path = "src/main.rs"

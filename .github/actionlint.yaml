@@ -1,0 +1,15 @@
+self-hosted-runner:
+  labels:
+    - artifact-review
+    - custody-primary-activation
+    - custody-primary-retrieval
+    - custody-primary-upload
+    - custody-review
+    - custody-secondary-activation
+    - custody-secondary-retrieval
+    - custody-secondary-upload
+    - macos-arm64
+    - oracle-independent
+    - oracle-primary
+    - oracle-review
+    - windows-amd64

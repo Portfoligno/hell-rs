@@ -1,0 +1,113 @@
+[package]
+name = "hell-ci-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.assurance]
+cargo-fuzz-version = "0.13.2"
+cargo-fuzz-toolchain = "nightly-2026-07-31"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hell-builtins = { path = "../../hell-builtins" }
+hell-ci = { path = ".." }
+hell-digest = { path = "../../hell-digest" }
+hell-testkit = { path = "../../hell-testkit", features = ["compat-tracing"] }
+
+[[bin]]
+name = "claim_toml"
+path = "fuzz_targets/claim_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalizer_toml"
+path = "fuzz_targets/normalizer_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "divergence_toml"
+path = "fuzz_targets/divergence_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dsse_envelope"
+path = "fuzz_targets/dsse_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acquisition_receipt"
+path = "fuzz_targets/acquisition_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observation_bundle_manifest"
+path = "fuzz_targets/observation_bundle_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provenance_record"
+path = "fuzz_targets/provenance_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "custody_receipt"
+path = "fuzz_targets/custody_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalizer_replay"
+path = "fuzz_targets/normalizer_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "worklist_escaping"
+path = "fuzz_targets/worklist_escaping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "semantic_trace"
+path = "fuzz_targets/semantic_trace.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "review_graph"
+path = "fuzz_targets/review_graph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evidence_graph_merge"
+path = "fuzz_targets/evidence_graph_merge.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

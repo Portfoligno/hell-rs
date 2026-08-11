@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+compat-tracing = ["hell-compiler/compat-tracing"]
+mutation-testing = []
+
 [dependencies]
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
 hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
+hell-digest = { version = "0.1.0", path = "../hell-digest" }
 hell-platform = { version = "0.1.0", path = "../hell-platform" }
+tar = "0.4.44"
 
 [dev-dependencies]
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
+hell-runtime = { version = "0.1.0", path = "../hell-runtime", features = ["compat-tracing"] }
 hell-source = { version = "0.1.0", path = "../hell-source" }
 hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 

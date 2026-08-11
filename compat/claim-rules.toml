@@ -1,0 +1,11 @@
+schema_version = 1
+default_decision = "ambiguous-needs-review"
+mechanical_public_parse = "applicable-derived"
+mechanical_all_static = "applicable-derived"
+family_pure_runtime = "applicable-derived"
+family_effects = "applicable-derived"
+family_concurrency = "applicable-derived"
+family_presentation = "applicable-derived"
+family_platform = "applicable-derived"
+family_resource = "applicable-derived"
+automatic_not_applicable = false

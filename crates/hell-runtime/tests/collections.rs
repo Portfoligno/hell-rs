@@ -1,4 +1,6 @@
 use std::io::Write;
+#[cfg(feature = "mutation-testing")]
+use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 
 use hell_compiler::{CompilerSession, compile_source};
@@ -79,6 +81,131 @@ fn map_operations_preserve_key_order_duplicate_bias_and_callback_order() {
 }
 
 #[test]
+fn map_from_list_consumes_ord_comparators_and_preserves_unordered_fallback() {
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  IO.print $ Map.toList $ Map.fromList [(1,\"a\"),(2,\"b\")]\n",
+            "  IO.print $ Map.size $ Map.fromList [(1,\"old\"),(1,\"new\")]\n",
+        )),
+        "[(1,\"a\"),(2,\"b\")]\n1\n"
+    );
+}
+
+#[cfg(not(feature = "compat-tracing"))]
+#[test]
+fn map_from_list_preserves_nan_unordered_fallback() {
+    assert_eq!(
+        run(concat!(
+            "nan = case Double.readMaybe \"NaN\" of { Maybe.Just value -> value; Maybe.Nothing -> 0.0 }\n",
+            "main = IO.print $ Map.size $ Map.fromList [(Main.nan,\"first\"),(Main.nan,\"last\")]\n",
+        )),
+        "2\n"
+    );
+}
+
+#[test]
+fn map_size_balancing_matches_pinned_nan_routing() {
+    assert_eq!(
+        run(concat!(
+            "nan = Maybe.maybe (Error.error \"nan\") Function.id $ Double.readMaybe \"NaN\"\n",
+            "base = Map.fromList [(Main.nan,\"nan\"),(1.0,\"one\"),(2.0,\"two\"),",
+            "(3.0,\"three\"),(4.0,\"four\"),(5.0,\"five\")]\n",
+            "main = do\n",
+            "  IO.print $ Map.toList Main.base\n",
+            "  IO.print $ Map.lookup Main.nan Main.base\n",
+            "  IO.print $ Map.lookup 1.0 Main.base\n",
+            "  IO.print $ Map.lookup 2.0 Main.base\n",
+            "  IO.print $ Map.lookup 3.0 Main.base\n",
+            "  IO.print $ Map.lookup 4.0 Main.base\n",
+            "  IO.print $ Map.lookup 5.0 Main.base\n",
+            "  IO.print $ Map.toList $ Map.delete 3.0 Main.base\n",
+            "  IO.print $ Map.toList $ Map.insert 0.0 \"zero\" Main.base\n",
+        )),
+        concat!(
+            "[(NaN,\"nan\"),(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),",
+            "(4.0,\"four\"),(5.0,\"five\")]\n",
+            "Nothing\n",
+            "Just \"one\"\n",
+            "Just \"two\"\n",
+            "Just \"three\"\n",
+            "Just \"four\"\n",
+            "Just \"five\"\n",
+            "[(NaN,\"nan\"),(1.0,\"one\"),(2.0,\"two\"),(4.0,\"four\"),",
+            "(5.0,\"five\")]\n",
+            "[(NaN,\"nan\"),(0.0,\"zero\"),(1.0,\"one\"),(2.0,\"two\"),",
+            "(3.0,\"three\"),(4.0,\"four\"),(5.0,\"five\")]\n",
+        )
+    );
+}
+
+#[test]
+fn map_builder_matches_pinned_long_nan_routing() {
+    assert_eq!(
+        run(concat!(
+            "nan = Maybe.maybe (Error.error \"nan\") Function.id $ Double.readMaybe \"NaN\"\n",
+            "base = Map.fromList [(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),",
+            "(Main.nan,\"nan-a\"),(4.0,\"four\"),(5.0,\"five\"),",
+            "(Main.nan,\"nan-b\"),(6.0,\"six\"),(0.0,\"zero\")]\n",
+            "main = do\n",
+            "  IO.print $ Map.toList Main.base\n",
+            "  IO.print $ Map.lookup Main.nan Main.base\n",
+            "  IO.print $ Map.lookup 0.0 Main.base\n",
+            "  IO.print $ Map.lookup 3.0 Main.base\n",
+            "  IO.print $ Map.lookup 6.0 Main.base\n",
+            "  IO.print $ Map.toList $ Map.delete Main.nan Main.base\n",
+            "  IO.print $ Map.toList $ Map.delete 3.0 Main.base\n",
+            "  IO.print $ Map.toList $ Map.insert Main.nan \"nan-c\" Main.base\n",
+            "  IO.print $ Map.toList $ Map.insert 2.5 \"middle\" Main.base\n",
+        )),
+        concat!(
+            "[(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),(NaN,\"nan-a\"),",
+            "(0.0,\"zero\"),(4.0,\"four\"),(5.0,\"five\"),(NaN,\"nan-b\"),",
+            "(6.0,\"six\")]\n",
+            "Nothing\n",
+            "Just \"zero\"\n",
+            "Nothing\n",
+            "Just \"six\"\n",
+            "[(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),(NaN,\"nan-a\"),",
+            "(0.0,\"zero\"),(4.0,\"four\"),(5.0,\"five\"),(NaN,\"nan-b\"),",
+            "(6.0,\"six\")]\n",
+            "[(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),(NaN,\"nan-a\"),",
+            "(0.0,\"zero\"),(4.0,\"four\"),(5.0,\"five\"),(NaN,\"nan-b\"),",
+            "(6.0,\"six\")]\n",
+            "[(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),(NaN,\"nan-a\"),",
+            "(0.0,\"zero\"),(4.0,\"four\"),(5.0,\"five\"),(NaN,\"nan-b\"),",
+            "(6.0,\"six\"),(NaN,\"nan-c\")]\n",
+            "[(1.0,\"one\"),(2.0,\"two\"),(3.0,\"three\"),(NaN,\"nan-a\"),",
+            "(0.0,\"zero\"),(2.5,\"middle\"),(4.0,\"four\"),(5.0,\"five\"),",
+            "(NaN,\"nan-b\"),(6.0,\"six\")]\n",
+        )
+    );
+}
+
+#[cfg(feature = "mutation-testing")]
+fn run_map_comparator_test(mutant: Option<&str>) -> ExitStatus {
+    let mut command = Command::new(std::env::current_exe().expect("collections test executable"));
+    command
+        .arg("map_from_list_consumes_ord_comparators_and_preserves_unordered_fallback")
+        .arg("--exact")
+        .env_remove("HELL_ASSURANCE_MUTANT_ID");
+    if let Some(mutant) = mutant {
+        command.env("HELL_ASSURANCE_MUTANT_ID", mutant);
+    }
+    command.status().expect("nested collections test runs")
+}
+
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn map_ordering_test_detects_comparator_substitution() {
+    assert!(run_map_comparator_test(None).success());
+    assert!(
+        !run_map_comparator_test(Some("ordering-comparator-constant-true")).success(),
+        "constant comparator survived Map.fromList ordering evidence"
+    );
+}
+
+#[test]
 fn map_callbacks_are_lazy_when_their_result_is_unneeded() {
     assert_eq!(
         run(concat!(
@@ -129,5 +256,19 @@ fn set_operations_are_sorted_deduplicated_and_have_structural_instances() {
             "True\n",
             "True\n",
         )
+    );
+}
+
+#[test]
+fn vector_and_exit_code_ordering_are_lexicographic_and_constructor_sensitive() {
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  IO.print $ Ord.lt (Vector.fromList [1,2]) (Vector.fromList [1,3])\n",
+            "  IO.print $ Ord.gt (Vector.fromList [1,3]) (Vector.fromList [1,2])\n",
+            "  IO.print $ Ord.lt Exit.ExitSuccess (Exit.ExitFailure 1)\n",
+            "  IO.print $ Ord.gt (Exit.ExitFailure 2) (Exit.ExitFailure 1)\n",
+        )),
+        "True\nTrue\nTrue\nTrue\n"
     );
 }

@@ -2,7 +2,20 @@
 
 use std::sync::OnceLock;
 
-mod compatibility;
+pub mod assurance_catalogs {
+    include!(concat!(env!("OUT_DIR"), "/assurance_catalogs.rs"));
+}
+
+pub use assurance_catalogs::{NormalizerContract, NormalizerId, ObservationField};
+
+/// Returns the generated, implementation-digest-bound contract for a normalizer.
+#[must_use]
+pub fn normalizer_contract(id: NormalizerId) -> Option<&'static NormalizerContract> {
+    assurance_catalogs::NORMALIZER_CONTRACTS
+        .iter()
+        .find(|contract| contract.id == id)
+}
+
 mod manifest;
 
 pub use manifest::{
@@ -11,20 +24,55 @@ pub use manifest::{
     type_constructor, type_constructors,
 };
 
-pub const LANGUAGE_VERSION: &str = "2026-05-29";
+pub const LANGUAGE_VERSION: &str = assurance_catalogs::CLAIM_BASELINE;
 pub const UPSTREAM_COMMIT: &str = "d4d028609ed46a560c62caea8c70e7e91d1afd29";
 pub const UPSTREAM_SOURCE_SHA256: &str =
     "6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9";
 pub const UPSTREAM_EXAMPLE_COUNT: usize = 44;
 /// Updated only alongside the strictly parsed committed promotion policy.
 pub const PROMOTION_POLICY_SHA256: &str =
-    "34a03fd2db8156c938b441403c7837557fccf046a3cfaa647b645ee08ce30d74";
+    "f757c44ab61bb590ed6a9ac0453a5a218d564d0c04fd3f340ebb248ee0149708";
 pub const PUBLIC_NAME_COUNT: usize = 345;
 pub const INTERNAL_NAME_COUNT: usize = 10;
 pub const UNIQUE_NAME_COUNT: usize = PUBLIC_NAME_COUNT + INTERNAL_NAME_COUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BuiltinId(pub u16);
+
+/// Canonical diagnostic codes emitted by the runtime evidence producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeDiagnosticCode {
+    ResourceLimit,
+    UserError,
+    BlackHole,
+    Io,
+    Cancelled,
+    Exit,
+    Http,
+    ResourceClosed,
+    InternalInvariant,
+    PanicContained,
+}
+
+impl RuntimeDiagnosticCode {
+    /// Parses one exact runtime diagnostic code from retained evidence.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "H0803" => Some(Self::ResourceLimit),
+            "H0901" => Some(Self::UserError),
+            "H0902" => Some(Self::BlackHole),
+            "H0903" => Some(Self::Io),
+            "H0906" => Some(Self::Cancelled),
+            "H0907" => Some(Self::Exit),
+            "H0908" => Some(Self::Http),
+            "H0909" => Some(Self::ResourceClosed),
+            "H9001" => Some(Self::InternalInvariant),
+            "H9004" => Some(Self::PanicContained),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -112,38 +160,17 @@ pub enum ClaimPlatform {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NormalizerId {
-    DiagnosticSandboxPathV1,
-    DiagnosticPathSeparatorV1,
-    StderrFixtureRootV1,
-}
-
-impl NormalizerId {
-    pub const ALL: [Self; 3] = [
-        Self::DiagnosticSandboxPathV1,
-        Self::DiagnosticPathSeparatorV1,
-        Self::StderrFixtureRootV1,
-    ];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::DiagnosticSandboxPathV1 => "diagnostic-sandbox-path-v1",
-            Self::DiagnosticPathSeparatorV1 => "diagnostic-path-separator-v1",
-            Self::StderrFixtureRootV1 => "stderr-fixture-root-v1",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScopedClaim {
     pub status: ClaimStatus,
     pub profiles: &'static [ExecutionProfile],
     pub platforms: &'static [ClaimPlatform],
     pub evidence: &'static [&'static str],
     pub normalizers: &'static [NormalizerId],
+    pub obligations: &'static [&'static str],
+    pub applicability_rule: &'static str,
     pub rationale: Option<&'static str>,
     pub issue: Option<&'static str>,
+    pub review_group: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +201,10 @@ pub enum ClaimValidationError {
     DuplicateProfile,
     DuplicatePlatform,
     DuplicateEvidence,
+    DuplicateObligation,
     OverlappingScope,
+    MissingApplicabilityRule,
+    InvalidNormalizerScope,
     InvalidStatusMetadata,
 }
 
@@ -214,6 +244,420 @@ pub struct BuiltinSpec {
     /// yet present in this build. Compilation reports H0004 instead of silently
     /// manufacturing a result.
     pub implementation: Option<&'static str>,
+}
+
+/// Trusted projection from an instantiated builtin type to the exact type
+/// head constrained by its class predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceHeadProjection {
+    FunctionArgument(u8),
+    FunctionResult,
+    ApplyFunction,
+    ApplyArgument,
+}
+
+/// Returns the exact registry-owned path from a constrained builtin's full
+/// instantiated type to its class-instance head.
+#[must_use]
+pub fn instance_head_projection(name: &str) -> Option<&'static [InstanceHeadProjection]> {
+    use InstanceHeadProjection::{ApplyArgument, ApplyFunction, FunctionArgument, FunctionResult};
+    Some(match name {
+        "Show.show" | "IO.print" | "Eq.eq" | "Ord.lt" | "Ord.gt" | "List.lookup" | "List.elem"
+        | "List.notElem" | "List.elemIndex" | "List.elemIndices" | "Map.lookup" | "Map.insert"
+        | "Map.delete" | "Map.singleton" | "Set.insert" | "Set.member" | "Set.delete"
+        | "Set.singleton" | "CI.mk" | "<>" => &[FunctionArgument(0)],
+        "Map.insertWith" | "Map.adjust" => &[FunctionArgument(1)],
+        "List.group"
+        | "List.isInfixOf"
+        | "List.isPrefixOf"
+        | "List.isSubsequenceOf"
+        | "List.isSuffixOf"
+        | "List.sort"
+        | "List.nubOrd"
+        | "Set.union"
+        | "Set.difference"
+        | "Set.intersection" => &[FunctionArgument(0), ApplyArgument],
+        "List.sortOn" => &[FunctionArgument(0), FunctionResult],
+        "Map.fromList" => &[FunctionResult, ApplyFunction, ApplyArgument],
+        "Map.unionWith" => &[FunctionArgument(1), ApplyFunction, ApplyArgument],
+        "Set.fromList" => &[FunctionResult, ApplyArgument],
+        "Functor.fmap" | "<$>" | "Monad.when" => &[FunctionArgument(1), ApplyFunction],
+        "Applicative.pure" | "Monad.return" => &[FunctionResult, ApplyFunction],
+        "<*>"
+        | "<**>"
+        | "Alternative.optional"
+        | "Alternative.many"
+        | "Monad.bind"
+        | "Monad.then" => &[FunctionArgument(0), ApplyFunction],
+        "Monad.mapM" | "Monad.mapM_" => &[FunctionArgument(0), FunctionResult, ApplyFunction],
+        "Monad.forM" | "Monad.forM_" => &[FunctionArgument(1), FunctionResult, ApplyFunction],
+        "Monad.sequence" => &[FunctionArgument(0), ApplyArgument, ApplyFunction],
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceReachability {
+    Public,
+    GeneratedOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectKind {
+    Pure,
+    Io,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeterminismClass {
+    Deterministic,
+    FixtureRelative,
+    ScheduleSensitive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssuranceCapability {
+    Filesystem,
+    Process,
+    Network,
+    Clock,
+    Concurrency,
+    StandardIo,
+    HostHandle,
+    Environment,
+    ProcessTermination,
+    CommandLine,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssuranceResourceRole {
+    Filesystem,
+    TemporaryResource,
+    Process,
+    StandardInput,
+    StandardOutput,
+    StandardError,
+    Handle,
+    Environment,
+    Clock,
+    Network,
+    Task,
+    Timer,
+    ProcessTermination,
+    CommandLine,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssuranceSensitivity {
+    Presentation,
+    Concurrency,
+    Resource,
+    Platform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinAssuranceMetadata {
+    pub source_reachability: SourceReachability,
+    pub semantic_family: &'static str,
+    pub effect_kind: EffectKind,
+    pub capabilities: &'static [AssuranceCapability],
+    pub determinism: DeterminismClass,
+    pub sensitivities: &'static [AssuranceSensitivity],
+    pub resource_roles: &'static [AssuranceResourceRole],
+    pub host_failure_applicable: bool,
+    pub compatibility_quirks: &'static [&'static str],
+}
+
+impl BuiltinSpec {
+    /// Derives the fail-closed assurance contract for this registry entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a public wired builtin has an unclassified IO return or
+    /// host-domain type, forcing registry changes to extend the authority.
+    #[must_use]
+    pub fn assurance_metadata(&self) -> BuiltinAssuranceMetadata {
+        const NO_SENSITIVITIES: &[AssuranceSensitivity] = &[];
+        const PRESENTATION: &[AssuranceSensitivity] = &[AssuranceSensitivity::Presentation];
+        const PRESENTATION_RESOURCE_PLATFORM: &[AssuranceSensitivity] = &[
+            AssuranceSensitivity::Presentation,
+            AssuranceSensitivity::Resource,
+            AssuranceSensitivity::Platform,
+        ];
+        const CONCURRENT: &[AssuranceSensitivity] = &[
+            AssuranceSensitivity::Concurrency,
+            AssuranceSensitivity::Resource,
+            AssuranceSensitivity::Platform,
+        ];
+        const RESOURCE_PLATFORM: &[AssuranceSensitivity] = &[
+            AssuranceSensitivity::Resource,
+            AssuranceSensitivity::Platform,
+        ];
+        const PLATFORM: &[AssuranceSensitivity] = &[AssuranceSensitivity::Platform];
+        let semantic_family = self.name.split_once('.').map_or(self.name, |pair| pair.0);
+        let capabilities = assurance_capabilities(self.implementation);
+        let resource_roles = assurance_resource_roles(self.implementation);
+        let compatibility_quirks = assurance_compatibility_quirks(self.name);
+        let effect_kind = if self.scheme.is_some_and(scheme_returns_io) {
+            EffectKind::Io
+        } else {
+            EffectKind::Pure
+        };
+        assert!(
+            assurance_contract_is_complete(self, effect_kind, capabilities, resource_roles),
+            "public builtin {} has no explicit host/effect/resource assurance contract",
+            self.name
+        );
+        let concurrency_sensitive = capabilities.contains(&AssuranceCapability::Concurrency);
+        let determinism = if concurrency_sensitive {
+            DeterminismClass::ScheduleSensitive
+        } else if effect_kind == EffectKind::Io {
+            DeterminismClass::FixtureRelative
+        } else {
+            DeterminismClass::Deterministic
+        };
+        let presentation_sensitive = self.name == "IO.print"
+            || matches!(
+                semantic_family,
+                "Show" | "Text" | "Json" | "Options" | "Diagnostic"
+            );
+        let sensitivities = if presentation_sensitive
+            && (effect_kind == EffectKind::Io
+                || !capabilities.is_empty()
+                || !resource_roles.is_empty())
+        {
+            PRESENTATION_RESOURCE_PLATFORM
+        } else if presentation_sensitive {
+            PRESENTATION
+        } else if concurrency_sensitive {
+            CONCURRENT
+        } else if effect_kind == EffectKind::Io
+            || !capabilities.is_empty()
+            || !resource_roles.is_empty()
+            || matches!(semantic_family, "List" | "Map" | "Set")
+        {
+            RESOURCE_PLATFORM
+        } else if matches!(semantic_family, "Int" | "Word" | "Double") {
+            PLATFORM
+        } else {
+            NO_SENSITIVITIES
+        };
+        BuiltinAssuranceMetadata {
+            source_reachability: match self.visibility {
+                Visibility::Public => SourceReachability::Public,
+                Visibility::Internal => SourceReachability::GeneratedOnly,
+            },
+            semantic_family,
+            effect_kind,
+            capabilities,
+            determinism,
+            sensitivities,
+            resource_roles,
+            host_failure_applicable: host_failure_applicable(self.implementation),
+            compatibility_quirks,
+        }
+    }
+}
+
+fn assurance_capabilities(implementation: Option<&str>) -> &'static [AssuranceCapability] {
+    use AssuranceCapability as Capability;
+    match implementation {
+        Some(
+            "text_read_file"
+            | "text_write_file"
+            | "text_append_file"
+            | "bytes_read_file"
+            | "bytes_write_file"
+            | "io_open_file"
+            | "temp_with_directory"
+            | "temp_with_file",
+        ) => &[Capability::Filesystem],
+        Some(value) if value.starts_with("directory_") => &[Capability::Filesystem],
+        Some(
+            "text_read_process"
+            | "text_read_process_checked"
+            | "text_read_process_stdout_checked"
+            | "bytes_read_process"
+            | "bytes_read_process_checked"
+            | "bytes_read_process_stdout_checked"
+            | "process_run"
+            | "process_run_checked",
+        ) => &[Capability::Process],
+        Some("utc_time_get_current") => &[Capability::Clock],
+        Some("thread_delay" | "timeout") => &[Capability::Concurrency],
+        Some(value) if value.starts_with("async_") => &[Capability::Concurrency],
+        Some("http_get_body_chunk" | "http_consume_body" | "http_run") => &[Capability::Network],
+        Some(
+            "text_get_line" | "text_get_contents" | "text_put_str" | "text_put_str_ln"
+            | "text_interact" | "bytes_get_contents" | "bytes_interact" | "io_print" | "io_stdin"
+            | "io_stdout" | "io_stderr",
+        ) => &[Capability::StandardIo],
+        Some(
+            "io_h_close" | "io_h_set_buffering" | "text_h_put_str" | "bytes_h_get"
+            | "bytes_h_put_str",
+        ) => &[Capability::HostHandle],
+        Some("environment_get_args" | "environment_get_env" | "environment_get_environment") => {
+            &[Capability::Environment]
+        }
+        Some("exit_die" | "exit_with") => &[Capability::ProcessTermination],
+        Some("options_exec_parser") => &[Capability::CommandLine],
+        _ => &[],
+    }
+}
+
+fn assurance_resource_roles(implementation: Option<&str>) -> &'static [AssuranceResourceRole] {
+    use AssuranceResourceRole as Role;
+    match implementation {
+        Some("temp_with_directory") => &[Role::TemporaryResource],
+        Some("temp_with_file") => &[Role::TemporaryResource, Role::Handle],
+        Some(
+            "text_read_file" | "text_write_file" | "text_append_file" | "bytes_read_file"
+            | "bytes_write_file",
+        ) => &[Role::Filesystem],
+        Some("io_open_file") => &[Role::Filesystem, Role::Handle],
+        Some(value) if value.starts_with("directory_") => &[Role::Filesystem],
+        Some(
+            "io_stdin" | "text_get_line" | "text_get_contents" | "text_interact"
+            | "bytes_get_contents" | "bytes_interact",
+        ) => &[Role::StandardInput],
+        Some("io_stdout" | "io_print" | "text_put_str" | "text_put_str_ln") => {
+            &[Role::StandardOutput]
+        }
+        Some("io_stderr") => &[Role::StandardError],
+        Some(
+            "io_h_close" | "io_h_set_buffering" | "text_h_put_str" | "bytes_h_get"
+            | "bytes_h_put_str",
+        ) => &[Role::Handle],
+        Some(
+            "text_read_process"
+            | "text_read_process_checked"
+            | "text_read_process_stdout_checked"
+            | "text_set_stdin"
+            | "bytes_read_process"
+            | "bytes_read_process_checked"
+            | "bytes_read_process_stdout_checked"
+            | "process_run"
+            | "process_run_checked"
+            | "process_null_stream"
+            | "process_proc"
+            | "process_set_env"
+            | "process_set_stderr"
+            | "process_set_stdin"
+            | "process_set_stdout"
+            | "process_set_working_dir"
+            | "process_use_handle_close"
+            | "process_use_handle_open",
+        ) => &[Role::Process],
+        Some("environment_get_args" | "environment_get_env" | "environment_get_environment") => {
+            &[Role::Environment]
+        }
+        Some("utc_time_get_current") => &[Role::Clock],
+        Some("thread_delay" | "timeout") => &[Role::Timer],
+        Some(value) if value.starts_with("async_") => &[Role::Task],
+        Some("http_run") => &[Role::Network, Role::Task],
+        Some(value) if value.starts_with("http_") => &[Role::Network],
+        Some("exit_die" | "exit_with") => &[Role::ProcessTermination],
+        Some("options_exec_parser") => &[Role::CommandLine],
+        _ => &[],
+    }
+}
+
+fn scheme_returns_io(scheme: &str) -> bool {
+    let mut depth = 0_u32;
+    let mut result_start = 0;
+    let bytes = scheme.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' => depth = depth.saturating_add(1),
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'-' if depth == 0 && bytes.get(index + 1) == Some(&b'>') => {
+                result_start = index + 2;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    scheme[result_start..].trim_start().starts_with("IO ")
+}
+
+fn assurance_contract_is_complete(
+    spec: &BuiltinSpec,
+    effect_kind: EffectKind,
+    capabilities: &[AssuranceCapability],
+    resource_roles: &[AssuranceResourceRole],
+) -> bool {
+    if spec.visibility != Visibility::Public || spec.implementation.is_none() {
+        return true;
+    }
+    if effect_kind == EffectKind::Io {
+        return !capabilities.is_empty()
+            || !resource_roles.is_empty()
+            || matches!(
+                spec.implementation,
+                Some("io_pure" | "io_map_m_" | "io_for_m_")
+            );
+    }
+    let scheme = spec.scheme.unwrap_or_default();
+    let carries_host_domain = [
+        "Handle", "Process", "Request", "Response", "Status", "FilePart",
+    ]
+    .iter()
+    .any(|domain| scheme.contains(domain));
+    !carries_host_domain || !resource_roles.is_empty()
+}
+
+fn host_failure_applicable(implementation: Option<&str>) -> bool {
+    matches!(
+        implementation,
+        Some(
+            "text_read_file"
+                | "text_write_file"
+                | "text_append_file"
+                | "bytes_read_file"
+                | "bytes_write_file"
+                | "io_open_file"
+                | "temp_with_directory"
+                | "temp_with_file"
+                | "text_read_process"
+                | "text_read_process_checked"
+                | "text_read_process_stdout_checked"
+                | "bytes_read_process"
+                | "bytes_read_process_checked"
+                | "bytes_read_process_stdout_checked"
+                | "process_run"
+                | "process_run_checked"
+                | "http_get_body_chunk"
+                | "http_consume_body"
+                | "http_run"
+                | "text_get_line"
+                | "text_get_contents"
+                | "text_interact"
+                | "environment_get_env"
+                | "exit_die"
+                | "exit_with"
+                | "options_exec_parser"
+                | "thread_delay"
+                | "timeout"
+                | "async_concurrently"
+                | "async_race"
+                | "async_pooled_map"
+                | "async_pooled_for"
+                | "async_pooled_map_"
+                | "async_pooled_for_"
+        )
+    ) || implementation.is_some_and(|value| value.starts_with("directory_"))
+}
+
+fn assurance_compatibility_quirks(name: &str) -> &'static [&'static str] {
+    match name {
+        "Int.subtract" | "Integer.subtract" | "Double.subtract" => {
+            &["upstream-second-argument-minus-first"]
+        }
+        "List.mapAccumR" => &["upstream-map-accum-r-uses-left-order"],
+        _ => &[],
+    }
 }
 
 const LAZY: &[Demand] = &[Demand::Lazy];
@@ -1541,24 +1985,91 @@ pub fn registry() -> &'static [BuiltinSpec] {
     })
 }
 
-const SUPPORTED_PROFILES: &[ExecutionProfile] =
-    &[ExecutionProfile::Upstream, ExecutionProfile::Sandboxed];
-const ALL_PLATFORMS: &[ClaimPlatform] = &[ClaimPlatform::All];
-const UNVERIFIED_SCOPES: &[ScopedClaim] = &[ScopedClaim {
-    status: ClaimStatus::Unverified,
-    profiles: SUPPORTED_PROFILES,
-    platforms: ALL_PLATFORMS,
-    evidence: &[],
-    normalizers: &[],
-    rationale: Some("No current pinned-oracle evidence has been published for this dimension."),
-    issue: Some("COMPAT-EVIDENCE"),
-}];
-
-fn unverified_dimension(dimension: CompatibilityDimension) -> DimensionClaim {
-    DimensionClaim {
-        dimension,
-        scopes: UNVERIFIED_SCOPES,
+/// Returns a source-language type annotation for an executable builtin.
+///
+/// The monadic traversal primitives use a manifest marker in [`BuiltinSpec::scheme`]
+/// because the compiler specializes their result shape from the selected method.
+/// Their source annotations remain ordinary polymorphic schemes.
+#[must_use]
+pub fn source_annotation_scheme(name: &str) -> Option<&'static str> {
+    match name {
+        "Monad.mapM" => Some("forall m a b. Monad m => (a -> m b) -> [a] -> m [b]"),
+        "Monad.mapM_" => Some("forall m a. Monad m => (a -> m ()) -> [a] -> m ()"),
+        "Monad.forM" => Some("forall m a b. Monad m => [a] -> (a -> m b) -> m [b]"),
+        "Monad.forM_" => Some("forall m a. Monad m => [a] -> (a -> m ()) -> m ()"),
+        "Monad.sequence" => Some("forall m a. Monad m => [m a] -> m [a]"),
+        _ => executable(name).map(|entry| entry.0),
     }
+}
+
+fn catalog_scope(source: &assurance_catalogs::GeneratedClaimScope) -> ScopedClaim {
+    let status = match source.status {
+        "exact" => ClaimStatus::Exact,
+        "normalized" => ClaimStatus::Normalized,
+        "platform-dependent" => ClaimStatus::PlatformDependent,
+        "deliberate-divergence" => ClaimStatus::DeliberateDivergence,
+        "unverified" => ClaimStatus::Unverified,
+        "not-applicable" => ClaimStatus::NotApplicable,
+        value => panic!("generated claim catalog contains unknown status {value:?}"),
+    };
+    let profiles = source
+        .profiles
+        .iter()
+        .map(|value| match *value {
+            "upstream" => ExecutionProfile::Upstream,
+            "sandboxed" => ExecutionProfile::Sandboxed,
+            other => panic!("generated claim catalog contains unknown profile {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .leak();
+    let platforms = source
+        .platforms
+        .iter()
+        .map(|value| match *value {
+            "all" => ClaimPlatform::All,
+            "linux" => ClaimPlatform::Linux,
+            "macos" => ClaimPlatform::MacOs,
+            "windows" => ClaimPlatform::Windows,
+            other => panic!("generated claim catalog contains unknown platform {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .leak();
+    let normalizers = source
+        .normalizers
+        .iter()
+        .map(|name| {
+            NormalizerId::ALL
+                .iter()
+                .copied()
+                .find(|normalizer| normalizer.as_str() == *name)
+                .unwrap_or_else(|| panic!("generated claim names unknown normalizer {name:?}"))
+        })
+        .collect::<Vec<_>>()
+        .leak();
+    ScopedClaim {
+        status,
+        profiles,
+        platforms,
+        evidence: source.evidence,
+        normalizers,
+        obligations: source.obligations,
+        applicability_rule: source.applicability_rule,
+        rationale: (!source.rationale.is_empty()).then_some(source.rationale),
+        issue: (!source.issue.is_empty()).then_some(source.issue),
+        review_group: (!source.review_group.is_empty()).then_some(source.review_group),
+    }
+}
+
+fn catalog_dimension(spec: &BuiltinSpec, dimension: CompatibilityDimension) -> DimensionClaim {
+    let generated = assurance_catalogs::CLAIM_OVERRIDES
+        .iter()
+        .find(|claim| claim.builtin == spec.name && claim.dimension == dimension.as_str());
+    let sources = generated.map_or_else(
+        || std::slice::from_ref(&assurance_catalogs::DEFAULT_CLAIM_SCOPE),
+        |claim| claim.scopes,
+    );
+    let scopes = sources.iter().map(catalog_scope).collect::<Vec<_>>().leak();
+    DimensionClaim { dimension, scopes }
 }
 
 /// Returns the conservative, dimensioned compatibility claim for every term.
@@ -1566,30 +2077,30 @@ fn unverified_dimension(dimension: CompatibilityDimension) -> DimensionClaim {
 /// Wiring and semantic equivalence are deliberately independent. Until a
 /// retained pinned-oracle evidence record is available, executable terms stay
 /// `Unverified` in every observable dimension.
+///
+/// # Panics
+///
+/// Panics only when generated catalog data names a builtin absent from the
+/// canonical registry. The build-time catalog validation and focused drift
+/// tests make that a repository-integrity failure rather than runtime input.
 #[must_use]
 pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
     static CLAIMS: OnceLock<Vec<CompatibilityClaim>> = OnceLock::new();
     CLAIMS.get_or_init(|| {
+        for generated in assurance_catalogs::CLAIM_OVERRIDES {
+            assert!(
+                registry().iter().any(|spec| spec.name == generated.builtin),
+                "generated claim catalog names unknown builtin {:?}",
+                generated.builtin
+            );
+        }
         registry()
             .iter()
-            .map(|spec| {
-                let mut dimensions = CompatibilityDimension::ALL.map(unverified_dimension);
-                for replacement in compatibility::OVERRIDES
-                    .iter()
-                    .filter(|replacement| replacement.builtin == spec.name)
-                {
-                    if let Some(slot) = CompatibilityDimension::ALL
-                        .iter()
-                        .position(|dimension| *dimension == replacement.dimension)
-                    {
-                        dimensions[slot].scopes = replacement.scopes;
-                    }
-                }
-                CompatibilityClaim {
-                    builtin: spec.id,
-                    baseline: LANGUAGE_VERSION,
-                    dimensions,
-                }
+            .map(|spec| CompatibilityClaim {
+                builtin: spec.id,
+                baseline: assurance_catalogs::CLAIM_BASELINE,
+                dimensions: CompatibilityDimension::ALL
+                    .map(|dimension| catalog_dimension(spec, dimension)),
             })
             .collect()
     })
@@ -1625,18 +2136,21 @@ pub fn validate_compatibility_claims(
             if dimension.dimension != CompatibilityDimension::ALL[slot] {
                 return Err(ClaimValidationError::DimensionOrder);
             }
-            validate_scopes(dimension.scopes)?;
+            validate_scopes(dimension.dimension, dimension.scopes)?;
         }
     }
     Ok(())
 }
 
-fn validate_scopes(scopes: &[ScopedClaim]) -> Result<(), ClaimValidationError> {
+fn validate_scopes(
+    dimension: CompatibilityDimension,
+    scopes: &[ScopedClaim],
+) -> Result<(), ClaimValidationError> {
     if scopes.is_empty() {
         return Err(ClaimValidationError::MissingScope);
     }
     for (index, scope) in scopes.iter().enumerate() {
-        validate_scope(scope)?;
+        validate_scope(dimension, scope)?;
         for other in &scopes[..index] {
             if scope
                 .profiles
@@ -1654,7 +2168,10 @@ fn validate_scopes(scopes: &[ScopedClaim]) -> Result<(), ClaimValidationError> {
     Ok(())
 }
 
-fn validate_scope(scope: &ScopedClaim) -> Result<(), ClaimValidationError> {
+fn validate_scope(
+    dimension: CompatibilityDimension,
+    scope: &ScopedClaim,
+) -> Result<(), ClaimValidationError> {
     if scope.profiles.is_empty() || scope.platforms.is_empty() {
         return Err(ClaimValidationError::MissingScope);
     }
@@ -1671,6 +2188,20 @@ fn validate_scope(scope: &ScopedClaim) -> Result<(), ClaimValidationError> {
     }
     if has_duplicates(scope.normalizers) {
         return Err(ClaimValidationError::MissingNormalizer);
+    }
+    if has_duplicates(scope.obligations) {
+        return Err(ClaimValidationError::DuplicateObligation);
+    }
+    if scope.applicability_rule.is_empty() {
+        return Err(ClaimValidationError::MissingApplicabilityRule);
+    }
+    if scope.normalizers.iter().any(|normalizer| {
+        assurance_catalogs::NORMALIZER_CONTRACTS
+            .iter()
+            .find(|contract| contract.id == *normalizer)
+            .is_none_or(|contract| !contract.allowed_dimensions.contains(&dimension))
+    }) {
+        return Err(ClaimValidationError::InvalidNormalizerScope);
     }
     if scope
         .evidence
@@ -1786,4 +2317,173 @@ pub fn validate_case_id(id: &str) -> bool {
 #[must_use]
 pub fn lookup(name: &str) -> Option<&'static BuiltinSpec> {
     registry().iter().find(|spec| spec.name == name)
+}
+
+#[cfg(test)]
+mod assurance_metadata_tests {
+    use super::{
+        AssuranceCapability, AssuranceResourceRole, AssuranceSensitivity, DeterminismClass,
+        EffectKind, Visibility, lookup, registry,
+    };
+
+    #[test]
+    fn every_public_wired_builtin_has_a_complete_generated_assurance_contract() {
+        for spec in registry()
+            .iter()
+            .filter(|spec| spec.visibility == Visibility::Public && spec.implementation.is_some())
+        {
+            let metadata = spec.assurance_metadata();
+            if metadata.effect_kind == EffectKind::Io {
+                assert!(
+                    !metadata.resource_roles.is_empty()
+                        || matches!(
+                            spec.implementation,
+                            Some("io_pure" | "io_map_m_" | "io_for_m_")
+                        ),
+                    "{}",
+                    spec.name
+                );
+            }
+            if !metadata.resource_roles.is_empty() {
+                for sensitivity in [
+                    AssuranceSensitivity::Resource,
+                    AssuranceSensitivity::Platform,
+                ] {
+                    assert!(
+                        metadata.sensitivities.contains(&sensitivity),
+                        "{}",
+                        spec.name
+                    );
+                }
+            }
+            assert!(
+                !metadata.host_failure_applicable || metadata.effect_kind == EffectKind::Io,
+                "{}",
+                spec.name
+            );
+        }
+        let double = lookup("Double.eq").unwrap().assurance_metadata();
+        assert!(
+            double
+                .sensitivities
+                .contains(&AssuranceSensitivity::Platform)
+        );
+        for name in ["Text.hPutStr", "ByteString.hGet", "ByteString.hPutStr"] {
+            assert!(
+                lookup(name)
+                    .unwrap()
+                    .assurance_metadata()
+                    .resource_roles
+                    .contains(&AssuranceResourceRole::Handle),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_adapter_capabilities_come_from_exact_implementations() {
+        for (name, capability) in [
+            ("Text.readFile", AssuranceCapability::Filesystem),
+            ("Text.writeFile", AssuranceCapability::Filesystem),
+            ("ByteString.readFile", AssuranceCapability::Filesystem),
+            ("Temp.withSystemTempFile", AssuranceCapability::Filesystem),
+            ("Text.readProcess", AssuranceCapability::Process),
+            (
+                "ByteString.readProcessStdout_",
+                AssuranceCapability::Process,
+            ),
+            ("UTCTime.getCurrentTime", AssuranceCapability::Clock),
+            ("Concurrent.threadDelay", AssuranceCapability::Concurrency),
+            ("Timeout.timeout", AssuranceCapability::Concurrency),
+            ("Async.race", AssuranceCapability::Concurrency),
+            ("Http.run", AssuranceCapability::Network),
+            ("IO.stdin", AssuranceCapability::StandardIo),
+            ("Text.getLine", AssuranceCapability::StandardIo),
+            ("ByteString.hGet", AssuranceCapability::HostHandle),
+            ("Environment.getEnv", AssuranceCapability::Environment),
+            ("Exit.exitWith", AssuranceCapability::ProcessTermination),
+            ("Options.execParser", AssuranceCapability::CommandLine),
+        ] {
+            let metadata = lookup(name)
+                .expect("named public builtin")
+                .assurance_metadata();
+            assert_eq!(metadata.capabilities, [capability], "{name}");
+        }
+        assert!(
+            lookup("Text.eq")
+                .expect("pure Text builtin")
+                .assurance_metadata()
+                .capabilities
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn io_presentation_and_concurrency_sensitivities_are_not_shadowed() {
+        let text_file = lookup("Text.readFile")
+            .expect("Text.readFile")
+            .assurance_metadata();
+        for sensitivity in [
+            AssuranceSensitivity::Presentation,
+            AssuranceSensitivity::Resource,
+            AssuranceSensitivity::Platform,
+        ] {
+            assert!(text_file.sensitivities.contains(&sensitivity));
+        }
+        for name in ["IO.stdin", "Environment.getArgs", "Exit.exitWith"] {
+            let metadata = lookup(name).expect("host adapter").assurance_metadata();
+            assert!(
+                metadata
+                    .sensitivities
+                    .contains(&AssuranceSensitivity::Resource),
+                "{name}"
+            );
+            assert!(
+                metadata
+                    .sensitivities
+                    .contains(&AssuranceSensitivity::Platform),
+                "{name}"
+            );
+        }
+        for name in [
+            "Text.getLine",
+            "Text.getContents",
+            "Text.interact",
+            "Environment.getEnv",
+            "Options.execParser",
+            "Exit.exitWith",
+            "Temp.withSystemTempFile",
+        ] {
+            assert!(
+                lookup(name)
+                    .expect("fallible host adapter")
+                    .assurance_metadata()
+                    .host_failure_applicable,
+                "{name}"
+            );
+        }
+        for name in [
+            "Text.setStdin",
+            "Process.proc",
+            "Process.setEnv",
+            "Http.responseBuilder",
+            "Http.responseStream",
+        ] {
+            let metadata = lookup(name)
+                .expect("pure host value builder")
+                .assurance_metadata();
+            assert!(metadata.capabilities.is_empty(), "{name}");
+            assert!(!metadata.host_failure_applicable, "{name}");
+            assert_eq!(metadata.effect_kind, super::EffectKind::Pure, "{name}");
+        }
+        let timeout = lookup("Timeout.timeout")
+            .expect("Timeout.timeout")
+            .assurance_metadata();
+        assert_eq!(timeout.determinism, DeterminismClass::ScheduleSensitive);
+        assert!(
+            timeout
+                .sensitivities
+                .contains(&AssuranceSensitivity::Concurrency)
+        );
+    }
 }

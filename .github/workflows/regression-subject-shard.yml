@@ -1,0 +1,71 @@
+name: Unprivileged regression subject shard
+
+on:
+  workflow_call:
+    inputs:
+      case_matrix:
+        required: true
+        type: string
+      evidence_provider_context:
+        required: true
+        type: string
+      nightly_provider_context:
+        required: true
+        type: string
+      public_provider_context:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  assemble:
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.case_matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted current scheduled subject automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build unprivileged scheduled regression subject driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Acquire exact scheduled mismatch artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.nightly_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/nightly.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/program --artifact ci-out/program-selection
+      - name: Acquire exact finalized evidence artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.evidence_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/promotion-evidence-review.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/evidence --artifact ci-out/evidence-selection
+      - name: Acquire exact current signed public state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REGRESSION_PROVIDER_CONTEXT: ${{ inputs.public_provider_context }}
+          REGRESSION_REQUIRED_WORKFLOW_PATH: .github/workflows/promotion-surveillance.yml
+        run: ./target/ci/hell-ci regression-import acquire-subject --output ci-in/public --artifact ci-out/public-selection
+      - name: Assemble exact scheduled regression subject
+        env:
+          REGRESSION_GENERATED_CASE: ${{ matrix.case_id }}
+          REGRESSION_TEMPLATE_CASE: ${{ matrix.template_case_id }}
+        run: ./target/ci/hell-ci regression-import assemble-generated-subject --program ci-in/program --input ci-in/evidence --proposal ci-in/public --findings ci-out/public-selection --expected "$REGRESSION_TEMPLATE_CASE" --issue "$REGRESSION_GENERATED_CASE" --artifact ci-out/program-selection --policy ci-out/evidence-selection --output ci-out/regression-subject
+      - name: Upload exact scheduled regression execution subject
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regression-subject-${{ matrix.case_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/regression-subject
+          if-no-files-found: error
+          retention-days: 30

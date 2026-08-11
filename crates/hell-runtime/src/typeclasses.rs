@@ -7,6 +7,8 @@ use std::sync::Arc;
 use hell_core::ClassEvidence;
 use hell_types::TypeNode;
 
+#[cfg(feature = "compat-tracing")]
+use crate::AdapterCausalIdentity;
 use crate::{
     Evaluator, ForceOutcome, FunctionValue, HostFunction, IoAction, ListCell, PrimitiveFamily,
     PrimitiveVariantValue, RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef, Value,
@@ -44,10 +46,17 @@ pub enum OptionParser {
     Map {
         function: ThunkRef,
         parser: Arc<Self>,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent: Option<AdapterCausalIdentity>,
     },
     Apply {
         function: Arc<Self>,
         argument: Arc<Self>,
+        flipped: bool,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent: Option<AdapterCausalIdentity>,
+        #[cfg(feature = "compat-tracing")]
+        callback_argument: u16,
     },
     Optional(Arc<Self>),
     Many(Arc<Self>),
@@ -110,22 +119,28 @@ pub(super) fn apply_native(
             then_value(evaluator, target.as_deref(), &arguments[0], &arguments[1])
         }
         "monad_map_m" | "monad_map_m_discard" | "monad_for_m" | "monad_for_m_discard" => {
-            let (callback, list) = if implementation.starts_with("monad_map") {
-                (&arguments[0], &arguments[1])
+            let (callback, list, callback_argument) = if implementation.starts_with("monad_map") {
+                (&arguments[0], &arguments[1], 0)
             } else {
-                (&arguments[1], &arguments[0])
+                (&arguments[1], &arguments[0], 1)
             };
             traverse_value(
                 evaluator,
                 target.as_deref(),
                 list,
                 Some(callback),
+                Some(callback_argument),
                 implementation.ends_with("discard"),
             )
         }
-        "monad_sequence" => {
-            traverse_value(evaluator, target.as_deref(), &arguments[0], None, false)
-        }
+        "monad_sequence" => traverse_value(
+            evaluator,
+            target.as_deref(),
+            &arguments[0],
+            None,
+            None,
+            false,
+        ),
         "monad_when" => {
             let selected = evaluator.force_bool(&arguments[0]);
             match selected {
@@ -189,15 +204,99 @@ pub(super) fn apply_native(
     })
 }
 
-fn instance_target(evaluator: &Evaluator, evidence: ClassEvidence) -> RuntimeResult<Arc<str>> {
-    let mut current = evidence.head.raw();
+pub(crate) fn instance_target(
+    evaluator: &Evaluator,
+    evidence: ClassEvidence,
+) -> RuntimeResult<Arc<str>> {
+    let plan = evaluator
+        .program
+        .instance_evidence(evidence.plan)
+        .ok_or_else(|| RuntimeError::internal("class evidence plan disappeared"))?;
+    if plan.class != evidence.class || plan.head != evidence.head.raw() {
+        return Err(RuntimeError::internal(
+            "class evidence root does not match its retained plan",
+        ));
+    }
+    instance_target_from_type(evaluator, plan.head)
+}
+
+#[cfg(feature = "compat-tracing")]
+pub(crate) struct RetainedInstanceEvidence {
+    pub(crate) target: Arc<str>,
+    pub(crate) premises: Vec<(Arc<str>, u8)>,
+}
+
+#[cfg(feature = "compat-tracing")]
+pub(crate) fn retained_instance_evidence(
+    evaluator: &Evaluator,
+    evidence: ClassEvidence,
+) -> RuntimeResult<RetainedInstanceEvidence> {
+    enum Work {
+        Enter(hell_core::InstanceEvidencePlanId, bool),
+        Leave(hell_core::InstanceEvidencePlanId),
+    }
+    let root = evaluator
+        .program
+        .instance_evidence(evidence.plan)
+        .ok_or_else(|| RuntimeError::internal("class evidence plan disappeared"))?;
+    if root.class != evidence.class || root.head != evidence.head.raw() {
+        return Err(RuntimeError::internal(
+            "class evidence root does not match its retained plan",
+        ));
+    }
+    let target = instance_target(evaluator, evidence)?;
+    let mut premises = Vec::new();
+    let mut active = BTreeSet::new();
+    let mut work = vec![Work::Enter(evidence.plan, true)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Leave(id) => {
+                if !active.remove(&id) {
+                    return Err(RuntimeError::internal(
+                        "class evidence plan leave is unbalanced",
+                    ));
+                }
+            }
+            Work::Enter(id, is_root) => {
+                if !active.insert(id) {
+                    return Err(RuntimeError::internal(
+                        "class evidence plan contains a cycle",
+                    ));
+                }
+                let plan = evaluator
+                    .program
+                    .instance_evidence(id)
+                    .ok_or_else(|| RuntimeError::internal("class evidence premise disappeared"))?;
+                let premise_target = instance_target_from_type(evaluator, plan.head)?;
+                if !is_root {
+                    premises.push((premise_target, plan.resolution.premise_count()));
+                }
+                work.push(Work::Leave(id));
+                work.extend(
+                    plan.premises
+                        .iter()
+                        .rev()
+                        .copied()
+                        .map(|premise| Work::Enter(premise, false)),
+                );
+            }
+        }
+    }
+    Ok(RetainedInstanceEvidence { target, premises })
+}
+
+fn instance_target_from_type(
+    evaluator: &Evaluator,
+    head: hell_types::TypeId,
+) -> RuntimeResult<Arc<str>> {
+    let mut current = head;
     while let TypeNode::Apply(function, _) = evaluator.program.types().get(current) {
         current = *function;
     }
     match evaluator.program.types().get(current) {
         TypeNode::Constructor { name, .. } => Ok(Arc::clone(name)),
         _ => Err(RuntimeError::internal(
-            "class evidence does not have a constructor head",
+            "class evidence premise does not have a constructor head",
         )),
     }
 }
@@ -250,97 +349,208 @@ fn map_value(
     function: &ThunkRef,
     container: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
     match target {
         Some("[]") => Ok(ForceOutcome::Alias(Thunk::suspended(Suspension::ListMap {
             function: Arc::clone(function),
             list: Arc::clone(container),
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
         }))),
-        Some("IO") => {
-            let action = Arc::clone(container);
-            let function = Arc::clone(function);
-            Ok(ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
-                move |evaluator, context| {
-                    let action = evaluator.force_io(&action)?;
-                    let value = action.run(evaluator, context)?;
-                    Ok(Thunk::suspended(Suspension::Apply {
-                        function: Arc::clone(&function),
-                        argument: value,
-                    }))
-                },
-            )))))
-        }
-        Some("Options.Parser") => {
-            let container = evaluator.force(container)?;
-            let Value::OptionsParser(parser) = container.as_ref() else {
-                return Err(RuntimeError::internal(
-                    "Functor Options.Parser value mismatch",
-                ));
-            };
-            Ok(ForceOutcome::Value(Arc::new(Value::OptionsParser(
-                Arc::new(OptionParser::Map {
-                    function: Arc::clone(function),
-                    parser: Arc::clone(parser),
-                }),
-            ))))
-        }
+        Some("IO") => Ok(map_io(
+            function,
+            container,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        )),
+        Some("Options.Parser") => map_option_parser(
+            evaluator,
+            function,
+            container,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ),
         Some("Tree") => map_tree(evaluator, function, container),
-        Some("Maybe") => match evaluator.force(container)?.as_ref() {
-            Value::Maybe(None) => Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None)))),
-            Value::Maybe(Some(value)) => Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(
-                Thunk::suspended(Suspension::Apply {
-                    function: Arc::clone(function),
-                    argument: Arc::clone(value),
-                }),
-            ))))),
-            _ => Err(RuntimeError::internal("Functor Maybe value mismatch")),
-        },
-        Some("Either") => match evaluator.force(container)?.as_ref() {
-            Value::PrimitiveVariant(variant)
-                if variant.family == PrimitiveFamily::Either && variant.constructor_index == 0 =>
-            {
-                Ok(ForceOutcome::Alias(Arc::clone(container)))
-            }
-            Value::PrimitiveVariant(variant)
-                if variant.family == PrimitiveFamily::Either && variant.constructor_index == 1 =>
-            {
-                let payload = variant
-                    .payloads
-                    .first()
-                    .ok_or_else(|| RuntimeError::internal("Either.Right payload is missing"))?;
-                Ok(ForceOutcome::Value(Arc::new(Value::PrimitiveVariant(
-                    PrimitiveVariantValue {
-                        family: PrimitiveFamily::Either,
-                        constructor_index: 1,
-                        payloads: Arc::from([Thunk::suspended(Suspension::Apply {
-                            function: Arc::clone(function),
-                            argument: Arc::clone(payload),
-                        })]),
-                    },
-                ))))
-            }
-            _ => Err(RuntimeError::internal("Functor Either value mismatch")),
-        },
-        Some("(,)") => match evaluator.force(container)?.as_ref() {
-            Value::Tuple(elements) if elements.len() == 2 => {
-                Ok(ForceOutcome::Value(Arc::new(Value::Tuple(
-                    [
-                        Arc::clone(&elements[0]),
-                        Thunk::suspended(Suspension::Apply {
-                            function: Arc::clone(function),
-                            argument: Arc::clone(&elements[1]),
-                        }),
-                    ]
-                    .into(),
-                ))))
-            }
-            _ => Err(RuntimeError::internal("Functor pair value mismatch")),
-        },
+        Some("Maybe") => map_maybe(
+            evaluator,
+            function,
+            container,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ),
+        Some("Either") => map_either(
+            evaluator,
+            function,
+            container,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ),
+        Some("(,)") => map_pair(
+            evaluator,
+            function,
+            container,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ),
         Some(other) => Err(RuntimeError::internal(format!(
             "manifest Functor target `{other}` has no runtime adapter"
         ))),
         None => Err(RuntimeError::internal(
             "Functor primitive is missing evidence",
         )),
+    }
+}
+
+fn map_io(
+    function: &ThunkRef,
+    container: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> ForceOutcome {
+    let action = Arc::clone(container);
+    let function = Arc::clone(function);
+    ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
+        move |evaluator, context| {
+            let action = evaluator.force_io(&action)?;
+            let value = action.run(evaluator, context)?;
+            #[cfg(feature = "compat-tracing")]
+            let mapped = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(&function),
+                &[value],
+                0,
+                "io-result",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let mapped = Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(&function),
+                argument: value,
+            });
+            Ok(mapped)
+        },
+    ))))
+}
+
+fn map_option_parser(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    container: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    let container = evaluator.force(container)?;
+    let Value::OptionsParser(parser) = container.as_ref() else {
+        return Err(RuntimeError::internal(
+            "Functor Options.Parser value mismatch",
+        ));
+    };
+    Ok(ForceOutcome::Value(Arc::new(Value::OptionsParser(
+        Arc::new(OptionParser::Map {
+            function: Arc::clone(function),
+            parser: Arc::clone(parser),
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        }),
+    ))))
+}
+
+fn map_maybe(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    container: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    match evaluator.force(container)?.as_ref() {
+        Value::Maybe(None) => Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None)))),
+        Value::Maybe(Some(value)) => {
+            #[cfg(feature = "compat-tracing")]
+            let mapped = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(function),
+                &[Arc::clone(value)],
+                0,
+                "just",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let mapped = Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(function),
+                argument: Arc::clone(value),
+            });
+            Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(mapped)))))
+        }
+        _ => Err(RuntimeError::internal("Functor Maybe value mismatch")),
+    }
+}
+
+fn map_either(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    container: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    match evaluator.force(container)?.as_ref() {
+        Value::PrimitiveVariant(variant)
+            if variant.family == PrimitiveFamily::Either && variant.constructor_index == 0 =>
+        {
+            Ok(ForceOutcome::Alias(Arc::clone(container)))
+        }
+        Value::PrimitiveVariant(variant)
+            if variant.family == PrimitiveFamily::Either && variant.constructor_index == 1 =>
+        {
+            let payload = variant
+                .payloads
+                .first()
+                .ok_or_else(|| RuntimeError::internal("Either.Right payload is missing"))?;
+            #[cfg(feature = "compat-tracing")]
+            let mapped = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(function),
+                &[Arc::clone(payload)],
+                0,
+                "right",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let mapped = Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(function),
+                argument: Arc::clone(payload),
+            });
+            Ok(ForceOutcome::Value(Arc::new(Value::PrimitiveVariant(
+                PrimitiveVariantValue {
+                    family: PrimitiveFamily::Either,
+                    constructor_index: 1,
+                    payloads: Arc::from([mapped]),
+                },
+            ))))
+        }
+        _ => Err(RuntimeError::internal("Functor Either value mismatch")),
+    }
+}
+
+fn map_pair(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    container: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    match evaluator.force(container)?.as_ref() {
+        Value::Tuple(elements) if elements.len() == 2 => {
+            #[cfg(feature = "compat-tracing")]
+            let mapped = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(function),
+                &[Arc::clone(&elements[1])],
+                0,
+                "second",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let mapped = Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(function),
+                argument: Arc::clone(&elements[1]),
+            });
+            Ok(ForceOutcome::Value(Arc::new(Value::Tuple(
+                [Arc::clone(&elements[0]), mapped].into(),
+            ))))
+        }
+        _ => Err(RuntimeError::internal("Functor pair value mismatch")),
     }
 }
 
@@ -352,6 +562,10 @@ fn apply_value(
     arguments: &ThunkRef,
     flipped: bool,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
+    #[cfg(feature = "compat-tracing")]
+    let callback_argument = u16::from(flipped);
     match target {
         Some("Options.Parser") => {
             let functions = evaluator.force(functions)?;
@@ -370,6 +584,11 @@ fn apply_value(
                 Arc::new(OptionParser::Apply {
                     function: Arc::clone(function),
                     argument: Arc::clone(argument),
+                    flipped,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
                 }),
             ))))
         }
@@ -389,83 +608,151 @@ fn apply_value(
                         let argument_action = evaluator.force_io(&arguments)?;
                         (function, argument_action.run(evaluator, context)?)
                     };
-                    Ok(Thunk::suspended(Suspension::Apply { function, argument }))
+                    #[cfg(feature = "compat-tracing")]
+                    let applied = Evaluator::callback_application_for_optional_parent(
+                        callback_parent,
+                        function,
+                        &[argument],
+                        callback_argument,
+                        "application",
+                    );
+                    #[cfg(not(feature = "compat-tracing"))]
+                    let applied = Thunk::suspended(Suspension::Apply { function, argument });
+                    Ok(applied)
                 },
             )))))
         }
         Some("Maybe") => {
-            let function = evaluator.force(functions)?;
-            let argument = evaluator.force(arguments)?;
-            match (function.as_ref(), argument.as_ref()) {
-                (Value::Maybe(Some(function)), Value::Maybe(Some(argument))) => {
-                    Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(
-                        Thunk::suspended(Suspension::Apply {
-                            function: Arc::clone(function),
-                            argument: Arc::clone(argument),
-                        }),
-                    )))))
-                }
-                (Value::Maybe(_), Value::Maybe(_)) => {
-                    Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))))
-                }
-                _ => Err(RuntimeError::internal("Applicative Maybe value mismatch")),
-            }
+            let (function, argument) = if flipped {
+                let Some(argument) = force_maybe_payload(evaluator, arguments)? else {
+                    return Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))));
+                };
+                let Some(function) = force_maybe_payload(evaluator, functions)? else {
+                    return Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))));
+                };
+                (function, argument)
+            } else {
+                let Some(function) = force_maybe_payload(evaluator, functions)? else {
+                    return Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))));
+                };
+                let Some(argument) = force_maybe_payload(evaluator, arguments)? else {
+                    return Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))));
+                };
+                (function, argument)
+            };
+            #[cfg(feature = "compat-tracing")]
+            let applied = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                function,
+                &[argument],
+                callback_argument,
+                "application",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let applied = Thunk::suspended(Suspension::Apply { function, argument });
+            Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(applied)))))
         }
         Some("Either") => {
-            let function = evaluator.force(functions)?;
-            let Value::PrimitiveVariant(function) = function.as_ref() else {
-                return Err(RuntimeError::internal(
-                    "Applicative Either function mismatch",
-                ));
+            let (function, argument) = if flipped {
+                let argument = force_applicative_either(evaluator, arguments)?;
+                let ApplicativeEither::Right(argument) = argument else {
+                    return Ok(argument.into_outcome());
+                };
+                let function = force_applicative_either(evaluator, functions)?;
+                let ApplicativeEither::Right(function) = function else {
+                    return Ok(function.into_outcome());
+                };
+                (function, argument)
+            } else {
+                let function = force_applicative_either(evaluator, functions)?;
+                let ApplicativeEither::Right(function) = function else {
+                    return Ok(function.into_outcome());
+                };
+                let argument = force_applicative_either(evaluator, arguments)?;
+                let ApplicativeEither::Right(argument) = argument else {
+                    return Ok(argument.into_outcome());
+                };
+                (function, argument)
             };
-            if function.constructor_index == 0 {
-                return Ok(ForceOutcome::Alias(Thunk::evaluated(
-                    Value::PrimitiveVariant(function.clone()),
-                )));
-            }
-            let argument = evaluator.force(arguments)?;
-            let Value::PrimitiveVariant(argument) = argument.as_ref() else {
-                return Err(RuntimeError::internal(
-                    "Applicative Either argument mismatch",
-                ));
-            };
-            if argument.constructor_index == 0 {
-                return Ok(ForceOutcome::Alias(Thunk::evaluated(
-                    Value::PrimitiveVariant(argument.clone()),
-                )));
-            }
-            let function = function.payloads.first().ok_or_else(|| {
-                RuntimeError::internal("Either.Right function payload is missing")
-            })?;
-            let argument = argument.payloads.first().ok_or_else(|| {
-                RuntimeError::internal("Either.Right argument payload is missing")
-            })?;
+            #[cfg(feature = "compat-tracing")]
+            let applied = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                function,
+                &[argument],
+                callback_argument,
+                "application",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let applied = Thunk::suspended(Suspension::Apply { function, argument });
             Ok(ForceOutcome::Value(Arc::new(Value::PrimitiveVariant(
                 PrimitiveVariantValue {
                     family: PrimitiveFamily::Either,
                     constructor_index: 1,
-                    payloads: Arc::from([Thunk::suspended(Suspension::Apply {
-                        function: Arc::clone(function),
-                        argument: Arc::clone(argument),
-                    })]),
+                    payloads: Arc::from([applied]),
                 },
             ))))
         }
         Some("[]") => {
-            let functions = evaluator.force_list_elements(functions)?;
-            let arguments = evaluator.force_list_elements(arguments)?;
-            let mut results = Vec::with_capacity(functions.len().saturating_mul(arguments.len()));
-            for function in functions {
-                for argument in &arguments {
-                    results.push(Thunk::suspended(Suspension::Apply {
-                        function: Arc::clone(&function),
-                        argument: Arc::clone(argument),
-                    }));
+            let (functions, arguments) = if flipped {
+                let arguments = evaluator.force_list_elements(arguments)?;
+                if arguments.is_empty() {
+                    return Ok(ForceOutcome::Alias(list_from_values(Vec::new())));
                 }
+                (evaluator.force_list_elements(functions)?, arguments)
+            } else {
+                let functions = evaluator.force_list_elements(functions)?;
+                if functions.is_empty() {
+                    return Ok(ForceOutcome::Alias(list_from_values(Vec::new())));
+                }
+                (functions, evaluator.force_list_elements(arguments)?)
+            };
+            let mut results = Vec::with_capacity(functions.len().saturating_mul(arguments.len()));
+            let pairs = if flipped {
+                arguments
+                    .iter()
+                    .flat_map(|argument| functions.iter().map(move |function| (function, argument)))
+                    .collect::<Vec<_>>()
+            } else {
+                functions
+                    .iter()
+                    .flat_map(|function| arguments.iter().map(move |argument| (function, argument)))
+                    .collect::<Vec<_>>()
+            };
+            for (function, argument) in pairs {
+                #[cfg(feature = "compat-tracing")]
+                results.push(Evaluator::callback_application_for_optional_parent(
+                    callback_parent,
+                    Arc::clone(function),
+                    &[Arc::clone(argument)],
+                    callback_argument,
+                    "application",
+                ));
+                #[cfg(not(feature = "compat-tracing"))]
+                results.push(Thunk::suspended(Suspension::Apply {
+                    function: Arc::clone(function),
+                    argument: Arc::clone(argument),
+                }));
             }
             Ok(ForceOutcome::Alias(list_from_values(results)))
         }
-        Some("Tree") => apply_tree(evaluator, functions, arguments),
+        Some("Tree") if flipped => apply_tree_flipped(
+            evaluator,
+            arguments,
+            functions,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            callback_argument,
+        ),
+        Some("Tree") => apply_tree(
+            evaluator,
+            functions,
+            arguments,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            callback_argument,
+        ),
         Some(other) => Err(RuntimeError::internal(format!(
             "manifest Applicative target `{other}` has no apply adapter"
         ))),
@@ -475,11 +762,61 @@ fn apply_value(
     }
 }
 
+fn force_maybe_payload(
+    evaluator: &mut Evaluator,
+    value: &ThunkRef,
+) -> RuntimeResult<Option<ThunkRef>> {
+    match evaluator.force(value)?.as_ref() {
+        Value::Maybe(payload) => Ok(payload.as_ref().map(Arc::clone)),
+        _ => Err(RuntimeError::internal("Applicative Maybe value mismatch")),
+    }
+}
+
+enum ApplicativeEither {
+    Left(PrimitiveVariantValue),
+    Right(ThunkRef),
+}
+
+impl ApplicativeEither {
+    fn into_outcome(self) -> ForceOutcome {
+        let Self::Left(value) = self else {
+            unreachable!("only a Left short-circuits Applicative Either")
+        };
+        ForceOutcome::Value(Arc::new(Value::PrimitiveVariant(value)))
+    }
+}
+
+fn force_applicative_either(
+    evaluator: &mut Evaluator,
+    value: &ThunkRef,
+) -> RuntimeResult<ApplicativeEither> {
+    let value = evaluator.force(value)?;
+    let Value::PrimitiveVariant(variant) = value.as_ref() else {
+        return Err(RuntimeError::internal("Applicative Either value mismatch"));
+    };
+    if variant.family != PrimitiveFamily::Either {
+        return Err(RuntimeError::internal("Applicative Either family mismatch"));
+    }
+    match variant.constructor_index {
+        0 => Ok(ApplicativeEither::Left(variant.clone())),
+        1 => variant
+            .payloads
+            .first()
+            .map(|payload| ApplicativeEither::Right(Arc::clone(payload)))
+            .ok_or_else(|| RuntimeError::internal("Either.Right payload is missing")),
+        _ => Err(RuntimeError::internal(
+            "Applicative Either constructor mismatch",
+        )),
+    }
+}
+
 fn traverse_tree(
     evaluator: &mut Evaluator,
     items: Vec<ThunkRef>,
     callback: Option<&ThunkRef>,
     discard: bool,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: Option<u16>,
 ) -> RuntimeResult<ForceOutcome> {
     let empty_children = || Thunk::evaluated(Value::List(ListCell::Nil));
     let mut accumulated = Thunk::evaluated(Value::Tree(TreeValue {
@@ -487,7 +824,14 @@ fn traverse_tree(
         children: empty_children(),
     }));
     for item in items {
-        let action = traversal_action(callback, &item);
+        let action = traversal_action(
+            callback,
+            &item,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            callback_argument,
+        );
         let continuation = Thunk::evaluated(Value::Function(FunctionValue::Host(
             HostFunction::new(move |values| {
                 let action = Arc::clone(&action);
@@ -601,6 +945,8 @@ fn bind_value(
     monad: &ThunkRef,
     continuation: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
     match target {
         Some("IO") => {
             let action = Arc::clone(monad);
@@ -609,6 +955,15 @@ fn bind_value(
                 move |evaluator, context| {
                     let action = evaluator.force_io(&action)?;
                     let result = action.run(evaluator, context)?;
+                    #[cfg(feature = "compat-tracing")]
+                    let applied = Evaluator::callback_application_for_optional_parent(
+                        callback_parent,
+                        Arc::clone(&continuation),
+                        &[result],
+                        1,
+                        "continuation",
+                    );
+                    #[cfg(not(feature = "compat-tracing"))]
                     let applied = Thunk::suspended(Suspension::Apply {
                         function: Arc::clone(&continuation),
                         argument: result,
@@ -621,10 +976,20 @@ fn bind_value(
         Some("Maybe") => match evaluator.force(monad)?.as_ref() {
             Value::Maybe(None) => Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None)))),
             Value::Maybe(Some(value)) => {
-                Ok(ForceOutcome::Alias(Thunk::suspended(Suspension::Apply {
+                #[cfg(feature = "compat-tracing")]
+                let applied = Evaluator::callback_application_for_optional_parent(
+                    callback_parent,
+                    Arc::clone(continuation),
+                    &[Arc::clone(value)],
+                    1,
+                    "continuation",
+                );
+                #[cfg(not(feature = "compat-tracing"))]
+                let applied = Thunk::suspended(Suspension::Apply {
                     function: Arc::clone(continuation),
                     argument: Arc::clone(value),
-                })))
+                });
+                Ok(ForceOutcome::Alias(applied))
             }
             _ => Err(RuntimeError::internal("Monad Maybe value mismatch")),
         },
@@ -637,15 +1002,36 @@ fn bind_value(
                     .payloads
                     .first()
                     .ok_or_else(|| RuntimeError::internal("Either.Right payload is missing"))?;
-                Ok(ForceOutcome::Alias(Thunk::suspended(Suspension::Apply {
+                #[cfg(feature = "compat-tracing")]
+                let applied = Evaluator::callback_application_for_optional_parent(
+                    callback_parent,
+                    Arc::clone(continuation),
+                    &[Arc::clone(value)],
+                    1,
+                    "continuation",
+                );
+                #[cfg(not(feature = "compat-tracing"))]
+                let applied = Thunk::suspended(Suspension::Apply {
                     function: Arc::clone(continuation),
                     argument: Arc::clone(value),
-                })))
+                });
+                Ok(ForceOutcome::Alias(applied))
             }
             _ => Err(RuntimeError::internal("Monad Either value mismatch")),
         },
-        Some("[]") => Ok(ForceOutcome::Alias(bind_list(monad, continuation))),
-        Some("Tree") => bind_tree(evaluator, monad, continuation),
+        Some("[]") => Ok(ForceOutcome::Alias(bind_list(
+            monad,
+            continuation,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ))),
+        Some("Tree") => bind_tree_with_parent(
+            evaluator,
+            monad,
+            continuation,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        ),
         Some(other) => Err(RuntimeError::internal(format!(
             "manifest Monad target `{other}` has no bind adapter"
         ))),
@@ -655,17 +1041,35 @@ fn bind_value(
     }
 }
 
-fn bind_list(list: &ThunkRef, continuation: &ThunkRef) -> ThunkRef {
+fn bind_list(
+    list: &ThunkRef,
+    continuation: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> ThunkRef {
     let list = Arc::clone(list);
     let continuation = Arc::clone(continuation);
     Thunk::deferred(move |evaluator| match evaluator.force(&list)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
+            #[cfg(feature = "compat-tracing")]
+            let first = Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(&continuation),
+                &[Arc::clone(head)],
+                1,
+                "continuation",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
             let first = Thunk::suspended(Suspension::Apply {
                 function: Arc::clone(&continuation),
                 argument: Arc::clone(head),
             });
-            let rest = bind_list(tail, &continuation);
+            let rest = bind_list(
+                tail,
+                &continuation,
+                #[cfg(feature = "compat-tracing")]
+                callback_parent,
+            );
             evaluator.force(&Thunk::suspended(Suspension::SemigroupAppend {
                 left: first,
                 right: rest,
@@ -708,6 +1112,7 @@ fn then_value(
             }
             _ => Err(RuntimeError::internal("Monad Either value mismatch")),
         },
+        Some("[]") => Ok(ForceOutcome::Alias(then_list(first, second))),
         Some("Tree") => then_tree(evaluator, first, second),
         Some(other) => Err(RuntimeError::internal(format!(
             "manifest Monad target `{other}` has no then adapter"
@@ -718,14 +1123,39 @@ fn then_value(
     }
 }
 
+fn then_list(first: &ThunkRef, second: &ThunkRef) -> ThunkRef {
+    let first = Arc::clone(first);
+    let second = Arc::clone(second);
+    Thunk::deferred(move |evaluator| match evaluator.force(&first)?.as_ref() {
+        Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
+        Value::List(ListCell::Cons { tail, .. }) => {
+            let rest = then_list(tail, &second);
+            evaluator.force(&Thunk::suspended(Suspension::SemigroupAppend {
+                left: Arc::clone(&second),
+                right: rest,
+            }))
+        }
+        _ => Err(RuntimeError::internal("Monad list value mismatch")),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn traverse_value(
     evaluator: &mut Evaluator,
     target: Option<&str>,
     list: &ThunkRef,
     callback: Option<&ThunkRef>,
+    callback_argument: Option<u16>,
     discard: bool,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(not(feature = "compat-tracing"))]
+    let _ = callback_argument;
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = if callback.is_some() {
+        evaluator.active_adapter_identity_optional()?
+    } else {
+        None
+    };
     let items = evaluator.force_list_elements(list)?;
     match target {
         Some("IO") => {
@@ -734,14 +1164,14 @@ fn traverse_value(
                 move |evaluator, context| {
                     let mut results = Vec::with_capacity(items.len());
                     for item in &items {
-                        let action = if let Some(callback) = &callback {
-                            Thunk::suspended(Suspension::Apply {
-                                function: Arc::clone(callback),
-                                argument: Arc::clone(item),
-                            })
-                        } else {
-                            Arc::clone(item)
-                        };
+                        let action = traversal_action(
+                            callback.as_ref(),
+                            item,
+                            #[cfg(feature = "compat-tracing")]
+                            callback_parent,
+                            #[cfg(feature = "compat-tracing")]
+                            callback_argument,
+                        );
                         let action = evaluator.force_io(&action)?;
                         results.push(action.run(evaluator, context)?);
                     }
@@ -756,7 +1186,14 @@ fn traverse_value(
         Some("Maybe") => {
             let mut results = Vec::with_capacity(items.len());
             for item in items {
-                let action = traversal_action(callback, &item);
+                let action = traversal_action(
+                    callback,
+                    &item,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
+                );
                 match evaluator.force(&action)?.as_ref() {
                     Value::Maybe(None) => {
                         return Ok(ForceOutcome::Value(Arc::new(Value::Maybe(None))));
@@ -775,7 +1212,14 @@ fn traverse_value(
         Some("Either") => {
             let mut results = Vec::with_capacity(items.len());
             for item in items {
-                let action = traversal_action(callback, &item);
+                let action = traversal_action(
+                    callback,
+                    &item,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
+                );
                 let action_value = evaluator.force(&action)?;
                 let Value::PrimitiveVariant(variant) = action_value.as_ref() else {
                     return Err(RuntimeError::internal("Monad Either traversal mismatch"));
@@ -808,7 +1252,14 @@ fn traverse_value(
         Some("[]") => {
             let mut combinations = vec![Vec::new()];
             for item in items {
-                let action = traversal_action(callback, &item);
+                let action = traversal_action(
+                    callback,
+                    &item,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
+                );
                 let alternatives = evaluator.force_list_elements(&action)?;
                 let mut next =
                     Vec::with_capacity(combinations.len().saturating_mul(alternatives.len()));
@@ -833,7 +1284,16 @@ fn traverse_value(
                 .collect();
             Ok(ForceOutcome::Alias(list_from_values(results)))
         }
-        Some("Tree") => traverse_tree(evaluator, items, callback, discard),
+        Some("Tree") => traverse_tree(
+            evaluator,
+            items,
+            callback,
+            discard,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            callback_argument,
+        ),
         Some(other) => Err(RuntimeError::internal(format!(
             "manifest Monad target `{other}` has no traversal adapter"
         ))),
@@ -843,10 +1303,24 @@ fn traverse_value(
     }
 }
 
-fn traversal_action(callback: Option<&ThunkRef>, item: &ThunkRef) -> ThunkRef {
+fn traversal_action(
+    callback: Option<&ThunkRef>,
+    item: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: Option<u16>,
+) -> ThunkRef {
     callback.map_or_else(
         || Arc::clone(item),
         |callback| {
+            #[cfg(feature = "compat-tracing")]
+            return Evaluator::callback_application_for_optional_parent(
+                callback_parent,
+                Arc::clone(callback),
+                &[Arc::clone(item)],
+                callback_argument.expect("traversal callback has an argument index"),
+                "element",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
             Thunk::suspended(Suspension::Apply {
                 function: Arc::clone(callback),
                 argument: Arc::clone(item),
@@ -873,10 +1347,19 @@ fn map_accum_l_compat(
                 ])))));
             }
             Value::List(ListCell::Cons { head, tail }) => {
+                #[cfg(feature = "compat-tracing")]
+                let apply_item = evaluator.callback_application(
+                    Arc::clone(function),
+                    &[Arc::clone(&accumulator), Arc::clone(head)],
+                    0,
+                    "accumulate",
+                )?;
+                #[cfg(not(feature = "compat-tracing"))]
                 let apply_accumulator = Thunk::suspended(Suspension::Apply {
                     function: Arc::clone(function),
                     argument: accumulator,
                 });
+                #[cfg(not(feature = "compat-tracing"))]
                 let apply_item = Thunk::suspended(Suspension::Apply {
                     function: apply_accumulator,
                     argument: Arc::clone(head),
@@ -935,10 +1418,42 @@ fn map_tree(
     function: &ThunkRef,
     tree: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
+    map_tree_with_parent(
+        evaluator,
+        function,
+        tree,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+        #[cfg(feature = "compat-tracing")]
+        0,
+        #[cfg(feature = "compat-tracing")]
+        "node",
+    )
+}
+
+fn map_tree_with_parent(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    tree: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: u16,
+    #[cfg(feature = "compat-tracing")] callback_branch: &'static str,
+) -> RuntimeResult<ForceOutcome> {
     let tree_value = evaluator.force(tree)?;
     let Value::Tree(tree) = tree_value.as_ref() else {
         return Err(RuntimeError::internal("Tree.map received a non-Tree value"));
     };
+    #[cfg(feature = "compat-tracing")]
+    let root = Evaluator::callback_application_for_optional_parent(
+        callback_parent,
+        Arc::clone(function),
+        &[Arc::clone(&tree.root)],
+        callback_argument,
+        callback_branch,
+    );
+    #[cfg(not(feature = "compat-tracing"))]
     let root = Thunk::suspended(Suspension::Apply {
         function: Arc::clone(function),
         argument: Arc::clone(&tree.root),
@@ -949,12 +1464,22 @@ fn map_tree(
         .into_iter()
         .map(|child| {
             let mapper = Arc::clone(&mapper);
-            Thunk::deferred(
-                move |evaluator| match map_tree(evaluator, &mapper, &child)? {
+            Thunk::deferred(move |evaluator| {
+                match map_tree_with_parent(
+                    evaluator,
+                    &mapper,
+                    &child,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_branch,
+                )? {
                     ForceOutcome::Value(value) => Ok(value),
                     ForceOutcome::Alias(value) => evaluator.force(&value),
-                },
-            )
+                }
+            })
         })
         .collect();
     Ok(ForceOutcome::Value(Arc::new(Value::Tree(TreeValue {
@@ -968,6 +1493,23 @@ fn fold_tree(
     function: &ThunkRef,
     tree: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
+    fold_tree_with_parent(
+        evaluator,
+        function,
+        tree,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+    )
+}
+
+fn fold_tree_with_parent(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    tree: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
     let tree_value = evaluator.force(tree)?;
     let Value::Tree(tree) = tree_value.as_ref() else {
         return Err(RuntimeError::internal(
@@ -979,22 +1521,41 @@ fn fold_tree(
         .into_iter()
         .map(|child| {
             let function = Arc::clone(function);
-            Thunk::deferred(
-                move |evaluator| match fold_tree(evaluator, &function, &child)? {
+            Thunk::deferred(move |evaluator| {
+                match fold_tree_with_parent(
+                    evaluator,
+                    &function,
+                    &child,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                )? {
                     ForceOutcome::Value(value) => Ok(value),
                     ForceOutcome::Alias(value) => evaluator.force(&value),
-                },
-            )
+                }
+            })
         })
         .collect();
-    let with_root = Thunk::suspended(Suspension::Apply {
-        function: Arc::clone(function),
-        argument: Arc::clone(&tree.root),
-    });
-    Ok(ForceOutcome::Alias(Thunk::suspended(Suspension::Apply {
-        function: with_root,
-        argument: list_from_values(folded),
-    })))
+    let folded = list_from_values(folded);
+    #[cfg(feature = "compat-tracing")]
+    let application = Evaluator::callback_application_for_optional_parent(
+        callback_parent,
+        Arc::clone(function),
+        &[Arc::clone(&tree.root), folded],
+        0,
+        "node",
+    );
+    #[cfg(not(feature = "compat-tracing"))]
+    let application = {
+        let with_root = Thunk::suspended(Suspension::Apply {
+            function: Arc::clone(function),
+            argument: Arc::clone(&tree.root),
+        });
+        Thunk::suspended(Suspension::Apply {
+            function: with_root,
+            argument: folded,
+        })
+    };
+    Ok(ForceOutcome::Alias(application))
 }
 
 fn flatten_tree(evaluator: &mut Evaluator, tree: &ThunkRef) -> RuntimeResult<ForceOutcome> {
@@ -1046,6 +1607,8 @@ fn apply_tree(
     evaluator: &mut Evaluator,
     functions: &ThunkRef,
     arguments: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: u16,
 ) -> RuntimeResult<ForceOutcome> {
     let function_value = evaluator.force(functions)?;
     let Value::Tree(functions) = function_value.as_ref() else {
@@ -1053,7 +1616,17 @@ fn apply_tree(
             "Applicative Tree function value mismatch",
         ));
     };
-    let mapped = outcome_thunk(map_tree(evaluator, &functions.root, arguments)?);
+    let mapped = outcome_thunk(map_tree_with_parent(
+        evaluator,
+        &functions.root,
+        arguments,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+        #[cfg(feature = "compat-tracing")]
+        callback_argument,
+        #[cfg(feature = "compat-tracing")]
+        "application",
+    )?);
     let mapped_value = evaluator.force(&mapped)?;
     let Value::Tree(mapped) = mapped_value.as_ref() else {
         return Err(RuntimeError::internal(
@@ -1064,7 +1637,15 @@ fn apply_tree(
     for function_child in evaluator.force_list_elements(&functions.children)? {
         let arguments = Arc::clone(arguments);
         children.push(Thunk::deferred(move |evaluator| {
-            let outcome = apply_tree(evaluator, &function_child, &arguments)?;
+            let outcome = apply_tree(
+                evaluator,
+                &function_child,
+                &arguments,
+                #[cfg(feature = "compat-tracing")]
+                callback_parent,
+                #[cfg(feature = "compat-tracing")]
+                callback_argument,
+            )?;
             outcome_value(evaluator, outcome)
         }));
     }
@@ -1074,15 +1655,165 @@ fn apply_tree(
     }))))
 }
 
+fn apply_tree_flipped(
+    evaluator: &mut Evaluator,
+    values: &ThunkRef,
+    functions: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: u16,
+) -> RuntimeResult<ForceOutcome> {
+    let value = evaluator.force(values)?;
+    let Value::Tree(values) = value.as_ref() else {
+        return Err(RuntimeError::internal(
+            "Applicative Tree argument value mismatch",
+        ));
+    };
+    let mapped = outcome_thunk(apply_value_to_function_tree(
+        evaluator,
+        &values.root,
+        functions,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+        #[cfg(feature = "compat-tracing")]
+        callback_argument,
+    )?);
+    let mapped = evaluator.force(&mapped)?;
+    let Value::Tree(mapped) = mapped.as_ref() else {
+        return Err(RuntimeError::internal(
+            "Applicative flipped Tree mapped value mismatch",
+        ));
+    };
+    let mut children = evaluator.force_list_elements(&mapped.children)?;
+    for value_child in evaluator.force_list_elements(&values.children)? {
+        let functions = Arc::clone(functions);
+        children.push(Thunk::deferred(move |evaluator| {
+            let outcome = apply_tree_flipped(
+                evaluator,
+                &value_child,
+                &functions,
+                #[cfg(feature = "compat-tracing")]
+                callback_parent,
+                #[cfg(feature = "compat-tracing")]
+                callback_argument,
+            )?;
+            outcome_value(evaluator, outcome)
+        }));
+    }
+    Ok(ForceOutcome::Value(Arc::new(Value::Tree(TreeValue {
+        root: Arc::clone(&mapped.root),
+        children: list_from_values(children),
+    }))))
+}
+
+fn apply_value_to_function_tree(
+    evaluator: &mut Evaluator,
+    value: &ThunkRef,
+    functions: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: u16,
+) -> RuntimeResult<ForceOutcome> {
+    let function_value = evaluator.force(functions)?;
+    let Value::Tree(functions) = function_value.as_ref() else {
+        return Err(RuntimeError::internal(
+            "Applicative flipped Tree function value mismatch",
+        ));
+    };
+    #[cfg(feature = "compat-tracing")]
+    let root = Evaluator::callback_application_for_optional_parent(
+        callback_parent,
+        Arc::clone(&functions.root),
+        &[Arc::clone(value)],
+        callback_argument,
+        "application",
+    );
+    #[cfg(not(feature = "compat-tracing"))]
+    let root = Thunk::suspended(Suspension::Apply {
+        function: Arc::clone(&functions.root),
+        argument: Arc::clone(value),
+    });
+    let children = evaluator
+        .force_list_elements(&functions.children)?
+        .into_iter()
+        .map(|function_child| {
+            let value = Arc::clone(value);
+            Thunk::deferred(move |evaluator| {
+                let outcome = apply_value_to_function_tree(
+                    evaluator,
+                    &value,
+                    &function_child,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_argument,
+                )?;
+                outcome_value(evaluator, outcome)
+            })
+        })
+        .collect();
+    Ok(ForceOutcome::Value(Arc::new(Value::Tree(TreeValue {
+        root,
+        children: list_from_values(children),
+    }))))
+}
+
 fn bind_tree(
     evaluator: &mut Evaluator,
     tree: &ThunkRef,
     continuation: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    bind_tree_inner(
+        evaluator,
+        tree,
+        continuation,
+        #[cfg(feature = "compat-tracing")]
+        None,
+    )
+}
+
+fn bind_tree_with_parent(
+    evaluator: &mut Evaluator,
+    tree: &ThunkRef,
+    continuation: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    bind_tree_inner(
+        evaluator,
+        tree,
+        continuation,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+    )
+}
+
+fn bind_tree_inner(
+    evaluator: &mut Evaluator,
+    tree: &ThunkRef,
+    continuation: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
     let tree_value = evaluator.force(tree)?;
     let Value::Tree(tree) = tree_value.as_ref() else {
         return Err(RuntimeError::internal("Monad Tree value mismatch"));
     };
+    #[cfg(feature = "compat-tracing")]
+    let applied = callback_parent.map_or_else(
+        || {
+            Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(continuation),
+                argument: Arc::clone(&tree.root),
+            })
+        },
+        |parent| {
+            Evaluator::callback_application_for_parent(
+                parent,
+                Arc::clone(continuation),
+                &[Arc::clone(&tree.root)],
+                1,
+                "continuation",
+            )
+        },
+    );
+    #[cfg(not(feature = "compat-tracing"))]
     let applied = Thunk::suspended(Suspension::Apply {
         function: Arc::clone(continuation),
         argument: Arc::clone(&tree.root),
@@ -1097,7 +1828,13 @@ fn bind_tree(
     for child in evaluator.force_list_elements(&tree.children)? {
         let continuation = Arc::clone(continuation);
         children.push(Thunk::deferred(move |evaluator| {
-            let outcome = bind_tree(evaluator, &child, &continuation)?;
+            let outcome = bind_tree_inner(
+                evaluator,
+                &child,
+                &continuation,
+                #[cfg(feature = "compat-tracing")]
+                callback_parent,
+            )?;
             outcome_value(evaluator, outcome)
         }));
     }
@@ -1156,15 +1893,24 @@ fn sort_list_on(
     function: &ThunkRef,
     list: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
-    let mut runs = Vec::new();
+    let mut decorated = Vec::new();
     for value in evaluator.force_list_elements(list)? {
         evaluator.ensure_not_cancelled()?;
+        #[cfg(feature = "compat-tracing")]
+        let key = evaluator.callback_application(
+            Arc::clone(function),
+            std::slice::from_ref(&value),
+            0,
+            "key",
+        )?;
+        #[cfg(not(feature = "compat-tracing"))]
         let key = Thunk::suspended(Suspension::Apply {
             function: Arc::clone(function),
             argument: Arc::clone(&value),
         });
-        runs.push(vec![(key, value)]);
+        decorated.push((key, value));
     }
+    let mut runs = natural_keyed_runs(evaluator, decorated)?;
     while runs.len() > 1 {
         evaluator.ensure_not_cancelled()?;
         let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
@@ -1187,6 +1933,45 @@ fn sort_list_on(
     )))
 }
 
+fn natural_keyed_runs(
+    evaluator: &mut Evaluator,
+    items: Vec<(ThunkRef, ThunkRef)>,
+) -> RuntimeResult<Vec<Vec<(ThunkRef, ThunkRef)>>> {
+    let mut remaining = items.into_iter().peekable();
+    let mut runs = Vec::new();
+    while let Some(first) = remaining.next() {
+        let Some(second) = remaining.next() else {
+            runs.push(vec![first]);
+            break;
+        };
+        let descending = keyed_greater_than(evaluator, &first.0, &second.0)?;
+        let mut run = vec![first];
+        let mut current = second;
+        while let Some(next) = remaining.peek() {
+            let next_descending = keyed_greater_than(evaluator, &current.0, &next.0)?;
+            if next_descending != descending {
+                break;
+            }
+            run.push(current);
+            current = remaining.next().expect("peeked keyed sort item exists");
+        }
+        run.push(current);
+        if descending {
+            run.reverse();
+        }
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
+fn keyed_greater_than(
+    evaluator: &mut Evaluator,
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> RuntimeResult<bool> {
+    Ok(!evaluator.equal_values(left, right)? && !evaluator.less_values(left, right)?)
+}
+
 fn merge_keyed_runs(
     evaluator: &mut Evaluator,
     left: Vec<(ThunkRef, ThunkRef)>,
@@ -1197,7 +1982,7 @@ fn merge_keyed_runs(
     let mut right = right.into_iter().peekable();
     while let (Some((left_key, _)), Some((right_key, _))) = (left.peek(), right.peek()) {
         evaluator.ensure_not_cancelled()?;
-        if evaluator.less_values(right_key, left_key)? {
+        if keyed_greater_than(evaluator, left_key, right_key)? {
             output.push(right.next().expect("peeked right keyed item exists"));
         } else {
             output.push(left.next().expect("peeked left keyed item exists"));
@@ -1226,6 +2011,14 @@ fn map_maybe_list(function: &ThunkRef, list: &ThunkRef) -> ThunkRef {
     Thunk::deferred(move |evaluator| match evaluator.force(&list)?.as_ref() {
         Value::List(ListCell::Nil) => Ok(Arc::new(Value::List(ListCell::Nil))),
         Value::List(ListCell::Cons { head, tail }) => {
+            #[cfg(feature = "compat-tracing")]
+            let application = evaluator.callback_application(
+                Arc::clone(&function),
+                std::slice::from_ref(head),
+                0,
+                "element",
+            )?;
+            #[cfg(not(feature = "compat-tracing"))]
             let application = Thunk::suspended(Suspension::Apply {
                 function: Arc::clone(&function),
                 argument: Arc::clone(head),
@@ -1254,6 +2047,32 @@ fn unfold_tree(
     function: &ThunkRef,
     seed: &ThunkRef,
 ) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let callback_parent = evaluator.active_adapter_identity_optional()?;
+    unfold_tree_with_parent(
+        evaluator,
+        function,
+        seed,
+        #[cfg(feature = "compat-tracing")]
+        callback_parent,
+    )
+}
+
+fn unfold_tree_with_parent(
+    evaluator: &mut Evaluator,
+    function: &ThunkRef,
+    seed: &ThunkRef,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+) -> RuntimeResult<ForceOutcome> {
+    #[cfg(feature = "compat-tracing")]
+    let function_application = Evaluator::callback_application_for_optional_parent(
+        callback_parent,
+        Arc::clone(function),
+        &[Arc::clone(seed)],
+        0,
+        "seed",
+    );
+    #[cfg(not(feature = "compat-tracing"))]
     let function_application = Thunk::suspended(Suspension::Apply {
         function: Arc::clone(function),
         argument: Arc::clone(seed),
@@ -1275,7 +2094,13 @@ fn unfold_tree(
         .map(|seed| {
             let function = Arc::clone(function);
             Thunk::deferred(move |evaluator| {
-                let outcome = unfold_tree(evaluator, &function, &seed)?;
+                let outcome = unfold_tree_with_parent(
+                    evaluator,
+                    &function,
+                    &seed,
+                    #[cfg(feature = "compat-tracing")]
+                    callback_parent,
+                )?;
                 outcome_value(evaluator, outcome)
             })
         })
@@ -1597,9 +2422,19 @@ fn compile_option_plan(parser: &OptionParser, plan: &mut ParserPlan) -> RuntimeR
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
         | OptionParser::Many(parser) => compile_option_plan(parser, plan)?,
-        OptionParser::Apply { function, argument } => {
-            compile_option_plan(function, plan)?;
-            compile_option_plan(argument, plan)?;
+        OptionParser::Apply {
+            function,
+            argument,
+            flipped,
+            ..
+        } => {
+            if *flipped {
+                compile_option_plan(argument, plan)?;
+                compile_option_plan(function, plan)?;
+            } else {
+                compile_option_plan(function, plan)?;
+                compile_option_plan(argument, plan)?;
+            }
         }
         OptionParser::Switch(modifiers) | OptionParser::Flag { modifiers, .. } => {
             plan_option(modifiers, PlannedOptionKind::Flag, plan)?;
@@ -1670,7 +2505,10 @@ fn tokenize_with_plan(
     let mut option_mode = true;
     let mut index = 0usize;
     while let Some(token) = arguments.get(index) {
-        if option_mode && token == "--" {
+        if option_mode
+            && token == "--"
+            && !crate::semantic_mutant_active("options-parser-argument-binding")
+        {
             option_mode = false;
             index += 1;
             continue;
@@ -1801,47 +2639,50 @@ fn evaluate_option(
                 0,
             ))
         }
-        OptionParser::Map { function, parser } => {
+        OptionParser::Map {
+            function,
+            parser,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+        } => {
             let result = evaluate_option(evaluator, parser, state)?;
             let OptionEvaluation::Success { value, consumed } = result else {
                 return Ok(result);
             };
-            Ok(option_success(
-                Thunk::suspended(Suspension::Apply {
-                    function: Arc::clone(function),
-                    argument: value,
-                }),
-                consumed,
-            ))
+            #[cfg(feature = "compat-tracing")]
+            let mapped = Evaluator::callback_application_for_optional_parent(
+                *callback_parent,
+                Arc::clone(function),
+                &[value],
+                0,
+                "parser-result",
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let mapped = Thunk::suspended(Suspension::Apply {
+                function: Arc::clone(function),
+                argument: value,
+            });
+            Ok(option_success(mapped, consumed))
         }
-        OptionParser::Apply { function, argument } => {
-            let function_result = evaluate_option(evaluator, function, state)?;
-            let OptionEvaluation::Success {
-                value: function,
-                consumed: function_consumed,
-            } = function_result
-            else {
-                return Ok(function_result);
-            };
-            let argument_result = evaluate_option(evaluator, argument, state)?;
-            let OptionEvaluation::Success {
-                value: argument,
-                consumed: argument_consumed,
-            } = argument_result
-            else {
-                let OptionEvaluation::Missing { expected, consumed } = argument_result else {
-                    unreachable!("option evaluation has two variants")
-                };
-                return Ok(OptionEvaluation::Missing {
-                    expected,
-                    consumed: function_consumed.saturating_add(consumed),
-                });
-            };
-            Ok(option_success(
-                Thunk::suspended(Suspension::Apply { function, argument }),
-                function_consumed.saturating_add(argument_consumed),
-            ))
-        }
+        OptionParser::Apply {
+            function,
+            argument,
+            flipped,
+            #[cfg(feature = "compat-tracing")]
+            callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            callback_argument,
+        } => evaluate_option_application(
+            evaluator,
+            function,
+            argument,
+            state,
+            *flipped,
+            #[cfg(feature = "compat-tracing")]
+            *callback_parent,
+            #[cfg(feature = "compat-tracing")]
+            *callback_argument,
+        ),
         OptionParser::Optional(parser) => match evaluate_option(evaluator, parser, state)? {
             OptionEvaluation::Success { value, consumed } => Ok(option_success(
                 Thunk::evaluated(Value::Maybe(Some(value))),
@@ -1949,6 +2790,80 @@ fn evaluate_option(
             }
         }
     }
+}
+
+fn evaluate_option_application(
+    evaluator: &mut Evaluator,
+    function_parser: &OptionParser,
+    argument_parser: &OptionParser,
+    state: &mut OptionParseState,
+    flipped: bool,
+    #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
+    #[cfg(feature = "compat-tracing")] callback_argument: u16,
+) -> RuntimeResult<OptionEvaluation> {
+    let (function, function_consumed, argument, argument_consumed) = if flipped {
+        let argument_result = evaluate_option(evaluator, argument_parser, state)?;
+        let OptionEvaluation::Success {
+            value: argument,
+            consumed: argument_consumed,
+        } = argument_result
+        else {
+            return Ok(argument_result);
+        };
+        let function_result = evaluate_option(evaluator, function_parser, state)?;
+        let OptionEvaluation::Success {
+            value: function,
+            consumed: function_consumed,
+        } = function_result
+        else {
+            let OptionEvaluation::Missing { expected, consumed } = function_result else {
+                unreachable!("option evaluation has two variants")
+            };
+            return Ok(OptionEvaluation::Missing {
+                expected,
+                consumed: argument_consumed.saturating_add(consumed),
+            });
+        };
+        (function, function_consumed, argument, argument_consumed)
+    } else {
+        let function_result = evaluate_option(evaluator, function_parser, state)?;
+        let OptionEvaluation::Success {
+            value: function,
+            consumed: function_consumed,
+        } = function_result
+        else {
+            return Ok(function_result);
+        };
+        let argument_result = evaluate_option(evaluator, argument_parser, state)?;
+        let OptionEvaluation::Success {
+            value: argument,
+            consumed: argument_consumed,
+        } = argument_result
+        else {
+            let OptionEvaluation::Missing { expected, consumed } = argument_result else {
+                unreachable!("option evaluation has two variants")
+            };
+            return Ok(OptionEvaluation::Missing {
+                expected,
+                consumed: function_consumed.saturating_add(consumed),
+            });
+        };
+        (function, function_consumed, argument, argument_consumed)
+    };
+    #[cfg(feature = "compat-tracing")]
+    let applied = Evaluator::callback_application_for_optional_parent(
+        callback_parent,
+        function,
+        &[argument],
+        callback_argument,
+        "application",
+    );
+    #[cfg(not(feature = "compat-tracing"))]
+    let applied = Thunk::suspended(Suspension::Apply { function, argument });
+    Ok(option_success(
+        applied,
+        function_consumed.saturating_add(argument_consumed),
+    ))
 }
 
 fn host_text(value: OsString) -> RuntimeResult<Arc<str>> {
@@ -2141,9 +3056,9 @@ fn parser_has_positional(parser: &OptionParser) -> bool {
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
         | OptionParser::Many(parser) => parser_has_positional(parser),
-        OptionParser::Apply { function, argument } => {
-            parser_has_positional(function) || parser_has_positional(argument)
-        }
+        OptionParser::Apply {
+            function, argument, ..
+        } => parser_has_positional(function) || parser_has_positional(argument),
         _ => false,
     }
 }
@@ -2153,9 +3068,19 @@ fn collect_option_help(parser: &OptionParser, entries: &mut Vec<(String, Option<
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
         | OptionParser::Many(parser) => collect_option_help(parser, entries),
-        OptionParser::Apply { function, argument } => {
-            collect_option_help(function, entries);
-            collect_option_help(argument, entries);
+        OptionParser::Apply {
+            function,
+            argument,
+            flipped,
+            ..
+        } => {
+            if *flipped {
+                collect_option_help(argument, entries);
+                collect_option_help(function, entries);
+            } else {
+                collect_option_help(function, entries);
+                collect_option_help(argument, entries);
+            }
         }
         OptionParser::Switch(modifiers) | OptionParser::Flag { modifiers, .. } => {
             if let Some(syntax) = option_long_syntax(modifiers) {
@@ -2203,9 +3128,9 @@ fn parser_help(parser: &OptionParser) -> Option<&str> {
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
         | OptionParser::Many(parser) => parser_help(parser),
-        OptionParser::Apply { function, argument } => {
-            parser_help(function).or_else(|| parser_help(argument))
-        }
+        OptionParser::Apply {
+            function, argument, ..
+        } => parser_help(function).or_else(|| parser_help(argument)),
         OptionParser::Switch(modifiers)
         | OptionParser::Flag { modifiers, .. }
         | OptionParser::StringOption(modifiers)

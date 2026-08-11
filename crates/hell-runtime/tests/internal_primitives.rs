@@ -85,6 +85,8 @@ impl CoreBuilder {
             nodes: self.nodes,
             types: self.types,
             main_type,
+            instance_evidence: Vec::new(),
+            compiler_evidence: hell_core::CompilerBuiltinEvidence::default(),
         })
         .expect("internal compatibility fixture verifies")
     }

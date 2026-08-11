@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "provider": "primary-worm",
+  "trustDomain": "primary",
+  "accountOrTenant": "100000000001",
+  "bucket": "custody-primary",
+  "uploadedBy": "arn:aws:sts::100000000001:assumed-role/upload/run",
+  "uploaderStableId": "UPLOADROLE",
+  "candidateCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "assuranceEpochSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "packageRootSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "manifestSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "retentionUntil": "2034-01-01T00:00:00Z",
+  "objectLockMode": "COMPLIANCE",
+  "encryption": "aws:kms",
+  "objects": [
+    {"sha256": "0000000000000000000000000000000000000000000000000000000000000000", "key": "0000000000000000000000000000000000000000000000000000000000000000", "version": "version-one", "checksumSha256Base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+  ]
+}

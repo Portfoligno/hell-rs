@@ -7,6 +7,9 @@
 use std::collections::BTreeMap;
 
 pub(crate) fn assignments(document: &str) -> Result<BTreeMap<String, String>, String> {
+    if document.contains('\0') {
+        return Err("TOML input contains a NUL byte".to_owned());
+    }
     let mut values = BTreeMap::new();
     let mut section = String::new();
     let mut pending = None::<(String, String)>;
@@ -175,6 +178,19 @@ pub(crate) fn string_array(value: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
+pub(crate) fn unsigned_array(value: &str) -> Result<Vec<u64>, String> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| format!("expected array, observed {value:?}"))?
+        .trim();
+    let inner = inner.strip_suffix(',').unwrap_or(inner).trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    inner.split(',').map(|item| unsigned(item.trim())).collect()
+}
+
 pub(crate) fn take(values: &mut BTreeMap<String, String>, key: &str) -> Result<String, String> {
     values
         .remove(key)
@@ -189,5 +205,36 @@ pub(crate) fn finish(values: &BTreeMap<String, String>) -> Result<(), String> {
             "unknown TOML keys: {}",
             values.keys().cloned().collect::<Vec<_>>().join(", ")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn fuzz_targets_claim_normalizer_and_divergence_toml_are_panic_free_and_fail_closed() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in [
+            "compat/claims/2026-05-29.toml",
+            "compat/normalizers.toml",
+            "compat/divergences.toml",
+        ] {
+            let canonical = std::fs::read_to_string(repository.join(relative)).unwrap();
+            assert!(std::panic::catch_unwind(|| assignments(&canonical)).is_ok());
+            let indices = (0..canonical.len()).step_by(canonical.len().div_ceil(256));
+            for index in indices {
+                let mut bytes = canonical.as_bytes().to_vec();
+                bytes[index] = 0;
+                let mutated = String::from_utf8(bytes).unwrap();
+                let outcome = std::panic::catch_unwind(|| assignments(&mutated));
+                assert!(outcome.is_ok(), "{relative} parser panicked at {index}");
+                assert!(
+                    outcome.unwrap().is_err(),
+                    "{relative} parser accepted NUL at {index}"
+                );
+            }
+        }
     }
 }

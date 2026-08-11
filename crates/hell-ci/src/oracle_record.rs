@@ -61,7 +61,9 @@ pub(crate) fn load(
     expected_platform: RequiredPlatform,
 ) -> Result<ReviewedOracleRecord, String> {
     let path = root
-        .join("crates/hell-ci/oracle")
+        .join("crates")
+        .join("hell-ci")
+        .join("oracle")
         .join(format!("{}.toml", expected_platform.as_str()));
     let document = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;

@@ -67,11 +67,13 @@ readiness. Missing reviewed claim mappings and required platform records remain
 truthful counters without becoming collection failures. Build, differential,
 policy, resource, and dependency failures still fail the command.
 
-After all three native shard artifacts have been retained and reviewed, apply
-the distinct fail-closed promotion gate explicitly:
+After all three native shard artifacts have been retained and reviewed, verify
+the committed source/catalog locks and apply the distinct fail-closed promotion
+gate explicitly with the exact candidate, epoch, and proposal identities:
 
 ```text
-target/ci/hell-ci promotion-gate --input ci-out/native-shards --explain --report ci-out/promotion-gate.json
+target/ci/hell-ci catalog-lock verify
+target/ci/hell-ci promotion-gate --input ci-out/native-shards --proposal ci-out/promotion-proposal.json --expect-source GIT_SHA --expect-epoch SHA256 --expect-proposal SHA256 --explain --report ci-out/promotion-gate.json
 ```
 
 This command is read-only with respect to its retained input, revalidates shard
@@ -94,6 +96,13 @@ bootstrap artifacts, inspect their inner manifests and native provenance,
 retain a durable copy, commit reviewed metadata, and then collect fresh shards
 for that exact commit. Do not replace review placeholders or availability
 states with inferred values.
+
+The complete collection, independent acquisition, provenance review, semantic
+coverage, custody, promotion, bounded-report, surveillance, and revocation
+procedure is documented in
+[`spec/promotion-assurance.md`](spec/promotion-assurance.md). A green workflow
+is transport and mechanical evidence, not a substitute for the signed decisions
+listed in that runbook.
 
 The reviewed Linux amd64 oracle is the `hell-linux-amd64` asset from the
 upstream `2026-05-29` release. Its source, executable digest, and pinned build

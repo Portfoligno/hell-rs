@@ -1,0 +1,6 @@
+schema_version = 1
+state = "review-required"
+required_assurance_mutants_detected = "all"
+minimum_semantic_family_score_per_mille = 900
+critical_mutants_must_all_be_detected = true
+maximum_report_age_days = 14

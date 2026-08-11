@@ -614,6 +614,11 @@ pub(super) fn apply_native(
             ))
         }),
         "time_of_day_from_time" => evaluator.force_double(&arguments[0]).and_then(|seconds| {
+            let seconds = if crate::semantic_mutant_active("datetime-rounding-boundary") {
+                seconds.ceil()
+            } else {
+                seconds
+            };
             TimeOfDay::from_seconds(seconds).map_or_else(
                 || Err(fixed_precision_error("TimeOfDay.timeToTimeOfDay")),
                 |time| value(Value::TimeOfDay(time)),

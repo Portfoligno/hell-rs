@@ -1,0 +1,11 @@
+schema_version = 2
+state = "review-required"
+pure_runtime = ["adapter-success", "adapter-failure", "lazy-boundary", "whnf-boundary", "deep-boundary", "conditional-selected", "conditional-unselected", "io-execution-boundary", "typed-result", "callback-order", "collection-interaction", "constructor-eliminator", "numeric-boundary", "encoding-boundary", "parser-composition"]
+effects = ["effect-success", "effect-failure", "effect-ordering"]
+concurrency = ["task-lifecycle", "race-cancellation", "scope-cleanup"]
+presentation = ["raw-observation", "normalized-shadow-diff"]
+platform = ["three-platform-observation"]
+resource_behavior = ["bounded-materialization", "resource-audit", "cleanup-trace"]
+boundary_classes = ["negative-count", "zero-count", "below-finite-length", "equal-finite-length", "above-finite-length", "infinite-source", "bottom-source-zero-count", "bottom-after-demanded-prefix", "empty-input", "singleton-input", "finite-input", "negative-value", "zero-value", "positive-value", "minimum-value", "maximum-value", "overflow", "ascii", "unicode", "invalid-encoding", "absent-option", "present-option", "repeated-option", "malformed-option", "end-of-options"]
+interaction_obligations = ["timeout-process", "race-temporary-resource", "list-laziness-error", "map-ordering-custom-ord", "text-decode-process-capture", "cwd-child-process", "http-stream-disconnect", "options-platform-argv", "json-number-presentation"]
+generated_direct_claim_evidence = false
