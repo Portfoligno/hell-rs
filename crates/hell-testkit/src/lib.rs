@@ -6,7 +6,7 @@ mod corpus;
 mod reviewed_set;
 mod runtime_obligations;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write as _};
@@ -35,9 +35,9 @@ pub use artifact::{
     retain_verified_profile_observation, retained_bundle_outcome_facts,
     retained_reached_claim_targets, retained_regression_reached_claim_targets,
     retained_regression_reviewed_claim_targets, reviewed_regression_case_from_bundle,
-    runtime_platform_shard_for_bundle, verify_observation_bundle,
-    verify_observation_bundle_for_case, verify_observation_bundle_manifest_bytes,
-    verify_regression_observation_bundle_for_case,
+    runtime_platform_shard_for_bundle, verified_observation_bundle_manifest_files,
+    verify_observation_bundle, verify_observation_bundle_for_case,
+    verify_observation_bundle_manifest_bytes, verify_regression_observation_bundle_for_case,
     verify_retained_alternate_executable_observation_against_bundle,
     verify_retained_native_environment, verify_retained_profile_observation,
     verify_retained_profile_observation_against_bundle, write_evidence_summary,
@@ -47,11 +47,14 @@ pub use collection_authority::{
     COLLECTION_CASE_AUTHORITY_COUNT, CollectionBlackBoxShard, CollectionBundleFacts,
     CollectionCaseAuthority, CollectionCompletion, CollectionDependencyAuthority,
     CollectionNativeBuildAuthority, CollectionOracleSubject, CollectionSourceAuthority,
-    CollectionVerifiedProviderRoot, reviewed_collection_cases,
+    CollectionVerifiedProviderRoot, decoded_collection_source_archive_sha256,
+    reviewed_collection_case_authorities, reviewed_collection_cases,
     validate_collection_black_box_structure, verify_collection_source_authority,
 };
 pub use corpus::{
-    GeneratedCase, GeneratedType, committed_differential_cases, generated_typed_cases,
+    GeneratedCase, GeneratedType, committed_differential_cases,
+    dormant_committed_differential_cases, generated_typed_cases, render_active_collection_claims,
+    verify_collection_activation_state,
 };
 pub use hell_digest::Digest;
 use hell_digest::Sha256;
@@ -571,14 +574,21 @@ pub(crate) fn task_trace_sha256<'a>(events: impl IntoIterator<Item = (usize, &'a
     sha256_bytes(&canonical)
 }
 
-pub(crate) fn process_status_sha256(success: bool, code: Option<i32>) -> Digest {
+/// Returns the canonical, domain-separated bytes used to identify one process
+/// status in retained collection and runtime evidence.
+#[must_use]
+pub fn canonical_process_status_bytes(success: bool, code: Option<i32>) -> Vec<u8> {
     let mut canonical = b"hell-runtime-process-status-v1\0".to_vec();
     canonical.extend_from_slice(if success { b"success\0" } else { b"failure\0" });
     canonical.extend_from_slice(
         code.map_or_else(|| "null".to_owned(), |value| value.to_string())
             .as_bytes(),
     );
-    sha256_bytes(&canonical)
+    canonical
+}
+
+pub(crate) fn process_status_sha256(success: bool, code: Option<i32>) -> Digest {
+    sha256_bytes(&canonical_process_status_bytes(success, code))
 }
 
 pub(crate) fn single_effect_lifecycle_sha256<'a>(
@@ -1786,8 +1796,13 @@ pub fn validate_runtime_obligation_coverage(cases: &[DifferentialCase]) -> Resul
     }
 }
 
-#[cfg(test)]
-pub(crate) fn runtime_obligation_scope_complete(
+/// Returns whether one exact runtime instance scope contains every required obligation.
+///
+/// # Errors
+///
+/// Returns an error when retained descriptors are invalid or the requested runtime cell is not
+/// part of the applicable obligation catalog.
+pub fn runtime_obligation_scope_complete(
     cases: &[DifferentialCase],
     builtin: &str,
     dimension: CompatibilityDimension,
@@ -1810,6 +1825,156 @@ pub(crate) fn runtime_obligation_scope_complete(
         .cloned()
         .unwrap_or_default();
     Ok(present == required)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivatedCollectionScopeCoverage {
+    pub exact_complete_scopes: BTreeSet<String>,
+    pub residual_incomplete_cells: usize,
+    pub boundary_gaps: usize,
+    pub interaction_gaps: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivatedCollectionClaimScope {
+    pub scope: String,
+    pub builtin: String,
+    pub case_refs: BTreeSet<String>,
+    pub required_platforms: [ClaimPlatform; 3],
+    pub fresh_evidence_required: bool,
+}
+
+/// Returns the exact 14 reviewed collection scopes and their 1,191 case references.
+///
+/// # Errors
+///
+/// Returns an error if the reviewed collection corpus is missing evidence, has ambiguous targets,
+/// or no longer partitions into the exact Map712/Set479 scope inventory.
+pub fn activated_collection_claim_scopes() -> Result<Vec<ActivatedCollectionClaimScope>, String> {
+    let mut grouped = BTreeMap::<String, BTreeSet<String>>::new();
+    for case in reviewed_collection_cases()? {
+        let descriptor = case
+            .claim_evidence
+            .ok_or_else(|| "activated collection case lacks claim evidence".to_owned())?;
+        let [target] = descriptor.semantic_targets.as_slice() else {
+            return Err("activated collection case does not bind one exact scope".to_owned());
+        };
+        grouped
+            .entry(target.builtin.to_string())
+            .or_default()
+            .insert(case.id.to_string());
+    }
+    let scopes = grouped
+        .into_iter()
+        .map(|(builtin, case_refs)| ActivatedCollectionClaimScope {
+            scope: format!("{builtin}|pure-runtime|upstream|linux,macos,windows"),
+            builtin,
+            case_refs,
+            required_platforms: [
+                ClaimPlatform::Linux,
+                ClaimPlatform::MacOs,
+                ClaimPlatform::Windows,
+            ],
+            fresh_evidence_required: true,
+        })
+        .collect::<Vec<_>>();
+    if scopes.len() != 14
+        || scopes
+            .iter()
+            .map(|scope| scope.case_refs.len())
+            .sum::<usize>()
+            != 1_191
+    {
+        return Err("activated collection claim scopes are not exact Map712/Set479".to_owned());
+    }
+    Ok(scopes)
+}
+
+/// Verifies exact scoped collection completeness while retaining the unrelated 120 residual cells.
+///
+/// # Errors
+///
+/// Returns an error unless all 14 activated scopes are complete and the global residual remains
+/// exactly 120 incomplete cells with zero boundary or interaction gaps.
+pub fn activated_collection_scope_completeness(
+    cases: &[DifferentialCase],
+) -> Result<ActivatedCollectionScopeCoverage, String> {
+    let collection = reviewed_collection_cases()?;
+    let mut targets = BTreeMap::<String, BTreeSet<String>>::new();
+    for case in &collection {
+        let descriptor = case
+            .claim_evidence
+            .as_ref()
+            .ok_or_else(|| "activated collection case lacks claim evidence".to_owned())?;
+        let [target] = descriptor.semantic_targets.as_slice() else {
+            return Err("activated collection case does not bind one exact scope".to_owned());
+        };
+        let instance = target
+            .expected_instance_target
+            .as_deref()
+            .ok_or_else(|| "activated collection scope lacks an instance target".to_owned())?;
+        if descriptor.profile != ExecutionProfile::Upstream
+            || target.dimension != CompatibilityDimension::PureRuntime
+        {
+            return Err("activated collection scope lacks exact fresh completeness".to_owned());
+        }
+        targets
+            .entry(target.builtin.to_string())
+            .or_default()
+            .insert(instance.to_owned());
+    }
+    if targets.len() != 14 {
+        return Err("activated collection scope set is not exactly 14 cells".to_owned());
+    }
+    let observations = runtime_coverage_observations(cases)?;
+    let cells = applicable_runtime_obligation_cells();
+    let mut scopes = BTreeSet::new();
+    for (builtin, instances) in targets {
+        let cell = cells
+            .iter()
+            .find(|cell| {
+                cell.builtin.as_ref() == builtin
+                    && cell.dimension == CompatibilityDimension::PureRuntime
+            })
+            .ok_or_else(|| "activated collection runtime cell is not applicable".to_owned())?;
+        let required = cell
+            .obligations
+            .iter()
+            .map(|obligation| Arc::clone(&obligation.0))
+            .collect::<BTreeSet<_>>();
+        for instance in instances {
+            let key = (
+                Arc::clone(&cell.builtin),
+                cell.dimension,
+                RuntimeInstanceScope::Resolved(Arc::from(instance)),
+            );
+            if observations.obligations.get(&key) != Some(&required) {
+                return Err("activated collection scope lacks exact fresh completeness".to_owned());
+            }
+        }
+        scopes.insert(format!(
+            "{builtin}|pure-runtime|upstream|linux,macos,windows"
+        ));
+    }
+    let error = match validate_runtime_obligation_coverage(cases) {
+        Ok(()) => {
+            return Err(
+                "collection scope activation unexpectedly closes unrelated runtime cells"
+                    .to_owned(),
+            );
+        }
+        Err(error) => error,
+    };
+    let prefix = "runtime obligation coverage has 120 incomplete cells, 0 boundary gaps, and 0 interaction gaps:";
+    if !error.starts_with(prefix) {
+        return Err("activated collection residual coverage differs from 120/0/0".to_owned());
+    }
+    Ok(ActivatedCollectionScopeCoverage {
+        exact_complete_scopes: scopes,
+        residual_incomplete_cells: 120,
+        boundary_gaps: 0,
+        interaction_gaps: 0,
+    })
 }
 
 fn boolean_outcome_partition_required(builtin: &str) -> bool {
@@ -4711,6 +4876,22 @@ fn parse_resource_audit(bytes: &[u8]) -> std::io::Result<ResourceAudit> {
     })
 }
 
+/// Verifies one canonical resource-audit document and requires its complete
+/// retained task/handle/process/body/temporary/cleanup audit to be zero.
+///
+/// # Errors
+///
+/// Returns an error for malformed audit bytes or any nonzero resource count.
+pub fn verify_zero_resource_audit_bytes(bytes: &[u8]) -> std::io::Result<()> {
+    let audit = parse_resource_audit(bytes)?;
+    if audit.failure_count() != 0 {
+        return Err(std::io::Error::other(
+            "collection resource audit records a retained resource failure",
+        ));
+    }
+    Ok(())
+}
+
 fn json_usize_line(document: &str, field: &str) -> Option<usize> {
     let prefix = format!("\"{field}\": ");
     let mut values = document.lines().filter_map(|line| {
@@ -5917,7 +6098,7 @@ mod evidence_catalog_tests {
 
     #[test]
     fn runtime_catalog_reports_exact_remaining_scope_after_core_data_tranche() {
-        let error = validate_runtime_obligation_coverage(&committed_differential_cases())
+        let error = validate_runtime_obligation_coverage(&dormant_committed_differential_cases())
             .expect_err("the runtime corpus is intentionally fail-closed until exhaustive");
         assert!(
             error.contains("134 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),

@@ -1,0 +1,7 @@
+schema_version = 1
+state = "active"
+revoked_subject_sha256 = []
+revoked_payload_merkle_roots = []
+revoked_candidate_commits = []
+revoked_provider_head_commits = []
+revoked_provider_run_ids = []

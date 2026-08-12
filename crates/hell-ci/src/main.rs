@@ -1,6 +1,8 @@
 mod assurance;
 mod catalog_lock;
 mod collection_authority_ops;
+mod collection_custody;
+mod collection_transport;
 mod command;
 mod custody_ops;
 mod fixtures;

@@ -19,6 +19,9 @@ on:
       native_artifact_id:
         type: string
         required: true
+      native_provider_archive_sha256:
+        type: string
+        required: true
       native_package_sha256:
         type: string
         required: true
@@ -29,6 +32,10 @@ permissions:
 
 jobs:
   package:
+    outputs:
+      decisions_artifact_id: ${{ steps.upload-decisions.outputs.artifact-id }}
+      decisions_artifact_digest: ${{ steps.upload-decisions.outputs.artifact-digest }}
+      decisions_directory_sha256: ${{ steps.bind-decisions.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -70,10 +77,27 @@ jobs:
           path: ci-out/evidence/native
       - name: Build decision packager
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact candidate checkout
+        env:
+          CLAIM_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$CLAIM_CANDIDATE_SHA"
+      - name: Verify exact externally authored decision checkout
+        env:
+          CLAIM_DECISION_SOURCE_SHA: ${{ inputs.decision_source_sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input decision-source --candidate-commit "$CLAIM_DECISION_SOURCE_SHA"
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Derive exact source claim coverage
         run: ./target/ci/hell-ci case-coverage report --input ci-out/evidence/native --output ci-out/evidence/claim-decisions/source/claim-coverage.details.json
       - name: Package externally authored decisions and provider facts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs
+      - name: Bind exact immutable claim decisions directory
+        id: bind-decisions
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/evidence/claim-decisions
       - name: Upload immutable claim decisions
         id: upload-decisions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

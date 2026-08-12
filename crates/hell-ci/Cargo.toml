@@ -13,6 +13,7 @@ name = "hell-ci"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
 hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
 hell-docgen = { version = "0.1.0", path = "../hell-docgen" }
@@ -20,6 +21,7 @@ hell-runtime = { version = "0.1.0", path = "../hell-runtime" }
 hell-source = { version = "0.1.0", path = "../hell-source" }
 hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 hell-testkit = { version = "0.1.0", path = "../hell-testkit" }
+tar = "0.4.44"
 
 [lints]
 workspace = true

@@ -18,9 +18,9 @@ use hell_builtins::{CompatibilityDimension, ExecutionProfile, Visibility};
 use hell_testkit::{
     DifferentialCase, Digest, ExecutableIdentity, ExecutableRole, committed_differential_cases,
     differential_with_identities, differential_with_nonclaim_trace_target,
-    observe_verified_executable_profile, retain_observation_bundle,
-    retain_verified_profile_observation, sha256_bytes, sha256_file, validate_evidence_catalog,
-    verify_executable,
+    dormant_committed_differential_cases, observe_verified_executable_profile,
+    retain_observation_bundle, retain_verified_profile_observation, sha256_bytes, sha256_file,
+    validate_evidence_catalog, verify_executable,
 };
 
 use crate::command::CommandSpec;
@@ -92,9 +92,9 @@ const REVIEW_ASSEMBLY_INPUTS: &[&str] = &[
     "native_package_sha256",
     "native_run_attempt",
     "native_run_id",
-    "oracle_event",
     "oracle_macos_artifact_id",
     "oracle_macos_package_sha256",
+    "provider_archive_sha256_json",
     "oracle_run_attempt",
     "oracle_run_id",
     "oracle_windows_artifact_id",
@@ -107,6 +107,7 @@ const CLAIM_DECISION_PRODUCER_INPUTS: &[&str] = &[
     "decision_source_sha",
     "native_artifact_id",
     "native_package_sha256",
+    "native_provider_archive_sha256",
     "native_run_attempt",
     "native_run_id",
 ];
@@ -194,6 +195,7 @@ fn github_dispatch_inputs_from(path: &Path) -> Result<(String, String, String), 
             "assurance_epoch_sha256",
             "candidate_sha",
             "proposal_artifact_id",
+            "proposal_provider_archive_sha256",
             "proposal_package_sha256",
             "proposal_run_attempt",
             "promotion_proposal_sha256",
@@ -233,6 +235,10 @@ fn github_dispatch_inputs_from(path: &Path) -> Result<(String, String, String), 
     require_digest(
         json_member(inputs, "proposal_package_sha256")?.string()?,
         "dispatch proposal package",
+    )?;
+    require_digest(
+        json_member(inputs, "proposal_provider_archive_sha256")?.string()?,
+        "dispatch proposal provider archive",
     )?;
     Ok((source, epoch, proposal))
 }
@@ -651,6 +657,7 @@ fn verify_proposal_provider_spec(
         spec.ids.2,
         candidate,
         package_sha256,
+        archive_sha256,
     )?;
     let document = parse_json(&selection)?;
     if json_member(document.object()?, "providerArchiveSha256")?.string()? != archive_sha256 {
@@ -733,6 +740,7 @@ fn promotion_approval_identity(
             "candidate_sha",
             "issued_at",
             "proposal_artifact_id",
+            "proposal_provider_archive_sha256",
             "proposal_package_sha256",
             "proposal_run_attempt",
             "promotion_proposal_sha256",
@@ -772,7 +780,9 @@ fn promotion_approval_identity(
     let run_attempt = identifier("proposal_run_attempt")?;
     let artifact_id = identifier("proposal_artifact_id")?;
     let expected_package = json_member(inputs, "proposal_package_sha256")?.string()?;
+    let expected_archive = json_member(inputs, "proposal_provider_archive_sha256")?.string()?;
     require_digest(expected_package, "approval proposal package")?;
+    require_digest(expected_archive, "approval proposal provider archive")?;
     let proposal_directory = proposal
         .parent()
         .ok_or_else(|| "approval proposal has no package directory".to_owned())?;
@@ -787,7 +797,9 @@ fn promotion_approval_identity(
         artifact_id,
         candidate,
         expected_package,
+        expected_archive,
     )?;
+    verify_selection_archive(&selection, expected_archive)?;
     write_atomic(
         &proposal_directory.join("proposal-provider-selection.json"),
         selection.as_bytes(),
@@ -1859,6 +1871,26 @@ fn verify_retained_proposal_provider_api(
 ) -> Result<(), String> {
     let artifact_path = directory.join("provider-selected-artifact.json");
     let run_path = directory.join("provider-selected-run.json");
+    if json_member(selection, "providerArtifactApiPath")?.string()?
+        != "provider-selected-artifact.json"
+        || json_member(selection, "providerRunApiPath")?.string()? != "provider-selected-run.json"
+        || json_member(selection, "providerArtifactId")?.number()? == 0
+        || json_member(selection, "providerRunId")?.number()? == 0
+        || json_member(selection, "providerRunAttempt")?.number()? == 0
+        || json_member(selection, "providerArchiveSize")?.number()? == 0
+        || !json_member(selection, "providerArchiveUrl")?
+            .string()?
+            .starts_with("https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/")
+    {
+        return Err("historical provider selector metadata is invalid".to_owned());
+    }
+    validate_utc_timestamp(json_member(selection, "providerCreatedAt")?.string()?)?;
+    validate_utc_timestamp(json_member(selection, "providerExpiresAt")?.string()?)?;
+    if utc_timestamp_seconds(json_member(selection, "providerCreatedAt")?.string()?)?
+        >= utc_timestamp_seconds(json_member(selection, "providerExpiresAt")?.string()?)?
+    {
+        return Err("historical provider retention interval is invalid".to_owned());
+    }
     for (path, path_field, digest_field, expected) in [
         (
             &artifact_path,
@@ -1905,8 +1937,7 @@ fn verify_retained_proposal_provider_api(
     let run_document = parse_json(&read_text(&run_path)?)?;
     let run = run_document.object()?;
     let repository = json_member(run, "repository")?.object()?;
-    let expected_repository_id = std::env::var("GITHUB_REPOSITORY_ID")
-        .map_err(|_| "proposal gate requires GITHUB_REPOSITORY_ID".to_owned())?;
+    let expected_repository_id = provider_selection_repository_identity()?.1;
     verify_provider_run_attempt(
         json_member(selection, "providerRunAttempt")?.number()?,
         json_member(run, "run_attempt")?.number()?,
@@ -1917,8 +1948,11 @@ fn verify_retained_proposal_provider_api(
     )?;
     if json_member(run, "id")?.number()? != run_id
         || json_member(run, "head_sha")?.string()? != candidate
-        || json_member(run, "path")?.string()?
-            != json_member(selection, "workflowPath")?.string()?
+        || provider_run_workflow_ref(
+            json_member(run, "path")?.string()?,
+            json_member(selection, "workflowPath")?.string()?,
+        )
+        .is_err()
         || json_member(run, "event")?.string()? != json_member(selection, "event")?.string()?
         || json_member(repository, "full_name")?.string()? != "Portfoligno/hell-rs"
         || json_member(repository, "id")?.number()?.to_string()
@@ -2384,6 +2418,7 @@ fn load_review_policy(root: &Path) -> Result<ReviewPolicy, String> {
         Ok(value)
     };
     team("claim_reviewer_team")?;
+    team("claim_author_team")?;
     team("platform_reviewer_team")?;
     team("security_reviewer_team")?;
     team("implementation_reviewer_team")?;
@@ -2500,15 +2535,10 @@ fn load_acquisition_policy(root: &Path) -> Result<AcquisitionPolicy, String> {
     {
         return Err("acquisition source policy is incomplete or unsupported".to_owned());
     }
-    let repository_id = if repository_id == "REVIEW_REQUIRED" {
-        None
-    } else {
-        repository_id
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value != 0)
-            .map(|value| value.to_string())
-    };
+    if repository_id != "1327351238" {
+        return Err("acquisition source policy repository ID is not pinned".to_owned());
+    }
+    let repository_id = Some(repository_id);
     Ok(AcquisitionPolicy {
         repository,
         repository_id,
@@ -3287,9 +3317,22 @@ fn case_coverage_command(root: &Path, options: &Options) -> Result<String, Strin
     let cases = committed_differential_cases();
     validate_evidence_catalog(&cases)?;
     let action = options.action.as_deref().unwrap_or("report");
-    let eligible = claim_eligible_cases(&cases);
+    let active = active_collection_coverage_scope(root)?;
+    let eligible = claim_eligible_cases(&cases)
+        .into_iter()
+        .filter(|case| {
+            active
+                .as_ref()
+                .is_none_or(|scope| scope.case_refs.contains(case.id.as_ref()))
+        })
+        .collect::<Vec<_>>();
     let input = options.input.as_deref();
     let missing_bundles = missing_claim_bundles(input, &eligible)?;
+    if active.is_some() && missing_bundles != 0 {
+        return Err(format!(
+            "activated collection coverage has {missing_bundles} missing or causally invalid bundles"
+        ));
+    }
     if let Some(message) = verified_coverage_message(action, missing_bundles, eligible.len())? {
         return Ok(message);
     }
@@ -3299,8 +3342,67 @@ fn case_coverage_command(root: &Path, options: &Options) -> Result<String, Strin
     })?;
     let source = git_output(root, &["rev-parse", "HEAD"])?;
     let (_, epoch) = epoch(root)?;
-    let total = total_claim_cell_count();
+    let total = active
+        .as_ref()
+        .map_or_else(total_claim_cell_count, |scope| {
+            scope
+                .builtins
+                .len()
+                .saturating_mul(REQUIRED_CLAIM_PLATFORMS.len())
+        });
     let retained_root = retained_evidence_root(output)?;
+    let coverage = collect_claim_coverage_rows(
+        input,
+        retained_root,
+        &eligible,
+        source.trim(),
+        &epoch.hex(),
+        active.as_ref().map(|scope| &scope.builtins),
+    )?;
+    let mut rows = coverage.rows;
+    derive_platform_dependent_statuses(&mut rows);
+    let mut json = render_claim_coverage(
+        source.trim(),
+        &epoch.hex(),
+        &ClaimCoverageCounts {
+            total,
+            ambiguous: coverage.ambiguous,
+            missing_obligations: coverage.missing_obligations,
+            required_platform_gaps: coverage.required_platform_gaps,
+            semantic_coverage_gaps: coverage.semantic_coverage_gaps,
+            unreached_targets: coverage.unreached_targets,
+        },
+        rows,
+        &coverage.mismatch_candidates,
+    )?;
+    if active.is_some() {
+        json = render_scoped_collection_coverage(&json)?;
+    }
+    write_atomic(output, json.as_bytes())?;
+    Ok(format!(
+        "wrote typed semantic coverage report to {}",
+        output.display()
+    ))
+}
+
+struct CollectedClaimCoverage<'a> {
+    rows: Vec<ClaimCoverageRow<'a>>,
+    mismatch_candidates: Vec<JsonValue>,
+    ambiguous: usize,
+    missing_obligations: usize,
+    required_platform_gaps: usize,
+    semantic_coverage_gaps: usize,
+    unreached_targets: usize,
+}
+
+fn collect_claim_coverage_rows<'a>(
+    input: &Path,
+    retained_root: &Path,
+    eligible: &[&DifferentialCase],
+    source: &str,
+    epoch: &str,
+    active_scopes: Option<&BTreeSet<String>>,
+) -> Result<CollectedClaimCoverage<'a>, String> {
     let mut rows = Vec::new();
     let mut mismatch_candidates = Vec::new();
     let mut ambiguous = 0_usize;
@@ -3309,17 +3411,22 @@ fn case_coverage_command(root: &Path, options: &Options) -> Result<String, Strin
     let mut semantic_coverage_gaps = 0_usize;
     let mut unreached_targets = 0_usize;
     for (builtin, dimension, decision, _) in applicability_rows() {
+        if active_scopes.as_ref().is_some_and(|scopes| {
+            dimension != CompatibilityDimension::PureRuntime || !scopes.contains(builtin)
+        }) {
+            continue;
+        }
         for &platform in REQUIRED_CLAIM_PLATFORMS {
             let required = claim_obligations(builtin, dimension, platform)?;
             let evidence = claim_cell_evidence(
                 input,
                 retained_root,
-                &eligible,
+                eligible,
                 builtin,
                 dimension,
                 platform,
-                source.trim(),
-                &epoch.hex(),
+                source,
+                epoch,
             )?;
             let missing = required
                 .iter()
@@ -3355,26 +3462,78 @@ fn case_coverage_command(root: &Path, options: &Options) -> Result<String, Strin
             mismatch_candidates.extend(candidates);
         }
     }
-    derive_platform_dependent_statuses(&mut rows);
-    let json = render_claim_coverage(
-        source.trim(),
-        &epoch.hex(),
-        &ClaimCoverageCounts {
-            total,
-            ambiguous,
-            missing_obligations,
-            required_platform_gaps,
-            semantic_coverage_gaps,
-            unreached_targets,
-        },
+    Ok(CollectedClaimCoverage {
         rows,
-        &mismatch_candidates,
-    )?;
-    write_atomic(output, json.as_bytes())?;
-    Ok(format!(
-        "wrote typed semantic coverage report to {}",
-        output.display()
-    ))
+        mismatch_candidates,
+        ambiguous,
+        missing_obligations,
+        required_platform_gaps,
+        semantic_coverage_gaps,
+        unreached_targets,
+    })
+}
+
+struct ActiveCollectionCoverageScope {
+    builtins: BTreeSet<String>,
+    case_refs: BTreeSet<String>,
+}
+
+fn active_collection_coverage_scope(
+    root: &Path,
+) -> Result<Option<ActiveCollectionCoverageScope>, String> {
+    let manifest = read_regular_file(&root.join("compat/collection-activation.toml"))?;
+    let provenance = read_regular_file(&root.join("compat/collection-activation-provenance.json"))?;
+    let claims = read_regular_file(&root.join("compat/collection-activation-claims.json"))?;
+    if !hell_testkit::verify_collection_activation_state(&manifest, &provenance, &claims)? {
+        return Ok(None);
+    }
+    crate::collection_custody::verify_active_collection_activation_repository(root)?;
+    let scopes = hell_testkit::activated_collection_claim_scopes()?;
+    Ok(Some(ActiveCollectionCoverageScope {
+        builtins: scopes.iter().map(|scope| scope.builtin.clone()).collect(),
+        case_refs: scopes
+            .into_iter()
+            .flat_map(|scope| scope.case_refs)
+            .collect(),
+    }))
+}
+
+fn render_scoped_collection_coverage(source: &str) -> Result<String, String> {
+    let mut document = parse_json(source)?;
+    let fields = document.object_mut()?;
+    fields.insert(
+        "coverageScope".to_owned(),
+        JsonValue::String("activated-collection-exact14".to_owned()),
+    );
+    fields.insert("activatedScopeCells".to_owned(), JsonValue::Number(14));
+    fields.insert("activeEvidenceCells".to_owned(), JsonValue::Number(42));
+    fields.insert(
+        "residualRuntimeCells".to_owned(),
+        JsonValue::Number(scoped_collection_residual_runtime_cells()?),
+    );
+    fields.insert(
+        "outOfScopeClaimCells".to_owned(),
+        JsonValue::Number(scoped_collection_out_of_scope_claim_cells()?),
+    );
+    canonical_json_bytes(&document).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|_| "scoped coverage is not UTF-8".to_owned())
+    })
+}
+
+fn scoped_collection_out_of_scope_claim_cells() -> Result<u64, String> {
+    let all = applicability_rows().len();
+    let active = active_collection_applicability_rows()?.len();
+    u64::try_from(all.saturating_sub(active))
+        .map_err(|_| "collection out-of-scope claim count exceeds u64".to_owned())
+}
+
+fn scoped_collection_residual_runtime_cells() -> Result<u64, String> {
+    let mut cases = dormant_committed_differential_cases();
+    cases.extend(hell_testkit::reviewed_collection_cases()?);
+    u64::try_from(
+        hell_testkit::activated_collection_scope_completeness(&cases)?.residual_incomplete_cells,
+    )
+    .map_err(|_| "collection residual runtime count exceeds u64".to_owned())
 }
 
 fn claim_coverage_row<'a>(
@@ -3970,7 +4129,9 @@ fn verify_claim_decision_native_source(
     candidate: &str,
 ) -> Result<(), String> {
     let package = map_value(inputs, "native_package_sha256")?;
+    let archive = map_value(inputs, "native_provider_archive_sha256")?;
     require_digest(package, "claim decision native package")?;
+    require_digest(archive, "claim decision native provider archive")?;
     let directory = Path::new("ci-out").join("evidence").join("native");
     let selection = verify_provider_artifact_selection(
         root,
@@ -3983,6 +4144,7 @@ fn verify_claim_decision_native_source(
         positive_map_integer(inputs, "native_artifact_id", "claim decision producer")?,
         candidate,
         package,
+        archive,
     )?;
     write_atomic(
         &directory.join("claim-decision-native-provider-selection.json"),
@@ -9978,7 +10140,7 @@ fn residual_risk_command(root: &Path, options: &Options) -> Result<String, Strin
         return Err("residual-risk input candidate or epoch is stale".to_owned());
     }
     let cells = json_member(coverage, "cells")?.array()?;
-    let status_counts = residual_status_counts(cells)?;
+    let status_counts = claim_coverage_status_counts(coverage)?;
     let unverified = status_counts["unverified"];
     let out_of_scope = status_counts["not-applicable"];
     let boundary_classes = residual_boundary_classes(cells)?;
@@ -10272,6 +10434,20 @@ fn residual_status_counts(cells: &[JsonValue]) -> Result<BTreeMap<String, u64>, 
             .get_mut(status)
             .ok_or_else(|| "residual-risk encountered an unknown claim status".to_owned())?;
         *count = count.saturating_add(1);
+    }
+    Ok(counts)
+}
+
+fn claim_coverage_status_counts(
+    coverage: &BTreeMap<String, JsonValue>,
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut counts = residual_status_counts(json_member(coverage, "cells")?.array()?)?;
+    if coverage.get("coverageScope").is_some() {
+        verify_scoped_collection_coverage_counts(coverage)?;
+        counts.insert(
+            "not-applicable".to_owned(),
+            json_member(coverage, "outOfScopeClaimCells")?.number()?,
+        );
     }
     Ok(counts)
 }
@@ -11124,10 +11300,6 @@ fn validate_review_assembly_identity<'a>(
     if !matches!(mutation_event, "workflow_dispatch" | "schedule") {
         return Err("review assembly mutation event is not accepted".to_owned());
     }
-    let oracle_event = map_value(inputs, "oracle_event")?;
-    if oracle_event != "workflow_dispatch" {
-        return Err("review assembly oracle event is not accepted".to_owned());
-    }
     Ok(candidate)
 }
 
@@ -11137,7 +11309,7 @@ fn verify_review_source_selections(
     candidate: &str,
 ) -> Result<(), String> {
     let mutation_event = map_value(inputs, "mutation_event")?;
-    let oracle_event = map_value(inputs, "oracle_event")?;
+    let archives = review_provider_archive_digests(inputs)?;
     let selections = vec![
         (
             "native",
@@ -11151,6 +11323,7 @@ fn verify_review_source_selections(
             "native_run_attempt",
             "native_artifact_id",
             "native_package_sha256",
+            "native",
         ),
         (
             "acquisition",
@@ -11164,6 +11337,7 @@ fn verify_review_source_selections(
             "acquisition_run_attempt",
             "acquisition_artifact_id",
             "acquisition_package_sha256",
+            "acquisition",
         ),
         (
             "mutation",
@@ -11177,6 +11351,7 @@ fn verify_review_source_selections(
             "mutation_run_attempt",
             "mutation_artifact_id",
             "mutation_package_sha256",
+            "mutation",
         ),
         (
             "oracle-macos",
@@ -11188,11 +11363,12 @@ fn verify_review_source_selections(
             PathBuf::from(".github")
                 .join("workflows")
                 .join("oracle-reproduce.yml"),
-            oracle_event,
+            "workflow_dispatch",
             "oracle_run_id",
             "oracle_run_attempt",
             "oracle_macos_artifact_id",
             "oracle_macos_package_sha256",
+            "oracleMacos",
         ),
         (
             "oracle-windows",
@@ -11204,16 +11380,46 @@ fn verify_review_source_selections(
             PathBuf::from(".github")
                 .join("workflows")
                 .join("oracle-reproduce.yml"),
-            oracle_event,
+            "workflow_dispatch",
             "oracle_run_id",
             "oracle_run_attempt",
             "oracle_windows_artifact_id",
             "oracle_windows_package_sha256",
+            "oracleWindows",
         ),
     ];
-    for (label, directory, artifact, workflow, event, run, attempt, id, digest) in selections {
+    verify_review_provider_specs(root, inputs, &archives, candidate, selections)?;
+    verify_claim_decision_selection(root, inputs)?;
+    Ok(())
+}
+
+type ReviewProviderSpec<'a> = (
+    &'a str,
+    PathBuf,
+    &'a str,
+    PathBuf,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+);
+
+fn verify_review_provider_specs(
+    root: &Path,
+    inputs: &BTreeMap<String, String>,
+    archives: &BTreeMap<String, String>,
+    candidate: &str,
+    selections: Vec<ReviewProviderSpec<'_>>,
+) -> Result<(), String> {
+    for (label, directory, artifact, workflow, event, run, attempt, id, digest, archive) in
+        selections
+    {
         let package = map_value(inputs, digest)?;
+        let archive = map_value(archives, archive)?;
         require_digest(package, "review source package")?;
+        require_digest(archive, "review source provider archive")?;
         let workflow = path_text(&workflow)?;
         let selection = verify_provider_artifact_selection(
             root,
@@ -11226,14 +11432,39 @@ fn verify_review_source_selections(
             positive_map_integer(inputs, id, "review assembly")?,
             candidate,
             package,
+            archive,
         )?;
         write_atomic(
             &directory.join(format!("{label}-provider-selection.json")),
             selection.as_bytes(),
         )?;
     }
-    verify_claim_decision_selection(root, inputs)?;
     Ok(())
+}
+
+fn review_provider_archive_digests(
+    inputs: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let document = parse_json(map_value(inputs, "provider_archive_sha256_json")?)?;
+    let fields = document.object()?;
+    exact_keys(
+        fields,
+        &[
+            "acquisition",
+            "mutation",
+            "native",
+            "oracleMacos",
+            "oracleWindows",
+        ],
+    )?;
+    fields
+        .iter()
+        .map(|(key, value)| {
+            let digest = value.string()?.to_owned();
+            require_digest(&digest, "review source provider archive")?;
+            Ok((key.clone(), digest))
+        })
+        .collect()
 }
 
 struct ClaimDecisionSelector {
@@ -11312,6 +11543,7 @@ fn verify_claim_decision_selection(
         selector.artifact_id,
         &selector.producer_commit,
         &selector.package_sha256,
+        &selector.archive_sha256,
     )?;
     let selection_document = parse_json(&selection)?;
     if json_member(selection_document.object()?, "providerArchiveSha256")?.string()?
@@ -12435,26 +12667,70 @@ fn divergence_propose(options: &Options) -> Result<String, String> {
 }
 
 fn artifact_acquire(root: &Path, options: &Options) -> Result<String, String> {
+    if let Some(result) = artifact_acquire_special(root, options) {
+        return result;
+    }
+    artifact_acquire_receipt(root, options)
+}
+
+fn artifact_acquire_special(root: &Path, options: &Options) -> Option<Result<String, String>> {
+    if options.action.as_deref() == Some("prepare-external-independent") {
+        return Some(prepare_external_independent_request(root, options));
+    }
+    if options.action.as_deref() == Some("verify-external-independent-request") {
+        let result = (|| {
+            let input = required_path(
+                &options.input,
+                "verify-external-independent-request requires --input request",
+            )?;
+            if options.output.is_some()
+                || options.artifact.as_deref() != Some("native-oracle-merged")
+                || options.github_dispatch_inputs
+            {
+                return Err(
+                    "verify-external-independent-request accepts only exact input and artifact"
+                        .to_owned(),
+                );
+            }
+            verify_external_independent_request(root, input, "native-oracle-merged")?;
+            Ok(format!(
+                "verified sealed external acquisition request {}",
+                input.display()
+            ))
+        })();
+        return Some(result);
+    }
     if options.action.as_deref() == Some("prepare-provider-attestation") {
-        return prepare_provider_attestation_subject(root, options);
+        return Some(prepare_provider_attestation_subject(root, options));
     }
     if options.action.as_deref() == Some("finalize") {
-        return artifact_finalize(root, options);
+        return Some(artifact_finalize(root, options));
     }
     if options.action.as_deref() == Some("assemble-finalize") {
-        return artifact_finalize_assemble(root, options);
+        return Some(artifact_finalize_assemble(root, options));
     }
     if matches!(
         options.action.as_deref(),
         Some("attest-primary" | "attest-independent")
     ) {
-        return artifact_receipt_attest(options);
+        return Some(artifact_receipt_attest(options));
     }
+    None
+}
+
+fn artifact_acquire_receipt(root: &Path, options: &Options) -> Result<String, String> {
     let output = required_path(&options.output, "artifact-acquire requires --output")?;
     let external_independent = options.action.as_deref() == Some("external-independent");
     let generated_input;
     let requested_input = if external_independent {
-        generated_input = acquire_external_independent_artifact(output)?;
+        generated_input = acquire_external_independent_artifact(
+            root,
+            required_path(
+                &options.input,
+                "external-independent acquisition requires --input sealed request",
+            )?,
+            output,
+        )?;
         generated_input.as_path()
     } else {
         required_path(
@@ -12482,7 +12758,17 @@ fn artifact_acquire(root: &Path, options: &Options) -> Result<String, String> {
         .as_deref()
         .ok_or_else(|| "artifact-acquire requires --artifact".to_owned())?;
     let primary = options.action.as_deref() == Some("primary");
-    let dispatch = if (primary || independent) && options.github_dispatch_inputs {
+    let dispatch = if external_independent {
+        Some(external_independent_dispatch_from_request(
+            root,
+            required_path(
+                &options.input,
+                "external-independent acquisition requires --input sealed request",
+            )?,
+            input,
+            artifact,
+        )?)
+    } else if (primary || independent) && options.github_dispatch_inputs {
         Some(artifact_primary_dispatch(root, input, artifact)?)
     } else {
         None
@@ -12507,6 +12793,258 @@ fn artifact_acquire(root: &Path, options: &Options) -> Result<String, String> {
         acquire_and_verify_provider_attestation(input, parent, &receipt)?;
     }
     Ok(format!("recorded acquisition receipt {}", output.display()))
+}
+
+fn external_independent_dispatch_from_request(
+    root: &Path,
+    request: &Path,
+    input: &Path,
+    artifact: &str,
+) -> Result<AcquisitionDispatch, String> {
+    let document = verify_external_independent_request(root, request, artifact)?;
+    let fields = document.object()?;
+    let candidate = json_member(fields, "candidateCommit")?.string()?;
+    let expected = json_member(fields, "expectedArtifactSetSha256")?.string()?;
+    if artifact != json_member(fields, "artifact")?.string()?
+        || git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate
+        || record_digest(input)? != expected
+    {
+        return Err("external acquisition result differs from sealed request".to_owned());
+    }
+    let run_id = json_member(fields, "sourceRunId")?.number()?.to_string();
+    let run_attempt = json_member(fields, "sourceRunAttempt")?
+        .number()?
+        .to_string();
+    let resolved = resolve_provider_artifact(&run_id, artifact)?;
+    if resolved.id != json_member(fields, "sourceArtifactId")?.number()? {
+        return Err("external source artifact ID differs from sealed request".to_owned());
+    }
+    verify_resolved_provider_archive(
+        &resolved,
+        json_member(fields, "sourceProviderArchiveSha256")?.string()?,
+    )?;
+    Ok(AcquisitionDispatch {
+        candidate: candidate.to_owned(),
+        run_id,
+        run_attempt,
+        acquired_at: crate::custody_ops::current_utc_timestamp()?,
+        provider_artifact_id: resolved.id,
+        provider_selection_api: resolved.api_bytes,
+        provider_event: "push".to_owned(),
+        workflow_path: ".github/workflows/nightly.yml".to_owned(),
+    })
+}
+
+fn verify_external_independent_request(
+    root: &Path,
+    request: &Path,
+    artifact: &str,
+) -> Result<JsonValue, String> {
+    let metadata = fs::symlink_metadata(request)
+        .map_err(|error| format!("cannot inspect external acquisition request: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("external acquisition request is not a regular file".to_owned());
+    }
+    let bytes = read_regular_file(request)?;
+    let document = parse_json(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| "external acquisition request is not UTF-8".to_owned())?,
+    )?;
+    if canonical_json_bytes(&document)? != bytes {
+        return Err("external acquisition request is not canonical".to_owned());
+    }
+    let fields = document.object()?;
+    exact_keys(
+        fields,
+        &[
+            "archiveSha256",
+            "artifact",
+            "bucket",
+            "candidateCommit",
+            "expectedArtifactSetSha256",
+            "key",
+            "region",
+            "schemaVersion",
+            "sourceArtifactId",
+            "sourceProviderArchiveSha256",
+            "sourceRunAttempt",
+            "sourceRunId",
+            "state",
+            "versionId",
+        ],
+    )?;
+    if json_member(fields, "schemaVersion")?.number()? != 1
+        || json_member(fields, "state")?.string()? != "sealed-before-external-credentials"
+        || json_member(fields, "artifact")?.string()? != artifact
+        || json_member(fields, "sourceArtifactId")?.number()? == 0
+        || json_member(fields, "sourceRunId")?.number()? == 0
+        || json_member(fields, "sourceRunAttempt")?.number()? == 0
+    {
+        return Err("external acquisition request identity is invalid".to_owned());
+    }
+    let candidate = json_member(fields, "candidateCommit")?.string()?;
+    require_git_sha_text(candidate, "external acquisition request candidate")?;
+    if git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate {
+        return Err("external acquisition request differs from current HEAD".to_owned());
+    }
+    require_digest(
+        json_member(fields, "expectedArtifactSetSha256")?.string()?,
+        "external acquisition request artifact set",
+    )?;
+    require_digest(
+        json_member(fields, "archiveSha256")?.string()?,
+        "external acquisition request archive",
+    )?;
+    external_s3_object_url(
+        json_member(fields, "bucket")?.string()?,
+        json_member(fields, "key")?.string()?,
+        json_member(fields, "versionId")?.string()?,
+        json_member(fields, "region")?.string()?,
+    )?;
+    let sibling = request.with_extension("json.sha256");
+    let sibling_metadata = fs::symlink_metadata(&sibling)
+        .map_err(|error| format!("cannot inspect external request digest: {error}"))?;
+    if sibling_metadata.file_type().is_symlink()
+        || !sibling_metadata.is_file()
+        || read_text(&sibling)? != format!("{}\n", sha256_bytes(&bytes).hex())
+    {
+        return Err("external acquisition request digest sibling differs".to_owned());
+    }
+    Ok(document)
+}
+
+fn prepare_external_independent_request(root: &Path, options: &Options) -> Result<String, String> {
+    let output = required_path(
+        &options.output,
+        "prepare-external-independent requires --output request",
+    )?;
+    if options.input.is_some()
+        || options.artifact.as_deref() != Some("native-oracle-merged")
+        || !options.github_dispatch_inputs
+    {
+        return Err(
+            "prepare-external-independent requires exact artifact and dispatch inputs".to_owned(),
+        );
+    }
+    let dispatch =
+        artifact_primary_dispatch_from_event(root, options.artifact.as_deref().unwrap())?;
+    let bucket = required_environment("ARTIFACT_INDEPENDENT_BUCKET")?;
+    let key = required_environment("ARTIFACT_INDEPENDENT_KEY")?;
+    let version = required_environment("ARTIFACT_INDEPENDENT_VERSION_ID")?;
+    let region = required_environment("ARTIFACT_INDEPENDENT_REGION")?;
+    let archive = required_environment("ARTIFACT_INDEPENDENT_ARCHIVE_SHA256")?;
+    require_digest(&archive, "external provider archive")?;
+    external_s3_object_url(&bucket, &key, &version, &region)?;
+    let request = JsonValue::Object(BTreeMap::from([
+        ("archiveSha256".to_owned(), JsonValue::String(archive)),
+        (
+            "artifact".to_owned(),
+            JsonValue::String("native-oracle-merged".to_owned()),
+        ),
+        ("bucket".to_owned(), JsonValue::String(bucket)),
+        (
+            "candidateCommit".to_owned(),
+            JsonValue::String(dispatch.candidate),
+        ),
+        (
+            "expectedArtifactSetSha256".to_owned(),
+            JsonValue::String(dispatch.expected_set),
+        ),
+        ("key".to_owned(), JsonValue::String(key)),
+        ("region".to_owned(), JsonValue::String(region)),
+        ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        (
+            "sourceRunAttempt".to_owned(),
+            JsonValue::Number(dispatch.run_attempt),
+        ),
+        (
+            "sourceArtifactId".to_owned(),
+            JsonValue::Number(dispatch.artifact_id),
+        ),
+        (
+            "sourceProviderArchiveSha256".to_owned(),
+            JsonValue::String(dispatch.archive_sha256),
+        ),
+        ("sourceRunId".to_owned(), JsonValue::Number(dispatch.run_id)),
+        (
+            "state".to_owned(),
+            JsonValue::String("sealed-before-external-credentials".to_owned()),
+        ),
+        ("versionId".to_owned(), JsonValue::String(version)),
+    ]));
+    let bytes = canonical_json_bytes(&request)?;
+    write_atomic(output, &bytes)?;
+    write_digest_sibling(output, sha256_bytes(&bytes))?;
+    Ok(format!(
+        "wrote sealed external acquisition request {}",
+        output.display()
+    ))
+}
+
+struct ExternalIndependentDispatch {
+    candidate: String,
+    run_id: u64,
+    run_attempt: u64,
+    artifact_id: u64,
+    expected_set: String,
+    archive_sha256: String,
+}
+
+fn artifact_primary_dispatch_from_event(
+    root: &Path,
+    artifact: &str,
+) -> Result<ExternalIndependentDispatch, String> {
+    if artifact != "native-oracle-merged" {
+        return Err("external acquisition artifact is not accepted".to_owned());
+    }
+    let event_path = std::env::var_os("GITHUB_EVENT_PATH")
+        .ok_or_else(|| "GITHUB_EVENT_PATH is unavailable for external acquisition".to_owned())?;
+    let event = parse_json(&read_text(Path::new(&event_path))?)?;
+    let inputs = json_member(event.object()?, "inputs")?.object()?;
+    exact_keys(
+        inputs,
+        &[
+            "candidate_sha",
+            "expected_artifact_set_sha256",
+            "source_artifact_id",
+            "source_provider_archive_sha256",
+            "source_run_attempt",
+            "source_run_id",
+        ],
+    )?;
+    let candidate = json_member(inputs, "candidate_sha")?.string()?.to_owned();
+    require_git_sha_text(&candidate, "external acquisition candidate")?;
+    if git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate {
+        return Err("external acquisition checkout differs from candidate".to_owned());
+    }
+    let expected_set = json_member(inputs, "expected_artifact_set_sha256")?
+        .string()?
+        .to_owned();
+    require_digest(&expected_set, "external acquisition artifact set")?;
+    let archive_sha256 = json_member(inputs, "source_provider_archive_sha256")?
+        .string()?
+        .to_owned();
+    require_digest(
+        &archive_sha256,
+        "external acquisition source provider archive",
+    )?;
+    let positive = |key| {
+        let number = json_member(inputs, key)?
+            .string()?
+            .parse::<u64>()
+            .map_err(|_| format!("external acquisition {key} is not an integer"))?;
+        (number != 0)
+            .then_some(number)
+            .ok_or_else(|| format!("external acquisition {key} must be nonzero"))
+    };
+    Ok(ExternalIndependentDispatch {
+        candidate,
+        run_id: positive("source_run_id")?,
+        run_attempt: positive("source_run_attempt")?,
+        artifact_id: positive("source_artifact_id")?,
+        expected_set,
+        archive_sha256,
+    })
 }
 
 fn prepare_provider_attestation_subject(root: &Path, options: &Options) -> Result<String, String> {
@@ -12819,7 +13357,11 @@ struct ExternalAcquisitionIdentity {
     acquired_at: String,
 }
 
-fn acquire_external_independent_artifact(output: &Path) -> Result<PathBuf, String> {
+fn acquire_external_independent_artifact(
+    root: &Path,
+    request: &Path,
+    output: &Path,
+) -> Result<PathBuf, String> {
     let directory = output
         .parent()
         .ok_or_else(|| "external acquisition output has no directory".to_owned())?;
@@ -12832,12 +13374,27 @@ fn acquire_external_independent_artifact(output: &Path) -> Result<PathBuf, Strin
     if archive.exists() || headers.exists() || tls_path.exists() || extracted.exists() {
         return Err("external acquisition output paths already exist".to_owned());
     }
-    let bucket = required_environment("ARTIFACT_INDEPENDENT_BUCKET")?;
-    let key = required_environment("ARTIFACT_INDEPENDENT_KEY")?;
-    let version = required_environment("ARTIFACT_INDEPENDENT_VERSION_ID")?;
-    let region = required_environment("ARTIFACT_INDEPENDENT_REGION")?;
-    let expected_archive = required_environment("ARTIFACT_INDEPENDENT_ARCHIVE_SHA256")?;
+    let request_document =
+        verify_external_independent_request(root, request, "native-oracle-merged")?;
+    let request_fields = request_document.object()?;
+    let bucket = json_member(request_fields, "bucket")?.string()?.to_owned();
+    let key = json_member(request_fields, "key")?.string()?.to_owned();
+    let version = json_member(request_fields, "versionId")?
+        .string()?
+        .to_owned();
+    let region = json_member(request_fields, "region")?.string()?.to_owned();
+    let expected_archive = json_member(request_fields, "archiveSha256")?
+        .string()?
+        .to_owned();
     require_digest(&expected_archive, "external provider archive")?;
+    require_git_sha_text(
+        json_member(request_fields, "candidateCommit")?.string()?,
+        "external acquisition request candidate",
+    )?;
+    require_digest(
+        json_member(request_fields, "expectedArtifactSetSha256")?.string()?,
+        "external acquisition request artifact set",
+    )?;
     let request_url = external_s3_object_url(&bucket, &key, &version, &region)?;
     let effective_host = format!("{bucket}.s3.{region}.amazonaws.com");
     let tls = crate::release_oracle::external_tls_identity_json(&effective_host)?;
@@ -13258,6 +13815,17 @@ pub(crate) fn extract_external_zip(archive: &Path, destination: &Path) -> Result
     verify_external_extracted_tree(destination, &entries)
 }
 
+pub(crate) fn collection_provider_archive_tree_identity(
+    bytes: &[u8],
+    extracted: &Path,
+) -> Result<(String, u64), String> {
+    let entries = external_zip_entries(bytes)?;
+    let digest = collection_archive_tree_digest(&entries, extracted)?;
+    let count = u64::try_from(entries.len())
+        .map_err(|_| "collection provider ZIP inventory is too large".to_owned())?;
+    Ok((digest, count))
+}
+
 #[derive(Clone)]
 struct ExternalZipEntry {
     path: PathBuf,
@@ -13468,6 +14036,16 @@ fn verify_collection_archive_tree(
     if record_digest(extracted)? != record_digest(retained_tree)? {
         return Err("collection provider ZIP replay differs from retained tree".to_owned());
     }
+    if collection_archive_tree_digest(entries, extracted)? != expected_tree_sha256 {
+        return Err("collection provider ZIP tree digest differs from selection".to_owned());
+    }
+    Ok(())
+}
+
+fn collection_archive_tree_digest(
+    entries: &[ExternalZipEntry],
+    extracted: &Path,
+) -> Result<String, String> {
     let mut inventory = Vec::with_capacity(entries.len());
     for entry in entries {
         let path = entry
@@ -13515,12 +14093,7 @@ fn verify_collection_archive_tree(
                     .as_bytes(),
             )
     });
-    if sha256_bytes(&canonical_json_bytes(&JsonValue::Array(inventory))?).hex()
-        != expected_tree_sha256
-    {
-        return Err("collection provider ZIP tree digest differs from selection".to_owned());
-    }
-    Ok(())
+    Ok(sha256_bytes(&canonical_json_bytes(&JsonValue::Array(inventory))?).hex())
 }
 
 fn verify_external_zip_local_entry(
@@ -14520,6 +15093,7 @@ fn artifact_finalize_assemble(root: &Path, options: &Options) -> Result<String, 
         dispatch.primary.artifact_id,
         &dispatch.candidate,
         &dispatch.primary.package_sha256,
+        &dispatch.primary.archive_sha256,
     )?;
     let independent_selection = verify_provider_artifact_selection(
         root,
@@ -14532,6 +15106,7 @@ fn artifact_finalize_assemble(root: &Path, options: &Options) -> Result<String, 
         dispatch.independent.artifact_id,
         &dispatch.candidate,
         &dispatch.independent.package_sha256,
+        &dispatch.independent.archive_sha256,
     )?;
     verify_selection_archive(&primary_selection, &dispatch.primary.archive_sha256)?;
     verify_selection_archive(&independent_selection, &dispatch.independent.archive_sha256)?;
@@ -14548,7 +15123,7 @@ fn artifact_finalize_assemble(root: &Path, options: &Options) -> Result<String, 
     Ok("verified provider objects and assembled exact artifact review sources".to_owned())
 }
 
-fn verify_selection_archive(selection: &str, expected: &str) -> Result<(), String> {
+pub(crate) fn verify_selection_archive(selection: &str, expected: &str) -> Result<(), String> {
     let document = parse_json(selection)?;
     if json_member(document.object()?, "providerArchiveSha256")?.string()? != expected {
         return Err("provider-selected archive digest differs from dispatch".to_owned());
@@ -14761,6 +15336,223 @@ const PROVIDER_SELECTION_KEYS: &[&str] = &[
     "workflowPath",
 ];
 
+pub(crate) fn verify_retained_collection_activation_selection(
+    root: &Path,
+    directory: &Path,
+    artifact_name: &str,
+    candidate: &str,
+) -> Result<BTreeMap<String, JsonValue>, String> {
+    let selection_path = directory.join("provider-selection.json");
+    let document = parse_json(&read_text(&selection_path)?)?;
+    let selection = document.object()?;
+    exact_keys(selection, PROVIDER_SELECTION_KEYS)?;
+    let run_id = json_member(selection, "providerRunId")?.number()?;
+    let run_attempt = json_member(selection, "providerRunAttempt")?.number()?;
+    let artifact_id = json_member(selection, "providerArtifactId")?.number()?;
+    if run_id == 0
+        || run_attempt == 0
+        || artifact_id == 0
+        || json_member(selection, "schemaVersion")?.number()? != 1
+        || json_member(selection, "selectionState")?.string()? != "exact-provider-object"
+        || json_member(selection, "artifact")?.string()? != artifact_name
+        || json_member(selection, "workflowPath")?.string()?
+            != ".github/workflows/collection-custody-integration.yml"
+        || json_member(selection, "event")?.string()? != "workflow_dispatch"
+        || json_member(selection, "candidateCommit")?.string()? != candidate
+    {
+        return Err(
+            "retained collection activation provider selection identity differs".to_owned(),
+        );
+    }
+    verify_retained_workflow_digest(
+        json_member(selection, "workflowBlobSha256")?.string()?,
+        &record_digest(&root.join(".github/workflows/collection-custody-integration.yml"))?,
+    )?;
+    verify_retained_proposal_provider_api(directory, selection, artifact_name, candidate)?;
+    Ok(selection.clone())
+}
+
+pub(crate) fn verify_historical_collection_activation_selection(
+    root: &Path,
+    directory: &Path,
+    artifact_name: &str,
+    candidate: &str,
+    workflow: &str,
+) -> Result<BTreeMap<String, JsonValue>, String> {
+    let selection_path = directory.join("provider-selection.json");
+    let selection_bytes = read_regular_file(&selection_path)?;
+    let document = parse_json(
+        std::str::from_utf8(&selection_bytes)
+            .map_err(|_| "historical provider selection is not UTF-8".to_owned())?,
+    )?;
+    if canonical_json_bytes(&document)? != selection_bytes {
+        return Err("historical provider selection is not canonical".to_owned());
+    }
+    let selection = document.object()?;
+    exact_keys(selection, PROVIDER_SELECTION_KEYS)?;
+    let configured_repository_id = load_acquisition_policy(root)?
+        .repository_id
+        .ok_or_else(|| "historical provider repository ID is not configured".to_owned())?;
+    if configured_repository_id != "1327351238"
+        || json_member(selection, "repositoryId")?.string()? != configured_repository_id
+        || json_member(selection, "schemaVersion")?.number()? != 1
+        || json_member(selection, "selectionState")?.string()? != "exact-provider-object"
+        || json_member(selection, "artifact")?.string()? != artifact_name
+        || json_member(selection, "workflowPath")?.string()? != workflow
+        || json_member(selection, "event")?.string()? != "workflow_dispatch"
+        || json_member(selection, "candidateCommit")?.string()? != candidate
+    {
+        return Err("historical provider selection identity differs".to_owned());
+    }
+    verify_retained_workflow_digest(
+        json_member(selection, "workflowBlobSha256")?.string()?,
+        &record_digest(&root.join(workflow))?,
+    )?;
+    verify_historical_proposal_provider_api(
+        directory,
+        selection,
+        artifact_name,
+        candidate,
+        &configured_repository_id,
+    )?;
+    Ok(selection.clone())
+}
+
+fn verify_historical_proposal_provider_api(
+    directory: &Path,
+    selection: &BTreeMap<String, JsonValue>,
+    artifact_name: &str,
+    candidate: &str,
+    repository_id: &str,
+) -> Result<(), String> {
+    let artifact_path = directory.join("provider-selected-artifact.json");
+    let run_path = directory.join("provider-selected-run.json");
+    verify_file_digest(
+        &artifact_path,
+        json_member(selection, "providerArtifactApiSha256")?.string()?,
+        "historical artifact API",
+    )?;
+    verify_file_digest(
+        &run_path,
+        json_member(selection, "providerRunApiSha256")?.string()?,
+        "historical run API",
+    )?;
+    let artifact_doc = parse_json(&read_text(&artifact_path)?)?;
+    let artifact = artifact_doc.object()?;
+    let run_doc = parse_json(&read_text(&run_path)?)?;
+    let run = run_doc.object()?;
+    verify_historical_provider_metadata(
+        selection,
+        artifact,
+        run,
+        artifact_name,
+        candidate,
+        repository_id,
+    )
+}
+
+fn verify_historical_provider_metadata(
+    selection: &BTreeMap<String, JsonValue>,
+    artifact: &BTreeMap<String, JsonValue>,
+    run: &BTreeMap<String, JsonValue>,
+    artifact_name: &str,
+    candidate: &str,
+    repository_id: &str,
+) -> Result<(), String> {
+    let run_id = json_member(selection, "providerRunId")?.number()?;
+    let run_attempt = json_member(selection, "providerRunAttempt")?.number()?;
+    let artifact_id = json_member(selection, "providerArtifactId")?.number()?;
+    let archive_size = json_member(selection, "providerArchiveSize")?.number()?;
+    let created_at = json_member(selection, "providerCreatedAt")?.string()?;
+    let expires_at = json_member(selection, "providerExpiresAt")?.string()?;
+    validate_utc_timestamp(created_at)?;
+    validate_utc_timestamp(expires_at)?;
+    let expected_archive_url = format!(
+        "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/{artifact_id}/zip"
+    );
+    if run_id == 0
+        || run_attempt == 0
+        || artifact_id == 0
+        || archive_size == 0
+        || json_member(selection, "providerArtifactApiPath")?.string()?
+            != "provider-selected-artifact.json"
+        || json_member(selection, "providerRunApiPath")?.string()? != "provider-selected-run.json"
+        || utc_timestamp_seconds(created_at)? >= utc_timestamp_seconds(expires_at)?
+        || json_member(selection, "providerArchiveUrl")?.string()? != expected_archive_url
+        || json_member(artifact, "id")?.number()?
+            != json_member(selection, "providerArtifactId")?.number()?
+        || json_member(artifact, "name")?.string()? != artifact_name
+        || json_member(artifact, "expired")?.boolean()?
+        || json_member(json_member(artifact, "workflow_run")?.object()?, "id")?.number()? != run_id
+        || json_member(artifact, "digest")?
+            .string()?
+            .strip_prefix("sha256:")
+            != Some(json_member(selection, "providerArchiveSha256")?.string()?)
+        || json_member(artifact, "size_in_bytes")?.number()?
+            != json_member(selection, "providerArchiveSize")?.number()?
+        || json_member(artifact, "created_at")?.string()?
+            != json_member(selection, "providerCreatedAt")?.string()?
+        || json_member(artifact, "expires_at")?.string()?
+            != json_member(selection, "providerExpiresAt")?.string()?
+        || json_member(artifact, "archive_download_url")?.string()?
+            != json_member(selection, "providerArchiveUrl")?.string()?
+        || json_member(run, "id")?.number()? != run_id
+        || json_member(run, "run_attempt")?.number()? != run_attempt
+        || json_member(run, "head_sha")?.string()? != candidate
+        || provider_run_workflow_ref(
+            json_member(run, "path")?.string()?,
+            json_member(selection, "workflowPath")?.string()?,
+        )
+        .is_err()
+        || json_member(run, "event")?.string()? != "workflow_dispatch"
+        || json_member(json_member(run, "repository")?.object()?, "id")?
+            .number()?
+            .to_string()
+            != repository_id
+        || json_member(json_member(run, "repository")?.object()?, "full_name")?.string()?
+            != "Portfoligno/hell-rs"
+    {
+        return Err("historical provider API facts differ".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_retained_activation_proposal_source_selection(
+    root: &Path,
+    subject: &Path,
+    directory: &Path,
+    candidate: &str,
+) -> Result<BTreeMap<String, JsonValue>, String> {
+    let selection_path = directory.join("provider-selection.json");
+    let document = parse_json(&read_text(&selection_path)?)?;
+    let selection = document.object()?;
+    exact_keys(selection, PROVIDER_SELECTION_KEYS)?;
+    let run_id = json_member(selection, "providerRunId")?.number()?;
+    let run_attempt = json_member(selection, "providerRunAttempt")?.number()?;
+    let artifact_id = json_member(selection, "providerArtifactId")?.number()?;
+    let artifact_name = format!("collection-activation-proposal-{run_id}-{run_attempt}");
+    if run_id == 0
+        || run_attempt == 0
+        || artifact_id == 0
+        || json_member(selection, "schemaVersion")?.number()? != 1
+        || json_member(selection, "selectionState")?.string()? != "exact-provider-object"
+        || json_member(selection, "artifact")?.string()? != artifact_name
+        || json_member(selection, "workflowPath")?.string()?
+            != ".github/workflows/collection-activation-preparation.yml"
+        || json_member(selection, "event")?.string()? != "workflow_dispatch"
+        || json_member(selection, "candidateCommit")?.string()? != candidate
+        || json_member(selection, "directorySha256")?.string()? != record_digest(subject)?
+    {
+        return Err("retained activation proposal source selection differs".to_owned());
+    }
+    verify_retained_workflow_digest(
+        json_member(selection, "workflowBlobSha256")?.string()?,
+        &record_digest(&root.join(".github/workflows/collection-activation-preparation.yml"))?,
+    )?;
+    verify_retained_proposal_provider_api(directory, selection, &artifact_name, candidate)?;
+    Ok(selection.clone())
+}
+
 fn acquisition_receipt_json(
     receipt: &AcquisitionReceipt,
     trust_review_ref: &str,
@@ -14830,6 +15622,8 @@ fn artifact_primary_dispatch(
     let base_keys = [
         "candidate_sha",
         "expected_artifact_set_sha256",
+        "source_artifact_id",
+        "source_provider_archive_sha256",
         "source_run_attempt",
         "source_run_id",
     ];
@@ -14839,6 +15633,7 @@ fn artifact_primary_dispatch(
         "candidate_sha",
         "expected_artifact_set_sha256",
         "provider_artifact_id",
+        "provider_archive_sha256",
         "retention_until",
         "review_issued_at",
         "source_run_attempt",
@@ -14891,27 +15686,14 @@ fn artifact_primary_dispatch(
         }
     }
     let resolved = resolve_provider_artifact(&run_id, artifact)?;
-    let (acquired_at, provider_artifact_id) = if custody {
-        let acquired_at = json_member(inputs, "acquisition_time")?
-            .string()?
-            .to_owned();
-        validate_utc_timestamp(&acquired_at)?;
-        let provider_artifact_id = json_member(inputs, "provider_artifact_id")?
-            .string()?
-            .parse::<u64>()
-            .map_err(|_| "provider artifact ID must be an integer".to_owned())?;
-        if provider_artifact_id == 0 {
-            return Err("provider artifact ID must be nonzero".to_owned());
-        }
-        if provider_artifact_id != resolved.id {
-            return Err(
-                "manual custody artifact ID differs from exact provider selection".to_owned(),
-            );
-        }
-        (acquired_at, provider_artifact_id)
+    let archive_key = if custody {
+        "provider_archive_sha256"
     } else {
-        (crate::custody_ops::current_utc_timestamp()?, resolved.id)
+        "source_provider_archive_sha256"
     };
+    verify_resolved_provider_archive(&resolved, json_member(inputs, archive_key)?.string()?)?;
+    let (acquired_at, provider_artifact_id) =
+        primary_acquisition_identity(inputs, custody, resolved.id)?;
     Ok(AcquisitionDispatch {
         candidate: candidate.to_owned(),
         run_id,
@@ -14924,16 +15706,493 @@ fn artifact_primary_dispatch(
     })
 }
 
+fn primary_acquisition_identity(
+    inputs: &BTreeMap<String, JsonValue>,
+    custody: bool,
+    resolved_id: u64,
+) -> Result<(String, u64), String> {
+    let key = if custody {
+        "provider_artifact_id"
+    } else {
+        "source_artifact_id"
+    };
+    let selected = json_member(inputs, key)?
+        .string()?
+        .parse::<u64>()
+        .map_err(|_| format!("{key} must be an integer"))?;
+    if selected == 0 || selected != resolved_id {
+        return Err(format!("{key} differs from exact provider selection"));
+    }
+    let acquired_at = if custody {
+        let value = json_member(inputs, "acquisition_time")?
+            .string()?
+            .to_owned();
+        validate_utc_timestamp(&value)?;
+        value
+    } else {
+        crate::custody_ops::current_utc_timestamp()?
+    };
+    Ok((acquired_at, selected))
+}
+
 struct ResolvedProviderArtifact {
     id: u64,
     api_bytes: Vec<u8>,
+}
+
+pub(crate) struct ResolvedProviderArtifactForWorkflow {
+    pub(crate) artifact_id: u64,
+    pub(crate) archive_sha256: String,
+}
+
+pub(crate) struct CurrentRunArtifactSelection {
+    pub(crate) primary_artifact_id: u64,
+    pub(crate) secondary_artifact_id: u64,
+    pub(crate) primary_archive_sha256: String,
+    pub(crate) secondary_archive_sha256: String,
+}
+
+pub(crate) struct VerifiedCurrentRunArtifactSelection {
+    pub(crate) primary_artifact_name: String,
+    pub(crate) primary_artifact_id: u64,
+    pub(crate) primary_archive_sha256: String,
+    pub(crate) secondary_artifact_name: String,
+    pub(crate) secondary_artifact_id: u64,
+    pub(crate) secondary_archive_sha256: String,
+    pub(crate) run_id: u64,
+    pub(crate) run_attempt: u64,
+    pub(crate) workflow_path: String,
+    pub(crate) event_name: String,
+    pub(crate) candidate: String,
+}
+
+pub(crate) struct CurrentRunArtifactSelectionRequest<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) output: &'a Path,
+    pub(crate) workflow_path: &'a str,
+    pub(crate) event_name: &'a str,
+    pub(crate) run_id: u64,
+    pub(crate) run_attempt: u64,
+    pub(crate) candidate: &'a str,
+    pub(crate) primary_artifact_name: &'a str,
+    pub(crate) secondary_artifact_name: &'a str,
+}
+
+pub(crate) fn select_current_run_artifacts(
+    request: &CurrentRunArtifactSelectionRequest<'_>,
+) -> Result<CurrentRunArtifactSelection, String> {
+    let workflow = validate_provider_workflow_path(request.workflow_path)?;
+    if !workflow.starts_with(Path::new(".github").join("workflows"))
+        || !request.root.join(&workflow).is_file()
+        || request.run_id == 0
+        || request.run_attempt == 0
+    {
+        return Err("current-run artifact selection identity is invalid".to_owned());
+    }
+    require_git_sha_text(request.candidate, "current-run artifact candidate")?;
+    validate_provider_atom(request.event_name, "current-run artifact event")?;
+    validate_provider_atom(
+        request.primary_artifact_name,
+        "current-run primary artifact",
+    )?;
+    validate_provider_atom(
+        request.secondary_artifact_name,
+        "current-run secondary artifact",
+    )?;
+    if request.primary_artifact_name == request.secondary_artifact_name {
+        return Err("current-run artifact names are not distinct".to_owned());
+    }
+    let (repository, repository_id) = provider_selection_repository_identity()?;
+    if repository != "Portfoligno/hell-rs" || repository_id != "1327351238" {
+        return Err("current-run artifact repository identity is invalid".to_owned());
+    }
+    let (_, run_endpoint) =
+        provider_selection_endpoints(&repository, 1, request.run_id, request.run_attempt);
+    let run = github_api_json(&run_endpoint)?;
+    verify_current_run_artifact_run(request, &run, &repository_id)?;
+    let primary =
+        resolve_provider_artifact(&request.run_id.to_string(), request.primary_artifact_name)?;
+    let secondary =
+        resolve_provider_artifact(&request.run_id.to_string(), request.secondary_artifact_name)?;
+    let primary_digest =
+        verify_current_run_artifact(&primary, request.run_id, request.primary_artifact_name)?;
+    let secondary_digest =
+        verify_current_run_artifact(&secondary, request.run_id, request.secondary_artifact_name)?;
+    if primary.id == secondary.id {
+        return Err("current-run artifacts resolve to the same provider object".to_owned());
+    }
+    retain_current_run_artifact_selection(
+        request,
+        &run,
+        &primary,
+        &secondary,
+        &primary_digest,
+        &secondary_digest,
+    )?;
+    Ok(CurrentRunArtifactSelection {
+        primary_artifact_id: primary.id,
+        secondary_artifact_id: secondary.id,
+        primary_archive_sha256: primary_digest,
+        secondary_archive_sha256: secondary_digest,
+    })
+}
+
+pub(crate) fn verify_current_run_artifact_selection(
+    directory: &Path,
+) -> Result<VerifiedCurrentRunArtifactSelection, String> {
+    let expected = BTreeSet::from([
+        OsString::from("primary-artifact.json"),
+        OsString::from("provider-run.json"),
+        OsString::from("secondary-artifact.json"),
+        OsString::from("selection.json"),
+        OsString::from("selection.json.sha256"),
+    ]);
+    require_exact_real_file_inventory(directory, &expected, "current-run artifact selection")?;
+    let bytes = fs::read(directory.join("selection.json"))
+        .map_err(|error| format!("cannot read current-run artifact selection: {error}"))?;
+    if fs::read_to_string(directory.join("selection.json.sha256"))
+        .map_err(|error| format!("cannot read current-run artifact selection digest: {error}"))?
+        != format!("{}\n", sha256_bytes(&bytes).hex())
+    {
+        return Err("current-run artifact selection digest differs".to_owned());
+    }
+    let document = parse_json(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| "current-run artifact selection is not UTF-8".to_owned())?,
+    )?;
+    if canonical_json_bytes(&document)? != bytes {
+        return Err("current-run artifact selection is not canonical".to_owned());
+    }
+    let fields = document.object()?;
+    verify_current_run_selection_keys(fields)?;
+    if json_member(fields, "schemaVersion")?.number()? != 1
+        || json_member(fields, "selectionState")?.string()?
+            != "exact-current-run-provider-artifacts"
+    {
+        return Err("current-run artifact selection schema is invalid".to_owned());
+    }
+    require_git_sha_text(
+        json_member(fields, "candidateCommit")?.string()?,
+        "current-run artifact candidate",
+    )?;
+    validate_provider_atom(
+        json_member(fields, "event")?.string()?,
+        "current-run artifact event",
+    )?;
+    validate_provider_workflow_path(json_member(fields, "workflowPath")?.string()?)?;
+    let run_id = json_member(fields, "providerRunId")?.number()?;
+    if run_id == 0 || json_member(fields, "providerRunAttempt")?.number()? == 0 {
+        return Err("current-run artifact run identity is invalid".to_owned());
+    }
+    let run =
+        read_exact_selection_json(directory, fields, "providerRunSha256", "provider-run.json")?;
+    let run_fields = run.object()?;
+    if json_member(run_fields, "id")?.number()? != run_id
+        || json_member(run_fields, "run_attempt")?.number()?
+            != json_member(fields, "providerRunAttempt")?.number()?
+        || json_member(run_fields, "head_sha")?.string()?
+            != json_member(fields, "candidateCommit")?.string()?
+        || json_member(run_fields, "event")?.string()? != json_member(fields, "event")?.string()?
+        || provider_run_workflow_ref(
+            json_member(run_fields, "path")?.string()?,
+            json_member(fields, "workflowPath")?.string()?,
+        )
+        .is_err()
+        || json_member(json_member(run_fields, "repository")?.object()?, "id")?.number()?
+            != 1_327_351_238
+        || json_member(
+            json_member(run_fields, "repository")?.object()?,
+            "full_name",
+        )?
+        .string()?
+            != "Portfoligno/hell-rs"
+    {
+        return Err("current-run artifact retained run differs".to_owned());
+    }
+    let primary = verify_retained_current_run_artifact(directory, fields, "primary", run_id)?;
+    let secondary = verify_retained_current_run_artifact(directory, fields, "secondary", run_id)?;
+    if primary.0 == secondary.0 || primary.1 == secondary.1 || primary.2 == secondary.2 {
+        return Err("current-run artifact selection is not distinct".to_owned());
+    }
+    Ok(VerifiedCurrentRunArtifactSelection {
+        primary_artifact_name: primary.1,
+        primary_artifact_id: primary.0,
+        primary_archive_sha256: primary.2,
+        secondary_artifact_name: secondary.1,
+        secondary_artifact_id: secondary.0,
+        secondary_archive_sha256: secondary.2,
+        run_id,
+        run_attempt: json_member(fields, "providerRunAttempt")?.number()?,
+        workflow_path: json_member(fields, "workflowPath")?.string()?.to_owned(),
+        event_name: json_member(fields, "event")?.string()?.to_owned(),
+        candidate: json_member(fields, "candidateCommit")?.string()?.to_owned(),
+    })
+}
+
+fn verify_current_run_selection_keys(fields: &BTreeMap<String, JsonValue>) -> Result<(), String> {
+    exact_keys(
+        fields,
+        &[
+            "candidateCommit",
+            "event",
+            "primaryArchiveSha256",
+            "primaryArtifactId",
+            "primaryArtifactName",
+            "primaryProviderApiSha256",
+            "providerRunAttempt",
+            "providerRunId",
+            "providerRunSha256",
+            "schemaVersion",
+            "secondaryArchiveSha256",
+            "secondaryArtifactId",
+            "secondaryArtifactName",
+            "secondaryProviderApiSha256",
+            "selectionState",
+            "workflowPath",
+        ],
+    )
+}
+
+fn verify_retained_current_run_artifact(
+    directory: &Path,
+    fields: &BTreeMap<String, JsonValue>,
+    channel: &str,
+    run_id: u64,
+) -> Result<(u64, String, String), String> {
+    let title = if channel == "primary" {
+        "primary"
+    } else {
+        "secondary"
+    };
+    let id_key = format!("{title}ArtifactId");
+    let name_key = format!("{title}ArtifactName");
+    let archive_key = format!("{title}ArchiveSha256");
+    let api_key = format!("{title}ProviderApiSha256");
+    let path = format!("{title}-artifact.json");
+    let response = read_exact_selection_json(directory, fields, &api_key, &path)?;
+    let response = response.object()?;
+    let artifacts = json_member(response, "artifacts")?.array()?;
+    if json_member(response, "total_count")?.number()? != 1 || artifacts.len() != 1 {
+        return Err("retained current-run artifact response cardinality differs".to_owned());
+    }
+    let artifact = artifacts
+        .first()
+        .ok_or_else(|| "retained current-run artifact response is empty".to_owned())?
+        .object()?;
+    let id = json_member(fields, &id_key)?.number()?;
+    let name = json_member(fields, &name_key)?.string()?;
+    let archive = json_member(fields, &archive_key)?.string()?;
+    require_digest(archive, "retained current-run provider archive")?;
+    validate_provider_atom(name, "retained current-run artifact name")?;
+    if id == 0
+        || json_member(artifact, "id")?.number()? != id
+        || json_member(artifact, "name")?.string()? != name
+        || json_member(artifact, "digest")?.string()? != format!("sha256:{archive}")
+        || json_member(artifact, "expired")?.boolean()?
+        || json_member(json_member(artifact, "workflow_run")?.object()?, "id")?.number()? != run_id
+    {
+        return Err("retained current-run artifact identity differs".to_owned());
+    }
+    Ok((id, name.to_owned(), archive.to_owned()))
+}
+
+fn read_exact_selection_json(
+    directory: &Path,
+    fields: &BTreeMap<String, JsonValue>,
+    digest_key: &str,
+    name: &str,
+) -> Result<JsonValue, String> {
+    let bytes = fs::read(directory.join(name))
+        .map_err(|error| format!("cannot read retained current-run provider facts: {error}"))?;
+    if json_member(fields, digest_key)?.string()? != sha256_bytes(&bytes).hex() {
+        return Err("retained current-run provider facts digest differs".to_owned());
+    }
+    let document = parse_json(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| "retained current-run provider facts are not UTF-8".to_owned())?,
+    )?;
+    if canonical_json_bytes(&document)? != bytes {
+        return Err("retained current-run provider facts are not canonical".to_owned());
+    }
+    Ok(document)
+}
+
+fn require_exact_real_file_inventory(
+    directory: &Path,
+    expected: &BTreeSet<OsString>,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect {label}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{label} is not a real directory"));
+    }
+    let mut actual = BTreeSet::new();
+    for entry in
+        fs::read_dir(directory).map_err(|error| format!("cannot enumerate {label}: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("cannot enumerate {label}: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect {label} member: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!("{label} contains a non-regular file"));
+        }
+        actual.insert(entry.file_name());
+    }
+    if &actual != expected {
+        return Err(format!("{label} inventory differs"));
+    }
+    Ok(())
+}
+
+fn verify_current_run_artifact_run(
+    request: &CurrentRunArtifactSelectionRequest<'_>,
+    run: &JsonValue,
+    repository_id: &str,
+) -> Result<(), String> {
+    let run = run.object()?;
+    let repository = json_member(run, "repository")?.object()?;
+    if json_member(run, "id")?.number()? != request.run_id
+        || json_member(run, "run_attempt")?.number()? != request.run_attempt
+        || json_member(run, "head_sha")?.string()? != request.candidate
+        || json_member(run, "event")?.string()? != request.event_name
+        || provider_run_workflow_ref(json_member(run, "path")?.string()?, request.workflow_path)
+            .is_err()
+        || json_member(repository, "id")?.number()?.to_string() != repository_id
+        || json_member(repository, "full_name")?.string()? != "Portfoligno/hell-rs"
+    {
+        return Err("current-run artifact provider run identity differs".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_current_run_artifact(
+    resolved: &ResolvedProviderArtifact,
+    run_id: u64,
+    artifact_name: &str,
+) -> Result<String, String> {
+    let response = parse_json(
+        std::str::from_utf8(&resolved.api_bytes)
+            .map_err(|_| "current-run artifact response is not UTF-8".to_owned())?,
+    )?;
+    let response = response.object()?;
+    let artifact = json_member(response, "artifacts")?
+        .array()?
+        .first()
+        .ok_or_else(|| "current-run artifact response is empty".to_owned())?
+        .object()?;
+    let digest = json_member(artifact, "digest")?
+        .string()?
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "current-run artifact digest is not SHA-256".to_owned())?;
+    require_digest(digest, "current-run artifact archive")?;
+    let created = json_member(artifact, "created_at")?.string()?;
+    let expires = json_member(artifact, "expires_at")?.string()?;
+    validate_utc_timestamp(created)?;
+    validate_utc_timestamp(expires)?;
+    let url = json_member(artifact, "archive_download_url")?.string()?;
+    if json_member(artifact, "id")?.number()? != resolved.id
+        || json_member(artifact, "name")?.string()? != artifact_name
+        || json_member(artifact, "expired")?.boolean()?
+        || json_member(artifact, "size_in_bytes")?.number()? == 0
+        || utc_timestamp_seconds(created)? >= utc_timestamp_seconds(expires)?
+        || json_member(json_member(artifact, "workflow_run")?.object()?, "id")?.number()? != run_id
+        || url
+            != format!(
+                "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/{}/zip",
+                resolved.id
+            )
+    {
+        return Err("current-run artifact provider identity differs".to_owned());
+    }
+    Ok(digest.to_owned())
+}
+
+fn retain_current_run_artifact_selection(
+    request: &CurrentRunArtifactSelectionRequest<'_>,
+    run: &JsonValue,
+    primary: &ResolvedProviderArtifact,
+    secondary: &ResolvedProviderArtifact,
+    primary_digest: &str,
+    secondary_digest: &str,
+) -> Result<(), String> {
+    fs::create_dir_all(request.output)
+        .map_err(|error| format!("cannot create current-run artifact selection: {error}"))?;
+    let run_bytes = canonical_json_bytes(run)?;
+    write_atomic(&request.output.join("provider-run.json"), &run_bytes)?;
+    write_atomic(
+        &request.output.join("primary-artifact.json"),
+        &primary.api_bytes,
+    )?;
+    write_atomic(
+        &request.output.join("secondary-artifact.json"),
+        &secondary.api_bytes,
+    )?;
+    let string = |value: &str| JsonValue::String(value.to_owned());
+    let selection = JsonValue::Object(BTreeMap::from([
+        ("candidateCommit".to_owned(), string(request.candidate)),
+        ("event".to_owned(), string(request.event_name)),
+        ("primaryArchiveSha256".to_owned(), string(primary_digest)),
+        (
+            "primaryArtifactId".to_owned(),
+            JsonValue::Number(primary.id),
+        ),
+        (
+            "primaryArtifactName".to_owned(),
+            string(request.primary_artifact_name),
+        ),
+        (
+            "primaryProviderApiSha256".to_owned(),
+            string(&sha256_bytes(&primary.api_bytes).hex()),
+        ),
+        (
+            "providerRunAttempt".to_owned(),
+            JsonValue::Number(request.run_attempt),
+        ),
+        (
+            "providerRunId".to_owned(),
+            JsonValue::Number(request.run_id),
+        ),
+        (
+            "providerRunSha256".to_owned(),
+            string(&sha256_bytes(&run_bytes).hex()),
+        ),
+        ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        (
+            "secondaryArchiveSha256".to_owned(),
+            string(secondary_digest),
+        ),
+        (
+            "secondaryArtifactId".to_owned(),
+            JsonValue::Number(secondary.id),
+        ),
+        (
+            "secondaryArtifactName".to_owned(),
+            string(request.secondary_artifact_name),
+        ),
+        (
+            "secondaryProviderApiSha256".to_owned(),
+            string(&sha256_bytes(&secondary.api_bytes).hex()),
+        ),
+        (
+            "selectionState".to_owned(),
+            string("exact-current-run-provider-artifacts"),
+        ),
+        ("workflowPath".to_owned(), string(request.workflow_path)),
+    ]));
+    let bytes = canonical_json_bytes(&selection)?;
+    write_atomic(&request.output.join("selection.json"), &bytes)?;
+    write_atomic(
+        &request.output.join("selection.json.sha256"),
+        format!("{}\n", sha256_bytes(&bytes).hex()).as_bytes(),
+    )
 }
 
 pub(crate) fn resolve_provider_artifact_for_workflow(
     run_id: &str,
     artifact_name: &str,
     retained_response: &Path,
-) -> Result<u64, String> {
+) -> Result<ResolvedProviderArtifactForWorkflow, String> {
     if run_id
         .parse::<u64>()
         .ok()
@@ -14944,17 +16203,19 @@ pub(crate) fn resolve_provider_artifact_for_workflow(
     }
     let resolved = resolve_provider_artifact(run_id, artifact_name)?;
     write_atomic(retained_response, &resolved.api_bytes)?;
-    Ok(resolved.id)
+    Ok(ResolvedProviderArtifactForWorkflow {
+        artifact_id: resolved.id,
+        archive_sha256: resolved_provider_archive_sha256(&resolved)?,
+    })
 }
 
 fn resolve_provider_artifact(
     run_id: &str,
     artifact_name: &str,
 ) -> Result<ResolvedProviderArtifact, String> {
-    let repository = std::env::var("GITHUB_REPOSITORY")
-        .map_err(|_| "artifact resolution requires GITHUB_REPOSITORY".to_owned())?;
-    if repository != "Portfoligno/hell-rs" {
-        return Err("artifact resolution repository is not accepted".to_owned());
+    let (repository, repository_id) = provider_selection_repository_identity()?;
+    if repository != "Portfoligno/hell-rs" || repository_id != "1327351238" {
+        return Err("artifact resolution repository identity is not accepted".to_owned());
     }
     let repository_path = repository
         .split('/')
@@ -14995,6 +16256,35 @@ fn resolve_provider_artifact_response(
         id,
         api_bytes: canonical_json_bytes(&JsonValue::Object(response.clone()))?,
     })
+}
+
+fn verify_resolved_provider_archive(
+    resolved: &ResolvedProviderArtifact,
+    expected: &str,
+) -> Result<(), String> {
+    require_digest(expected, "resolved provider archive")?;
+    if resolved_provider_archive_sha256(resolved)? != expected {
+        return Err("resolved provider archive differs from dispatch".to_owned());
+    }
+    Ok(())
+}
+
+fn resolved_provider_archive_sha256(resolved: &ResolvedProviderArtifact) -> Result<String, String> {
+    let response = parse_json(
+        std::str::from_utf8(&resolved.api_bytes)
+            .map_err(|_| "resolved provider response is not UTF-8".to_owned())?,
+    )?;
+    let artifact = json_member(response.object()?, "artifacts")?
+        .array()?
+        .first()
+        .ok_or_else(|| "resolved provider response is empty".to_owned())?
+        .object()?;
+    let observed = json_member(artifact, "digest")?
+        .string()?
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "resolved provider archive is not SHA-256".to_owned())?;
+    require_digest(observed, "resolved provider archive")?;
+    Ok(observed.to_owned())
 }
 
 fn acquire_provider_metadata(
@@ -15175,6 +16465,7 @@ pub(crate) fn verify_provider_artifact_selection(
     artifact_id: u64,
     candidate: &str,
     expected_directory_sha256: &str,
+    expected_archive_sha256: &str,
 ) -> Result<String, String> {
     verify_provider_artifact_selection_to(
         root,
@@ -15188,6 +16479,7 @@ pub(crate) fn verify_provider_artifact_selection(
         artifact_id,
         candidate,
         expected_directory_sha256,
+        expected_archive_sha256,
     )
 }
 
@@ -15204,6 +16496,7 @@ pub(crate) fn verify_provider_artifact_selection_to(
     artifact_id: u64,
     candidate: &str,
     expected_directory_sha256: &str,
+    expected_archive_sha256: &str,
 ) -> Result<String, String> {
     verify_provider_artifact_selection_subject_to(&ProviderArtifactSelectionSubject {
         root,
@@ -15218,6 +16511,7 @@ pub(crate) fn verify_provider_artifact_selection_to(
         provider_head: candidate,
         candidate,
         expected_directory_sha256,
+        expected_archive_sha256,
     })
 }
 
@@ -15234,6 +16528,7 @@ pub(crate) struct ProviderArtifactSelectionSubject<'a> {
     pub(crate) provider_head: &'a str,
     pub(crate) candidate: &'a str,
     pub(crate) expected_directory_sha256: &'a str,
+    pub(crate) expected_archive_sha256: &'a str,
 }
 
 pub(crate) fn verify_provider_artifact_selection_subject_to(
@@ -15252,19 +16547,21 @@ pub(crate) fn verify_provider_artifact_selection_subject_to(
         provider_head,
         candidate,
         expected_directory_sha256,
+        expected_archive_sha256,
     } = *request;
     let workflow_relative = validate_provider_selection_subject(request)?;
     let observed_directory_sha256 = record_digest(input_directory)?;
     if observed_directory_sha256 != expected_directory_sha256 {
         return Err("provider-selected directory digest differs from dispatch".to_owned());
     }
-    let repository = std::env::var("GITHUB_REPOSITORY")
-        .map_err(|_| "provider selection requires GITHUB_REPOSITORY".to_owned())?;
+    require_digest(
+        expected_archive_sha256,
+        "provider selection expected archive",
+    )?;
+    let (repository, repository_id) = provider_selection_repository_identity()?;
     if repository != "Portfoligno/hell-rs" {
         return Err("provider selection repository is not accepted".to_owned());
     }
-    let repository_id = std::env::var("GITHUB_REPOSITORY_ID")
-        .map_err(|_| "provider selection requires GITHUB_REPOSITORY_ID".to_owned())?;
     let (artifact_endpoint, run_endpoint) =
         provider_selection_endpoints(&repository, artifact_id, run_id, run_attempt);
     let artifact_response = github_api_json(&artifact_endpoint)?;
@@ -15276,6 +16573,9 @@ pub(crate) fn verify_provider_artifact_selection_subject_to(
         .strip_prefix("sha256:")
         .ok_or_else(|| "provider-selected artifact digest is not SHA-256".to_owned())?;
     require_digest(provider_archive_sha256, "provider-selected archive")?;
+    if provider_archive_sha256 != expected_archive_sha256 {
+        return Err("provider-selected archive digest differs from dispatch".to_owned());
+    }
     let provider_archive_size = json_member(artifact, "size_in_bytes")?.number()?;
     let created_at = json_member(artifact, "created_at")?.string()?;
     let expires_at = json_member(artifact, "expires_at")?.string()?;
@@ -15333,6 +16633,19 @@ pub(crate) fn verify_provider_artifact_selection_subject_to(
     }))
 }
 
+fn provider_selection_repository_identity() -> Result<(String, String), String> {
+    #[cfg(test)]
+    if TEST_GITHUB_API.with(|api| api.borrow().is_some()) {
+        return Ok(("Portfoligno/hell-rs".to_owned(), "1327351238".to_owned()));
+    }
+    Ok((
+        std::env::var("GITHUB_REPOSITORY")
+            .map_err(|_| "provider selection requires GITHUB_REPOSITORY".to_owned())?,
+        std::env::var("GITHUB_REPOSITORY_ID")
+            .map_err(|_| "provider selection requires GITHUB_REPOSITORY_ID".to_owned())?,
+    ))
+}
+
 fn validate_provider_selection_subject(
     request: &ProviderArtifactSelectionSubject<'_>,
 ) -> Result<PathBuf, String> {
@@ -15341,6 +16654,10 @@ fn validate_provider_selection_subject(
     require_digest(
         request.expected_directory_sha256,
         "provider selection directory digest",
+    )?;
+    require_digest(
+        request.expected_archive_sha256,
+        "provider selection archive digest",
     )?;
     if request.run_id == 0 || request.run_attempt == 0 || request.artifact_id == 0 {
         return Err("provider selection identifiers must be nonzero".to_owned());
@@ -15415,26 +16732,68 @@ struct ProviderSelection<'a> {
 }
 
 fn render_provider_selection(selection: &ProviderSelection<'_>) -> String {
-    format!(
-        "{{\n  \"schemaVersion\": 1,\n  \"artifact\": {},\n  \"workflowPath\": {},\n  \"workflowBlobSha256\": {},\n  \"event\": {},\n  \"providerRunId\": {run_id},\n  \"providerRunAttempt\": {run_attempt},\n  \"providerArtifactId\": {artifact_id},\n  \"providerArchiveSha256\": {},\n  \"providerArchiveSize\": {},\n  \"providerCreatedAt\": {},\n  \"providerExpiresAt\": {},\n  \"providerArchiveUrl\": {},\n  \"providerArtifactApiPath\": \"provider-selected-artifact.json\",\n  \"providerArtifactApiSha256\": {},\n  \"providerRunApiPath\": \"provider-selected-run.json\",\n  \"providerRunApiSha256\": {},\n  \"repositoryId\": {},\n  \"candidateCommit\": {},\n  \"directorySha256\": {},\n  \"selectionState\": \"exact-provider-object\"\n}}\n",
-        json_string(selection.artifact_name),
-        json_string(selection.workflow_path),
-        json_string(selection.workflow_sha256),
-        json_string(selection.event_name),
-        json_string(selection.provider_archive_sha256),
-        selection.provider_archive_size,
-        json_string(selection.created_at),
-        json_string(selection.expires_at),
-        json_string(selection.archive_download_url),
-        json_string(&sha256_bytes(selection.artifact_bytes).hex()),
-        json_string(&sha256_bytes(selection.run_bytes).hex()),
-        json_string(selection.repository_id),
-        json_string(selection.candidate),
-        json_string(selection.directory_sha256),
-        run_id = selection.run_id,
-        run_attempt = selection.run_attempt,
-        artifact_id = selection.artifact_id,
-    )
+    let string = |value: &str| JsonValue::String(value.to_owned());
+    let document = JsonValue::Object(BTreeMap::from([
+        ("artifact".to_owned(), string(selection.artifact_name)),
+        ("candidateCommit".to_owned(), string(selection.candidate)),
+        (
+            "directorySha256".to_owned(),
+            string(selection.directory_sha256),
+        ),
+        ("event".to_owned(), string(selection.event_name)),
+        (
+            "providerArchiveSha256".to_owned(),
+            string(selection.provider_archive_sha256),
+        ),
+        (
+            "providerArchiveSize".to_owned(),
+            JsonValue::Number(selection.provider_archive_size),
+        ),
+        (
+            "providerArchiveUrl".to_owned(),
+            string(selection.archive_download_url),
+        ),
+        (
+            "providerArtifactApiPath".to_owned(),
+            string("provider-selected-artifact.json"),
+        ),
+        (
+            "providerArtifactApiSha256".to_owned(),
+            string(&sha256_bytes(selection.artifact_bytes).hex()),
+        ),
+        (
+            "providerArtifactId".to_owned(),
+            JsonValue::Number(selection.artifact_id),
+        ),
+        ("providerCreatedAt".to_owned(), string(selection.created_at)),
+        ("providerExpiresAt".to_owned(), string(selection.expires_at)),
+        (
+            "providerRunApiPath".to_owned(),
+            string("provider-selected-run.json"),
+        ),
+        (
+            "providerRunApiSha256".to_owned(),
+            string(&sha256_bytes(selection.run_bytes).hex()),
+        ),
+        (
+            "providerRunAttempt".to_owned(),
+            JsonValue::Number(selection.run_attempt),
+        ),
+        (
+            "providerRunId".to_owned(),
+            JsonValue::Number(selection.run_id),
+        ),
+        ("repositoryId".to_owned(), string(selection.repository_id)),
+        ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        ("selectionState".to_owned(), string("exact-provider-object")),
+        (
+            "workflowBlobSha256".to_owned(),
+            string(selection.workflow_sha256),
+        ),
+        ("workflowPath".to_owned(), string(selection.workflow_path)),
+    ]));
+    String::from_utf8(canonical_json_bytes(&document).expect("provider selection JSON is valid"))
+        .expect("provider selection JSON is UTF-8")
 }
 
 fn validate_provider_atom(value: &str, label: &str) -> Result<(), String> {
@@ -15519,6 +16878,10 @@ fn github_api_json_for(
     endpoint: &Path,
     operation: ExternalServiceOperation,
 ) -> Result<JsonValue, String> {
+    #[cfg(test)]
+    if let Some(result) = invoke_test_github_api(endpoint, operation) {
+        return result;
+    }
     let mut command = Command::new("gh");
     command.args([OsStr::new("api"), endpoint.as_os_str()]);
     command
@@ -15542,6 +16905,49 @@ fn github_api_json_for(
         std::str::from_utf8(&response.stdout)
             .map_err(|_| "GitHub artifact metadata is not UTF-8".to_owned())?,
     )
+}
+
+#[cfg(test)]
+type TestGithubApi = Box<dyn Fn(&Path, ExternalServiceOperation) -> Result<JsonValue, String>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_GITHUB_API: std::cell::RefCell<Option<TestGithubApi>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn invoke_test_github_api(
+    endpoint: &Path,
+    operation: ExternalServiceOperation,
+) -> Option<Result<JsonValue, String>> {
+    TEST_GITHUB_API.with(|api| api.borrow().as_ref().map(|api| api(endpoint, operation)))
+}
+
+#[cfg(test)]
+struct TestGithubApiGuard;
+
+#[cfg(test)]
+impl TestGithubApiGuard {
+    fn install(api: TestGithubApi) -> Result<Self, String> {
+        TEST_GITHUB_API.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return Err("test GitHub API is already installed".to_owned());
+            }
+            *slot = Some(api);
+            Ok(Self)
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestGithubApiGuard {
+    fn drop(&mut self) {
+        TEST_GITHUB_API.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 pub(crate) fn github_raw_source_at(
@@ -15592,6 +16998,13 @@ fn github_api_json_named_artifact(
     artifact_name: &str,
 ) -> Result<JsonValue, String> {
     let query = GithubArtifactNameQuery::new(endpoint, artifact_name)?.argument()?;
+    #[cfg(test)]
+    if let Some(result) = invoke_test_github_api(
+        Path::new(&query),
+        ExternalServiceOperation::EvidenceCollection,
+    ) {
+        return result;
+    }
     let response = Command::new("gh")
         .args([OsStr::new("api"), query.as_os_str()])
         .output()
@@ -15655,7 +17068,7 @@ impl GithubArtifactNameQuery {
     }
 }
 
-fn canonical_json_bytes(value: &JsonValue) -> Result<Vec<u8>, String> {
+pub(crate) fn canonical_json_bytes(value: &JsonValue) -> Result<Vec<u8>, String> {
     let mut output = String::new();
     push_json_value(&mut output, value)?;
     output.push('\n');
@@ -17421,31 +18834,44 @@ fn verify_bound_details(
     )?;
     match kind {
         "claim-coverage" => {
-            exact_keys(
-                details,
-                &[
-                    "ambiguousClaimScopes",
-                    "applicabilityDecisionsPath",
-                    "applicabilityDecisionsSha256",
-                    "assuranceEpochSha256",
-                    "candidateSourceCommit",
-                    "cells",
-                    "explicitDispositionCells",
-                    "missingObligations",
-                    "mismatchCandidates",
-                    "requiredPlatformGaps",
-                    "schemaVersion",
-                    "semanticCoverageGaps",
-                    "totalClaimCells",
-                    "unreachedTargets",
-                    "sourceCoveragePath",
-                    "sourceCoverageSha256",
-                ],
-            )?;
+            let scoped = details.get("coverageScope").is_some();
+            let mut expected_keys = vec![
+                "ambiguousClaimScopes",
+                "applicabilityDecisionsPath",
+                "applicabilityDecisionsSha256",
+                "assuranceEpochSha256",
+                "candidateSourceCommit",
+                "cells",
+                "explicitDispositionCells",
+                "missingObligations",
+                "mismatchCandidates",
+                "requiredPlatformGaps",
+                "schemaVersion",
+                "semanticCoverageGaps",
+                "totalClaimCells",
+                "unreachedTargets",
+                "sourceCoveragePath",
+                "sourceCoverageSha256",
+            ];
+            if scoped {
+                expected_keys.extend([
+                    "activatedScopeCells",
+                    "activeEvidenceCells",
+                    "coverageScope",
+                    "outOfScopeClaimCells",
+                    "residualRuntimeCells",
+                ]);
+                expected_keys.sort_unstable();
+            }
+            exact_keys(details, &expected_keys)?;
             let mut retained_decisions =
                 verify_finalized_claim_inputs(path, details, candidate, epoch)?;
             let total = json_member(details, "totalClaimCells")?.number()?;
-            let expected_rows = applicability_rows();
+            let expected_rows = if scoped {
+                active_collection_applicability_rows()?
+            } else {
+                applicability_rows()
+            };
             let expected_total = u64::try_from(
                 expected_rows
                     .len()
@@ -17460,11 +18886,17 @@ fn verify_bound_details(
                         .len()
                         .saturating_mul(REQUIRED_CLAIM_PLATFORMS.len())
                 || verify_zero_coverage_gaps(details).is_err()
+                || (scoped && verify_scoped_collection_coverage_counts(details).is_err())
             {
                 return Err("claim coverage graph is incomplete".to_owned());
             }
-            verify_canonical_claim_cell_scope(cells)?;
+            if scoped {
+                verify_scoped_collection_claim_cell_scope(cells)?;
+            } else {
+                verify_canonical_claim_cell_scope(cells)?;
+            }
             let mut reviewed_ambiguous = 0_u64;
+            let mut scoped_evidence_edges = BTreeSet::new();
             let expected_cells = expected_rows.into_iter().flat_map(|row| {
                 REQUIRED_CLAIM_PLATFORMS
                     .iter()
@@ -17573,6 +19005,18 @@ fn verify_bound_details(
                         evidenced_obligations.extend(verify_claim_evidence_reference(
                             reference, path, builtin, dimension, platform, candidate, epoch,
                         )?);
+                        if scoped {
+                            let reference = reference.object()?;
+                            if !scoped_evidence_edges.insert((
+                                json_member(reference, "caseId")?.string()?.to_owned(),
+                                json_member(reference, "platform")?.string()?.to_owned(),
+                            )) {
+                                return Err(
+                                    "active collection coverage duplicates a case/platform edge"
+                                        .to_owned(),
+                                );
+                            }
+                        }
                     }
                     if evidenced_obligations
                         != required_obligations
@@ -17586,6 +19030,9 @@ fn verify_bound_details(
                         );
                     }
                 }
+            }
+            if scoped {
+                verify_scoped_collection_evidence_edges(&scoped_evidence_edges)?;
             }
             verify_platform_dependent_cells(cells, path)?;
             if json_member(details, "ambiguousClaimScopes")?.number()? != reviewed_ambiguous
@@ -18499,7 +19946,7 @@ fn verify_residual_source_bindings(
     let cells = json_member(coverage, "cells")?.array()?;
     verify_residual_claim_source_facts(
         details,
-        cells,
+        coverage,
         json_member(coverage, "requiredPlatformGaps")?.number()?,
         json_member(coverage, "ambiguousClaimScopes")?.number()?,
     )?;
@@ -18556,12 +20003,13 @@ fn verify_residual_source_bindings(
 
 fn verify_residual_claim_source_facts(
     details: &BTreeMap<String, JsonValue>,
-    cells: &[JsonValue],
+    coverage: &BTreeMap<String, JsonValue>,
     required_platform_gaps: u64,
     ambiguous_claim_scopes: u64,
 ) -> Result<(), String> {
+    let cells = json_member(coverage, "cells")?.array()?;
     let expected_statuses = JsonValue::Object(
-        residual_status_counts(cells)?
+        claim_coverage_status_counts(coverage)?
             .into_iter()
             .map(|(status, count)| (status, JsonValue::Number(count)))
             .collect(),
@@ -19617,6 +21065,15 @@ fn claim_authoring_binding(
             .join("2026-05-29.toml"),
         PathBuf::from("compat").join("claim-rules.toml"),
         PathBuf::from("compat").join("corpus-obligations.toml"),
+        PathBuf::from("compat").join("collection-activation.toml"),
+        PathBuf::from("compat").join("collection-activation-claims.json"),
+        PathBuf::from("compat").join("collection-activation-provenance.json"),
+        PathBuf::from("compat").join("collection-activation-review-subject"),
+        PathBuf::from("compat").join("collection-activation-reviews"),
+        PathBuf::from("crates")
+            .join("hell-testkit")
+            .join("src")
+            .join("corpus.rs"),
     ];
     let changed_paths = changed_governed_paths(repository, candidate, &paths)?;
     if changed_paths.is_empty() {
@@ -20746,6 +22203,7 @@ fn human_review_role(role: &str) -> bool {
     matches!(
         role,
         "artifact-trust-reviewer"
+            | "claim-author"
             | "claim-reviewer"
             | "custody-reviewer"
             | "divergence-reviewer"
@@ -22556,6 +24014,101 @@ fn verify_canonical_claim_cell_scope(cells: &[JsonValue]) -> Result<(), String> 
     Ok(())
 }
 
+fn active_collection_applicability_rows() -> Result<
+    Vec<(
+        &'static str,
+        CompatibilityDimension,
+        &'static str,
+        &'static str,
+    )>,
+    String,
+> {
+    let scopes = hell_testkit::activated_collection_claim_scopes()?
+        .into_iter()
+        .map(|scope| scope.builtin)
+        .collect::<BTreeSet<_>>();
+    let rows = applicability_rows()
+        .into_iter()
+        .filter(|(builtin, dimension, _, _)| {
+            *dimension == CompatibilityDimension::PureRuntime && scopes.contains(*builtin)
+        })
+        .collect::<Vec<_>>();
+    if rows.len() != 14 {
+        return Err("active collection applicability scope is not exact14".to_owned());
+    }
+    Ok(rows)
+}
+
+fn verify_scoped_collection_coverage_counts(
+    details: &BTreeMap<String, JsonValue>,
+) -> Result<(), String> {
+    if json_member(details, "coverageScope")?.string()? != "activated-collection-exact14"
+        || json_member(details, "activatedScopeCells")?.number()? != 14
+        || json_member(details, "activeEvidenceCells")?.number()? != 42
+        || json_member(details, "totalClaimCells")?.number()? != 42
+        || json_member(details, "explicitDispositionCells")?.number()? != 42
+        || json_member(details, "residualRuntimeCells")?.number()?
+            != scoped_collection_residual_runtime_cells()?
+        || json_member(details, "outOfScopeClaimCells")?.number()?
+            != scoped_collection_out_of_scope_claim_cells()?
+    {
+        return Err("active collection scoped coverage counts differ".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_scoped_collection_claim_cell_scope(cells: &[JsonValue]) -> Result<(), String> {
+    let expected = active_collection_applicability_rows()?
+        .into_iter()
+        .flat_map(|(builtin, dimension, _, _)| {
+            REQUIRED_CLAIM_PLATFORMS.iter().map(move |platform| {
+                (
+                    builtin.to_owned(),
+                    dimension.as_str().to_owned(),
+                    "upstream".to_owned(),
+                    (*platform).to_owned(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if cells.len() != expected.len() {
+        return Err("active collection coverage is not exact14 x three platforms".to_owned());
+    }
+    for (cell, (builtin, dimension, profile, platform)) in cells.iter().zip(expected) {
+        let cell = cell.object()?;
+        if json_member(cell, "builtin")?.string()? != builtin
+            || json_member(cell, "dimension")?.string()? != dimension
+            || json_member(cell, "profile")?.string()? != profile
+            || json_member(cell, "platform")?.string()? != platform
+        {
+            return Err("active collection coverage substitutes a scoped cell".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn verify_scoped_collection_evidence_edges(
+    observed: &BTreeSet<(String, String)>,
+) -> Result<(), String> {
+    let expected = hell_testkit::activated_collection_claim_scopes()?
+        .into_iter()
+        .flat_map(|scope| {
+            scope.case_refs.into_iter().flat_map(|case_id| {
+                REQUIRED_CLAIM_PLATFORMS
+                    .iter()
+                    .map(move |platform| (case_id.clone(), (*platform).to_owned()))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if observed != &expected {
+        return Err(
+            "active collection coverage is not the exact 1,191-case x three-platform set"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn require_unique_claim_evidence_edges(evidence: &[JsonValue]) -> Result<(), String> {
     let mut edges = BTreeSet::new();
     for reference in evidence {
@@ -23944,6 +25497,19 @@ fn custody_command(options: &Options) -> Result<String, String> {
     }
 }
 
+pub(crate) fn verify_retained_custody_receipt(
+    input: &Path,
+    signer_policy: &Path,
+) -> Result<(), String> {
+    custody_command(&Options {
+        action: Some("verify".to_owned()),
+        input: Some(input.to_path_buf()),
+        policy: Some(signer_policy.to_path_buf()),
+        ..Options::default()
+    })
+    .map(|_| ())
+}
+
 fn retained_evidence_root(path: &Path) -> Result<&Path, String> {
     path.ancestors()
         .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "evidence"))
@@ -24140,7 +25706,14 @@ fn signable_review_packet(
     }
     let mut findings_json = String::new();
     push_json_value(&mut findings_json, &findings)?;
-    let mut artifacts = review_packet_artifacts(input, role)?;
+    let mut artifacts = if matches!(
+        options.category.as_deref(),
+        Some("collection-activation-author" | "collection-activation-final")
+    ) {
+        collection_activation_review_artifacts(input, role)?
+    } else {
+        review_packet_artifacts(input, role)?
+    };
     if let Some(authorization) = authorization
         && !artifacts.insert(record_digest(authorization)?)
     {
@@ -24164,7 +25737,9 @@ fn signable_review_packet(
                 return Err("claim-group packet requires a claim or graph reviewer role".to_owned());
             }
             reviewed_claim_groups_json(input, source.trim(), &epoch.hex())?
-        } else if role == "claim-reviewer" {
+        } else if role == "claim-reviewer"
+            && options.category.as_deref() != Some("collection-activation-final")
+        {
             reviewed_finalized_claim_groups_json(input, source.trim(), &epoch.hex())?
         } else {
             (String::new(), BTreeMap::new())
@@ -24323,6 +25898,7 @@ fn signable_review_identity<'a>(
     let evidence_role = matches!(
         role,
         "artifact-trust-reviewer"
+            | "claim-author"
             | "claim-reviewer"
             | "custody-reviewer"
             | "normalizer-reviewer"
@@ -24349,6 +25925,7 @@ fn signable_review_identity<'a>(
     let identity = if options.github_dispatch_inputs {
         match role {
             "artifact-trust-reviewer"
+            | "claim-author"
             | "claim-reviewer"
             | "custody-reviewer"
             | "normalizer-reviewer"
@@ -24735,6 +26312,28 @@ fn review_statement_id(review: &ReviewStatementIdentity<'_>) -> String {
         }
     }
     sha256_bytes(identity.as_bytes()).hex()
+}
+
+#[cfg(test)]
+pub(crate) fn clean_review_statement_id(
+    candidate: &str,
+    epoch: &str,
+    role: &str,
+    reviewer: &str,
+    issued_at: &str,
+    artifacts: &BTreeSet<String>,
+) -> String {
+    review_statement_id(&ReviewStatementIdentity {
+        candidate,
+        epoch,
+        role,
+        reviewer,
+        decision: "accept",
+        issued_at,
+        artifacts,
+        claim_groups: &BTreeMap::new(),
+        findings_sha256: &sha256_bytes(b"[]\n").hex(),
+    })
 }
 
 fn add_required_artifact_exception_finding(
@@ -25557,46 +27156,7 @@ const FINAL_REVIEW_GRAPH_INPUTS: &[&str] = &[
 
 fn review_authorization_candidate(root: &Path, options: &Options) -> Result<String, String> {
     if options.category.as_deref() == Some("regression-final") {
-        let subject = required_path(
-            &options.input,
-            "regression authorization requires --input provider-bound subject",
-        )?;
-        let document = parse_json(&read_text(subject)?)?;
-        let document = document.object()?;
-        exact_keys(
-            document,
-            &[
-                "assuranceEpochSha256",
-                "candidateCommit",
-                "packageSha256",
-                "providerSelectionSha256",
-                "proposerAccountId",
-                "schemaVersion",
-                "state",
-            ],
-        )?;
-        let candidate = json_member(document, "candidateCommit")?.string()?;
-        if json_member(document, "schemaVersion")?.number()? != 1
-            || json_member(document, "state")?.string()? != "requires-regression-review"
-            || git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate
-        {
-            return Err("regression authorization subject is not trusted current state".to_owned());
-        }
-        for (field, label) in [
-            ("assuranceEpochSha256", "regression authorization epoch"),
-            ("packageSha256", "regression authorization package"),
-            (
-                "providerSelectionSha256",
-                "regression authorization provider selection",
-            ),
-        ] {
-            require_digest(json_member(document, field)?.string()?, label)?;
-        }
-        if json_member(document, "proposerAccountId")?.number()? == 0 {
-            return Err("regression authorization proposer identity is invalid".to_owned());
-        }
-        verify_regression_authorization_subject(root, subject, document)?;
-        return Ok(candidate.to_owned());
+        return regression_authorization_candidate(root, options);
     }
     if options.category.as_deref() == Some("artifact-trust-final") {
         return artifact_finalize_dispatch(root).map(|dispatch| dispatch.candidate);
@@ -25622,18 +27182,32 @@ fn review_authorization_candidate(root: &Path, options: &Options) -> Result<Stri
     if let Some((role, allowed_events)) = match options.category.as_deref() {
         Some("oracle-platform-final") => Some(("platform-reviewer", &["workflow_dispatch"][..])),
         Some("custody-final") => Some(("custody-reviewer", &["workflow_dispatch"][..])),
+        Some("collection-activation-author") => Some(("claim-author", &["workflow_dispatch"][..])),
+        Some("collection-activation-final") => Some(("claim-reviewer", &["workflow_dispatch"][..])),
         _ => None,
     } {
         let subject = required_path(
             &options.input,
             "protected human review authorization requires --input subject",
         )?;
+        if matches!(role, "claim-author" | "claim-reviewer") {
+            return collection_activation_authorization_candidate(
+                root,
+                subject,
+                role,
+                allowed_events,
+            );
+        }
         return protected_review_subject_candidate(root, subject, role, allowed_events);
     }
     if options.category.as_deref() != Some("final-review-graph") {
         let inputs = github_dispatch_object(REVIEW_ASSEMBLY_INPUTS)?;
         return validate_review_assembly_identity(root, &inputs).map(str::to_owned);
     }
+    final_review_graph_authorization_candidate(root)
+}
+
+fn final_review_graph_authorization_candidate(root: &Path) -> Result<String, String> {
     let inputs = github_dispatch_object(FINAL_REVIEW_GRAPH_INPUTS)?;
     if map_value(&inputs, "artifact_class")? != "pre-review-evidence" {
         return Err("final review graph requires pre-review evidence custody".to_owned());
@@ -25654,6 +27228,79 @@ fn review_authorization_candidate(root: &Path, options: &Options) -> Result<Stri
     require_git_sha_text(candidate, "final review graph candidate")?;
     if git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate {
         return Err("final review graph checkout differs from candidate".to_owned());
+    }
+    Ok(candidate.to_owned())
+}
+
+fn regression_authorization_candidate(root: &Path, options: &Options) -> Result<String, String> {
+    let subject = required_path(
+        &options.input,
+        "regression authorization requires --input provider-bound subject",
+    )?;
+    let document = parse_json(&read_text(subject)?)?;
+    let document = document.object()?;
+    exact_keys(
+        document,
+        &[
+            "assuranceEpochSha256",
+            "candidateCommit",
+            "packageSha256",
+            "providerSelectionSha256",
+            "proposerAccountId",
+            "schemaVersion",
+            "state",
+        ],
+    )?;
+    let candidate = json_member(document, "candidateCommit")?.string()?;
+    if json_member(document, "schemaVersion")?.number()? != 1
+        || json_member(document, "state")?.string()? != "requires-regression-review"
+        || git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate
+    {
+        return Err("regression authorization subject is not trusted current state".to_owned());
+    }
+    for (field, label) in [
+        ("assuranceEpochSha256", "regression authorization epoch"),
+        ("packageSha256", "regression authorization package"),
+        (
+            "providerSelectionSha256",
+            "regression authorization provider selection",
+        ),
+    ] {
+        require_digest(json_member(document, field)?.string()?, label)?;
+    }
+    if json_member(document, "proposerAccountId")?.number()? == 0 {
+        return Err("regression authorization proposer identity is invalid".to_owned());
+    }
+    verify_regression_authorization_subject(root, subject, document)?;
+    Ok(candidate.to_owned())
+}
+
+fn collection_activation_authorization_candidate(
+    root: &Path,
+    subject: &Path,
+    role: &str,
+    allowed_events: &[&str],
+) -> Result<String, String> {
+    if !matches!(role, "claim-author" | "claim-reviewer")
+        || subject.file_name() != Some(OsStr::new("review-subject.json"))
+    {
+        return Err("collection activation authorization subject is invalid".to_owned());
+    }
+    let subject_root = subject
+        .parent()
+        .ok_or_else(|| "collection activation review subject has no directory".to_owned())?;
+    let proposal_root =
+        crate::collection_custody::verify_activation_review_subject(root, subject_root)?;
+    let document = parse_json(&read_text(&proposal_root.join("activation-proposal.json"))?)?;
+    let candidate = json_member(document.object()?, "baseCandidateCommit")?.string()?;
+    let event = std::env::var("GITHUB_EVENT_NAME")
+        .map_err(|_| "collection activation authorization requires GITHUB_EVENT_NAME".to_owned())?;
+    if git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate
+        || !allowed_events.contains(&event.as_str())
+    {
+        return Err(
+            "collection activation authorization is stale or has an unsupported event".to_owned(),
+        );
     }
     Ok(candidate.to_owned())
 }
@@ -25796,17 +27443,18 @@ fn protected_review_subject(
     if artifacts.is_empty() {
         return Err("protected review subject has no reviewed artifacts".to_owned());
     }
-    let expected_id = sha256_bytes(
-        [
-            candidate.as_bytes(),
-            subject_epoch.as_bytes(),
-            role.as_bytes(),
-            ordered.join("\n").as_bytes(),
-        ]
-        .concat()
-        .as_slice(),
-    )
-    .hex();
+    let empty_claim_groups = BTreeMap::new();
+    let expected_id = review_statement_id(&ReviewStatementIdentity {
+        candidate: &candidate,
+        epoch: &subject_epoch,
+        role,
+        reviewer,
+        decision: "accept",
+        issued_at,
+        artifacts: &artifacts,
+        claim_groups: &empty_claim_groups,
+        findings_sha256: &sha256_bytes(b"[]\n").hex(),
+    });
     if json_member(packet, "reviewId")?.string()? != expected_id {
         return Err(
             "protected review subject ID is not derived from its exact artifacts".to_owned(),
@@ -26138,6 +27786,10 @@ fn final_review_provider_facts_if_required(
             custody_review_subject_name(request.run_id, request.run_attempt),
             ".github/workflows/evidence-custody.yml",
         ),
+        Some("collection-activation-author" | "collection-activation-final") => (
+            collection_activation_subject_name(request.run_id, request.run_attempt),
+            ".github/workflows/collection-activation.yml",
+        ),
         _ => return Ok(None),
     };
     retain_final_review_provider_facts(request, &artifact_name, workflow).map(Some)
@@ -26149,6 +27801,10 @@ fn final_review_subject_name(run_id: u64, run_attempt: u64) -> String {
     name.push('-');
     name.push_str(&run_attempt.to_string());
     name
+}
+
+fn collection_activation_subject_name(run_id: u64, run_attempt: u64) -> String {
+    format!("collection-activation-proposal-{run_id}-{run_attempt}")
 }
 
 fn artifact_review_subject_name(run_id: u64, run_attempt: u64) -> String {
@@ -26191,10 +27847,7 @@ fn retain_final_review_provider_facts(
 ) -> Result<FinalReviewProviderFacts, String> {
     let (extracted_manifest_bytes, extracted_root_sha256, extracted_manifest_path) =
         retain_reviewed_provider_snapshot(request, workflow)?;
-    let repository = std::env::var("GITHUB_REPOSITORY")
-        .map_err(|_| "final graph authorization requires GITHUB_REPOSITORY".to_owned())?;
-    let repository_id = std::env::var("GITHUB_REPOSITORY_ID")
-        .map_err(|_| "final graph authorization requires GITHUB_REPOSITORY_ID".to_owned())?;
+    let (repository, repository_id) = provider_selection_repository_identity()?;
     let repository_id = repository_id
         .parse::<u64>()
         .map_err(|_| "final graph repository ID is not an integer".to_owned())?;
@@ -26453,14 +28106,14 @@ fn provider_run_workflow_ref(value: &str, expected_path: &str) -> Result<String,
         .split_once('@')
         .ok_or_else(|| "provider workflow path does not bind its exact ref".to_owned())?;
     if path != expected_path
-        || reference.is_empty()
+        || reference != "main"
         || reference.contains('@')
         || reference.contains('\\')
         || reference.chars().any(char::is_whitespace)
     {
         return Err("provider workflow path/ref identity is invalid".to_owned());
     }
-    Ok(reference.to_owned())
+    Ok("refs/heads/main".to_owned())
 }
 
 fn retain_review_authorization(
@@ -26564,6 +28217,7 @@ fn evidence_review_authority(role: &str) -> Result<(&'static str, &'static str),
     match role {
         "artifact-trust-reviewer" => Ok(("security_reviewer_team", "artifact-authenticity-review")),
         "mutation-reviewer" => Ok(("security_reviewer_team", "assurance-mutation-review")),
+        "claim-author" => Ok(("claim_author_team", "compatibility-claim-author")),
         "claim-reviewer" | "regression-reviewer" => {
             Ok(("claim_reviewer_team", "compatibility-claim-review"))
         }
@@ -26780,10 +28434,25 @@ fn verify_review_authorization(
     candidate: &str,
     reviewed_artifact: &Path,
 ) -> Result<(u64, String, String, String, Option<String>), String> {
+    verify_review_authorization_at(
+        &repository_root()?,
+        path,
+        role,
+        candidate,
+        reviewed_artifact,
+    )
+}
+
+fn verify_review_authorization_at(
+    repository: &Path,
+    path: &Path,
+    role: &str,
+    candidate: &str,
+    reviewed_artifact: &Path,
+) -> Result<(u64, String, String, String, Option<String>), String> {
     let document = parse_json(&read_text(path)?)?;
     let record = document.object()?;
-    let repository = repository_root()?;
-    let context = review_authorization_context(record, role, candidate, &repository)?;
+    let context = review_authorization_context(record, role, candidate, repository)?;
     let retained = RetainedReviewAuthorization::verify(path, record)?;
     let approvals = parse_json(&read_text(&retained.approvals)?)?;
     let reviewed_artifact_sha256 = json_member(record, "reviewedArtifactSha256")?.string()?;
@@ -26795,11 +28464,14 @@ fn verify_review_authorization(
         role,
         "review-graph-reviewer"
             | "artifact-trust-reviewer"
+            | "claim-author"
+            | "claim-reviewer"
             | "custody-reviewer"
             | "mutation-reviewer"
             | "platform-reviewer"
     ) {
         verify_final_review_provider_retention(
+            repository,
             path,
             record,
             role,
@@ -26860,6 +28532,168 @@ fn verify_review_authorization(
     ))
 }
 
+pub(crate) fn verify_historical_activation_authorization(
+    repository: &Path,
+    path: &Path,
+    role: &str,
+    candidate: &str,
+    reviewed_artifact: &Path,
+) -> Result<String, String> {
+    if !matches!(role, "claim-author" | "claim-reviewer") {
+        return Err("historical activation authorization role is unsupported".to_owned());
+    }
+    let document = parse_json(&read_text(path)?)?;
+    let record = document.object()?;
+    let context = review_authorization_context(record, role, candidate, repository)?;
+    let retained = RetainedReviewAuthorization::verify(path, record)?;
+    let reviewed_digest = json_member(record, "reviewedArtifactSha256")?.string()?;
+    if record_digest(reviewed_artifact)? != reviewed_digest {
+        return Err("historical activation authorization subject differs".to_owned());
+    }
+    let reviewed_at = json_member(record, "reviewedAt")?.string()?.to_owned();
+    verify_historical_activation_provider_retention(
+        repository,
+        path,
+        record,
+        role,
+        candidate,
+        &reviewed_at,
+    )?;
+    let approvals = parse_json(&read_text(&retained.approvals)?)?;
+    let scope = ReviewApprovalScope {
+        environment: &context.environment,
+        role,
+        candidate,
+        reviewed_artifact_sha256: reviewed_digest,
+        artifact_exception_required: false,
+    };
+    let (account_id, login, decision) = approved_environment_actor(&approvals, &scope)?;
+    let membership = parse_json(&read_text(&retained.membership)?)?;
+    let membership = membership.object()?;
+    let member = json_member(membership, "user")?.object()?;
+    let signing_keys = parse_json(&read_text(&retained.signing_keys)?)?;
+    let signing_key = select_github_signing_key(
+        &signing_keys,
+        json_member(record, "signingKeyId")?.number()?,
+    )?;
+    if json_member(record, "accountId")?.number()? != account_id
+        || json_member(record, "login")?.string()? != login
+        || decision.reviewed_at != reviewed_at
+        || json_member(membership, "state")?.string()? != "active"
+        || json_member(member, "id")?.number()? != account_id
+        || json_member(member, "login")?.string()? != login
+        || read_text(&retained.signer_policy)?
+            != format!("{role}:github-account-{account_id} {signing_key}\n")
+        || read_regular_file(&retained.trust_roots)?
+            != read_regular_file(&repository.join("compat/trust-roots.toml"))?
+        || read_regular_file(&retained.surveillance_policy)?
+            != read_regular_file(&repository.join("compat/surveillance-policy.toml"))?
+        || read_regular_file(&retained.review_revocations)?
+            != read_regular_file(&repository.join("compat/review-revocations.toml"))?
+    {
+        return Err("historical activation authorization provider facts differ".to_owned());
+    }
+    Ok(reviewed_at)
+}
+
+fn verify_historical_activation_provider_retention(
+    repository: &Path,
+    path: &Path,
+    record: &BTreeMap<String, JsonValue>,
+    role: &str,
+    candidate: &str,
+    reviewed_at: &str,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "historical activation authorization has no directory".to_owned())?;
+    let artifact_path = parent.join("reviewed-provider-artifact.json");
+    let run_path = parent.join("reviewed-provider-run.json");
+    let extracted_manifest_path = parent.join("reviewed-provider-extracted-manifest.json");
+    let extracted_subject_path = parent.join("reviewed-provider-extracted-subject");
+    let artifact_document = parse_json(&read_text(&artifact_path)?)?;
+    let artifact = artifact_document.object()?;
+    let run_id = json_member(record, "runId")?.number()?;
+    let run_attempt = json_member(record, "runAttempt")?.number()?;
+    let (artifact_name, workflow) = retained_review_subject_identity(
+        role,
+        run_id,
+        run_attempt,
+        json_member(artifact, "name")?.string()?,
+    )?;
+    let created = utc_timestamp_seconds(json_member(artifact, "created_at")?.string()?)?;
+    let expires = utc_timestamp_seconds(json_member(artifact, "expires_at")?.string()?)?;
+    let reviewed = utc_timestamp_seconds(reviewed_at)?;
+    let artifact_id = json_member(artifact, "id")?.number()?;
+    let archive_url = json_member(artifact, "archive_download_url")?.string()?;
+    let expected_archive_url = format!(
+        "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/{artifact_id}/zip"
+    );
+    let archive = json_member(artifact, "digest")?
+        .string()?
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "historical activation archive is not SHA-256".to_owned())?;
+    require_digest(archive, "historical activation provider archive")?;
+    if artifact_id == 0
+        || json_member(artifact, "name")?.string()? != artifact_name
+        || json_member(artifact, "expired")?.boolean()?
+        || json_member(artifact, "size_in_bytes")?.number()? == 0
+        || archive_url != expected_archive_url
+        || json_member(json_member(artifact, "workflow_run")?.object()?, "id")?.number()? != run_id
+        || !(created <= reviewed && reviewed < expires)
+        || json_member(record, "reviewedProviderArtifactId")?.number()? != artifact_id
+        || json_member(record, "reviewedProviderArchiveSha256")?.string()? != archive
+    {
+        return Err("historical activation artifact was not live at review time".to_owned());
+    }
+    verify_named_retained_file(
+        record,
+        &artifact_path,
+        "reviewedProviderArtifactApiPath",
+        "reviewedProviderArtifactApiSha256",
+        "reviewed-provider-artifact.json",
+    )?;
+    verify_named_retained_file(
+        record,
+        &run_path,
+        "reviewedProviderRunApiPath",
+        "reviewedProviderRunApiSha256",
+        "reviewed-provider-run.json",
+    )?;
+    verify_named_retained_file(
+        record,
+        &extracted_manifest_path,
+        "reviewedProviderExtractedManifestPath",
+        "reviewedProviderExtractedManifestSha256",
+        "reviewed-provider-extracted-manifest.json",
+    )?;
+    if json_member(record, "reviewedProviderExtractedSubjectPath")?.string()?
+        != "reviewed-provider-extracted-subject"
+    {
+        return Err("historical activation extracted subject path is invalid".to_owned());
+    }
+    let extracted_manifest = parse_json(&read_text(&extracted_manifest_path)?)?;
+    verify_artifact_review_file_manifest_exact(
+        &extracted_subject_path,
+        &extracted_manifest,
+        json_member(record, "reviewedProviderExtractedRootSha256")?.string()?,
+    )?;
+    if record_digest(&extracted_subject_path.join("review-subject.json"))?
+        != json_member(record, "reviewedArtifactSha256")?.string()?
+    {
+        return Err("historical provider snapshot reviewed a different subject".to_owned());
+    }
+    verify_retained_provider_run(
+        repository,
+        record,
+        &run_path,
+        candidate,
+        run_id,
+        run_attempt,
+        workflow,
+    )
+}
+
 struct ReviewAuthorizationContext {
     environment: String,
 }
@@ -26874,6 +28708,8 @@ fn review_authorization_context(
         role,
         "review-graph-reviewer"
             | "artifact-trust-reviewer"
+            | "claim-author"
+            | "claim-reviewer"
             | "custody-reviewer"
             | "mutation-reviewer"
             | "platform-reviewer"
@@ -26999,6 +28835,7 @@ const FINAL_REVIEW_AUTHORIZATION_KEYS: &[&str] = &[
 ];
 
 fn verify_final_review_provider_retention(
+    repository: &Path,
     path: &Path,
     record: &BTreeMap<String, JsonValue>,
     role: &str,
@@ -27061,7 +28898,15 @@ fn verify_final_review_provider_retention(
     {
         return Err("final graph authorization changes retained provider identity".to_owned());
     }
-    verify_retained_provider_run(record, &run_path, candidate, run_id, run_attempt, workflow)?;
+    verify_retained_provider_run(
+        repository,
+        record,
+        &run_path,
+        candidate,
+        run_id,
+        run_attempt,
+        workflow,
+    )?;
     require_digest(
         reviewed_artifact_sha256,
         "retained final graph reviewed subject",
@@ -27104,11 +28949,16 @@ fn retained_review_subject_identity(
             custody_review_subject_name(run_id, run_attempt),
             ".github/workflows/evidence-custody.yml",
         )),
+        "claim-author" | "claim-reviewer" => Ok((
+            collection_activation_subject_name(run_id, run_attempt),
+            ".github/workflows/collection-activation.yml",
+        )),
         _ => Err("provider-bound authorization role is unsupported".to_owned()),
     }
 }
 
 fn verify_retained_provider_run(
+    repository: &Path,
     record: &BTreeMap<String, JsonValue>,
     run_path: &Path,
     candidate: &str,
@@ -27117,13 +28967,24 @@ fn verify_retained_provider_run(
     workflow: &str,
 ) -> Result<(), String> {
     let repository_id = json_member(record, "reviewedProviderRepositoryId")?.number()?;
-    if repository_id == 0 {
-        return Err("retained final graph repository ID must be nonzero".to_owned());
+    let configured_repository_id = load_acquisition_policy(repository)?
+        .repository_id
+        .ok_or_else(|| "retained final graph repository ID is not configured".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "configured repository ID is invalid".to_owned())?;
+    if repository_id != configured_repository_id {
+        return Err("retained final graph repository ID differs from policy".to_owned());
     }
     let run_document = parse_json(&read_text(run_path)?)?;
+    let run = run_document.object()?;
+    if json_member(json_member(run, "repository")?.object()?, "full_name")?.string()?
+        != "Portfoligno/hell-rs"
+    {
+        return Err("retained final graph repository name differs".to_owned());
+    }
     let (workflow_ref, provider_event, _) = verify_final_review_run(
-        &repository_root()?,
-        run_document.object()?,
+        repository,
+        run,
         candidate,
         repository_id,
         run_id,
@@ -27140,6 +29001,12 @@ fn verify_retained_provider_run(
                     .ok_or_else(|| "retained provider run lacks a directory".to_owned())?
                     .join("reviewed-provider-workflow.yml"),
             )?
+        || record_digest(
+            &run_path
+                .parent()
+                .ok_or_else(|| "retained provider run lacks a directory".to_owned())?
+                .join("reviewed-provider-workflow.yml"),
+        )? != record_digest(&repository.join(workflow))?
     {
         return Err("final review provider workflow binding is stale".to_owned());
     }
@@ -27328,6 +29195,29 @@ fn review_packet_artifacts(input: &Path, role: &str) -> Result<BTreeSet<String>,
         return Ok(BTreeSet::from([digest]));
     }
     promotion_approval_artifacts(input, &digest)
+}
+
+fn collection_activation_review_artifacts(
+    input: &Path,
+    role: &str,
+) -> Result<BTreeSet<String>, String> {
+    collection_activation_review_artifacts_at(&repository_root()?, input, role)
+}
+
+fn collection_activation_review_artifacts_at(
+    root: &Path,
+    input: &Path,
+    role: &str,
+) -> Result<BTreeSet<String>, String> {
+    if !matches!(role, "claim-author" | "claim-reviewer")
+        || input.file_name().and_then(|name| name.to_str()) != Some("review-subject.json")
+    {
+        return Err("collection activation review subject or role is invalid".to_owned());
+    }
+    let directory = input
+        .parent()
+        .ok_or_else(|| "collection activation review subject has no directory".to_owned())?;
+    crate::collection_custody::activation_review_subject_artifacts(root, directory)
 }
 
 fn promotion_approval_artifacts(input: &Path, digest: &str) -> Result<BTreeSet<String>, String> {
@@ -28557,6 +30447,354 @@ pub(crate) fn verify_review_binding(
     Ok((review.subject, review.signer_fingerprint))
 }
 
+pub(crate) fn verify_review_binding_payload(
+    input: &Path,
+    payload_path: &Path,
+    policy: &Path,
+    role: &str,
+    candidate: &str,
+    epoch: &str,
+    required_artifacts: &BTreeSet<String>,
+) -> Result<(String, String), String> {
+    let binding = verify_review_binding(input, policy, role, candidate, epoch, required_artifacts)?;
+    let envelope = parse_json(&read_text(input)?)?;
+    let payload = decode_base64(json_member(envelope.object()?, "payload")?.string()?)?;
+    if payload != read_text(payload_path)?.as_bytes() {
+        return Err("review envelope payload differs from the retained review packet".to_owned());
+    }
+    Ok(binding)
+}
+
+pub(crate) struct VerifiedActivationReviewPackage {
+    pub(crate) subject: String,
+    pub(crate) signer_fingerprint: String,
+    pub(crate) envelope: Vec<u8>,
+    pub(crate) authorization_sha256: String,
+    pub(crate) packet_sha256: String,
+}
+
+pub(crate) fn verify_activation_review_package(
+    root: &Path,
+    directory: &Path,
+    subject: &Path,
+    role: &str,
+) -> Result<VerifiedActivationReviewPackage, String> {
+    if !matches!(role, "claim-author" | "claim-reviewer") {
+        return Err("activation review package role is unsupported".to_owned());
+    }
+    require_activation_review_package_inventory(directory)?;
+    let authorization = directory.join("authorization.json");
+    let packet = directory.join("review-packet.json");
+    let packet_digest = directory.join("review-packet.json.sha256");
+    let envelope = directory.join("review.dsse.json");
+    let envelope_digest = directory.join("review.dsse.json.sha256");
+    for path in [
+        &authorization,
+        &packet,
+        &packet_digest,
+        &envelope,
+        &envelope_digest,
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("activation review package input is absent: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("activation review package input is not a regular file".to_owned());
+        }
+    }
+    verify_activation_review_package_binding(root, directory, subject, role)
+}
+
+fn require_activation_review_package_inventory(directory: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect activation review package: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("activation review package is not a real directory".to_owned());
+    }
+    let expected = BTreeSet::from([
+        "authorization.json",
+        "environment-approvals.json",
+        "review-revocations.toml",
+        "review-packet.json",
+        "review-packet.json.sha256",
+        "review.dsse.json",
+        "review.dsse.json.sha256",
+        "reviewed-provider-artifact.json",
+        "reviewed-provider-extracted-manifest.json",
+        "reviewed-provider-extracted-subject",
+        "reviewed-provider-run.json",
+        "reviewed-provider-workflow.yml",
+        "reviewer.allowed_signers",
+        "ssh-signing-keys.json",
+        "surveillance-policy.toml",
+        "team-membership.json",
+        "trust-roots.toml",
+    ])
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let observed = fs::read_dir(directory)
+        .map_err(|error| format!("cannot enumerate activation review package: {error}"))?
+        .map(|entry| {
+            entry
+                .map_err(|error| format!("cannot enumerate activation review package: {error}"))
+                .and_then(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| "activation review package name is not UTF-8".to_owned())
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if observed != expected {
+        return Err("activation review package inventory is not exact".to_owned());
+    }
+    require_real_activation_review_tree(directory, directory)
+}
+
+fn verify_activation_review_package_binding(
+    root: &Path,
+    directory: &Path,
+    subject: &Path,
+    role: &str,
+) -> Result<VerifiedActivationReviewPackage, String> {
+    let authorization = directory.join("authorization.json");
+    let packet = directory.join("review-packet.json");
+    let packet_digest = directory.join("review-packet.json.sha256");
+    let envelope = directory.join("review.dsse.json");
+    let envelope_digest = directory.join("review.dsse.json.sha256");
+    if subject.file_name() != Some(OsStr::new("review-subject.json")) {
+        return Err("activation review package subject path is invalid".to_owned());
+    }
+    let subject_root = subject
+        .parent()
+        .ok_or_else(|| "activation review subject has no directory".to_owned())?;
+    let proposal_root =
+        crate::collection_custody::verify_activation_review_subject(root, subject_root)?;
+    let proposal = proposal_root.join("activation-proposal.json");
+    let proposal_document = parse_json(&read_text(&proposal)?)?;
+    let proposal_fields = proposal_document.object()?;
+    let candidate = json_member(proposal_fields, "baseCandidateCommit")?.string()?;
+    let epoch = json_member(proposal_fields, "baseAssuranceEpochSha256")?.string()?;
+    let (_, _, reviewed_at, _, _) =
+        verify_review_authorization_at(root, &authorization, role, candidate, subject)?;
+    let mut required = collection_activation_review_artifacts_at(root, subject, role)?;
+    let authorization_sha256 = record_digest(&authorization)?;
+    if !required.insert(authorization_sha256.clone()) {
+        return Err("activation authorization duplicates a reviewed proposal root".to_owned());
+    }
+    let (packet_candidate, packet_epoch, packet_artifacts) =
+        protected_review_subject(&packet, role)?;
+    let packet_document = parse_json(&read_text(&packet)?)?;
+    if packet_candidate != candidate
+        || packet_epoch != epoch
+        || packet_artifacts != required
+        || activation_review_timestamp_matches(&packet_document, &reviewed_at).is_err()
+    {
+        return Err(
+            "activation review packet does not bind exact proposal and authorization".to_owned(),
+        );
+    }
+    let packet_sha256 = record_digest(&packet)?;
+    if read_text(&packet_digest)? != format!("{packet_sha256}\n") {
+        return Err("activation review packet digest sibling differs".to_owned());
+    }
+    let policy = directory.join("reviewer.allowed_signers");
+    let (subject, signer_fingerprint) = verify_review_binding_payload(
+        &envelope, &packet, &policy, role, candidate, epoch, &required,
+    )?;
+    if read_text(&envelope_digest)? != format!("{}\n", record_digest(&envelope)?) {
+        return Err("activation review envelope digest sibling differs".to_owned());
+    }
+    if git_output(root, &["rev-parse", "HEAD"])?.trim() != candidate {
+        return Err("activation review package differs from current reviewed base".to_owned());
+    }
+    Ok(VerifiedActivationReviewPackage {
+        subject,
+        signer_fingerprint,
+        envelope: read_regular_file(&envelope)?,
+        authorization_sha256,
+        packet_sha256,
+    })
+}
+
+pub(crate) fn activation_review_timestamp_matches(
+    packet: &JsonValue,
+    reviewed_at: &str,
+) -> Result<(), String> {
+    validate_utc_timestamp(reviewed_at)?;
+    let issued_at = json_member(packet.object()?, "issuedAt")?.string()?;
+    validate_utc_timestamp(issued_at)?;
+    if issued_at != reviewed_at {
+        return Err("activation authorization and packet timestamps differ".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn require_real_activation_review_tree(
+    root: &Path,
+    directory: &Path,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("cannot enumerate activation review package: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("cannot enumerate activation review package: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect activation review package: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("activation review package contains a symlink".to_owned());
+        }
+        if metadata.is_dir() {
+            require_real_activation_review_tree(root, &entry.path())?;
+        } else if !metadata.is_file() {
+            return Err("activation review package contains a non-regular node".to_owned());
+        }
+        entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| "activation review package entry escapes root".to_owned())?;
+    }
+    Ok(())
+}
+
+pub(crate) struct UnsignedReviewPayloadInput<'a> {
+    pub(crate) reviewer: &'a str,
+    pub(crate) issued_at: &'a str,
+    pub(crate) candidate: &'a str,
+    pub(crate) epoch: &'a str,
+    pub(crate) reviewed_artifacts: &'a BTreeSet<String>,
+}
+
+pub(crate) fn render_unsigned_custody_review_payload(
+    allowed_signers: &Path,
+    input: &UnsignedReviewPayloadInput<'_>,
+) -> Result<(Vec<u8>, String), String> {
+    require_git_sha_text(input.candidate, "custody review candidate")?;
+    require_digest(input.epoch, "custody review assurance epoch")?;
+    if !input.reviewer.starts_with("custody-reviewer:") || input.reviewer == "custody-reviewer:" {
+        return Err("custody review principal does not match its role".to_owned());
+    }
+    allowed_signer_key_fingerprint(allowed_signers, input.reviewer)?;
+    required_signature_schemes(allowed_signers)?;
+    if input.reviewed_artifacts.is_empty() {
+        return Err("custody review has no reviewed artifacts".to_owned());
+    }
+    for artifact in input.reviewed_artifacts {
+        require_digest(artifact, "custody reviewed artifact")?;
+    }
+    validate_utc_timestamp(input.issued_at)?;
+    let issued_seconds = utc_timestamp_seconds(input.issued_at)?;
+    let current_seconds = current_utc_seconds()?;
+    if issued_seconds > current_seconds {
+        return Err("custody review statement is future-dated".to_owned());
+    }
+    let config_root = allowed_signers
+        .parent()
+        .ok_or_else(|| "allowed signers has no policy directory".to_owned())?;
+    let surveillance = read_text(&config_root.join("surveillance-policy.toml"))?;
+    let maximum_age_days = assignment_u64(&surveillance, "mutation_report_maximum_age_days")?;
+    let maximum_age = maximum_age_days
+        .checked_mul(86_400)
+        .filter(|maximum| *maximum > 0)
+        .ok_or_else(|| "review maximum age must be nonzero and bounded".to_owned())?;
+    if current_seconds.saturating_sub(issued_seconds) > maximum_age {
+        return Err("custody review statement is stale".to_owned());
+    }
+    let empty_claim_groups = BTreeMap::new();
+    let findings_sha256 = sha256_bytes(b"[]\n").hex();
+    let derived_id = review_statement_id(&ReviewStatementIdentity {
+        candidate: input.candidate,
+        epoch: input.epoch,
+        role: "custody-reviewer",
+        reviewer: input.reviewer,
+        decision: "accept",
+        issued_at: input.issued_at,
+        artifacts: input.reviewed_artifacts,
+        claim_groups: &empty_claim_groups,
+        findings_sha256: &findings_sha256,
+    });
+    let revocations = read_text(&config_root.join("review-revocations.toml"))?;
+    if assignment_string_array(&revocations, "revoked_review_ids")?
+        .iter()
+        .any(|revoked| revoked == &derived_id)
+    {
+        return Err("custody review statement is revoked".to_owned());
+    }
+    let reviewed_artifacts = input
+        .reviewed_artifacts
+        .iter()
+        .map(|artifact| json_string(artifact))
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!(
+        "{{\"schemaVersion\":1,\"reviewId\":{},\"role\":\"custody-reviewer\",\"reviewer\":{},\"decision\":\"accept\",\"candidateCommit\":{},\"assuranceEpochSha256\":{},\"reviewedArtifacts\":[{reviewed_artifacts}],\"distinctSubjects\":1,\"independenceViolations\":[],\"findings\":[],\"issuedAt\":{}}}\n",
+        json_string(&derived_id),
+        json_string(input.reviewer),
+        json_string(input.candidate),
+        json_string(input.epoch),
+        json_string(input.issued_at),
+    );
+    let document = parse_json(&payload)?;
+    admit_review_payload(document.object()?)?;
+    Ok((payload.into_bytes(), derived_id))
+}
+
+pub(crate) struct VerifiedUnsignedCustodyReview {
+    pub(crate) reviewer: String,
+    pub(crate) issued_at: String,
+    pub(crate) review_id: String,
+    pub(crate) candidate: String,
+    pub(crate) epoch: String,
+    pub(crate) reviewed_artifacts: BTreeSet<String>,
+}
+
+pub(crate) fn verify_unsigned_custody_review_payload(
+    allowed_signers: &Path,
+    bytes: &[u8],
+) -> Result<VerifiedUnsignedCustodyReview, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "unsigned custody review payload is not UTF-8".to_owned())?;
+    let document = parse_json(text)?;
+    let payload = document.object()?;
+    admit_review_payload(payload)?;
+    if json_member(payload, "role")?.string()? != "custody-reviewer"
+        || json_member(payload, "decision")?.string()? != "accept"
+    {
+        return Err("unsigned custody review payload has the wrong role or decision".to_owned());
+    }
+    let reviewed_artifacts = json_member(payload, "reviewedArtifacts")?
+        .array()?
+        .iter()
+        .map(|artifact| artifact.string().map(str::to_owned))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let facts = VerifiedUnsignedCustodyReview {
+        reviewer: json_member(payload, "reviewer")?.string()?.to_owned(),
+        issued_at: json_member(payload, "issuedAt")?.string()?.to_owned(),
+        review_id: json_member(payload, "reviewId")?.string()?.to_owned(),
+        candidate: json_member(payload, "candidateCommit")?
+            .string()?
+            .to_owned(),
+        epoch: json_member(payload, "assuranceEpochSha256")?
+            .string()?
+            .to_owned(),
+        reviewed_artifacts,
+    };
+    let (canonical, derived_review_id) = render_unsigned_custody_review_payload(
+        allowed_signers,
+        &UnsignedReviewPayloadInput {
+            reviewer: &facts.reviewer,
+            issued_at: &facts.issued_at,
+            candidate: &facts.candidate,
+            epoch: &facts.epoch,
+            reviewed_artifacts: &facts.reviewed_artifacts,
+        },
+    )?;
+    if canonical != bytes || derived_review_id != facts.review_id {
+        return Err("unsigned custody review payload is not canonical and exact".to_owned());
+    }
+    Ok(facts)
+}
+
 fn verify_historical_review_binding(
     input: &Path,
     policy: &Path,
@@ -28583,6 +30821,94 @@ fn verify_historical_review_binding(
         );
     }
     Ok((review.subject, review.signer_fingerprint))
+}
+
+pub(crate) struct HistoricalActivationReviewBinding<'a> {
+    pub(crate) input: &'a Path,
+    pub(crate) policy: &'a Path,
+    pub(crate) current_revocations: &'a Path,
+    pub(crate) role: &'a str,
+    pub(crate) candidate: &'a str,
+    pub(crate) epoch: &'a str,
+    pub(crate) required_artifacts: &'a BTreeSet<String>,
+    pub(crate) current_trust_roots: &'a Path,
+}
+
+pub(crate) fn verify_historical_activation_review_binding(
+    request: &HistoricalActivationReviewBinding<'_>,
+) -> Result<(String, String), String> {
+    let &HistoricalActivationReviewBinding {
+        input,
+        policy,
+        current_revocations,
+        role,
+        candidate,
+        epoch,
+        required_artifacts,
+        current_trust_roots,
+    } = request;
+    if !matches!(role, "claim-author" | "claim-reviewer") {
+        return Err("historical activation review role is unsupported".to_owned());
+    }
+    let directory = input
+        .parent()
+        .ok_or_else(|| "historical activation review lacks a directory".to_owned())?;
+    require_activation_review_package_inventory(directory)?;
+    let packet_path = directory.join("review-packet.json");
+    let packet_bytes = read_regular_file(&packet_path)?;
+    let (packet_candidate, packet_epoch, packet_artifacts) =
+        protected_review_subject(&packet_path, role)?;
+    if packet_candidate != candidate
+        || packet_epoch != epoch
+        || packet_artifacts != *required_artifacts
+        || read_text(&directory.join("review-packet.json.sha256"))?
+            != format!("{}\n", sha256_bytes(&packet_bytes).hex())
+        || read_text(&directory.join("review.dsse.json.sha256"))?
+            != format!("{}\n", record_digest(input)?)
+    {
+        return Err("historical activation review package binding differs".to_owned());
+    }
+    let binding = verify_historical_review_binding(
+        input,
+        policy,
+        current_revocations,
+        role,
+        candidate,
+        epoch,
+        required_artifacts,
+    )?;
+    let envelope = parse_json(&read_text(input)?)?;
+    let payload = decode_base64(json_member(envelope.object()?, "payload")?.string()?)?;
+    if payload != packet_bytes {
+        return Err("historical activation DSSE payload differs from retained packet".to_owned());
+    }
+    let signatures = json_member(envelope.object()?, "signatures")?.array()?;
+    let sigstore = signatures
+        .iter()
+        .map(JsonValue::object)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|signature| {
+            json_member(signature, "scheme").and_then(JsonValue::string) == Ok("sigstore")
+        })
+        .ok_or_else(|| "historical activation review lacks Sigstore authority".to_owned())?;
+    verify_sigstore_signature_with_trust_roots(current_trust_roots, sigstore, &payload)?;
+    Ok(binding)
+}
+
+fn verify_sigstore_signature_with_trust_roots(
+    trust_roots: &Path,
+    signature: &BTreeMap<String, JsonValue>,
+    payload: &[u8],
+) -> Result<(), String> {
+    let temporary = create_private_temp_directory("hell-current-activation-trust")?;
+    let policy = temporary.join("reviewer.allowed_signers");
+    let roots = temporary.join("trust-roots.toml");
+    write_atomic(&policy, b"historical-activation no-key\n")?;
+    write_atomic(&roots, &read_regular_file(trust_roots)?)?;
+    let result = verify_sigstore_signature(&policy, signature, payload);
+    let _ = fs::remove_dir_all(&temporary);
+    result
 }
 
 pub(crate) fn verify_reviewed_claim_groups(
@@ -28749,6 +31075,7 @@ fn verify_review_envelope_with_context_at(
     if !matches!(
         role.as_str(),
         "artifact-trust-reviewer"
+            | "claim-author"
             | "claim-reviewer"
             | "custody-provider"
             | "custody-reviewer"
@@ -29234,23 +31561,108 @@ fn verify_sigstore_signature(
         file.sync_all()
             .map_err(|error| format!("cannot sync Sigstore input: {error}"))?;
     }
+    let result = run_sigstore_verify_blob(&bundle_path, identity, issuer, &payload_path);
+    let _ = fs::remove_dir_all(&temporary);
+    result
+}
+
+fn sigstore_verify_blob_arguments(
+    bundle: &Path,
+    identity: &str,
+    issuer: &str,
+    payload: &Path,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("verify-blob"),
+        OsString::from("--bundle"),
+        bundle.as_os_str().to_owned(),
+        OsString::from("--certificate-identity"),
+        OsString::from(identity),
+        OsString::from("--certificate-oidc-issuer"),
+        OsString::from(issuer),
+        payload.as_os_str().to_owned(),
+    ]
+}
+
+fn run_sigstore_verify_blob(
+    bundle: &Path,
+    identity: &str,
+    issuer: &str,
+    payload: &Path,
+) -> Result<(), String> {
+    let invocation = SigstoreVerifyInvocation {
+        arguments: sigstore_verify_blob_arguments(bundle, identity, issuer, payload),
+        #[cfg(test)]
+        bundle: bundle.to_owned(),
+        #[cfg(test)]
+        payload: payload.to_owned(),
+    };
+    #[cfg(test)]
+    if let Some(result) = invoke_test_sigstore_verifier(&invocation) {
+        return result;
+    }
     let result = Command::new("cosign")
-        .args([
-            OsStr::new("verify-blob"),
-            OsStr::new("--bundle"),
-            bundle_path.as_os_str(),
-            OsStr::new("--certificate-identity"),
-            OsStr::new(identity),
-            OsStr::new("--certificate-oidc-issuer"),
-            OsStr::new(issuer),
-            payload_path.as_os_str(),
-        ])
+        .args(&invocation.arguments)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .map_err(|error| format!("cannot run Sigstore verifier: {error}"))?;
-    let _ = fs::remove_dir_all(&temporary);
     verify_sigstore_process_result(result.status.success(), &result.stderr)
+}
+
+struct SigstoreVerifyInvocation {
+    arguments: Vec<OsString>,
+    #[cfg(test)]
+    bundle: PathBuf,
+    #[cfg(test)]
+    payload: PathBuf,
+}
+
+#[cfg(test)]
+type TestSigstoreVerifier = Box<dyn Fn(&SigstoreVerifyInvocation) -> Result<(), String>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SIGSTORE_VERIFIER: std::cell::RefCell<Option<TestSigstoreVerifier>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn invoke_test_sigstore_verifier(
+    invocation: &SigstoreVerifyInvocation,
+) -> Option<Result<(), String>> {
+    TEST_SIGSTORE_VERIFIER.with(|verifier| {
+        verifier
+            .borrow()
+            .as_ref()
+            .map(|verifier| verifier(invocation))
+    })
+}
+
+#[cfg(test)]
+struct TestSigstoreVerifierGuard;
+
+#[cfg(test)]
+impl TestSigstoreVerifierGuard {
+    fn install(verifier: TestSigstoreVerifier) -> Result<Self, String> {
+        TEST_SIGSTORE_VERIFIER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return Err("test Sigstore verifier is already installed".to_owned());
+            }
+            *slot = Some(verifier);
+            Ok(Self)
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSigstoreVerifierGuard {
+    fn drop(&mut self) {
+        TEST_SIGSTORE_VERIFIER.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 fn sigstore_workflow_keys(payload_role: &str) -> Result<&'static [&'static str], String> {
@@ -29264,6 +31676,7 @@ fn sigstore_workflow_keys(payload_role: &str) -> Result<&'static [&'static str],
         "collection-linux-release-acquirer" => &["collection_release_oracle_workflow"],
         "custody-reviewer" => &[
             "custody_workflow",
+            "collection_custody_review_workflow",
             "surveillance_workflow",
             "surveillance_watchdog_workflow",
         ],
@@ -29273,8 +31686,8 @@ fn sigstore_workflow_keys(payload_role: &str) -> Result<&'static [&'static str],
             "surveillance_workflow",
         ],
         "promotion-approver" => &["approval_workflow"],
+        "claim-author" | "claim-reviewer" => &["collection_activation_workflow"],
         "review-graph-reviewer"
-        | "claim-reviewer"
         | "divergence-reviewer"
         | "divergence-platform-reviewer"
         | "divergence-implementation-reviewer"
@@ -29926,6 +32339,10 @@ fn compatibility_status_counts(coverage: &JsonValue) -> Result<(u64, u64, u64, u
             }
         };
         counts[index] = counts[index].saturating_add(1);
+    }
+    if coverage.object()?.get("coverageScope").is_some() {
+        verify_scoped_collection_coverage_counts(coverage.object()?)?;
+        counts[4] = json_member(coverage.object()?, "outOfScopeClaimCells")?.number()?;
     }
     Ok((counts[0], counts[1], counts[2], counts[3], counts[4]))
 }
@@ -33708,6 +36125,7 @@ struct RegressionProviderContext {
     event: String,
     head_sha: String,
     directory_sha256: String,
+    archive_sha256: String,
     run_id: u64,
     run_attempt: u64,
     artifact_id: u64,
@@ -33724,6 +36142,7 @@ fn regression_provider_context() -> Result<RegressionProviderContext, String> {
         &[
             "artifactId",
             "artifactName",
+            "archiveSha256",
             "directorySha256",
             "event",
             "headSha",
@@ -33747,6 +36166,7 @@ fn regression_provider_context() -> Result<RegressionProviderContext, String> {
         directory_sha256: json_member(document, "directorySha256")?
             .string()?
             .to_owned(),
+        archive_sha256: json_member(document, "archiveSha256")?.string()?.to_owned(),
         run_id: positive("runId")?,
         run_attempt: positive("runAttempt")?,
         artifact_id: positive("artifactId")?,
@@ -33777,6 +36197,9 @@ fn regression_acquire_subject(
         .join(context.artifact_id.to_string())
         .join("zip");
     let bytes = github_api_bytes(&endpoint)?;
+    if sha256_bytes(&bytes).hex() != context.archive_sha256 {
+        return Err("regression provider archive differs from dispatch".to_owned());
+    }
     let temporary = create_private_temp_directory("hell-regression-acquire")?;
     let archive = temporary.join("artifact.zip");
     write_atomic(&archive, &bytes)?;
@@ -33795,6 +36218,7 @@ fn regression_acquire_subject(
         context.artifact_id,
         &context.head_sha,
         &context.directory_sha256,
+        &context.archive_sha256,
     )?;
     write_atomic(&selection.join("selection.json"), rendered.as_bytes())?;
     verify_regression_provider_archive(subject, &selection, context.artifact_id, &rendered)?;
@@ -33914,6 +36338,7 @@ fn regression_select_subject(root: &Path, options: &Options) -> Result<String, S
     let event = required("REGRESSION_PROVIDER_EVENT")?;
     let head = required("REGRESSION_PROVIDER_HEAD_SHA")?;
     let directory = required("REGRESSION_PROVIDER_DIRECTORY_SHA256")?;
+    let archive = required("REGRESSION_PROVIDER_ARCHIVE_SHA256")?;
     let artifact_id = positive("REGRESSION_PROVIDER_ARTIFACT_ID")?;
     let selection = verify_provider_artifact_selection_to(
         root,
@@ -33927,6 +36352,7 @@ fn regression_select_subject(root: &Path, options: &Options) -> Result<String, S
         artifact_id,
         &head,
         &directory,
+        &archive,
     )?;
     write_atomic(&output.join("selection.json"), selection.as_bytes())?;
     verify_regression_provider_archive(input, output, artifact_id, &selection)?;
@@ -34002,6 +36428,8 @@ pub(crate) struct VerifiedCollectionProviderArtifact {
     pub run_id: u64,
     pub run_attempt: u64,
     pub artifact_id: u64,
+    pub artifact_name: String,
+    pub archive_size: u64,
     pub workflow_ref: String,
     pub event: String,
     pub provider_head_commit: String,
@@ -34068,6 +36496,8 @@ fn verify_collection_provider_artifact_with_repository_id(
             "providerArchiveSize",
             "providerArtifactApiPage",
             "providerArtifactId",
+            "providerGhExecutableSha256",
+            "providerGhInstallManifestSha256",
             "providerHeadCommit",
             "providerJobApiPage",
             "providerJobId",
@@ -34079,6 +36509,7 @@ fn verify_collection_provider_artifact_with_repository_id(
             "workflowPath",
         ],
     )?;
+    verify_collection_provider_transport(provider_root, selection)?;
     let facts = collection_selection_facts(selection, platform)?;
     let run_bytes = read_regular_file(&directory.join("provider-selected-run.json"))?;
     let run = parse_json_bytes(&run_bytes)?;
@@ -34127,6 +36558,8 @@ fn verify_collection_provider_artifact_with_repository_id(
         run_id: facts.run_id,
         run_attempt: facts.run_attempt,
         artifact_id: facts.artifact_id,
+        artifact_name: facts.artifact,
+        archive_size: facts.archive_size,
         workflow_ref: COLLECTION_AUTHORITY_WORKFLOW_REF.to_owned(),
         event: json_member(run.object()?, "event")?.string()?.to_owned(),
         provider_head_commit: facts.provider_head_commit,
@@ -34142,6 +36575,24 @@ fn verify_collection_provider_artifact_with_repository_id(
         tree_sha256: facts.tree_sha256,
         provider_subject_sha256: subject_sha256,
     })
+}
+
+fn verify_collection_provider_transport(
+    provider_root: &Path,
+    selection: &BTreeMap<String, JsonValue>,
+) -> Result<(), String> {
+    let directory = provider_root.join("transport");
+    let manifest_path = directory.join("gh-install-manifest.json");
+    let manifest_bytes = read_regular_file(&manifest_path)?;
+    crate::collection_custody::verify_gh_install_manifest(&manifest_bytes)?;
+    if json_member(selection, "providerGhExecutableSha256")?.string()?
+        != crate::collection_transport::reviewed_gh_binary_sha256()
+        || json_member(selection, "providerGhInstallManifestSha256")?.string()?
+            != sha256_bytes(&manifest_bytes).hex()
+    {
+        return Err("retained provider gh identity differs".to_owned());
+    }
+    Ok(())
 }
 
 struct CollectionSelectionFacts {
@@ -37827,7 +40278,7 @@ fn push_json_value(output: &mut String, value: &JsonValue) -> Result<(), String>
     Ok(())
 }
 
-fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(4) {
         return Err("base64 length is not divisible by four".to_owned());
     }
@@ -37861,7 +40312,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn encode_base64(bytes: &[u8]) -> String {
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -37912,7 +40363,7 @@ fn require_git_sha_text(value: &str, label: &str) -> Result<(), String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Null,
     Bool(bool),
     Number(u64),
@@ -37922,7 +40373,7 @@ enum JsonValue {
 }
 
 impl JsonValue {
-    fn object(&self) -> Result<&BTreeMap<String, Self>, String> {
+    pub(crate) fn object(&self) -> Result<&BTreeMap<String, Self>, String> {
         match self {
             Self::Object(value) => Ok(value),
             _ => Err("expected JSON object".to_owned()),
@@ -37936,28 +40387,28 @@ impl JsonValue {
         }
     }
 
-    fn string(&self) -> Result<&str, String> {
+    pub(crate) fn string(&self) -> Result<&str, String> {
         match self {
             Self::String(value) => Ok(value),
             _ => Err("expected JSON string".to_owned()),
         }
     }
 
-    fn number(&self) -> Result<u64, String> {
+    pub(crate) fn number(&self) -> Result<u64, String> {
         match self {
             Self::Number(value) => Ok(*value),
             _ => Err("expected unsigned JSON integer".to_owned()),
         }
     }
 
-    fn boolean(&self) -> Result<bool, String> {
+    pub(crate) fn boolean(&self) -> Result<bool, String> {
         match self {
             Self::Bool(value) => Ok(*value),
             _ => Err("expected JSON boolean".to_owned()),
         }
     }
 
-    fn array(&self) -> Result<&[Self], String> {
+    pub(crate) fn array(&self) -> Result<&[Self], String> {
         match self {
             Self::Array(value) => Ok(value),
             _ => Err("expected JSON array".to_owned()),
@@ -37972,7 +40423,7 @@ impl JsonValue {
     }
 }
 
-fn parse_json(document: &str) -> Result<JsonValue, String> {
+pub(crate) fn parse_json(document: &str) -> Result<JsonValue, String> {
     let document = crate::fuzz_surfaces::strict_json_record(document.as_bytes())?;
     let mut parser = JsonParser {
         bytes: document.as_bytes(),
@@ -38194,7 +40645,7 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn json_member<'a>(
+pub(crate) fn json_member<'a>(
     object: &'a BTreeMap<String, JsonValue>,
     name: &str,
 ) -> Result<&'a JsonValue, String> {
@@ -38221,6 +40672,13 @@ fn exact_keys(object: &BTreeMap<String, JsonValue>, expected: &[&str]) -> Result
         ));
     }
     Ok(())
+}
+
+pub(crate) fn require_exact_json_keys(
+    object: &BTreeMap<String, JsonValue>,
+    expected: &[&str],
+) -> Result<(), String> {
+    exact_keys(object, expected)
 }
 
 #[cfg(test)]
@@ -38545,6 +41003,95 @@ pub(crate) mod tests {
             report["applicabilityDecisionsSha256"],
             JsonValue::String("decisions-digest".to_owned())
         );
+    }
+
+    #[test]
+    fn scoped_collection_coverage_counts_and_cell_inventory_are_exact() {
+        let mut details = BTreeMap::from([
+            (
+                "coverageScope".to_owned(),
+                JsonValue::String("activated-collection-exact14".to_owned()),
+            ),
+            ("activatedScopeCells".to_owned(), JsonValue::Number(14)),
+            ("activeEvidenceCells".to_owned(), JsonValue::Number(42)),
+            ("totalClaimCells".to_owned(), JsonValue::Number(42)),
+            ("explicitDispositionCells".to_owned(), JsonValue::Number(42)),
+            ("residualRuntimeCells".to_owned(), JsonValue::Number(120)),
+            ("outOfScopeClaimCells".to_owned(), JsonValue::Number(2_826)),
+        ]);
+        verify_scoped_collection_coverage_counts(&details).unwrap();
+        details.insert("cells".to_owned(), JsonValue::Array(Vec::new()));
+        assert_eq!(
+            claim_coverage_status_counts(&details).unwrap()["not-applicable"],
+            2_826
+        );
+        details.remove("cells");
+        for field in [
+            "activatedScopeCells",
+            "activeEvidenceCells",
+            "totalClaimCells",
+            "explicitDispositionCells",
+            "residualRuntimeCells",
+            "outOfScopeClaimCells",
+        ] {
+            let original = details
+                .insert(field.to_owned(), JsonValue::Number(0))
+                .unwrap();
+            assert!(verify_scoped_collection_coverage_counts(&details).is_err());
+            details.insert(field.to_owned(), original);
+        }
+        let cells = active_collection_applicability_rows()
+            .unwrap()
+            .into_iter()
+            .flat_map(|(builtin, dimension, _, _)| {
+                REQUIRED_CLAIM_PLATFORMS.iter().map(move |platform| {
+                    JsonValue::Object(BTreeMap::from([
+                        ("builtin".to_owned(), JsonValue::String(builtin.to_owned())),
+                        (
+                            "dimension".to_owned(),
+                            JsonValue::String(dimension.as_str().to_owned()),
+                        ),
+                        (
+                            "profile".to_owned(),
+                            JsonValue::String("upstream".to_owned()),
+                        ),
+                        (
+                            "platform".to_owned(),
+                            JsonValue::String((*platform).to_owned()),
+                        ),
+                    ]))
+                })
+            })
+            .collect::<Vec<_>>();
+        verify_scoped_collection_claim_cell_scope(&cells).unwrap();
+        assert!(verify_scoped_collection_claim_cell_scope(&cells[..41]).is_err());
+        let mut substituted = cells;
+        substituted[0]
+            .object_mut()
+            .unwrap()
+            .insert("platform".to_owned(), JsonValue::String("other".to_owned()));
+        assert!(verify_scoped_collection_claim_cell_scope(&substituted).is_err());
+    }
+
+    #[test]
+    fn scoped_collection_evidence_edges_require_every_case_on_three_platforms() {
+        let scopes = hell_testkit::activated_collection_claim_scopes().unwrap();
+        let mut edges = scopes
+            .into_iter()
+            .flat_map(|scope| {
+                scope.case_refs.into_iter().flat_map(|case_id| {
+                    REQUIRED_CLAIM_PLATFORMS
+                        .iter()
+                        .map(move |platform| (case_id.clone(), (*platform).to_owned()))
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(edges.len(), 1_191 * 3);
+        verify_scoped_collection_evidence_edges(&edges).unwrap();
+        let omitted = edges.pop_first().unwrap();
+        assert!(verify_scoped_collection_evidence_edges(&edges).is_err());
+        edges.insert((format!("{}-substituted", omitted.0), omitted.1));
+        assert!(verify_scoped_collection_evidence_edges(&edges).is_err());
     }
 
     #[test]
@@ -40127,10 +42674,11 @@ pub(crate) mod tests {
         let epoch = test_digest(b"epoch");
         let proposal = test_digest(b"proposal");
         let package = test_digest(b"package");
+        let archive = test_digest(b"archive");
         fs::write(
             &path,
             format!(
-                "{{\"inputs\":{{\"candidate_sha\":\"{source}\",\"assurance_epoch_sha256\":\"{epoch}\",\"promotion_proposal_sha256\":\"{proposal}\",\"proposal_run_id\":\"42\",\"proposal_run_attempt\":\"2\",\"proposal_artifact_id\":\"71\",\"proposal_package_sha256\":\"{package}\",\"require_promotion\":\"true\"}},\"repository\":{{}}}}\n"
+                "{{\"inputs\":{{\"candidate_sha\":\"{source}\",\"assurance_epoch_sha256\":\"{epoch}\",\"promotion_proposal_sha256\":\"{proposal}\",\"proposal_run_id\":\"42\",\"proposal_run_attempt\":\"2\",\"proposal_artifact_id\":\"71\",\"proposal_provider_archive_sha256\":\"{archive}\",\"proposal_package_sha256\":\"{package}\",\"require_promotion\":\"true\"}},\"repository\":{{}}}}\n"
             ),
         )
         .unwrap();
@@ -40141,7 +42689,7 @@ pub(crate) mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"inputs\":{{\"candidate_sha\":\"{source}\",\"assurance_epoch_sha256\":\"{epoch}\",\"promotion_proposal_sha256\":\"{proposal}\",\"proposal_run_id\":\"42\",\"proposal_run_attempt\":\"2\",\"proposal_artifact_id\":\"71\",\"proposal_package_sha256\":\"{package}\",\"require_promotion\":\"true\",\"forged\":\"yes\"}}}}\n"
+                "{{\"inputs\":{{\"candidate_sha\":\"{source}\",\"assurance_epoch_sha256\":\"{epoch}\",\"promotion_proposal_sha256\":\"{proposal}\",\"proposal_run_id\":\"42\",\"proposal_run_attempt\":\"2\",\"proposal_artifact_id\":\"71\",\"proposal_provider_archive_sha256\":\"{archive}\",\"proposal_package_sha256\":\"{package}\",\"require_promotion\":\"true\",\"forged\":\"yes\"}}}}\n"
             ),
         )
         .unwrap();
@@ -40661,17 +43209,18 @@ pub(crate) mod tests {
             ),
         ]);
         details.insert("unacceptableClaimGroups".to_owned(), JsonValue::Number(0));
-        assert!(verify_residual_claim_source_facts(&details, &[], 0, 0).is_ok());
+        let coverage = BTreeMap::from([("cells".to_owned(), JsonValue::Array(Vec::new()))]);
+        assert!(verify_residual_claim_source_facts(&details, &coverage, 0, 0).is_ok());
         let Some(JsonValue::Object(statuses)) = details.get_mut("claimStatusCounts") else {
             panic!("test residual statuses must be an object");
         };
         statuses.insert("exact".to_owned(), JsonValue::Number(1));
-        assert!(verify_residual_claim_source_facts(&details, &[], 0, 0).is_err());
+        assert!(verify_residual_claim_source_facts(&details, &coverage, 0, 0).is_err());
         let Some(JsonValue::Object(statuses)) = details.get_mut("claimStatusCounts") else {
             panic!("test residual statuses must be an object");
         };
         statuses.insert("exact".to_owned(), JsonValue::Number(0));
-        assert!(verify_residual_claim_source_facts(&details, &[], 1, 0).is_err());
+        assert!(verify_residual_claim_source_facts(&details, &coverage, 1, 0).is_err());
     }
 
     #[test]
@@ -42069,6 +44618,12 @@ last: value=9007199254740993"
                 .join("2026-05-29.toml"),
             PathBuf::from("compat").join("claim-rules.toml"),
             PathBuf::from("compat").join("corpus-obligations.toml"),
+            PathBuf::from("compat").join("collection-activation.toml"),
+            PathBuf::from("compat").join("collection-activation-provenance.json"),
+            PathBuf::from("crates")
+                .join("hell-testkit")
+                .join("src")
+                .join("corpus.rs"),
         ];
         let mut files = Vec::new();
         for relative in &relative_paths {
@@ -42090,7 +44645,12 @@ last: value=9007199254740993"
         files.pop();
         let incomplete = BTreeMap::from([("files".to_owned(), JsonValue::Array(files))]);
         assert!(
-            verify_authored_provider_file(&repository, &incomplete, &relative_paths[2]).is_err()
+            verify_authored_provider_file(
+                &repository,
+                &incomplete,
+                relative_paths.last().unwrap(),
+            )
+            .is_err()
         );
     }
 
@@ -42404,7 +44964,7 @@ last: value=9007199254740993"
         let workflow = ".github/workflows/artifact-authenticity-finalize.yml";
         assert_eq!(
             provider_run_workflow_ref(
-                ".github/workflows/artifact-authenticity-finalize.yml@refs/heads/main",
+                ".github/workflows/artifact-authenticity-finalize.yml@main",
                 workflow,
             )
             .unwrap(),
@@ -42414,10 +44974,88 @@ last: value=9007199254740993"
             ".github/workflows/artifact-authenticity-finalize.yml",
             ".github/workflows/artifact-authenticity-finalize.yml@",
             ".github/workflows/artifact-authenticity-finalize.yml@main@other",
+            ".github/workflows/artifact-authenticity-finalize.yml@refs/heads/main",
             ".github/workflows/other.yml@refs/heads/main",
         ] {
             assert!(provider_run_workflow_ref(invalid, workflow).is_err());
         }
+    }
+
+    #[test]
+    fn rendered_provider_selection_is_canonical_for_historical_replay() {
+        let rendered = render_provider_selection(&ProviderSelection {
+            artifact_name: "artifact",
+            workflow_path: ".github/workflows/collection-activation-preparation.yml",
+            event_name: "workflow_dispatch",
+            run_id: 1,
+            run_attempt: 1,
+            artifact_id: 2,
+            candidate: &"a".repeat(40),
+            directory_sha256: &"b".repeat(64),
+            workflow_sha256: &"c".repeat(64),
+            repository_id: "1327351238",
+            artifact_bytes: b"artifact\n",
+            run_bytes: b"run\n",
+            provider_archive_sha256: &"d".repeat(64),
+            provider_archive_size: 1,
+            created_at: "2026-01-01T00:00:00Z",
+            expires_at: "2026-01-02T00:00:00Z",
+            archive_download_url: "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/2/zip",
+        });
+        let document = parse_json(&rendered).unwrap();
+        assert_eq!(
+            canonical_json_bytes(&document).unwrap(),
+            rendered.as_bytes()
+        );
+    }
+
+    #[test]
+    fn protected_review_subject_rejects_the_old_alternate_review_id() {
+        let directory = create_private_temp_directory("hell-review-id-mutant").unwrap();
+        let packet = directory.join("review-packet.json");
+        let candidate = test_git_sha('a');
+        let epoch = test_digest(b"activation-review-id-epoch");
+        let artifact = test_digest(b"activation-review-id-artifact");
+        let issued_at = "2026-08-12T00:00:00Z";
+        let reviewer = "claim-author:github-account-501";
+        let artifacts = BTreeSet::from([artifact.clone()]);
+        let review_id = review_statement_id(&ReviewStatementIdentity {
+            candidate: &candidate,
+            epoch: &epoch,
+            role: "claim-author",
+            reviewer,
+            decision: "accept",
+            issued_at,
+            artifacts: &artifacts,
+            claim_groups: &BTreeMap::new(),
+            findings_sha256: &sha256_bytes(b"[]\n").hex(),
+        });
+        let render = |id: &str| {
+            format!(
+                "{{\"schemaVersion\":1,\"reviewId\":{},\"role\":\"claim-author\",\"reviewer\":{},\"decision\":\"accept\",\"candidateCommit\":{},\"assuranceEpochSha256\":{},\"reviewedArtifacts\":[{}],\"distinctSubjects\":1,\"independenceViolations\":[],\"findings\":[],\"issuedAt\":{}}}\n",
+                json_string(id),
+                json_string(reviewer),
+                json_string(&candidate),
+                json_string(&epoch),
+                json_string(&artifact),
+                json_string(issued_at),
+            )
+        };
+        write_atomic(&packet, render(&review_id).as_bytes()).unwrap();
+        protected_review_subject(&packet, "claim-author").unwrap();
+        let alternate =
+            sha256_bytes(format!("{candidate}\n{epoch}\nclaim-author\n{artifact}\n").as_bytes())
+                .hex();
+        write_atomic(&packet, render(&alternate).as_bytes()).unwrap();
+        assert!(protected_review_subject(&packet, "claim-author").is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn activation_review_timestamp_requires_exact_authorization_time() {
+        let packet = parse_json("{\"issuedAt\":\"2026-08-12T00:00:00Z\"}\n").unwrap();
+        activation_review_timestamp_matches(&packet, "2026-08-12T00:00:00Z").unwrap();
+        assert!(activation_review_timestamp_matches(&packet, "2026-08-12T00:00:01Z").is_err());
     }
 
     #[test]
@@ -42501,6 +45139,36 @@ last: value=9007199254740993"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn collection_custody_reviewer_has_one_exact_dedicated_workflow_identity() {
+        let document = read_text(&root().join("compat/trust-roots.toml")).unwrap();
+        let key = "collection_custody_review_workflow";
+        let workflow = ".github/workflows/collection-custody-review.yml";
+        assert!(
+            sigstore_workflow_keys("custody-reviewer")
+                .unwrap()
+                .contains(&key)
+        );
+        assert_eq!(exact_assignment_string(&document, key).unwrap(), workflow);
+        assert!(github_workflow_identity_matches(
+            "https://github.com/Portfoligno/hell-rs/.github/workflows/collection-custody-review.yml@refs/heads/main",
+            "Portfoligno/hell-rs",
+            workflow,
+            "refs/heads/main",
+        ));
+        for identity in [
+            "https://github.com/Portfoligno/hell-rs/.github/workflows/collection-custody-integration.yml@refs/heads/main",
+            "https://github.com/Portfoligno/hell-rs/.github/workflows/collection-custody-review.yml@refs/heads/candidate",
+        ] {
+            assert!(!github_workflow_identity_matches(
+                identity,
+                "Portfoligno/hell-rs",
+                workflow,
+                "refs/heads/main",
+            ));
+        }
     }
 
     #[test]
@@ -43429,6 +46097,10 @@ last: value=9007199254740993"
             ("type".to_owned(), JsonValue::String("file".to_owned())),
         ]))]);
         let tree = sha256_bytes(&canonical_json_bytes(&inventory).unwrap()).hex();
+        let transport = provider.join("transport");
+        fs::create_dir(&transport).unwrap();
+        let gh_manifest = collection_provider_gh_manifest_fixture();
+        fs::write(transport.join("gh-install-manifest.json"), &gh_manifest).unwrap();
         let (repository, provider_head) = collection_fixture_repository(&temporary);
         let artifact = collection_provider_artifact_fixture(&provider_head, &archive);
         let artifact_page = JsonValue::Object(BTreeMap::from([
@@ -43471,7 +46143,12 @@ last: value=9007199254740993"
         )
         .unwrap();
         fs::write(platform_root.join("provider-workflow.yml"), workflow).unwrap();
-        let selection = collection_provider_selection_fixture(&provider_head, &archive, &tree);
+        let selection = collection_provider_selection_fixture(
+            &provider_head,
+            &archive,
+            &tree,
+            &sha256_bytes(&gh_manifest).hex(),
+        );
         fs::write(
             platform_root.join("selection.json"),
             canonical_json_bytes(&selection).unwrap(),
@@ -43598,6 +46275,7 @@ last: value=9007199254740993"
         provider_head: &str,
         archive: &[u8],
         tree: &str,
+        gh_manifest_sha256: &str,
     ) -> JsonValue {
         JsonValue::Object(BTreeMap::from([
             (
@@ -43635,6 +46313,16 @@ last: value=9007199254740993"
             ),
             ("providerArtifactId".to_owned(), JsonValue::Number(99)),
             (
+                "providerGhExecutableSha256".to_owned(),
+                JsonValue::String(
+                    crate::collection_transport::reviewed_gh_binary_sha256().to_owned(),
+                ),
+            ),
+            (
+                "providerGhInstallManifestSha256".to_owned(),
+                JsonValue::String(gh_manifest_sha256.to_owned()),
+            ),
+            (
                 "providerHeadCommit".to_owned(),
                 JsonValue::String(provider_head.to_owned()),
             ),
@@ -43659,6 +46347,24 @@ last: value=9007199254740993"
                 JsonValue::String(COLLECTION_AUTHORITY_WORKFLOW_PATH.to_owned()),
             ),
         ]))
+    }
+
+    fn collection_provider_gh_manifest_fixture() -> Vec<u8> {
+        canonical_json_bytes(&JsonValue::Object(BTreeMap::from([
+            ("archiveInventorySha256".to_owned(), JsonValue::String(test_digest(b"inventory"))),
+            ("archiveMemberCount".to_owned(), JsonValue::Number(1)),
+            ("binaryArchivePath".to_owned(), JsonValue::String("gh_2.93.0_linux_amd64/bin/gh".to_owned())),
+            ("binaryMode".to_owned(), JsonValue::String("0755".to_owned())),
+            ("ghArchiveSha256".to_owned(), JsonValue::String("02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0".to_owned())),
+            ("ghArchiveUrl".to_owned(), JsonValue::String("https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_linux_amd64.tar.gz".to_owned())),
+            ("ghBinarySha256".to_owned(), JsonValue::String(crate::collection_transport::reviewed_gh_binary_sha256().to_owned())),
+            ("ghChecksumsEntry".to_owned(), JsonValue::String("02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0  gh_2.93.0_linux_amd64.tar.gz".to_owned())),
+            ("ghChecksumsSha256".to_owned(), JsonValue::String("f62a3bc9dedc88262c9c2b56eb653cb3ded6bde8076bdbb151f4cce9c8729da5".to_owned())),
+            ("ghChecksumsUrl".to_owned(), JsonValue::String("https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_checksums.txt".to_owned())),
+            ("ghReleaseVersion".to_owned(), JsonValue::String("2.93.0".to_owned())),
+            ("schema".to_owned(), JsonValue::String("hell.collection-custody.gh-install.v1".to_owned())),
+        ])))
+        .unwrap()
     }
 
     #[test]
@@ -43782,6 +46488,40 @@ last: value=9007199254740993"
                 b"name: Nightly\n",
             )
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn collection_provider_rejects_pinned_transport_substitutions() {
+        for field in [
+            "providerGhExecutableSha256",
+            "providerGhInstallManifestSha256",
+        ] {
+            assert_collection_provider_identity_mutation_rejected(|fixture| {
+                let path = fixture.platform_root.join("selection.json");
+                let mut selection = parse_json(&read_text(&path).unwrap()).unwrap();
+                selection.object_mut().unwrap().insert(
+                    field.to_owned(),
+                    JsonValue::String(test_digest(field.as_bytes())),
+                );
+                write_json_fixture(&path, &selection);
+            });
+        }
+        assert_collection_provider_identity_mutation_rejected(|fixture| {
+            let path = fixture.provider.join("transport/gh-install-manifest.json");
+            let mut manifest = parse_json(&read_text(&path).unwrap()).unwrap();
+            manifest.object_mut().unwrap().insert(
+                "ghReleaseVersion".to_owned(),
+                JsonValue::String("2.92.0".to_owned()),
+            );
+            write_json_fixture(&path, &manifest);
+        });
+        #[cfg(unix)]
+        assert_collection_provider_identity_mutation_rejected(|fixture| {
+            use std::os::unix::fs::symlink;
+            let path = fixture.provider.join("transport/gh-install-manifest.json");
+            fs::remove_file(&path).unwrap();
+            symlink("elsewhere.json", path).unwrap();
         });
     }
 
@@ -44063,7 +46803,7 @@ last: value=9007199254740993"
         )
         .unwrap();
         let policy = load_acquisition_policy(&directory).unwrap();
-        assert!(policy.repository_id.is_none());
+        assert_eq!(policy.repository_id.as_deref(), Some("1327351238"));
         for forged in [
             committed.replace(
                 "require_candidate_commit = true",
@@ -44071,6 +46811,7 @@ last: value=9007199254740993"
             ),
             committed.replace("external-versioned-object", "same-provider-download"),
             committed.replace("minimum_acquisitions = 2\n", ""),
+            committed.replace("repository_id = \"1327351238\"", "repository_id = \"9\""),
         ] {
             fs::write(
                 directory.join("compat").join("acquisition-sources.toml"),
@@ -45868,7 +48609,7 @@ last: value=9007199254740993"
             ("id".to_owned(), JsonValue::Number(19)),
             (
                 "path".to_owned(),
-                JsonValue::String(format!("{}@refs/heads/main", facts.workflow)),
+                JsonValue::String(format!("{}@main", facts.workflow)),
             ),
             (
                 "repository".to_owned(),
@@ -46062,6 +48803,72 @@ last: value=9007199254740993"
     }
 
     #[test]
+    fn historical_activation_provider_metadata_rejects_impossible_retained_facts() {
+        let (mut selection, artifact, mut run) = retained_regression_provider_api_fixture();
+        let workflow = ".github/workflows/collection-custody-integration.yml";
+        selection.insert(
+            "workflowPath".to_owned(),
+            JsonValue::String(workflow.to_owned()),
+        );
+        run.insert(
+            "path".to_owned(),
+            JsonValue::String(format!("{workflow}@main")),
+        );
+        verify_historical_provider_metadata(
+            &selection,
+            &artifact,
+            &run,
+            "subject-19-2",
+            &"a".repeat(40),
+            "23",
+        )
+        .unwrap();
+        for (key, value) in [
+            ("providerRunId", JsonValue::Number(0)),
+            ("providerRunAttempt", JsonValue::Number(0)),
+            ("providerArtifactId", JsonValue::Number(0)),
+            ("providerArchiveSize", JsonValue::Number(0)),
+            (
+                "providerArchiveUrl",
+                JsonValue::String("https://example.invalid/artifact.zip".to_owned()),
+            ),
+            (
+                "providerExpiresAt",
+                JsonValue::String("2026-07-01T00:00:00Z".to_owned()),
+            ),
+        ] {
+            let original = selection.insert(key.to_owned(), value).unwrap();
+            assert!(
+                verify_historical_provider_metadata(
+                    &selection,
+                    &artifact,
+                    &run,
+                    "subject-19-2",
+                    &"a".repeat(40),
+                    "23",
+                )
+                .is_err()
+            );
+            selection.insert(key.to_owned(), original);
+        }
+        run.insert(
+            "path".to_owned(),
+            JsonValue::String(format!("{workflow}@refs/heads/main")),
+        );
+        assert!(
+            verify_historical_provider_metadata(
+                &selection,
+                &artifact,
+                &run,
+                "subject-19-2",
+                &"a".repeat(40),
+                "23",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn committed_regression_row_binds_every_package_authority_column() {
         let verified = VerifiedRegressionProposal {
             package_sha256: test_digest(b"package"),
@@ -46128,7 +48935,7 @@ last: value=9007199254740993"
             ("id".to_owned(), JsonValue::Number(71)),
             (
                 "path".to_owned(),
-                JsonValue::String(format!("{workflow}@refs/heads/main")),
+                JsonValue::String(format!("{workflow}@main")),
             ),
             ("run_attempt".to_owned(), JsonValue::Number(2)),
             (
@@ -46154,11 +48961,12 @@ last: value=9007199254740993"
                 .unwrap()
                 .insert(field.to_owned(), value)
                 .unwrap();
-            assert!(
-                automatic_regression_run(&run, &candidate, workflow, "schedule")
-                    .unwrap()
-                    .is_none()
-            );
+            let result = automatic_regression_run(&run, &candidate, workflow, "schedule");
+            if field == "path" {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_none());
+            }
             run.object_mut().unwrap().insert(field.to_owned(), original);
         }
 
@@ -46852,9 +49660,7 @@ last: value=9007199254740993"
             ("id".to_owned(), JsonValue::Number(identity.run_id)),
             (
                 "path".to_owned(),
-                JsonValue::String(
-                    ".github/workflows/regression-corpus.yml@refs/heads/main".to_owned(),
-                ),
+                JsonValue::String(".github/workflows/regression-corpus.yml@main".to_owned()),
             ),
             (
                 "repository".to_owned(),
@@ -47876,5 +50682,797 @@ last: value=9007199254740993"
         })
         .unwrap();
         assert_eq!(attempted, vec![80, 70]);
+    }
+
+    #[test]
+    fn provider_workflow_reference_requires_exact_protected_main_identity() {
+        let workflow = ".github/workflows/collection-activation.yml";
+        assert_eq!(
+            provider_run_workflow_ref(".github/workflows/collection-activation.yml@main", workflow,),
+            Ok("refs/heads/main".to_owned())
+        );
+        for mutant in [
+            ".github/workflows/collection-activation.yml",
+            ".github/workflows/collection-activation.yml@refs/heads/main",
+            ".github/workflows/collection-activation.yml@refs/heads/topic",
+            ".github/workflows/other.yml@refs/heads/main",
+            ".github/workflows/collection-activation.yml@refs/heads/main@again",
+        ] {
+            assert!(provider_run_workflow_ref(mutant, workflow).is_err());
+        }
+    }
+
+    #[test]
+    fn test_sigstore_process_seam_binds_exact_typed_invocation_and_staged_bytes() {
+        let directory = create_private_temp_directory("hell-sigstore-seam-test").unwrap();
+        let bundle = directory.join("bundle.json");
+        let payload = directory.join("payload.json");
+        let bundle_bytes =
+            br#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}"#;
+        let payload_bytes = br#"{"role":"claim-reviewer"}"#;
+        fs::write(&bundle, bundle_bytes).unwrap();
+        fs::write(&payload, payload_bytes).unwrap();
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&invoked);
+        let expected_bundle = bundle.clone();
+        let expected_payload = payload.clone();
+        let _guard = TestSigstoreVerifierGuard::install(Box::new(move |invocation| {
+            assert_eq!(invocation.bundle, expected_bundle);
+            assert_eq!(invocation.payload, expected_payload);
+            assert_eq!(fs::read(&invocation.bundle).unwrap(), bundle_bytes);
+            assert_eq!(fs::read(&invocation.payload).unwrap(), payload_bytes);
+            assert_eq!(
+                invocation.arguments,
+                vec![
+                    OsString::from("verify-blob"),
+                    OsString::from("--bundle"),
+                    invocation.bundle.as_os_str().to_owned(),
+                    OsString::from("--certificate-identity"),
+                    OsString::from("https://github.com/Portfoligno/hell-rs/.github/workflows/collection-activation.yml@refs/heads/main"),
+                    OsString::from("--certificate-oidc-issuer"),
+                    OsString::from("https://token.actions.githubusercontent.com"),
+                    invocation.payload.as_os_str().to_owned(),
+                ]
+            );
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }))
+        .unwrap();
+        run_sigstore_verify_blob(
+            &bundle,
+            "https://github.com/Portfoligno/hell-rs/.github/workflows/collection-activation.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+            &payload,
+        )
+        .unwrap();
+        assert!(invoked.load(Ordering::SeqCst));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn test_github_api_seam_preserves_typed_endpoint_and_operation() {
+        let endpoint = PathBuf::from("repos/Portfoligno/hell-rs/actions/artifacts/17");
+        let expected = endpoint.clone();
+        let _guard = TestGithubApiGuard::install(Box::new(move |observed, operation| {
+            assert_eq!(observed, expected);
+            assert_eq!(operation, ExternalServiceOperation::EvidenceCollection);
+            Ok(JsonValue::Object(BTreeMap::from([(
+                "id".to_owned(),
+                JsonValue::Number(17),
+            )])))
+        }))
+        .unwrap();
+        let response = github_api_json(&endpoint).unwrap();
+        assert_eq!(response.object().unwrap()["id"], JsonValue::Number(17));
+    }
+
+    fn current_run_artifact_response(id: u64, name: &str, run_id: u64) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            (
+                "artifacts".to_owned(),
+                JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
+                    (
+                        "archive_download_url".to_owned(),
+                        JsonValue::String(format!(
+                            "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/{id}/zip"
+                        )),
+                    ),
+                    (
+                        "created_at".to_owned(),
+                        JsonValue::String("2026-08-12T00:00:00Z".to_owned()),
+                    ),
+                    (
+                        "digest".to_owned(),
+                        JsonValue::String(format!("sha256:{}", test_digest(name.as_bytes()))),
+                    ),
+                    ("expired".to_owned(), JsonValue::Bool(false)),
+                    (
+                        "expires_at".to_owned(),
+                        JsonValue::String("2033-08-12T00:00:00Z".to_owned()),
+                    ),
+                    ("id".to_owned(), JsonValue::Number(id)),
+                    ("name".to_owned(), JsonValue::String(name.to_owned())),
+                    ("size_in_bytes".to_owned(), JsonValue::Number(41)),
+                    (
+                        "workflow_run".to_owned(),
+                        JsonValue::Object(BTreeMap::from([(
+                            "id".to_owned(),
+                            JsonValue::Number(run_id),
+                        )])),
+                    ),
+                ]))]),
+            ),
+            ("total_count".to_owned(), JsonValue::Number(1)),
+        ]))
+    }
+
+    #[test]
+    fn current_run_artifact_selection_binds_two_distinct_immutable_objects() {
+        let directory = create_private_temp_directory("hell-current-run-artifacts").unwrap();
+        let workflow = ".github/workflows/custody-provider-selector-recovery.yml";
+        fs::create_dir_all(directory.join(".github/workflows")).unwrap();
+        fs::write(directory.join(workflow), b"name: fixture\n").unwrap();
+        let candidate = test_git_sha('a');
+        let callback_candidate = candidate.clone();
+        let primary = "ephemeralEvidence-provider-selector-recovery-primary-worm-42-2";
+        let secondary = "ephemeralEvidence-provider-selector-recovery-secondary-worm-42-2";
+        let _guard = TestGithubApiGuard::install(Box::new(move |endpoint, operation| {
+            assert_eq!(operation, ExternalServiceOperation::EvidenceCollection);
+            let endpoint = endpoint.to_string_lossy();
+            if endpoint.ends_with("/actions/runs/42/attempts/2") {
+                Ok(JsonValue::Object(BTreeMap::from([
+                    (
+                        "event".to_owned(),
+                        JsonValue::String("workflow_dispatch".to_owned()),
+                    ),
+                    (
+                        "head_sha".to_owned(),
+                        JsonValue::String(callback_candidate.clone()),
+                    ),
+                    ("id".to_owned(), JsonValue::Number(42)),
+                    (
+                        "path".to_owned(),
+                        JsonValue::String(format!("{workflow}@main")),
+                    ),
+                    (
+                        "repository".to_owned(),
+                        JsonValue::Object(BTreeMap::from([
+                            (
+                                "full_name".to_owned(),
+                                JsonValue::String("Portfoligno/hell-rs".to_owned()),
+                            ),
+                            ("id".to_owned(), JsonValue::Number(1_327_351_238)),
+                        ])),
+                    ),
+                    ("run_attempt".to_owned(), JsonValue::Number(2)),
+                ])))
+            } else if endpoint
+                .contains("?name=ephemeralEvidence-provider-selector-recovery-primary-worm-42-2")
+            {
+                Ok(current_run_artifact_response(501, primary, 42))
+            } else if endpoint
+                .contains("?name=ephemeralEvidence-provider-selector-recovery-secondary-worm-42-2")
+            {
+                Ok(current_run_artifact_response(502, secondary, 42))
+            } else {
+                Err(format!(
+                    "unexpected current-run artifact endpoint {endpoint}"
+                ))
+            }
+        }))
+        .unwrap();
+        let output = directory.join("selection");
+        let selected = select_current_run_artifacts(&CurrentRunArtifactSelectionRequest {
+            root: &directory,
+            output: &output,
+            workflow_path: workflow,
+            event_name: "workflow_dispatch",
+            run_id: 42,
+            run_attempt: 2,
+            candidate: &candidate,
+            primary_artifact_name: primary,
+            secondary_artifact_name: secondary,
+        })
+        .unwrap();
+        assert_eq!(selected.primary_artifact_id, 501);
+        assert_eq!(selected.secondary_artifact_id, 502);
+        let replay = verify_current_run_artifact_selection(&output).unwrap();
+        assert_eq!(replay.primary_artifact_name, primary);
+        assert_eq!(replay.secondary_artifact_name, secondary);
+        assert_eq!(
+            fs::read_dir(&output).unwrap().count(),
+            5,
+            "selection retains exact run, two provider responses, document, and digest"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn activation_e2e_provider_response(endpoint: &Path) -> Result<JsonValue, String> {
+        let endpoint = endpoint
+            .to_str()
+            .ok_or_else(|| "activation E2E provider endpoint is not UTF-8".to_owned())?;
+        let endpoint = endpoint.split_once('?').map_or(endpoint, |(path, _)| path);
+        let (run_id, run_attempt, artifact_id, artifact_name, workflow, digest) =
+            if endpoint.ends_with("/actions/artifacts/201") {
+                (
+                    101,
+                    1,
+                    201,
+                    "collection-custody-admission-101-1",
+                    "",
+                    "d".repeat(64),
+                )
+            } else if endpoint.ends_with("/actions/runs/101/attempts/1") {
+                (
+                    101,
+                    1,
+                    201,
+                    "",
+                    ".github/workflows/collection-custody-integration.yml",
+                    "d".repeat(64),
+                )
+            } else if endpoint.ends_with("/actions/artifacts/202") {
+                (
+                    102,
+                    1,
+                    202,
+                    "collection-activation-proposal-102-1",
+                    "",
+                    "e".repeat(64),
+                )
+            } else if endpoint.ends_with("/actions/runs/102/attempts/1") {
+                (
+                    102,
+                    1,
+                    202,
+                    "",
+                    ".github/workflows/collection-activation-preparation.yml",
+                    "e".repeat(64),
+                )
+            } else if endpoint.ends_with("/actions/runs/103/artifacts") {
+                return Ok(activation_e2e_review_artifacts(103, 301));
+            } else if endpoint.ends_with("/actions/runs/104/artifacts") {
+                return Ok(activation_e2e_review_artifacts(104, 302));
+            } else if endpoint.ends_with("/actions/runs/103/attempts/1") {
+                (
+                    103,
+                    1,
+                    301,
+                    "",
+                    ".github/workflows/collection-activation.yml",
+                    "f".repeat(64),
+                )
+            } else if endpoint.ends_with("/actions/runs/104/attempts/1") {
+                (
+                    104,
+                    1,
+                    302,
+                    "",
+                    ".github/workflows/collection-activation.yml",
+                    "a".repeat(64),
+                )
+            } else {
+                return Err(format!("unexpected activation E2E endpoint {endpoint}"));
+            };
+        if workflow.is_empty() {
+            Ok(activation_e2e_artifact_response(
+                run_id,
+                artifact_id,
+                artifact_name,
+                &digest,
+            ))
+        } else {
+            Ok(JsonValue::Object(BTreeMap::from([
+                (
+                    "event".to_owned(),
+                    JsonValue::String("workflow_dispatch".to_owned()),
+                ),
+                ("head_sha".to_owned(), JsonValue::String(String::new())),
+                ("id".to_owned(), JsonValue::Number(run_id)),
+                (
+                    "path".to_owned(),
+                    JsonValue::String(format!("{workflow}@main")),
+                ),
+                (
+                    "repository".to_owned(),
+                    JsonValue::Object(BTreeMap::from([
+                        (
+                            "full_name".to_owned(),
+                            JsonValue::String("Portfoligno/hell-rs".to_owned()),
+                        ),
+                        ("id".to_owned(), JsonValue::Number(1_327_351_238)),
+                    ])),
+                ),
+                ("run_attempt".to_owned(), JsonValue::Number(run_attempt)),
+            ])))
+        }
+    }
+
+    fn activation_e2e_review_artifacts(run_id: u64, artifact_id: u64) -> JsonValue {
+        let name = format!("collection-activation-proposal-{run_id}-1");
+        JsonValue::Object(BTreeMap::from([
+            ("total_count".to_owned(), JsonValue::Number(1)),
+            (
+                "artifacts".to_owned(),
+                JsonValue::Array(vec![activation_e2e_artifact_response(
+                    run_id,
+                    artifact_id,
+                    &name,
+                    &if run_id == 103 { "f" } else { "a" }.repeat(64),
+                )]),
+            ),
+        ]))
+    }
+
+    fn activation_e2e_artifact_response(
+        run_id: u64,
+        artifact_id: u64,
+        artifact_name: &str,
+        digest: &str,
+    ) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            (
+                "archive_download_url".to_owned(),
+                JsonValue::String(format!(
+                    "https://api.github.com/repos/Portfoligno/hell-rs/actions/artifacts/{artifact_id}/zip"
+                )),
+            ),
+            (
+                "created_at".to_owned(),
+                JsonValue::String("2026-08-01T00:00:00Z".to_owned()),
+            ),
+            (
+                "digest".to_owned(),
+                JsonValue::String(format!("sha256:{digest}")),
+            ),
+            ("expired".to_owned(), JsonValue::Bool(false)),
+            (
+                "expires_at".to_owned(),
+                JsonValue::String("2026-09-01T00:00:00Z".to_owned()),
+            ),
+            ("id".to_owned(), JsonValue::Number(artifact_id)),
+            (
+                "name".to_owned(),
+                JsonValue::String(artifact_name.to_owned()),
+            ),
+            ("size_in_bytes".to_owned(), JsonValue::Number(4096)),
+            (
+                "workflow_run".to_owned(),
+                JsonValue::Object(BTreeMap::from([(
+                    "id".to_owned(),
+                    JsonValue::Number(run_id),
+                )])),
+            ),
+        ]))
+    }
+
+    struct ActivationReviewTestIdentity {
+        role: &'static str,
+        account_id: u64,
+        run_id: u64,
+    }
+
+    fn activation_review_test_package(
+        repository: &Path,
+        reviewed_subject: &Path,
+        output: &Path,
+        candidate: &str,
+        epoch: &str,
+        identity: &ActivationReviewTestIdentity,
+    ) -> Result<(), String> {
+        fs::create_dir_all(output)
+            .map_err(|error| format!("cannot create activation review fixture: {error}"))?;
+        let key = output.join("signing-key");
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .map_err(|error| format!("cannot generate activation review key: {error}"))?;
+        if !status.success() {
+            return Err("cannot generate activation review key".to_owned());
+        }
+        let public_key = read_text(&key.with_extension("pub"))?;
+        let public_key = public_key
+            .split_ascii_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let reviewed_digest = record_digest(reviewed_subject)?;
+        let provider_request = FinalReviewProviderRequest {
+            root: repository,
+            reviewed_artifact: reviewed_subject,
+            output: &output.join("authorization.json"),
+            category: Some(if identity.role == "claim-author" {
+                "collection-activation-author"
+            } else {
+                "collection-activation-final"
+            }),
+            candidate,
+            reviewed_artifact_sha256: &reviewed_digest,
+            run_id: identity.run_id,
+            run_attempt: 1,
+            platform: None,
+        };
+        let provider = final_review_provider_facts_if_required(&provider_request)?
+            .ok_or_else(|| "activation review fixture lacks provider facts".to_owned())?;
+        retain_activation_review_test_authorization(
+            repository,
+            output,
+            candidate,
+            &reviewed_digest,
+            &public_key,
+            identity,
+            &provider,
+        )?;
+        write_activation_review_test_packet(
+            repository,
+            reviewed_subject,
+            output,
+            candidate,
+            epoch,
+            identity,
+        )?;
+        sign_activation_review_test_packet(output, &key, identity.role)?;
+        fs::remove_file(key).map_err(|error| format!("cannot remove test private key: {error}"))?;
+        fs::remove_file(output.join("signing-key.pub"))
+            .map_err(|error| format!("cannot remove test public key: {error}"))
+    }
+
+    fn retain_activation_review_test_authorization(
+        repository: &Path,
+        output: &Path,
+        candidate: &str,
+        reviewed_digest: &str,
+        public_key: &str,
+        identity: &ActivationReviewTestIdentity,
+        provider: &FinalReviewProviderFacts,
+    ) -> Result<(), String> {
+        let reviewed_at = "2026-08-12T00:00:00Z";
+        let environment = if identity.role == "claim-author" {
+            "compatibility-claim-author"
+        } else {
+            "compatibility-claim-review"
+        };
+        let team_key = if identity.role == "claim-author" {
+            "claim_author_team"
+        } else {
+            "claim_reviewer_team"
+        };
+        let policy = read_text(&repository.join("compat/review-policy.toml"))?;
+        let team = assignment_string(&policy, team_key)?;
+        let login = format!("activation-e2e-{}", identity.account_id);
+        let comment = format!(
+            "{{\"candidateCommit\":{},\"decision\":\"accept\",\"exceptionIssue\":null,\"reviewRationale\":\"independent protected activation review fixture\",\"reviewedArtifactSha256\":{},\"reviewedAt\":{},\"role\":{},\"schemaVersion\":2,\"sshSigningKeyId\":{}}}",
+            json_string(candidate),
+            json_string(reviewed_digest),
+            json_string(reviewed_at),
+            json_string(identity.role),
+            identity.account_id,
+        );
+        let approvals = JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
+            ("comment".to_owned(), JsonValue::String(comment)),
+            (
+                "environments".to_owned(),
+                JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([(
+                    "name".to_owned(),
+                    JsonValue::String(environment.to_owned()),
+                )]))]),
+            ),
+            ("state".to_owned(), JsonValue::String("approved".to_owned())),
+            (
+                "user".to_owned(),
+                activation_review_test_user(identity.account_id, &login),
+            ),
+        ]))]);
+        let membership = JsonValue::Object(BTreeMap::from([
+            ("role".to_owned(), JsonValue::String("member".to_owned())),
+            ("state".to_owned(), JsonValue::String("active".to_owned())),
+            (
+                "user".to_owned(),
+                activation_review_test_user(identity.account_id, &login),
+            ),
+        ]));
+        let signing_keys = JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
+            (
+                "created_at".to_owned(),
+                JsonValue::String("2026-08-01T00:00:00Z".to_owned()),
+            ),
+            ("id".to_owned(), JsonValue::Number(identity.account_id)),
+            ("key".to_owned(), JsonValue::String(public_key.to_owned())),
+            (
+                "title".to_owned(),
+                JsonValue::String("activation-e2e".to_owned()),
+            ),
+        ]))]);
+        let approvals = canonical_json_bytes(&approvals)?;
+        let membership = canonical_json_bytes(&membership)?;
+        let signing_keys = canonical_json_bytes(&signing_keys)?;
+        retain_review_authorization(
+            repository,
+            &output.join("authorization.json"),
+            &ReviewAuthorizationRetention {
+                role: identity.role,
+                candidate,
+                reviewed_artifact_sha256: reviewed_digest,
+                run_id: identity.run_id,
+                run_attempt: 1,
+                environment,
+                reviewed_at,
+                review_rationale: "independent protected activation review fixture",
+                exception_issue: None,
+                account_id: identity.account_id,
+                login: &login,
+                team: &team,
+                signing_key_id: identity.account_id,
+                signing_key: public_key,
+                approvals_bytes: &approvals,
+                membership_bytes: &membership,
+                signing_keys_bytes: &signing_keys,
+                provider: Some(provider),
+            },
+        )
+    }
+
+    fn write_activation_review_test_packet(
+        repository: &Path,
+        reviewed_subject: &Path,
+        output: &Path,
+        candidate: &str,
+        epoch: &str,
+        identity: &ActivationReviewTestIdentity,
+    ) -> Result<(), String> {
+        let authorization = output.join("authorization.json");
+        let authorization_document = parse_json(&read_text(&authorization)?)?;
+        let authorization_fields = authorization_document.object()?;
+        let reviewer = format!("{}:github-account-{}", identity.role, identity.account_id);
+        let issued_at = json_member(authorization_fields, "reviewedAt")?.string()?;
+        let mut artifacts =
+            collection_activation_review_artifacts_at(repository, reviewed_subject, identity.role)?;
+        artifacts.insert(record_digest(&authorization)?);
+        let empty_groups = BTreeMap::new();
+        let review_id = review_statement_id(&ReviewStatementIdentity {
+            candidate,
+            epoch,
+            role: identity.role,
+            reviewer: &reviewer,
+            decision: "accept",
+            issued_at,
+            artifacts: &artifacts,
+            claim_groups: &empty_groups,
+            findings_sha256: &sha256_bytes(b"[]\n").hex(),
+        });
+        let packet = format!(
+            "{{\"schemaVersion\":1,\"reviewId\":{},\"role\":{},\"reviewer\":{},\"decision\":\"accept\",\"candidateCommit\":{},\"assuranceEpochSha256\":{},\"reviewedArtifacts\":[{}],\"distinctSubjects\":1,\"independenceViolations\":[],\"findings\":[],\"issuedAt\":{}}}\n",
+            json_string(&review_id),
+            json_string(identity.role),
+            json_string(&reviewer),
+            json_string(candidate),
+            json_string(epoch),
+            artifacts
+                .iter()
+                .map(|artifact| json_string(artifact))
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string(issued_at),
+        );
+        write_atomic(&output.join("review-packet.json"), packet.as_bytes())?;
+        write_atomic(
+            &output.join("review-packet.json.sha256"),
+            format!("{}\n", sha256_bytes(packet.as_bytes()).hex()).as_bytes(),
+        )?;
+        protected_review_subject(&output.join("review-packet.json"), identity.role)?;
+        Ok(())
+    }
+
+    fn sign_activation_review_test_packet(
+        output: &Path,
+        key: &Path,
+        role: &str,
+    ) -> Result<(), String> {
+        let payload = read_regular_file(&output.join("review-packet.json"))?;
+        let packet =
+            parse_json(std::str::from_utf8(&payload).map_err(|_| "test packet UTF-8".to_owned())?)?;
+        let reviewer = json_member(packet.object()?, "reviewer")?.string()?;
+        let temporary = create_private_temp_directory("hell-activation-e2e-sign")?;
+        let payload_path = temporary.join("payload.json");
+        write_atomic(&payload_path, &payload)?;
+        let ssh = ssh_review_signature(&payload_path, key)?;
+        fs::remove_dir_all(temporary)
+            .map_err(|error| format!("cannot remove activation signing fixture: {error}"))?;
+        let bundle = b"{}";
+        let envelope = format!(
+            "{{\n  \"payloadType\": \"application/vnd.hell-rs.assurance+json\",\n  \"payload\": {},\n  \"signatures\": [{{\"scheme\": \"ssh\", \"keyid\": {}, \"sig\": {}}}, {{\"scheme\": \"sigstore\", \"bundle\": {}, \"certificateIdentity\": {}, \"certificateIssuer\": \"https://token.actions.githubusercontent.com\"}}]\n}}\n",
+            json_string(&encode_base64(&payload)),
+            json_string(reviewer),
+            json_string(&encode_base64(&ssh)),
+            json_string(&encode_base64(bundle)),
+            json_string(
+                "https://github.com/Portfoligno/hell-rs/.github/workflows/collection-activation.yml@refs/heads/main"
+            ),
+        );
+        write_atomic(&output.join("review.dsse.json"), envelope.as_bytes())?;
+        write_atomic(
+            &output.join("review.dsse.json.sha256"),
+            format!("{}\n", sha256_bytes(envelope.as_bytes()).hex()).as_bytes(),
+        )?;
+        if role.is_empty() {
+            return Err("activation review role is empty".to_owned());
+        }
+        Ok(())
+    }
+
+    fn activation_review_test_user(account_id: u64, login: &str) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            ("id".to_owned(), JsonValue::Number(account_id)),
+            ("login".to_owned(), JsonValue::String(login.to_owned())),
+        ]))
+    }
+
+    #[test]
+    fn activation_prepare_and_outer_wrapper_replay_provider_selections_end_to_end() {
+        let directory = create_private_temp_directory("hell-activation-e2e").unwrap();
+        let repository = directory.join("repository");
+        synthetic_repository_snapshot(&root(), &repository).unwrap();
+        let candidate = git_output(&repository, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let admission = crate::collection_custody::write_activation_admission_test_fixture(
+            &repository,
+            &candidate,
+        )
+        .unwrap();
+        let admission_digest = crate::custody_ops::verified_directory_digest(&admission).unwrap();
+        let callback_candidate = candidate.clone();
+        let _api = TestGithubApiGuard::install(Box::new(move |endpoint, _| {
+            let mut response = activation_e2e_provider_response(endpoint)?;
+            if let Ok(run) = response.object_mut()
+                && run.contains_key("head_sha")
+            {
+                run.insert(
+                    "head_sha".to_owned(),
+                    JsonValue::String(callback_candidate.clone()),
+                );
+            }
+            Ok(response)
+        }))
+        .unwrap();
+        let epoch = prepare_activation_test_subject(&repository, &admission_digest);
+        complete_activation_test_review(&repository, &candidate, &epoch);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn prepare_activation_test_subject(repository: &Path, admission_digest: &str) -> String {
+        crate::collection_custody::prepare_activation(
+            repository,
+            &crate::collection_custody::PrepareActivationInput {
+                artifact: Path::new("ci-in/collection-custody-activation"),
+                output: Path::new("ci-out/collection-activation-proposal"),
+                run_id: 101,
+                run_attempt: 1,
+                artifact_id: 201,
+                expected_directory_sha256: admission_digest,
+                expected_archive_sha256: &"d".repeat(64),
+            },
+        )
+        .unwrap();
+        fs::rename(
+            repository.join("ci-out/collection-activation-proposal"),
+            repository.join("ci-in/collection-activation-proposal"),
+        )
+        .unwrap();
+        crate::collection_custody::verify_activation_proposal(
+            repository,
+            Path::new("ci-in/collection-activation-proposal"),
+        )
+        .unwrap();
+        crate::collection_custody::verify_activation_proposal_source(
+            repository,
+            Path::new("ci-in/collection-activation-proposal"),
+            102,
+            1,
+            202,
+            &"e".repeat(64),
+        )
+        .unwrap();
+        fs::rename(
+            repository.join("ci-out/collection-activation-review-subject"),
+            repository.join("ci-in/collection-activation-review-subject"),
+        )
+        .unwrap();
+        crate::collection_custody::verify_activation_review_subject(
+            repository,
+            Path::new("ci-in/collection-activation-review-subject"),
+        )
+        .unwrap();
+        let proposal = parse_json(
+            &read_text(&repository.join(
+                "ci-in/collection-activation-review-subject/proposal/activation-proposal.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        json_member(proposal.object().unwrap(), "baseAssuranceEpochSha256")
+            .unwrap()
+            .string()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn complete_activation_test_review(repository: &Path, candidate: &str, epoch: &str) {
+        let reviewed_subject =
+            repository.join("ci-in/collection-activation-review-subject/review-subject.json");
+        let author = repository.join("ci-in/collection-activation-review/claim-author");
+        let reviewer = repository.join("ci-in/collection-activation-review/claim-reviewer");
+        activation_review_test_package(
+            repository,
+            &reviewed_subject,
+            &author,
+            candidate,
+            epoch,
+            &ActivationReviewTestIdentity {
+                role: "claim-author",
+                account_id: 501,
+                run_id: 103,
+            },
+        )
+        .unwrap();
+        activation_review_test_package(
+            repository,
+            &reviewed_subject,
+            &reviewer,
+            candidate,
+            epoch,
+            &ActivationReviewTestIdentity {
+                role: "claim-reviewer",
+                account_id: 502,
+                run_id: 104,
+            },
+        )
+        .unwrap();
+        let _sigstore = TestSigstoreVerifierGuard::install(Box::new(|invocation| {
+            assert_eq!(invocation.arguments[0], OsString::from("verify-blob"));
+            assert!(parse_json(&read_text(&invocation.bundle)?).is_ok());
+            assert!(parse_json(&read_text(&invocation.payload)?).is_ok());
+            Ok(())
+        }))
+        .unwrap();
+        crate::collection_custody::finalize_activation(
+            repository,
+            Path::new("ci-in/collection-activation-review-subject"),
+            Path::new("ci-in/collection-activation-review/claim-author"),
+            Path::new("ci-in/collection-activation-review/claim-reviewer"),
+            Path::new("ci-out/collection-activation-tree"),
+        )
+        .unwrap();
+        apply_activation_test_tree(
+            &repository.join("ci-out/collection-activation-tree"),
+            repository,
+        )
+        .unwrap();
+        crate::catalog_lock::verify_repository_locks(repository).unwrap();
+        crate::collection_custody::verify_active_collection_activation_repository(repository)
+            .unwrap();
+    }
+
+    fn apply_activation_test_tree(source: &Path, repository: &Path) -> Result<(), String> {
+        let compat = source.join("compat");
+        for entry in fs::read_dir(&compat)
+            .map_err(|error| format!("cannot read activation test tree: {error}"))?
+        {
+            let entry = entry.map_err(|error| format!("cannot read activation tree: {error}"))?;
+            let destination = repository.join("compat").join(entry.file_name());
+            if fs::symlink_metadata(&destination).is_ok() {
+                if destination.is_dir() {
+                    fs::remove_dir_all(&destination)
+                        .map_err(|error| format!("cannot replace activation directory: {error}"))?;
+                } else {
+                    fs::remove_file(&destination)
+                        .map_err(|error| format!("cannot replace activation file: {error}"))?;
+                }
+            }
+            copy_record_tree(&entry.path(), &destination)?;
+        }
+        Ok(())
     }
 }

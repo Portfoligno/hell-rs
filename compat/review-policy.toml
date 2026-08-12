@@ -1,6 +1,7 @@
 schema_version = 1
 state = "review-required"
 claim_reviewer_team = "Portfoligno/compatibility-reviewers"
+claim_author_team = "Portfoligno/compatibility-authors"
 platform_reviewer_team = "Portfoligno/platform-reviewers"
 security_reviewer_team = "Portfoligno/security-reviewers"
 implementation_reviewer_team = "Portfoligno/implementation-reviewers"

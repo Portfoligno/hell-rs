@@ -314,6 +314,7 @@ fn workflow_active_subject_selection(options: &Options) -> Result<String, String
         return Err("active subject artifact came from an unsupported event".to_owned());
     }
     let provider_head = github_value("GITHUB_SHA")?;
+    let expected_archive_sha256 = github_value("ACTIVE_SUBJECT_ARCHIVE_SHA256")?;
     let expected_directory_sha256 = crate::custody_ops::directory_digest(&input)?;
     let output = component_path([
         "ci-out",
@@ -334,6 +335,7 @@ fn workflow_active_subject_selection(options: &Options) -> Result<String, String
             provider_head: &provider_head,
             candidate: &candidate,
             expected_directory_sha256: &expected_directory_sha256,
+            expected_archive_sha256: &expected_archive_sha256,
         },
     )?;
     let selection_path = component_path([
@@ -1110,13 +1112,7 @@ fn verify_surveillance_trigger(
             Ok(None)
         }
         Ok("workflow_dispatch") => {
-            let inputs = crate::assurance::github_dispatch_object(&[
-                "activation_correlation_sha256",
-                "activation_run_attempt",
-                "activation_run_id",
-                "assurance_epoch_sha256",
-                "candidate_sha",
-            ])?;
+            let inputs = surveillance_dispatch_inputs()?;
             let run_id = inputs
                 .get("activation_run_id")
                 .map(String::as_str)
@@ -1159,6 +1155,52 @@ fn verify_surveillance_trigger(
         }
         _ => Err("promotion surveillance provider event is unsupported".to_owned()),
     }
+}
+
+fn surveillance_dispatch_inputs() -> Result<std::collections::BTreeMap<String, String>, String> {
+    let inputs = crate::assurance::github_dispatch_object(&[
+        "activation_correlation_sha256",
+        "activation_run_attempt",
+        "activation_run_id",
+        "assurance_epoch_sha256",
+        "candidate_sha",
+        "selector_archive_sha256",
+        "selector_artifact_id",
+        "selector_directory_sha256",
+        "selector_run_attempt",
+        "selector_run_id",
+        "selector_source_sha",
+    ])?;
+    for key in ["selector_archive_sha256", "selector_directory_sha256"] {
+        require_digest(
+            inputs
+                .get(key)
+                .map(String::as_str)
+                .ok_or_else(|| format!("surveillance dispatch lacks {key}"))?,
+            "surveillance selector digest",
+        )?;
+    }
+    for key in [
+        "selector_artifact_id",
+        "selector_run_attempt",
+        "selector_run_id",
+    ] {
+        require_nonzero(
+            inputs
+                .get(key)
+                .map(String::as_str)
+                .ok_or_else(|| format!("surveillance dispatch lacks {key}"))?,
+            "surveillance selector provider identity",
+        )?;
+    }
+    require_git_sha(
+        inputs
+            .get("selector_source_sha")
+            .map(String::as_str)
+            .ok_or_else(|| "surveillance dispatch lacks selector_source_sha".to_owned())?,
+        "surveillance selector source",
+    )?;
+    Ok(inputs)
 }
 
 fn surveillance_current_head() -> Result<String, String> {
@@ -1503,6 +1545,7 @@ fn workflow_verify_approved_source() -> Result<String, String> {
         "candidate_sha",
         "promotion_proposal_sha256",
         "proposal_artifact_id",
+        "proposal_provider_archive_sha256",
         "proposal_package_sha256",
         "proposal_run_attempt",
         "proposal_run_id",
@@ -1551,6 +1594,11 @@ fn workflow_verify_approved_source() -> Result<String, String> {
         artifact_id,
         &candidate,
         &observed,
+        required_map(&inputs, "proposal_provider_archive_sha256")?,
+    )?;
+    crate::assurance::verify_selection_archive(
+        &provider_selection,
+        required_map(&inputs, "proposal_provider_archive_sha256")?,
     )?;
     let provider_selection_sha256 = sha256_bytes(provider_selection.as_bytes()).hex();
     write_atomic(
@@ -2036,6 +2084,7 @@ fn select_native_provenance_run(
             provider_head: &run.head_sha,
             candidate,
             expected_directory_sha256: &macos_download.tree_sha256,
+            expected_archive_sha256: &macos_download.archive_sha256,
         },
     )?;
     let windows_provider_selection =
@@ -2053,6 +2102,7 @@ fn select_native_provenance_run(
                 provider_head: &run.head_sha,
                 candidate,
                 expected_directory_sha256: &windows_download.tree_sha256,
+                expected_archive_sha256: &windows_download.archive_sha256,
             },
         )?;
     let macos_provider_selection_sha256 = sha256_bytes(macos_provider_selection.as_bytes()).hex();
@@ -3707,6 +3757,7 @@ fn verify_selected_native_platform(
             provider_head: context.provider_head,
             candidate: context.candidate,
             expected_directory_sha256: &tree_sha256,
+            expected_archive_sha256: &quoted_field(context.document, &archive_field)?,
         },
     )?;
     let archive = expected_root.join("artifact.zip");

@@ -137,6 +137,7 @@ const CUSTODY_DISPATCH_KEYS: &[&str] = &[
     "source_run_id",
 ];
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkflowProvider {
     provider: String,
     trust_domain: String,
@@ -161,6 +162,7 @@ struct WorkflowProvider {
     current_transition: Option<WorkflowTransitionContext>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkflowTransitionContext {
     record_key: String,
     record_version: String,
@@ -196,6 +198,413 @@ fn workflow_provider(require_active_receipt: bool) -> Result<WorkflowProvider, S
     strict_toml::finish(&values)?;
     validate_workflow_provider(&provider, require_active_receipt)?;
     Ok(provider)
+}
+
+fn parse_provider_context_text(document: &str) -> Result<WorkflowProvider, String> {
+    let mut values = strict_toml::assignments(document)?;
+    if strict_toml::unsigned(&strict_toml::take(&mut values, "schema_version")?)? != 1 {
+        return Err("custody provider context schema_version must be 1".to_owned());
+    }
+    let mut provider = take_workflow_provider(&mut values)?;
+    provider.current_transition = take_transition_context(&mut values)?;
+    strict_toml::finish(&values)?;
+    validate_workflow_provider(&provider, true)?;
+    Ok(provider)
+}
+
+const MAINTENANCE_SELECTOR_PATH: &[&str] =
+    &["ci-out", "custody-maintenance", "provider-selector.json"];
+
+fn workflow_prepare_provider_selector() -> Result<String, String> {
+    let operation = std::env::var("CUSTODY_PROVIDER_OPERATION")
+        .map_err(|_| "provider preflight lacks CUSTODY_PROVIDER_OPERATION".to_owned())?;
+    if !matches!(
+        operation.as_str(),
+        "upload"
+            | "retrieval"
+            | "activation"
+            | "maintenance"
+            | "surveillance"
+            | "transition-publication"
+            | "complete-initial-publication"
+            | "selector-export"
+    ) {
+        return Err("provider selector operation is unsupported".to_owned());
+    }
+    let source = std::env::var("ACTIVE_CUSTODY_PROVIDER_SELECTOR")
+        .map_err(|_| "maintenance preflight lacks ACTIVE_CUSTODY_PROVIDER_SELECTOR".to_owned())?;
+    let provider = parse_provider_selector_source(source.as_bytes())?;
+    let expected_provider = std::env::var("CUSTODY_EXPECTED_PROVIDER")
+        .map_err(|_| "maintenance preflight lacks CUSTODY_EXPECTED_PROVIDER".to_owned())?;
+    let expected_trust_domain = std::env::var("CUSTODY_EXPECTED_TRUST_DOMAIN")
+        .map_err(|_| "maintenance preflight lacks CUSTODY_EXPECTED_TRUST_DOMAIN".to_owned())?;
+    if provider.provider != expected_provider || provider.trust_domain != expected_trust_domain {
+        return Err("maintenance selector differs from the matrix provider identity".to_owned());
+    }
+    validate_workflow_provider(&provider, operation_requires_active(&operation))?;
+    let bytes = render_provider_selector(&operation, &provider)?;
+    let output: PathBuf = MAINTENANCE_SELECTOR_PATH.iter().collect();
+    write_atomic(&output, &bytes)?;
+    write_atomic(
+        &output.with_extension("json.sha256"),
+        format!("{}\n", sha256_bytes(&bytes).hex()).as_bytes(),
+    )?;
+    Ok("sealed exact active custody provider selector before credentials".to_owned())
+}
+
+fn verified_provider_selector(expected_operation: &str) -> Result<WorkflowProvider, String> {
+    let path: PathBuf = MAINTENANCE_SELECTOR_PATH.iter().collect();
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("cannot read sealed maintenance selector: {error}"))?;
+    let digest = path.with_extension("json.sha256");
+    if fs::read_to_string(&digest)
+        .map_err(|error| format!("cannot read maintenance selector digest: {error}"))?
+        != format!("{}\n", sha256_bytes(&bytes).hex())
+    {
+        return Err("maintenance selector digest sibling differs".to_owned());
+    }
+    let (operation, sealed) = parse_provider_selector(&bytes)?;
+    if operation != expected_operation {
+        return Err("sealed provider selector operation differs".to_owned());
+    }
+    let protected = workflow_provider(operation_requires_active(expected_operation))?;
+    let matches = provider_selector_matches_protected(expected_operation, &sealed, &protected);
+    if !matches {
+        return Err(
+            "sealed maintenance selector differs from protected provider context".to_owned(),
+        );
+    }
+    Ok(if expected_operation == "retrieval" {
+        sealed
+    } else {
+        protected
+    })
+}
+
+fn parse_provider_selector(bytes: &[u8]) -> Result<(String, WorkflowProvider), String> {
+    parse_provider_selector_document(bytes, true).and_then(|(operation, provider)| {
+        operation
+            .map(|operation| (operation, provider))
+            .ok_or_else(|| "sealed provider selector lacks operation".to_owned())
+    })
+}
+
+fn parse_provider_selector_source(bytes: &[u8]) -> Result<WorkflowProvider, String> {
+    let (operation, provider) = parse_provider_selector_document(bytes, false)?;
+    if operation.is_some() {
+        return Err("provider selector source must be operation-neutral".to_owned());
+    }
+    Ok(provider)
+}
+
+fn parse_provider_selector_document(
+    bytes: &[u8],
+    sealed: bool,
+) -> Result<(Option<String>, WorkflowProvider), String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "maintenance selector is not UTF-8".to_owned())?;
+    let document = crate::assurance::parse_json(text)?;
+    if crate::assurance::canonical_json_bytes(&document)? != bytes {
+        return Err("maintenance selector is not canonical JSON".to_owned());
+    }
+    let fields = document.object()?;
+    let mut expected = maintenance_selector_keys();
+    if !sealed {
+        expected.remove("operation");
+    }
+    if fields.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err("maintenance selector field inventory differs".to_owned());
+    }
+    let string = |key| {
+        crate::assurance::json_member(fields, key)?
+            .string()
+            .map(str::to_owned)
+    };
+    if crate::assurance::json_member(fields, "schemaVersion")?.number()? != 1
+        || string("state")?
+            != if sealed {
+                "sealed-provider-context"
+            } else {
+                "provider-context-source"
+            }
+    {
+        return Err("maintenance selector identity is invalid".to_owned());
+    }
+    let transition =
+        parse_maintenance_transition(crate::assurance::json_member(fields, "currentTransition")?)?;
+    let provider = WorkflowProvider {
+        provider: string("provider")?,
+        trust_domain: string("trustDomain")?,
+        bucket: string("bucket")?,
+        active_candidate: string("activeCandidate")?,
+        active_epoch: string("activeEpoch")?,
+        active_manifest: string("activeManifest")?,
+        active_receipt_key: string("activeReceiptKey")?,
+        active_receipt_version: string("activeReceiptVersion")?,
+        active_receipt_sha256: string("activeReceiptSha256")?,
+        active_activation_record_key: string("activeActivationRecordKey")?,
+        active_activation_record_version: string("activeActivationRecordVersion")?,
+        active_activation_record_sha256: string("activeActivationRecordSha256")?,
+        active_activation_packet_key: string("activeActivationPacketKey")?,
+        active_activation_packet_version: string("activeActivationPacketVersion")?,
+        active_activation_packet_sha256: string("activeActivationPacketSha256")?,
+        active_activation_dsse_key: string("activeActivationDsseKey")?,
+        active_activation_dsse_version: string("activeActivationDsseVersion")?,
+        active_activation_dsse_sha256: string("activeActivationDsseSha256")?,
+        activation_public_state: string("activationPublicState")?,
+        activation_public_completion_sha256: string("activationPublicCompletionSha256")?,
+        current_transition: transition,
+    };
+    let operation = sealed.then(|| string("operation")).transpose()?;
+    if let Some(operation) = operation.as_deref() {
+        validate_workflow_provider(&provider, operation_requires_active(operation))?;
+    } else {
+        for (label, value) in [
+            ("provider", provider.provider.as_str()),
+            ("trust domain", provider.trust_domain.as_str()),
+            ("bucket", provider.bucket.as_str()),
+        ] {
+            require_atom(value, label)?;
+        }
+    }
+    Ok((operation, provider))
+}
+
+fn operation_requires_active(operation: &str) -> bool {
+    !matches!(
+        operation,
+        "upload" | "retrieval" | "activation" | "selector-export"
+    )
+}
+
+fn provider_selector_matches_protected(
+    operation: &str,
+    sealed: &WorkflowProvider,
+    protected: &WorkflowProvider,
+) -> bool {
+    if matches!(operation, "retrieval" | "selector-export") {
+        sealed.provider == protected.provider
+            && sealed.trust_domain == protected.trust_domain
+            && sealed.bucket == protected.bucket
+    } else {
+        sealed == protected
+    }
+}
+
+fn maintenance_selector_keys() -> BTreeSet<&'static str> {
+    [
+        "schemaVersion",
+        "state",
+        "operation",
+        "provider",
+        "trustDomain",
+        "bucket",
+        "activeCandidate",
+        "activeEpoch",
+        "activeManifest",
+        "activeReceiptKey",
+        "activeReceiptVersion",
+        "activeReceiptSha256",
+        "activeActivationRecordKey",
+        "activeActivationRecordVersion",
+        "activeActivationRecordSha256",
+        "activeActivationPacketKey",
+        "activeActivationPacketVersion",
+        "activeActivationPacketSha256",
+        "activeActivationDsseKey",
+        "activeActivationDsseVersion",
+        "activeActivationDsseSha256",
+        "activationPublicState",
+        "activationPublicCompletionSha256",
+        "currentTransition",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn parse_maintenance_transition(
+    value: &crate::assurance::JsonValue,
+) -> Result<Option<WorkflowTransitionContext>, String> {
+    if matches!(value, crate::assurance::JsonValue::Null) {
+        return Ok(None);
+    }
+    let fields = value.object()?;
+    let expected = [
+        "recordKey",
+        "recordVersion",
+        "recordSha256",
+        "packetKey",
+        "packetVersion",
+        "packetSha256",
+        "dsseKey",
+        "dsseVersion",
+        "dsseSha256",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if fields.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err("maintenance transition field inventory differs".to_owned());
+    }
+    let string = |key| {
+        crate::assurance::json_member(fields, key)?
+            .string()
+            .map(str::to_owned)
+    };
+    Ok(Some(WorkflowTransitionContext {
+        record_key: string("recordKey")?,
+        record_version: string("recordVersion")?,
+        record_sha256: string("recordSha256")?,
+        packet_key: string("packetKey")?,
+        packet_version: string("packetVersion")?,
+        packet_sha256: string("packetSha256")?,
+        dsse_key: string("dsseKey")?,
+        dsse_version: string("dsseVersion")?,
+        dsse_sha256: string("dsseSha256")?,
+    }))
+}
+
+fn render_provider_selector(
+    operation: &str,
+    provider: &WorkflowProvider,
+) -> Result<Vec<u8>, String> {
+    use crate::assurance::JsonValue;
+    let string = |value: &str| JsonValue::String(value.to_owned());
+    let transition = provider
+        .current_transition
+        .as_ref()
+        .map_or(JsonValue::Null, |value| {
+            JsonValue::Object(BTreeMap::from([
+                ("dsseKey".to_owned(), string(&value.dsse_key)),
+                ("dsseSha256".to_owned(), string(&value.dsse_sha256)),
+                ("dsseVersion".to_owned(), string(&value.dsse_version)),
+                ("packetKey".to_owned(), string(&value.packet_key)),
+                ("packetSha256".to_owned(), string(&value.packet_sha256)),
+                ("packetVersion".to_owned(), string(&value.packet_version)),
+                ("recordKey".to_owned(), string(&value.record_key)),
+                ("recordSha256".to_owned(), string(&value.record_sha256)),
+                ("recordVersion".to_owned(), string(&value.record_version)),
+            ]))
+        });
+    crate::assurance::canonical_json_bytes(&JsonValue::Object(BTreeMap::from([
+        (
+            "activationPublicCompletionSha256".to_owned(),
+            string(&provider.activation_public_completion_sha256),
+        ),
+        (
+            "activationPublicState".to_owned(),
+            string(&provider.activation_public_state),
+        ),
+        (
+            "activeActivationDsseKey".to_owned(),
+            string(&provider.active_activation_dsse_key),
+        ),
+        (
+            "activeActivationDsseSha256".to_owned(),
+            string(&provider.active_activation_dsse_sha256),
+        ),
+        (
+            "activeActivationDsseVersion".to_owned(),
+            string(&provider.active_activation_dsse_version),
+        ),
+        (
+            "activeActivationPacketKey".to_owned(),
+            string(&provider.active_activation_packet_key),
+        ),
+        (
+            "activeActivationPacketSha256".to_owned(),
+            string(&provider.active_activation_packet_sha256),
+        ),
+        (
+            "activeActivationPacketVersion".to_owned(),
+            string(&provider.active_activation_packet_version),
+        ),
+        (
+            "activeActivationRecordKey".to_owned(),
+            string(&provider.active_activation_record_key),
+        ),
+        (
+            "activeActivationRecordSha256".to_owned(),
+            string(&provider.active_activation_record_sha256),
+        ),
+        (
+            "activeActivationRecordVersion".to_owned(),
+            string(&provider.active_activation_record_version),
+        ),
+        (
+            "activeCandidate".to_owned(),
+            string(&provider.active_candidate),
+        ),
+        ("activeEpoch".to_owned(), string(&provider.active_epoch)),
+        (
+            "activeManifest".to_owned(),
+            string(&provider.active_manifest),
+        ),
+        (
+            "activeReceiptKey".to_owned(),
+            string(&provider.active_receipt_key),
+        ),
+        (
+            "activeReceiptSha256".to_owned(),
+            string(&provider.active_receipt_sha256),
+        ),
+        (
+            "activeReceiptVersion".to_owned(),
+            string(&provider.active_receipt_version),
+        ),
+        ("bucket".to_owned(), string(&provider.bucket)),
+        ("currentTransition".to_owned(), transition),
+        ("operation".to_owned(), string(operation)),
+        ("provider".to_owned(), string(&provider.provider)),
+        ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        ("state".to_owned(), string("sealed-provider-context")),
+        ("trustDomain".to_owned(), string(&provider.trust_domain)),
+    ])))
+}
+
+fn render_provider_selector_source(provider: &WorkflowProvider) -> Result<Vec<u8>, String> {
+    let sealed = render_provider_selector("source-placeholder", provider)?;
+    let mut document = crate::assurance::parse_json(
+        std::str::from_utf8(&sealed).map_err(|_| "selector fixture is not UTF-8".to_owned())?,
+    )?;
+    let crate::assurance::JsonValue::Object(fields) = &mut document else {
+        return Err("selector fixture is not an object".to_owned());
+    };
+    fields.remove("operation");
+    fields.insert(
+        "state".to_owned(),
+        crate::assurance::JsonValue::String("provider-context-source".to_owned()),
+    );
+    crate::assurance::canonical_json_bytes(&document)
+}
+
+fn write_provider_selector_update(provider: &WorkflowProvider) -> Result<(), String> {
+    let bytes = render_provider_selector_source(provider)?;
+    let output = component_path([
+        "ci-out",
+        "provider-selector-update",
+        "provider-selector.json",
+    ]);
+    write_atomic(&output, &bytes)?;
+    let digest = sha256_bytes(&bytes).hex();
+    write_atomic(
+        &output.with_extension("json.sha256"),
+        format!("{digest}\n").as_bytes(),
+    )?;
+    if let Some(github_output) = std::env::var_os("GITHUB_OUTPUT") {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(github_output)
+            .map_err(|error| format!("cannot open provider selector GitHub output: {error}"))?;
+        writeln!(file, "provider-selector-sha256={digest}")
+            .map_err(|error| format!("cannot write provider selector GitHub output: {error}"))?;
+    }
+    Ok(())
+}
+
+fn workflow_export_provider_selector() -> Result<String, String> {
+    let provider = verified_provider_selector("selector-export")?;
+    write_provider_selector_update(&provider)?;
+    Ok("exported current provider selector without mutating provider state".to_owned())
 }
 
 fn take_workflow_provider(
@@ -430,7 +839,7 @@ fn run_workflow_action(action: &str) -> Result<String, String> {
         }
         "workflow-upload" => {
             let inputs = dispatch()?;
-            apply_workflow_provider(&mut options, workflow_provider(false)?);
+            apply_workflow_provider(&mut options, verified_provider_selector("upload")?);
             options.input = Some(component_path(["ci-out", "custody-package"]));
             options.output = Some(component_path(["ci-out", "upload-receipt.json"]));
             options.retention_until = inputs.get("retention_until").cloned();
@@ -444,11 +853,14 @@ fn run_workflow_action(action: &str) -> Result<String, String> {
         "workflow-publish-transition" => workflow_publish_transition(),
         "workflow-verify-public-source-artifact" => workflow_verify_public_source_artifact(),
         "workflow-publish-public-transition" => workflow_publish_public_transition(),
+        "workflow-prepare-public-publication-selector" => {
+            workflow_prepare_public_publication_selector()
+        }
         "workflow-observe-public-transition" => workflow_observe_public_transition(),
         "workflow-retain-prior-public-transition" => workflow_retain_prior_public_transition(),
-        "workflow-dispatch-initial-surveillance" => workflow_dispatch_initial_surveillance(),
         "workflow-finalize-initial-surveillance" => workflow_finalize_initial_surveillance(),
         "workflow-complete-initial-activation" => workflow_complete_initial_activation(),
+        "workflow-verify-initial-completion" => workflow_verify_initial_completion(),
         "workflow-record-initial-surveillance-failure" => {
             workflow_record_initial_surveillance_failure()
         }
@@ -457,10 +869,22 @@ fn run_workflow_action(action: &str) -> Result<String, String> {
                 .to_owned(),
         ),
         "workflow-retrieve" => workflow_retrieve(),
+        "workflow-verify-upload-subject" => workflow_verify_upload_subject(),
         "workflow-copy-record" => workflow_copy_record(),
         "workflow-review-packet" => workflow_review_packet(),
         "workflow-transition-packet" => workflow_transition_packet(),
         "workflow-surveillance-retrieve" => workflow_surveillance_retrieve(),
+        "workflow-prepare-maintenance-selector" | "workflow-prepare-provider-selector" => {
+            workflow_prepare_provider_selector()
+        }
+        "workflow-export-provider-selector" => workflow_export_provider_selector(),
+        "workflow-select-provider-selector-updates" => workflow_select_provider_selector_updates(),
+        "workflow-verify-provider-selector-update-barrier" => {
+            workflow_verify_provider_selector_update_barrier()
+        }
+        "workflow-assemble-provider-selector-updates" => {
+            workflow_assemble_provider_selector_updates()
+        }
         "workflow-surveillance-retrieval-packet-primary"
         | "workflow-surveillance-retrieval-packet-secondary" => {
             workflow_surveillance_retrieval_packet(action)
@@ -470,6 +894,7 @@ fn run_workflow_action(action: &str) -> Result<String, String> {
             &component_path(["ci-out", "active-promotion-record"]),
         ),
         "workflow-materialize-review-package" => workflow_materialize_review_package(),
+        "workflow-assemble-collection-worm" => workflow_assemble_collection_worm(),
         "workflow-retain-review-subject" => workflow_retain_review_subject(),
         "workflow-initial-scrub" => workflow_initial_scrub(),
         "workflow-initial-scrub-packet" => workflow_initial_scrub_packet(),
@@ -479,6 +904,341 @@ fn run_workflow_action(action: &str) -> Result<String, String> {
         }
         _ => Err("unknown custody workflow action".to_owned()),
     }
+}
+
+fn workflow_verify_provider_selector_update_barrier() -> Result<String, String> {
+    let input = component_path(["ci-in", "provider-selector-updates"]);
+    let expected_top = BTreeSet::from([
+        OsString::from("primary-worm"),
+        OsString::from("secondary-worm"),
+        OsString::from("source-selection"),
+    ]);
+    require_real_selector_directory(&input)?;
+    if selector_directory_inventory(&input)? != expected_top {
+        return Err("provider selector barrier inventory differs".to_owned());
+    }
+    let primary = verify_provider_selector_update(
+        &input.join("primary-worm"),
+        "primary-worm",
+        "organization-primary",
+    )?;
+    let secondary = verify_provider_selector_update(
+        &input.join("secondary-worm"),
+        "secondary-worm",
+        "organization-secondary",
+    )?;
+    let source =
+        crate::assurance::verify_current_run_artifact_selection(&input.join("source-selection"))?;
+    for (name, expected) in [
+        ("ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT", primary),
+        ("ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT", secondary),
+    ] {
+        let observed =
+            std::env::var(name).map_err(|_| format!("provider selector barrier lacks {name}"))?;
+        if observed.as_bytes() != expected {
+            return Err(format!("{name} differs from the selected provider context"));
+        }
+    }
+    let run_id = required_environment_u64("CUSTODY_SELECTOR_AGGREGATE_RUN_ID")?;
+    let run_attempt = required_environment_u64("CUSTODY_SELECTOR_AGGREGATE_RUN_ATTEMPT")?;
+    let artifact_id = required_environment_u64("CUSTODY_SELECTOR_AGGREGATE_ARTIFACT_ID")?;
+    let archive = std::env::var("CUSTODY_SELECTOR_AGGREGATE_ARCHIVE_SHA256")
+        .map_err(|_| "provider selector barrier lacks aggregate archive digest".to_owned())?;
+    let directory = std::env::var("CUSTODY_SELECTOR_AGGREGATE_DIRECTORY_SHA256")
+        .map_err(|_| "provider selector barrier lacks aggregate directory digest".to_owned())?;
+    let workflow = std::env::var("CUSTODY_SELECTOR_AGGREGATE_WORKFLOW")
+        .map_err(|_| "provider selector barrier lacks aggregate workflow".to_owned())?;
+    let event = std::env::var("CUSTODY_SELECTOR_AGGREGATE_EVENT")
+        .map_err(|_| "provider selector barrier lacks aggregate event".to_owned())?;
+    let candidate = std::env::var("CUSTODY_SELECTOR_AGGREGATE_CANDIDATE")
+        .map_err(|_| "provider selector barrier lacks aggregate candidate".to_owned())?;
+    verify_selector_source_matches_aggregate(
+        &source,
+        run_id,
+        run_attempt,
+        &workflow,
+        &event,
+        &candidate,
+    )?;
+    require_digest(&archive, "provider selector aggregate archive")?;
+    require_digest(&directory, "provider selector aggregate directory")?;
+    let output = component_path(["ci-out", "provider-selector-barrier"]);
+    let selection = crate::assurance::verify_provider_artifact_selection_to(
+        Path::new("."),
+        &input,
+        &output,
+        &format!("custody-provider-selectors-{run_id}-{run_attempt}"),
+        &workflow,
+        &event,
+        run_id,
+        run_attempt,
+        artifact_id,
+        &candidate,
+        &directory,
+        &archive,
+    )?;
+    crate::assurance::verify_selection_archive(&selection, &archive)?;
+    write_atomic(&output.join("selection.json"), selection.as_bytes())?;
+    Ok("verified exact provider selector update barrier".to_owned())
+}
+
+fn verify_selector_source_matches_aggregate(
+    source: &crate::assurance::VerifiedCurrentRunArtifactSelection,
+    run_id: u64,
+    run_attempt: u64,
+    workflow: &str,
+    event: &str,
+    candidate: &str,
+) -> Result<(), String> {
+    let prefix = if workflow == ".github/workflows/custody-provider-selector-recovery.yml" {
+        "ephemeralEvidence-provider-selector-recovery"
+    } else {
+        "custody-provider-selector-update"
+    };
+    let primary_name = format!("{prefix}-primary-worm-{run_id}-{run_attempt}");
+    let secondary_name = format!("{prefix}-secondary-worm-{run_id}-{run_attempt}");
+    if source.run_id != run_id
+        || source.run_attempt != run_attempt
+        || source.workflow_path != workflow
+        || source.event_name != event
+        || source.candidate != candidate
+        || source.primary_artifact_name != primary_name
+        || source.secondary_artifact_name != secondary_name
+        || source.primary_artifact_id == 0
+        || source.secondary_artifact_id == 0
+        || source.primary_artifact_id == source.secondary_artifact_id
+        || require_digest(
+            &source.primary_archive_sha256,
+            "primary selector source archive",
+        )
+        .is_err()
+        || require_digest(
+            &source.secondary_archive_sha256,
+            "secondary selector source archive",
+        )
+        .is_err()
+        || source.primary_archive_sha256 == source.secondary_archive_sha256
+    {
+        return Err(
+            "provider selector inner source differs from aggregate provider tuple".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn workflow_select_provider_selector_updates() -> Result<String, String> {
+    let workflow_path = std::env::var("CUSTODY_SELECTOR_SOURCE_WORKFLOW")
+        .map_err(|_| "selector artifact selection lacks source workflow".to_owned())?;
+    let prefix = match workflow_path.as_str() {
+        ".github/workflows/custody-provider-selector-recovery.yml" => {
+            "ephemeralEvidence-provider-selector-recovery"
+        }
+        ".github/workflows/evidence-custody.yml"
+        | ".github/workflows/promotion-surveillance.yml"
+        | ".github/workflows/promotion-surveillance-watchdog.yml"
+        | ".github/workflows/promotion-initial-public-finalize.yml" => {
+            "custody-provider-selector-update"
+        }
+        _ => return Err("selector artifact source workflow is unsupported".to_owned()),
+    };
+    let run_id = required_environment_u64("GITHUB_RUN_ID")?;
+    let run_attempt = required_environment_u64("GITHUB_RUN_ATTEMPT")?;
+    let candidate = std::env::var("GITHUB_SHA")
+        .map_err(|_| "selector artifact selection lacks GITHUB_SHA".to_owned())?;
+    let event = std::env::var("GITHUB_EVENT_NAME")
+        .map_err(|_| "selector artifact selection lacks GITHUB_EVENT_NAME".to_owned())?;
+    let primary = format!("{prefix}-primary-worm-{run_id}-{run_attempt}");
+    let secondary = format!("{prefix}-secondary-worm-{run_id}-{run_attempt}");
+    let output = component_path(["ci-out", "provider-selector-selection"]);
+    if fs::symlink_metadata(&output).is_ok() {
+        return Err("provider selector artifact selection output already exists".to_owned());
+    }
+    let selection = crate::assurance::select_current_run_artifacts(
+        &crate::assurance::CurrentRunArtifactSelectionRequest {
+            root: Path::new("."),
+            output: &output,
+            workflow_path: &workflow_path,
+            event_name: &event,
+            run_id,
+            run_attempt,
+            candidate: &candidate,
+            primary_artifact_name: &primary,
+            secondary_artifact_name: &secondary,
+        },
+    )?;
+    let github_output = std::env::var_os("GITHUB_OUTPUT")
+        .ok_or_else(|| "selector artifact selection lacks GITHUB_OUTPUT".to_owned())?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(github_output)
+        .map_err(|error| format!("cannot open selector artifact GITHUB_OUTPUT: {error}"))?;
+    for (key, value) in [
+        (
+            "primary-artifact-id",
+            selection.primary_artifact_id.to_string(),
+        ),
+        (
+            "secondary-artifact-id",
+            selection.secondary_artifact_id.to_string(),
+        ),
+        ("primary-archive-sha256", selection.primary_archive_sha256),
+        (
+            "secondary-archive-sha256",
+            selection.secondary_archive_sha256,
+        ),
+    ] {
+        writeln!(file, "{key}={value}")
+            .map_err(|error| format!("cannot write selector artifact output: {error}"))?;
+    }
+    file.sync_all()
+        .map_err(|error| format!("cannot sync selector artifact output: {error}"))?;
+    Ok("selected exact immutable current-run provider selector artifacts".to_owned())
+}
+
+fn required_environment_u64(name: &str) -> Result<u64, String> {
+    let value = std::env::var(name).map_err(|_| format!("{name} is unavailable"))?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} is not an integer"))?;
+    if value == 0 {
+        return Err(format!("{name} must be nonzero"));
+    }
+    Ok(value)
+}
+
+fn workflow_assemble_provider_selector_updates() -> Result<String, String> {
+    let input = component_path(["ci-in", "provider-selector-updates"]);
+    let selection_input = component_path(["ci-out", "provider-selector-selection"]);
+    let output = component_path(["ci-out", "provider-selector-updates"]);
+    assemble_provider_selector_updates(&input, &selection_input, &output)
+}
+
+fn assemble_provider_selector_updates(
+    input: &Path,
+    selection_input: &Path,
+    output: &Path,
+) -> Result<String, String> {
+    if fs::symlink_metadata(output).is_ok() {
+        return Err("provider selector update output already exists".to_owned());
+    }
+    require_real_selector_directory(input)?;
+    let expected_providers = BTreeSet::from([
+        OsString::from("primary-worm"),
+        OsString::from("secondary-worm"),
+    ]);
+    if selector_directory_inventory(input)? != expected_providers {
+        return Err("provider selector update provider inventory differs".to_owned());
+    }
+    let selection = crate::assurance::verify_current_run_artifact_selection(selection_input)?;
+    let prefix =
+        if selection.workflow_path == ".github/workflows/custody-provider-selector-recovery.yml" {
+            "ephemeralEvidence-provider-selector-recovery"
+        } else if matches!(
+            selection.workflow_path.as_str(),
+            ".github/workflows/evidence-custody.yml"
+                | ".github/workflows/promotion-surveillance.yml"
+                | ".github/workflows/promotion-surveillance-watchdog.yml"
+                | ".github/workflows/promotion-initial-public-finalize.yml"
+        ) {
+            "custody-provider-selector-update"
+        } else {
+            return Err("provider selector source workflow differs".to_owned());
+        };
+    if selection.primary_artifact_name
+        != format!(
+            "{prefix}-primary-worm-{}-{}",
+            selection.run_id, selection.run_attempt
+        )
+        || selection.secondary_artifact_name
+            != format!(
+                "{prefix}-secondary-worm-{}-{}",
+                selection.run_id, selection.run_attempt
+            )
+    {
+        return Err("provider selector source selection channels differ".to_owned());
+    }
+    let mut updates = Vec::new();
+    for (provider, trust_domain) in [
+        ("primary-worm", "organization-primary"),
+        ("secondary-worm", "organization-secondary"),
+    ] {
+        let directory = input.join(provider);
+        updates.push((
+            provider,
+            verify_provider_selector_update(&directory, provider, trust_domain)?,
+        ));
+    }
+    fs::create_dir_all(output)
+        .map_err(|error| format!("cannot create provider selector update output: {error}"))?;
+    for (provider, bytes) in updates {
+        let destination = output.join(provider);
+        fs::create_dir(&destination)
+            .map_err(|error| format!("cannot create selector provider output: {error}"))?;
+        write_atomic(&destination.join("provider-selector.json"), &bytes)?;
+        write_atomic(
+            &destination.join("provider-selector.json.sha256"),
+            format!("{}\n", sha256_bytes(&bytes).hex()).as_bytes(),
+        )?;
+    }
+    copy_retained_tree(selection_input, &output.join("source-selection"))?;
+    Ok("assembled exact primary and secondary provider selector updates".to_owned())
+}
+
+fn verify_provider_selector_update(
+    directory: &Path,
+    provider: &str,
+    trust_domain: &str,
+) -> Result<Vec<u8>, String> {
+    require_real_selector_directory(directory)?;
+    let expected = BTreeSet::from([
+        OsString::from("provider-selector.json"),
+        OsString::from("provider-selector.json.sha256"),
+    ]);
+    if selector_directory_inventory(directory)? != expected {
+        return Err("provider selector update inventory differs".to_owned());
+    }
+    let selector = directory.join("provider-selector.json");
+    let digest = directory.join("provider-selector.json.sha256");
+    require_real_selector_file(&selector)?;
+    require_real_selector_file(&digest)?;
+    let bytes = fs::read(&selector)
+        .map_err(|error| format!("cannot read provider selector update: {error}"))?;
+    let parsed = parse_provider_selector_source(&bytes)?;
+    if parsed.provider != provider
+        || parsed.trust_domain != trust_domain
+        || fs::read_to_string(digest)
+            .map_err(|error| format!("cannot read provider selector digest: {error}"))?
+            != format!("{}\n", sha256_bytes(&bytes).hex())
+    {
+        return Err("provider selector update identity differs".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn selector_directory_inventory(directory: &Path) -> Result<BTreeSet<OsString>, String> {
+    fs::read_dir(directory)
+        .map_err(|error| format!("cannot enumerate selector update: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| format!("cannot enumerate selector update: {error}"))
+}
+
+fn require_real_selector_directory(directory: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect selector update directory: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("provider selector update is not a real directory".to_owned());
+    }
+    Ok(())
+}
+
+fn require_real_selector_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect selector update file: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("provider selector update contains a non-regular file".to_owned());
+    }
+    Ok(())
 }
 
 fn workflow_retain_review_subject() -> Result<String, String> {
@@ -588,7 +1348,7 @@ fn workflow_stage_current_scrub() -> Result<String, String> {
 
 fn workflow_retrieve() -> Result<String, String> {
     let mut options = Options::default();
-    apply_workflow_provider(&mut options, workflow_provider(false)?);
+    apply_workflow_provider(&mut options, verified_provider_selector("retrieval")?);
     options.input = Some(component_path([
         "ci-out",
         "custody",
@@ -604,6 +1364,137 @@ fn workflow_retrieve() -> Result<String, String> {
     ]));
     options.policy = Some(component_path(["compat", "custody-policy.toml"]));
     retrieve(&options, "retrieval")
+}
+
+fn workflow_verify_upload_subject() -> Result<String, String> {
+    let root = std::env::current_dir()
+        .map_err(|error| format!("cannot determine custody checkout: {error}"))?;
+    let directory = component_path(["ci-out", "custody", "current", "upload"]);
+    require_exact_upload_subject_inventory(&directory)?;
+    let receipt_path = directory.join("upload-receipt.json");
+    let pointer_path = directory.join("upload-receipt-provider-pointer.json");
+    let packet_path = directory.join("upload-receipt-packet.json");
+    let dsse_path = directory.join("upload-receipt.dsse.json");
+    let receipt_document = fs::read_to_string(&receipt_path)
+        .map_err(|error| format!("cannot read downloaded upload receipt: {error}"))?;
+    let receipt = parse_upload_receipt(&receipt_document)?;
+    let dispatch = crate::assurance::github_dispatch_object(CUSTODY_DISPATCH_KEYS)?;
+    let candidate = dispatch
+        .get("candidate_sha")
+        .ok_or_else(|| "custody dispatch omits candidate_sha".to_owned())?;
+    let (_, epoch) = crate::assurance::epoch(&root)?;
+    let expected_provider = required_environment_atom("CUSTODY_EXPECTED_PROVIDER")?;
+    let expected_trust_domain = required_environment_atom("CUSTODY_EXPECTED_TRUST_DOMAIN")?;
+    if receipt.candidate != *candidate
+        || receipt.epoch != epoch.hex()
+        || receipt.provider != expected_provider
+        || receipt.trust_domain != expected_trust_domain
+    {
+        return Err(
+            "downloaded upload receipt differs from dispatch, epoch, or provider selection"
+                .to_owned(),
+        );
+    }
+    let (pointer_key, pointer_version, pointer_digest, pointer_retention) =
+        parse_provider_pointer(&pointer_path)?;
+    let receipt_digest = sha256_bytes(receipt_document.as_bytes()).hex();
+    if pointer_key != receipt_digest
+        || pointer_digest != receipt_digest
+        || pointer_version.is_empty()
+        || pointer_retention != receipt.retention_until
+    {
+        return Err("downloaded upload provider pointer differs from its receipt".to_owned());
+    }
+    let artifacts = BTreeSet::from([
+        receipt.manifest_sha256.clone(),
+        receipt_digest,
+        sha256_file(&pointer_path)
+            .map_err(|error| error.to_string())?
+            .hex(),
+    ]);
+    crate::assurance::verify_review_binding_payload(
+        &dsse_path,
+        &packet_path,
+        &component_path(["compat", "reviews.allowed_signers"]),
+        "custody-provider",
+        candidate,
+        &epoch.hex(),
+        &artifacts,
+    )?;
+    load_custody_policy(&component_path(["compat", "custody-policy.toml"]))?;
+    let provider = WorkflowProvider {
+        provider: receipt.provider,
+        trust_domain: receipt.trust_domain,
+        bucket: receipt.bucket,
+        active_candidate: String::new(),
+        active_epoch: String::new(),
+        active_manifest: String::new(),
+        active_receipt_key: pointer_key,
+        active_receipt_version: pointer_version,
+        active_receipt_sha256: pointer_digest,
+        active_activation_record_key: String::new(),
+        active_activation_record_version: String::new(),
+        active_activation_record_sha256: String::new(),
+        active_activation_packet_key: String::new(),
+        active_activation_packet_version: String::new(),
+        active_activation_packet_sha256: String::new(),
+        active_activation_dsse_key: String::new(),
+        active_activation_dsse_version: String::new(),
+        active_activation_dsse_sha256: String::new(),
+        activation_public_state: String::new(),
+        activation_public_completion_sha256: String::new(),
+        current_transition: None,
+    };
+    let selector = render_provider_selector("retrieval", &provider)?;
+    let selector_path: PathBuf = MAINTENANCE_SELECTOR_PATH.iter().collect();
+    write_atomic(&selector_path, &selector)?;
+    write_atomic(
+        &selector_path.with_extension("json.sha256"),
+        format!("{}\n", sha256_bytes(&selector).hex()).as_bytes(),
+    )?;
+    Ok("verified exact signed upload subject before retrieval credentials".to_owned())
+}
+
+fn require_exact_upload_subject_inventory(directory: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect downloaded upload subject: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("downloaded upload subject is not a real directory".to_owned());
+    }
+    let expected = BTreeSet::from([
+        "upload-receipt-provider-pointer.json".to_owned(),
+        "upload-receipt-packet.json".to_owned(),
+        "upload-receipt.dsse.json".to_owned(),
+        "upload-receipt.json".to_owned(),
+    ]);
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("cannot enumerate downloaded upload subject: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("cannot enumerate downloaded upload subject: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("cannot inspect downloaded upload subject file: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("downloaded upload subject contains a non-regular file".to_owned());
+        }
+        observed.insert(
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "downloaded upload subject filename is not UTF-8".to_owned())?,
+        );
+    }
+    if observed != expected {
+        return Err("downloaded upload subject inventory is not exact".to_owned());
+    }
+    Ok(())
+}
+
+fn required_environment_atom(name: &str) -> Result<String, String> {
+    let value = std::env::var(name).map_err(|_| format!("{name} is unavailable"))?;
+    require_atom(&value, name)?;
+    Ok(value)
 }
 
 fn workflow_copy_record() -> Result<String, String> {
@@ -691,6 +1582,54 @@ fn workflow_materialize_review_package() -> Result<String, String> {
     Ok("materialized post-custody evidence for final role-graph review".to_owned())
 }
 
+fn workflow_assemble_collection_worm() -> Result<String, String> {
+    let source = component_path(["ci-out", "custody"]);
+    let output = component_path(["ci-out", "collection-worm-custody"]);
+    copy_retained_tree(&source, &output)?;
+    let package = output
+        .join("retained")
+        .join("transport")
+        .join("custody-package");
+    materialize_package(&package, &output.join("subject"))?;
+    for (provider, source_name) in [
+        ("primary-worm", "primary-worm-current-scrub"),
+        ("secondary-worm", "secondary-worm-current-scrub"),
+    ] {
+        copy_retained_tree(
+            &component_path(["ci-out", source_name]),
+            &output.join(format!("{provider}-current-scrub")),
+        )?;
+    }
+    let manifest = fs::read_to_string(package.join("manifest.json"))
+        .map_err(|error| format!("cannot read collection WORM custody manifest: {error}"))?;
+    let (candidate, epoch, _) = parse_manifest(&manifest)?;
+    verify_current_scrub_subject(
+        &output,
+        &component_path(["compat", "reviews.allowed_signers"]),
+        &component_path(["compat", "custody-policy.toml"]),
+        &output.join("subject"),
+        &candidate,
+        &epoch,
+    )?;
+    let digest = directory_digest(&output)?;
+    write_atomic(
+        &component_path(["ci-out", "collection-worm-custody.directory.sha256"]),
+        format!("{digest}\n").as_bytes(),
+    )?;
+    if let Some(github_output) = std::env::var_os("GITHUB_OUTPUT") {
+        let mut github_output = fs::OpenOptions::new()
+            .append(true)
+            .open(github_output)
+            .map_err(|error| format!("cannot open collection WORM GITHUB_OUTPUT: {error}"))?;
+        writeln!(github_output, "directory-sha256={digest}")
+            .map_err(|error| format!("cannot write collection WORM GITHUB_OUTPUT: {error}"))?;
+        github_output
+            .sync_all()
+            .map_err(|error| format!("cannot sync collection WORM GITHUB_OUTPUT: {error}"))?;
+    }
+    Ok("assembled exact collection WORM custody admission evidence".to_owned())
+}
+
 fn copy_retained_tree(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
@@ -748,7 +1687,7 @@ fn workflow_activate() -> Result<String, String> {
     if inputs.get("artifact_class").map(String::as_str) != Some("final-promotion-record") {
         return Err("only a final promotion record may become active custody evidence".to_owned());
     }
-    let provider = workflow_provider(false)?;
+    let provider = verified_provider_selector("activation")?;
     let provider_root = component_path(["ci-out", "custody"])
         .join(&provider.provider)
         .join("upload");
@@ -823,7 +1762,7 @@ fn workflow_activate() -> Result<String, String> {
 }
 
 fn workflow_activation_packet() -> Result<String, String> {
-    let provider = workflow_provider(false)?;
+    let provider = verified_provider_selector("activation")?;
     let directory = component_path(["ci-out", "custody-activation"]).join(&provider.provider);
     packet(&Options {
         input: Some(directory.join("activation-receipt.json")),
@@ -835,7 +1774,7 @@ fn workflow_activation_packet() -> Result<String, String> {
 }
 
 fn workflow_commit_activation() -> Result<String, String> {
-    let provider = workflow_provider(false)?;
+    let provider = verified_provider_selector("activation")?;
     let directory = component_path(["ci-out", "custody-activation"]).join(&provider.provider);
     let record = directory.join("activation-receipt.json");
     let packet_path = directory.join("activation-packet.json");
@@ -919,6 +1858,7 @@ fn workflow_commit_activation() -> Result<String, String> {
         dsse_version,
         dsse_sha,
     );
+    write_provider_selector_update(&parse_provider_context_text(&context)?)?;
     aws(&[
         "ssm",
         "put-parameter",
@@ -947,123 +1887,6 @@ fn retain_activation_object(
     Ok((key, metadata.version, digest.hex()))
 }
 
-fn workflow_dispatch_initial_surveillance() -> Result<String, String> {
-    let run_id = required_positive_environment("GITHUB_RUN_ID")?;
-    let run_attempt = required_positive_environment("GITHUB_RUN_ATTEMPT")?;
-    let primary = component_path([
-        "ci-out",
-        "custody-activation",
-        "primary-worm",
-        "activation-receipt.json",
-    ]);
-    let secondary = component_path([
-        "ci-out",
-        "custody-activation",
-        "secondary-worm",
-        "activation-receipt.json",
-    ]);
-    let primary_text = verify_dispatch_activation(&primary, "primary-worm")?;
-    let secondary_text = verify_dispatch_activation(&secondary, "secondary-worm")?;
-    let candidate = quoted_field(&primary_text, "candidateCommit")?;
-    let epoch = quoted_field(&primary_text, "assuranceEpochSha256")?;
-    if quoted_field(&secondary_text, "candidateCommit")? != candidate
-        || quoted_field(&secondary_text, "assuranceEpochSha256")? != epoch
-        || quoted_field(&primary_text, "custodyGateSha256")?
-            != quoted_field(&secondary_text, "custodyGateSha256")?
-    {
-        return Err("dual activation receipts disagree on initial surveillance subject".to_owned());
-    }
-    verify_activation_run_binding(&primary_text, &secondary_text, run_id, run_attempt)?;
-    let inputs = crate::assurance::github_dispatch_object(CUSTODY_DISPATCH_KEYS)?;
-    if inputs.get("artifact_class").map(String::as_str) != Some("final-promotion-record")
-        || inputs.get("candidate_sha").map(String::as_str) != Some(candidate.as_str())
-    {
-        return Err("initial surveillance dispatch differs from custody dispatch".to_owned());
-    }
-    let correlation = initial_activation_correlation(
-        &candidate,
-        &epoch,
-        run_id,
-        run_attempt,
-        &public_report_file_digest(&primary)?,
-        &public_report_file_digest(&secondary)?,
-    );
-    let body =
-        initial_surveillance_dispatch_body(&candidate, &epoch, run_id, run_attempt, &correlation);
-    let endpoint = component_path([
-        "repos",
-        "Portfoligno",
-        "hell-rs",
-        "actions",
-        "workflows",
-        "promotion-surveillance.yml",
-        "dispatches",
-    ]);
-    let token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| "initial surveillance dispatch lacks GITHUB_TOKEN".to_owned())?;
-    let mut child = Command::new("gh")
-        .args([
-            OsStr::new("api"),
-            OsStr::new("--method"),
-            OsStr::new("POST"),
-            endpoint.as_os_str(),
-            OsStr::new("--input"),
-            OsStr::new("-"),
-        ])
-        .env("GH_TOKEN", &token)
-        .env_remove("GITHUB_TOKEN")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| format!("cannot start initial surveillance dispatch: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "initial surveillance dispatch lacks stdin".to_owned())?
-        .write_all(body.as_bytes())
-        .map_err(|error| format!("cannot write initial surveillance dispatch: {error}"))?;
-    let response = child
-        .wait_with_output()
-        .map_err(|error| format!("cannot wait for initial surveillance dispatch: {error}"))?;
-    if !response.status.success() || !response.stdout.is_empty() {
-        return Err("initial surveillance dispatch failed or returned a body".to_owned());
-    }
-    let receipt = format!(
-        "{{\n  \"schemaVersion\": 2,\n  \"candidateCommit\": \"{candidate}\",\n  \"assuranceEpochSha256\": \"{epoch}\",\n  \"activationRunId\": {run_id},\n  \"activationRunAttempt\": {run_attempt},\n  \"activationCorrelationSha256\": \"{correlation}\",\n  \"primaryActivationSha256\": \"{}\",\n  \"secondaryActivationSha256\": \"{}\",\n  \"requestSha256\": \"{}\",\n  \"workflowPath\": \".github/workflows/promotion-surveillance.yml\",\n  \"ref\": \"main\",\n  \"state\": \"dispatch-accepted-pending-publication\"\n}}\n",
-        public_report_file_digest(&primary)?,
-        public_report_file_digest(&secondary)?,
-        sha256_bytes(body.as_bytes()).hex(),
-    );
-    write_atomic(
-        &component_path(["ci-out", "initial-surveillance-dispatch.json"]),
-        receipt.as_bytes(),
-    )?;
-    Ok("dispatched pending initial public surveillance for exact dual activation".to_owned())
-}
-
-fn verify_dispatch_activation(path: &Path, provider: &str) -> Result<String, String> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| "activation receipt has no directory".to_owned())?;
-    let packet = directory.join("activation-packet.json");
-    let dsse = directory.join("activation-receipt.dsse.json");
-    verify_public_transition_signature_for_role(&dsse, "custody-provider")?;
-    let document = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read dispatch activation receipt: {error}"))?;
-    if quoted_field(&document, "provider")? != provider {
-        return Err("activation receipt provider differs from dispatch channel".to_owned());
-    }
-    crate::assurance::verify_review_packet_first_artifact(
-        &packet,
-        "custody-provider",
-        &quoted_field(&document, "candidateCommit")?,
-        &quoted_field(&document, "assuranceEpochSha256")?,
-        &public_report_file_digest(path)?,
-    )?;
-    Ok(document)
-}
-
 pub(crate) fn verify_activation_run_binding(
     primary: &str,
     secondary: &str,
@@ -1080,35 +1903,6 @@ pub(crate) fn verify_activation_run_binding(
         return Err("signed dual activation receipts differ from activation run".to_owned());
     }
     Ok(())
-}
-
-fn initial_surveillance_dispatch_body(
-    candidate: &str,
-    epoch: &str,
-    run_id: u64,
-    run_attempt: u64,
-    correlation: &str,
-) -> String {
-    let mut body = String::from("{\"ref\":\"main\",\"inputs\":{");
-    for (index, (field, value)) in [
-        ("candidate_sha", candidate.to_owned()),
-        ("assurance_epoch_sha256", epoch.to_owned()),
-        ("activation_run_id", run_id.to_string()),
-        ("activation_run_attempt", run_attempt.to_string()),
-        ("activation_correlation_sha256", correlation.to_owned()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if index != 0 {
-            body.push(',');
-        }
-        push_json(&mut body, field);
-        body.push(':');
-        push_json(&mut body, &value);
-    }
-    body.push_str("}}\n");
-    body
 }
 
 pub(crate) fn initial_activation_correlation(
@@ -1241,12 +2035,13 @@ fn workflow_record_initial_surveillance_failure() -> Result<String, String> {
 
 fn workflow_complete_initial_activation() -> Result<String, String> {
     let completion_path = component_path(["ci-out", "initial-surveillance-completion.json"]);
+    verify_initial_completion_proof(&completion_path, true)?;
     let completion = fs::read_to_string(&completion_path)
         .map_err(|error| format!("cannot read initial public completion: {error}"))?;
     if quoted_field(&completion, "state")? != "completed-success-and-publicly-observed" {
         return Err("initial public completion has not reached its terminal state".to_owned());
     }
-    let mut provider = workflow_provider(true)?;
+    let mut provider = verified_provider_selector("complete-initial-publication")?;
     let completion_sha256 = public_report_file_digest(&completion_path)?;
     if quoted_field(&completion, "candidateCommit")? != provider.active_candidate
         || quoted_field(&completion, "assuranceEpochSha256")? != provider.active_epoch
@@ -1294,6 +2089,7 @@ fn workflow_complete_initial_activation() -> Result<String, String> {
                 )
             });
     let context = provider_context_with_transition(&provider, record, packet, dsse);
+    write_provider_selector_update(&parse_provider_context_text(&context)?)?;
     aws(&[
         "ssm",
         "put-parameter",
@@ -1309,6 +2105,66 @@ fn workflow_complete_initial_activation() -> Result<String, String> {
         "completed initial public activation for provider {}",
         provider.provider
     ))
+}
+
+fn workflow_verify_initial_completion() -> Result<String, String> {
+    workflow_prepare_provider_selector()?;
+    let path = component_path(["ci-out", "initial-surveillance-completion.json"]);
+    verify_initial_completion_proof(&path, false)?;
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("cannot retain initial completion proof: {error}"))?;
+    write_atomic(
+        &path.with_extension("json.sha256"),
+        format!("{}\n", sha256_bytes(&bytes).hex()).as_bytes(),
+    )?;
+    Ok("verified exact initial public completion before provider credentials".to_owned())
+}
+
+fn verify_initial_completion_proof(path: &Path, require_sibling: bool) -> Result<(), String> {
+    let document = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read initial public completion: {error}"))?;
+    if quoted_field(&document, "state")? != "completed-success-and-publicly-observed" {
+        return Err("initial public completion has not reached its terminal state".to_owned());
+    }
+    require_git_sha(
+        &quoted_field(&document, "candidateCommit")?,
+        "completion candidate",
+    )?;
+    for key in [
+        "assuranceEpochSha256",
+        "activationCorrelationSha256",
+        "primaryActivationSha256",
+        "secondaryActivationSha256",
+        "transitionArchiveSha256",
+        "publicArchiveSha256",
+        "publicPublicationReceiptSha256",
+    ] {
+        require_digest(&quoted_field(&document, key)?, key)?;
+    }
+    for key in [
+        "activationRunId",
+        "activationRunAttempt",
+        "surveillanceRunId",
+        "surveillanceRunAttempt",
+        "transitionArtifactId",
+        "publicArtifactId",
+    ] {
+        if unsigned_field(&document, key)? == 0 {
+            return Err(format!("initial completion {key} must be nonzero"));
+        }
+    }
+    let digest = path.with_extension("json.sha256");
+    if require_sibling && !digest.is_file() {
+        return Err("initial completion preflight digest is absent".to_owned());
+    }
+    if digest.is_file()
+        && fs::read_to_string(&digest)
+            .map_err(|error| format!("cannot read completion digest sibling: {error}"))?
+            != format!("{}\n", sha256_bytes(document.as_bytes()).hex())
+    {
+        return Err("initial completion digest sibling differs".to_owned());
+    }
+    Ok(())
 }
 
 fn verify_completion_activation_binding(
@@ -1802,7 +2658,7 @@ fn github_api_output(token: &str, arguments: &[OsString]) -> Result<Output, Stri
 }
 
 fn workflow_publish_transition() -> Result<String, String> {
-    let provider = workflow_provider(true)?;
+    let provider = verified_provider_selector("transition-publication")?;
     require_provider_activation_visibility(&provider)?;
     let current_transition = workflow_current_transition(&provider)?;
     let record = component_path(["ci-out", "surveillance", "promotion-transition.json"]);
@@ -1868,7 +2724,7 @@ fn workflow_publish_transition() -> Result<String, String> {
             return Err(format!("transition differs from active provider {field}"));
         }
     }
-    let upload_receipt = workflow_active_receipt()?;
+    let upload_receipt = workflow_active_receipt_from(&provider)?;
     let upload = parse_upload_receipt(
         &fs::read_to_string(&upload_receipt)
             .map_err(|error| format!("cannot read active upload receipt: {error}"))?,
@@ -1885,6 +2741,7 @@ fn workflow_publish_transition() -> Result<String, String> {
         (&packet_key, &packet_version, &packet_sha),
         (&dsse_key, &dsse_version, &dsse_sha),
     );
+    write_provider_selector_update(&parse_provider_context_text(&context)?)?;
     aws(&[
         "ssm",
         "put-parameter",
@@ -1983,6 +2840,7 @@ fn produce_public_source_selection(
             provider_head: &context.source_commit,
             candidate: &quoted_field(transition, "candidateCommit")?,
             expected_directory_sha256: &extracted_sha256,
+            expected_archive_sha256: &public_report_file_digest(&archive)?,
         },
     )?;
     let selection_path = root.join("public-source-selection.json");
@@ -3383,6 +4241,7 @@ fn reverify_observed_public_source(
                 "candidateCommit",
             )?,
             expected_directory_sha256: &directory_sha256,
+            expected_archive_sha256: &public_report_file_digest(&archive)?,
         },
     )?;
     write_atomic(
@@ -3472,6 +4331,93 @@ fn public_publication_context() -> Result<PublicPublicationContext, String> {
     let base_url = std::env::var("PUBLIC_COMPATIBILITY_REPORT_BASE_URL")
         .map_err(|_| "public report publication lacks its base URL".to_owned())?;
     require_atom(&bucket, "public report bucket")?;
+    let context = PublicPublicationContext { bucket, base_url };
+    let selector = component_path(["ci-out", "surveillance", "public-publication-selector.json"]);
+    let bytes = fs::read(&selector)
+        .map_err(|error| format!("cannot read sealed public publication selector: {error}"))?;
+    let sealed = parse_public_publication_selector(&bytes)?;
+    if fs::read_to_string(selector.with_extension("json.sha256"))
+        .map_err(|error| format!("cannot read public selector digest: {error}"))?
+        != format!("{}\n", sha256_bytes(&bytes).hex())
+        || sealed.bucket != context.bucket
+        || sealed.base_url != context.base_url
+    {
+        return Err("sealed public publication selector differs from protected context".to_owned());
+    }
+    Ok(context)
+}
+
+fn require_https_base_url(base_url: &str) -> Result<(), String> {
+    PublicReportUrl::new(base_url, "current-state.json").map(|_| ())
+}
+
+fn workflow_prepare_public_publication_selector() -> Result<String, String> {
+    let bucket = std::env::var("PUBLIC_COMPATIBILITY_REPORT_BUCKET")
+        .map_err(|_| "public publication preflight lacks bucket".to_owned())?;
+    let base_url = std::env::var("PUBLIC_COMPATIBILITY_REPORT_BASE_URL")
+        .map_err(|_| "public publication preflight lacks base URL".to_owned())?;
+    require_atom(&bucket, "public report bucket")?;
+    require_https_base_url(&base_url)?;
+    let document = crate::assurance::JsonValue::Object(BTreeMap::from([
+        (
+            "baseUrl".to_owned(),
+            crate::assurance::JsonValue::String(base_url),
+        ),
+        (
+            "bucket".to_owned(),
+            crate::assurance::JsonValue::String(bucket),
+        ),
+        (
+            "operation".to_owned(),
+            crate::assurance::JsonValue::String("public-transition-publication".to_owned()),
+        ),
+        (
+            "schemaVersion".to_owned(),
+            crate::assurance::JsonValue::Number(1),
+        ),
+        (
+            "state".to_owned(),
+            crate::assurance::JsonValue::String("sealed-before-publication-credentials".to_owned()),
+        ),
+    ]));
+    let bytes = crate::assurance::canonical_json_bytes(&document)?;
+    let output = component_path(["ci-out", "surveillance", "public-publication-selector.json"]);
+    write_atomic(&output, &bytes)?;
+    write_atomic(
+        &output.with_extension("json.sha256"),
+        format!("{}\n", sha256_bytes(&bytes).hex()).as_bytes(),
+    )?;
+    Ok("sealed exact public publication destination before credentials".to_owned())
+}
+
+fn parse_public_publication_selector(bytes: &[u8]) -> Result<PublicPublicationContext, String> {
+    let document = crate::assurance::parse_json(
+        std::str::from_utf8(bytes).map_err(|_| "public selector is not UTF-8".to_owned())?,
+    )?;
+    if crate::assurance::canonical_json_bytes(&document)? != bytes {
+        return Err("public publication selector is not canonical".to_owned());
+    }
+    let fields = document.object()?;
+    if fields.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != ["baseUrl", "bucket", "operation", "schemaVersion", "state"]
+            .into_iter()
+            .collect()
+        || crate::assurance::json_member(fields, "schemaVersion")?.number()? != 1
+        || crate::assurance::json_member(fields, "operation")?.string()?
+            != "public-transition-publication"
+        || crate::assurance::json_member(fields, "state")?.string()?
+            != "sealed-before-publication-credentials"
+    {
+        return Err("public publication selector identity differs".to_owned());
+    }
+    let bucket = crate::assurance::json_member(fields, "bucket")?
+        .string()?
+        .to_owned();
+    let base_url = crate::assurance::json_member(fields, "baseUrl")?
+        .string()?
+        .to_owned();
+    require_atom(&bucket, "public report bucket")?;
+    require_https_base_url(&base_url)?;
     Ok(PublicPublicationContext { bucket, base_url })
 }
 
@@ -3561,6 +4507,7 @@ fn reverify_public_source_selection(
             provider_head: &context.source_commit,
             candidate: &quoted_field(transition, "candidateCommit")?,
             expected_directory_sha256: &expected_directory_sha256,
+            expected_archive_sha256: &quoted_field(&selection, "providerArchiveSha256")?,
         },
     )?;
     verify_retained_public_source_reselection(
@@ -3878,7 +4825,7 @@ fn workflow_review_packet() -> Result<String, String> {
 
 fn workflow_maintenance(action: &str) -> Result<String, String> {
     if action == "workflow-maintenance-packet" {
-        let provider = workflow_provider(false)?;
+        let provider = verified_provider_selector("maintenance")?;
         let receipt = [
             component_path(["ci-out", "custody-maintenance", "scrub-receipt.json"]),
             component_path(["ci-out", "custody-maintenance", "recovery-receipt.json"]),
@@ -3900,13 +4847,14 @@ fn workflow_maintenance(action: &str) -> Result<String, String> {
             ..Options::default()
         });
     }
+    let provider = verified_provider_selector("maintenance")?;
     let mut options = Options {
-        input: Some(workflow_active_receipt()?),
+        input: Some(workflow_active_receipt_from(&provider)?),
         output: Some(component_path(["ci-out", "custody-maintenance"])),
         policy: Some(component_path(["compat", "custody-policy.toml"])),
         ..Options::default()
     };
-    apply_workflow_provider(&mut options, workflow_provider(false)?);
+    apply_workflow_provider(&mut options, provider.clone());
     let result = retrieve(
         &options,
         if action == "workflow-scrub" {
@@ -3915,7 +4863,7 @@ fn workflow_maintenance(action: &str) -> Result<String, String> {
             "recovery"
         },
     )?;
-    workflow_active_activation()?;
+    workflow_active_activation_from(&provider)?;
     Ok(result)
 }
 
@@ -3955,7 +4903,7 @@ struct SurveillanceRetrieval {
 }
 
 fn surveillance_retrieval(observer_candidate: &str, observer_epoch: &str) -> SurveillanceRetrieval {
-    match workflow_provider(true) {
+    match verified_provider_selector("surveillance") {
         Ok(provider) => {
             let outcome = require_provider_activation_visibility(&provider)
                 .and_then(|()| workflow_current_transition(&provider))
@@ -4003,12 +4951,18 @@ fn surveillance_retrieval(observer_candidate: &str, observer_epoch: &str) -> Sur
 }
 
 fn require_provider_activation_visibility(provider: &WorkflowProvider) -> Result<(), String> {
-    match (
-        std::env::var("GITHUB_EVENT_NAME").as_deref(),
-        provider.activation_public_state.as_str(),
-    ) {
-        (Ok("workflow_dispatch"), "pending-publication" | "completed-publication")
-        | (Ok("schedule"), "completed-publication") => Ok(()),
+    let event = std::env::var("GITHUB_EVENT_NAME")
+        .map_err(|_| "surveillance event identity is unavailable".to_owned())?;
+    require_provider_activation_visibility_for_event(provider, &event)
+}
+
+fn require_provider_activation_visibility_for_event(
+    provider: &WorkflowProvider,
+    event: &str,
+) -> Result<(), String> {
+    match (event, provider.activation_public_state.as_str()) {
+        ("workflow_dispatch", "pending-publication" | "completed-publication")
+        | ("schedule" | "push", "completed-publication") => Ok(()),
         _ => Err("provider activation is not finalized for this surveillance event".to_owned()),
     }
 }
@@ -4203,8 +5157,7 @@ fn workflow_current_transition(
     }))
 }
 
-fn workflow_active_activation() -> Result<(), String> {
-    let provider = workflow_provider(true)?;
+fn workflow_active_activation_from(provider: &WorkflowProvider) -> Result<(), String> {
     let directory = component_path(["ci-out", "custody-maintenance", "activation"]);
     fs::create_dir_all(&directory)
         .map_err(|error| format!("cannot create activation retrieval directory: {error}"))?;
@@ -4268,8 +5221,7 @@ fn workflow_active_activation() -> Result<(), String> {
     Ok(())
 }
 
-fn workflow_active_receipt() -> Result<PathBuf, String> {
-    let provider = workflow_provider(true)?;
+fn workflow_active_receipt_from(provider: &WorkflowProvider) -> Result<PathBuf, String> {
     let path = component_path(["ci-out", "active-upload-receipt.json"]);
     get_object(
         &provider.bucket,
@@ -5489,6 +6441,11 @@ pub(crate) fn directory_digest(root: &Path) -> Result<String, String> {
     assurance_directory_manifest(root).map(|manifest| sha256_bytes(manifest.as_bytes()).hex())
 }
 
+pub(crate) fn verified_directory_digest(root: &Path) -> Result<String, String> {
+    require_custody_package_directory(root, "artifact directory")?;
+    directory_digest(root)
+}
+
 fn package(options: &Options) -> Result<String, String> {
     let input = required_path(options.input.as_ref(), "--input")?;
     let output = required_path(options.output.as_ref(), "--output")?;
@@ -5557,13 +6514,37 @@ fn package(options: &Options) -> Result<String, String> {
     ))
 }
 
+pub(crate) fn package_directory(
+    input: &Path,
+    output: &Path,
+    candidate: &str,
+    epoch: &str,
+) -> Result<(), String> {
+    package(&Options {
+        input: Some(input.to_path_buf()),
+        output: Some(output.to_path_buf()),
+        candidate: Some(candidate.to_owned()),
+        epoch: Some(epoch.to_owned()),
+        ..Options::default()
+    })
+    .map(|_| ())
+}
+
 fn verify_package(package: &Path) -> Result<String, String> {
+    require_custody_package_directory(package, "package")?;
+    require_custody_package_file(&package.join("manifest.json"), "manifest")?;
+    require_custody_package_file(&package.join("root.sha256"), "root digest")?;
+    require_custody_package_directory(&package.join("blobs"), "blob directory")?;
     let manifest = fs::read_to_string(package.join("manifest.json"))
         .map_err(|error| format!("cannot read custody manifest: {error}"))?;
     let (candidate, epoch, entries) = parse_manifest(&manifest)?;
     if entries.is_empty() {
         return Err("custody manifest has no files".to_owned());
     }
+    if manifest != manifest_json(&candidate, &epoch, &entries) {
+        return Err("custody manifest is not exact canonical JSON".to_owned());
+    }
+    require_exact_custody_package_inventory(package, &entries)?;
     for entry in &entries {
         let blob = package.join("blobs").join(entry.digest.hex());
         let metadata = fs::symlink_metadata(&blob)
@@ -5579,10 +6560,124 @@ fn verify_package(package: &Path) -> Result<String, String> {
     let expected = package_root_digest(&candidate, &epoch, &entries).hex();
     let observed = fs::read_to_string(package.join("root.sha256"))
         .map_err(|error| format!("cannot read custody root digest: {error}"))?;
-    if observed.trim() != expected {
+    if observed != format!("{expected}\n") {
         return Err("custody root digest does not match manifest".to_owned());
     }
     Ok("verified deterministic custody package".to_owned())
+}
+
+fn require_custody_package_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect custody {label} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "custody {label} {} is not a real directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_custody_package_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect custody {label} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "custody {label} {} is not a real file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_custody_package_inventory(
+    package: &Path,
+    entries: &[ManifestEntry],
+) -> Result<(), String> {
+    let mut top_level = fs::read_dir(package)
+        .map_err(|error| format!("cannot enumerate custody package: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("cannot enumerate custody package: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    top_level.sort();
+    if top_level
+        != ["blobs", "manifest.json", "root.sha256"]
+            .map(OsString::from)
+            .as_slice()
+    {
+        return Err("custody package top-level inventory is not exact".to_owned());
+    }
+
+    let expected = entries
+        .iter()
+        .map(|entry| OsString::from(entry.digest.hex()))
+        .collect::<BTreeSet<_>>();
+    let observed = fs::read_dir(package.join("blobs"))
+        .map_err(|error| format!("cannot enumerate custody blobs: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("cannot enumerate custody blobs: {error}"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if observed != expected {
+        return Err("custody package blob inventory is not exact".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_current_scrub_subject(
+    evidence: &Path,
+    signer_policy: &Path,
+    custody_policy: &Path,
+    subject: &Path,
+    candidate: &str,
+    epoch: &str,
+) -> Result<Digest, String> {
+    require_custody_package_directory(evidence, "evidence directory")?;
+    let custody_receipt = evidence.join("custody-receipt.json");
+    crate::assurance::verify_retained_custody_receipt(&custody_receipt, signer_policy)?;
+    let first = evidence.join("primary-worm-current-scrub");
+    let second = evidence.join("secondary-worm-current-scrub");
+    let policy = load_custody_policy(custody_policy)?;
+    let scrub_identity = verify_current_scrub_set(
+        &first.join("scrub-receipt.json"),
+        &first.join("custody-maintenance-receipt.dsse.json"),
+        &second.join("scrub-receipt.json"),
+        &second.join("custody-maintenance-receipt.dsse.json"),
+        signer_policy,
+        &custody_receipt,
+        candidate,
+        epoch,
+        policy.scrub_interval_days,
+    )?;
+    let custody = fs::read_to_string(&custody_receipt)
+        .map_err(|error| format!("cannot read current custody receipt: {error}"))?;
+    let package = safe_retained_path(evidence, &quoted_field(&custody, "packageRoot")?)?;
+    verify_package(&package)?;
+    let manifest = fs::read_to_string(package.join("manifest.json"))
+        .map_err(|error| format!("cannot read custody manifest: {error}"))?;
+    let (observed_candidate, observed_epoch, observed_entries) = parse_manifest(&manifest)?;
+    if observed_candidate != candidate || observed_epoch != epoch {
+        return Err(
+            "custody subject candidate or epoch differs from collection overlay".to_owned(),
+        );
+    }
+    if observed_entries != collect_entries(subject)? {
+        return Err("custody package subject differs from exact collection overlay".to_owned());
+    }
+    let identity = format!(
+        "{}\n{}\n{}\n",
+        sha256_file(&custody_receipt)
+            .map_err(|error| error.to_string())?
+            .hex(),
+        scrub_identity,
+        sha256_bytes(manifest.as_bytes()).hex(),
+    );
+    Ok(sha256_bytes(identity.as_bytes()))
 }
 
 fn materialize_package(package: &Path, output: &Path) -> Result<String, String> {
@@ -6869,6 +7964,293 @@ mod tests {
         }
     }
 
+    #[test]
+    fn surveillance_visibility_is_event_and_publication_state_specific() {
+        let mut provider = pending_provider("primary-worm", &fixture_digest());
+        for (event, accepted) in [
+            ("workflow_dispatch", true),
+            ("schedule", false),
+            ("push", false),
+            ("workflow_run", false),
+        ] {
+            assert_eq!(
+                require_provider_activation_visibility_for_event(&provider, event).is_ok(),
+                accepted,
+                "pending visibility for {event}"
+            );
+        }
+        provider.activation_public_state = "completed-publication".to_owned();
+        provider.activation_public_completion_sha256 = fixture_digest();
+        for (event, accepted) in [
+            ("workflow_dispatch", true),
+            ("schedule", true),
+            ("push", true),
+            ("workflow_run", false),
+        ] {
+            assert_eq!(
+                require_provider_activation_visibility_for_event(&provider, event).is_ok(),
+                accepted,
+                "completed visibility for {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_barrier_rejects_cross_run_inner_source_selection() {
+        let candidate = fixture_candidate();
+        let digest = fixture_digest();
+        let workflow = ".github/workflows/evidence-custody.yml";
+        let mut source = crate::assurance::VerifiedCurrentRunArtifactSelection {
+            primary_artifact_name: "custody-provider-selector-update-primary-worm-41-2".to_owned(),
+            primary_artifact_id: 71,
+            primary_archive_sha256: digest.clone(),
+            secondary_artifact_name: "custody-provider-selector-update-secondary-worm-41-2"
+                .to_owned(),
+            secondary_artifact_id: 72,
+            secondary_archive_sha256: sha256_bytes(b"secondary-selector-archive").hex(),
+            run_id: 41,
+            run_attempt: 2,
+            workflow_path: workflow.to_owned(),
+            event_name: "workflow_dispatch".to_owned(),
+            candidate: candidate.clone(),
+        };
+        assert!(
+            verify_selector_source_matches_aggregate(
+                &source,
+                41,
+                2,
+                workflow,
+                "workflow_dispatch",
+                &candidate,
+            )
+            .is_ok()
+        );
+
+        source.run_id = 40;
+        assert!(
+            verify_selector_source_matches_aggregate(
+                &source,
+                41,
+                2,
+                workflow,
+                "workflow_dispatch",
+                &candidate,
+            )
+            .is_err()
+        );
+        source.run_id = 41;
+        source.candidate = different_candidate();
+        assert!(
+            verify_selector_source_matches_aggregate(
+                &source,
+                41,
+                2,
+                workflow,
+                "workflow_dispatch",
+                &candidate,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn maintenance_selector_is_canonical_exact_and_round_trips() {
+        let mut provider = pending_provider("primary-worm", &fixture_digest());
+        provider.current_transition = Some(WorkflowTransitionContext {
+            record_key: "record-key".to_owned(),
+            record_version: "record-version".to_owned(),
+            record_sha256: fixture_digest(),
+            packet_key: "packet-key".to_owned(),
+            packet_version: "packet-version".to_owned(),
+            packet_sha256: fixture_digest(),
+            dsse_key: "dsse-key".to_owned(),
+            dsse_version: "dsse-version".to_owned(),
+            dsse_sha256: fixture_digest(),
+        });
+        let source = render_provider_selector_source(&provider).unwrap();
+        assert_eq!(parse_provider_selector_source(&source).unwrap(), provider);
+        let bytes = render_provider_selector("maintenance", &provider).unwrap();
+        assert_eq!(
+            parse_provider_selector(&bytes).unwrap(),
+            ("maintenance".to_owned(), provider)
+        );
+
+        let mut extra = bytes.clone();
+        let insertion = extra.len() - 2;
+        extra.splice(
+            insertion..insertion,
+            b",\"unexpected\":false".iter().copied(),
+        );
+        assert!(parse_provider_selector(&extra).is_err());
+
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let reordered = text.replacen(
+            "\"activationPublicCompletionSha256\":\"\",\"activationPublicState\":",
+            "\"activationPublicState\":\"pending-publication\",\"activationPublicCompletionSha256\":",
+            1,
+        );
+        assert_ne!(reordered.as_bytes(), bytes);
+        assert!(parse_provider_selector(reordered.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn inactive_selector_source_bootstraps_only_inactive_operations() {
+        let mut inactive = pending_provider("primary-worm", &fixture_digest());
+        inactive.active_candidate.clear();
+        inactive.active_epoch.clear();
+        inactive.active_manifest.clear();
+        inactive.active_receipt_sha256.clear();
+        inactive.active_activation_record_sha256.clear();
+        inactive.active_activation_packet_sha256.clear();
+        inactive.active_activation_dsse_sha256.clear();
+        inactive.activation_public_state.clear();
+        let source = render_provider_selector_source(&inactive).unwrap();
+        assert_eq!(parse_provider_selector_source(&source).unwrap(), inactive);
+        for operation in ["upload", "activation"] {
+            let sealed = render_provider_selector(operation, &inactive).unwrap();
+            assert!(parse_provider_selector(&sealed).is_ok());
+        }
+        for operation in ["maintenance", "surveillance", "transition-publication"] {
+            let sealed = render_provider_selector(operation, &inactive).unwrap();
+            assert!(parse_provider_selector(&sealed).is_err());
+        }
+    }
+
+    fn selector_update_fixture() -> (PathBuf, Vec<u8>) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hell-provider-selector-update-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let mut provider = pending_provider("primary-worm", &fixture_digest());
+        provider.trust_domain = "organization-primary".to_owned();
+        let bytes = render_provider_selector_source(&provider).unwrap();
+        fs::write(root.join("provider-selector.json"), &bytes).unwrap();
+        fs::write(
+            root.join("provider-selector.json.sha256"),
+            format!("{}\n", sha256_bytes(&bytes).hex()),
+        )
+        .unwrap();
+        (root, bytes)
+    }
+
+    #[test]
+    fn provider_selector_update_requires_exact_real_inventory() {
+        let (root, expected) = selector_update_fixture();
+        assert_eq!(
+            verify_provider_selector_update(&root, "primary-worm", "organization-primary").unwrap(),
+            expected
+        );
+
+        fs::write(root.join("extra.json"), b"{}\n").unwrap();
+        assert!(
+            verify_provider_selector_update(&root, "primary-worm", "organization-primary").is_err()
+        );
+        fs::remove_file(root.join("extra.json")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let selector = root.join("provider-selector.json");
+            let retained_selector = root.join("retained-selector");
+            fs::rename(&selector, &retained_selector).unwrap();
+            symlink(&retained_selector, &selector).unwrap();
+            assert!(
+                verify_provider_selector_update(&root, "primary-worm", "organization-primary")
+                    .is_err()
+            );
+            fs::remove_file(&selector).unwrap();
+            fs::rename(&retained_selector, &selector).unwrap();
+
+            let digest = root.join("provider-selector.json.sha256");
+            let retained = root.join("retained-digest");
+            fs::rename(&digest, &retained).unwrap();
+            symlink(&retained, &digest).unwrap();
+            assert!(
+                verify_provider_selector_update(&root, "primary-worm", "organization-primary")
+                    .is_err()
+            );
+            fs::remove_file(digest).unwrap();
+
+            let alias = root.with_extension("alias");
+            symlink(&root, &alias).unwrap();
+            assert!(
+                verify_provider_selector_update(&alias, "primary-worm", "organization-primary")
+                    .is_err()
+            );
+            fs::remove_file(alias).unwrap();
+        }
+        let selector = root.join("provider-selector.json");
+        let retained_selector = root.join("retained-selector");
+        fs::rename(&selector, &retained_selector).unwrap();
+        fs::create_dir(&selector).unwrap();
+        assert!(
+            verify_provider_selector_update(&root, "primary-worm", "organization-primary").is_err()
+        );
+        fs::remove_dir(selector).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_selector_update_top_inventory_requires_exact_two_directories() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hell-provider-selector-top-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("primary-worm")).unwrap();
+        fs::create_dir(root.join("secondary-worm")).unwrap();
+        let expected = BTreeSet::from([
+            OsString::from("primary-worm"),
+            OsString::from("secondary-worm"),
+        ]);
+        assert_eq!(selector_directory_inventory(&root).unwrap(), expected);
+        fs::create_dir(root.join("third-provider")).unwrap();
+        assert_ne!(selector_directory_inventory(&root).unwrap(), expected);
+        fs::remove_dir(root.join("third-provider")).unwrap();
+        fs::remove_dir(root.join("secondary-worm")).unwrap();
+        assert_ne!(selector_directory_inventory(&root).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retrieval_and_export_match_only_the_sealed_stable_destination() {
+        let sealed = pending_provider("primary-worm", &fixture_digest());
+        let mut protected = sealed.clone();
+        protected.active_candidate = different_candidate();
+        protected.active_epoch = sha256_bytes(b"other epoch").hex();
+        assert!(provider_selector_matches_protected(
+            "retrieval",
+            &sealed,
+            &protected
+        ));
+        assert!(provider_selector_matches_protected(
+            "selector-export",
+            &sealed,
+            &protected
+        ));
+        assert!(!provider_selector_matches_protected(
+            "maintenance",
+            &sealed,
+            &protected
+        ));
+        protected.bucket = "other-bucket".to_owned();
+        assert!(!provider_selector_matches_protected(
+            "retrieval",
+            &sealed,
+            &protected
+        ));
+    }
+
     fn activation_completion(primary: &str, secondary: &str, run_id: u64) -> String {
         let candidate = fixture_candidate();
         let epoch = fixture_digest();
@@ -7252,6 +8634,60 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn package_node_kind_mutants(root: &Path, digest: Digest) {
+        use std::os::unix::fs::symlink;
+
+        let alias = root.with_extension("symlink");
+        symlink(root, &alias).unwrap();
+        assert!(verify_package(&alias).is_err());
+        fs::remove_file(alias).unwrap();
+
+        for name in ["manifest.json", "root.sha256"] {
+            let node = root.join(name);
+            let retained = root.join(format!("{name}.retained"));
+            fs::rename(&node, &retained).unwrap();
+            symlink(&retained, &node).unwrap();
+            assert!(verify_package(root).is_err());
+            fs::remove_file(&node).unwrap();
+            fs::rename(&retained, &node).unwrap();
+
+            fs::rename(&node, &retained).unwrap();
+            fs::create_dir(&node).unwrap();
+            assert!(verify_package(root).is_err());
+            fs::remove_dir(&node).unwrap();
+            fs::rename(&retained, &node).unwrap();
+        }
+
+        let blobs = root.join("blobs");
+        let retained_blobs = root.join("blobs.retained");
+        fs::rename(&blobs, &retained_blobs).unwrap();
+        symlink(&retained_blobs, &blobs).unwrap();
+        assert!(verify_package(root).is_err());
+        fs::remove_file(&blobs).unwrap();
+        fs::rename(&retained_blobs, &blobs).unwrap();
+
+        fs::rename(&blobs, &retained_blobs).unwrap();
+        fs::write(&blobs, b"not a directory\n").unwrap();
+        assert!(verify_package(root).is_err());
+        fs::remove_file(&blobs).unwrap();
+        fs::rename(&retained_blobs, &blobs).unwrap();
+
+        let blob = blobs.join(digest.hex());
+        let retained_blob = root.join("retained-blob");
+        fs::rename(&blob, &retained_blob).unwrap();
+        symlink(&retained_blob, &blob).unwrap();
+        assert!(verify_package(root).is_err());
+        fs::remove_file(&blob).unwrap();
+        fs::rename(&retained_blob, &blob).unwrap();
+
+        fs::rename(&blob, &retained_blob).unwrap();
+        fs::create_dir(&blob).unwrap();
+        assert!(verify_package(root).is_err());
+        fs::remove_dir(&blob).unwrap();
+        fs::rename(&retained_blob, &blob).unwrap();
+    }
+
     #[test]
     fn interrupted_custody_retrieval_never_verifies_a_partial_package() {
         let root = std::env::temp_dir().join(format!(
@@ -7283,6 +8719,34 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(verify_package(&root).is_ok());
+
+        fs::write(root.join("unmanifested.json"), b"{}\n").unwrap();
+        assert!(verify_package(&root).is_err());
+        fs::remove_file(root.join("unmanifested.json")).unwrap();
+
+        let extra_blob = sha256_bytes(b"unmanifested blob").hex();
+        fs::write(root.join("blobs").join(&extra_blob), b"unmanifested blob").unwrap();
+        assert!(verify_package(&root).is_err());
+        fs::remove_file(root.join("blobs").join(extra_blob)).unwrap();
+
+        let canonical_manifest = fs::read_to_string(root.join("manifest.json")).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            canonical_manifest.replace("}\n", ",\n  \"unexpected\": true\n}\n"),
+        )
+        .unwrap();
+        assert!(verify_package(&root).is_err());
+        fs::write(root.join("manifest.json"), canonical_manifest).unwrap();
+
+        let canonical_root = fs::read_to_string(root.join("root.sha256")).unwrap();
+        fs::write(root.join("root.sha256"), format!("{canonical_root}\n")).unwrap();
+        assert!(verify_package(&root).is_err());
+        fs::write(root.join("root.sha256"), canonical_root).unwrap();
+
+        #[cfg(unix)]
+        package_node_kind_mutants(&root, digest);
+
         assert!(verify_package(&root).is_ok());
         fs::write(root.join("blobs").join(digest.hex()), &bytes[..7]).unwrap();
         assert!(verify_package(&root).is_err());
@@ -7393,6 +8857,48 @@ mod tests {
         ] {
             assert!(PublicReportUrl::new(base, key).is_err());
         }
+    }
+
+    #[test]
+    fn public_publication_selector_is_canonical_and_destination_bound() {
+        let document = crate::assurance::JsonValue::Object(BTreeMap::from([
+            (
+                "baseUrl".to_owned(),
+                crate::assurance::JsonValue::String("https://compat.example.test".to_owned()),
+            ),
+            (
+                "bucket".to_owned(),
+                crate::assurance::JsonValue::String("public-bucket".to_owned()),
+            ),
+            (
+                "operation".to_owned(),
+                crate::assurance::JsonValue::String("public-transition-publication".to_owned()),
+            ),
+            (
+                "schemaVersion".to_owned(),
+                crate::assurance::JsonValue::Number(1),
+            ),
+            (
+                "state".to_owned(),
+                crate::assurance::JsonValue::String(
+                    "sealed-before-publication-credentials".to_owned(),
+                ),
+            ),
+        ]));
+        let bytes = crate::assurance::canonical_json_bytes(&document).unwrap();
+        let parsed = parse_public_publication_selector(&bytes).unwrap();
+        assert_eq!(parsed.bucket, "public-bucket");
+        assert_eq!(parsed.base_url, "https://compat.example.test");
+        let substituted = bytes
+            .windows(b"https://compat.example.test".len())
+            .position(|value| value == b"https://compat.example.test")
+            .map(|index| {
+                let mut value = bytes.clone();
+                value[index] = b'X';
+                value
+            })
+            .unwrap();
+        assert!(parse_public_publication_selector(&substituted).is_err());
     }
 
     #[test]
@@ -7624,18 +9130,15 @@ mod tests {
     }
 
     fn review_packet_fixture(candidate: &str, epoch: &str, artifacts: &[String]) -> String {
-        let artifact_identity = artifacts.join("\n");
-        let review_id = sha256_bytes(
-            [
-                candidate.as_bytes(),
-                epoch.as_bytes(),
-                b"custody-reviewer",
-                artifact_identity.as_bytes(),
-            ]
-            .concat()
-            .as_slice(),
-        )
-        .hex();
+        let artifacts_set = artifacts.iter().cloned().collect::<BTreeSet<_>>();
+        let review_id = crate::assurance::clean_review_statement_id(
+            candidate,
+            epoch,
+            "custody-reviewer",
+            "custody-reviewer:fixture",
+            "2026-08-10T00:00:00Z",
+            &artifacts_set,
+        );
         packet_json(
             &review_id,
             "custody-reviewer",

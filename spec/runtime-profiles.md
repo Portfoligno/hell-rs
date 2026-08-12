@@ -23,6 +23,8 @@ diagnostics. `--build-info` serializes the complete `CompilerConfig` and
 | `crates/hell-http-host/src/lib.rs`: `BODY_CHANNEL_CAPACITY` | Backpressure implementation | Bounded channel capacity only; the stream remains lossless. |
 | `crates/hell-http-host/src/lib.rs`: `HYPER_MINIMUM_BUFFER_SIZE` | Transport implementation | Hyper allocation floor, not a request limit. |
 | `crates/hell-runtime/src/native_json.rs`: `MAX_DEPTH` | Test-only fixture | Compiled only under `cfg(test)`; production uses `RuntimePolicy.limits.json_depth`. |
+| `crates/hell-runtime/src/lib.rs`: `MAX_DEPTH` | Evidence canonicalization guardrail | Under `compat-tracing`, recursive evidence traversal emits an explicit `ForceBoundary` depth-limit marker at 64 levels; it neither forces nor rejects a guest value. |
+| `crates/hell-runtime/src/lib.rs`: `MAX_ELEMENTS` | Evidence canonicalization guardrail | Under `compat-tracing`, list evidence traversal records at most 1,024 elements and an explicit element-limit termination; guest list evaluation remains unchanged. |
 
 The former temporary-resource collision count is
 `RuntimePolicy.cleanup.temp_create_retries`: upstream is unlimited and the

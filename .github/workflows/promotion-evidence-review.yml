@@ -21,6 +21,10 @@ on:
       issued_at:
         type: string
         required: true
+      provider_archive_sha256_json:
+        description: Exact canonical provider archive digests for all five evidence sources
+        type: string
+        required: true
       native_run_id:
         type: string
         required: true
@@ -67,10 +71,6 @@ on:
       oracle_run_attempt:
         type: string
         required: true
-      oracle_event:
-        type: choice
-        required: true
-        options: [push, schedule, workflow_dispatch]
       oracle_macos_artifact_id:
         type: string
         required: true
@@ -174,11 +174,15 @@ jobs:
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Install pinned prior-state signature verifier
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Retain authenticated prior public promotion state
         env:
           PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}
         run: ./target/ci/hell-ci custody-ops workflow-retain-prior-public-transition
       - name: Verify exact provider source objects
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./target/ci/hell-ci review-assemble prepare --github-dispatch-inputs
       - name: Derive claim coverage from retained observations
         run: ./target/ci/hell-ci case-coverage report --input ci-out/evidence/native --output ci-out/evidence/coverage/claim-coverage.details.json
@@ -255,19 +259,21 @@ jobs:
           key: promotion-claim-review-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-evidence-review.yml') }}
       - name: Build trusted claim review driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected claim reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain claim reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/coverage/claim-coverage.finalized.json --output ci-out/evidence/review/auth/claim/authorization.json --role claim-reviewer --github-dispatch-inputs
       - name: Create claim review packet
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/coverage/claim-coverage.finalized.json --from ci-out/evidence/review/auth/claim/authorization.json --output ci-out/evidence/review/auth/claim/review-packet.json --role claim-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected claim reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign claim review packet
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/auth/claim/review-packet.json --output ci-out/evidence/review/auth/claim/review.dsse.json --role claim-reviewer --decision accept --policy ci-out/evidence/review/auth/claim/reviewer.allowed_signers
       - name: Bind claim review to exact details
@@ -336,19 +342,21 @@ jobs:
           key: promotion-normalizer-review-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-evidence-review.yml') }}
       - name: Build trusted specialist review driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected specialist reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.NORMALIZER_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain normalizer reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/coverage/normalizer-audit.details.json --output ci-out/evidence/review/auth/normalizer/authorization.json --role normalizer-reviewer --github-dispatch-inputs
       - name: Create and retain normalizer review
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/coverage/normalizer-audit.details.json --from ci-out/evidence/review/auth/normalizer/authorization.json --output ci-out/evidence/review/auth/normalizer/review-packet.json --role normalizer-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected specialist reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.NORMALIZER_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign normalizer review
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/auth/normalizer/review-packet.json --output ci-out/evidence/review/auth/normalizer/review.dsse.json --role normalizer-reviewer --decision accept --policy ci-out/evidence/review/auth/normalizer/reviewer.allowed_signers
       - name: Bind normalizer review
@@ -423,13 +431,6 @@ jobs:
           key: promotion-divergence-review-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-evidence-review.yml') }}
       - name: Build trusted divergence review driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected divergence reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.DIVERGENCE_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Apply exact protected divergence decisions
         run: ./target/ci/hell-ci divergence-verify accept --input ci-out/evidence/review/divergence-report.proposed.json --output ci-out/evidence/review/divergence-report.details.json --github-dispatch-inputs
       - name: Derive exact divergence approval role plan
@@ -447,6 +448,15 @@ jobs:
         run: ./target/ci/hell-ci residual-risk report --input ci-out/evidence/coverage --output ci-out/evidence/coverage/residual-risk.details.json
       - name: Create exact divergence review
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/review/divergence-report.details.json --from ci-out/evidence/review/auth/divergence/authorization.json --output ci-out/evidence/review/auth/divergence/review-packet.json --role divergence-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected divergence reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DIVERGENCE_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact divergence review
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/auth/divergence/review-packet.json --output ci-out/evidence/review/auth/divergence/review.dsse.json --role divergence-reviewer --decision accept --policy ci-out/evidence/review/auth/divergence/reviewer.allowed_signers
       - name: Bind exact divergence review
@@ -501,19 +511,21 @@ jobs:
           path: ci-out/evidence
       - name: Build trusted divergence approval driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected divergence platform reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.DIVERGENCE_PLATFORM_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain divergence platform reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/review/divergence-report.details.json --output ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/authorization.json --role divergence-platform-reviewer --github-dispatch-inputs
       - name: Create exact divergence platform approval
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/review/divergence-report.details.json --from ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/authorization.json --output ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/review-packet.json --role divergence-platform-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected divergence platform reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DIVERGENCE_PLATFORM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact divergence platform approval
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/review-packet.json --output ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/review.dsse.json --role divergence-platform-reviewer --decision accept --policy ci-out/evidence/review/divergence-approvals/divergence-platform-reviewer/reviewer.allowed_signers
       - name: Upload immutable divergence platform approval
@@ -551,19 +563,21 @@ jobs:
           path: ci-out/evidence
       - name: Build trusted divergence approval driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected divergence implementation reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.DIVERGENCE_IMPLEMENTATION_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain divergence implementation reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/review/divergence-report.details.json --output ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/authorization.json --role divergence-implementation-reviewer --github-dispatch-inputs
       - name: Create exact divergence implementation approval
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/review/divergence-report.details.json --from ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/authorization.json --output ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/review-packet.json --role divergence-implementation-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected divergence implementation reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DIVERGENCE_IMPLEMENTATION_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact divergence implementation approval
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/review-packet.json --output ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/review.dsse.json --role divergence-implementation-reviewer --decision accept --policy ci-out/evidence/review/divergence-approvals/divergence-implementation-reviewer/reviewer.allowed_signers
       - name: Upload immutable divergence implementation approval
@@ -601,19 +615,21 @@ jobs:
           path: ci-out/evidence
       - name: Build trusted divergence approval driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected divergence product reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.DIVERGENCE_PRODUCT_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain divergence product reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/review/divergence-report.details.json --output ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/authorization.json --role divergence-product-reviewer --github-dispatch-inputs
       - name: Create exact divergence product approval
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/review/divergence-report.details.json --from ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/authorization.json --output ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/review-packet.json --role divergence-product-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected divergence product reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DIVERGENCE_PRODUCT_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact divergence product approval
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/review-packet.json --output ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/review.dsse.json --role divergence-product-reviewer --decision accept --policy ci-out/evidence/review/divergence-approvals/divergence-product-reviewer/reviewer.allowed_signers
       - name: Upload immutable divergence product approval
@@ -651,19 +667,21 @@ jobs:
           path: ci-out/evidence
       - name: Build trusted divergence approval driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected divergence security reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.DIVERGENCE_SECURITY_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain divergence security reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/review/divergence-report.details.json --output ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/authorization.json --role divergence-security-reviewer --github-dispatch-inputs
       - name: Create exact divergence security approval
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/review/divergence-report.details.json --from ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/authorization.json --output ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/review-packet.json --role divergence-security-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected divergence security reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DIVERGENCE_SECURITY_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact divergence security approval
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/review-packet.json --output ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/review.dsse.json --role divergence-security-reviewer --decision accept --policy ci-out/evidence/review/divergence-approvals/divergence-security-reviewer/reviewer.allowed_signers
       - name: Upload immutable divergence security approval
@@ -778,19 +796,21 @@ jobs:
           key: promotion-residual-risk-review-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-evidence-review.yml') }}
       - name: Build trusted residual risk review driver before loading review credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-      - name: Load protected residual risk reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.RESIDUAL_RISK_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain residual risk reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-out/evidence/coverage/residual-risk.details.json --output ci-out/evidence/review/auth/residual-risk/authorization.json --role residual-risk-reviewer --github-dispatch-inputs
       - name: Create exact residual risk review
         run: ./target/ci/hell-ci review-packet --input ci-out/evidence/coverage/residual-risk.details.json --from ci-out/evidence/review/auth/residual-risk/authorization.json --output ci-out/evidence/review/auth/residual-risk/review-packet.json --role residual-risk-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected residual risk reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.RESIDUAL_RISK_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact residual risk review
         run: ./target/ci/hell-ci review-sign --input ci-out/evidence/review/auth/residual-risk/review-packet.json --output ci-out/evidence/review/auth/residual-risk/review.dsse.json --role residual-risk-reviewer --decision accept --policy ci-out/evidence/review/auth/residual-risk/reviewer.allowed_signers
       - name: Bind exact residual risk review
@@ -827,6 +847,10 @@ jobs:
       - normalizer-review
       - divergence-approvals
       - residual-risk-review
+    outputs:
+      review_artifact_id: ${{ steps.upload-reviewed.outputs.artifact-id }}
+      review_artifact_digest: ${{ steps.upload-reviewed.outputs.artifact-digest }}
+      review_directory_sha256: ${{ steps.bind-reviewed.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -882,7 +906,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci offline-review-ops workflow-verify-components
+      - name: Bind exact promotion review ready directory
+        id: bind-reviewed
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/evidence
       - name: Upload promotion review ready evidence
+        id: upload-reviewed
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: promotion-review-ready-evidence

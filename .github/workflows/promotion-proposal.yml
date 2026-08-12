@@ -87,6 +87,10 @@ permissions:
 
 jobs:
   assemble:
+    outputs:
+      proposal_artifact_id: ${{ steps.upload-proposal.outputs.artifact-id }}
+      proposal_artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}
+      proposal_directory_sha256: ${{ steps.bind-proposal.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -153,11 +157,25 @@ jobs:
           path: ci-out/native-shards/evidence/custody/current-scrub/secondary-worm
       - name: Build proposal driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact proposal candidate checkout
+        env:
+          PROMOTION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$PROMOTION_CANDIDATE_SHA"
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Recompute assurance epoch
         run: ./target/ci/hell-ci evidence-epoch write --output ci-out/native-shards/assurance-epoch.json
       - name: Assemble fail-closed proposal
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./target/ci/hell-ci promotion-proposal --input ci-out/native-shards --output ci-out/native-shards/promotion-proposal.json --github-dispatch-inputs
+      - name: Bind exact proposal package directory
+        id: bind-proposal
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards
       - name: Upload immutable proposal package
+        id: upload-proposal
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: promotion-proposal

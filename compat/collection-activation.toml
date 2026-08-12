@@ -1,0 +1,6 @@
+schema_version = 1
+domain = "hell.collection-activation.v1"
+scopes = ["Map.adjust|pure-runtime|upstream|linux,macos,windows", "Map.delete|pure-runtime|upstream|linux,macos,windows", "Map.fromList|pure-runtime|upstream|linux,macos,windows", "Map.insert|pure-runtime|upstream|linux,macos,windows", "Map.insertWith|pure-runtime|upstream|linux,macos,windows", "Map.lookup|pure-runtime|upstream|linux,macos,windows", "Map.unionWith|pure-runtime|upstream|linux,macos,windows", "Set.delete|pure-runtime|upstream|linux,macos,windows", "Set.difference|pure-runtime|upstream|linux,macos,windows", "Set.fromList|pure-runtime|upstream|linux,macos,windows", "Set.insert|pure-runtime|upstream|linux,macos,windows", "Set.intersection|pure-runtime|upstream|linux,macos,windows", "Set.member|pure-runtime|upstream|linux,macos,windows", "Set.union|pure-runtime|upstream|linux,macos,windows"]
+fresh_collection_required = true
+map712 = false
+set479 = false

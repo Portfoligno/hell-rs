@@ -61,6 +61,16 @@ pub fn generated_typed_cases(seed: u64, count: usize) -> Vec<GeneratedCase> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn committed_differential_cases() -> Vec<DifferentialCase> {
+    committed_differential_cases_with_collection(true)
+}
+
+#[must_use]
+pub fn dormant_committed_differential_cases() -> Vec<DifferentialCase> {
+    committed_differential_cases_with_collection(false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn committed_differential_cases_with_collection(include_collection: bool) -> Vec<DifferentialCase> {
     let mut cases = [
         (
             "laziness-unused-error",
@@ -363,10 +373,11 @@ pub fn committed_differential_cases() -> Vec<DifferentialCase> {
     cases.extend(runtime_map_accum_boundary_cases());
     cases.extend(runtime_simple_list_boundary_cases());
     cases.extend(runtime_eq_list_boundary_cases());
-    if ORD_MAP_CLAIM_READY {
+    let (ord_map_claim_ready, ord_set_claim_ready) = collection_activation_flags();
+    if include_collection && ord_map_claim_ready {
         cases.extend(runtime_ord_map_cases());
     }
-    if ORD_SET_CLAIM_READY {
+    if include_collection && ord_set_claim_ready {
         cases.extend(runtime_ord_set_cases());
     }
     cases.extend(runtime_map_set_boundary_cases());
@@ -5878,8 +5889,6 @@ fn runtime_ord_list_double_shape_cases(
     ));
     cases
 }
-
-const ORD_SET_CLAIM_READY: bool = false;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OrdSetBoundary {
@@ -17825,7 +17834,339 @@ fn eq_list_tree(root: &str, children: &[String]) -> String {
     )
 }
 
-const ORD_MAP_CLAIM_READY: bool = false;
+const COLLECTION_ACTIVATION: &str = include_str!("../../../compat/collection-activation.toml");
+const COLLECTION_ACTIVATION_PROVENANCE: &str =
+    include_str!("../../../compat/collection-activation-provenance.json");
+const COLLECTION_ACTIVATION_CLAIMS: &str =
+    include_str!("../../../compat/collection-activation-claims.json");
+const DORMANT_COLLECTION_PROVENANCE: &str = "{\"activationAuthority\":false,\"domain\":\"hell.collection-activation.provenance.v1\",\"freshCollectionRequired\":true,\"promotionAuthority\":false,\"schemaVersion\":1,\"state\":\"dormant-no-reviewed-activation\"}\n";
+const DORMANT_COLLECTION_CLAIMS: &str = "{\"activationAuthority\":false,\"domain\":\"hell.collection-activation.claims.v1\",\"freshEvidenceRequired\":true,\"promotionAuthority\":false,\"schemaVersion\":1,\"scopes\":[],\"state\":\"dormant-no-activated-claims\"}\n";
+const DORMANT_COLLECTION_ACTIVATION: &str = concat!(
+    "schema_version = 1\n",
+    "domain = \"hell.collection-activation.v1\"\n",
+    "scopes = [\"Map.adjust|pure-runtime|upstream|linux,macos,windows\", \"Map.delete|pure-runtime|upstream|linux,macos,windows\", \"Map.fromList|pure-runtime|upstream|linux,macos,windows\", \"Map.insert|pure-runtime|upstream|linux,macos,windows\", \"Map.insertWith|pure-runtime|upstream|linux,macos,windows\", \"Map.lookup|pure-runtime|upstream|linux,macos,windows\", \"Map.unionWith|pure-runtime|upstream|linux,macos,windows\", \"Set.delete|pure-runtime|upstream|linux,macos,windows\", \"Set.difference|pure-runtime|upstream|linux,macos,windows\", \"Set.fromList|pure-runtime|upstream|linux,macos,windows\", \"Set.insert|pure-runtime|upstream|linux,macos,windows\", \"Set.intersection|pure-runtime|upstream|linux,macos,windows\", \"Set.member|pure-runtime|upstream|linux,macos,windows\", \"Set.union|pure-runtime|upstream|linux,macos,windows\"]\n",
+    "fresh_collection_required = true\n",
+    "map712 = false\n",
+    "set479 = false\n",
+);
+const ACTIVE_COLLECTION_ACTIVATION: &str = concat!(
+    "schema_version = 1\n",
+    "domain = \"hell.collection-activation.v1\"\n",
+    "scopes = [\"Map.adjust|pure-runtime|upstream|linux,macos,windows\", \"Map.delete|pure-runtime|upstream|linux,macos,windows\", \"Map.fromList|pure-runtime|upstream|linux,macos,windows\", \"Map.insert|pure-runtime|upstream|linux,macos,windows\", \"Map.insertWith|pure-runtime|upstream|linux,macos,windows\", \"Map.lookup|pure-runtime|upstream|linux,macos,windows\", \"Map.unionWith|pure-runtime|upstream|linux,macos,windows\", \"Set.delete|pure-runtime|upstream|linux,macos,windows\", \"Set.difference|pure-runtime|upstream|linux,macos,windows\", \"Set.fromList|pure-runtime|upstream|linux,macos,windows\", \"Set.insert|pure-runtime|upstream|linux,macos,windows\", \"Set.intersection|pure-runtime|upstream|linux,macos,windows\", \"Set.member|pure-runtime|upstream|linux,macos,windows\", \"Set.union|pure-runtime|upstream|linux,macos,windows\"]\n",
+    "fresh_collection_required = true\n",
+    "map712 = true\n",
+    "set479 = true\n",
+);
+
+fn collection_activation_flags() -> (bool, bool) {
+    verify_collection_activation_state(
+        COLLECTION_ACTIVATION.as_bytes(),
+        COLLECTION_ACTIVATION_PROVENANCE.as_bytes(),
+        COLLECTION_ACTIVATION_CLAIMS.as_bytes(),
+    )
+    .map_or((false, false), |active| (active, active))
+}
+
+/// Verifies the atomic collection activation manifest and its non-authoritative provenance.
+///
+/// # Errors
+///
+/// Returns an error unless the three inputs are the exact canonical dormant state or the exact
+/// reviewed active state derived from the committed Map712/Set479 corpus.
+pub fn verify_collection_activation_state(
+    manifest: &[u8],
+    provenance: &[u8],
+    claims: &[u8],
+) -> Result<bool, String> {
+    if manifest == DORMANT_COLLECTION_ACTIVATION.as_bytes() {
+        return (provenance == DORMANT_COLLECTION_PROVENANCE.as_bytes()
+            && claims == DORMANT_COLLECTION_CLAIMS.as_bytes())
+        .then_some(false)
+        .ok_or_else(|| "dormant collection activation provenance is not canonical".to_owned());
+    }
+    if manifest != ACTIVE_COLLECTION_ACTIVATION.as_bytes() {
+        return Err("collection activation manifest is not an exact atomic state".to_owned());
+    }
+    verify_active_collection_provenance(provenance)?;
+    if claims != render_active_collection_claims()?.as_slice() {
+        return Err("active collection claims differ from exact reviewed case mapping".to_owned());
+    }
+    Ok(true)
+}
+
+/// Renders the exact non-authoritative 14-scope Map712/Set479 activation mapping.
+///
+/// # Errors
+///
+/// Returns an error if the reviewed collection corpus no longer has one exact upstream native
+/// `PureRuntime` target per case or the exact 14-scope/1,191-case inventory.
+pub fn render_active_collection_claims() -> Result<Vec<u8>, String> {
+    let cases = crate::reviewed_collection_cases()?;
+    let mut scopes =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for case in cases {
+        let descriptor = case
+            .claim_evidence
+            .ok_or_else(|| "collection activation case lacks claim evidence".to_owned())?;
+        let [target] = descriptor.semantic_targets.as_slice() else {
+            return Err("collection activation case does not bind one exact scope".to_owned());
+        };
+        if descriptor.profile != ExecutionProfile::Upstream
+            || !descriptor.claim_normalizers.is_empty()
+            || target.dimension != CompatibilityDimension::PureRuntime
+            || target.expected_instance_target.is_none()
+            || target.platforms
+                != [
+                    ClaimPlatform::Linux,
+                    ClaimPlatform::MacOs,
+                    ClaimPlatform::Windows,
+                ]
+        {
+            return Err("collection activation case scope metadata is not exact".to_owned());
+        }
+        scopes
+            .entry(target.builtin.to_string())
+            .or_default()
+            .insert(case.id.to_string());
+    }
+    if scopes.len() != 14
+        || scopes
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum::<usize>()
+            != 1_191
+    {
+        return Err("collection activation claims are not exact Map712/Set479".to_owned());
+    }
+    let mut output = String::from(
+        "{\"activationAuthority\":false,\"domain\":\"hell.collection-activation.claims.v1\",\"freshEvidenceRequired\":true,\"promotionAuthority\":false,\"schemaVersion\":1,\"scopes\":[",
+    );
+    for (index, (builtin, case_ids)) in scopes.into_iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"caseRefs\":[");
+        for (case_index, case_id) in case_ids.into_iter().enumerate() {
+            if case_index != 0 {
+                output.push(',');
+            }
+            if case_id.is_empty()
+                || !case_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err("collection activation case reference is not canonical".to_owned());
+            }
+            write!(output, "\"{case_id}\"").expect("writing to String cannot fail");
+        }
+        write!(output, "],\"disposition\":\"requires-fresh-evidence\",\"scope\":\"{builtin}|pure-runtime|upstream|linux,macos,windows\"}}")
+            .expect("writing to String cannot fail");
+    }
+    output.push_str("],\"state\":\"activated-scopes-require-fresh-evidence\"}\n");
+    Ok(output.into_bytes())
+}
+
+fn verify_active_collection_provenance(bytes: &[u8]) -> Result<(), String> {
+    let mut input = std::str::from_utf8(bytes)
+        .map_err(|_| "collection activation provenance is not UTF-8".to_owned())?;
+    take_activation_literal(&mut input, "{")?;
+    let author_authorization =
+        take_activation_string(&mut input, "activationAuthorAuthorizationSha256")?;
+    let author_packet = take_activation_string(&mut input, "activationAuthorPacketSha256")?;
+    let author_sha = take_activation_string(&mut input, "activationAuthorSha256")?;
+    let author_fingerprint =
+        take_activation_string(&mut input, "activationAuthorSignerFingerprint")?;
+    let author_subject = take_activation_string(&mut input, "activationAuthorSubject")?;
+    take_activation_literal(&mut input, "\"activationAuthority\":false,")?;
+    let claims = take_activation_string(&mut input, "activationClaimsSha256")?;
+    let proposal = take_activation_string(&mut input, "activationProposalSha256")?;
+    let review_authorization =
+        take_activation_string(&mut input, "activationReviewAuthorizationSha256")?;
+    let review_packet = take_activation_string(&mut input, "activationReviewPacketSha256")?;
+    let review_sha = take_activation_string(&mut input, "activationReviewSha256")?;
+    let review_fingerprint =
+        take_activation_string(&mut input, "activationReviewSignerFingerprint")?;
+    let review_subject = take_activation_string(&mut input, "activationReviewSubject")?;
+    let token = take_activation_string(&mut input, "activationTokenSha256")?;
+    let base = take_activation_string(&mut input, "baseCandidateCommit")?;
+    let mapping = take_activation_string(&mut input, "corpusMappingSha256")?;
+    let retained = parse_retained_activation_provenance(&mut input)?;
+    let worm = take_activation_final_string(&mut input, "wormCustodyIdentitySha256")?;
+    take_activation_literal(&mut input, "}\n")?;
+    if !input.is_empty() {
+        return Err("collection activation provenance has trailing bytes".to_owned());
+    }
+    for digest in [
+        author_sha,
+        author_authorization,
+        author_packet,
+        author_fingerprint,
+        claims,
+        proposal,
+        review_sha,
+        review_authorization,
+        review_packet,
+        review_fingerprint,
+        token,
+        mapping,
+        worm,
+    ]
+    .into_iter()
+    .chain(retained.digests)
+    {
+        require_activation_hex(digest, 64, "collection activation digest")?;
+    }
+    require_activation_hex(base, 40, "collection activation base commit")?;
+    for commit in retained.commits {
+        require_activation_hex(commit, 40, "retained activation commit")?;
+    }
+    if author_subject == review_subject || author_fingerprint == review_fingerprint {
+        return Err("collection activation author and reviewer are not independent".to_owned());
+    }
+    Ok(())
+}
+
+struct RetainedActivationProvenance<'a> {
+    digests: Vec<&'a str>,
+    commits: [&'a str; 2],
+}
+
+fn parse_retained_activation_provenance<'a>(
+    input: &mut &'a str,
+) -> Result<RetainedActivationProvenance<'a>, String> {
+    require_activation_string(input, "domain", "hell.collection-activation.provenance.v1")?;
+    take_activation_literal(input, "\"freshCollectionRequired\":true,")?;
+    let historical_candidate =
+        take_activation_string(input, "historicalCollectionCandidateCommit")?;
+    let integration_proof = take_activation_string(input, "integrationProofSha256")?;
+    let integration_review = take_activation_string(input, "integrationReviewSha256")?;
+    take_activation_positive_number(input, "mapCaseCount")?;
+    let outer_archive = take_activation_string(input, "outerArchiveSha256")?;
+    take_activation_positive_number(input, "outerArtifactId")?;
+    let outer_candidate = take_activation_string(input, "outerCandidateCommit")?;
+    let outer_directory = take_activation_string(input, "outerDirectorySha256")?;
+    take_activation_positive_number(input, "outerRunAttempt")?;
+    take_activation_positive_number(input, "outerRunId")?;
+    let outer_selection = take_activation_string(input, "outerSelectionSha256")?;
+    require_activation_string(
+        input,
+        "outerWorkflowPath",
+        ".github/workflows/collection-activation-preparation.yml",
+    )?;
+    let package = take_activation_string(input, "packageTreeSha256")?;
+    let payload = take_activation_string(input, "payloadMerkleRoot")?;
+    take_activation_literal(input, "\"promotionAuthority\":false,")?;
+    let archive = take_activation_string(input, "providerArchiveSha256")?;
+    take_activation_positive_number(input, "providerArtifactId")?;
+    let directory = take_activation_string(input, "providerDirectorySha256")?;
+    take_activation_positive_number(input, "providerRunAttempt")?;
+    take_activation_positive_number(input, "providerRunId")?;
+    let selection = take_activation_string(input, "providerSelectionSha256")?;
+    require_activation_string(
+        input,
+        "providerWorkflowPath",
+        ".github/workflows/collection-custody-integration.yml",
+    )?;
+    take_activation_positive_number(input, "replayCaseCount")?;
+    let replay = take_activation_string(input, "replayObservationRootSha256")?;
+    take_activation_literal(input, "\"schemaVersion\":1,")?;
+    take_activation_positive_number(input, "setCaseCount")?;
+    let signature = take_activation_string(input, "signatureTreeSha256")?;
+    require_activation_string(
+        input,
+        "state",
+        "reviewed-activation-requires-fresh-collection",
+    )?;
+    Ok(RetainedActivationProvenance {
+        digests: vec![
+            integration_proof,
+            integration_review,
+            outer_archive,
+            outer_directory,
+            outer_selection,
+            package,
+            payload,
+            archive,
+            directory,
+            selection,
+            replay,
+            signature,
+        ],
+        commits: [historical_candidate, outer_candidate],
+    })
+}
+
+fn take_activation_literal(input: &mut &str, expected: &str) -> Result<(), String> {
+    *input = input
+        .strip_prefix(expected)
+        .ok_or_else(|| "collection activation provenance is not canonical".to_owned())?;
+    Ok(())
+}
+
+fn take_activation_string<'a>(input: &mut &'a str, key: &str) -> Result<&'a str, String> {
+    take_activation_string_with_suffix(input, key, ",")
+}
+
+fn take_activation_final_string<'a>(input: &mut &'a str, key: &str) -> Result<&'a str, String> {
+    take_activation_string_with_suffix(input, key, "")
+}
+
+fn take_activation_string_with_suffix<'a>(
+    input: &mut &'a str,
+    key: &str,
+    suffix: &str,
+) -> Result<&'a str, String> {
+    let prefix = format!("\"{key}\":\"");
+    take_activation_literal(input, &prefix)?;
+    let end = input
+        .find('"')
+        .ok_or_else(|| format!("collection activation provenance {key} is unterminated"))?;
+    let value = &input[..end];
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'\\' | b'"'))
+    {
+        return Err(format!("collection activation provenance {key} is invalid"));
+    }
+    *input = &input[end + 1..];
+    take_activation_literal(input, suffix)?;
+    Ok(value)
+}
+
+fn require_activation_string(input: &mut &str, key: &str, expected: &str) -> Result<(), String> {
+    if take_activation_string(input, key)? != expected {
+        return Err(format!("collection activation provenance {key} differs"));
+    }
+    Ok(())
+}
+
+fn take_activation_positive_number(input: &mut &str, key: &str) -> Result<(), String> {
+    take_activation_literal(input, &format!("\"{key}\":"))?;
+    let end = input
+        .find(',')
+        .ok_or_else(|| format!("collection activation provenance {key} is unterminated"))?;
+    let digits = &input[..end];
+    let number = digits
+        .parse::<u64>()
+        .map_err(|_| format!("collection activation provenance {key} is invalid"))?;
+    if number == 0 || (digits.len() > 1 && digits.starts_with('0')) {
+        return Err(format!("collection activation provenance {key} is invalid"));
+    }
+    *input = &input[end + 1..];
+    Ok(())
+}
+
+fn require_activation_hex(value: &str, length: usize, label: &str) -> Result<(), String> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} is not canonical lowercase hexadecimal"));
+    }
+    Ok(())
+}
 
 struct OrdMapObservation {
     target_expression: String,
@@ -21353,7 +21694,7 @@ mod tests {
 
     #[test]
     fn ord_list_matrix_has_exact_isolated_cell_and_boundary_delta() {
-        let cases = crate::committed_differential_cases();
+        let cases = dormant_committed_differential_cases();
         let after = crate::validate_runtime_obligation_coverage(&cases)
             .expect_err("the remaining runtime catalog is intentionally incomplete");
         assert!(
@@ -21532,7 +21873,7 @@ mod tests {
 
     #[test]
     fn ord_map_matrix_has_exact_isolated_cell_and_boundary_delta() {
-        let mut cases = crate::committed_differential_cases();
+        let mut cases = dormant_committed_differential_cases();
         let before = crate::validate_runtime_obligation_coverage(&cases)
             .expect_err("the committed runtime catalog is intentionally incomplete");
         assert!(
@@ -21840,6 +22181,46 @@ mod tests {
                 validate_ord_set_inventory(&reduced).is_err(),
                 "omitted Ord/Set path {omitted}"
             );
+        }
+    }
+
+    #[test]
+    fn collection_activation_manifest_is_exact_and_atomic() {
+        assert!(matches!(
+            COLLECTION_ACTIVATION,
+            DORMANT_COLLECTION_ACTIVATION | ACTIVE_COLLECTION_ACTIVATION
+        ));
+        let (map, set) = collection_activation_flags();
+        assert_eq!(map, set, "collection activation must remain atomic");
+    }
+
+    #[test]
+    fn collection_activation_provenance_is_canonical_and_two_role() {
+        let digest = "a".repeat(64);
+        let reviewer_fingerprint = "b".repeat(64);
+        let commit = "c".repeat(40);
+        let active = format!(
+            "{{\"activationAuthorAuthorizationSha256\":\"{digest}\",\"activationAuthorPacketSha256\":\"{digest}\",\"activationAuthorSha256\":\"{digest}\",\"activationAuthorSignerFingerprint\":\"{digest}\",\"activationAuthorSubject\":\"author-1\",\"activationAuthority\":false,\"activationClaimsSha256\":\"{digest}\",\"activationProposalSha256\":\"{digest}\",\"activationReviewAuthorizationSha256\":\"{digest}\",\"activationReviewPacketSha256\":\"{digest}\",\"activationReviewSha256\":\"{digest}\",\"activationReviewSignerFingerprint\":\"{reviewer_fingerprint}\",\"activationReviewSubject\":\"reviewer-2\",\"activationTokenSha256\":\"{digest}\",\"baseCandidateCommit\":\"{commit}\",\"corpusMappingSha256\":\"{digest}\",\"domain\":\"hell.collection-activation.provenance.v1\",\"freshCollectionRequired\":true,\"historicalCollectionCandidateCommit\":\"{commit}\",\"integrationProofSha256\":\"{digest}\",\"integrationReviewSha256\":\"{digest}\",\"mapCaseCount\":712,\"outerArchiveSha256\":\"{digest}\",\"outerArtifactId\":6,\"outerCandidateCommit\":\"{commit}\",\"outerDirectorySha256\":\"{digest}\",\"outerRunAttempt\":5,\"outerRunId\":4,\"outerSelectionSha256\":\"{digest}\",\"outerWorkflowPath\":\".github/workflows/collection-activation-preparation.yml\",\"packageTreeSha256\":\"{digest}\",\"payloadMerkleRoot\":\"{digest}\",\"promotionAuthority\":false,\"providerArchiveSha256\":\"{digest}\",\"providerArtifactId\":3,\"providerDirectorySha256\":\"{digest}\",\"providerRunAttempt\":2,\"providerRunId\":1,\"providerSelectionSha256\":\"{digest}\",\"providerWorkflowPath\":\".github/workflows/collection-custody-integration.yml\",\"replayCaseCount\":1191,\"replayObservationRootSha256\":\"{digest}\",\"schemaVersion\":1,\"setCaseCount\":479,\"signatureTreeSha256\":\"{digest}\",\"state\":\"reviewed-activation-requires-fresh-collection\",\"wormCustodyIdentitySha256\":\"{digest}\"}}\n"
+        );
+        assert!(verify_active_collection_provenance(active.as_bytes()).is_ok());
+        assert_eq!(
+            verify_collection_activation_state(
+                DORMANT_COLLECTION_ACTIVATION.as_bytes(),
+                DORMANT_COLLECTION_PROVENANCE.as_bytes(),
+                DORMANT_COLLECTION_CLAIMS.as_bytes(),
+            ),
+            Ok(false)
+        );
+        for mutant in [
+            active.replacen('{', "{\"extra\":true,", 1),
+            active.replace("reviewer-2", "author-1"),
+            active.replace(
+                "\"promotionAuthority\":false",
+                "\"promotionAuthority\":true",
+            ),
+            active.replace(&commit, &"C".repeat(40)),
+        ] {
+            assert!(verify_active_collection_provenance(mutant.as_bytes()).is_err());
         }
     }
 

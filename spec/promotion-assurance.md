@@ -283,3 +283,109 @@ Provider or API outages are classified as retryable collection failures only
 before a policy deadline. Once freshness, custody, authorization, or retention
 requirements are missed, the state is a compatibility assurance failure rather
 than a silently ignored infrastructure warning.
+
+## Provider selector operations
+
+Every AWS-backed custody operation is selected before workload credentials are
+configured. Repository variables `CUSTODY_PRIMARY_PROVIDER_SELECTOR` and
+`CUSTODY_SECONDARY_PROVIDER_SELECTOR` contain canonical, operation-neutral
+`provider-context-source` JSON for the fixed provider and trust domain. The
+corresponding `ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT` and
+`ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT` variables contain the latest reviewed
+active source after activation. Each source binds the provider, trust domain,
+bucket, candidate, assurance epoch, active receipt and activation object
+versions and digests, public-completion state, and current transition. Bootstrap
+values may omit active locators only for the initial `upload` operation.
+
+The trusted driver injects exactly one operation into a sealed local selector:
+`upload`, `retrieval`, `activation`, `maintenance`, `surveillance`,
+`transition-publication`, `complete-initial-publication`, or `selector-export`.
+It writes `ci-out/custody-maintenance/provider-selector.json` and its `.sha256`
+sibling before AWS credentials. Mutating and current-active operations re-read
+protected SSM context and require full selector equality before object access or
+mutation. Initial retrieval derives its selector from the signed upload receipt,
+and selector export may start from an older recovery source; those two read-only
+operations compare the fixed provider, trust domain, and bucket before reading
+the current protected context, then emit the fully current selector. Public
+report jobs separately seal the exact
+`PUBLIC_COMPATIBILITY_REPORT_BUCKET`/`PUBLIC_COMPATIBILITY_REPORT_BASE_URL`
+destination before publication credentials.
+
+Activation commit, transition publication, and initial-publication completion
+emit the next operation-neutral selector at
+`ci-out/provider-selector-update/provider-selector.json` with a digest sibling.
+The workflows combine the exact primary and secondary updates into one canonical
+artifact and expose its immutable artifact ID, provider archive digest, and
+canonical directory digest. Operators update the two selector variables only
+from that reviewed aggregate; the archive digest is not interchangeable with
+the directory digest. No workflow automatically changes repository variables.
+
+Activation and initial-publication transitions have explicit selector-update
+barriers. After activation, the evidence-custody run must finish its aggregate;
+an operator verifies its immutable artifact ID, provider archive digest, and
+canonical directory digest, updates both `ACTIVE_CUSTODY_*` variables from the
+two exact canonical selector files, and only then manually dispatches the
+initial promotion-surveillance run with the activation run and correlation
+inputs. The surveillance run likewise seals its transition selector aggregate.
+The initial-public finalizer is manually dispatched only after both variables
+exactly match that aggregate, using the exact successful surveillance run ID
+and attempt plus the aggregate artifact ID, archive digest, and directory
+digest. There is no automatic activation-to-surveillance or
+surveillance-to-finalization edge: this prevents a newly mutated SSM context
+from being compared with stale repository variables.
+
+If a protected context mutation succeeds but its aggregate artifact is lost,
+the manually dispatched `custody-provider-selector-recovery.yml` workflow uses
+fixed, protected read-only SSM roles to export both current contexts. It seals
+the fixed provider/trust/bucket identity before credentials, performs no object
+read or provider mutation, validates and aggregates the two canonical sources,
+and exposes the same immutable ID/archive/directory triple. Required protected
+configuration is the two selector source variables, per-provider recovery roles
+and regions, and the existing provider-specific protected environments.
+
+## Collection activation operator sequence
+
+The Map712/Set479 collection path is deliberately a sequence of sealed external
+handoffs and reviewed commits; none of its preparation, custody, or activation
+artifacts grants promotion authority by itself.
+
+1. Dispatch `collection-authority.yml` at the exact candidate. Retain the
+   merged collection payload and signed Linux/macOS/Windows evidence, then use
+   its typed payload-overlay assembler. Review and commit only the exact
+   `compat/collection-custody/{payload,signature}` tree from that immutable
+   artifact; propagate its artifact ID, provider archive digest, and canonical
+   directory digest without renaming or recomputing them.
+2. Dispatch `collection-custody-review.yml` at that payload-only main commit.
+   The unprivileged job prepares the exact proof and review packet; the
+   `collection-custody-review` environment authorizes the custody reviewer only
+   after packet finalization. Use the typed review-overlay artifact to review
+   and commit exactly `integration-proof.tsv` and
+   `integration-review.dsse.json`. This signed review is supplemental custody
+   authorization, not generic promotion authority.
+3. Dispatch `evidence-custody.yml` in `collection-custody` mode. Its protected
+   primary and secondary provider jobs upload, independently retrieve, review,
+   scrub, and assemble the exact prepared collection package. Carry the final
+   WORM artifact run ID and attempt, immutable artifact ID, provider archive
+   digest, and canonical directory digest into
+   `collection-custody-integration.yml`; that workflow replays the provider
+   workflow/head and produces only a verified admission report plus the
+   non-authoritative activation token.
+4. Pass the admission artifact's exact run/attempt/ID/archive/directory tuple to
+   `collection-activation-preparation.yml`. Its output is an unsigned,
+   non-mutating proposal containing the reviewed exact-14 scope mapping,
+   prospective activation manifest, provenance, and prospective locks. It does
+   not change the checkout and cannot grant activation or promotion authority.
+5. Dispatch `collection-activation.yml` with the proposal's exact tuple. The
+   protected claim-author and independent claim-reviewer environments finalize
+   and sign distinct packets only after the immutable proposal is verified;
+   their principals and signer fingerprints must differ. The unprivileged
+   finalizer emits a commit-ready four-file activation tree and its immutable
+   ID/archive/directory tuple. It does not commit, push, open a pull request, or
+   claim promotion authority.
+6. Human review commits only that sealed activation tree. Repository policy
+   then verifies the active manifest, exact 14-scope/1,191-case mapping,
+   retained dual review, provider selection, provenance, and regenerated
+   catalog/assurance locks. A fresh generic three-platform campaign must run at
+   the activated commit and new assurance epoch; pre-activation collection
+   evidence cannot substitute for this Phase-10 evidence or its normal
+   promotion review and approval chain.

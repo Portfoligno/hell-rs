@@ -52,6 +52,32 @@ pub struct CollectionSourceAuthority {
     pub(crate) set_source: Digest,
 }
 
+impl CollectionSourceAuthority {
+    /// Digest of the verified collection source-authority manifest bytes.
+    #[must_use]
+    pub const fn manifest_sha256(&self) -> Digest {
+        self.manifest
+    }
+
+    /// Digest of the independently reviewed collection model source.
+    #[must_use]
+    pub const fn reviewed_model_sha256(&self) -> Digest {
+        self.reviewed_model
+    }
+
+    /// Digest of the retained `Data.Map.Internal` source bytes.
+    #[must_use]
+    pub const fn map_source_sha256(&self) -> Digest {
+        self.map_source
+    }
+
+    /// Digest of the retained `Data.Set.Internal` source bytes.
+    #[must_use]
+    pub const fn set_source_sha256(&self) -> Digest {
+        self.set_source
+    }
+}
+
 /// Verifies the complete retained containers source/model authority package.
 ///
 /// This authority identifies the reviewed version source and model. It does
@@ -320,6 +346,17 @@ fn decode_base64(encoded: &[u8]) -> std::io::Result<Vec<u8>> {
         }
     }
     Ok(output)
+}
+
+/// Decodes the retained collection source archive and returns its exact
+/// content digest. The decoder is the same strict implementation used by the
+/// production collection source-authority verifier.
+///
+/// # Errors
+///
+/// Returns an error if the retained archive is not canonical base64.
+pub fn decoded_collection_source_archive_sha256(encoded: &[u8]) -> std::io::Result<Digest> {
+    Ok(sha256_bytes(&decode_base64(encoded)?))
 }
 
 fn base64_sextet(byte: u8) -> std::io::Result<u8> {
@@ -684,7 +721,14 @@ pub fn validate_collection_black_box_structure(
     Ok(())
 }
 
-fn reviewed_collection_case_authorities(
+/// Derives the exact canonical Map712/Set479 case-authority inventory from the
+/// reviewed source/model authority.
+///
+/// # Errors
+///
+/// Returns an error if any reviewed case, descriptor, instance, comparator,
+/// input, or expected result is missing or noncanonical.
+pub fn reviewed_collection_case_authorities(
     source: &CollectionSourceAuthority,
 ) -> Result<Vec<CollectionCaseAuthority>, String> {
     reviewed_collection_cases()?

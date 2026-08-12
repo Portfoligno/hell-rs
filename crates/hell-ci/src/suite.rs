@@ -15,15 +15,14 @@ use hell_testkit::{
     DifferentialCase, Digest, DivergenceClass, EvidenceSummary, ExecutableIdentity, ExecutableRole,
     GeneratedCase, NATIVE_BUILD_ENVIRONMENT_NAMES, NativeExecutionEnvironment,
     NativeExecutionEnvironmentInputs, ReleaseGateInput, ReleaseGateReport, RuntimePlatformShard,
-    bind_process_helper_directory, collection_bundle_facts, committed_differential_cases,
-    differential_with_identities, evaluate_release_gate, generated_typed_cases,
-    observe_verified_executable_profile, retain_mismatch_bundle, retain_observation_bundle,
-    retain_verified_profile_observation, reviewed_collection_cases,
-    runtime_platform_shard_for_bundle, sha256_bytes, sha256_file,
+    activated_collection_scope_completeness, bind_process_helper_directory,
+    collection_bundle_facts, committed_differential_cases, differential_with_identities,
+    evaluate_release_gate, generated_typed_cases, observe_verified_executable_profile,
+    retain_mismatch_bundle, retain_observation_bundle, retain_verified_profile_observation,
+    reviewed_collection_cases, runtime_platform_shard_for_bundle, sha256_bytes, sha256_file,
     validate_collection_black_box_structure, validate_evidence_catalog,
-    validate_runtime_obligation_coverage, validate_runtime_platform_set,
-    verify_collection_source_authority, verify_executable, verify_observation_bundle_for_case,
-    verify_retained_native_environment, write_evidence_summary,
+    validate_runtime_platform_set, verify_collection_source_authority, verify_executable,
+    verify_observation_bundle_for_case, verify_retained_native_environment, write_evidence_summary,
 };
 
 use crate::command::{CommandResult, CommandSpec};
@@ -1866,6 +1865,47 @@ pub(crate) fn collection_authority_verify(
     provider_root: &Path,
     report: &Path,
 ) -> Result<(), String> {
+    let campaign = verified_collection_campaign(root, input, provider_root)?;
+    let document = collection_authority_report(
+        campaign.source_manifest,
+        &campaign.providers,
+        campaign.campaign_subject_sha256,
+        &campaign.shards,
+    );
+    if let Some(parent) = report.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create collection report directory: {error}"))?;
+    }
+    fs::write(report, document.as_bytes())
+        .map_err(|error| format!("cannot write collection authority report: {error}"))?;
+    fs::write(
+        report.with_extension("json.sha256"),
+        format!(
+            "{}  {}\n",
+            sha256_bytes(document.as_bytes()).hex(),
+            report
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| "collection report filename is not UTF-8".to_owned())?
+        ),
+    )
+    .map_err(|error| format!("cannot write collection authority report digest: {error}"))
+}
+
+pub(crate) struct VerifiedCollectionCampaign {
+    pub(crate) source: hell_testkit::CollectionSourceAuthority,
+    pub(crate) native_builds: Vec<CollectionNativeBuildAuthority>,
+    pub(crate) providers: Vec<(crate::assurance::VerifiedCollectionProviderArtifact, String)>,
+    pub(crate) shards: Vec<CollectionBlackBoxShard>,
+    pub(crate) source_manifest: Digest,
+    pub(crate) campaign_subject_sha256: Digest,
+}
+
+pub(crate) fn verified_collection_campaign(
+    root: &Path,
+    input: &Path,
+    provider_root: &Path,
+) -> Result<VerifiedCollectionCampaign, String> {
     let source = verify_collection_source_authority(root).map_err(|error| error.to_string())?;
     let mut cases = reviewed_collection_cases()?;
     bind_runtime_process_helper(&mut cases)?;
@@ -1929,30 +1969,14 @@ pub(crate) fn collection_authority_verify(
         .ok_or_else(|| "collection campaign contains no cases".to_owned())?;
     let native_builds = collection_native_build_authorities(input, &providers, source_manifest)?;
     validate_collection_black_box_structure(&source, &native_builds, &shards)?;
-    let document = collection_authority_report(
+    Ok(VerifiedCollectionCampaign {
+        source,
+        native_builds,
+        providers,
+        shards,
         source_manifest,
-        &providers,
         campaign_subject_sha256,
-        &shards,
-    );
-    if let Some(parent) = report.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create collection report directory: {error}"))?;
-    }
-    fs::write(report, document.as_bytes())
-        .map_err(|error| format!("cannot write collection authority report: {error}"))?;
-    fs::write(
-        report.with_extension("json.sha256"),
-        format!(
-            "{}  {}\n",
-            sha256_bytes(document.as_bytes()).hex(),
-            report
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .ok_or_else(|| "collection report filename is not UTF-8".to_owned())?
-        ),
-    )
-    .map_err(|error| format!("cannot write collection authority report digest: {error}"))
+    })
 }
 
 fn validate_collection_trusted_provider_head(
@@ -2154,7 +2178,7 @@ fn collection_platform_name(platform: hell_builtins::ClaimPlatform) -> &'static 
     }
 }
 
-fn collection_authority_report(
+pub(crate) fn collection_authority_report(
     source_manifest: Digest,
     providers: &[(crate::assurance::VerifiedCollectionProviderArtifact, String)],
     campaign_subject_sha256: Digest,
@@ -5099,7 +5123,11 @@ fn validate_claim_index_contents(
         Digest::from_hex(&parsed.candidate_sha256).map_err(str::to_owned)?;
     let mut committed = committed_differential_cases();
     bind_runtime_process_helper(&mut committed)?;
-    validate_runtime_obligation_coverage(&committed)?;
+    let activated_claims = activated_collection_claims_current().unwrap_or_default();
+    if !activated_claims.is_empty() {
+        activated_collection_scope_completeness(&committed)?;
+        validate_activated_claim_scope_contract(&activated_claims)?;
+    }
     let mut runtime_shards = BTreeMap::<String, RuntimePlatformShard>::new();
     let mut expected = Vec::<String>::new();
     for (spec, claim) in hell_builtins::registry()
@@ -5162,6 +5190,41 @@ fn validate_claim_index_contents(
             }
         }
     }
+    for scope in &activated_claims {
+        if !scope.required_platforms.contains(&claim_platform) || !scope.fresh_evidence_required {
+            return Err(
+                "activated claim scope lacks exact native fresh-evidence policy".to_owned(),
+            );
+        }
+        for case_id in &scope.case_refs {
+            let reference = format!("differential:{case_id}");
+            let case = committed
+                .iter()
+                .find(|case| case.id.as_ref() == case_id)
+                .ok_or_else(|| {
+                    format!("activated claim references non-committed case {case_id:?}")
+                })?;
+            let descriptor = case
+                .claim_evidence
+                .as_ref()
+                .ok_or_else(|| format!("activated claim references ineligible case {case_id:?}"))?;
+            if descriptor.profile != hell_builtins::ExecutionProfile::Upstream
+                || !descriptor.targets.iter().any(|target| {
+                    target.builtin.as_ref() == scope.builtin
+                        && target.dimension == CompatibilityDimension::PureRuntime
+                })
+            {
+                return Err(format!(
+                    "activated case {case_id:?} does not bind exact scope {}",
+                    scope.scope
+                ));
+            }
+            expected.push(format!(
+                "{}\0pure-runtime\0exact\0{reference}",
+                scope.builtin
+            ));
+        }
+    }
     expected.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     let mut observed = Vec::<String>::new();
     for line in &parsed.entries {
@@ -5200,7 +5263,7 @@ fn validate_claim_index_contents(
                 .into_iter()
                 .find(|candidate| candidate.as_str() == dimension)
                 .ok_or_else(|| format!("claim index dimension {dimension:?} is unknown"))?;
-            let scope = claim
+            let source_scope = claim
                 .dimensions
                 .iter()
                 .find(|candidate| candidate.dimension == dimension_value)
@@ -5212,23 +5275,51 @@ fn validate_claim_index_contents(
                                 .profiles
                                 .contains(&hell_builtins::ExecutionProfile::Upstream)
                     })
-                })
-                .ok_or_else(|| "claim index entry has no exact source claim scope".to_owned())?;
-            if inline_json_bool(line, "targetDeclared") != Some(true)
-                || inline_json_string_array(line, "harnessNormalizers")?
-                    != ["diagnostic-sandbox-path-v1"]
-                || inline_json_string_array(line, "claimNormalizers")?
-                    != scope
+                });
+            let activated_scope = activated_claims.iter().find(|scope| {
+                scope.builtin == builtin
+                    && dimension_value == CompatibilityDimension::PureRuntime
+                    && status == "exact"
+                    && scope.case_refs.contains(case_id)
+            });
+            let (normalizers, platforms) = if let Some(scope) = source_scope {
+                (
+                    scope
                         .normalizers
                         .iter()
                         .map(|normalizer| normalizer.as_str())
-                        .collect::<Vec<_>>()
-                || inline_json_string_array(line, "claimPlatforms")?
-                    != scope
+                        .collect::<Vec<_>>(),
+                    scope
                         .platforms
                         .iter()
                         .map(|platform| claim_platform_name(*platform))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
+                )
+            } else if let Some(scope) = activated_scope {
+                (
+                    case.claim_evidence
+                        .as_ref()
+                        .expect("validated committed activation case")
+                        .claim_normalizers
+                        .iter()
+                        .map(|normalizer| normalizer.as_str())
+                        .collect::<Vec<_>>(),
+                    scope
+                        .required_platforms
+                        .iter()
+                        .map(|platform| claim_platform_name(*platform))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                return Err(
+                    "claim index entry has no exact source or activated claim scope".to_owned(),
+                );
+            };
+            if inline_json_bool(line, "targetDeclared") != Some(true)
+                || inline_json_string_array(line, "harnessNormalizers")?
+                    != ["diagnostic-sandbox-path-v1"]
+                || inline_json_string_array(line, "claimNormalizers")? != normalizers
+                || inline_json_string_array(line, "claimPlatforms")? != platforms
             {
                 return Err(
                     "claim index target, normalizer, or platform metadata disagrees with source"
@@ -5273,16 +5364,14 @@ fn validate_claim_index_contents(
                 write!(file_fields, "{relative:?}: {observed_digest:?}")
                     .expect("writing to String cannot fail");
             }
-            let claim_normalizers = scope
-                .normalizers
+            let claim_normalizers = normalizers
                 .iter()
-                .map(|normalizer| format!("{:?}", normalizer.as_str()))
+                .map(|normalizer| format!("{normalizer:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let claim_platforms = scope
-                .platforms
+            let claim_platforms = platforms
                 .iter()
-                .map(|platform| format!("{:?}", claim_platform_name(*platform)))
+                .map(|platform| format!("{platform:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let canonical = format!(
@@ -6640,9 +6729,13 @@ fn collection_inventory_digest(inventory: &[(String, Digest)]) -> String {
 }
 
 fn runtime_promotion_completeness() -> Result<(), String> {
+    let activated = activated_collection_claims_current().ok_or_else(|| {
+        "reviewed collection activation is not current and historically verified".to_owned()
+    })?;
+    validate_activated_claim_scope_contract(&activated)?;
     let mut committed = committed_differential_cases();
     bind_runtime_process_helper(&mut committed)?;
-    validate_runtime_obligation_coverage(&committed)
+    activated_collection_scope_completeness(&committed).map(|_| ())
 }
 
 fn retain_generated_regression_proposal(
@@ -7097,6 +7190,119 @@ fn write_claim_evidence_index(
             }
         }
     }
+    if let Some(activated_claims) = activated_collection_claims_current() {
+        activated_collection_scope_completeness(committed).map_err(SuiteFailure::fixture)?;
+        validate_activated_claim_scope_contract(&activated_claims)
+            .map_err(SuiteFailure::fixture)?;
+        let claim_platform = claim_platform.ok_or_else(|| {
+            SuiteFailure::fixture("activated collection claims require a native platform")
+        })?;
+        for scope in activated_claims {
+            if !scope.required_platforms.contains(&claim_platform) || !scope.fresh_evidence_required
+            {
+                return Err(SuiteFailure::fixture(
+                    "activated collection scope lacks exact fresh native policy",
+                ));
+            }
+            for case_id in scope.case_refs {
+                let reference = format!("differential:{case_id}");
+                let Some(case) = committed.iter().find(|case| case.id.as_ref() == case_id) else {
+                    result.irrelevant_references = result.irrelevant_references.saturating_add(1);
+                    continue;
+                };
+                let Some(descriptor) = &case.claim_evidence else {
+                    result.irrelevant_references = result.irrelevant_references.saturating_add(1);
+                    continue;
+                };
+                if descriptor.profile != hell_builtins::ExecutionProfile::Upstream
+                    || !descriptor.targets.iter().any(|target| {
+                        target.builtin.as_ref() == scope.builtin
+                            && target.dimension == CompatibilityDimension::PureRuntime
+                    })
+                {
+                    result.profile_mismatches = result.profile_mismatches.saturating_add(1);
+                    continue;
+                }
+                let Some(outcome) = outcomes.get(&case_id) else {
+                    result.missing_bundles = result.missing_bundles.saturating_add(1);
+                    continue;
+                };
+                if !outcome_supports_claim_status(*outcome, ClaimStatus::Exact)
+                    || outcome.timed_out
+                    || outcome.resource_failures != 0
+                {
+                    result.failed_observations = result.failed_observations.saturating_add(1);
+                    continue;
+                }
+                let directory = observations.join(&case_id);
+                let Ok(bundle_manifest_sha256) =
+                    verify_observation_bundle_for_case(&directory, case)
+                else {
+                    result.missing_bundles = result.missing_bundles.saturating_add(1);
+                    continue;
+                };
+                let mut file_fields = String::new();
+                let mut files_valid = true;
+                for (index, relative) in [
+                    "main.hell",
+                    "case.toml",
+                    "oracle/observation.json",
+                    "candidate/observation.json",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let Ok(digest) = sha256_file(&directory.join(relative)) else {
+                        files_valid = false;
+                        break;
+                    };
+                    if index != 0 {
+                        file_fields.push_str(", ");
+                    }
+                    write!(file_fields, "{relative:?}: {:?}", digest.hex())
+                        .expect("writing to String cannot fail");
+                }
+                if !files_valid {
+                    result.missing_bundles = result.missing_bundles.saturating_add(1);
+                    continue;
+                }
+                let normalizers = descriptor
+                    .claim_normalizers
+                    .iter()
+                    .map(|normalizer| format!("{:?}", normalizer.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let claim_platforms = scope
+                    .required_platforms
+                    .iter()
+                    .map(|platform| format!("{:?}", claim_platform_name(*platform)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let entry = format!(
+                    concat!(
+                        "{{ \"builtin\": {:?}, \"dimension\": \"pure-runtime\", \"status\": \"exact\", ",
+                        "\"profile\": \"upstream\", \"platform\": {:?}, ",
+                        "\"claimPlatforms\": [{}], \"reference\": {:?}, ",
+                        "\"targetDeclared\": true, \"harnessNormalizers\": [\"diagnostic-sandbox-path-v1\"], ",
+                        "\"claimNormalizers\": [{}], \"bundleManifestSha256\": {:?}, ",
+                        "\"bundleFiles\": {{ {} }} }}"
+                    ),
+                    scope.builtin,
+                    platform,
+                    claim_platforms,
+                    reference,
+                    normalizers,
+                    bundle_manifest_sha256.hex(),
+                    file_fields,
+                );
+                let key = format!(
+                    "{}\0pure-runtime\0upstream\0{}\0{reference}",
+                    scope.builtin, platform
+                );
+                entries.push((key, entry));
+            }
+        }
+    }
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     result.indexed_entries = entries.len();
     let mut output = format!(
@@ -7476,6 +7682,28 @@ fn retain_divergence_profile_observations(
 }
 
 fn missing_claim_evidence() -> usize {
+    let activated = activated_collection_claims_current();
+    missing_claim_evidence_for_activation(activated.as_deref())
+}
+
+fn missing_claim_evidence_for_activation(
+    activated: Option<&[hell_testkit::ActivatedCollectionClaimScope]>,
+) -> usize {
+    if let Some(activated) = activated {
+        let Ok(expected) = hell_testkit::activated_collection_claim_scopes() else {
+            return usize::MAX;
+        };
+        return expected
+            .iter()
+            .filter(|scope| !activated.contains(scope))
+            .count()
+            .saturating_add(
+                activated
+                    .iter()
+                    .filter(|scope| !expected.contains(scope))
+                    .count(),
+            );
+    }
     hell_builtins::compatibility_claims()
         .iter()
         .flat_map(|claim| claim.dimensions.iter())
@@ -7492,15 +7720,86 @@ fn missing_claim_evidence() -> usize {
         .count()
 }
 
+fn validate_activated_claim_scope_contract(
+    activated: &[hell_testkit::ActivatedCollectionClaimScope],
+) -> Result<Vec<hell_testkit::ActivatedCollectionClaimScope>, String> {
+    let expected = hell_testkit::activated_collection_claim_scopes()?;
+    if activated != expected {
+        return Err(
+            "activated collection claim scopes differ from exact reviewed mapping".to_owned(),
+        );
+    }
+    if activated.iter().any(|scope| {
+        scope.required_platforms
+            != [
+                hell_builtins::ClaimPlatform::Linux,
+                hell_builtins::ClaimPlatform::MacOs,
+                hell_builtins::ClaimPlatform::Windows,
+            ]
+            || !scope.fresh_evidence_required
+    }) {
+        return Err(
+            "activated collection claim scopes lack exact fresh three-platform evidence".to_owned(),
+        );
+    }
+    Ok(expected)
+}
+
 fn unverified_out_of_scope_claims(required_profiles: &[hell_builtins::ExecutionProfile]) -> usize {
-    hell_builtins::compatibility_claims()
+    let activated = activated_collection_claims_current();
+    unverified_out_of_scope_claims_for_activation(required_profiles, activated.as_deref())
+}
+
+fn unverified_out_of_scope_claims_for_activation(
+    required_profiles: &[hell_builtins::ExecutionProfile],
+    activated: Option<&[hell_testkit::ActivatedCollectionClaimScope]>,
+) -> usize {
+    hell_builtins::registry()
         .iter()
-        .flat_map(|claim| claim.dimensions.iter())
-        .flat_map(|dimension| dimension.scopes.iter())
-        .filter(|scope| scope.status == ClaimStatus::Unverified)
-        .flat_map(|scope| scope.profiles.iter())
-        .filter(|profile| !required_profiles.contains(profile))
+        .zip(hell_builtins::compatibility_claims())
+        .flat_map(|(builtin, claim)| {
+            claim.dimensions.iter().flat_map(move |dimension| {
+                dimension.scopes.iter().flat_map(move |scope| {
+                    scope.profiles.iter().filter(move |profile| {
+                        scope.status == ClaimStatus::Unverified
+                            && if let Some(activated) = activated {
+                                required_profiles.contains(profile)
+                                    && !activated.iter().any(|activated| {
+                                        activated.builtin == builtin.name
+                                            && dimension.dimension
+                                                == CompatibilityDimension::PureRuntime
+                                    })
+                            } else {
+                                !required_profiles.contains(profile)
+                            }
+                    })
+                })
+            })
+        })
         .count()
+}
+
+fn activated_collection_claims_current() -> Option<Vec<hell_testkit::ActivatedCollectionClaimScope>>
+{
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    let manifest = fs::read(root.join("compat/collection-activation.toml")).ok()?;
+    let provenance = fs::read(root.join("compat/collection-activation-provenance.json")).ok()?;
+    let claims = fs::read(root.join("compat/collection-activation-claims.json")).ok()?;
+    if !hell_testkit::verify_collection_activation_state(&manifest, &provenance, &claims).ok()? {
+        return None;
+    }
+    crate::collection_custody::verify_active_collection_activation_repository(root).ok()?;
+    let scopes = hell_testkit::activated_collection_claim_scopes().ok()?;
+    validate_activated_claim_scope_contract(&scopes).ok()?;
+    let committed = committed_differential_cases()
+        .into_iter()
+        .map(|case| case.id.to_string())
+        .collect::<BTreeSet<_>>();
+    scopes
+        .iter()
+        .flat_map(|scope| &scope.case_refs)
+        .all(|case_id| committed.contains(case_id))
+        .then_some(scopes)
 }
 
 fn required_platform_skips(root: &Path) -> usize {
@@ -7991,9 +8290,9 @@ mod tests {
 
     #[test]
     fn exploratory_generation_remains_available_before_promotion_completeness() {
-        let committed = committed_differential_cases();
+        let committed = hell_testkit::dormant_committed_differential_cases();
         validate_exploratory_corpus(&committed).unwrap();
-        let incomplete = validate_runtime_obligation_coverage(&committed)
+        let incomplete = hell_testkit::validate_runtime_obligation_coverage(&committed)
             .expect_err("promotion completeness must remain fail-closed");
         assert!(
             incomplete.contains("134 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
@@ -8003,6 +8302,28 @@ mod tests {
         let generated = generated_typed_cases(0x4845_4c4c_2026, 1_024);
         assert_eq!(generated.len(), 1_024);
         assert!(generated.iter().all(|case| !case.source.is_empty()));
+    }
+
+    #[test]
+    fn activated_collection_is_exact_scoped_promotion_completeness() {
+        let mut activated = hell_testkit::dormant_committed_differential_cases();
+        activated.extend(reviewed_collection_cases().unwrap());
+        bind_runtime_process_helper(&mut activated).unwrap();
+        let coverage = activated_collection_scope_completeness(&activated).unwrap();
+        assert_eq!(coverage.exact_complete_scopes.len(), 14);
+        assert_eq!(coverage.residual_incomplete_cells, 120);
+        assert_eq!(coverage.boundary_gaps, 0);
+        assert_eq!(coverage.interaction_gaps, 0);
+
+        activated.retain(|case| {
+            case.claim_evidence.as_ref().is_none_or(|descriptor| {
+                descriptor
+                    .semantic_targets
+                    .iter()
+                    .all(|target| target.builtin.as_ref() != "Map.fromList")
+            })
+        });
+        assert!(activated_collection_scope_completeness(&activated).is_err());
     }
 
     #[test]
@@ -8075,7 +8396,7 @@ mod tests {
 
     #[test]
     fn unreviewed_claims_are_recorded_without_becoming_collection_failures() {
-        let missing = missing_claim_evidence();
+        let missing = missing_claim_evidence_for_activation(None);
         assert_eq!(missing, 2_840);
         let gate = evaluate_release_gate(
             &ReleaseGateInput {
@@ -8094,6 +8415,67 @@ mod tests {
         );
         assert!(gate.collection_passed());
         assert!(!gate.promotion_ready());
+    }
+
+    #[test]
+    fn activated_claim_requiredness_is_exact_and_residual_is_out_of_scope() {
+        let activated = hell_testkit::activated_collection_claim_scopes().unwrap();
+        validate_activated_claim_scope_contract(&activated).unwrap();
+        assert_eq!(activated.len(), 14);
+        assert_eq!(
+            activated
+                .iter()
+                .map(|scope| scope.case_refs.len())
+                .sum::<usize>(),
+            1_191
+        );
+        assert_eq!(missing_claim_evidence_for_activation(None), 2_840);
+        assert_eq!(
+            unverified_out_of_scope_claims_for_activation(
+                &[hell_builtins::ExecutionProfile::Upstream],
+                None,
+            ),
+            2_840
+        );
+        assert_eq!(missing_claim_evidence_for_activation(Some(&activated)), 0);
+        let residual = unverified_out_of_scope_claims_for_activation(
+            &[hell_builtins::ExecutionProfile::Upstream],
+            Some(&activated),
+        );
+        assert_eq!(residual, 2_826);
+
+        let mut missing_scope = activated.clone();
+        missing_scope.pop();
+        assert_ne!(missing_scope.len(), 14);
+        assert!(validate_activated_claim_scope_contract(&missing_scope).is_err());
+        assert_eq!(
+            missing_claim_evidence_for_activation(Some(&missing_scope)),
+            1
+        );
+
+        let mut substituted_scope = activated.clone();
+        substituted_scope[0].required_platforms = [
+            hell_builtins::ClaimPlatform::Linux,
+            hell_builtins::ClaimPlatform::MacOs,
+            hell_builtins::ClaimPlatform::All,
+        ];
+        assert!(validate_activated_claim_scope_contract(&substituted_scope).is_err());
+        assert_eq!(
+            missing_claim_evidence_for_activation(Some(&substituted_scope)),
+            2,
+            "one substituted scope is both missing and unexpected"
+        );
+
+        let mut stale_scope = activated[0].clone();
+        stale_scope.fresh_evidence_required = false;
+        let mut extra_scope = activated.clone();
+        extra_scope.push(stale_scope);
+        assert!(validate_activated_claim_scope_contract(&extra_scope).is_err());
+        assert_eq!(
+            missing_claim_evidence_for_activation(Some(&extra_scope)),
+            1,
+            "an extra stale scope must remain promotion-blocking"
+        );
     }
 
     #[test]
@@ -8568,6 +8950,8 @@ mod tests {
                 "macos-arm64" => 2,
                 _ => 3,
             },
+            artifact_name: format!("collection-authority-{platform}-42-1"),
+            archive_size: 1,
             workflow_ref:
                 "Portfoligno/hell-rs/.github/workflows/collection-authority.yml@refs/heads/main"
                     .to_owned(),

@@ -110,14 +110,16 @@ fn workflow_resolve_unsigned(platform: &str, primary: bool) -> Result<String, St
     .join(platform);
     fs::create_dir_all(&selection)
         .map_err(|error| format!("cannot create oracle provider selection directory: {error}"))?;
-    let artifact_id = crate::assurance::resolve_provider_artifact_for_workflow(
+    let artifact = crate::assurance::resolve_provider_artifact_for_workflow(
         &run_id,
         &unsigned_artifact_name(platform, primary),
         &selection.join("provider-artifact-list.json"),
     )?;
-    write_positive_github_output("artifact_id", artifact_id)?;
+    write_positive_github_output("artifact_id", artifact.artifact_id)?;
+    write_github_output("artifact_digest", &artifact.archive_sha256)?;
     Ok(format!(
-        "resolved exact unsigned oracle artifact ID {artifact_id}"
+        "resolved exact unsigned oracle artifact ID {}",
+        artifact.artifact_id
     ))
 }
 
@@ -141,6 +143,7 @@ fn workflow_select_unsigned(platform: &str, primary: bool) -> Result<String, Str
     let artifact_id = github_positive("ORACLE_UNSIGNED_ARTIFACT_ID")?
         .parse::<u64>()
         .map_err(|_| "unsigned oracle artifact ID is invalid".to_owned())?;
+    let expected_archive_sha256 = github_value("ORACLE_UNSIGNED_ARCHIVE_SHA256")?;
     let provider_head = github_value("GITHUB_SHA")?;
     let run_id = github_positive("GITHUB_RUN_ID")?
         .parse::<u64>()
@@ -162,6 +165,7 @@ fn workflow_select_unsigned(platform: &str, primary: bool) -> Result<String, Str
             provider_head: &provider_head,
             candidate: &candidate,
             expected_directory_sha256: &expected_directory_sha256,
+            expected_archive_sha256: &expected_archive_sha256,
         },
     )?;
     let selection_path = build.join("unsigned-provider-selection.json");
@@ -188,6 +192,19 @@ fn write_positive_github_output(key: &str, value: u64) -> Result<(), String> {
         return Err("GitHub provider output must be nonzero".to_owned());
     }
     require_atom(key, "GitHub output key")?;
+    let path = std::env::var_os("GITHUB_OUTPUT")
+        .ok_or_else(|| "GITHUB_OUTPUT is unavailable".to_owned())?;
+    let mut output = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open GITHUB_OUTPUT: {error}"))?;
+    writeln!(output, "{key}={value}")
+        .map_err(|error| format!("cannot write GITHUB_OUTPUT: {error}"))
+}
+
+fn write_github_output(key: &str, value: &str) -> Result<(), String> {
+    require_atom(key, "GitHub output key")?;
+    require_atom(value, "GitHub output value")?;
     let path = std::env::var_os("GITHUB_OUTPUT")
         .ok_or_else(|| "GITHUB_OUTPUT is unavailable".to_owned())?;
     let mut output = fs::OpenOptions::new()

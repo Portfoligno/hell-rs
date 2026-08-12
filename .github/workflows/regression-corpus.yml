@@ -59,6 +59,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -105,6 +106,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -168,6 +170,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.seal-review-subject.outputs.artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.seal-review-subject.outputs.artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.seal-review-subject.outputs.directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -175,19 +178,21 @@ jobs:
           REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
           REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
         run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-sealed --output ci-out/regression-sealed-selection
-      - name: Load protected claim reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned Sigstore verifier and signer
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain current regression reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-in/regression-sealed/review-subject.json --output ci-out/regression-review/authorization.json --role regression-reviewer --category regression-final --github-dispatch-inputs
       - name: Create exact regression review packet
         run: ./target/ci/hell-ci review-packet --input ci-in/regression-sealed/review-subject.json --from ci-out/regression-review/authorization.json --output ci-out/regression-review/review-packet.json --role regression-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected claim reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned Sigstore verifier and signer after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact regression review packet
         run: ./target/ci/hell-ci review-sign --input ci-out/regression-review/review-packet.json --output ci-out/regression-review/review.dsse.json --role regression-reviewer --decision accept --policy ci-out/regression-review/reviewer.allowed_signers
       - name: Retain exact reviewed subject beside signatures
@@ -276,6 +281,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -298,6 +304,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.prepare.outputs.artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.prepare.outputs.directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -331,6 +338,7 @@ jobs:
     environment: compatibility-claim-review
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -353,6 +361,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.seal-review-subject-automatic.outputs.artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.seal-review-subject-automatic.outputs.artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.seal-review-subject-automatic.outputs.directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -360,19 +369,21 @@ jobs:
           REGRESSION_PROVIDER_RUN_ID: ${{ github.run_id }}
           REGRESSION_PROVIDER_WORKFLOW_PATH: .github/workflows/regression-corpus.yml
         run: ./target/ci/hell-ci regression-import select-subject --input ci-in/regression-sealed --output ci-out/regression-sealed-selection
-      - name: Load protected automatic claim reviewer SSH key
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
-          log-public-key: false
-      - name: Install pinned automatic Sigstore signer
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Retain current automatic regression reviewer authorization
         env:
           GITHUB_TOKEN: ${{ secrets.REVIEW_AUTHORIZATION_GITHUB_TOKEN }}
         run: ./target/ci/hell-ci review-authorization --input ci-in/regression-sealed/review-subject.json --output ci-out/regression-review/authorization.json --role regression-reviewer --category regression-final --github-dispatch-inputs
       - name: Create exact automatic regression review packet
         run: ./target/ci/hell-ci review-packet --input ci-in/regression-sealed/review-subject.json --from ci-out/regression-review/authorization.json --output ci-out/regression-review/review-packet.json --role regression-reviewer --decision accept --github-dispatch-inputs
+      - name: Load protected automatic claim reviewer SSH key after exact packet finalization
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY }}
+          log-public-key: false
+      - name: Install pinned automatic Sigstore signer after exact packet finalization
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact automatic regression review packet
         run: ./target/ci/hell-ci review-sign --input ci-out/regression-review/review-packet.json --output ci-out/regression-review/review.dsse.json --role regression-reviewer --decision accept --policy ci-out/regression-review/reviewer.allowed_signers
       - name: Retain automatic reviewed subject beside signatures
@@ -397,6 +408,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -424,6 +436,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.prepare.outputs.artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.prepare.outputs.directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -436,6 +449,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.review-automatic.outputs.artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-${{ github.run_id }}-${{ github.run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.review-automatic.outputs.artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.review-automatic.outputs.directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}

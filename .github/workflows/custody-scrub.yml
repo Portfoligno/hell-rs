@@ -63,6 +63,7 @@ jobs:
       - name: Check out active promotion records
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Restore scrub Cargo dependency cache
@@ -82,6 +83,17 @@ jobs:
           key: custody-scrub-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/custody-scrub.yml') }}
       - name: Build trusted assurance driver before acquiring provider credentials
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted scrub driver HEAD before provider credentials
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
+      - name: Seal exact active provider selector before credentials
+        env:
+          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}
+          CUSTODY_PROVIDER_OPERATION: maintenance
+          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}
+          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}
+        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector
       - name: Configure independent scrub identity
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -93,20 +105,22 @@ jobs:
       - name: Recover and revalidate active immutable copy
         if: ${{ matrix.operation == 'recover' }}
         run: ./target/ci/hell-ci custody-ops workflow-recover
-      - name: Install pinned Cosign
+      - name: Prepare scrub or recovery signature packet
+        run: ./target/ci/hell-ci custody-ops workflow-maintenance-packet
+      - name: Install pinned Cosign after maintenance packet finalization
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Load protected primary maintenance SSH key
+        with:
+          cosign-release: v2.4.3
+      - name: Load protected primary maintenance SSH key after packet finalization
         if: ${{ matrix.provider == 'primary-worm' }}
         uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
         with:
           ssh-private-key: ${{ secrets.CUSTODY_PRIMARY_MAINTENANCE_SSH_PRIVATE_KEY }}
-      - name: Load protected secondary maintenance SSH key
+      - name: Load protected secondary maintenance SSH key after packet finalization
         if: ${{ matrix.provider == 'secondary-worm' }}
         uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
         with:
           ssh-private-key: ${{ secrets.CUSTODY_SECONDARY_MAINTENANCE_SSH_PRIVATE_KEY }}
-      - name: Prepare scrub or recovery signature packet
-        run: ./target/ci/hell-ci custody-ops workflow-maintenance-packet
       - name: Sign scrub or recovery receipt
         run: ./target/ci/hell-ci review-sign --input ci-out/custody-maintenance-packet.json --output ci-out/custody-maintenance-receipt.dsse.json --role custody-provider --decision accept --policy compat/reviews.allowed_signers
       - name: Stage canonical current scrub package

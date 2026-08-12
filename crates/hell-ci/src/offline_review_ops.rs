@@ -1293,6 +1293,13 @@ fn require_safe_html_path(path: &str) -> Result<(), String> {
 }
 
 fn copy_attachment(source: &Path, destination: &Path) -> Result<(), String> {
+    require_regular_file(source, "offline review attachment")?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(format!(
+            "offline review attachment destination already exists: {}",
+            destination.display()
+        ));
+    }
     fs::copy(source, destination)
         .map(|_| ())
         .map_err(|error| format!("cannot copy {}: {error}", source.display()))
@@ -1549,13 +1556,27 @@ fn strip_evidence_prefix(path: &str) -> Result<&str, String> {
 }
 
 fn file_digest(path: &Path) -> Result<String, String> {
+    require_regular_file(path, "offline review digest input")?;
     sha256_file(path)
         .map(hell_testkit::Digest::hex)
         .map_err(|error| format!("cannot digest {}: {error}", path.display()))
 }
 
 fn read(path: &Path) -> Result<String, String> {
+    require_regular_file(path, "offline review input")?;
     fs::read_to_string(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
+fn require_regular_file(path: &Path, purpose: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {purpose} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{purpose} must be a real regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn git_output(arguments: &[&str]) -> Result<String, String> {
@@ -1607,6 +1628,9 @@ fn push_json(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     fn finalized_cell(builtin: &str, dimension: &str) -> crate::assurance::FinalizedClaimCell {
         crate::assurance::FinalizedClaimCell {
@@ -1678,6 +1702,45 @@ mod tests {
         assert!(require_safe_html_path("../receipt.json").is_err());
         assert!(require_safe_html_path("provider/<receipt>.json").is_err());
         assert!(require_safe_html_path("provider/receipt\n.json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_attachment_reads_digests_and_copies_reject_symlinks() {
+        let unique = format!(
+            "hell-offline-review-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        fs::create_dir(&root).unwrap();
+        let real = root.join("real.json");
+        let link = root.join("attachment.json");
+        let destination = root.join("copied.json");
+        fs::write(&real, b"{}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        for attachment_class in [
+            "role graph",
+            "review details",
+            "bound review",
+            "signed review",
+            "review authorization",
+        ] {
+            assert!(
+                copy_attachment(&link, &destination).is_err(),
+                "copied symlinked {attachment_class}"
+            );
+            assert!(read(&link).is_err(), "read symlinked {attachment_class}");
+            assert!(
+                file_digest(&link).is_err(),
+                "digested symlinked {attachment_class}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

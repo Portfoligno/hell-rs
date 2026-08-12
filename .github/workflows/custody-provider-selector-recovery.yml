@@ -1,0 +1,118 @@
+name: Recover custody provider selectors
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custody-provider-selector-recovery
+  cancel-in-progress: false
+
+jobs:
+  export:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: primary-worm
+            trust-domain: organization-primary
+            environment: custody-primary-selector-recovery
+            runner-label: custody-primary-retrieval
+            provider-selector-variable: CUSTODY_PRIMARY_PROVIDER_SELECTOR
+            role-variable: CUSTODY_PRIMARY_SELECTOR_RECOVERY_ROLE
+            region-variable: CUSTODY_PRIMARY_REGION
+          - provider: secondary-worm
+            trust-domain: organization-secondary
+            environment: custody-secondary-selector-recovery
+            runner-label: custody-secondary-retrieval
+            provider-selector-variable: CUSTODY_SECONDARY_PROVIDER_SELECTOR
+            role-variable: CUSTODY_SECONDARY_SELECTOR_RECOVERY_ROLE
+            region-variable: CUSTODY_SECONDARY_REGION
+    environment: ${{ matrix.environment }}
+    runs-on:
+      - self-hosted
+      - ${{ matrix.runner-label }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact trusted selector recovery source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore selector recovery Cargo dependencies
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: custody-provider-selector-recovery-cargo-v1-${{ matrix.provider }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore selector recovery target
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: custody-provider-selector-recovery-target-v1-${{ matrix.provider }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/custody-provider-selector-recovery.yml') }}
+      - name: Build trusted selector recovery driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted selector recovery HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
+      - name: Seal fixed selector recovery identity before credentials
+        env:
+          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.provider-selector-variable] }}
+          CUSTODY_PROVIDER_OPERATION: selector-export
+          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}
+          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}
+        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector
+      - name: Configure read-only provider selector recovery identity
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars[matrix.role-variable] }}
+          aws-region: ${{ vars[matrix.region-variable] }}
+      - name: Export exact current provider selector without object access
+        id: export-selector
+        env:
+          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}
+          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}
+        run: ./target/ci/hell-ci custody-ops workflow-export-provider-selector
+      - name: Upload ephemeral exact provider selector source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ephemeralEvidence-provider-selector-recovery-${{ matrix.provider }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/provider-selector-update
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save selector recovery Cargo dependencies
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: custody-provider-selector-recovery-cargo-v1-${{ matrix.provider }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save selector recovery target
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: custody-provider-selector-recovery-target-v1-${{ matrix.provider }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/custody-provider-selector-recovery.yml') }}
+
+  seal:
+    needs: export
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/custody-provider-selector-seal.yml
+    with:
+      source_workflow: .github/workflows/custody-provider-selector-recovery.yml

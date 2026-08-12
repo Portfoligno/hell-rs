@@ -107,6 +107,7 @@ dependencies = [
 name = "hell-ci"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hell-builtins",
  "hell-compiler",
  "hell-docgen",
@@ -114,6 +115,7 @@ dependencies = [
  "hell-source",
  "hell-syntax",
  "hell-testkit",
+ "tar",
 ]
 
 [[package]]

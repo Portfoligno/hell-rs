@@ -61,16 +61,18 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-verify-target-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
 
       - name: Resolve pinned Rust toolchain
         run: rustup show active-toolchain
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
 
       - name: Verify fail-closed assurance policy
         run: ./target/ci/hell-ci assurance-verify --output ci-out/assurance-policy.json
@@ -114,7 +116,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
 
   portability-macos:
     name: Portability / macOS
@@ -145,16 +147,18 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-portability-target-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
 
       - name: Resolve pinned Rust toolchain
         run: rustup show active-toolchain
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
 
       - name: Run macOS portability suite
         run: ./target/ci/hell-ci portability --report ci-out/portability-macos.json
@@ -183,7 +187,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
 
   portability-windows:
     name: Portability / Windows
@@ -214,16 +218,18 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-portability-target-
+          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
 
       - name: Resolve pinned Rust toolchain
         run: rustup show active-toolchain
 
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
 
       - name: Run Windows portability suite
         run: .\target\ci\hell-ci.exe portability --report ci-out\portability-windows.json
@@ -252,4 +258,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/**') }}
+          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}

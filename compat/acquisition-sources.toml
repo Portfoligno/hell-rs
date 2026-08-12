@@ -1,7 +1,7 @@
 schema_version = 1
 state = "review-required"
 repository = "Portfoligno/hell-rs"
-repository_id = "REVIEW_REQUIRED"
+repository_id = "1327351238"
 workflow = ".github/workflows/nightly.yml"
 minimum_acquisitions = 2
 minimum_trust_domains = 2

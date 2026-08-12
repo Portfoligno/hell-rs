@@ -10,6 +10,8 @@ const CARGO_DENY_ACTION: &str =
     "EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902";
 const CARGO_DENY_INSTALL: &str = "run: cargo install cargo-deny --locked --version 0.20.2";
 const CARGO_DENY_CHECK: &str = "run: cargo deny --all-features check all";
+const COSIGN_INSTALLER: &str =
+    "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2";
 const CARGO_FUZZ_TOOLCHAIN: &str = "nightly-2026-07-31";
 const CARGO_FUZZ_VERSION: &str = "0.13.2";
 const SEMANTIC_FUZZ_TARGETS: [&str; 13] = [
@@ -56,6 +58,17 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
     check_dependency_policy(root, &mut failures);
     check_semantic_fuzz_campaign(root, &mut failures);
     check_collection_authority_producer(root, &mut failures);
+    match fs::read_to_string(root.join(".github/workflows/artifact-independent-acquisition.yml")) {
+        Ok(workflow) => check_external_independent_preflight(&workflow, &mut failures),
+        Err(error) => failures.push(format!(
+            "cannot read independent acquisition workflow: {error}"
+        )),
+    }
+    match fs::read_to_string(root.join(".github/workflows/collection-activation.yml")) {
+        Ok(workflow) => check_collection_activation_review(&workflow, &mut failures),
+        Err(error) => failures.push(format!("cannot read collection activation review: {error}")),
+    }
+    check_collection_activation_manifest(root, &mut failures);
     check_expected_mismatch_manifest(root, &mut failures);
     if failures.is_empty() {
         Ok(())
@@ -64,23 +77,164 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
     }
 }
 
+fn check_collection_activation_manifest(root: &Path, failures: &mut Vec<String>) {
+    let path = root.join("compat").join("collection-activation.toml");
+    let provenance_path = root
+        .join("compat")
+        .join("collection-activation-provenance.json");
+    let claims_path = root
+        .join("compat")
+        .join("collection-activation-claims.json");
+    match (
+        fs::read_to_string(&path),
+        fs::read(&provenance_path),
+        fs::read(&claims_path),
+    ) {
+        (Ok(document), Ok(provenance), Ok(claims)) => {
+            let state = hell_testkit::verify_collection_activation_state(
+                document.as_bytes(),
+                &provenance,
+                &claims,
+            );
+            if !collection_activation_manifest_is_exact(&document)
+                || state.is_err()
+                || state.is_ok_and(|active| {
+                    active
+                        && crate::collection_custody::verify_active_collection_activation_repository(
+                            root,
+                        )
+                        .is_err()
+                })
+            {
+                failures.push(
+                    "collection activation manifest, provenance, claims, and retained review must be an exact bound dormant or reviewed active state"
+                        .to_owned(),
+                );
+            }
+        }
+        (Err(error), _, _) => failures.push(format!(
+            "cannot read collection activation manifest {}: {error}",
+            path.display()
+        )),
+        (_, Err(error), _) => failures.push(format!(
+            "cannot read collection activation provenance {}: {error}",
+            provenance_path.display()
+        )),
+        (_, _, Err(error)) => failures.push(format!(
+            "cannot read collection activation claims {}: {error}",
+            claims_path.display()
+        )),
+    }
+}
+
+fn collection_activation_manifest_is_exact(document: &str) -> bool {
+    const PREFIX: &str = concat!(
+        "schema_version = 1\n",
+        "domain = \"hell.collection-activation.v1\"\n",
+        "scopes = [\"Map.adjust|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.delete|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.insert|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.insertWith|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.lookup|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Map.unionWith|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.delete|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.difference|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.insert|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.intersection|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.member|pure-runtime|upstream|linux,macos,windows\", ",
+        "\"Set.union|pure-runtime|upstream|linux,macos,windows\"]\n",
+        "fresh_collection_required = true\n",
+    );
+    matches!(
+        document,
+        concat!(
+            "schema_version = 1\n",
+            "domain = \"hell.collection-activation.v1\"\n",
+            "scopes = [\"Map.adjust|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.delete|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.insert|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.insertWith|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.lookup|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.unionWith|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.delete|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.difference|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.insert|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.intersection|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.member|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.union|pure-runtime|upstream|linux,macos,windows\"]\n",
+            "fresh_collection_required = true\n",
+            "map712 = false\n",
+            "set479 = false\n",
+        ) | concat!(
+            "schema_version = 1\n",
+            "domain = \"hell.collection-activation.v1\"\n",
+            "scopes = [\"Map.adjust|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.delete|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.insert|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.insertWith|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.lookup|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Map.unionWith|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.delete|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.difference|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.fromList|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.insert|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.intersection|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.member|pure-runtime|upstream|linux,macos,windows\", ",
+            "\"Set.union|pure-runtime|upstream|linux,macos,windows\"]\n",
+            "fresh_collection_required = true\n",
+            "map712 = true\n",
+            "set479 = true\n",
+        )
+    ) && document.starts_with(PREFIX)
+}
+
 const COLLECTION_ACQUISITION_COMMAND: &str = concat!(
-    "run: python3 tools/collection_authority_acquire.py --repository \"$GITHUB_REPOSITORY\" ",
+    "run: ./target/ci/hell-ci collection-authority acquire-provider ",
+    "--repository Portfoligno/hell-rs ",
     "--run-id \"$GITHUB_RUN_ID\" --run-attempt \"$GITHUB_RUN_ATTEMPT\" ",
     "--provider-head \"$GITHUB_SHA\" --candidate-commit \"$HELL_SOURCE_COMMIT\" ",
     "--workflow-path .github/workflows/collection-authority.yml ",
-    "--output ci-out/collection-provider ",
-    "--artifact \"linux-amd64:collection-authority-linux-amd64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT:$COLLECTION_LINUX_ARTIFACT_ID\" ",
-    "--artifact \"macos-arm64:collection-authority-macos-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT:$COLLECTION_MACOS_ARTIFACT_ID\" ",
-    "--artifact \"windows-amd64:collection-authority-windows-amd64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT:$COLLECTION_WINDOWS_ARTIFACT_ID\"",
+    "--linux-artifact-id \"$COLLECTION_LINUX_ARTIFACT_ID\" ",
+    "--macos-artifact-id \"$COLLECTION_MACOS_ARTIFACT_ID\" ",
+    "--windows-artifact-id \"$COLLECTION_WINDOWS_ARTIFACT_ID\" ",
+    "--gh-executable ci-out/collection-custody-tools/gh ",
+    "--gh-install-manifest ci-out/collection-custody-tools/gh-install-manifest.json ",
+    "--output ci-out/collection-provider",
 );
 
 const COLLECTION_VERIFY_COMMAND: &str = "run: ./target/ci/hell-ci collection-authority verify --input ci-out/native-shards --provider ci-out/collection-provider --report ci-out/native-shards/collection-authority.json";
+const COLLECTION_COMPACT_COMMAND: &str = "run: ./target/ci/hell-ci collection-authority compact --input ci-out/native-shards --provider ci-out/collection-provider --verified-report ci-out/native-shards/collection-authority.json --output ci-out/collection-custody";
+const COLLECTION_INSTALL_GH_COMMAND: &str = "run: ./target/ci/hell-ci collection-authority install-pinned-gh --output ci-out/collection-custody-tools";
+const COLLECTION_ATTESTATION_TOOL_COMMAND: &str = "run: ./target/ci/hell-ci collection-authority capture-custody-attestation --subject ci-out/collection-custody/custody-attestation-subject.json --bundle \"$COLLECTION_CUSTODY_BUNDLE_PATH\" --provider-head \"$GITHUB_SHA\" --run-id \"$GITHUB_RUN_ID\" --run-attempt \"$GITHUB_RUN_ATTEMPT\" --gh-executable ci-out/collection-custody-tools/gh --gh-install-manifest ci-out/collection-custody-tools/gh-install-manifest.json --trusted-root ci-out/collection-custody-attestation-input/trusted-root.jsonl --trusted-root-provenance ci-out/collection-custody-attestation-input/trusted-root-provenance.json --raw-verification ci-out/collection-custody-attestation-input/online-verification.raw.json --online-verification ci-out/collection-custody-attestation-input/online-verification.json";
+const COLLECTION_RETAIN_CUSTODY_COMMAND: &str = "run: ./target/ci/hell-ci collection-authority retain-custody-attestation --package ci-out/collection-custody --bundle \"$COLLECTION_CUSTODY_BUNDLE_PATH\" --trusted-root ci-out/collection-custody-attestation-input/trusted-root.jsonl --trusted-root-provenance ci-out/collection-custody-attestation-input/trusted-root-provenance.json --online-verification ci-out/collection-custody-attestation-input/online-verification.json --gh-install-manifest ci-out/collection-custody-tools/gh-install-manifest.json --output ci-out/collection-custody-signature";
+const COLLECTION_REVIEW_DISPATCH: &str = concat!(
+    "name: Collection Custody Review\n\non:\n  workflow_dispatch:\n    inputs:\n",
+    "      preparation_sha:\n",
+    "        description: Exact main commit containing payload and signature but no review overlay\n",
+    "        required: true\n        type: string\n",
+    "      reviewer:\n",
+    "        description: Exact role-qualified custody reviewer principal\n",
+    "        required: true\n        type: string\n",
+    "      issued_at:\n",
+    "        description: Exact UTC review statement issuance time\n",
+    "        required: true\n        type: string\n",
+);
 
 fn check_collection_authority_producer(root: &Path, failures: &mut Vec<String>) {
     let workflow_path = root.join(".github/workflows/collection-authority.yml");
+    let integration_path = root.join(".github/workflows/collection-custody-integration.yml");
+    let review_path = root.join(".github/workflows/collection-custody-review.yml");
+    let activation_path = root.join(".github/workflows/collection-activation-preparation.yml");
+    let custody_bridge_path = root.join(".github/workflows/evidence-custody.yml");
+    let revocations_path = root.join("compat/collection-authority-revocations.toml");
+    let trust_roots_path = root.join("compat/trust-roots.toml");
     let nightly_path = root.join(".github/workflows/nightly.yml");
-    let tool_path = root.join("tools/collection_authority_acquire.py");
+    let transport_path = root.join("crates/hell-ci/src/collection_transport.rs");
     let workflow = match fs::read_to_string(&workflow_path) {
         Ok(value) => value,
         Err(error) => {
@@ -100,21 +254,830 @@ fn check_collection_authority_producer(root: &Path, failures: &mut Vec<String>) 
         }
         _ => {}
     }
-    let tool = match fs::read_to_string(&tool_path) {
+    let transport = match fs::read_to_string(&transport_path) {
         Ok(value) => value,
         Err(error) => {
-            failures.push(format!("cannot read {}: {error}", tool_path.display()));
+            failures.push(format!("cannot read {}: {error}", transport_path.display()));
             return;
         }
     };
-    check_collection_authority_producer_text(&workflow, &tool, failures);
+    check_collection_authority_producer_text(&workflow, &transport, failures);
+    let integration = match fs::read_to_string(&integration_path) {
+        Ok(value) => value,
+        Err(error) => {
+            failures.push(format!(
+                "cannot read {}: {error}",
+                integration_path.display()
+            ));
+            return;
+        }
+    };
+    let revocations = match fs::read_to_string(&revocations_path) {
+        Ok(value) => value,
+        Err(error) => {
+            failures.push(format!(
+                "cannot read {}: {error}",
+                revocations_path.display()
+            ));
+            return;
+        }
+    };
+    check_collection_custody_integration_text(&integration, &revocations, failures);
+    let review = match fs::read_to_string(&review_path) {
+        Ok(value) => value,
+        Err(error) => {
+            failures.push(format!("cannot read {}: {error}", review_path.display()));
+            return;
+        }
+    };
+    let trust_roots = match fs::read_to_string(&trust_roots_path) {
+        Ok(value) => value,
+        Err(error) => {
+            failures.push(format!(
+                "cannot read {}: {error}",
+                trust_roots_path.display()
+            ));
+            return;
+        }
+    };
+    check_collection_custody_review_text(&review, &trust_roots, failures);
+    match fs::read_to_string(&activation_path) {
+        Ok(activation) => check_collection_activation_preparation_text(&activation, failures),
+        Err(error) => failures.push(format!(
+            "cannot read {}: {error}",
+            activation_path.display()
+        )),
+    }
+    match fs::read_to_string(&custody_bridge_path) {
+        Ok(bridge) => check_collection_worm_bridge_text(&bridge, failures),
+        Err(error) => failures.push(format!(
+            "cannot read {}: {error}",
+            custody_bridge_path.display()
+        )),
+    }
+}
+
+fn check_collection_activation_preparation_text(workflow: &str, failures: &mut Vec<String>) {
+    const VERIFY: &str = "run: ./target/ci/hell-ci collection-authority verify-activation-artifact --input ci-in/collection-custody-activation/collection-custody-activation-token.json --report ci-in/collection-custody-activation/collection-custody-admission.json";
+    const PREPARE: &str = "run: ./target/ci/hell-ci collection-authority prepare-activation --input ci-in/collection-custody-activation --output ci-out/collection-activation-proposal --run-id \"$COLLECTION_ACTIVATION_RUN_ID\" --run-attempt \"$COLLECTION_ACTIVATION_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_ACTIVATION_ARTIFACT_ID\" --expected-directory-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"";
+    let Some(lines) = workflow_job_lines(workflow, "prepare-non-authoritative-activation") else {
+        failures.push(
+            "collection activation preparation lacks its protected preparation job".to_owned(),
+        );
+        return;
+    };
+    let body = lines.join("\n");
+    let runs = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run: "))
+        .collect::<Vec<_>>();
+    let expected_runs = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_ACTIVATION_SHA\"",
+        VERIFY,
+        PREPARE,
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/collection-activation-proposal",
+    ];
+    let build = body.find("run: cargo build --locked --profile ci --package hell-ci --bin hell-ci");
+    let download = body.find("uses: actions/download-artifact@");
+    let verify = body.find(VERIFY);
+    let prepare = body.find(PREPARE);
+    let upload = body.find("uses: actions/upload-artifact@");
+    let expected_uses = [
+        "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1",
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+    ];
+    check_collection_rust_caches(
+        &body,
+        "collection-activation-preparation",
+        Some("${{ inputs.activation_sha }}"),
+        ".github/workflows/collection-activation-preparation.yml",
+        failures,
+    );
+    if !activation_preparation_control_exact(workflow, &body)
+        || runs.iter().any(|run| run.contains("${{"))
+        || runs != expected_runs
+        || collection_workflow_entries(&body, "uses: ") != expected_uses
+        || ![build, download, verify, prepare, upload]
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .is_some_and(|positions| positions.windows(2).all(|pair| pair[0] < pair[1]))
+        || body.matches("id: bind-proposal").count() != 1
+        || body.matches("id: upload-proposal").count() != 1
+        || body
+            .matches("proposal_artifact_id: ${{ steps.upload-proposal.outputs.artifact-id }}")
+            .count()
+            != 1
+        || body
+            .matches(
+                "proposal_artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}",
+            )
+            .count()
+            != 1
+        || body
+            .matches(
+                "proposal_directory_sha256: ${{ steps.bind-proposal.outputs.directory_sha256 }}",
+            )
+            .count()
+            != 1
+        || body
+            .matches("path: ci-out/collection-activation-proposal")
+            .count()
+            != 1
+        || body.matches("if-no-files-found: error").count() != 1
+        || body.matches("retention-days: 14").count() != 1
+        || body.contains("git commit")
+        || body.contains("git push")
+        || body.contains("gh pr")
+        || body.contains("aws-actions/configure-aws-credentials@")
+        || body.contains("webfactory/ssh-agent@")
+        || body.contains("sigstore/cosign-installer@")
+        || body.contains("secrets.")
+        || body.contains("promotionAuthority: true")
+        || body.contains("activationAuthority: true")
+    {
+        failures.push(
+            "collection activation preparation is not an exact provider-authenticated non-authoritative proposal"
+                .to_owned(),
+        );
+    }
+}
+
+fn activation_preparation_control_exact(workflow: &str, body: &str) -> bool {
+    let inputs = [
+        "      activation_sha:",
+        "      source_run_id:",
+        "      source_run_attempt:",
+        "      artifact_id:",
+        "      expected_directory_sha256:",
+        "      expected_archive_sha256:",
+    ];
+    let bindings = [
+        "run-id: ${{ inputs.source_run_id }}",
+        "artifact-ids: ${{ inputs.artifact_id }}",
+        "github-token: ${{ github.token }}",
+        "path: ci-in/collection-custody-activation",
+        "COLLECTION_ACTIVATION_RUN_ID: ${{ inputs.source_run_id }}",
+        "COLLECTION_ACTIVATION_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}",
+        "COLLECTION_ACTIVATION_ARTIFACT_ID: ${{ inputs.artifact_id }}",
+        "COLLECTION_ACTIVATION_DIRECTORY_SHA256: ${{ inputs.expected_directory_sha256 }}",
+        "COLLECTION_ACTIVATION_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}",
+    ];
+    workflow.starts_with("name: Collection Activation Preparation\n\non:\n  workflow_dispatch:\n")
+        && !["  push:", "  schedule:", "  workflow_call:", "  pull_request:"]
+            .iter()
+            .any(|trigger| workflow.contains(trigger))
+        && workflow.matches("        required: true").count() == 6
+        && workflow.matches("        type: string").count() == 6
+        && inputs.iter().all(|input| workflow.matches(input).count() == 1)
+        && workflow.matches("concurrency:\n  group: collection-activation-preparation-${{ github.repository }}\n  cancel-in-progress: false").count() == 1
+        && body.matches("if: ${{ github.ref == 'refs/heads/main' && inputs.activation_sha == github.sha }}").count() == 1
+        && body.matches("environment: collection-activation-preparation").count() == 1
+        && body.matches("actions: read").count() == 1
+        && body.matches("contents: read").count() == 1
+        && !body.contains(": write")
+        && body.matches("runs-on: ubuntu-24.04").count() == 1
+        && body.matches("timeout-minutes: 45").count() == 1
+        && body.matches("ref: ${{ inputs.activation_sha }}").count() == 1
+        && body.matches("fetch-depth: 0").count() == 1
+        && body.matches("persist-credentials: false").count() == 1
+        && bindings.iter().all(|binding| body.matches(binding).count() == 1)
+}
+
+fn check_collection_worm_bridge_text(workflow: &str, failures: &mut Vec<String>) {
+    const PREPARE: &str = "run: ./target/ci/hell-ci collection-authority prepare-worm-custody --package compat/collection-custody/payload --signature compat/collection-custody/signature --candidate-executable target/release/hell --integration-proof compat/collection-custody/integration-proof.tsv --integration-review compat/collection-custody/integration-review.dsse.json --output ci-out";
+    const VALIDATE: &str =
+        "run: ./target/ci/hell-ci custody-ops verify-package --input ci-out/custody-package";
+    const ASSEMBLE: &str = "run: ./target/ci/hell-ci custody-ops workflow-assemble-collection-worm";
+    let Some(package) = workflow_job_lines(workflow, "package") else {
+        failures.push("collection WORM bridge lacks preparation job".to_owned());
+        return;
+    };
+    let Some(upload) = workflow_job_lines(workflow, "upload") else {
+        failures.push("collection WORM bridge lacks provider upload job".to_owned());
+        return;
+    };
+    let Some(retrieve) = workflow_job_lines(workflow, "retrieve") else {
+        failures.push("collection WORM bridge lacks independent retrieval job".to_owned());
+        return;
+    };
+    let Some(review) = workflow_job_lines(workflow, "review-and-assemble") else {
+        failures.push("collection WORM bridge lacks protected review job".to_owned());
+        return;
+    };
+    let package = package.join("\n");
+    let upload = upload.join("\n");
+    let retrieve = retrieve.join("\n");
+    let review = review.join("\n");
+    let package_order = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_CANDIDATE_SHA\"",
+        PREPARE,
+        "id: upload-package",
+    ];
+    let upload_order = [
+        "artifact-ids: ${{ needs.package.outputs.artifact_id }}",
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        VALIDATE,
+        "run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector",
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        "run: ./target/ci/hell-ci custody-ops workflow-upload",
+    ];
+    let review_order = [
+        "artifact-ids: ${{ needs.review-prepare.outputs.artifact_id }}",
+        "run: ./target/ci/hell-ci custody-ops verify-package --input ci-out/custody-subject/transport/custody-package",
+        "run: ./target/ci/hell-ci custody-ops workflow-retain-review-subject",
+        "run: ./target/ci/hell-ci review-authorization --input ci-out/custody-subject/review-packet.json --output ci-out/custody/authorization.json --role custody-reviewer --category custody-final --github-dispatch-inputs",
+        "run: ./target/ci/hell-ci review-packet --input ci-out/custody-subject/review-packet.json --from ci-out/custody/authorization.json --output ci-out/custody/review-packet.authorized.json --role custody-reviewer --category custody-final --decision accept --github-dispatch-inputs",
+        "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
+        "uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0",
+        "run: ssh-add -L",
+        "run: ./target/ci/hell-ci review-sign --input ci-out/custody/review-packet.authorized.json --output ci-out/custody/custody-review.dsse.json --role custody-reviewer --decision accept --policy ci-out/custody/reviewer.allowed_signers",
+        "run: ./target/ci/hell-ci custody verify --input ci-out/custody/custody-receipt.json --policy compat/reviews.allowed_signers",
+        "path: ci-out/primary-worm-current-scrub",
+        "path: ci-out/secondary-worm-current-scrub",
+        "id: assemble-collection-worm",
+        ASSEMBLE,
+        "id: upload-collection-worm",
+        "path: ci-out/collection-worm-custody",
+    ];
+    let retrieve_order = [
+        "name: ephemeralEvidence-custody-upload-${{ matrix.provider }}",
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci custody-ops workflow-verify-upload-subject",
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        "run: ./target/ci/hell-ci custody-ops workflow-retrieve",
+    ];
+    if !collection_worm_artifacts_are_exact(workflow, &package, &upload, &retrieve, &review)
+        || !markers_are_ordered(&package, &package_order)
+        || !markers_are_ordered(&upload, &upload_order)
+        || !markers_are_ordered(&retrieve, &retrieve_order)
+        || !markers_are_ordered(&review, &review_order)
+        || workflow.contains("collection-authority verify-custody --")
+    {
+        failures.push(
+            "collection custody WORM bridge does not preserve exact prepared subject through protected two-provider review"
+                .to_owned(),
+        );
+    }
+}
+
+fn collection_worm_artifacts_are_exact(
+    workflow: &str,
+    package: &str,
+    upload: &str,
+    retrieve: &str,
+    review: &str,
+) -> bool {
+    const PREPARE: &str = "run: ./target/ci/hell-ci collection-authority prepare-worm-custody --package compat/collection-custody/payload --signature compat/collection-custody/signature --candidate-executable target/release/hell --integration-proof compat/collection-custody/integration-proof.tsv --integration-review compat/collection-custody/integration-review.dsse.json --output ci-out";
+    const VALIDATE: &str =
+        "run: ./target/ci/hell-ci custody-ops verify-package --input ci-out/custody-package";
+    const ASSEMBLE: &str = "run: ./target/ci/hell-ci custody-ops workflow-assemble-collection-worm";
+    let upload_files = [
+        "            ci-out/upload-receipt.json\n",
+        "            ci-out/upload-receipt-provider-pointer.json\n",
+        "            ci-out/upload-receipt-packet.json\n",
+        "            ci-out/upload-receipt.dsse.json\n",
+    ];
+    workflow.matches("          - collection-custody").count() == 1
+        && package.matches(PREPARE).count() == 1
+        && package
+            .matches("COLLECTION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}")
+            .count()
+            == 1
+        && package.matches("            ci-out/subject\n").count() == 1
+        && workflow
+            .matches("artifact-ids: ${{ needs.package.outputs.artifact_id }}")
+            .count()
+            == 2
+        && upload.matches(VALIDATE).count() == 1
+        && upload
+            .matches("CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+            .count()
+            == 1
+        && upload
+            .matches("CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+            .count()
+            == 1
+        && upload_files
+            .iter()
+            .all(|path| upload.matches(path).count() == 1)
+        && upload
+            .matches(concat!(
+                "          path: |\n",
+                "            ci-out/upload-receipt.json\n",
+                "            ci-out/upload-receipt-provider-pointer.json\n",
+                "            ci-out/upload-receipt-packet.json\n",
+                "            ci-out/upload-receipt.dsse.json\n",
+                "          if-no-files-found: error",
+            ))
+            .count()
+            == 1
+        && retrieve
+            .matches("CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+            .count()
+            == 1
+        && retrieve
+            .matches("CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+            .count()
+            == 1
+        && review.matches(ASSEMBLE).count() == 1
+        && review.matches("collection_worm_directory_sha256: ${{ steps.assemble-collection-worm.outputs.directory-sha256 }}").count() == 1
+        && review.matches("environment: custody-review").count() == 1
+        && review.matches("run: ./target/ci/hell-ci custody-ops verify-package --input ci-out/custody-subject/transport/custody-package").count() == 1
+        && review.matches("name: collection-worm-custody-${{ github.run_id }}-${{ github.run_attempt }}").count() == 1
+}
+
+fn check_collection_custody_review_text(
+    workflow: &str,
+    trust_roots: &str,
+    failures: &mut Vec<String>,
+) {
+    let Some(prepare_lines) = workflow_job_lines(workflow, "prepare-unsigned-custody-review")
+    else {
+        failures
+            .push("collection custody review lacks its unprivileged preparation job".to_owned());
+        return;
+    };
+    let Some(sign_lines) = workflow_job_lines(workflow, "sign-prepared-custody-review") else {
+        failures.push("collection custody review lacks its protected signer job".to_owned());
+        return;
+    };
+    let prepare = prepare_lines.join("\n");
+    let sign = sign_lines.join("\n");
+    let prepare_runs = collection_workflow_entries(&prepare, "run: ");
+    let expected_prepare_runs = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_PREPARATION_SHA\"",
+        "run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper",
+        "run: cargo build --locked --release --package hell-cli --bin hell --features hell-cli/compat-tracing",
+        "run: ./target/ci/hell-ci collection-authority prepare-custody-review --package compat/collection-custody/payload --signature compat/collection-custody/signature --candidate-executable target/release/hell --reviewer \"$COLLECTION_CUSTODY_REVIEWER\" --issued-at \"$COLLECTION_CUSTODY_ISSUED_AT\" --output ci-out/collection-custody-review",
+    ];
+    let sign_runs = collection_workflow_entries(&sign, "run: ");
+    let expected_sign_runs = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_PREPARATION_SHA\"",
+        "run: ./target/ci/hell-ci collection-authority verify-custody-review-preparation --input ci-in/collection-custody-review",
+        "run: ssh-add -L",
+        "run: ./target/ci/hell-ci review-sign --input ci-in/collection-custody-review/integration-review-payload.json --output ci-in/collection-custody-review-signed/integration-review.dsse.json --role custody-reviewer --decision accept --policy compat/reviews.allowed_signers",
+        "run: ./target/ci/hell-ci review-verify --input ci-in/collection-custody-review-signed/integration-review.dsse.json --policy compat/reviews.allowed_signers --role custody-reviewer",
+        "run: ./target/ci/hell-ci collection-authority assemble-custody-review-overlay --input ci-in/collection-custody-review --integration-review ci-in/collection-custody-review-signed/integration-review.dsse.json --output ci-out/collection-custody-review-overlay",
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/collection-custody-review-overlay/tree",
+    ];
+    let uses_are_exact = collection_custody_review_uses_are_exact(&prepare, &sign, failures);
+    if !workflow.starts_with(COLLECTION_REVIEW_DISPATCH)
+        || workflow.matches("  workflow_dispatch:").count() != 1
+        || ["  push:", "  schedule:", "  workflow_call:", "  pull_request:"]
+            .iter()
+            .any(|trigger| workflow.contains(trigger))
+        || prepare
+            .matches("if: ${{ github.ref == 'refs/heads/main' && inputs.preparation_sha == github.sha }}")
+            .count()
+            != 1
+        || sign
+            .matches("if: ${{ github.ref == 'refs/heads/main' && inputs.preparation_sha == github.sha }}")
+            .count()
+            != 1
+        || sign.matches("needs: prepare-unsigned-custody-review").count() != 1
+        || sign.matches("environment: collection-custody-review").count() != 1
+        || sign.matches("id-token: write").count() != 1
+        || sign.matches("contents: read").count() != 1
+        || sign.matches("actions: read").count() != 1
+        || prepare.contains("id-token: write")
+        || workflow.contains("contents: write")
+        || !collection_custody_review_env_is_exact(
+            &prepare,
+            &sign,
+            &prepare_runs,
+            &sign_runs,
+        )
+        || prepare.matches("ref: ${{ inputs.preparation_sha }}").count() != 1
+        || sign.matches("ref: ${{ inputs.preparation_sha }}").count() != 1
+        || workflow.matches("persist-credentials: false").count() != 2
+        || sign
+            .matches("artifact-ids: ${{ needs.prepare-unsigned-custody-review.outputs.artifact_id }}")
+            .count()
+            != 1
+        || prepare_runs != expected_prepare_runs
+        || sign_runs != expected_sign_runs
+        || !uses_are_exact
+        || sign.matches("overlay_artifact_id: ${{ steps.upload-overlay.outputs.artifact-id }}").count() != 1
+        || sign.matches("overlay_artifact_digest: ${{ steps.upload-overlay.outputs.artifact-digest }}").count() != 1
+        || sign.matches("overlay_directory_sha256: ${{ steps.bind-overlay.outputs.directory_sha256 }}").count() != 1
+        || sign.matches("id: bind-overlay").count() != 1
+        || sign.matches("id: upload-overlay").count() != 1
+        || sign.matches("name: collection-custody-review-overlay-${{ github.run_id }}-${{ github.run_attempt }}").count() != 1
+        || sign.matches("path: ci-out/collection-custody-review-overlay/tree").count() != 1
+        || sign.contains("path: |\n            ci-out/integration-review.dsse.json")
+        || sign.contains("verify-custody --")
+        || sign.find("verify-custody-review-preparation")
+            > sign.find("webfactory/ssh-agent")
+        || trust_roots
+            .matches("collection_custody_review_workflow = \".github/workflows/collection-custody-review.yml\"")
+            .count()
+            != 1
+    {
+        failures.push(
+            "collection custody review is not the exact protected non-integrating signer"
+                .to_owned(),
+        );
+    }
+}
+
+fn collection_custody_review_uses_are_exact(
+    prepare: &str,
+    sign: &str,
+    failures: &mut Vec<String>,
+) -> bool {
+    let cache_restore =
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+    let cache_save = "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+    let expected_prepare = [
+        "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        cache_restore,
+        cache_restore,
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        cache_save,
+        cache_save,
+    ];
+    let expected_sign = [
+        "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        cache_restore,
+        cache_restore,
+        "uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1",
+        "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
+        "uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0",
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        cache_save,
+        cache_save,
+    ];
+    check_collection_rust_caches(
+        prepare,
+        "collection-custody-prepare",
+        Some("${{ inputs.preparation_sha }}"),
+        ".github/workflows/collection-custody-review.yml",
+        failures,
+    );
+    check_collection_rust_caches(
+        sign,
+        "collection-custody-sign",
+        Some("${{ inputs.preparation_sha }}"),
+        ".github/workflows/collection-custody-review.yml",
+        failures,
+    );
+    collection_workflow_entries(prepare, "uses: ") == expected_prepare
+        && collection_workflow_entries(sign, "uses: ") == expected_sign
+}
+
+fn collection_custody_review_env_is_exact(
+    prepare: &str,
+    sign: &str,
+    prepare_runs: &[&str],
+    sign_runs: &[&str],
+) -> bool {
+    !prepare_runs.iter().any(|run| run.contains("${{"))
+        && !sign_runs.iter().any(|run| run.contains("${{"))
+        && prepare
+            .matches("COLLECTION_PREPARATION_SHA: ${{ inputs.preparation_sha }}")
+            .count()
+            == 1
+        && sign
+            .matches("COLLECTION_PREPARATION_SHA: ${{ inputs.preparation_sha }}")
+            .count()
+            == 1
+        && prepare
+            .matches("COLLECTION_CUSTODY_REVIEWER: ${{ inputs.reviewer }}")
+            .count()
+            == 1
+        && prepare
+            .matches("COLLECTION_CUSTODY_ISSUED_AT: ${{ inputs.issued_at }}")
+            .count()
+            == 1
+}
+
+fn collection_workflow_entries<'a>(body: &'a str, prefix: &str) -> Vec<&'a str> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(prefix))
+        .collect()
+}
+
+const COLLECTION_CARGO_HASH: &str =
+    "${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}";
+const COLLECTION_TARGET_HASH: &str = "${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '";
+
+fn check_collection_rust_caches(
+    body: &str,
+    scope: &str,
+    exact_sha: Option<&str>,
+    workflow: &str,
+    failures: &mut Vec<String>,
+) {
+    let cargo_key = format!(
+        "key: v2-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-{scope}-cargo-{COLLECTION_CARGO_HASH}"
+    );
+    let sha = exact_sha.map_or_else(String::new, |value| format!("{value}-"));
+    let target_key = format!(
+        "key: v2-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-{scope}-target-{sha}{COLLECTION_TARGET_HASH}{workflow}') }}}}"
+    );
+    let cargo_save = "if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}";
+    let target_save = "if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}";
+    if body.matches(&cargo_key).count() != 2
+        || body.matches(&target_key).count() != 2
+        || body.matches("id: cargo-cache").count() != 1
+        || body.matches("id: target-cache").count() != 1
+        || body.matches(cargo_save).count() != 1
+        || body.matches(target_save).count() != 1
+        || body.contains("restore-keys:")
+    {
+        failures.push(format!(
+            "collection job {scope} lacks exact split dependency and compilation caches"
+        ));
+    }
+}
+
+fn check_collection_candidate_cache(job: &str, body: &str, failures: &mut Vec<String>) {
+    let key = "key: v2-${{ runner.os }}-${{ runner.arch }}-collection-candidate-${{ inputs.candidate_sha }}-${{ hashFiles('ci-work/candidate/rust-toolchain.toml', 'ci-work/candidate/Cargo.lock', 'ci-work/candidate/Cargo.toml', 'ci-work/candidate/crates/**/Cargo.toml', 'ci-work/candidate/**/build.rs', 'ci-work/candidate/.cargo/**', 'ci-work/candidate/crates/**/*.rs', 'ci-work/candidate/builtins/**', 'ci-work/candidate/compat/**', 'ci-work/candidate/fixtures/**', 'ci-work/candidate/baseline.toml', 'ci-work/candidate/spec/**', '.github/workflows/collection-authority.yml') }}";
+    let save = "if: ${{ always() && steps.candidate-target-cache.outcome == 'success' && steps.candidate-target-cache.outputs.cache-hit != 'true' }}";
+    if body.matches(key).count() != 2
+        || body.matches("id: candidate-target-cache").count() != 1
+        || body.matches("path: ci-out/candidate-target").count() != 2
+        || body.matches(save).count() != 1
+    {
+        failures.push(format!(
+            "collection producer {job} lacks its candidate-SHA-bound compilation cache"
+        ));
+    }
+}
+
+fn check_collection_stack_caches(job: &str, body: &str, failures: &mut Vec<String>) {
+    let dependency_key = "key: v2-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-collection-oracle-${{ hashFiles('ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**') }}";
+    let build_key = "key: v2-${{ runner.os }}-${{ runner.arch }}-collection-stack-work-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**') }}-${{ hashFiles('crates/**/*.rs', 'compat/**', 'ci-work/oracle-source/stack.yaml', 'ci-work/oracle-source/stack.yaml.lock', 'ci-work/oracle-source/package.yaml', 'ci-work/oracle-source/hell.cabal', 'ci-work/oracle-source/src/**', '.github/workflows/collection-authority.yml') }}";
+    let dependency_save = "if: ${{ always() && steps.native-stack-cache.outcome == 'success' && steps.native-stack-cache.outputs.cache-hit != 'true' }}";
+    let build_save = "if: ${{ always() && steps.native-stack-work-cache.outcome == 'success' && steps.native-stack-work-cache.outputs.cache-hit != 'true' }}";
+    if body.matches(dependency_key).count() != 2
+        || body.matches(build_key).count() != 2
+        || body.matches("id: setup-stack").count() != 1
+        || body.matches("id: native-stack-cache").count() != 1
+        || body.matches("id: native-stack-work-cache").count() != 1
+        || body.matches(dependency_save).count() != 1
+        || body.matches(build_save).count() != 1
+    {
+        failures.push(format!(
+            "collection producer {job} lacks exact pinned native Stack caches"
+        ));
+    }
+}
+
+fn check_collection_custody_integration_text(
+    workflow: &str,
+    revocations: &str,
+    failures: &mut Vec<String>,
+) {
+    const DISPATCH: &str = concat!(
+        "name: Collection Custody Integration\n\non:\n  workflow_dispatch:\n    inputs:\n",
+        "      integration_sha:\n",
+        "        description: Exact protected integration commit containing durable collection custody\n",
+        "        required: true\n        type: string\n",
+    );
+    let Some(lines) = workflow_job_lines(workflow, "verify-protected-integration") else {
+        failures.push("collection custody integration lacks its protected verifier job".to_owned());
+        return;
+    };
+    let body = lines.join("\n");
+    let runs = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run: "))
+        .collect::<Vec<_>>();
+    let expected_runs = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_INTEGRATION_SHA\"",
+        "run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper",
+        "run: cargo build --locked --release --package hell-cli --bin hell --features hell-cli/compat-tracing",
+        "run: ./target/ci/hell-ci collection-authority verify-worm-artifact --input ci-in/collection-worm-custody --expected-directory-sha256 \"$COLLECTION_WORM_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_WORM_ARCHIVE_SHA256\" --run-id \"$COLLECTION_WORM_RUN_ID\" --run-attempt \"$COLLECTION_WORM_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_WORM_ARTIFACT_ID\"",
+        "run: ./target/ci/hell-ci collection-authority verify-custody --package compat/collection-custody/payload --signature compat/collection-custody/signature --candidate-executable target/release/hell --integration-proof compat/collection-custody/integration-proof.tsv --integration-review compat/collection-custody/integration-review.dsse.json --worm-custody ci-in/collection-worm-custody --report ci-out/collection-custody-admission.json",
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out",
+    ];
+    let uses_are_exact = collection_custody_integration_uses_are_exact(&body, failures);
+    if !collection_custody_integration_control_exact(workflow, &body, DISPATCH)
+        || runs.iter().any(|run| run.contains("${{"))
+        || runs != expected_runs
+        || !uses_are_exact
+        || body
+            .matches(
+                "name: collection-custody-admission-${{ github.run_id }}-${{ github.run_attempt }}",
+            )
+            .count()
+            != 1
+        || body.matches("id: bind-admission").count() != 1
+        || body.matches("id: upload-admission").count() != 1
+        || body
+            .matches("            ci-out/collection-custody-admission.json\n")
+            .count()
+            != 1
+        || body
+            .matches("            ci-out/collection-custody-admission.json.sha256\n")
+            .count()
+            != 1
+        || body
+            .matches("            ci-out/collection-custody-activation-token.json\n")
+            .count()
+            != 1
+        || body
+            .matches("            ci-out/collection-custody-activation-token.json.sha256\n")
+            .count()
+            != 1
+        || body.matches("if-no-files-found: error").count() != 1
+        || body.matches("retention-days: 30").count() != 1
+        || crate::collection_custody::parse_revocation_document(revocations).is_err()
+    {
+        failures.push(
+            "collection custody integration is not the exact protected current replay gate"
+                .to_owned(),
+        );
+    }
+}
+
+fn collection_custody_integration_control_exact(
+    workflow: &str,
+    body: &str,
+    dispatch: &str,
+) -> bool {
+    let job_bindings = [
+        "if: ${{ github.ref == 'refs/heads/main' && inputs.integration_sha == github.sha }}",
+        "environment: collection-custody-integration",
+        "permissions:",
+        "contents: read",
+        "actions: read",
+        "runs-on: ubuntu-24.04",
+        "timeout-minutes: 180",
+        "admission_artifact_id: ${{ steps.upload-admission.outputs.artifact-id }}",
+        "admission_artifact_digest: ${{ steps.upload-admission.outputs.artifact-digest }}",
+        "admission_directory_sha256: ${{ steps.bind-admission.outputs.directory_sha256 }}",
+        "ref: ${{ inputs.integration_sha }}",
+        "fetch-depth: 0",
+        "persist-credentials: false",
+        "COLLECTION_INTEGRATION_SHA: ${{ inputs.integration_sha }}",
+        "artifact-ids: ${{ inputs.worm_artifact_id }}",
+        "run-id: ${{ inputs.worm_source_run_id }}",
+        "COLLECTION_WORM_ARCHIVE_SHA256: ${{ inputs.expected_worm_archive_sha256 }}",
+        "COLLECTION_WORM_ARTIFACT_ID: ${{ inputs.worm_artifact_id }}",
+        "github-token: ${{ github.token }}",
+        "COLLECTION_WORM_DIRECTORY_SHA256: ${{ inputs.expected_worm_directory_sha256 }}",
+        "COLLECTION_WORM_RUN_ATTEMPT: ${{ inputs.worm_source_run_attempt }}",
+        "COLLECTION_WORM_RUN_ID: ${{ inputs.worm_source_run_id }}",
+        "path: ci-in/collection-worm-custody",
+    ];
+    workflow.starts_with(dispatch)
+        && workflow.matches("  workflow_dispatch:").count() == 1
+        && !["  push:", "  schedule:", "  workflow_call:", "  pull_request:"]
+            .iter()
+            .any(|trigger| workflow.contains(trigger))
+        && workflow.matches("permissions:\n  contents: read\n").count() == 1
+        && workflow.matches("concurrency:\n  group: collection-custody-integration-${{ github.repository }}\n  cancel-in-progress: false").count() == 1
+        && workflow.matches("  verify-protected-integration:").count() == 1
+        && job_bindings
+            .iter()
+            .all(|binding| body.matches(binding).count() == 1)
+        && !body.contains(": write")
+}
+
+fn collection_custody_integration_uses_are_exact(body: &str, failures: &mut Vec<String>) -> bool {
+    let cache_restore =
+        "uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+    let cache_save = "uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+    let expected = [
+        "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        cache_restore,
+        cache_restore,
+        "uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1",
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        cache_save,
+        cache_save,
+    ];
+    check_collection_rust_caches(
+        body,
+        "collection-custody-integration",
+        Some("${{ inputs.integration_sha }}"),
+        ".github/workflows/collection-custody-integration.yml",
+        failures,
+    );
+    collection_workflow_entries(body, "uses: ") == expected
+}
+
+fn check_collection_transport_source(source: &str, failures: &mut Vec<String>) {
+    let required = [
+        "\"acquire-provider\" | \"install-pinned-gh\" | \"capture-custody-attestation\"",
+        "const GH_VERSION: &str = \"2.93.0\";",
+        "const GH_ARCHIVE_SHA256: &str = \"02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0\";",
+        "const GH_CHECKSUMS_SHA256: &str =",
+        "const GH_BINARY_SHA256: &str = \"014fcd614de4de5b4a1441d298175684bad99f713d10296c5fcaaba47ac332d1\";",
+        "fn provider_pages(",
+        "fn validate_complete_pages(",
+        "fn configure_provider_environment(",
+        "fn validate_attestation_bundle(",
+        "fn validate_attestation_verification(",
+        "fn configure_gh_environment(",
+        "fn attestation_verify_arguments(",
+        "#[cfg(test)]\nmod tests",
+    ];
+    if required.into_iter().any(|marker| !source.contains(marker))
+        || source.contains("implementation is incomplete")
+        || source.contains("Command::new(\"sh\")")
+        || source.contains("Command::new(\"bash\")")
+    {
+        failures.push(
+            "collection transport Rust source lacks the reviewed typed fail-closed implementation"
+                .to_owned(),
+        );
+    }
 }
 
 fn check_collection_authority_producer_text(
     workflow: &str,
-    tool: &str,
+    transport: &str,
     failures: &mut Vec<String>,
 ) {
+    if !collection_authority_dispatch_is_exact(workflow) {
+        failures.push(
+            "collection authority campaign is not isolated dispatch-only non-cancelling work"
+                .to_owned(),
+        );
+    }
+    check_collection_linux_acquisition_jobs(workflow, failures);
+    check_collection_authority_platform_jobs(workflow, failures);
+    check_collection_authority_merge(workflow, failures);
+    check_collection_custody_payload_overlay(workflow, failures);
+    check_collection_transport_source(transport, failures);
+}
+
+fn check_collection_custody_payload_overlay(workflow: &str, failures: &mut Vec<String>) {
+    let Some(lines) = workflow_job_lines(workflow, "assemble-custody-payload-overlay") else {
+        failures
+            .push("collection campaign lacks its typed commit-ready payload overlay".to_owned());
+        return;
+    };
+    let body = lines.join("\n");
+    check_collection_rust_caches(
+        &body,
+        "collection-payload-overlay",
+        None,
+        ".github/workflows/collection-authority.yml",
+        failures,
+    );
+    let expected_runs = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+        "run: ./target/ci/hell-ci collection-authority assemble-custody-payload-overlay --package ci-in/collection-custody-merge/collection-custody --signature ci-in/collection-custody-merge/collection-custody-signature --output ci-out/collection-custody-payload-overlay",
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/collection-custody-payload-overlay/tree",
+    ];
+    let ordered = [
+        expected_runs[0],
+        expected_runs[1],
+        "artifact-ids: ${{ needs.merge-collection-authority.outputs.custody_artifact_id }}",
+        expected_runs[2],
+        "id: bind-overlay",
+        expected_runs[3],
+        "id: upload-overlay",
+    ];
+    if body.matches("needs: merge-collection-authority").count() != 1
+        || body
+            .matches("if: ${{ github.ref == 'refs/heads/main' && needs.merge-collection-authority.result == 'success' }}")
+            .count()
+            != 1
+        || body.matches("actions: read").count() != 1
+        || body.matches("contents: read").count() != 1
+        || body.contains("id-token: write")
+        || body.matches("ref: ${{ github.sha }}").count() != 1
+        || body.matches("fetch-depth: 1").count() != 1
+        || body.matches("persist-credentials: false").count() != 1
+        || collection_workflow_entries(&body, "run: ") != expected_runs
+        || !markers_are_ordered(&body, &ordered)
+        || body.matches("overlay_artifact_id: ${{ steps.upload-overlay.outputs.artifact-id }}").count() != 1
+        || body.matches("overlay_artifact_digest: ${{ steps.upload-overlay.outputs.artifact-digest }}").count() != 1
+        || body.matches("overlay_directory_sha256: ${{ steps.bind-overlay.outputs.directory_sha256 }}").count() != 1
+        || body.matches("name: collection-custody-payload-overlay-${{ github.run_id }}-${{ github.run_attempt }}").count() != 1
+        || body.matches("path: ci-out/collection-custody-payload-overlay/tree").count() != 1
+        || body.matches("if-no-files-found: error").count() != 1
+        || body.matches("retention-days: 30").count() != 1
+        || body.contains("contents: write")
+        || body.contains("git push")
+    {
+        failures.push(
+            "collection custody payload overlay is not an exact immutable commit-ready handoff"
+                .to_owned(),
+        );
+    }
+}
+
+fn collection_authority_dispatch_is_exact(workflow: &str) -> bool {
     const DISPATCH_PREFIX: &str = concat!(
         "name: Collection Authority\n\non:\n  workflow_dispatch:\n    inputs:\n",
         "      candidate_sha:\n",
@@ -125,8 +1088,8 @@ fn check_collection_authority_producer_text(
         "concurrency:\n  group: collection-authority-${{ github.repository }}\n",
         "  cancel-in-progress: false",
     );
-    if !workflow.starts_with(DISPATCH_PREFIX)
-        || [
+    workflow.starts_with(DISPATCH_PREFIX)
+        && ![
             "  push:",
             "  schedule:",
             "  workflow_call:",
@@ -134,20 +1097,17 @@ fn check_collection_authority_producer_text(
         ]
         .iter()
         .any(|trigger| workflow.contains(trigger))
-        || workflow.matches("  workflow_dispatch:").count() != 1
-        || workflow.matches(CONCURRENCY).count() != 1
-        || workflow.contains("  cancel-in-progress: true")
-        || workflow
+        && workflow.matches("  workflow_dispatch:").count() == 1
+        && workflow.matches(CONCURRENCY).count() == 1
+        && !workflow.contains("  cancel-in-progress: true")
+        && workflow
             .matches("HELL_SOURCE_COMMIT: ${{ inputs.candidate_sha }}")
             .count()
-            != 1
-    {
-        failures.push(
-            "collection authority campaign is not isolated dispatch-only non-cancelling work"
-                .to_owned(),
-        );
-    }
-    check_collection_linux_acquisition_jobs(workflow, failures);
+            == 1
+        && !workflow.contains("merge-base --is-ancestor")
+}
+
+fn check_collection_authority_platform_jobs(workflow: &str, failures: &mut Vec<String>) {
     for (job, name, runner, timeout, collect, subject, upload_id, artifact) in [
         (
             "collection-authority-linux",
@@ -189,19 +1149,19 @@ fn check_collection_authority_producer_text(
         let body = lines.join("\n");
         let (provider_guard, candidate_guard) = if job == "collection-authority-windows" {
             (
-                "run: git merge-base --is-ancestor \"$env:GITHUB_SHA\" HEAD",
-                "run: git -C ci-work/candidate merge-base --is-ancestor \"$env:HELL_SOURCE_COMMIT\" HEAD",
+                "run: .\\target\\ci\\hell-ci.exe collection-authority verify-checkout --input . --candidate-commit \"$env:GITHUB_SHA\"",
+                "run: .\\target\\ci\\hell-ci.exe collection-authority verify-checkout --input ci-work\\candidate --candidate-commit \"$env:HELL_SOURCE_COMMIT\"",
             )
         } else {
             (
-                "run: git merge-base --is-ancestor \"$GITHUB_SHA\" HEAD",
-                "run: git -C ci-work/candidate merge-base --is-ancestor \"$HELL_SOURCE_COMMIT\" HEAD",
+                "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+                "run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$HELL_SOURCE_COMMIT\"",
             )
         };
         let ordered = [
+            "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
             provider_guard,
             candidate_guard,
-            "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
             "run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper",
             "run: cargo build --locked --release --manifest-path ci-work/candidate/Cargo.toml --target-dir ci-out/candidate-target --package hell-cli --bin hell --features hell-cli/compat-tracing",
             collect,
@@ -225,29 +1185,71 @@ fn check_collection_authority_producer_text(
                 "collection authority producer {job} is not one bounded standalone collect-subject-upload pipeline"
             ));
         }
+        let scope = match job {
+            "collection-authority-linux" => "collection-linux",
+            "collection-authority-macos" => "collection-macos",
+            "collection-authority-windows" => "collection-windows",
+            _ => unreachable!("reviewed collection job list"),
+        };
+        check_collection_rust_caches(
+            &body,
+            scope,
+            None,
+            ".github/workflows/collection-authority.yml",
+            failures,
+        );
+        check_collection_candidate_cache(job, &body, failures);
+        if matches!(
+            job,
+            "collection-authority-macos" | "collection-authority-windows"
+        ) {
+            check_collection_stack_caches(job, &body, failures);
+        }
         check_collection_authority_job_identity(job, &body, failures);
     }
 
     check_collection_authority_platform_builds(workflow, failures);
+}
 
+fn check_collection_authority_merge(workflow: &str, failures: &mut Vec<String>) {
     let Some(lines) = workflow_job_lines(workflow, "merge-collection-authority") else {
         failures.push("collection authority workflow lacks protected merge job".to_owned());
         return;
     };
     let body = lines.join("\n");
+    check_collection_rust_caches(
+        &body,
+        "collection-merge",
+        None,
+        ".github/workflows/collection-authority.yml",
+        failures,
+    );
     let ordered = [
-        COLLECTION_ACQUISITION_COMMAND,
         "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+        COLLECTION_INSTALL_GH_COMMAND,
+        COLLECTION_ACQUISITION_COMMAND,
         COLLECTION_VERIFY_COMMAND,
+        COLLECTION_COMPACT_COMMAND,
         "uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1",
-        "subject-path: ci-out/native-shards/collection-authority.json",
-        "name: collection-authority-merged-${{ github.run_id }}-${{ github.run_attempt }}",
+        "subject-path: ci-out/collection-custody/custody-attestation-subject.json",
+        COLLECTION_ATTESTATION_TOOL_COMMAND,
+        COLLECTION_RETAIN_CUSTODY_COMMAND,
+        "name: collection-authority-custody-${{ github.run_id }}-${{ github.run_attempt }}",
     ];
     if !markers_are_ordered(&body, &ordered)
         || body.matches(COLLECTION_ACQUISITION_COMMAND).count() != 1
         || body.matches(COLLECTION_VERIFY_COMMAND).count() != 1
+        || body.matches(COLLECTION_COMPACT_COMMAND).count() != 1
+        || body.matches(COLLECTION_INSTALL_GH_COMMAND).count() != 1
+        || body.matches(COLLECTION_ATTESTATION_TOOL_COMMAND).count() != 1
+        || body.matches(COLLECTION_RETAIN_CUSTODY_COMMAND).count() != 1
+        || body
+            .matches("run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"")
+            .count()
+            != 1
         || body.matches("actions: read").count() != 1
-        || body.matches("timeout-minutes: 45").count() != 1
+        || body.matches("timeout-minutes: 90").count() != 1
         || body.matches("needs: [collection-authority-linux, collection-authority-macos, collection-authority-windows]").count() != 1
         || body.matches("if: ${{ always() && github.ref == 'refs/heads/main' && needs.collection-authority-linux.result == 'success' && needs.collection-authority-macos.result == 'success' && needs.collection-authority-windows.result == 'success' }}").count() != 1
         || body.matches("attestations: write").count() != 1
@@ -261,18 +1263,42 @@ fn check_collection_authority_producer_text(
         || body.matches("ref: ${{ github.sha }}").count() != 1
         || body.matches("fetch-depth: 1").count() != 1
         || body.matches("persist-credentials: false").count() != 1
-        || body.matches("subject-path: ci-out/native-shards/collection-authority.json").count() != 1
-        || body.matches("ci-out/native-shards").count() < 2
-        || body.matches("ci-out/collection-provider").count() < 2
+        || body.matches("id: attest-collection-custody").count() != 1
+        || body.matches("subject-path: ci-out/collection-custody/custody-attestation-subject.json").count() != 1
+        || body.matches("COLLECTION_CUSTODY_BUNDLE_PATH: ${{ steps.attest-collection-custody.outputs.bundle-path }}").count() != 2
+        || body.matches("custody_artifact_id: ${{ steps.upload-collection-custody.outputs.artifact-id }}").count() != 1
+        || body.matches("custody_artifact_digest: ${{ steps.upload-collection-custody.outputs.artifact-digest }}").count() != 1
+        || body.matches("id: upload-collection-custody").count() != 1
+        || body
+            .matches("uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1")
+            .count()
+            != 1
+        || body
+            .matches("uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1")
+            .count()
+            != 1
+        || body.matches("name: collection-authority-custody-${{ github.run_id }}-${{ github.run_attempt }}").count() != 1
+        || body.matches("            ci-out/collection-custody\n").count() != 1
+        || body
+            .matches("            ci-out/collection-custody-signature\n")
+            .count()
+            != 1
+        || body.matches("retention-days: 30").count() != 1
+        || body.contains("name: collection-authority-merged-")
+        || body.contains("            ci-out/native-shards\n")
+        || body.contains("            ci-out/collection-provider\n")
+        || body.contains("            ci-out/collection-custody-attestation-input\n")
+        || body.contains("collection-authority verify-custody")
         || body.contains("actions/download-artifact@")
+        || body.contains("python3")
+        || body.contains(".py")
+        || body.contains("./tools/")
     {
         failures.push(
-            "collection authority merge is not one API-selected, offline-verified three-platform campaign"
+            "collection authority merge is not one API-selected, verified, compacted, attested transport-only campaign"
                 .to_owned(),
         );
     }
-
-    check_collection_authority_tool(tool, failures);
 }
 
 fn check_collection_linux_acquisition_jobs(workflow: &str, failures: &mut Vec<String>) {
@@ -281,9 +1307,17 @@ fn check_collection_linux_acquisition_jobs(workflow: &str, failures: &mut Vec<St
         return;
     };
     let subject = subject.join("\n");
+    check_collection_rust_caches(
+        &subject,
+        "collection-linux-acquisition",
+        None,
+        ".github/workflows/collection-authority.yml",
+        failures,
+    );
     let subject_order = [
         "ref: ${{ github.sha }}",
         "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
         "run: ./target/ci/hell-ci release-oracle acquire --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json",
         "id: upload-subject",
         "name: collection-linux-acquisition-subject-${{ github.run_id }}-${{ github.run_attempt }}",
@@ -305,6 +1339,10 @@ fn check_collection_linux_acquisition_jobs(workflow: &str, failures: &mut Vec<St
             .count()
             != 1
         || subject.matches("persist-credentials: false").count() != 1
+        || subject
+            .matches("run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"")
+            .count()
+            != 1
     {
         failures.push("collection Linux acquisition subject trust role differs".to_owned());
     }
@@ -314,9 +1352,17 @@ fn check_collection_linux_acquisition_jobs(workflow: &str, failures: &mut Vec<St
         return;
     };
     let signer = signer.join("\n");
+    check_collection_rust_caches(
+        &signer,
+        "collection-linux-acquisition-sign",
+        None,
+        ".github/workflows/collection-authority.yml",
+        failures,
+    );
     let signer_order = [
         "ref: ${{ github.sha }}",
         "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
         "artifact-ids: ${{ needs.linux-acquisition-subject.outputs.artifact_id }}",
         "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
         "run: ./target/ci/hell-ci release-oracle attest --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json --attestation ci-out/linux-release-oracle-acquisition.dsse.json",
@@ -333,6 +1379,10 @@ fn check_collection_linux_acquisition_jobs(workflow: &str, failures: &mut Vec<St
         || signer.matches("artifact_id: ${{ steps.upload-signed.outputs.artifact-id }}").count()
             != 1
         || signer.matches("persist-credentials: false").count() != 1
+        || signer
+            .matches("run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"")
+            .count()
+            != 1
     {
         failures.push("collection Linux acquisition signer trust role differs".to_owned());
     }
@@ -423,46 +1473,6 @@ fn check_collection_authority_platform_builds(workflow: &str, failures: &mut Vec
         {
             failures.push(format!(
                 "native collection producer {job} lacks its exact source build and executable join"
-            ));
-        }
-    }
-}
-
-fn check_collection_authority_tool(tool: &str, failures: &mut Vec<String>) {
-    for required in [
-        "PLATFORMS = (\"linux-amd64\", \"macos-arm64\", \"windows-amd64\")",
-        "\"linux-amd64\": \"Collection authority / Linux amd64\"",
-        "\"macos-arm64\": \"Collection authority / macOS arm64\"",
-        "\"windows-amd64\": \"Collection authority / Windows amd64\"",
-        "PER_PAGE = 100",
-        "MAX_PAGES = 100",
-        "artifact pagination total changed during acquisition",
-        "artifact pagination IDs are not unique and strictly descending",
-        "job pagination total changed during acquisition",
-        "producer job {expected_name} did not complete successfully",
-        "provider run is not active or complete",
-        "require_string(run.get(\"event\"), \"run event\") != \"workflow_dispatch\"",
-        "require_string(run.get(\"head_branch\"), \"run head branch\") != \"main\"",
-        "provider head is not a lowercase full SHA-1",
-        "arguments.workflow_path != \".github/workflows/collection-authority.yml\"",
-        "workflow_response.body.startswith(b\"name: Collection Authority\\n\")",
-        "\"providerHeadCommit\": arguments.provider_head",
-        "selected artifact IDs are not unique",
-        "artifact {spec.name} identity or lifetime is invalid",
-        "artifact ZIP contains a duplicate path",
-        "artifact ZIP file {info.filename!r} has invalid mode",
-        "artifact ZIP expands beyond the reviewed byte bound",
-        "provider-archive.zip",
-        "provider-selected-artifact.json",
-        "provider-selected-run.json",
-        "provider-workflow.yml",
-        "selection.json",
-        "case_count != 1191",
-        "collection-evidence\" / \"provider-subject.json",
-    ] {
-        if !tool.contains(required) {
-            failures.push(format!(
-                "collection authority acquisition tool lacks exact fail-closed invariant {required}"
             ));
         }
     }
@@ -877,7 +1887,7 @@ fn workflow_entry(line: &str) -> &str {
 }
 
 fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
-    const REVIEWED: [(&str, &str); 6] = [
+    const REVIEWED: [(&str, &str); 8] = [
         (
             "crates/hell-runtime/src/native_http.rs",
             "SANDBOX_SOCKET_TIMEOUT",
@@ -893,6 +1903,8 @@ fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
             "HYPER_MINIMUM_BUFFER_SIZE",
         ),
         ("crates/hell-runtime/src/native_json.rs", "MAX_DEPTH"),
+        ("crates/hell-runtime/src/lib.rs", "MAX_DEPTH"),
+        ("crates/hell-runtime/src/lib.rs", "MAX_ELEMENTS"),
     ];
     let inventory_path = root.join("spec").join("runtime-profiles.md");
     let inventory = match fs::read_to_string(&inventory_path) {
@@ -924,6 +1936,7 @@ fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
                 "semantic limit {path}:{name} is absent from spec/runtime-profiles.md"
             ));
         }
+        check_exact_evidence_limit(path, name, &source, &inventory, failures);
     }
     let mut sources = Vec::new();
     for directory in [
@@ -955,6 +1968,38 @@ fn check_semantic_limit_inventory(root: &Path, failures: &mut Vec<String>) {
                     "unreviewed semantic-limit candidate {relative}:{name}; classify it in spec/runtime-profiles.md"
                 ));
             }
+        }
+    }
+}
+
+fn check_exact_evidence_limit(
+    path: &str,
+    name: &str,
+    source: &str,
+    inventory: &str,
+    failures: &mut Vec<String>,
+) {
+    let reviewed = match (path, name) {
+        ("crates/hell-runtime/src/lib.rs", "MAX_DEPTH") => Some((
+            "const MAX_DEPTH: usize = 64;",
+            "| `crates/hell-runtime/src/lib.rs`: `MAX_DEPTH` | Evidence canonicalization guardrail | Under `compat-tracing`, recursive evidence traversal emits an explicit `ForceBoundary` depth-limit marker at 64 levels; it neither forces nor rejects a guest value. |",
+        )),
+        ("crates/hell-runtime/src/lib.rs", "MAX_ELEMENTS") => Some((
+            "const MAX_ELEMENTS: usize = 1_024;",
+            "| `crates/hell-runtime/src/lib.rs`: `MAX_ELEMENTS` | Evidence canonicalization guardrail | Under `compat-tracing`, list evidence traversal records at most 1,024 elements and an explicit element-limit termination; guest list evaluation remains unchanged. |",
+        )),
+        _ => None,
+    };
+    if let Some((declaration, row)) = reviewed {
+        if source.matches(declaration).count() != 1 {
+            failures.push(format!(
+                "reviewed evidence limit declaration {path}:{name} differs"
+            ));
+        }
+        if inventory.matches(row).count() != 1 {
+            failures.push(format!(
+                "reviewed evidence limit classification {path}:{name} differs"
+            ));
         }
     }
 }
@@ -1241,6 +2286,9 @@ fn check_workflows(root: &Path, tracked: &[PathBuf], failures: &mut Vec<String>)
             }
         };
         check_workflow(path, &text, failures);
+        check_provider_replay_token_binding(path, &text, true, failures);
+        check_active_repository_verifier_liveness(path, &text, true, failures);
+        check_precredential_provider_selectors(path, &text, true, failures);
     }
 }
 
@@ -1249,10 +2297,188 @@ fn check_workflow(path: &Path, text: &str, failures: &mut Vec<String>) {
     let mut save_keys = BTreeSet::new();
     let lines = text.lines().collect::<Vec<_>>();
     check_duplicate_yaml_mapping_keys(path, &lines, failures);
+    check_exact_cosign_release(path, &lines, failures);
     check_workflow_dispatch_input_limit(path, &lines, failures);
     check_protected_job_trust_isolation(path, &lines, failures);
     check_transport_probe_sigstore_identity(path, text, failures);
+    check_regression_provider_archive_binding(path, &lines, failures);
+    check_external_consumer_archive_binding(path, text, failures);
     check_offline_packet_verifier_order(path, &lines, failures);
+    check_provider_replay_token_binding(path, text, false, failures);
+    check_active_repository_verifier_liveness(path, text, false, failures);
+    check_trusted_driver_checkouts(path, text, failures);
+    check_campaign_external_handoffs(path, text, failures);
+    check_named_workflow_policy(path, text, failures);
+    for (index, original) in lines.iter().enumerate() {
+        check_workflow_line(
+            path,
+            &lines,
+            index,
+            original,
+            failures,
+            &mut restore_keys,
+            &mut save_keys,
+        );
+    }
+    check_cache_key_pairs(path, &restore_keys, &save_keys, failures);
+}
+
+fn check_external_consumer_archive_binding(
+    path: &Path,
+    workflow: &str,
+    failures: &mut Vec<String>,
+) {
+    let name = path.file_name().and_then(|value| value.to_str());
+    let Some((header, required, forbidden)) = external_consumer_archive_contract(name) else {
+        return;
+    };
+    if !workflow.starts_with(header) {
+        return;
+    }
+    if required
+        .iter()
+        .any(|marker| workflow.matches(marker).count() != 1)
+        || forbidden.iter().any(|marker| workflow.contains(marker))
+    {
+        failures.push(format!(
+            "external artifact consumer lacks the exact ID/archive/directory contract in {}",
+            path.display()
+        ));
+    }
+}
+
+type ExternalConsumerArchiveContract = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+fn external_consumer_archive_contract(
+    name: Option<&str>,
+) -> Option<ExternalConsumerArchiveContract> {
+    Some(match name {
+        Some("artifact-authenticity-review.yml") => (
+            "name: Artifact authenticity review",
+            &["      source_provider_archive_sha256:"],
+            &[],
+        ),
+        Some("artifact-independent-acquisition.yml") => (
+            "name: Independent artifact acquisition",
+            &["      source_provider_archive_sha256:"],
+            &[],
+        ),
+        Some("evidence-custody.yml") => (
+            "name: Durable evidence custody",
+            &["      provider_archive_sha256:"],
+            &[],
+        ),
+        Some("claim-applicability-decisions.yml") => (
+            "name: Package externally authored claim applicability decisions",
+            &["      native_provider_archive_sha256:"],
+            &[],
+        ),
+        Some("promotion-evidence-review.yml") => (
+            "name: Generate and review promotion evidence",
+            &[
+                "      provider_archive_sha256_json:",
+                "description: Exact canonical provider archive digests for all five evidence sources",
+            ],
+            &[
+                "      oracle_event:",
+                "      native_provider_archive_sha256:",
+                "      acquisition_provider_archive_sha256:",
+                "      mutation_provider_archive_sha256:",
+                "      oracle_macos_provider_archive_sha256:",
+                "      oracle_windows_provider_archive_sha256:",
+            ],
+        ),
+        Some("promotion-approval.yml" | "nightly.yml") => (
+            if name == Some("nightly.yml") {
+                "name: Nightly"
+            } else {
+                "name: Promotion proposal approval"
+            },
+            &["      proposal_provider_archive_sha256:"],
+            &[],
+        ),
+        Some("promotion-proposal.yml") => (
+            "name: Promotion proposal assembly",
+            &[
+                "      evidence_provider_archive_sha256:",
+                "      review_provider_archive_sha256:",
+                "      custody_provider_archive_sha256:",
+                "      primary_scrub_digests:",
+                "      secondary_scrub_digests:",
+            ],
+            &[
+                "      primary_scrub_provider_archive_sha256:",
+                "      secondary_scrub_provider_archive_sha256:",
+            ],
+        ),
+        Some("artifact-authenticity-finalize.yml") => (
+            "name: Artifact authenticity finalization",
+            &[
+                "      primary_packet_archive_sha256:",
+                "      independent_review_archive_sha256:",
+            ],
+            &[],
+        ),
+        Some("collection-activation-preparation.yml") => (
+            "name: Collection Activation Preparation",
+            &["      expected_archive_sha256:"],
+            &[],
+        ),
+        Some("collection-activation.yml") => (
+            "name: Collection Activation Review",
+            &["      proposal_archive_sha256:"],
+            &[],
+        ),
+        Some("collection-custody-integration.yml") => (
+            "name: Collection Custody Integration",
+            &[
+                "      worm_source_run_attempt:",
+                "      expected_worm_archive_sha256:",
+                "COLLECTION_WORM_ARCHIVE_SHA256: ${{ inputs.expected_worm_archive_sha256 }}",
+                "COLLECTION_WORM_ARTIFACT_ID: ${{ inputs.worm_artifact_id }}",
+            ],
+            &[],
+        ),
+        _ => return None,
+    })
+}
+
+fn check_regression_provider_archive_binding(
+    path: &Path,
+    lines: &[&str],
+    failures: &mut Vec<String>,
+) {
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("regression-import select-subject") {
+            continue;
+        }
+        let start = lines[..index]
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("- name:") || line.trim() == "- uses:")
+            .unwrap_or(0);
+        let count = lines[start..index]
+            .iter()
+            .filter(|line| {
+                line.trim_start()
+                    .starts_with("REGRESSION_PROVIDER_ARCHIVE_SHA256: ")
+            })
+            .count();
+        if count != 1 {
+            failures.push(format!(
+                "regression provider replay lacks one expected archive digest at {}:{}",
+                path.display(),
+                index + 1
+            ));
+        }
+    }
+}
+
+fn check_named_workflow_policy(path: &Path, text: &str, failures: &mut Vec<String>) {
+    check_selector_seal_caller(path, text, failures);
     match path.file_name().and_then(|value| value.to_str()) {
         Some("regression-subject.yml") => {
             check_automatic_regression_batch_transaction(text, failures);
@@ -1260,71 +2486,1424 @@ fn check_workflow(path: &Path, text: &str, failures: &mut Vec<String>) {
         Some("regression-corpus.yml") => {
             check_automatic_regression_child_isolation(text, failures);
         }
+        Some("nightly.yml") => check_fresh_activated_campaign_liveness(text, failures),
+        Some(
+            "evidence-custody.yml"
+            | "promotion-surveillance.yml"
+            | "promotion-initial-public-finalize.yml",
+        ) => {
+            check_selector_update_barrier_topology(path, text, failures);
+        }
+        Some("custody-provider-selector-recovery.yml") => {
+            check_selector_recovery_workflow(text, failures);
+        }
+        Some("custody-provider-selector-seal.yml") => {
+            check_selector_seal_workflow(text, failures);
+        }
+        Some("claim-applicability-decisions.yml") => {
+            check_claim_applicability_decision_checkouts(text, failures);
+        }
+        Some("artifact-authenticity-review.yml") => {
+            check_primary_acquisition_checkout(text, failures);
+        }
+        Some("promotion-proposal.yml" | "promotion-approval.yml") => {
+            check_promotion_package_handoff(path, text, failures);
+        }
         _ => {}
     }
-    for (index, original) in lines.iter().enumerate() {
-        let line = strip_yaml_comment(original).trim();
-        let entry = line.strip_prefix("- ").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        let location = format!("{}:{}", path.display(), index + 1);
-        if yaml_key(entry, "shell").is_some() {
-            failures.push(format!("workflow shell key is forbidden at {location}"));
-        }
-        if yaml_key(entry, "queue").is_some() {
-            failures.push(format!(
-                "unsupported workflow concurrency queue key at {location}"
-            ));
-        }
-        if yaml_key(entry, "env").is_some() && !reviewed_workflow_env(path, &lines, index, original)
+}
+
+fn check_selector_seal_caller(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return;
+    };
+    let (header, expected) = match name {
+        "custody-provider-selector-recovery.yml" => (
+            "name: Recover custody provider selectors",
+            format!(
+                "uses: ./.github/workflows/custody-provider-selector-seal.yml\n    with:\n      source_workflow: .github/workflows/{name}"
+            ),
+        ),
+        "evidence-custody.yml" => (
+            "name: Durable evidence custody",
+            format!(
+                "uses: ./.github/workflows/custody-provider-selector-seal.yml\n    with:\n      source_workflow: .github/workflows/{name}"
+            ),
+        ),
+        "promotion-surveillance.yml" => (
+            "name: Promotion surveillance",
+            format!(
+                "uses: ./.github/workflows/custody-provider-selector-seal.yml\n    with:\n      source_workflow: .github/workflows/{name}"
+            ),
+        ),
+        "promotion-surveillance-watchdog.yml" => (
+            "name: Promotion surveillance watchdog",
+            format!(
+                "uses: ./.github/workflows/custody-provider-selector-seal.yml\n    with:\n      source_workflow: .github/workflows/{name}"
+            ),
+        ),
+        "promotion-initial-public-finalize.yml" => (
+            "name: Initial public promotion finalizer",
+            format!(
+                "uses: ./.github/workflows/custody-provider-selector-seal.yml\n    with:\n      source_workflow: .github/workflows/{name}"
+            ),
+        ),
+        _ => return,
+    };
+    if workflow.starts_with(header) && workflow.matches(&expected).count() != 1 {
+        failures.push(format!(
+            "provider selector seal caller does not bind its exact source workflow in {}",
+            path.display()
+        ));
+    }
+}
+
+fn check_workflow_line(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+    failures: &mut Vec<String>,
+    restore_keys: &mut BTreeSet<String>,
+    save_keys: &mut BTreeSet<String>,
+) {
+    let line = strip_yaml_comment(original).trim();
+    let entry = line.strip_prefix("- ").unwrap_or(line);
+    if line.is_empty() {
+        return;
+    }
+    let location = format!("{}:{}", path.display(), index + 1);
+    if yaml_key(entry, "shell").is_some() {
+        failures.push(format!("workflow shell key is forbidden at {location}"));
+    }
+    if yaml_key(entry, "queue").is_some() {
+        failures.push(format!(
+            "unsupported workflow concurrency queue key at {location}"
+        ));
+    }
+    if yaml_key(entry, "env").is_some() && !reviewed_workflow_env(path, lines, index, original) {
+        failures.push(format!("workflow env key is forbidden at {location}"));
+    }
+    if yaml_key(entry, "pull_request").is_some() || yaml_key(entry, "pull_request_target").is_some()
+    {
+        failures.push(format!("pull request trigger is forbidden at {location}"));
+    }
+    if yaml_key(entry, "branches").is_some() {
+        failures.push(format!(
+            "branch-filtered workflow trigger is forbidden at {location}"
+        ));
+    }
+    if let Some(run) = yaml_key(entry, "run") {
+        check_run_value(run.trim(), &location, failures);
+    }
+    if let Some(uses) = yaml_key(entry, "uses") {
+        check_uses_value(uses.trim(), &location, failures);
+        if uses.contains("actions/checkout@")
+            && following_value(lines, index, "persist-credentials") != Some("false")
         {
-            failures.push(format!("workflow env key is forbidden at {location}"));
+            failures.push(format!("checkout persists credentials at {location}"));
         }
-        if yaml_key(entry, "pull_request").is_some()
-            || yaml_key(entry, "pull_request_target").is_some()
+        if uses.contains("actions/cache/restore@")
+            && let Some(key) = following_value(lines, index, "key")
         {
-            failures.push(format!("pull request trigger is forbidden at {location}"));
+            restore_keys.insert(key.to_owned());
         }
-        if yaml_key(entry, "branches").is_some() {
-            failures.push(format!(
-                "branch-filtered workflow trigger is forbidden at {location}"
-            ));
+        if uses.contains("actions/cache/restore@") || uses.contains("actions/cache/save@") {
+            check_cache_scope(path, lines, index, &location, failures);
         }
-        if let Some(run) = yaml_key(entry, "run") {
-            check_run_value(run.trim(), &location, failures);
-        }
-        if let Some(uses) = yaml_key(entry, "uses") {
-            check_uses_value(uses.trim(), &location, failures);
-            if uses.contains("actions/checkout@")
-                && following_value(&lines, index, "persist-credentials") != Some("false")
-            {
-                failures.push(format!("checkout persists credentials at {location}"));
+        if uses.contains("actions/cache/save@") {
+            let condition = preceding_value(lines, index, "if");
+            if !condition.is_some_and(|value| value.contains("always()")) {
+                failures.push(format!("cache save lacks always() at {location}"));
             }
-            if uses.contains("actions/cache/restore@")
-                && let Some(key) = following_value(&lines, index, "key")
-            {
-                restore_keys.insert(key.to_owned());
-            }
-            if uses.contains("actions/cache/restore@") || uses.contains("actions/cache/save@") {
-                check_cache_scope(path, &lines, index, &location, failures);
-            }
-            if uses.contains("actions/cache/save@") {
-                let condition = preceding_value(&lines, index, "if");
-                if !condition.is_some_and(|value| value.contains("always()")) {
-                    failures.push(format!("cache save lacks always() at {location}"));
-                }
-                if let Some(key) = following_value(&lines, index, "key") {
-                    save_keys.insert(key.to_owned());
-                }
+            if let Some(key) = following_value(lines, index, "key") {
+                save_keys.insert(key.to_owned());
             }
         }
     }
-    if !save_keys.is_subset(&restore_keys) {
+}
+
+fn check_cache_key_pairs(
+    path: &Path,
+    restore_keys: &BTreeSet<String>,
+    save_keys: &BTreeSet<String>,
+    failures: &mut Vec<String>,
+) {
+    if !save_keys.is_subset(restore_keys) {
         failures.push(format!(
             "cache save key has no identical restore key in {}",
             path.display()
         ));
+    }
+}
+
+fn check_exact_cosign_release(path: &Path, lines: &[&str], failures: &mut Vec<String>) {
+    const INSTALLER: &str =
+        "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6";
+    for (index, line) in lines.iter().enumerate() {
+        if strip_yaml_comment(line).trim() != INSTALLER {
+            continue;
+        }
+        if lines.get(index + 1).map(|line| line.trim()) != Some("with:")
+            || lines.get(index + 2).map(|line| line.trim()) != Some("cosign-release: v2.4.3")
+        {
+            failures.push(format!(
+                "Cosign installer lacks exact executable release v2.4.3 at {}:{}",
+                path.display(),
+                index + 1
+            ));
+        }
+    }
+}
+
+fn check_selector_recovery_workflow(workflow: &str, failures: &mut Vec<String>) {
+    let required = [
+        "name: Recover custody provider selectors",
+        "if: ${{ github.ref == 'refs/heads/main' }}",
+        "environment: ${{ matrix.environment }}",
+        "provider: primary-worm",
+        "trust-domain: organization-primary",
+        "provider-selector-variable: CUSTODY_PRIMARY_PROVIDER_SELECTOR",
+        "provider: secondary-worm",
+        "trust-domain: organization-secondary",
+        "provider-selector-variable: CUSTODY_SECONDARY_PROVIDER_SELECTOR",
+        "CUSTODY_PROVIDER_OPERATION: selector-export",
+        "run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector",
+        "run: ./target/ci/hell-ci custody-ops workflow-export-provider-selector",
+        "uses: ./.github/workflows/custody-provider-selector-seal.yml",
+    ];
+    let forbidden = [
+        "workflow-upload",
+        "workflow-activate",
+        "workflow-commit-activation",
+        "workflow-publish-transition",
+        "workflow-complete-initial-activation",
+        "s3api",
+        "put-object",
+        "delete-object",
+    ];
+    let export = workflow_job_lines(workflow, "export").map(|lines| lines.join("\n"));
+    let ordered = [
+        "run: ./target/ci/hell-ci collection-authority verify-checkout",
+        "run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector",
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        "run: ./target/ci/hell-ci custody-ops workflow-export-provider-selector",
+    ];
+    if required
+        .iter()
+        .any(|value| workflow.matches(value).count() != 1)
+        || forbidden.iter().any(|value| workflow.contains(value))
+        || export
+            .as_deref()
+            .is_none_or(|body| !markers_are_ordered(body, &ordered))
+    {
+        failures.push(
+            "custody provider selector recovery is not exact, read-only, and precredential-bound"
+                .to_owned(),
+        );
+    }
+}
+
+fn check_selector_seal_workflow(workflow: &str, failures: &mut Vec<String>) {
+    let required = [
+        "name: Seal custody provider selector updates",
+        "source_workflow:",
+        "CUSTODY_SELECTOR_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}",
+        "GITHUB_TOKEN: ${{ github.token }}",
+        "run: ./target/ci/hell-ci custody-ops workflow-select-provider-selector-updates",
+        "artifact_id: ${{ steps.upload.outputs.artifact-id }}",
+        "artifact_digest: ${{ steps.upload.outputs.artifact-digest }}",
+        "directory_sha256: ${{ steps.bind.outputs.directory_sha256 }}",
+        "artifact-ids: ${{ steps.select.outputs.primary-artifact-id }}",
+        "artifact-ids: ${{ steps.select.outputs.secondary-artifact-id }}",
+        "run: ./target/ci/hell-ci custody-ops workflow-assemble-provider-selector-updates",
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/provider-selector-updates",
+        "name: custody-provider-selectors-${{ github.run_id }}-${{ github.run_attempt }}",
+    ];
+    let seal = workflow_job_lines(workflow, "seal").map(|lines| lines.join("\n"));
+    let ordered = [
+        "run: ./target/ci/hell-ci collection-authority verify-checkout",
+        "run: ./target/ci/hell-ci custody-ops workflow-select-provider-selector-updates",
+        "artifact-ids: ${{ steps.select.outputs.primary-artifact-id }}",
+        "artifact-ids: ${{ steps.select.outputs.secondary-artifact-id }}",
+        "run: ./target/ci/hell-ci custody-ops workflow-assemble-provider-selector-updates",
+        "id: bind",
+        "id: upload",
+    ];
+    if required
+        .iter()
+        .any(|value| workflow.matches(value).count() != 1)
+        || workflow.contains("id-token: write")
+        || workflow.contains("environment:")
+        || seal
+            .as_deref()
+            .is_none_or(|body| !markers_are_ordered(body, &ordered))
+    {
+        failures.push(
+            "custody provider selector sealer lacks an exact unprivileged two-provider triple"
+                .to_owned(),
+        );
+    }
+}
+
+fn check_selector_update_barrier_topology(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let expected_header = match path.file_name().and_then(|value| value.to_str()) {
+        Some("evidence-custody.yml") => "name: Durable evidence custody",
+        Some("promotion-surveillance.yml") => "name: Promotion surveillance",
+        Some("promotion-initial-public-finalize.yml") => "name: Initial public promotion finalizer",
+        _ => return,
+    };
+    if !workflow.starts_with(expected_header) {
+        return;
+    }
+    let valid = match path.file_name().and_then(|value| value.to_str()) {
+        Some("evidence-custody.yml") => {
+            !workflow.contains("dispatch-initial-public-state:")
+                && !workflow.contains("workflow-dispatch-initial-surveillance")
+                && workflow.contains("  seal-provider-selector-updates:")
+        }
+        Some("promotion-surveillance.yml") => {
+            let required = [
+                "if: ${{ github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || (inputs.candidate_sha == github.sha && inputs.selector_source_sha == github.sha)) }}",
+                "selector_run_id:",
+                "selector_run_attempt:",
+                "selector_artifact_id:",
+                "selector_archive_sha256:",
+                "selector_directory_sha256:",
+                "selector_source_sha:",
+                "name: Download exact activated provider selector aggregate\n        if: ${{ github.event_name == 'workflow_dispatch' }}",
+                "artifact-ids: ${{ inputs.selector_artifact_id }}",
+                "name: Verify activated provider selector update barrier before credentials\n        if: ${{ github.event_name == 'workflow_dispatch' }}",
+                "CUSTODY_SELECTOR_AGGREGATE_WORKFLOW: .github/workflows/evidence-custody.yml",
+                "run: ./target/ci/hell-ci custody-ops workflow-verify-provider-selector-update-barrier",
+            ];
+            required
+                .iter()
+                .all(|value| workflow.matches(value).count() >= 1)
+        }
+        Some("promotion-initial-public-finalize.yml") => {
+            let required = [
+                "if: ${{ github.ref == 'refs/heads/main' && inputs.selector_source_sha == github.sha }}",
+                "workflow_dispatch:",
+                "surveillance_run_id:",
+                "surveillance_run_attempt:",
+                "selector_artifact_id:",
+                "selector_archive_sha256:",
+                "selector_directory_sha256:",
+                "selector_source_sha:",
+                "artifact-ids: ${{ inputs.selector_artifact_id }}",
+                "CUSTODY_SELECTOR_AGGREGATE_WORKFLOW: .github/workflows/promotion-surveillance.yml",
+                "run: ./target/ci/hell-ci custody-ops workflow-verify-provider-selector-update-barrier",
+            ];
+            required
+                .iter()
+                .all(|value| workflow.matches(value).count() >= 1)
+                && !workflow.contains("workflow_run:")
+                && !workflow.contains("github.event.workflow_run")
+        }
+        _ => unreachable!("workflow filename was checked above"),
+    };
+    if !valid {
+        failures.push(format!(
+            "initial public custody phases lack an exact selector-update barrier in {}",
+            path.display()
+        ));
+    }
+}
+
+fn check_active_repository_verifier_liveness(
+    path: &Path,
+    workflow: &str,
+    require_jobs: bool,
+    failures: &mut Vec<String>,
+) {
+    let jobs: &[(&str, &str)] = match path.file_name().and_then(|value| value.to_str()) {
+        Some("ci.yml") => &[
+            ("verify", "hell-ci assurance-verify"),
+            ("portability-macos", "hell-ci portability"),
+            ("portability-windows", "hell-ci.exe portability"),
+        ],
+        Some("nightly.yml") => &[
+            ("evidence-collection-linux", "hell-ci nightly --oracle"),
+            (
+                "branch-evidence-collection-linux",
+                "hell-ci nightly-exploratory --oracle",
+            ),
+            ("native-oracle-macos", "hell-ci native-oracle-shard"),
+            ("native-oracle-windows", "hell-ci.exe native-oracle-shard"),
+            ("merge-native-evidence", "hell-ci merge-native-shards"),
+            (
+                "branch-merge-native-evidence",
+                "hell-ci merge-native-shards",
+            ),
+            ("promotion-gate", "hell-ci promotion-gate"),
+        ],
+        Some("oracle-reproduce.yml") => &[("primary-build", "hell-ci native-oracle-shard")],
+        Some("promotion-proposal.yml") => &[("assemble", "hell-ci promotion-proposal")],
+        Some("promotion-evidence-review.yml") => &[("assemble", "hell-ci case-coverage report")],
+        Some("claim-applicability-decisions.yml") => &[("package", "hell-ci case-coverage report")],
+        Some("promotion-surveillance.yml") => &[
+            (
+                "execute-active-subject",
+                "hell-ci nightly-surveillance-subject",
+            ),
+            ("verify-and-transition", "hell-ci assurance-verify"),
+        ],
+        Some("evidence-custody.yml") => &[("package", "hell-ci assurance-verify")],
+        Some("artifact-authenticity-review.yml") => {
+            &[("acquisition-packet", "hell-ci assurance-verify")]
+        }
+        _ => return,
+    };
+    for (job, boundary) in jobs {
+        let Some(lines) = workflow_job_lines(workflow, job) else {
+            if require_jobs {
+                failures.push(format!(
+                    "active repository verifier job {job:?} is missing from {}",
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        let installer = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| (workflow_entry(line) == COSIGN_INSTALLER).then_some(index))
+            .collect::<Vec<_>>();
+        let consumer = lines.iter().position(|line| line.contains(boundary));
+        if !matches!((installer.as_slice(), consumer), ([install], Some(consumer)) if *install < consumer)
+        {
+            failures.push(format!(
+                "active repository verifier job {job:?} must install the exact pinned Cosign verifier once before {boundary:?} in {}",
+                path.display()
+            ));
+        }
+        if path == workflow_path("evidence-custody.yml")
+            && installer.first().is_none_or(|index| {
+                preceding_value(&lines, *index, "if")
+                    != Some("${{ inputs.artifact_class != 'collection-custody' }}")
+            })
+        {
+            failures.push(
+                "evidence custody active-review verifier condition differs from its active repository consumer"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn check_claim_applicability_decision_checkouts(workflow: &str, failures: &mut Vec<String>) {
+    let Some(lines) = workflow_job_lines(workflow, "package") else {
+        failures.push("claim applicability decision package job is missing".to_owned());
+        return;
+    };
+    let required = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$CLAIM_CANDIDATE_SHA\"",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input decision-source --candidate-commit \"$CLAIM_DECISION_SOURCE_SHA\"",
+        COSIGN_INSTALLER,
+        "run: ./target/ci/hell-ci case-coverage report --input ci-out/evidence/native --output ci-out/evidence/claim-decisions/source/claim-coverage.details.json",
+        "GITHUB_TOKEN: ${{ github.token }}",
+        "run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs",
+    ];
+    if required.iter().any(|marker| {
+        lines
+            .iter()
+            .filter(|line| workflow_entry(line) == *marker)
+            .count()
+            != 1
+    }) || required.windows(2).any(|pair| {
+        let first = lines
+            .iter()
+            .position(|line| workflow_entry(line) == pair[0]);
+        let second = lines
+            .iter()
+            .position(|line| workflow_entry(line) == pair[1]);
+        !matches!((first, second), (Some(first), Some(second)) if first < second)
+    }) {
+        failures.push(
+            "claim applicability decisions must verify both exact checkouts and install the pinned verifier before deriving scoped coverage"
+                .to_owned(),
+        );
+    }
+}
+
+fn check_primary_acquisition_checkout(workflow: &str, failures: &mut Vec<String>) {
+    let Some(lines) = workflow_job_lines(workflow, "acquisition-packet") else {
+        failures.push("primary artifact acquisition packet job is missing".to_owned());
+        return;
+    };
+    let body = lines.join("\n");
+    let required = [
+        "if: ${{ github.ref == 'refs/heads/main' && inputs.candidate_sha == github.sha }}",
+        "ref: ${{ github.sha }}",
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "ACQUISITION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$ACQUISITION_CANDIDATE_SHA\"",
+        "run: ./target/ci/hell-ci assurance-verify --report ci-out/assurance-policy.json",
+        "Download producing-run evidence after building the verifier",
+        "artifact-ids: ${{ inputs.source_artifact_id }}",
+        "run: ./target/ci/hell-ci artifact-acquire primary --input ci-out/acquisition/primary --output ci-out/acquisition/receipt-primary.json --artifact native-oracle-merged --github-dispatch-inputs",
+    ];
+    if required
+        .iter()
+        .any(|marker| body.matches(marker).count() != 1)
+        || !markers_are_ordered(&body, &required)
+    {
+        failures.push(
+            "primary artifact acquisition does not bind provider workflow bytes to exact candidate HEAD"
+                .to_owned(),
+        );
+    }
+}
+
+fn check_promotion_package_handoff(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let Some((header, job, outputs, ordered)) = (match path
+        .file_name()
+        .and_then(|value| value.to_str())
+    {
+        Some("promotion-proposal.yml") => Some((
+            "name: Promotion proposal assembly",
+            "assemble",
+            [
+                "proposal_artifact_id: ${{ steps.upload-proposal.outputs.artifact-id }}",
+                "proposal_artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}",
+                "proposal_directory_sha256: ${{ steps.bind-proposal.outputs.directory_sha256 }}",
+            ],
+            [
+                "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+                "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$PROMOTION_CANDIDATE_SHA\"",
+                "run: ./target/ci/hell-ci promotion-proposal --input ci-out/native-shards --output ci-out/native-shards/promotion-proposal.json --github-dispatch-inputs",
+                "id: bind-proposal",
+                "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards",
+                "id: upload-proposal",
+                "name: promotion-proposal",
+                "path: ci-out/native-shards",
+            ],
+        )),
+        Some("promotion-approval.yml") => Some((
+            "name: Promotion proposal approval",
+            "approve",
+            [
+                "approved_artifact_id: ${{ steps.upload-approved.outputs.artifact-id }}",
+                "approved_artifact_digest: ${{ steps.upload-approved.outputs.artifact-digest }}",
+                "approved_directory_sha256: ${{ steps.bind-approved.outputs.directory_sha256 }}",
+            ],
+            [
+                "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+                "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$PROMOTION_CANDIDATE_SHA\"",
+                "run: ./target/ci/hell-ci promotion-approval-subject --input ci-out/native-shards/promotion-proposal.json --output ci-out/native-shards/promotion-approval-subject.json",
+                "run: ./target/ci/hell-ci review-verify --input ci-out/native-shards/promotion-proposal-approval.dsse.json --policy ci-out/native-shards/reviewer.allowed_signers --role promotion-approver",
+                "id: bind-approved",
+                "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards",
+                "id: upload-approved",
+                "name: promotion-approved-proposal",
+            ],
+        )),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Some(lines) = workflow_job_lines(workflow, job) else {
+        if workflow.starts_with(header) {
+            failures.push(format!(
+                "promotion package handoff job {job:?} is missing from {}",
+                path.display()
+            ));
+        }
+        return;
+    };
+    let body = lines.join("\n");
+    if outputs
+        .iter()
+        .any(|marker| body.matches(marker).count() != 1)
+        || !markers_are_ordered(&body, &ordered)
+        || body.matches("if-no-files-found: error").count() != 1
+        || body.matches("retention-days: 30").count() != 1
+    {
+        failures.push(format!(
+            "promotion package handoff is not bound to one immutable artifact and canonical directory digest in {}",
+            path.display()
+        ));
+    }
+}
+
+fn trusted_driver_jobs(
+    path: &Path,
+) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+    Some(match path.file_name().and_then(|value| value.to_str()) {
+        Some("nightly.yml") => (
+            "name: Nightly",
+            &[("promotion-gate", "workflow-verify-approved-source")],
+        ),
+        Some("promotion-initial-public-finalize.yml") => (
+            "name: Initial public promotion finalizer",
+            &[
+                (
+                    "finalize-completed-publication",
+                    "workflow-finalize-initial-surveillance",
+                ),
+                (
+                    "complete-provider-activation",
+                    "aws-actions/configure-aws-credentials@",
+                ),
+            ],
+        ),
+        Some("promotion-surveillance.yml") => (
+            "name: Promotion surveillance",
+            &[
+                ("retrieve-active", "aws-actions/configure-aws-credentials@"),
+                (
+                    "execute-active-subject",
+                    "Download primary active provider evidence",
+                ),
+                (
+                    "verify-and-transition",
+                    "workflow-retain-current-governance",
+                ),
+                (
+                    "publish-current-state",
+                    "Download signed surveillance transition",
+                ),
+                (
+                    "publish-public-report",
+                    "Download signed surveillance transition for public report",
+                ),
+                ("incident-alert", "workflow-alert"),
+            ],
+        ),
+        Some("evidence-custody.yml") => (
+            "name: Durable evidence custody",
+            &[
+                (
+                    "activate-final-record",
+                    "custody verify --input ci-out/custody/custody-receipt.json",
+                ),
+                (
+                    "seal-current-scrubs",
+                    "Download exact current-run primary scrub package",
+                ),
+            ],
+        ),
+        Some("promotion-surveillance-watchdog.yml") => (
+            "name: Promotion surveillance watchdog",
+            &[
+                ("retrieve-active", "aws-actions/configure-aws-credentials@"),
+                ("deadline", "workflow-observe-public-transition"),
+                (
+                    "publish-at-risk-state",
+                    "Download exact signed watchdog transition",
+                ),
+                (
+                    "publish-public-at-risk-report",
+                    "Download exact watchdog transition for public report",
+                ),
+            ],
+        ),
+        Some("custody-scrub.yml") => (
+            "name: Custody scrub and recovery",
+            &[("scrub", "aws-actions/configure-aws-credentials@")],
+        ),
+        Some("mutation.yml") => (
+            "name: Assurance mutation",
+            &[("review", "Download exact mutation review subject")],
+        ),
+        Some("artifact-authenticity-finalize.yml") => (
+            "name: Finalize artifact authenticity",
+            &[("finalize", "Download exact pre-review subject")],
+        ),
+        Some("oracle-reproduce.yml") => (
+            "name: Oracle reproducibility evidence",
+            &[(
+                "seal-reviewed-platform-evidence",
+                "Download exact current-run macOS reviewed evidence",
+            )],
+        ),
+        _ => return None,
+    })
+}
+
+fn check_trusted_driver_checkouts(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let Some((header, expected)) = trusted_driver_jobs(path) else {
+        return;
+    };
+    let complete = workflow.starts_with(header);
+    let verify = "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$TRUSTED_DRIVER_SHA\"";
+    for (job, boundary) in expected {
+        let Some(lines) = workflow_job_lines(workflow, job) else {
+            if complete {
+                failures.push(format!(
+                    "trusted-driver job {job:?} is missing from {}",
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        let body = lines.join("\n");
+        let order = [
+            "ref: ${{ github.sha }}",
+            "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+            "TRUSTED_DRIVER_SHA: ${{ github.sha }}",
+            verify,
+            boundary,
+        ];
+        if order.iter().any(|marker| body.matches(marker).count() != 1)
+            || !markers_are_ordered(&body, &order)
+        {
+            failures.push(format!(
+                "trusted-driver job {job:?} does not bind exact current HEAD before {boundary:?} in {}",
+                path.display()
+            ));
+        }
+    }
+    if path == workflow_path("nightly.yml")
+        && (complete || workflow_job_lines(workflow, "promotion-gate").is_some())
+        && !workflow.contains("inputs.candidate_sha == github.sha")
+    {
+        failures.push(
+            "promotion gate must bind the approved provider workflow source to current exact candidate HEAD"
+                .to_owned(),
+        );
+    }
+    if path == workflow_path("promotion-surveillance.yml") {
+        check_surveillance_active_checkout(workflow, failures);
+    }
+    check_precredential_provider_selectors(path, workflow, false, failures);
+}
+
+fn check_precredential_provider_selectors(
+    path: &Path,
+    workflow: &str,
+    require_jobs: bool,
+    failures: &mut Vec<String>,
+) {
+    let jobs = provider_selector_jobs(path);
+    if jobs.is_empty() {
+        return;
+    }
+    let mut found_job = false;
+    for (job, consumer, operation, source) in jobs {
+        let Some(lines) = workflow_job_lines(workflow, job) else {
+            if require_jobs {
+                failures.push(format!(
+                    "protected provider job {job:?} is missing from {}",
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        found_job = true;
+        check_provider_selector_job(
+            path,
+            &lines.join("\n"),
+            job,
+            consumer,
+            operation,
+            source,
+            failures,
+        );
+    }
+    if found_job || require_jobs {
+        check_provider_selector_matrix(path, workflow, failures);
+    }
+    check_public_publication_preflight(path, workflow, require_jobs, failures);
+}
+
+fn check_public_publication_preflight(
+    path: &Path,
+    workflow: &str,
+    require_jobs: bool,
+    failures: &mut Vec<String>,
+) {
+    let job = match path.file_name().and_then(|value| value.to_str()) {
+        Some("promotion-surveillance.yml") => "publish-public-report",
+        Some("promotion-surveillance-watchdog.yml") => "publish-public-at-risk-report",
+        _ => return,
+    };
+    let Some(lines) = workflow_job_lines(workflow, job) else {
+        if require_jobs {
+            failures.push(format!(
+                "public publication job {job:?} is missing from {}",
+                path.display()
+            ));
+        }
+        return;
+    };
+    let body = lines.join("\n");
+    let prepare =
+        "run: ./target/ci/hell-ci custody-ops workflow-prepare-public-publication-selector";
+    let ordered = [
+        prepare,
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        "run: ./target/ci/hell-ci custody-ops workflow-publish-public-transition",
+    ];
+    if body.matches(prepare).count() != 1
+        || body.matches("PUBLIC_COMPATIBILITY_REPORT_BUCKET: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BUCKET }}").count() != 2
+        || body.matches("PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}").count() != 2
+        || !markers_are_ordered(&body, &ordered)
+    {
+        failures.push(format!(
+            "public publication job {job:?} does not seal its exact destination before credentials in {}",
+            path.display()
+        ));
+    }
+}
+
+fn provider_selector_jobs(
+    path: &Path,
+) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    let jobs: &[(&str, &str, &str, &str)] = match path.file_name().and_then(|value| value.to_str())
+    {
+        Some("custody-scrub.yml") => &[("scrub", "workflow-scrub", "maintenance", "active")],
+        Some("promotion-surveillance.yml") => &[
+            (
+                "retrieve-active",
+                "workflow-surveillance-retrieve",
+                "surveillance",
+                "active",
+            ),
+            (
+                "publish-current-state",
+                "workflow-publish-transition",
+                "transition-publication",
+                "active",
+            ),
+        ],
+        Some("promotion-surveillance-watchdog.yml") => &[
+            (
+                "retrieve-active",
+                "workflow-surveillance-retrieve",
+                "surveillance",
+                "active",
+            ),
+            (
+                "publish-at-risk-state",
+                "workflow-publish-transition",
+                "transition-publication",
+                "active",
+            ),
+        ],
+        Some("promotion-initial-public-finalize.yml") => &[(
+            "complete-provider-activation",
+            "workflow-complete-initial-activation",
+            "complete-initial-publication",
+            "active",
+        )],
+        Some("evidence-custody.yml") => &[
+            ("upload", "workflow-upload", "upload", "provider"),
+            ("retrieve", "workflow-retrieve", "retrieval", "derived"),
+            (
+                "activate-final-record",
+                "workflow-activate",
+                "activation",
+                "active",
+            ),
+        ],
+        _ => &[],
+    };
+    jobs.to_vec()
+}
+
+fn check_provider_selector_job(
+    path: &Path,
+    body: &str,
+    job: &str,
+    consumer: &str,
+    operation: &str,
+    source: &str,
+    failures: &mut Vec<String>,
+) {
+    let prepare = if source == "derived" {
+        "run: ./target/ci/hell-ci custody-ops workflow-verify-upload-subject"
+    } else {
+        "run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector"
+    };
+    let ordered = [
+        prepare,
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        consumer,
+    ];
+    if body.matches(prepare).count() != 1 || !markers_are_ordered(body, &ordered) {
+        failures.push(format!(
+                "protected provider job {job:?} does not seal exact provider inputs before credentials in {}",
+                path.display()
+            ));
+    }
+    if consumer == "workflow-complete-initial-activation"
+            && body
+                .matches("artifact-ids: ${{ needs.finalize-completed-publication.outputs.completion_artifact_id }}")
+                .count()
+                != 1
+        {
+            failures.push(format!(
+                "protected provider job {job:?} does not consume the exact immutable completion artifact in {}",
+                path.display()
+            ));
+        }
+    let selector = match source {
+        "active" => {
+            Some("ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}")
+        }
+        "provider" => {
+            Some("ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.provider-selector-variable] }}")
+        }
+        _ => None,
+    };
+    if selector.is_some_and(|selector| body.matches(selector).count() != 1)
+        || (source != "derived"
+            && body
+                .matches(&format!("CUSTODY_PROVIDER_OPERATION: {operation}"))
+                .count()
+                != 1)
+        || body
+            .matches("CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+            .count()
+            != 1
+        || body
+            .matches("CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+            .count()
+            != 1
+    {
+        failures.push(format!(
+                "protected provider job {job:?} does not bind its exact maintenance selector identity in {}",
+                path.display()
+            ));
+    }
+}
+
+fn check_provider_selector_matrix(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let (active_repetitions, trust_repetitions) =
+        match path.file_name().and_then(|value| value.to_str()) {
+            Some(
+                "custody-scrub.yml"
+                | "promotion-surveillance.yml"
+                | "promotion-surveillance-watchdog.yml",
+            ) => (2, 2),
+            Some("promotion-initial-public-finalize.yml") => (1, 1),
+            Some("evidence-custody.yml") => (1, 3),
+            _ => return,
+        };
+    for value in [
+        "default-receipt-variable: ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT",
+        "default-receipt-variable: ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT",
+    ] {
+        if workflow.matches(value).count() != active_repetitions {
+            failures.push(format!(
+                "protected provider selector matrix does not contain exact {value:?} entries in {}",
+                path.display()
+            ));
+        }
+    }
+    for value in [
+        "trust-domain: organization-primary",
+        "trust-domain: organization-secondary",
+    ] {
+        if workflow.matches(value).count() != trust_repetitions {
+            failures.push(format!(
+                "protected provider selector matrix does not contain exact {value:?} entries in {}",
+                path.display()
+            ));
+        }
+    }
+    if path == workflow_path("evidence-custody.yml") {
+        for value in [
+            "provider-selector-variable: CUSTODY_PRIMARY_PROVIDER_SELECTOR",
+            "provider-selector-variable: CUSTODY_SECONDARY_PROVIDER_SELECTOR",
+        ] {
+            if workflow.matches(value).count() != 1 {
+                failures.push(format!(
+                    "protected provider selector matrix does not contain exact {value:?} entries in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn check_surveillance_active_checkout(workflow: &str, failures: &mut Vec<String>) {
+    let Some(lines) = workflow_job_lines(workflow, "execute-active-subject") else {
+        return;
+    };
+    let body = lines.join("\n");
+    let active = [
+        "path: ci-work/candidate",
+        "ACTIVE_SUBJECT_SHA: ${{ steps.active.outputs.candidate }}",
+        "run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$ACTIVE_SUBJECT_SHA\"",
+        "working-directory: ci-work/candidate",
+    ];
+    if body
+        .matches("ACTIVE_SUBJECT_SHA: ${{ steps.active.outputs.candidate }}")
+        .count()
+        != 1
+        || body
+            .matches("run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$ACTIVE_SUBJECT_SHA\"")
+            .count()
+            != 1
+        || !markers_are_ordered(&body, &active)
+    {
+        failures.push(
+            "surveillance active subject checkout is not typed-verified before subject execution"
+                .to_owned(),
+        );
+    }
+}
+
+type CampaignHandoff = (&'static str, [&'static str; 3], [&'static str; 4]);
+
+fn campaign_external_handoffs(path: &Path) -> Option<(&'static str, Vec<CampaignHandoff>)> {
+    let name = path.file_name().and_then(|value| value.to_str())?;
+    campaign_primary_handoffs(name)
+        .or_else(|| campaign_review_handoffs(name))
+        .or_else(|| campaign_decision_handoffs(name))
+        .or_else(|| campaign_state_handoffs(name))
+}
+
+fn campaign_primary_handoffs(name: &str) -> Option<(&'static str, Vec<CampaignHandoff>)> {
+    Some(match name {
+        "nightly.yml" => (
+            "name: Nightly",
+            vec![
+                (
+                    "merge-native-evidence",
+                    [
+                        "native_artifact_id: ${{ steps.upload-native.outputs.artifact-id }}",
+                        "native_artifact_digest: ${{ steps.upload-native.outputs.artifact-digest }}",
+                        "native_directory_sha256: ${{ steps.bind-native.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-native",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards",
+                        "id: upload-native",
+                        "name: native-oracle-merged",
+                    ],
+                ),
+                (
+                    "promotion-gate",
+                    [
+                        "promotion_record_artifact_id: ${{ steps.final-record.outputs.artifact-id }}",
+                        "promotion_record_artifact_digest: ${{ steps.final-record.outputs.artifact-digest }}",
+                        "promotion_record_directory_sha256: ${{ steps.bind-final-record.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-final-record",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/promotion-record",
+                        "id: final-record",
+                        "name: promotion-record",
+                    ],
+                ),
+            ],
+        ),
+        "promotion-evidence-review.yml" => (
+            "name: Generate and review promotion evidence",
+            vec![(
+                "assemble-reviewed-evidence",
+                [
+                    "review_artifact_id: ${{ steps.upload-reviewed.outputs.artifact-id }}",
+                    "review_artifact_digest: ${{ steps.upload-reviewed.outputs.artifact-digest }}",
+                    "review_directory_sha256: ${{ steps.bind-reviewed.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-reviewed",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/evidence",
+                    "id: upload-reviewed",
+                    "name: promotion-review-ready-evidence",
+                ],
+            )],
+        ),
+        "oracle-reproduce.yml" => (
+            "name: Oracle reproducibility evidence",
+            vec![
+                (
+                    "seal-reviewed-platform-evidence",
+                    [
+                        "macos_artifact_id: ${{ steps.upload-macos.outputs.artifact-id }}",
+                        "macos_artifact_digest: ${{ steps.upload-macos.outputs.artifact-digest }}",
+                        "macos_directory_sha256: ${{ steps.bind-macos.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-macos",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/reviewed-macos",
+                        "id: upload-macos",
+                        "name: ephemeralEvidence-oracle-reviewed-macos-arm64",
+                    ],
+                ),
+                (
+                    "seal-reviewed-platform-evidence",
+                    [
+                        "windows_artifact_id: ${{ steps.upload-windows.outputs.artifact-id }}",
+                        "windows_artifact_digest: ${{ steps.upload-windows.outputs.artifact-digest }}",
+                        "windows_directory_sha256: ${{ steps.bind-windows.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-windows",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/reviewed-windows",
+                        "id: upload-windows",
+                        "name: ephemeralEvidence-oracle-reviewed-windows-amd64",
+                    ],
+                ),
+            ],
+        ),
+        _ => return None,
+    })
+}
+
+fn campaign_review_handoffs(name: &str) -> Option<(&'static str, Vec<CampaignHandoff>)> {
+    Some(match name {
+        "evidence-custody.yml" => (
+            "name: Durable evidence custody",
+            vec![
+                (
+                    "review-and-assemble",
+                    [
+                        "pre_review_artifact_id: ${{ steps.upload-pre-review.outputs.artifact-id }}",
+                        "pre_review_artifact_digest: ${{ steps.upload-pre-review.outputs.artifact-digest }}",
+                        "pre_review_directory_sha256: ${{ steps.bind-pre-review.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-pre-review",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/custody",
+                        "id: upload-pre-review",
+                        "name: promotion-custody-evidence",
+                    ],
+                ),
+                (
+                    "approve-final-review-graph",
+                    [
+                        "reviewed_artifact_id: ${{ steps.upload-reviewed.outputs.artifact-id }}",
+                        "reviewed_artifact_digest: ${{ steps.upload-reviewed.outputs.artifact-digest }}",
+                        "reviewed_directory_sha256: ${{ steps.bind-reviewed.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-reviewed",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/evidence",
+                        "id: upload-reviewed",
+                        "name: promotion-final-reviewed-evidence",
+                    ],
+                ),
+                (
+                    "seal-current-scrubs",
+                    [
+                        "primary_artifact_id: ${{ steps.upload-primary.outputs.artifact-id }}",
+                        "primary_artifact_digest: ${{ steps.upload-primary.outputs.artifact-digest }}",
+                        "primary_directory_sha256: ${{ steps.bind-primary.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-primary",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/current-scrub-primary",
+                        "id: upload-primary",
+                        "name: ephemeralEvidence-current-scrub-primary-worm-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ],
+                ),
+                (
+                    "seal-current-scrubs",
+                    [
+                        "secondary_artifact_id: ${{ steps.upload-secondary.outputs.artifact-id }}",
+                        "secondary_artifact_digest: ${{ steps.upload-secondary.outputs.artifact-digest }}",
+                        "secondary_directory_sha256: ${{ steps.bind-secondary.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-secondary",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/current-scrub-secondary",
+                        "id: upload-secondary",
+                        "name: ephemeralEvidence-current-scrub-secondary-worm-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ],
+                ),
+            ],
+        ),
+        "mutation.yml" => (
+            "name: Assurance mutation",
+            vec![(
+                "review",
+                [
+                    "mutation_artifact_id: ${{ steps.upload-mutation.outputs.artifact-id }}",
+                    "mutation_artifact_digest: ${{ steps.upload-mutation.outputs.artifact-digest }}",
+                    "mutation_directory_sha256: ${{ steps.bind-mutation.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-mutation",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/mutation",
+                    "id: upload-mutation",
+                    "name: promotion-mutation-evidence",
+                ],
+            )],
+        ),
+        "artifact-authenticity-finalize.yml" => (
+            "name: Finalize artifact authenticity",
+            vec![(
+                "finalize",
+                [
+                    "authenticity_artifact_id: ${{ steps.upload-authenticity.outputs.artifact-id }}",
+                    "authenticity_artifact_digest: ${{ steps.upload-authenticity.outputs.artifact-digest }}",
+                    "authenticity_directory_sha256: ${{ steps.bind-authenticity.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-authenticity",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/acquisition",
+                    "id: upload-authenticity",
+                    "name: promotion-artifact-authenticity",
+                ],
+            )],
+        ),
+        _ => return None,
+    })
+}
+
+fn campaign_decision_handoffs(name: &str) -> Option<(&'static str, Vec<CampaignHandoff>)> {
+    match name {
+        "claim-applicability-decisions.yml" => Some((
+            "name: Package externally authored claim applicability decisions",
+            vec![(
+                "package",
+                [
+                    "decisions_artifact_id: ${{ steps.upload-decisions.outputs.artifact-id }}",
+                    "decisions_artifact_digest: ${{ steps.upload-decisions.outputs.artifact-digest }}",
+                    "decisions_directory_sha256: ${{ steps.bind-decisions.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-decisions",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/evidence/claim-decisions",
+                    "id: upload-decisions",
+                    "name: promotion-claim-applicability-decisions",
+                ],
+            )],
+        )),
+        "artifact-independent-acquisition.yml" => Some((
+            "name: Independent artifact acquisition",
+            vec![(
+                "acquire",
+                [
+                    "acquisition_artifact_id: ${{ steps.upload-acquisition.outputs.artifact-id }}",
+                    "acquisition_artifact_digest: ${{ steps.upload-acquisition.outputs.artifact-digest }}",
+                    "acquisition_directory_sha256: ${{ steps.bind-acquisition.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-acquisition",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/acquisition",
+                    "id: upload-acquisition",
+                    "name: artifact-independent-acquisition",
+                ],
+            )],
+        )),
+        "artifact-authenticity-review.yml" => Some((
+            "name: Artifact authenticity review",
+            vec![(
+                "acquisition-packet",
+                [
+                    "packet_artifact_id: ${{ steps.upload-packet.outputs.artifact-id }}",
+                    "packet_artifact_digest: ${{ steps.upload-packet.outputs.artifact-digest }}",
+                    "packet_directory_sha256: ${{ steps.bind-packet.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-packet",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out",
+                    "id: upload-packet",
+                    "name: ephemeralEvidence-artifact-authenticity",
+                ],
+            )],
+        )),
+        _ => None,
+    }
+}
+
+fn campaign_state_handoffs(name: &str) -> Option<(&'static str, Vec<CampaignHandoff>)> {
+    match name {
+        "promotion-surveillance.yml" => Some((
+            "name: Promotion surveillance",
+            vec![
+                (
+                    "execute-active-subject",
+                    [
+                        "artifact_id: ${{ steps.upload.outputs.artifact-id }}",
+                        "artifact_digest: ${{ steps.upload.outputs.artifact-digest }}",
+                        "directory_sha256: ${{ steps.bind-execution.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-execution",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-work/candidate/ci-out",
+                        "id: upload",
+                        "name: ephemeralEvidence-active-subject-execution",
+                    ],
+                ),
+                (
+                    "verify-and-transition",
+                    [
+                        "transition_artifact_id: ${{ steps.upload-transition.outputs.artifact-id }}",
+                        "transition_artifact_digest: ${{ steps.upload-transition.outputs.artifact-digest }}",
+                        "transition_directory_sha256: ${{ steps.bind-transition.outputs.directory_sha256 }}",
+                    ],
+                    [
+                        "id: bind-transition",
+                        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/surveillance",
+                        "id: upload-transition",
+                        "name: promotion-surveillance-${{ github.run_id }}-${{ github.run_attempt }}",
+                    ],
+                ),
+            ],
+        )),
+        "promotion-surveillance-watchdog.yml" => Some((
+            "name: Promotion surveillance watchdog",
+            vec![(
+                "deadline",
+                [
+                    "transition_artifact_id: ${{ steps.upload-transition.outputs.artifact-id }}",
+                    "transition_artifact_digest: ${{ steps.upload-transition.outputs.artifact-digest }}",
+                    "transition_directory_sha256: ${{ steps.bind-transition.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-transition",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/surveillance",
+                    "id: upload-transition",
+                    "name: promotion-surveillance-watchdog-${{ github.run_id }}-${{ github.run_attempt }}",
+                ],
+            )],
+        )),
+        "promotion-initial-public-finalize.yml" => Some((
+            "name: Initial public promotion finalizer",
+            vec![(
+                "finalize-completed-publication",
+                [
+                    "completion_artifact_id: ${{ steps.upload-completion.outputs.artifact-id }}",
+                    "completion_artifact_digest: ${{ steps.upload-completion.outputs.artifact-digest }}",
+                    "completion_directory_sha256: ${{ steps.bind-completion.outputs.directory_sha256 }}",
+                ],
+                [
+                    "id: bind-completion",
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out",
+                    "id: upload-completion",
+                    "name: custody-initial-public-completion-${{ inputs.surveillance_run_id }}-${{ inputs.surveillance_run_attempt }}",
+                ],
+            )],
+        )),
+        _ => None,
+    }
+}
+
+fn check_campaign_external_handoffs(path: &Path, workflow: &str, failures: &mut Vec<String>) {
+    let Some((header, handoffs)) = campaign_external_handoffs(path) else {
+        return;
+    };
+    let complete = workflow.starts_with(header);
+    for (job, outputs, order) in &handoffs {
+        let Some(lines) = workflow_job_lines(workflow, job) else {
+            if complete {
+                failures.push(format!(
+                    "campaign external handoff job {job:?} is missing from {}",
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        let body = lines.join("\n");
+        if outputs
+            .iter()
+            .any(|marker| body.matches(marker).count() != 1)
+            || !markers_are_ordered(&body, order)
+        {
+            failures.push(format!(
+                "campaign external handoff job {job:?} lacks exact artifact/archive/directory outputs in {}",
+                path.display()
+            ));
+        }
+    }
+}
+
+fn check_provider_replay_token_binding(
+    path: &Path,
+    workflow: &str,
+    require_job: bool,
+    failures: &mut Vec<String>,
+) {
+    let Some((job, command)) = (match path.file_name().and_then(|value| value.to_str()) {
+        Some("claim-applicability-decisions.yml") => Some((
+            "package",
+            "run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs",
+        )),
+        Some("promotion-evidence-review.yml") => Some((
+            "assemble",
+            "run: ./target/ci/hell-ci review-assemble prepare --github-dispatch-inputs",
+        )),
+        Some("promotion-proposal.yml") => Some((
+            "assemble",
+            "run: ./target/ci/hell-ci promotion-proposal --input ci-out/native-shards --output ci-out/native-shards/promotion-proposal.json --github-dispatch-inputs",
+        )),
+        Some("promotion-approval.yml") => Some((
+            "approve",
+            "run: ./target/ci/hell-ci promotion-approval-subject --input ci-out/native-shards/promotion-proposal.json --output ci-out/native-shards/promotion-approval-subject.json",
+        )),
+        Some("artifact-authenticity-finalize.yml") => Some((
+            "prepare",
+            "run: ./target/ci/hell-ci artifact-acquire assemble-finalize --input ci-out/finalize-source --output ci-out/acquisition --github-dispatch-inputs",
+        )),
+        Some("promotion-surveillance.yml") => Some((
+            "verify-and-transition",
+            "run: ./target/ci/hell-ci surveillance-ops workflow-objective",
+        )),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Some(lines) = workflow_job_lines(workflow, job) else {
+        if require_job {
+            failures.push(format!(
+                "provider replay job {job:?} is missing from {}",
+                path.display()
+            ));
+        }
+        return;
+    };
+    let commands = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (workflow_entry(line) == command).then_some(index))
+        .collect::<Vec<_>>();
+    if !matches!(commands.as_slice(), [index]
+        if index.checked_sub(2).is_some_and(|env| workflow_entry(lines[env]) == "env:")
+            && index.checked_sub(1).is_some_and(|token| workflow_entry(lines[token]) == "GITHUB_TOKEN: ${{ github.token }}"))
+    {
+        failures.push(format!(
+            "provider replay command must have one exact step-scoped GitHub read token in {}",
+            path.display()
+        ));
+    }
+}
+
+fn check_fresh_activated_campaign_liveness(workflow: &str, failures: &mut Vec<String>) {
+    let exact = [
+        ("evidence-collection-linux", "timeout-minutes: 120"),
+        ("branch-evidence-collection-linux", "timeout-minutes: 120"),
+        ("native-oracle-macos", "timeout-minutes: 180"),
+        ("native-oracle-windows", "timeout-minutes: 180"),
+    ];
+    if exact.iter().any(|(job, timeout)| {
+        workflow_job_lines(workflow, job).is_none_or(|lines| {
+            lines
+                .iter()
+                .filter(|line| strip_yaml_comment(line).trim() == *timeout)
+                .count()
+                != 1
+        })
+    }) {
+        failures.push(
+            "fresh generic campaign lacks bounded Map712/Set479 three-platform execution budgets"
+                .to_owned(),
+        );
+    }
+    let required = [
+        "run: ./target/ci/hell-ci nightly --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json",
+        "run: ./target/ci/hell-ci native-oracle-shard --source ci-work/oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/shards/macos-arm64/report.json",
+        "run: .\\target\\ci\\hell-ci.exe native-oracle-shard --source ci-work\\oracle-source --platform windows-amd64 --dependency-attestation ci-out\\dependency-policy.json --report ci-out\\shards\\windows-amd64\\report.json",
+        "run: ./target/ci/hell-ci evidence-epoch write --output ci-out/native-shards/assurance-epoch.json",
+    ];
+    if required
+        .iter()
+        .any(|command| workflow.matches(command).count() != 1)
+        || workflow.contains("collection-custody-admission")
+        || workflow.contains("collection-worm-custody")
+    {
+        failures.push(
+            "fresh generic campaign may substitute supplemental custody evidence for current-epoch native execution"
+                .to_owned(),
+        );
     }
 }
 
@@ -1397,15 +3976,337 @@ fn reviewed_workflow_env(path: &Path, lines: &[&str], index: usize, original: &s
         || reviewed_evidence_review_token_binding(path, lines, index, original)
         || reviewed_external_acquisition_configuration(path, lines, index, original)
         || reviewed_provider_metadata_token_binding(path, lines, index, original)
+        || reviewed_provider_replay_token_binding(path, lines, index, original)
         || reviewed_oracle_provider_selection(path, lines, index, original)
         || reviewed_public_report_configuration(path, lines, index, original)
-        || reviewed_initial_surveillance_dispatch(path, lines, index, original)
         || reviewed_initial_surveillance_finalizer(path, lines, index, original)
         || reviewed_active_subject_selection(path, lines, index, original)
         || reviewed_prior_public_promotion(path, lines, index, original)
         || reviewed_collection_authority_acquisition(path, lines, index, original)
+        || reviewed_collection_custody_environment(path, lines, index, original)
+        || reviewed_collection_activation_environment(path, lines, index, original)
+        || reviewed_collection_worm_environment(path, lines, index, original)
+        || reviewed_claim_applicability_decision_environment(path, lines, index, original)
+        || reviewed_primary_acquisition_checkout_environment(path, lines, index, original)
+        || reviewed_maintenance_selector_environment(path, lines, index, original)
+        || reviewed_selector_export_environment(path, lines, index, original)
+        || reviewed_selector_selection_environment(path, lines, index, original)
+        || reviewed_selector_barrier_environment(path, lines, index, original)
+        || reviewed_promotion_checkout_environment(path, lines, index, original)
+        || reviewed_exact_checkout_environment(path, lines, index, original)
+        || reviewed_custody_upload_subject_environment(path, lines, index, original)
         || reviewed_transport_probe_environment(path, lines, index, original)
         || reviewed_regression_environment(path, lines, index, original)
+}
+
+fn reviewed_selector_selection_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    path == workflow_path("custody-provider-selector-seal.yml")
+        && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          CUSTODY_SELECTOR_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}")
+        && lines.get(index + 2) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
+        && lines.get(index + 3)
+            == Some(
+                &"        run: ./target/ci/hell-ci custody-ops workflow-select-provider-selector-updates",
+            )
+}
+
+fn reviewed_selector_barrier_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if original != "        env:" {
+        return false;
+    }
+    let following = &lines[index.saturating_add(1)..];
+    let common = [
+        "          ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT: ${{ vars.ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT }}",
+        "          ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT: ${{ vars.ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT }}",
+        "          CUSTODY_SELECTOR_AGGREGATE_ARCHIVE_SHA256: ${{ inputs.selector_archive_sha256 }}",
+        "          CUSTODY_SELECTOR_AGGREGATE_ARTIFACT_ID: ${{ inputs.selector_artifact_id }}",
+        "          CUSTODY_SELECTOR_AGGREGATE_CANDIDATE: ${{ inputs.selector_source_sha }}",
+        "          CUSTODY_SELECTOR_AGGREGATE_DIRECTORY_SHA256: ${{ inputs.selector_directory_sha256 }}",
+        "          CUSTODY_SELECTOR_AGGREGATE_EVENT: workflow_dispatch",
+    ];
+    if !following.starts_with(&common) {
+        return false;
+    }
+    let tail = match path.file_name().and_then(|value| value.to_str()) {
+        Some("promotion-surveillance.yml") => [
+            "          CUSTODY_SELECTOR_AGGREGATE_RUN_ATTEMPT: ${{ inputs.selector_run_attempt }}",
+            "          CUSTODY_SELECTOR_AGGREGATE_RUN_ID: ${{ inputs.selector_run_id }}",
+            "          CUSTODY_SELECTOR_AGGREGATE_WORKFLOW: .github/workflows/evidence-custody.yml",
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            "        run: ./target/ci/hell-ci custody-ops workflow-verify-provider-selector-update-barrier",
+        ],
+        Some("promotion-initial-public-finalize.yml") => [
+            "          CUSTODY_SELECTOR_AGGREGATE_RUN_ATTEMPT: ${{ inputs.surveillance_run_attempt }}",
+            "          CUSTODY_SELECTOR_AGGREGATE_RUN_ID: ${{ inputs.surveillance_run_id }}",
+            "          CUSTODY_SELECTOR_AGGREGATE_WORKFLOW: .github/workflows/promotion-surveillance.yml",
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            "        run: ./target/ci/hell-ci custody-ops workflow-verify-provider-selector-update-barrier",
+        ],
+        _ => return false,
+    };
+    following[common.len()..].starts_with(&tail)
+}
+
+fn reviewed_selector_export_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    path == workflow_path("custody-provider-selector-recovery.yml")
+        && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+        && lines.get(index + 2)
+            == Some(&"          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+        && lines.get(index + 3)
+            == Some(
+                &"        run: ./target/ci/hell-ci custody-ops workflow-export-provider-selector",
+            )
+}
+
+fn reviewed_maintenance_selector_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(
+            "custody-scrub.yml"
+                | "promotion-surveillance.yml"
+                | "promotion-surveillance-watchdog.yml"
+                | "promotion-initial-public-finalize.yml"
+                | "evidence-custody.yml"
+                | "custody-provider-selector-recovery.yml"
+        )
+    ) && original == "        env:"
+        && lines.get(index + 1)
+            .is_some_and(|line| matches!(
+                *line,
+                "          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}"
+                    | "          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.provider-selector-variable] }}"
+            ))
+        && lines.get(index + 2).is_some_and(|line| {
+            matches!(
+                *line,
+                "          CUSTODY_PROVIDER_OPERATION: upload"
+                    | "          CUSTODY_PROVIDER_OPERATION: selector-export"
+                    | "          CUSTODY_PROVIDER_OPERATION: activation"
+                    | "          CUSTODY_PROVIDER_OPERATION: maintenance"
+                    | "          CUSTODY_PROVIDER_OPERATION: surveillance"
+                    | "          CUSTODY_PROVIDER_OPERATION: transition-publication"
+                    | "          CUSTODY_PROVIDER_OPERATION: complete-initial-publication"
+            )
+        })
+        && lines.get(index + 3)
+            == Some(&"          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+        && lines.get(index + 4)
+            == Some(&"          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+        && lines.get(index + 5)
+            == Some(
+                &"        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector",
+            )
+}
+
+fn reviewed_primary_acquisition_checkout_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    path == workflow_path("artifact-authenticity-review.yml")
+        && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          ACQUISITION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}")
+        && lines.get(index + 2)
+            == Some(
+                &"        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$ACQUISITION_CANDIDATE_SHA\"",
+            )
+}
+
+fn reviewed_exact_checkout_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if original != "        env:" {
+        return false;
+    }
+    if lines.get(index + 1)
+        == Some(
+            &"          PUBLIC_COMPATIBILITY_REPORT_BUCKET: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BUCKET }}",
+        )
+        && lines.get(index + 2)
+            == Some(
+                &"          PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}",
+            )
+    {
+        return lines.get(index + 3)
+            == Some(
+                &"        run: ./target/ci/hell-ci custody-ops workflow-prepare-public-publication-selector",
+            );
+    }
+    let exact = [
+        "          TRUSTED_DRIVER_SHA: ${{ github.sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$TRUSTED_DRIVER_SHA\"",
+    ];
+    let active = [
+        "          ACTIVE_SUBJECT_SHA: ${{ steps.active.outputs.candidate }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$ACTIVE_SUBJECT_SHA\"",
+    ];
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(
+            "nightly.yml"
+                | "promotion-initial-public-finalize.yml"
+                | "promotion-surveillance.yml"
+                | "promotion-surveillance-watchdog.yml"
+                | "evidence-custody.yml"
+                | "custody-provider-selector-recovery.yml"
+                | "custody-provider-selector-seal.yml"
+                | "custody-scrub.yml"
+                | "mutation.yml"
+                | "artifact-authenticity-finalize.yml"
+                | "oracle-reproduce.yml"
+        )
+    ) && (lines[index.saturating_add(1)..].starts_with(&exact)
+        || (path == workflow_path("promotion-surveillance.yml")
+            && lines[index.saturating_add(1)..].starts_with(&active)))
+}
+
+fn reviewed_promotion_checkout_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some("promotion-proposal.yml" | "promotion-approval.yml")
+    ) && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          PROMOTION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}")
+        && lines.get(index + 2)
+            == Some(
+                &"        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$PROMOTION_CANDIDATE_SHA\"",
+            )
+}
+
+fn reviewed_collection_activation_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if original != "        env:" {
+        return false;
+    }
+    let following = &lines[index.saturating_add(1)..];
+    if path == workflow_path("collection-activation.yml") {
+        let checkout = [
+            "          COLLECTION_ACTIVATION_SHA: ${{ inputs.activation_sha }}",
+            "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_ACTIVATION_SHA\"",
+        ];
+        let verify = [
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            "          COLLECTION_PROPOSAL_ARCHIVE_SHA256: ${{ inputs.proposal_archive_sha256 }}",
+            "          COLLECTION_PROPOSAL_ARTIFACT_ID: ${{ inputs.proposal_artifact_id }}",
+            "          COLLECTION_PROPOSAL_DIRECTORY_SHA256: ${{ inputs.proposal_directory_sha256 }}",
+            "          COLLECTION_PROPOSAL_RUN_ATTEMPT: ${{ inputs.proposal_run_attempt }}",
+            "          COLLECTION_PROPOSAL_RUN_ID: ${{ inputs.proposal_run_id }}",
+        ];
+        let review_subject = [
+            "          WRAPPER_DIRECTORY_SHA256: ${{ needs.retain-proposal.outputs.directory_sha256 }}",
+            "        run: ./target/ci/hell-ci collection-authority verify-activation-review-subject --input ci-in/collection-activation-review-subject --expected-directory-sha256 \"$WRAPPER_DIRECTORY_SHA256\"",
+        ];
+        return following.starts_with(&checkout)
+            || following.starts_with(&verify)
+            || following.starts_with(&review_subject);
+    }
+    if path != workflow_path("collection-activation-preparation.yml") {
+        return false;
+    }
+    let checkout = [
+        "          COLLECTION_ACTIVATION_SHA: ${{ inputs.activation_sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_ACTIVATION_SHA\"",
+    ];
+    let prepare = [
+        "          COLLECTION_ACTIVATION_ARTIFACT_ID: ${{ inputs.artifact_id }}",
+        "          COLLECTION_ACTIVATION_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}",
+        "          COLLECTION_ACTIVATION_DIRECTORY_SHA256: ${{ inputs.expected_directory_sha256 }}",
+        "          COLLECTION_ACTIVATION_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}",
+        "          COLLECTION_ACTIVATION_RUN_ID: ${{ inputs.source_run_id }}",
+        "        run: ./target/ci/hell-ci collection-authority prepare-activation --input ci-in/collection-custody-activation --output ci-out/collection-activation-proposal --run-id \"$COLLECTION_ACTIVATION_RUN_ID\" --run-attempt \"$COLLECTION_ACTIVATION_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_ACTIVATION_ARTIFACT_ID\" --expected-directory-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"",
+    ];
+    following.starts_with(&checkout) || following.starts_with(&prepare)
+}
+
+fn reviewed_claim_applicability_decision_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if path != workflow_path("claim-applicability-decisions.yml") || original != "        env:" {
+        return false;
+    }
+    let following = &lines[index.saturating_add(1)..];
+    following.starts_with(&[
+        "          CLAIM_CANDIDATE_SHA: ${{ inputs.candidate_sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$CLAIM_CANDIDATE_SHA\"",
+    ]) || following.starts_with(&[
+        "          CLAIM_DECISION_SOURCE_SHA: ${{ inputs.decision_source_sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input decision-source --candidate-commit \"$CLAIM_DECISION_SOURCE_SHA\"",
+    ]) || following.starts_with(&[
+        "          GITHUB_TOKEN: ${{ github.token }}",
+        "        run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs",
+    ])
+}
+
+fn reviewed_custody_upload_subject_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    path == workflow_path("evidence-custody.yml")
+        && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}")
+        && lines.get(index + 2)
+            == Some(&"          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}")
+        && lines.get(index + 3)
+            == Some(&"        run: ./target/ci/hell-ci custody-ops workflow-verify-upload-subject")
+}
+
+fn reviewed_collection_worm_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    path == workflow_path("evidence-custody.yml")
+        && original == "        env:"
+        && lines.get(index + 1)
+            == Some(&"          COLLECTION_CANDIDATE_SHA: ${{ inputs.candidate_sha }}")
+        && lines.get(index + 2)
+            == Some(
+                &"        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_CANDIDATE_SHA\"",
+            )
 }
 
 fn reviewed_collection_authority_acquisition(
@@ -1432,12 +4333,65 @@ fn reviewed_collection_authority_acquisition(
         "          COLLECTION_WINDOWS_ARTIFACT_ID: ${{ needs.collection-authority-windows.outputs.artifact_id }}",
         "          GITHUB_TOKEN: ${{ github.token }}",
     ];
+    let custody_bundle = [
+        "          COLLECTION_CUSTODY_BUNDLE_PATH: ${{ steps.attest-collection-custody.outputs.bundle-path }}",
+    ];
     following.starts_with(&macos)
         || following.starts_with(&windows)
         || (following.starts_with(&merge)
             && following.get(merge.len()).is_some_and(|line| {
                 line.strip_prefix("        ") == Some(COLLECTION_ACQUISITION_COMMAND)
             }))
+        || (following.starts_with(&custody_bundle)
+            && following.get(custody_bundle.len()).is_some_and(|line| {
+                matches!(
+                    line.strip_prefix("        "),
+                    Some(COLLECTION_ATTESTATION_TOOL_COMMAND | COLLECTION_RETAIN_CUSTODY_COMMAND)
+                )
+            }))
+}
+
+fn reviewed_collection_custody_environment(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if original != "        env:" {
+        return false;
+    }
+    let following = &lines[index.saturating_add(1)..];
+    let integration = [
+        "          COLLECTION_INTEGRATION_SHA: ${{ inputs.integration_sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_INTEGRATION_SHA\"",
+    ];
+    let worm_digest = [
+        "          COLLECTION_WORM_ARCHIVE_SHA256: ${{ inputs.expected_worm_archive_sha256 }}",
+        "          COLLECTION_WORM_ARTIFACT_ID: ${{ inputs.worm_artifact_id }}",
+        "          COLLECTION_WORM_DIRECTORY_SHA256: ${{ inputs.expected_worm_directory_sha256 }}",
+        "          COLLECTION_WORM_RUN_ATTEMPT: ${{ inputs.worm_source_run_attempt }}",
+        "          COLLECTION_WORM_RUN_ID: ${{ inputs.worm_source_run_id }}",
+        "          GITHUB_TOKEN: ${{ github.token }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-worm-artifact --input ci-in/collection-worm-custody --expected-directory-sha256 \"$COLLECTION_WORM_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_WORM_ARCHIVE_SHA256\" --run-id \"$COLLECTION_WORM_RUN_ID\" --run-attempt \"$COLLECTION_WORM_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_WORM_ARTIFACT_ID\"",
+    ];
+    let preparation = [
+        "          COLLECTION_PREPARATION_SHA: ${{ inputs.preparation_sha }}",
+        "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_PREPARATION_SHA\"",
+    ];
+    let review = [
+        "          COLLECTION_CUSTODY_ISSUED_AT: ${{ inputs.issued_at }}",
+        "          COLLECTION_CUSTODY_REVIEWER: ${{ inputs.reviewer }}",
+        "        run: ./target/ci/hell-ci collection-authority prepare-custody-review --package compat/collection-custody/payload --signature compat/collection-custody/signature --candidate-executable target/release/hell --reviewer \"$COLLECTION_CUSTODY_REVIEWER\" --issued-at \"$COLLECTION_CUSTODY_ISSUED_AT\" --output ci-out/collection-custody-review",
+    ];
+    match path.file_name().and_then(|value| value.to_str()) {
+        Some("collection-custody-integration.yml") => {
+            following.starts_with(&integration) || following.starts_with(&worm_digest)
+        }
+        Some("collection-custody-review.yml") => {
+            following.starts_with(&preparation) || following.starts_with(&review)
+        }
+        _ => false,
+    }
 }
 
 fn reviewed_transport_probe_environment(
@@ -1469,6 +4423,7 @@ fn reviewed_transport_probe_controller_environment(following: &[&str]) -> bool {
         "          GITHUB_TOKEN: ${{ github.token }}",
         "          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.assemble.outputs.artifact_id }}",
         "          REGRESSION_PROVIDER_ARTIFACT_NAME: assurance-transport-readiness-subject-${{ github.run_id }}-${{ github.run_attempt }}",
+        "          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.assemble.outputs.artifact_digest }}",
         "          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.assemble.outputs.directory_sha256 }}",
         "          REGRESSION_PROVIDER_EVENT: workflow_dispatch",
         "          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}",
@@ -1504,6 +4459,9 @@ fn transport_probe_controller_envelope_environment(suffix: &str) -> Vec<String> 
             "          REGRESSION_PROVIDER_ARTIFACT_NAME: assurance-transport-readiness-envelope-{suffix}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}"
         ),
         format!(
+            "          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{{{ needs.sign-{suffix}.outputs.artifact_digest }}}}"
+        ),
+        format!(
             "          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{{{ needs.sign-{suffix}.outputs.directory_sha256 }}}}"
         ),
         "          REGRESSION_PROVIDER_EVENT: workflow_dispatch".to_owned(),
@@ -1535,9 +4493,10 @@ fn reviewed_transport_probe_signer_environment(following: &[&str], suffix: &str)
 }
 
 fn transport_probe_signer_selection_environment(role: &str) -> Vec<String> {
-    let (artifact_id, artifact_name, directory_digest, input, output) = match role {
+    let (artifact_id, archive_digest, artifact_name, directory_digest, input, output) = match role {
         "packet" => (
             "packet_artifact_id",
+            "packet_artifact_digest",
             "packets",
             "packet_directory_sha256",
             "transport-packets",
@@ -1545,6 +4504,7 @@ fn transport_probe_signer_selection_environment(role: &str) -> Vec<String> {
         ),
         "subject" => (
             "subject_artifact_id",
+            "subject_artifact_digest",
             "subject",
             "subject_directory_sha256",
             "transport-subject",
@@ -1558,6 +4518,7 @@ fn transport_probe_signer_selection_environment(role: &str) -> Vec<String> {
         format!(
             "          REGRESSION_PROVIDER_ARTIFACT_NAME: assurance-transport-readiness-{artifact_name}-${{{{ inputs.parent_run_id }}}}-${{{{ inputs.parent_run_attempt }}}}"
         ),
+        format!("          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{{{ inputs.{archive_digest} }}}}"),
         format!(
             "          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{{{ inputs.{directory_digest} }}}}"
         ),
@@ -1639,6 +4600,7 @@ fn reviewed_regression_environment(
             "          GITHUB_TOKEN: ${{ github.token }}",
             "          REGRESSION_PROVIDER_ARTIFACT_ID: ${{ needs.seal-review-subject.outputs.artifact_id }}",
             "          REGRESSION_PROVIDER_ARTIFACT_NAME: regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}",
+            "          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ needs.seal-review-subject.outputs.artifact_digest }}",
             "          REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ needs.seal-review-subject.outputs.directory_sha256 }}",
             "          REGRESSION_PROVIDER_EVENT: workflow_dispatch",
             "          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}",
@@ -1687,40 +4649,46 @@ fn reviewed_automatic_regression_environment(following: &[&str]) -> bool {
     let suffixes = [
         (
             "${{ needs.prepare.outputs.artifact_id }}",
+            "${{ needs.prepare.outputs.artifact_digest }}",
             "regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}",
             "${{ needs.prepare.outputs.directory_sha256 }}",
             "ci-out/regression-sealed/package --output ci-out/regression-sealed/proposal-selection",
         ),
         (
             "${{ needs.seal-review-subject-automatic.outputs.artifact_id }}",
+            "${{ needs.seal-review-subject-automatic.outputs.artifact_digest }}",
             "regression-review-subject-${{ github.run_id }}-${{ github.run_attempt }}",
             "${{ needs.seal-review-subject-automatic.outputs.directory_sha256 }}",
             "ci-in/regression-sealed --output ci-out/regression-sealed-selection",
         ),
         (
             "${{ needs.prepare.outputs.artifact_id }}",
+            "${{ needs.prepare.outputs.artifact_digest }}",
             "regression-proposal-${{ github.run_id }}-${{ github.run_attempt }}",
             "${{ needs.prepare.outputs.directory_sha256 }}",
             "ci-in/regression-package --output ci-out/regression-package-selection",
         ),
         (
             "${{ needs.review-automatic.outputs.artifact_id }}",
+            "${{ needs.review-automatic.outputs.artifact_digest }}",
             "regression-review-${{ github.run_id }}-${{ github.run_attempt }}",
             "${{ needs.review-automatic.outputs.directory_sha256 }}",
             "ci-in/regression-review --output ci-out/regression-review-selection",
         ),
         (
             "${{ needs.promote-automatic.outputs.artifact_id }}",
+            "${{ needs.promote-automatic.outputs.artifact_digest }}",
             "reviewed-regression-${{ github.run_id }}-${{ github.run_attempt }}",
             "${{ needs.promote-automatic.outputs.directory_sha256 }}",
             "ci-in/reviewed-regression --output ci-out/reviewed-regression-selection",
         ),
     ];
-    suffixes.iter().any(|(id, name, digest, command)| {
+    suffixes.iter().any(|(id, archive, name, digest, command)| {
         following.starts_with(&[
             "          GITHUB_TOKEN: ${{ github.token }}",
             &format!("          REGRESSION_PROVIDER_ARTIFACT_ID: {id}"),
             &format!("          REGRESSION_PROVIDER_ARTIFACT_NAME: {name}"),
+            &format!("          REGRESSION_PROVIDER_ARCHIVE_SHA256: {archive}"),
             &format!("          REGRESSION_PROVIDER_DIRECTORY_SHA256: {digest}"),
             "          REGRESSION_PROVIDER_EVENT: workflow_dispatch",
             "          REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}",
@@ -1861,8 +4829,12 @@ fn reviewed_active_subject_selection(
             == Some(
                 &"          ACTIVE_SUBJECT_ARTIFACT_ID: ${{ needs.execute-active-subject.outputs.artifact_id }}",
             )
-        && lines.get(index + 2) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
-        && lines.get(index + 3)
+        && lines.get(index + 2)
+            == Some(
+                &"          ACTIVE_SUBJECT_ARCHIVE_SHA256: ${{ needs.execute-active-subject.outputs.artifact_digest }}",
+            )
+        && lines.get(index + 3) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
+        && lines.get(index + 4)
             == Some(
                 &"        run: ./target/ci/hell-ci surveillance-ops workflow-active-subject-selection",
             )
@@ -1885,9 +4857,11 @@ fn reviewed_oracle_provider_selection(
     }) {
         lines[index + 2]
     } else if lines.get(index + 2).is_some_and(|line| {
+        line.starts_with("          ORACLE_UNSIGNED_ARCHIVE_SHA256: ${{ steps.resolve-")
+    }) && lines.get(index + 3).is_some_and(|line| {
         line.starts_with("          ORACLE_UNSIGNED_ARTIFACT_ID: ${{ steps.resolve-")
     }) {
-        lines.get(index + 3).copied().unwrap_or_default()
+        lines.get(index + 4).copied().unwrap_or_default()
     } else {
         return false;
     };
@@ -2041,6 +5015,154 @@ fn check_protected_job_trust_isolation(path: &Path, lines: &[&str], failures: &m
                 start + first_build.unwrap_or_default() + 1
             ));
         }
+        check_review_signing_credential_order(path, job, block, start, failures);
+        check_provider_receipt_signing_order(path, job, block, start, failures);
+        check_state_transition_signing_order(path, job, block, start, failures);
+    }
+}
+
+fn check_state_transition_signing_order(
+    path: &Path,
+    job: &str,
+    block: &[&str],
+    start: usize,
+    failures: &mut Vec<String>,
+) {
+    let packet = block
+        .iter()
+        .position(|line| line.contains("custody-ops workflow-transition-packet"));
+    let credential = block
+        .iter()
+        .position(|line| line.contains("uses: webfactory/ssh-agent@"));
+    let signature = block.iter().position(|line| {
+        line.contains("run: ./target/ci/hell-ci review-sign ")
+            && line.contains("promotion-transition-packet.json")
+    });
+    if packet.is_some()
+        && !matches!(
+            (packet, credential, signature),
+            (Some(packet), Some(credential), Some(signature))
+                if packet < credential && credential < signature
+        )
+    {
+        failures.push(format!(
+            "protected state transition job {job:?} must finalize its exact packet before loading signing credentials at {}:{}",
+            path.display(),
+            start + 1
+        ));
+    }
+}
+
+fn check_provider_receipt_signing_order(
+    path: &Path,
+    job: &str,
+    block: &[&str],
+    start: usize,
+    failures: &mut Vec<String>,
+) {
+    let first_credential = block
+        .iter()
+        .position(|line| line.contains("uses: webfactory/ssh-agent@"));
+    let first_signature = block.iter().position(|line| {
+        line.contains("run: ./target/ci/hell-ci review-sign ")
+            && line.contains(" --role custody-provider ")
+    });
+    let packet = block.iter().rposition(|line| {
+        line.contains("run: ./target/ci/hell-ci custody-ops workflow-") && line.contains("packet")
+    });
+    let provider_signing_job = block
+        .iter()
+        .any(|line| line.contains("run: ./target/ci/hell-ci custody-ops workflow-"))
+        && first_signature.is_some()
+        && first_credential.is_some();
+    if provider_signing_job
+        && !matches!(
+            (packet, first_credential, first_signature),
+            (Some(packet), Some(credential), Some(signature))
+                if packet < credential && credential < signature
+        )
+    {
+        failures.push(format!(
+            "protected provider job {job:?} must finalize its typed receipt packet before loading signing credentials at {}:{}",
+            path.display(),
+            start + 1
+        ));
+    }
+}
+
+fn check_review_signing_credential_order(
+    path: &Path,
+    job: &str,
+    block: &[&str],
+    start: usize,
+    failures: &mut Vec<String>,
+) {
+    let authorizations = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.contains("run: ./target/ci/hell-ci review-authorization ")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let signing_credentials = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (line.contains("uses: webfactory/ssh-agent@")
+                || line.contains("uses: sigstore/cosign-installer@"))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if authorizations.is_empty() || signing_credentials.is_empty() {
+        return;
+    }
+    let finalizations = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.contains("run: ./target/ci/hell-ci review-packet ")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let downloads = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.contains("uses: actions/download-artifact@")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let signatures = block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.contains("run: ./target/ci/hell-ci review-sign ")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let first_authorization = authorizations[0];
+    let last_authorization = *authorizations.last().unwrap_or(&first_authorization);
+    let first_credential = signing_credentials[0];
+    let packet_before_credentials = finalizations
+        .iter()
+        .copied()
+        .filter(|packet| *packet < first_credential)
+        .max();
+    let first_download = downloads.first().copied();
+    let first_signature = signatures.first().copied();
+    let valid = first_download.is_none_or(|download| download < first_authorization)
+        && packet_before_credentials.is_some_and(|packet| last_authorization < packet)
+        && first_signature.is_some_and(|signature| first_credential < signature)
+        && signing_credentials
+            .iter()
+            .all(|credential| packet_before_credentials.is_some_and(|packet| packet < *credential));
+    if !valid {
+        failures.push(format!(
+            "protected review job {job:?} must download and authorize its exact subject, finalize its review packet, then load signing credentials before signing at {}:{}",
+            path.display(),
+            start + 1
+        ));
     }
 }
 
@@ -2133,12 +5255,12 @@ fn reviewed_initial_surveillance_finalizer(
     {
         return false;
     }
-    let finalize = lines.get(index + 1) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
+    lines.get(index + 1) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
         && lines.get(index + 2)
-            == Some(&"          INITIAL_SURVEILLANCE_RUN_ID: ${{ github.event.workflow_run.id }}")
+            == Some(&"          INITIAL_SURVEILLANCE_RUN_ID: ${{ inputs.surveillance_run_id }}")
         && lines.get(index + 3)
             == Some(
-                &"          INITIAL_SURVEILLANCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}",
+                &"          INITIAL_SURVEILLANCE_RUN_ATTEMPT: ${{ inputs.surveillance_run_attempt }}",
             )
         && lines.get(index + 4)
             == Some(
@@ -2147,36 +5269,6 @@ fn reviewed_initial_surveillance_finalizer(
         && lines.get(index + 5)
             == Some(
                 &"        run: ./target/ci/hell-ci custody-ops workflow-finalize-initial-surveillance",
-            );
-    let failure = lines.get(index + 1)
-        == Some(&"          INITIAL_SURVEILLANCE_RUN_ID: ${{ github.event.workflow_run.id }}")
-        && lines.get(index + 2)
-            == Some(
-                &"          INITIAL_SURVEILLANCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}",
-            )
-        && lines.get(index + 3)
-            == Some(
-                &"          INITIAL_SURVEILLANCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}",
-            )
-        && lines.get(index + 4)
-            == Some(
-                &"        run: ./target/ci/hell-ci custody-ops workflow-record-initial-surveillance-failure",
-            );
-    finalize || failure
-}
-
-fn reviewed_initial_surveillance_dispatch(
-    path: &Path,
-    lines: &[&str],
-    index: usize,
-    original: &str,
-) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("evidence-custody.yml")
-        && original == "        env:"
-        && lines.get(index + 1) == Some(&"          GITHUB_TOKEN: ${{ github.token }}")
-        && lines.get(index + 2)
-            == Some(
-                &"        run: ./target/ci/hell-ci custody-ops workflow-dispatch-initial-surveillance",
             )
 }
 
@@ -2238,36 +5330,313 @@ fn reviewed_external_acquisition_configuration(
     index: usize,
     original: &str,
 ) -> bool {
-    path == workflow_path("artifact-independent-acquisition.yml")
-        && original == "        env:"
-        && lines.get(index + 1) == Some(&"          GH_TOKEN: ${{ github.token }}")
+    if path != workflow_path("artifact-independent-acquisition.yml") || original != "        env:" {
+        return false;
+    }
+    let preparation = lines.get(index + 1)
+        == Some(
+            &"          ARTIFACT_INDEPENDENT_ARCHIVE_SHA256: ${{ vars.ARTIFACT_INDEPENDENT_ARCHIVE_SHA256 }}",
+        )
         && lines.get(index + 2)
-            == Some(
-                &"          ARTIFACT_INDEPENDENT_ARCHIVE_SHA256: ${{ vars.ARTIFACT_INDEPENDENT_ARCHIVE_SHA256 }}",
-            )
-        && lines.get(index + 3)
             == Some(
                 &"          ARTIFACT_INDEPENDENT_BUCKET: ${{ vars.ARTIFACT_INDEPENDENT_BUCKET }}",
             )
-        && lines.get(index + 4)
+        && lines.get(index + 3)
             == Some(&"          ARTIFACT_INDEPENDENT_KEY: ${{ vars.ARTIFACT_INDEPENDENT_KEY }}")
-        && lines.get(index + 5)
+        && lines.get(index + 4)
             == Some(
                 &"          ARTIFACT_INDEPENDENT_REGION: ${{ vars.ARTIFACT_INDEPENDENT_REGION }}",
             )
-        && lines.get(index + 6)
+        && lines.get(index + 5)
             == Some(
                 &"          ARTIFACT_INDEPENDENT_VERSION_ID: ${{ vars.ARTIFACT_INDEPENDENT_VERSION_ID }}",
             )
-        && lines.get(index + 7)
+        && lines.get(index + 6)
             == Some(
-                &"        run: ./target/ci/hell-ci artifact-acquire external-independent --output ci-out/acquisition/receipt-independent.json --artifact native-oracle-merged --github-dispatch-inputs",
+                &"        run: ./target/ci/hell-ci artifact-acquire prepare-external-independent --output ci-out/acquisition/external-independent-request.json --artifact native-oracle-merged --github-dispatch-inputs",
+            );
+    let execution = lines.get(index + 1) == Some(&"          GH_TOKEN: ${{ github.token }}")
+        && lines.get(index + 2)
+            == Some(
+                &"        run: ./target/ci/hell-ci artifact-acquire external-independent --input ci-out/acquisition/external-independent-request.json --output ci-out/acquisition/receipt-independent.json --artifact native-oracle-merged",
+            );
+    preparation || execution
+}
+
+fn check_external_independent_preflight(workflow: &str, failures: &mut Vec<String>) {
+    let Some(prepare) = workflow_job_lines(workflow, "prepare-request") else {
+        failures.push(
+            "independent acquisition lacks unprivileged sealed request preparation".to_owned(),
+        );
+        return;
+    };
+    let Some(execute) = workflow_job_lines(workflow, "acquire") else {
+        failures
+            .push("independent acquisition lacks protected sealed request execution".to_owned());
+        return;
+    };
+    let prepare = prepare.join("\n");
+    let execute = execute.join("\n");
+    let prepare_command = "run: ./target/ci/hell-ci artifact-acquire prepare-external-independent --output ci-out/acquisition/external-independent-request.json --artifact native-oracle-merged --github-dispatch-inputs";
+    let verify_command = "run: ./target/ci/hell-ci artifact-acquire verify-external-independent-request --input ci-out/acquisition/external-independent-request.json --artifact native-oracle-merged";
+    let execute_command = "run: ./target/ci/hell-ci artifact-acquire external-independent --input ci-out/acquisition/external-independent-request.json --output ci-out/acquisition/receipt-independent.json --artifact native-oracle-merged";
+    let order = [
+        "run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+        "artifact-ids: ${{ needs.prepare-request.outputs.request_artifact_id }}",
+        verify_command,
+        "uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3",
+        execute_command,
+    ];
+    if workflow.matches("source_artifact_id:").count() != 1
+        || prepare.matches(prepare_command).count() != 1
+        || prepare.contains("id-token: write")
+        || prepare.contains("environment: artifact-independent-acquisition")
+        || prepare.contains("configure-aws-credentials")
+        || prepare.contains("GH_TOKEN:")
+        || prepare.matches("id: upload-request").count() != 1
+        || prepare
+            .matches("request_artifact_id: ${{ steps.upload-request.outputs.artifact-id }}")
+            .count()
+            != 1
+        || prepare
+            .matches("request_artifact_digest: ${{ steps.upload-request.outputs.artifact-digest }}")
+            .count()
+            != 1
+        || prepare
+            .matches("            ci-out/acquisition/external-independent-request.json\n")
+            .count()
+            != 1
+        || prepare
+            .matches("            ci-out/acquisition/external-independent-request.json.sha256\n")
+            .count()
+            != 1
+        || execute.matches("needs: prepare-request").count() != 1
+        || execute.matches("id-token: write").count() != 1
+        || execute
+            .matches("environment: artifact-independent-acquisition")
+            .count()
+            != 1
+        || execute.matches(verify_command).count() != 1
+        || execute.matches(execute_command).count() != 1
+        || execute.contains("--github-dispatch-inputs")
+        || execute.contains("ARTIFACT_INDEPENDENT_BUCKET:")
+        || execute.contains("ARTIFACT_INDEPENDENT_KEY:")
+        || !markers_are_ordered(&execute, &order)
+    {
+        failures.push(
+            "independent acquisition does not validate one needs-linked sealed request before credentials"
+                .to_owned(),
+        );
+    }
+}
+
+fn check_collection_activation_review(workflow: &str, failures: &mut Vec<String>) {
+    let Some(retain) = workflow_job_lines(workflow, "retain-proposal") else {
+        failures.push("collection activation review lacks outer proposal retention".to_owned());
+        return;
+    };
+    let Some(author) = workflow_job_lines(workflow, "claim-author") else {
+        failures.push("collection activation review lacks protected claim author".to_owned());
+        return;
+    };
+    let Some(reviewer) = workflow_job_lines(workflow, "claim-reviewer") else {
+        failures.push("collection activation review lacks independent claim reviewer".to_owned());
+        return;
+    };
+    let Some(finalize) = workflow_job_lines(workflow, "finalize-commit-ready-tree") else {
+        failures.push("collection activation review lacks unprivileged finalizer".to_owned());
+        return;
+    };
+    let retain = retain.join("\n");
+    let author = author.join("\n");
+    let reviewer = reviewer.join("\n");
+    let finalize = finalize.join("\n");
+    let verify = "collection-authority verify-activation-preparation --input ci-in/collection-activation-proposal";
+    let verify_review_subject = "collection-authority verify-activation-review-subject --input ci-in/collection-activation-review-subject --expected-directory-sha256 \"$WRAPPER_DIRECTORY_SHA256\"";
+    let author_authorization = "review-authorization --input ci-in/collection-activation-review-subject/review-subject.json --output ci-out/collection-activation-review/claim-author/authorization.json --role claim-author --category collection-activation-author --github-dispatch-inputs";
+    let author_packet = "review-packet --input ci-in/collection-activation-review-subject/review-subject.json --from ci-out/collection-activation-review/claim-author/authorization.json --output ci-out/collection-activation-review/claim-author/review-packet.json --role claim-author --category collection-activation-author --decision accept --github-dispatch-inputs";
+    let reviewer_authorization = "review-authorization --input ci-in/collection-activation-review-subject/review-subject.json --output ci-out/collection-activation-review/claim-reviewer/authorization.json --role claim-reviewer --category collection-activation-final --github-dispatch-inputs";
+    let reviewer_packet = "review-packet --input ci-in/collection-activation-review-subject/review-subject.json --from ci-out/collection-activation-review/claim-reviewer/authorization.json --output ci-out/collection-activation-review/claim-reviewer/review-packet.json --role claim-reviewer --category collection-activation-final --decision accept --github-dispatch-inputs";
+    if !activation_review_structure_exact(
+        workflow,
+        &retain,
+        &author,
+        &reviewer,
+        &finalize,
+        &ActivationReviewMarkers {
+            verify,
+            verify_subject: verify_review_subject,
+            author_authorization,
+            author_packet,
+            reviewer_authorization,
+            reviewer_packet,
+        },
+    ) {
+        failures.push("collection activation review is not an exact two-role non-authoritative commit-ready handoff".to_owned());
+    }
+}
+
+struct ActivationReviewMarkers<'a> {
+    verify: &'a str,
+    verify_subject: &'a str,
+    author_authorization: &'a str,
+    author_packet: &'a str,
+    reviewer_authorization: &'a str,
+    reviewer_packet: &'a str,
+}
+
+fn activation_review_structure_exact(
+    workflow: &str,
+    retain: &str,
+    author: &str,
+    reviewer: &str,
+    finalize: &str,
+    markers: &ActivationReviewMarkers<'_>,
+) -> bool {
+    workflow.starts_with("name: Collection Activation Review\n\non:\n  workflow_dispatch:\n")
+        && workflow.matches("  workflow_dispatch:").count() == 1
+        && !workflow.contains("  push:")
+        && !workflow.contains("contents: write")
+        && !workflow.contains("git push")
+        && !workflow.contains("promotionAuthority: true")
+        && workflow
+            .matches("collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_ACTIVATION_SHA\"")
+            .count()
+            == 4
+        && retain.matches(markers.verify).count() == 1
+        && retain.matches("GITHUB_TOKEN: ${{ github.token }}").count() == 1
+        && markers_are_ordered(
+            retain,
+            &[
+                markers.verify,
+                "id: bind-review-subject",
+                "path: ci-out/collection-activation-review-subject",
+            ],
+        )
+        && retain.contains("artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}")
+        && retain
+            .contains("directory_sha256: ${{ steps.bind-review-subject.outputs.directory_sha256 }}")
+        && retain
+            .matches(
+                "collection-activation-proposal-${{ github.run_id }}-${{ github.run_attempt }}",
             )
-        && lines[..index]
-            .iter()
-            .rev()
-            .take(2)
-            .any(|line| *line == "      - name: Acquire exact immutable external artifact set")
+            .count()
+            == 1
+        && author
+            .matches("environment: compatibility-claim-author")
+            .count()
+            == 1
+        && reviewer
+            .matches("environment: compatibility-claim-review")
+            .count()
+            == 1
+        && author.matches("--role claim-author").count() == 3
+        && !author.contains("--role claim-reviewer")
+        && reviewer.matches("--role claim-reviewer").count() == 3
+        && !reviewer.contains("--role claim-author")
+        && !author.contains(markers.verify)
+        && !reviewer.contains(markers.verify)
+        && workflow.matches(markers.verify_subject).count() == 3
+        && workflow
+            .matches("WRAPPER_DIRECTORY_SHA256: ${{ needs.retain-proposal.outputs.directory_sha256 }}")
+            .count()
+            == 3
+        && workflow
+            .matches("artifact-ids: ${{ needs.retain-proposal.outputs.artifact_id }}")
+            .count()
+            == 3
+        && activation_signer_exact(
+            author,
+            markers.verify_subject,
+            markers.author_authorization,
+            markers.author_packet,
+            "claim-author",
+        )
+        && activation_signer_exact(
+            reviewer,
+            markers.verify_subject,
+            markers.reviewer_authorization,
+            markers.reviewer_packet,
+            "claim-reviewer",
+        )
+        && author
+            .matches("secrets.CLAIM_AUTHOR_SSH_PRIVATE_KEY")
+            .count()
+            == 1
+        && reviewer
+            .matches("secrets.CLAIM_REVIEWER_SSH_PRIVATE_KEY")
+            .count()
+            == 1
+        && !finalize.contains("environment:")
+        && !finalize.contains("id-token: write")
+        && activation_finalizer_exact(finalize, markers.verify_subject)
+}
+
+fn activation_signer_exact(
+    job: &str,
+    verify_subject: &str,
+    authorization: &str,
+    packet: &str,
+    role: &str,
+) -> bool {
+    let sign = format!(
+        "review-sign --input ci-out/collection-activation-review/{role}/review-packet.json"
+    );
+    let bind = format!(
+        "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/collection-activation-review/{role}"
+    );
+    markers_are_ordered(
+        job,
+        &[
+            "path: ci-in/collection-activation-review-subject",
+            verify_subject,
+            authorization,
+            packet,
+            "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
+            "webfactory/ssh-agent@",
+            &sign,
+            &bind,
+            "id: upload-review",
+        ],
+    ) && job
+        .matches("artifact_id: ${{ steps.upload-review.outputs.artifact-id }}")
+        .count()
+        == 1
+        && job
+            .matches("artifact_digest: ${{ steps.upload-review.outputs.artifact-digest }}")
+            .count()
+            == 1
+        && job
+            .matches("directory_sha256: ${{ steps.bind-review.outputs.directory_sha256 }}")
+            .count()
+            == 1
+}
+
+fn activation_finalizer_exact(finalize: &str, verify_subject: &str) -> bool {
+    markers_are_ordered(
+        finalize,
+        &[
+            "needs.retain-proposal.outputs.artifact_id",
+            verify_subject,
+            "needs.claim-author.outputs.artifact_id",
+            "needs.claim-reviewer.outputs.artifact_id",
+            "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
+            "collection-authority finalize-activation --input ci-in/collection-activation-review-subject --signature ci-in/collection-activation-review/claim-author --integration-review ci-in/collection-activation-review/claim-reviewer --output ci-out/collection-activation-tree",
+            "id: bind-tree",
+            "id: upload-tree",
+        ],
+    ) && finalize
+        .matches("tree_artifact_id: ${{ steps.upload-tree.outputs.artifact-id }}")
+        .count()
+        == 1
+        && finalize
+            .matches("tree_artifact_digest: ${{ steps.upload-tree.outputs.artifact-digest }}")
+            .count()
+            == 1
+        && finalize
+            .matches("tree_directory_sha256: ${{ steps.bind-tree.outputs.directory_sha256 }}")
+            .count()
+            == 1
 }
 
 fn reviewed_provider_metadata_token_binding(
@@ -2288,6 +5657,57 @@ fn reviewed_provider_metadata_token_binding(
             .rev()
             .take(2)
             .any(|line| *line == "      - name: Record primary acquisition receipt")
+}
+
+fn reviewed_provider_replay_token_binding(
+    path: &Path,
+    lines: &[&str],
+    index: usize,
+    original: &str,
+) -> bool {
+    if original != "        env:"
+        || lines.get(index + 1) != Some(&"          GITHUB_TOKEN: ${{ github.token }}")
+    {
+        return false;
+    }
+    let run = lines.get(index + 2).copied().unwrap_or_default();
+    matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci case-coverage prepare-decisions --input ci-out/evidence/claim-decisions/source/claim-coverage.details.json --from decision-source/compat/reviews/claim-applicability-decisions.json --output ci-out/evidence/claim-decisions/claim-applicability-decisions.json --github-dispatch-inputs"
+        ) if path == workflow_path("claim-applicability-decisions.yml")
+    ) || matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci review-assemble prepare --github-dispatch-inputs"
+        ) if path == workflow_path("promotion-evidence-review.yml")
+    ) || matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci promotion-proposal --input ci-out/native-shards --output ci-out/native-shards/promotion-proposal.json --github-dispatch-inputs"
+        ) if path == workflow_path("promotion-proposal.yml")
+    ) || matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci promotion-approval-subject --input ci-out/native-shards/promotion-proposal.json --output ci-out/native-shards/promotion-approval-subject.json"
+        ) if path == workflow_path("promotion-approval.yml")
+    ) || matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci artifact-acquire assemble-finalize --input ci-out/finalize-source --output ci-out/acquisition --github-dispatch-inputs"
+        ) if path == workflow_path("artifact-authenticity-finalize.yml")
+    ) || matches!(
+        (path, run),
+        (
+            path,
+            "        run: ./target/ci/hell-ci surveillance-ops workflow-objective"
+        ) if path == workflow_path("promotion-surveillance.yml")
+    )
 }
 
 fn check_offline_packet_verifier_order(path: &Path, lines: &[&str], failures: &mut Vec<String>) {
@@ -2657,6 +6077,21 @@ fn reviewed_evidence_review_token_binding(
                     "        run: ./target/ci/hell-ci review-authorization --input ci-out/custody-subject/review-packet.json --output ci-out/custody/authorization.json --role custody-reviewer --category custody-final --github-dispatch-inputs"
                 )
             ))
+        || reviewed_activation_token_binding(path, name, run)
+}
+
+fn reviewed_activation_token_binding(path: &Path, name: &str, run: &str) -> bool {
+    path == workflow_path("collection-activation.yml")
+        && matches!(
+            (name, run),
+            (
+                "      - name: Retain protected claim author authorization",
+                "        run: ./target/ci/hell-ci review-authorization --input ci-in/collection-activation-review-subject/review-subject.json --output ci-out/collection-activation-review/claim-author/authorization.json --role claim-author --category collection-activation-author --github-dispatch-inputs"
+            ) | (
+                "      - name: Retain protected claim reviewer authorization",
+                "        run: ./target/ci/hell-ci review-authorization --input ci-in/collection-activation-review-subject/review-subject.json --output ci-out/collection-activation-review/claim-reviewer/authorization.json --role claim-reviewer --category collection-activation-final --github-dispatch-inputs"
+            )
+        )
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
@@ -2971,6 +6406,57 @@ fn check_environment_configuration(root: &Path, tracked: &[PathBuf], failures: &
 mod tests {
     use super::*;
 
+    #[test]
+    fn evidence_canonicalization_limits_require_exact_source_and_classification() {
+        let source = include_str!("../../hell-runtime/src/lib.rs");
+        let inventory = include_str!("../../../spec/runtime-profiles.md");
+        for (name, declaration) in [
+            ("MAX_DEPTH", "const MAX_DEPTH: usize = 64;"),
+            ("MAX_ELEMENTS", "const MAX_ELEMENTS: usize = 1_024;"),
+        ] {
+            let mut baseline = Vec::new();
+            check_exact_evidence_limit(
+                "crates/hell-runtime/src/lib.rs",
+                name,
+                source,
+                inventory,
+                &mut baseline,
+            );
+            assert!(baseline.is_empty(), "{name}: {baseline:?}");
+
+            let source_mutant = source.replacen(declaration, "const MUTATED_LIMIT: usize = 1;", 1);
+            let mut source_failures = Vec::new();
+            check_exact_evidence_limit(
+                "crates/hell-runtime/src/lib.rs",
+                name,
+                &source_mutant,
+                inventory,
+                &mut source_failures,
+            );
+            assert!(!source_failures.is_empty(), "accepted source mutant {name}");
+
+            let row = inventory
+                .lines()
+                .find(|line| {
+                    line.contains("`crates/hell-runtime/src/lib.rs`") && line.contains(name)
+                })
+                .unwrap();
+            let inventory_mutant = inventory.replacen(row, "| missing reviewed row |", 1);
+            let mut inventory_failures = Vec::new();
+            check_exact_evidence_limit(
+                "crates/hell-runtime/src/lib.rs",
+                name,
+                source,
+                &inventory_mutant,
+                &mut inventory_failures,
+            );
+            assert!(
+                !inventory_failures.is_empty(),
+                "accepted inventory mutant {name}"
+            );
+        }
+    }
+
     fn workflow(body: &str) -> Vec<String> {
         let mut failures = Vec::new();
         check_workflow(Path::new("workflow.yml"), body, &mut failures);
@@ -2980,6 +6466,30 @@ mod tests {
     fn collection_authority_policy(workflow: &str, tool: &str) -> Vec<String> {
         let mut failures = Vec::new();
         check_collection_authority_producer_text(workflow, tool, &mut failures);
+        failures
+    }
+
+    fn collection_custody_integration_policy(workflow: &str, revocations: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        check_collection_custody_integration_text(workflow, revocations, &mut failures);
+        failures
+    }
+
+    fn collection_custody_review_policy(workflow: &str, trust_roots: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        check_collection_custody_review_text(workflow, trust_roots, &mut failures);
+        failures
+    }
+
+    fn collection_worm_bridge_policy(workflow: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        check_collection_worm_bridge_text(workflow, &mut failures);
+        failures
+    }
+
+    fn collection_activation_preparation_policy(workflow: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        check_collection_activation_preparation_text(workflow, &mut failures);
         failures
     }
 
@@ -3015,10 +6525,314 @@ mod tests {
         }
     }
 
+    fn collection_custody_integration_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        let mut mutants = vec![
+            (
+                "trigger",
+                workflow.replacen("  workflow_dispatch:", "  push:\n  workflow_dispatch:", 1),
+            ),
+            (
+                "optional-input",
+                workflow.replacen("required: true", "required: false", 1),
+            ),
+            (
+                "non-current-integration",
+                workflow.replacen(" && inputs.integration_sha == github.sha", "", 1),
+            ),
+            (
+                "unprotected-environment",
+                workflow.replacen(
+                    "environment: collection-custody-integration",
+                    "environment: unreviewed",
+                    1,
+                ),
+            ),
+            (
+                "shallow-checkout",
+                workflow.replacen("fetch-depth: 0", "fetch-depth: 1", 1),
+            ),
+            (
+                "credential-retention",
+                workflow.replacen("persist-credentials: false", "persist-credentials: true", 1),
+            ),
+            (
+                "checkout-pin",
+                workflow.replacen(
+                    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                    "actions/checkout@0000000000000000000000000000000000000000",
+                    1,
+                ),
+            ),
+            (
+                "candidate-substitution",
+                workflow.replacen(
+                    "--candidate-commit \"$COLLECTION_INTEGRATION_SHA\"",
+                    "--candidate-commit HEAD",
+                    1,
+                ),
+            ),
+            (
+                "direct-input-interpolation",
+                workflow.replacen(
+                    "--candidate-commit \"$COLLECTION_INTEGRATION_SHA\"",
+                    "--candidate-commit \"${{ inputs.integration_sha }}\"",
+                    1,
+                ),
+            ),
+        ];
+        mutants.extend(collection_custody_integration_worm_mutants(workflow));
+        mutants
+    }
+
+    fn collection_custody_integration_worm_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        let mut mutants = vec![
+            ("proof-substitution", workflow.replacen("--integration-proof compat/collection-custody/integration-proof.tsv", "--integration-proof ci-out/unreviewed.tsv", 1)),
+            ("review-substitution", workflow.replacen("--integration-review compat/collection-custody/integration-review.dsse.json", "--integration-review ci-out/unreviewed.dsse.json", 1)),
+            ("activation-token-omission", workflow.replacen("            ci-out/collection-custody-activation-token.json\n", "", 1)),
+            ("activation-token-digest-omission", workflow.replacen("            ci-out/collection-custody-activation-token.json.sha256\n", "", 1)),
+            ("admission-directory-binding-omission", workflow.replacen("run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out", "run: true", 1)),
+            ("admission-artifact-output-substitution", workflow.replacen("steps.upload-admission.outputs.artifact-id", "steps.upload-admission.outputs.artifact-digest", 1)),
+            ("admission-directory-output-substitution", workflow.replacen("steps.bind-admission.outputs.directory_sha256", "steps.upload-admission.outputs.artifact-digest", 1)),
+            ("write-permission", workflow.replacen("contents: read", "contents: write", 1)),
+        ];
+        mutants.extend([
+            (
+                "artifact-name-instead-of-id",
+                workflow.replacen(
+                    "artifact-ids: ${{ inputs.worm_artifact_id }}",
+                    "name: collection-worm-custody",
+                    1,
+                ),
+            ),
+            (
+                "source-run-substitution",
+                workflow.replacen(
+                    "run-id: ${{ inputs.worm_source_run_id }}",
+                    "run-id: ${{ github.run_id }}",
+                    1,
+                ),
+            ),
+            (
+                "worm-path-substitution",
+                workflow.replacen(
+                    "path: ci-in/collection-worm-custody",
+                    "path: ci-in/unreviewed",
+                    1,
+                ),
+            ),
+            (
+                "worm-digest-omission",
+                workflow.replacen(
+                    "collection-authority verify-worm-artifact",
+                    "collection-authority verify-checkout",
+                    1,
+                ),
+            ),
+            (
+                "archive-digest-substitution",
+                workflow.replacen(
+                    "inputs.expected_worm_directory_sha256",
+                    "inputs.worm_artifact_digest",
+                    1,
+                ),
+            ),
+            (
+                "worm-admission-omission",
+                workflow.replacen(" --worm-custody ci-in/collection-worm-custody", "", 1),
+            ),
+            (
+                "cache-workflow-binding",
+                workflow.replacen(
+                    ".github/workflows/collection-custody-integration.yml') }}",
+                    ".github/workflows/unreviewed.yml') }}",
+                    1,
+                ),
+            ),
+            (
+                "cache-integration-sha-binding",
+                workflow.replacen(
+                    "integration-target-${{ inputs.integration_sha }}-",
+                    "integration-target-unbound-",
+                    1,
+                ),
+            ),
+            (
+                "cache-save-not-always",
+                workflow.replacen(
+                    "if: ${{ always() && steps.target-cache.outcome",
+                    "if: ${{ success() && steps.target-cache.outcome",
+                    1,
+                ),
+            ),
+        ]);
+        mutants
+    }
+
+    fn collection_custody_review_trust_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "trigger",
+                workflow.replacen("  workflow_dispatch:", "  push:\n  workflow_dispatch:", 1),
+            ),
+            (
+                "non-current-preparation",
+                workflow.replacen(" && inputs.preparation_sha == github.sha", "", 1),
+            ),
+            (
+                "unlinked-artifact",
+                workflow.replacen(
+                    "needs.prepare-unsigned-custody-review.outputs.artifact_id",
+                    "inputs.preparation_artifact_id",
+                    1,
+                ),
+            ),
+            (
+                "unprotected-environment",
+                workflow.replacen(
+                    "environment: collection-custody-review",
+                    "environment: unreviewed",
+                    1,
+                ),
+            ),
+            (
+                "missing-oidc",
+                workflow.replacen("id-token: write", "id-token: none", 1),
+            ),
+            (
+                "payload-substitution",
+                workflow.replacen(
+                    "ci-in/collection-custody-review/integration-review-payload.json",
+                    "ci-in/unreviewed.json",
+                    1,
+                ),
+            ),
+            (
+                "direct-preparation-interpolation",
+                workflow.replacen(
+                    "--candidate-commit \"$COLLECTION_PREPARATION_SHA\"",
+                    "--candidate-commit \"${{ inputs.preparation_sha }}\"",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn collection_custody_review_cache_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        let mut mutants = collection_custody_review_input_mutants(workflow);
+        mutants.extend([
+            (
+                "validator-after-key",
+                workflow.replacen(
+                    "      - name: Validate exact unsigned custody review inventory and roots\n        run: ./target/ci/hell-ci collection-authority verify-custody-review-preparation --input ci-in/collection-custody-review\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "role-substitution",
+                workflow.replacen("--role custody-reviewer", "--role claim-reviewer", 1),
+            ),
+            (
+                "missing-overlay-assembly",
+                workflow.replacen(
+                    "      - name: Assemble exact commit-ready proof and review overlay\n        run: ./target/ci/hell-ci collection-authority assemble-custody-review-overlay --input ci-in/collection-custody-review --integration-review ci-in/collection-custody-review-signed/integration-review.dsse.json --output ci-out/collection-custody-review-overlay\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "overlay-proof-substitution",
+                workflow.replacen(
+                    "--input ci-in/collection-custody-review --integration-review",
+                    "--input ci-in/unreviewed-custody-review --integration-review",
+                    1,
+                ),
+            ),
+            (
+                "overlay-review-substitution",
+                workflow.replacen(
+                    "--integration-review ci-in/collection-custody-review-signed/integration-review.dsse.json",
+                    "--integration-review ci-in/unreviewed.dsse.json",
+                    1,
+                ),
+            ),
+            (
+                "overlay-directory-digest-omission",
+                workflow.replacen(
+                    "      overlay_directory_sha256: ${{ steps.bind-overlay.outputs.directory_sha256 }}\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "overlay-artifact-id-substitution",
+                workflow.replacen(
+                    "overlay_artifact_id: ${{ steps.upload-overlay.outputs.artifact-id }}",
+                    "overlay_artifact_id: unbound",
+                    1,
+                ),
+            ),
+            (
+                "overlay-broad-upload",
+                workflow.replacen(
+                    "path: ci-out/collection-custody-review-overlay/tree",
+                    "path: ci-out/collection-custody-review-overlay",
+                    1,
+                ),
+            ),
+            (
+                "cache-workflow-binding",
+                workflow.replacen(
+                    ".github/workflows/collection-custody-review.yml') }}",
+                    ".github/workflows/unreviewed.yml') }}",
+                    1,
+                ),
+            ),
+            (
+                "cache-preparation-sha-binding",
+                workflow.replacen(
+                    "prepare-target-${{ inputs.preparation_sha }}-",
+                    "prepare-target-unbound-",
+                    1,
+                ),
+            ),
+            (
+                "cache-save-not-always",
+                workflow.replacen(
+                    "if: ${{ always() && steps.target-cache.outcome",
+                    "if: ${{ success() && steps.target-cache.outcome",
+                    1,
+                ),
+            ),
+        ]);
+        mutants
+    }
+
+    fn collection_custody_review_input_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "direct-reviewer-interpolation",
+                workflow.replacen(
+                    "--reviewer \"$COLLECTION_CUSTODY_REVIEWER\"",
+                    "--reviewer \"${{ inputs.reviewer }}\"",
+                    1,
+                ),
+            ),
+            (
+                "direct-issued-at-interpolation",
+                workflow.replacen(
+                    "--issued-at \"$COLLECTION_CUSTODY_ISSUED_AT\"",
+                    "--issued-at \"${{ inputs.issued_at }}\"",
+                    1,
+                ),
+            ),
+        ]
+    }
+
     #[test]
     fn collection_authority_workflow_is_isolated_and_producers_are_exact() {
         let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
-        let tool = include_str!("../../../tools/collection_authority_acquire.py");
+        let tool = include_str!("collection_transport.rs");
         assert!(
             collection_authority_policy(campaign, tool).is_empty(),
             "{}",
@@ -3103,9 +6917,122 @@ mod tests {
     }
 
     #[test]
+    fn collection_authority_payload_overlay_is_exact() {
+        let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
+        let tool = include_str!("collection_transport.rs");
+        assert_collection_workflow_mutants_rejected(
+            tool,
+            [
+                (
+                    "payload-overlay-omission",
+                    collection_job_mutant(
+                        campaign,
+                        "assemble-custody-payload-overlay",
+                        "collection-authority assemble-custody-payload-overlay",
+                        "collection-authority verify",
+                    ),
+                ),
+                (
+                    "payload-overlay-artifact-substitution",
+                    collection_job_mutant(
+                        campaign,
+                        "assemble-custody-payload-overlay",
+                        "needs.merge-collection-authority.outputs.custody_artifact_id",
+                        "inputs.artifact_id",
+                    ),
+                ),
+                (
+                    "payload-overlay-broad-upload",
+                    collection_job_mutant(
+                        campaign,
+                        "assemble-custody-payload-overlay",
+                        "path: ci-out/collection-custody-payload-overlay/tree",
+                        "path: ci-out/collection-custody-payload-overlay",
+                    ),
+                ),
+                (
+                    "payload-overlay-directory-digest-omission",
+                    collection_job_mutant(
+                        campaign,
+                        "assemble-custody-payload-overlay",
+                        "overlay_directory_sha256: ${{ steps.bind-overlay.outputs.directory_sha256 }}",
+                        "overlay_directory_sha256: unbound",
+                    ),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn collection_custody_integration_is_exact_and_rejects_substitutions() {
+        let workflow =
+            include_str!("../../../.github/workflows/collection-custody-integration.yml");
+        let revocations = include_str!("../../../compat/collection-authority-revocations.toml");
+        assert!(
+            collection_custody_integration_policy(workflow, revocations).is_empty(),
+            "{:?}",
+            collection_custody_integration_policy(workflow, revocations)
+        );
+        for (label, mutant) in collection_custody_integration_mutants(workflow) {
+            assert!(
+                !collection_custody_integration_policy(&mutant, revocations).is_empty(),
+                "accepted collection custody integration substitution {label}"
+            );
+        }
+        for mutant in [
+            revocations.replacen("state = \"active\"", "state = \"review-required\"", 1),
+            revocations.replacen(
+                "revoked_provider_run_ids = []",
+                "revoked_provider_run_ids = [\"42\", \"21\"]",
+                1,
+            ),
+        ] {
+            assert!(
+                !collection_custody_integration_policy(workflow, &mutant).is_empty(),
+                "accepted noncanonical collection authority revocations"
+            );
+        }
+        let canonical_nonempty = revocations.replacen(
+            "revoked_provider_run_ids = []",
+            "revoked_provider_run_ids = [\"21\", \"42\"]",
+            1,
+        );
+        assert!(
+            collection_custody_integration_policy(workflow, &canonical_nonempty).is_empty(),
+            "rejected canonical nonempty collection authority revocations"
+        );
+    }
+
+    #[test]
+    fn collection_custody_review_is_needs_linked_protected_and_exact() {
+        let workflow = include_str!("../../../.github/workflows/collection-custody-review.yml");
+        let trust_roots = include_str!("../../../compat/trust-roots.toml");
+        assert!(
+            collection_custody_review_policy(workflow, trust_roots).is_empty(),
+            "{:?}",
+            collection_custody_review_policy(workflow, trust_roots)
+        );
+        let mutants = collection_custody_review_trust_mutants(workflow)
+            .into_iter()
+            .chain(collection_custody_review_cache_mutants(workflow));
+        for (label, mutant) in mutants {
+            assert!(
+                !collection_custody_review_policy(&mutant, trust_roots).is_empty(),
+                "accepted collection custody review substitution {label}"
+            );
+        }
+        let substituted_roots = trust_roots.replacen(
+            "collection_custody_review_workflow = \".github/workflows/collection-custody-review.yml\"",
+            "collection_custody_review_workflow = \".github/workflows/unreviewed.yml\"",
+            1,
+        );
+        assert!(!collection_custody_review_policy(workflow, &substituted_roots).is_empty());
+    }
+
+    #[test]
     fn collection_authority_rejects_candidate_control_of_trusted_harness() {
         let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
-        let tool = include_str!("../../../tools/collection_authority_acquire.py");
+        let tool = include_str!("collection_transport.rs");
         assert_collection_workflow_mutants_rejected(
             tool,
             [
@@ -3114,8 +7041,17 @@ mod tests {
                     collection_job_mutant(
                         campaign,
                         "collection-authority-macos",
-                        "run: git -C ci-work/candidate merge-base --is-ancestor \"$HELL_SOURCE_COMMIT\" HEAD",
+                        "run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$HELL_SOURCE_COMMIT\"",
                         "run: true",
+                    ),
+                ),
+                (
+                    "ancestry-instead-of-identity",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-macos",
+                        "run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit \"$HELL_SOURCE_COMMIT\"",
+                        "run: git -C ci-work/candidate merge-base --is-ancestor \"$HELL_SOURCE_COMMIT\" HEAD",
                     ),
                 ),
                 (
@@ -3152,7 +7088,7 @@ mod tests {
     #[test]
     fn collection_authority_linux_acquisition_roles_reject_substitution() {
         let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
-        let tool = include_str!("../../../tools/collection_authority_acquire.py");
+        let tool = include_str!("collection_transport.rs");
         assert_collection_workflow_mutants_rejected(
             tool,
             [
@@ -3190,14 +7126,186 @@ mod tests {
                         1,
                     ),
                 ),
+                (
+                    "subject-provider-head-verification",
+                    collection_job_mutant(
+                        campaign,
+                        "linux-acquisition-subject",
+                        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+                        "run: true",
+                    ),
+                ),
+                (
+                    "signer-provider-head-verification",
+                    collection_job_mutant(
+                        campaign,
+                        "sign-linux-acquisition",
+                        "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+                        "run: true",
+                    ),
+                ),
             ],
         );
     }
 
     #[test]
+    fn collection_authority_caches_reject_incomplete_or_shared_keys() {
+        let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
+        let tool = include_str!("collection_transport.rs");
+        assert_collection_workflow_mutants_rejected(
+            tool,
+            [
+                (
+                    "provider-compile-input",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-linux",
+                        "'builtins/**', ",
+                        "",
+                    ),
+                ),
+                (
+                    "provider-cache-sharing",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-macos",
+                        "collection-macos-target-",
+                        "collection-linux-target-",
+                    ),
+                ),
+                (
+                    "candidate-sha",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-linux",
+                        "collection-candidate-${{ inputs.candidate_sha }}-",
+                        "collection-candidate-unbound-",
+                    ),
+                ),
+                (
+                    "candidate-compile-input",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-macos",
+                        "'ci-work/candidate/spec/**', ",
+                        "",
+                    ),
+                ),
+                (
+                    "stack-workflow-binding",
+                    collection_job_mutant(
+                        campaign,
+                        "collection-authority-windows",
+                        ".github/workflows/collection-authority.yml') }}",
+                        ".github/workflows/unreviewed.yml') }}",
+                    ),
+                ),
+                (
+                    "cache-save-not-always",
+                    collection_job_mutant(
+                        campaign,
+                        "merge-collection-authority",
+                        "if: ${{ always() && steps.target-cache.outcome",
+                        "if: ${{ success() && steps.target-cache.outcome",
+                    ),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn collection_worm_bridge_preserves_prepared_identity_and_requires_review() {
+        let workflow = include_str!("../../../.github/workflows/evidence-custody.yml");
+        assert!(
+            collection_worm_bridge_policy(workflow).is_empty(),
+            "{:?}",
+            collection_worm_bridge_policy(workflow)
+        );
+        for (label, mutant) in [
+            (
+                "repackage",
+                workflow.replacen(
+                    "collection-authority prepare-worm-custody",
+                    "custody-ops workflow-package",
+                    1,
+                ),
+            ),
+            (
+                "mutable-package-name",
+                workflow.replacen(
+                    "artifact-ids: ${{ needs.package.outputs.artifact_id }}",
+                    "name: ephemeralEvidence-custody-package-${{ github.run_id }}-${{ github.run_attempt }}",
+                    1,
+                ),
+            ),
+            (
+                "credentials-before-validation",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci custody-ops verify-package --input ci-out/custody-package",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "upload-subject-validation-omission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci custody-ops workflow-verify-upload-subject",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "upload-subject-provider-substitution",
+                workflow.replacen(
+                    "CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}",
+                    "CUSTODY_EXPECTED_PROVIDER: primary-worm",
+                    1,
+                ),
+            ),
+            (
+                "upload-subject-extra-transport",
+                workflow.replacen(
+                    "            ci-out/upload-receipt.dsse.json\n",
+                    "            ci-out/upload-receipt.dsse.json\n            ci-out/custody-package\n",
+                    1,
+                ),
+            ),
+            (
+                "review-credentials-before-finalization",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci review-packet --input ci-out/custody-subject/review-packet.json --from ci-out/custody/authorization.json --output ci-out/custody/review-packet.authorized.json --role custody-reviewer --category custody-final --decision accept --github-dispatch-inputs",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "subject-omission",
+                workflow.replacen("            ci-out/subject\n", "", 1),
+            ),
+            (
+                "scrub-omission",
+                workflow.replacen("path: ci-out/primary-worm-current-scrub", "path: ci-out", 1),
+            ),
+            (
+                "automatic-admission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci custody-ops workflow-assemble-collection-worm",
+                    "run: ./target/ci/hell-ci collection-authority verify-custody --worm-custody ci-out/collection-worm-custody",
+                    1,
+                ),
+            ),
+        ] {
+            assert!(
+                !collection_worm_bridge_policy(&mutant).is_empty(),
+                "accepted collection WORM bridge substitution {label}"
+            );
+        }
+    }
+
+    #[test]
     fn collection_authority_merge_rejects_transport_and_identity_substitutions() {
         let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
-        let tool = include_str!("../../../tools/collection_authority_acquire.py");
+        let tool = include_str!("collection_transport.rs");
         assert_collection_workflow_mutants_rejected(
             tool,
             [
@@ -3218,14 +7326,20 @@ mod tests {
                 1,
             )),
                 ("run-attempt", campaign.replacen(
-                "$GITHUB_RUN_ATTEMPT:$COLLECTION_LINUX_ARTIFACT_ID",
-                "1:$COLLECTION_LINUX_ARTIFACT_ID",
+                "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+                "--run-attempt 1",
                 1,
             )),
                 ("provider-candidate", campaign.replacen(
                 "--provider-head \"$GITHUB_SHA\" --candidate-commit \"$HELL_SOURCE_COMMIT\"",
                 "--provider-head \"$HELL_SOURCE_COMMIT\" --candidate-commit \"$GITHUB_SHA\"",
                 1,
+            )),
+                ("merge-provider-head-verification", collection_job_mutant(
+                campaign,
+                "merge-collection-authority",
+                "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$GITHUB_SHA\"",
+                "run: true",
             )),
                 ("subject-input", campaign.replacen(
                 "collection-authority subject --input ci-out/collection-shard/linux-amd64",
@@ -3238,12 +7352,12 @@ mod tests {
                 1,
             )),
                 ("attested-subject", campaign.replacen(
+                "subject-path: ci-out/collection-custody/custody-attestation-subject.json",
                 "subject-path: ci-out/native-shards/collection-authority.json",
-                "subject-path: ci-out/native-shards/merge-report.json",
                 1,
             )),
                 ("name-download", campaign.replacen(
-                "run: python3 tools/collection_authority_acquire.py --repository",
+                "run: ./target/ci/hell-ci collection-authority acquire-provider --repository",
                 "uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0\n        with:\n          name: collection-authority-merged\n      - run: true #",
                 1,
             )),
@@ -3251,59 +7365,201 @@ mod tests {
         );
     }
 
+    fn collection_custody_authority_mutants(campaign: &str) -> Vec<(&'static str, String)> {
+        let reordered = campaign
+            .replacen(COLLECTION_VERIFY_COMMAND, "run: __collection_verify__", 1)
+            .replacen(COLLECTION_COMPACT_COMMAND, COLLECTION_VERIFY_COMMAND, 1)
+            .replacen("run: __collection_verify__", COLLECTION_COMPACT_COMMAND, 1);
+        let gh_reordered = campaign
+            .replacen(
+                COLLECTION_INSTALL_GH_COMMAND,
+                "run: __collection_install_gh__",
+                1,
+            )
+            .replacen(
+                "uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1",
+                COLLECTION_INSTALL_GH_COMMAND,
+                1,
+            )
+            .replacen(
+                "run: __collection_install_gh__",
+                "uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1",
+                1,
+            );
+        vec![
+            ("compact-before-verify", reordered),
+            ("gh-install-after-attest", gh_reordered),
+            (
+                "alternate-install-driver",
+                campaign.replacen(
+                    "run: ./target/ci/hell-ci collection-authority install-pinned-gh",
+                    "run: cargo run --package hell-ci -- collection-authority install-pinned-gh",
+                    1,
+                ),
+            ),
+            (
+                "verified-report-substitution",
+                campaign.replacen(
+                    "--verified-report ci-out/native-shards/collection-authority.json",
+                    "--verified-report ci-out/native-shards/unverified.json",
+                    1,
+                ),
+            ),
+            (
+                "attestation-bundle-substitution",
+                campaign.replacen(
+                    "steps.attest-collection-custody.outputs.bundle-path",
+                    "steps.unreviewed.outputs.bundle-path",
+                    1,
+                ),
+            ),
+            (
+                "path-gh-fallback",
+                campaign.replacen(
+                    "--gh-executable ci-out/collection-custody-tools/gh",
+                    "--gh-executable gh",
+                    1,
+                ),
+            ),
+            (
+                "gh-install-manifest-substitution",
+                campaign.replacen(
+                    "ci-out/collection-custody-tools/gh-install-manifest.json",
+                    "ci-out/unreviewed-gh.json",
+                    1,
+                ),
+            ),
+            (
+                "signature-output-substitution",
+                campaign.replacen(
+                    "--output ci-out/collection-custody-signature",
+                    "--output ci-out/unreviewed-signature",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn collection_custody_transport_mutants(campaign: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "transient-provider-upload",
+                campaign.replacen(
+                    "            ci-out/collection-custody-signature\n",
+                    "            ci-out/collection-provider\n",
+                    1,
+                ),
+            ),
+            (
+                "transient-shard-upload",
+                campaign.replacen(
+                    "            ci-out/collection-custody\n",
+                    "            ci-out/native-shards\n",
+                    1,
+                ),
+            ),
+            (
+                "automatic-integration",
+                campaign.replacen(
+                    "      - name: Upload compact collection custody transport only",
+                    "      - run: ./target/ci/hell-ci collection-authority verify-custody\n      - name: Upload compact collection custody transport only",
+                    1,
+                ),
+            ),
+            (
+                "artifact-digest-output",
+                campaign.replacen(
+                    "steps.upload-collection-custody.outputs.artifact-digest",
+                    "steps.upload-collection-custody.outputs.unreviewed",
+                    1,
+                ),
+            ),
+            (
+                "transport-name",
+                campaign.replacen(
+                    "collection-authority-custody-${{ github.run_id }}-${{ github.run_attempt }}",
+                    "collection-authority-merged-${{ github.run_id }}-${{ github.run_attempt }}",
+                    1,
+                ),
+            ),
+            (
+                "unbounded-merge",
+                campaign.replacen("timeout-minutes: 90", "timeout-minutes: 360", 1),
+            ),
+        ]
+    }
+
     #[test]
-    fn collection_authority_acquisition_invariants_reject_substitution() {
+    fn collection_custody_workflow_rejects_transient_or_uncontrolled_authority() {
         let campaign = include_str!("../../../.github/workflows/collection-authority.yml");
-        let tool = include_str!("../../../tools/collection_authority_acquire.py");
+        let tool = include_str!("collection_transport.rs");
+        assert_collection_workflow_mutants_rejected(
+            tool,
+            collection_custody_authority_mutants(campaign),
+        );
+        assert_collection_workflow_mutants_rejected(
+            tool,
+            collection_custody_transport_mutants(campaign),
+        );
+    }
+
+    #[test]
+    fn collection_transport_source_rejects_authority_substitutions() {
+        let tool = include_str!("collection_transport.rs");
+        let mut baseline = Vec::new();
+        check_collection_transport_source(tool, &mut baseline);
+        assert!(baseline.is_empty(), "{baseline:?}");
         for (label, mutant) in [
             (
-                "page-size",
-                tool.replacen("PER_PAGE = 100", "PER_PAGE = 99", 1),
-            ),
-            (
-                "job-completion",
+                "release-version",
                 tool.replacen(
-                    "producer job {expected_name} did not complete successfully",
-                    "producer job may still be running",
+                    "const GH_VERSION: &str = \"2.93.0\";",
+                    "const GH_VERSION: &str = \"latest\";",
                     1,
                 ),
             ),
             (
-                "archive",
-                tool.replacen("provider-archive.zip", "provider-repacked.zip", 1),
-            ),
-            (
-                "run-event",
+                "archive-digest",
                 tool.replacen(
-                    "require_string(run.get(\"event\"), \"run event\") != \"workflow_dispatch\"",
-                    "False",
+                    "02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0",
+                    "12d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0",
                     1,
                 ),
             ),
             (
-                "run-branch",
+                "binary-digest",
                 tool.replacen(
-                    "require_string(run.get(\"head_branch\"), \"run head branch\") != \"main\"",
-                    "False",
+                    "014fcd614de4de5b4a1441d298175684bad99f713d10296c5fcaaba47ac332d1",
+                    "114fcd614de4de5b4a1441d298175684bad99f713d10296c5fcaaba47ac332d1",
                     1,
                 ),
             ),
             (
-                "mode",
+                "provider-pages",
+                tool.replacen("fn provider_pages(", "fn unreviewed_provider_pages(", 1),
+            ),
+            (
+                "attestation-validation",
                 tool.replacen(
-                    "artifact ZIP file {info.filename!r} has invalid mode",
-                    "artifact mode ignored",
+                    "fn validate_attestation_verification(",
+                    "fn accept_verification_result(",
                     1,
                 ),
             ),
             (
-                "inventory",
-                tool.replacen("case_count != 1191", "case_count < 1191", 1),
+                "attestation-arguments",
+                tool.replacen(
+                    "fn attestation_verify_arguments(",
+                    "fn unreviewed_attestation_arguments(",
+                    1,
+                ),
             ),
         ] {
+            let mut failures = Vec::new();
+            check_collection_transport_source(&mutant, &mut failures);
             assert!(
-                !collection_authority_policy(campaign, &mutant).is_empty(),
-                "accepted collection acquisition substitution {label}"
+                !failures.is_empty(),
+                "accepted collection transport source substitution {label}"
             );
         }
     }
@@ -3570,6 +7826,24 @@ mod tests {
                 include_str!("../../../.github/workflows/collection-authority.yml"),
             ),
             (
+                ".github/workflows/collection-activation-preparation.yml",
+                include_str!("../../../.github/workflows/collection-activation-preparation.yml"),
+            ),
+            (
+                ".github/workflows/collection-activation.yml",
+                include_str!("../../../.github/workflows/collection-activation.yml"),
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_workflow(Path::new(path), body, &mut failures);
+            assert!(failures.is_empty(), "{path}: {}", failures.join("\n"));
+        }
+    }
+
+    #[test]
+    fn remaining_promotion_assurance_workflows_pass_strict_policy_scan() {
+        for (path, body) in [
+            (
                 ".github/workflows/promotion-approval.yml",
                 include_str!("../../../.github/workflows/promotion-approval.yml"),
             ),
@@ -3606,6 +7880,14 @@ mod tests {
                 include_str!("../../../.github/workflows/promotion-surveillance-watchdog.yml"),
             ),
             (
+                ".github/workflows/custody-provider-selector-recovery.yml",
+                include_str!("../../../.github/workflows/custody-provider-selector-recovery.yml"),
+            ),
+            (
+                ".github/workflows/custody-provider-selector-seal.yml",
+                include_str!("../../../.github/workflows/custody-provider-selector-seal.yml"),
+            ),
+            (
                 ".github/workflows/assurance-transport-readiness.yml",
                 include_str!("../../../.github/workflows/assurance-transport-readiness.yml"),
             ),
@@ -3621,6 +7903,1690 @@ mod tests {
             let mut failures = Vec::new();
             check_workflow(Path::new(path), body, &mut failures);
             assert!(failures.is_empty(), "{path}: {}", failures.join("\n"));
+        }
+    }
+
+    #[test]
+    fn every_cosign_installer_pins_the_exact_executable_release() {
+        for (path, workflow) in [
+            (
+                ".github/workflows/nightly.yml",
+                include_str!("../../../.github/workflows/nightly.yml"),
+            ),
+            (
+                ".github/workflows/evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                ".github/workflows/assurance-transport-readiness.yml",
+                include_str!("../../../.github/workflows/assurance-transport-readiness.yml"),
+            ),
+        ] {
+            let lines = workflow.lines().collect::<Vec<_>>();
+            let mut failures = Vec::new();
+            check_exact_cosign_release(Path::new(path), &lines, &mut failures);
+            assert!(failures.is_empty(), "{path}: {}", failures.join("\n"));
+            for (label, mutant) in [
+                (
+                    "release-omission",
+                    workflow.replacen("          cosign-release: v2.4.3\n", "", 1),
+                ),
+                (
+                    "release-substitution",
+                    workflow.replacen("cosign-release: v2.4.3", "cosign-release: latest", 1),
+                ),
+            ] {
+                let lines = mutant.lines().collect::<Vec<_>>();
+                let mut failures = Vec::new();
+                check_exact_cosign_release(Path::new(path), &lines, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} in {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn external_independent_request_is_sealed_before_credentials() {
+        let workflow =
+            include_str!("../../../.github/workflows/artifact-independent-acquisition.yml");
+        let mut failures = Vec::new();
+        check_external_independent_preflight(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for (label, mutant) in [
+            (
+                "preflight-omission",
+                workflow.replacen("prepare-external-independent", "external-independent", 1),
+            ),
+            (
+                "preflight-credentials",
+                workflow.replacen(
+                    "permissions:\n      contents: read",
+                    "permissions:\n      contents: read\n      id-token: write",
+                    1,
+                ),
+            ),
+            (
+                "mutable-request-name",
+                workflow.replacen(
+                    "artifact-ids: ${{ needs.prepare-request.outputs.request_artifact_id }}",
+                    "name: artifact-independent-request",
+                    1,
+                ),
+            ),
+            (
+                "source-artifact-id-omission",
+                workflow.replacen(
+                    "      source_artifact_id:\n        type: string\n        required: true\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "source-artifact-id-run-substitution",
+                workflow.replacen("source_artifact_id:", "source_run_id:", 1),
+            ),
+            (
+                "request-substitution",
+                workflow.replacen(
+                    "--input ci-out/acquisition/external-independent-request.json",
+                    "--input ci-out/acquisition/unsealed.json",
+                    1,
+                ),
+            ),
+            (
+                "precredential-verification-omission",
+                workflow.replacen(
+                    "artifact-acquire verify-external-independent-request",
+                    "artifact-acquire external-independent-request-unverified",
+                    1,
+                ),
+            ),
+            (
+                "precredential-verification-after-aws",
+                workflow.replacen(
+                    "      - name: Verify sealed external acquisition request before credentials\n        run: ./target/ci/hell-ci artifact-acquire verify-external-independent-request --input ci-out/acquisition/external-independent-request.json --artifact native-oracle-merged\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "dispatch-rederivation",
+                workflow.replacen(
+                    "--artifact native-oracle-merged\n      - name: Install pinned Sigstore",
+                    "--artifact native-oracle-merged --github-dispatch-inputs\n      - name: Install pinned Sigstore",
+                    1,
+                ),
+            ),
+            (
+                "credentials-before-request",
+                workflow.replacen(
+                    "artifact-ids: ${{ needs.prepare-request.outputs.request_artifact_id }}",
+                    "artifact-ids: unbound",
+                    1,
+                ),
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_external_independent_preflight(&mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted external preflight mutant {label}");
+        }
+    }
+
+    #[test]
+    fn collection_activation_review_is_two_role_and_non_authoritative() {
+        let workflow = include_str!("../../../.github/workflows/collection-activation.yml");
+        let mut failures = Vec::new();
+        check_collection_activation_review(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for (label, mutant) in activation_review_transport_mutants(workflow)
+            .into_iter()
+            .chain(activation_review_role_mutants(workflow))
+        {
+            let mut failures = Vec::new();
+            check_collection_activation_review(&mutant, &mut failures);
+            assert!(
+                !failures.is_empty(),
+                "accepted activation review mutant {label}"
+            );
+        }
+    }
+
+    fn activation_review_transport_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "push-trigger",
+                workflow.replacen("  workflow_dispatch:", "  push:\n  workflow_dispatch:", 1),
+            ),
+            (
+                "outer-artifact-name",
+                workflow.replacen(
+                    "collection-activation-proposal-${{ github.run_id }}-${{ github.run_attempt }}",
+                    "collection-activation-proposal",
+                    1,
+                ),
+            ),
+            (
+                "review-subject-artifact-digest",
+                workflow.replacen(
+                    "artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}",
+                    "artifact_digest: unbound",
+                    1,
+                ),
+            ),
+            (
+                "review-subject-directory-digest",
+                workflow.replacen(
+                    "directory_sha256: ${{ steps.bind-review-subject.outputs.directory_sha256 }}",
+                    "directory_sha256: unbound",
+                    1,
+                ),
+            ),
+            (
+                "author-wrapper-artifact-id-substitution",
+                workflow.replacen(
+                    "artifact-ids: ${{ needs.retain-proposal.outputs.artifact_id }}",
+                    "artifact-ids: ${{ inputs.proposal_artifact_id }}",
+                    1,
+                ),
+            ),
+            (
+                "reviewer-wrapper-artifact-id-substitution",
+                workflow.replacen(
+                    "artifact-ids: ${{ needs.retain-proposal.outputs.artifact_id }}",
+                    "artifact-ids: ${{ inputs.proposal_artifact_id }}",
+                    2,
+                ),
+            ),
+            (
+                "finalizer-wrapper-directory-substitution",
+                workflow.replacen(
+                    "WRAPPER_DIRECTORY_SHA256: ${{ needs.retain-proposal.outputs.directory_sha256 }}",
+                    "WRAPPER_DIRECTORY_SHA256: ${{ inputs.proposal_directory_sha256 }}",
+                    3,
+                ),
+            ),
+            (
+                "author-checkout",
+                workflow.replacen(
+                    "collection-authority verify-checkout --input . --candidate-commit \"$COLLECTION_ACTIVATION_SHA\"",
+                    "collection-authority verify-checkout --input . --candidate-commit HEAD",
+                    2,
+                ),
+            ),
+        ]
+    }
+
+    fn activation_review_role_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "author-environment",
+                workflow.replacen(
+                    "environment: compatibility-claim-author",
+                    "environment: compatibility-claim-review",
+                    1,
+                ),
+            ),
+            (
+                "author-role",
+                workflow.replacen("--role claim-author", "--role claim-reviewer", 1),
+            ),
+            (
+                "reviewer-role",
+                workflow.replacen("--role claim-reviewer", "--role claim-author", 1),
+            ),
+            (
+                "signed-package-directory-archive-substitution",
+                workflow.replacen(
+                    "directory_sha256: ${{ steps.bind-review.outputs.directory_sha256 }}",
+                    "directory_sha256: ${{ steps.upload-review.outputs.artifact-digest }}",
+                    1,
+                ),
+            ),
+            (
+                "signed-package-directory-binding-omission",
+                workflow.replacen("        id: bind-review", "        id: unbound-review", 1),
+            ),
+            (
+                "author-before-packet",
+                workflow.replacen(
+                    author_packet_marker(),
+                    "review-packet --input unverified",
+                    1,
+                ),
+            ),
+            (
+                "reviewer-before-packet",
+                workflow.replacen(
+                    reviewer_packet_marker(),
+                    "review-packet --input unverified",
+                    1,
+                ),
+            ),
+            (
+                "author-artifact-id",
+                workflow.replacen(
+                    "needs.claim-author.outputs.artifact_id",
+                    "inputs.claim_author_artifact_id",
+                    1,
+                ),
+            ),
+            (
+                "cosign-pin",
+                workflow.replacen(
+                    "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
+                    "sigstore/cosign-installer@main",
+                    1,
+                ),
+            ),
+            (
+                "finalizer-cosign-omission",
+                workflow.replacen(
+                    "      - name: Install pinned activation review verifier after exact input validation\n        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "reviewer-artifact-id",
+                workflow.replacen(
+                    "needs.claim-reviewer.outputs.artifact_id",
+                    "inputs.claim_reviewer_artifact_id",
+                    1,
+                ),
+            ),
+            (
+                "commit-write",
+                workflow.replacen("contents: read", "contents: write", 1),
+            ),
+            (
+                "directory-digest",
+                workflow.replacen(
+                    "tree_directory_sha256: ${{ steps.bind-tree.outputs.directory_sha256 }}",
+                    "tree_directory_sha256: unbound",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn author_packet_marker() -> &'static str {
+        "review-packet --input ci-in/collection-activation-review-subject/review-subject.json --from ci-out/collection-activation-review/claim-author/authorization.json --output ci-out/collection-activation-review/claim-author/review-packet.json --role claim-author --category collection-activation-author --decision accept --github-dispatch-inputs"
+    }
+
+    fn reviewer_packet_marker() -> &'static str {
+        "review-packet --input ci-in/collection-activation-review-subject/review-subject.json --from ci-out/collection-activation-review/claim-reviewer/authorization.json --output ci-out/collection-activation-review/claim-reviewer/review-packet.json --role claim-reviewer --category collection-activation-final --decision accept --github-dispatch-inputs"
+    }
+
+    fn active_repository_consumer_workflows() -> Vec<(PathBuf, &'static str)> {
+        [
+            ("ci.yml", include_str!("../../../.github/workflows/ci.yml")),
+            (
+                "nightly.yml",
+                include_str!("../../../.github/workflows/nightly.yml"),
+            ),
+            (
+                "oracle-reproduce.yml",
+                include_str!("../../../.github/workflows/oracle-reproduce.yml"),
+            ),
+            (
+                "promotion-proposal.yml",
+                include_str!("../../../.github/workflows/promotion-proposal.yml"),
+            ),
+            (
+                "promotion-evidence-review.yml",
+                include_str!("../../../.github/workflows/promotion-evidence-review.yml"),
+            ),
+            (
+                "claim-applicability-decisions.yml",
+                include_str!("../../../.github/workflows/claim-applicability-decisions.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                "mutation.yml",
+                include_str!("../../../.github/workflows/mutation.yml"),
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+            ),
+            (
+                "promotion-surveillance-watchdog.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance-watchdog.yml"),
+            ),
+            (
+                "promotion-initial-public-finalize.yml",
+                include_str!("../../../.github/workflows/promotion-initial-public-finalize.yml"),
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                "custody-scrub.yml",
+                include_str!("../../../.github/workflows/custody-scrub.yml"),
+            ),
+            (
+                "artifact-authenticity-review.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-review.yml"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, workflow)| (workflow_path(name), workflow))
+        .collect()
+    }
+
+    fn deleted_ci_verify_job(ci: &str) -> String {
+        let start = ci
+            .find("  verify:\n")
+            .expect("CI workflow must retain the verify job");
+        let end = ci[start..]
+            .find("\n  portability-macos:\n")
+            .map(|offset| start + offset + 1)
+            .expect("CI verify job must precede portability-macos");
+        let mut mutant = ci.to_owned();
+        mutant.replace_range(start..end, "");
+        mutant
+    }
+
+    fn active_repository_consumer_mutants(ci: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("deleted-job", deleted_ci_verify_job(ci)),
+            (
+                "renamed-job",
+                ci.replacen("  verify:", "  verify-renamed:", 1),
+            ),
+            (
+                "omitted",
+                ci.replace(
+                    "      - name: Install pinned active-review verifier\n        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2\n        with:\n          cosign-release: v2.4.3\n\n",
+                    "",
+                ),
+            ),
+            (
+                "mutable-pin",
+                ci.replace(
+                    "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
+                    "sigstore/cosign-installer@main",
+                ),
+            ),
+            (
+                "version-substitution",
+                ci.replace("# v4.1.2", "# v4.2.0"),
+            ),
+            (
+                "after-consumer",
+                ci.replacen(
+                    "      - name: Install pinned active-review verifier\n        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2\n        with:\n          cosign-release: v2.4.3\n\n      - name: Verify fail-closed assurance policy\n        run: ./target/ci/hell-ci assurance-verify --output ci-out/assurance-policy.json",
+                    "      - name: Verify fail-closed assurance policy\n        run: ./target/ci/hell-ci assurance-verify --output ci-out/assurance-policy.json\n\n      - name: Install pinned active-review verifier\n        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2\n        with:\n          cosign-release: v2.4.3",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn fresh_activated_campaign_has_bounded_three_platform_liveness() {
+        let workflow = include_str!("../../../.github/workflows/nightly.yml");
+        let mut failures = Vec::new();
+        check_fresh_activated_campaign_liveness(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for mutant in [
+            workflow.replacen("timeout-minutes: 120", "timeout-minutes: 60", 1),
+            workflow.replacen("timeout-minutes: 180", "timeout-minutes: 90", 1),
+            workflow.replacen(
+                "./target/ci/hell-ci nightly --oracle",
+                "./target/ci/hell-ci collection-authority verify-custody --oracle",
+                1,
+            ),
+            workflow.replacen(
+                "evidence-epoch write --output ci-out/native-shards/assurance-epoch.json",
+                "evidence-epoch verify --output ci-out/native-shards/assurance-epoch.json",
+                1,
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_fresh_activated_campaign_liveness(&mutant, &mut failures);
+            assert!(!failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn active_repository_consumers_install_the_exact_verifier_before_use() {
+        for (path, workflow) in active_repository_consumer_workflows() {
+            let mut failures = Vec::new();
+            check_active_repository_verifier_liveness(&path, workflow, true, &mut failures);
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        for (label, mutant) in active_repository_consumer_mutants(ci) {
+            let mut failures = Vec::new();
+            check_active_repository_verifier_liveness(
+                &workflow_path("ci.yml"),
+                &mutant,
+                true,
+                &mut failures,
+            );
+            assert!(!failures.is_empty(), "accepted {label}");
+        }
+
+        let custody = include_str!("../../../.github/workflows/evidence-custody.yml");
+        let conditional_substitution = custody.replacen(
+            "      - name: Install pinned active-review verifier\n        if: ${{ inputs.artifact_class != 'collection-custody' }}",
+            "      - name: Install pinned active-review verifier\n        if: ${{ inputs.artifact_class == 'collection-custody' }}",
+            1,
+        );
+        let mut failures = Vec::new();
+        check_active_repository_verifier_liveness(
+            &workflow_path("evidence-custody.yml"),
+            &conditional_substitution,
+            true,
+            &mut failures,
+        );
+        assert!(!failures.is_empty(), "accepted conditional substitution");
+    }
+
+    #[test]
+    fn claim_decision_producer_verifies_both_exact_sources_before_coverage() {
+        let workflow = include_str!("../../../.github/workflows/claim-applicability-decisions.yml");
+        let mut failures = Vec::new();
+        check_claim_applicability_decision_checkouts(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for (label, mutant) in [
+            (
+                "candidate-checkout-omission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$CLAIM_CANDIDATE_SHA\"",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "candidate-substitution",
+                workflow.replacen(
+                    "--candidate-commit \"$CLAIM_CANDIDATE_SHA\"",
+                    "--candidate-commit HEAD",
+                    1,
+                ),
+            ),
+            (
+                "decision-checkout-omission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci collection-authority verify-checkout --input decision-source --candidate-commit \"$CLAIM_DECISION_SOURCE_SHA\"",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "decision-source-substitution",
+                workflow.replacen("--input decision-source", "--input .", 1),
+            ),
+            (
+                "provider-token-omission",
+                workflow.replacen("          GITHUB_TOKEN: ${{ github.token }}", "", 1),
+            ),
+            (
+                "provider-token-substitution",
+                workflow.replacen(
+                    "GITHUB_TOKEN: ${{ github.token }}",
+                    "GITHUB_TOKEN: ${{ secrets.UNREVIEWED_TOKEN }}",
+                    1,
+                ),
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_claim_applicability_decision_checkouts(&mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn primary_acquisition_binds_provider_workflow_bytes_to_candidate_head() {
+        let workflow = include_str!("../../../.github/workflows/artifact-authenticity-review.yml");
+        let mut failures = Vec::new();
+        check_primary_acquisition_checkout(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for (label, mutant) in [
+            (
+                "current-candidate-equality-omission",
+                workflow.replacen(" && inputs.candidate_sha == github.sha", "", 1),
+            ),
+            (
+                "candidate-checkout-substitution",
+                workflow.replacen("ref: ${{ github.sha }}", "ref: ${{ inputs.candidate_sha }}", 1),
+            ),
+            (
+                "typed-checkout-omission",
+                workflow.replacen(
+                    "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$ACQUISITION_CANDIDATE_SHA\"",
+                    "        run: ./target/ci/hell-ci assurance-verify --report ci-out/unbound.json",
+                    1,
+                ),
+            ),
+            (
+                "immutable-artifact-id-omission",
+                workflow.replacen(
+                    "          artifact-ids: ${{ inputs.source_artifact_id }}",
+                    "          name: native-oracle-merged",
+                    1,
+                ),
+            ),
+            (
+                "artifact-id-run-substitution",
+                workflow.replacen(
+                    "artifact-ids: ${{ inputs.source_artifact_id }}",
+                    "artifact-ids: ${{ inputs.source_run_id }}",
+                    1,
+                ),
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_primary_acquisition_checkout(&mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn every_provider_replay_has_one_exact_step_scoped_read_token() {
+        for (name, workflow) in [
+            (
+                "claim-applicability-decisions.yml",
+                include_str!("../../../.github/workflows/claim-applicability-decisions.yml"),
+            ),
+            (
+                "promotion-evidence-review.yml",
+                include_str!("../../../.github/workflows/promotion-evidence-review.yml"),
+            ),
+            (
+                "promotion-proposal.yml",
+                include_str!("../../../.github/workflows/promotion-proposal.yml"),
+            ),
+            (
+                "promotion-approval.yml",
+                include_str!("../../../.github/workflows/promotion-approval.yml"),
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_provider_replay_token_binding(&path, workflow, true, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            for (label, mutant) in [
+                (
+                    "omitted",
+                    workflow.replace("          GITHUB_TOKEN: ${{ github.token }}", ""),
+                ),
+                (
+                    "substituted",
+                    workflow.replace(
+                        "GITHUB_TOKEN: ${{ github.token }}",
+                        "GITHUB_TOKEN: ${{ secrets.UNREVIEWED_TOKEN }}",
+                    ),
+                ),
+            ] {
+                let mut failures = Vec::new();
+                check_provider_replay_token_binding(&path, &mutant, true, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} token in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_packages_expose_exact_immutable_handoff_outputs() {
+        for (name, workflow) in [
+            (
+                "promotion-proposal.yml",
+                include_str!("../../../.github/workflows/promotion-proposal.yml"),
+            ),
+            (
+                "promotion-approval.yml",
+                include_str!("../../../.github/workflows/promotion-approval.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_promotion_package_handoff(&path, workflow, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            for (label, mutant) in promotion_handoff_mutants(name, workflow) {
+                let mut failures = Vec::new();
+                check_promotion_package_handoff(&path, &mutant, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_state_jobs_bind_exact_trusted_driver_head_before_provider_work() {
+        for (name, workflow) in [
+            (
+                "nightly.yml",
+                include_str!("../../../.github/workflows/nightly.yml"),
+            ),
+            (
+                "promotion-initial-public-finalize.yml",
+                include_str!("../../../.github/workflows/promotion-initial-public-finalize.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                "mutation.yml",
+                include_str!("../../../.github/workflows/mutation.yml"),
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+            ),
+            (
+                "oracle-reproduce.yml",
+                include_str!("../../../.github/workflows/oracle-reproduce.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_trusted_driver_checkouts(&path, workflow, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            for (label, mutant) in trusted_driver_mutants(name, workflow) {
+                let mut failures = Vec::new();
+                check_trusted_driver_checkouts(&path, &mutant, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_provider_inputs_are_sealed_before_credentials() {
+        for (name, workflow) in [
+            (
+                "custody-scrub.yml",
+                include_str!("../../../.github/workflows/custody-scrub.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "promotion-surveillance-watchdog.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance-watchdog.yml"),
+            ),
+            (
+                "promotion-initial-public-finalize.yml",
+                include_str!("../../../.github/workflows/promotion-initial-public-finalize.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_precredential_provider_selectors(&path, workflow, true, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            for (label, mutant) in provider_selector_mutants(name, workflow) {
+                let mut failures = Vec::new();
+                check_precredential_provider_selectors(&path, &mutant, true, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn initial_public_sequence_requires_current_selector_update_barriers() {
+        for (name, workflow) in [
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "promotion-initial-public-finalize.yml",
+                include_str!("../../../.github/workflows/promotion-initial-public-finalize.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_selector_update_barrier_topology(&path, workflow, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            let mutant = match name {
+                "evidence-custody.yml" => format!(
+                    "{workflow}\n  dispatch-initial-public-state:\n    run: workflow-dispatch-initial-surveillance\n"
+                ),
+                "promotion-surveillance.yml" => {
+                    workflow.replacen("selector_archive_sha256:", "selector_unbound_sha256:", 1)
+                }
+                _ => workflow.replacen("workflow_dispatch:", "workflow_run:", 1),
+            };
+            let mut failures = Vec::new();
+            check_selector_update_barrier_topology(&path, &mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted barrier mutant in {name}");
+            if name == "promotion-surveillance.yml" {
+                let mutant = workflow.replacen(
+                    "inputs.candidate_sha == github.sha && inputs.selector_source_sha == github.sha",
+                    "inputs.candidate_sha == github.sha",
+                    1,
+                );
+                let mut failures = Vec::new();
+                check_selector_update_barrier_topology(&path, &mutant, &mut failures);
+                assert!(
+                    !failures.is_empty(),
+                    "accepted surveillance cross-HEAD drift"
+                );
+            }
+            if name == "promotion-initial-public-finalize.yml" {
+                let mutant =
+                    workflow.replacen(" && inputs.selector_source_sha == github.sha", "", 1);
+                let mut failures = Vec::new();
+                check_selector_update_barrier_topology(&path, &mutant, &mut failures);
+                assert!(!failures.is_empty(), "accepted finalizer cross-HEAD drift");
+            }
+        }
+    }
+
+    #[test]
+    fn selector_aggregate_uses_provider_selected_immutable_sources() {
+        let workflow =
+            include_str!("../../../.github/workflows/custody-provider-selector-seal.yml");
+        let mut failures = Vec::new();
+        check_selector_seal_workflow(workflow, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        for (label, mutant) in [
+            (
+                "selector-omission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci custody-ops workflow-select-provider-selector-updates",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "primary-name-substitution",
+                workflow.replacen(
+                    "artifact-ids: ${{ steps.select.outputs.primary-artifact-id }}",
+                    "name: custody-provider-selector-update-primary-worm-${{ github.run_id }}-${{ github.run_attempt }}",
+                    1,
+                ),
+            ),
+            (
+                "secondary-id-substitution",
+                workflow.replacen(
+                    "artifact-ids: ${{ steps.select.outputs.secondary-artifact-id }}",
+                    "artifact-ids: ${{ steps.select.outputs.primary-artifact-id }}",
+                    1,
+                ),
+            ),
+            (
+                "source-workflow-substitution",
+                workflow.replacen(
+                    "CUSTODY_SELECTOR_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}",
+                    "CUSTODY_SELECTOR_SOURCE_WORKFLOW: .github/workflows/evidence-custody.yml",
+                    1,
+                ),
+            ),
+            (
+                "provider-token-omission",
+                workflow.replacen("          GITHUB_TOKEN: ${{ github.token }}\n", "", 1),
+            ),
+        ] {
+            let mut failures = Vec::new();
+            check_selector_seal_workflow(&mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn every_regression_provider_replay_binds_the_expected_archive_digest() {
+        for (name, workflow) in [
+            (
+                "assurance-transport-readiness.yml",
+                include_str!("../../../.github/workflows/assurance-transport-readiness.yml"),
+            ),
+            (
+                "assurance-transport-signer-a.yml",
+                include_str!("../../../.github/workflows/assurance-transport-signer-a.yml"),
+            ),
+            (
+                "assurance-transport-signer-b.yml",
+                include_str!("../../../.github/workflows/assurance-transport-signer-b.yml"),
+            ),
+            (
+                "regression-corpus.yml",
+                include_str!("../../../.github/workflows/regression-corpus.yml"),
+            ),
+        ] {
+            let lines = workflow.lines().collect::<Vec<_>>();
+            let mut failures = Vec::new();
+            check_regression_provider_archive_binding(&workflow_path(name), &lines, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            let mutant = workflow.replacen(
+                "          REGRESSION_PROVIDER_ARCHIVE_SHA256:",
+                "          REGRESSION_PROVIDER_UNBOUND_SHA256:",
+                1,
+            );
+            let lines = mutant.lines().collect::<Vec<_>>();
+            let mut failures = Vec::new();
+            check_regression_provider_archive_binding(&workflow_path(name), &lines, &mut failures);
+            assert!(!failures.is_empty(), "accepted archive omission in {name}");
+        }
+    }
+
+    #[test]
+    fn every_external_consumer_requires_the_reviewed_archive_contract() {
+        for (name, workflow, marker) in [
+            (
+                "artifact-authenticity-review.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-review.yml"),
+                "      source_provider_archive_sha256:",
+            ),
+            (
+                "artifact-independent-acquisition.yml",
+                include_str!("../../../.github/workflows/artifact-independent-acquisition.yml"),
+                "      source_provider_archive_sha256:",
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+                "      provider_archive_sha256:",
+            ),
+            (
+                "claim-applicability-decisions.yml",
+                include_str!("../../../.github/workflows/claim-applicability-decisions.yml"),
+                "      native_provider_archive_sha256:",
+            ),
+            (
+                "promotion-evidence-review.yml",
+                include_str!("../../../.github/workflows/promotion-evidence-review.yml"),
+                "      provider_archive_sha256_json:",
+            ),
+            (
+                "promotion-approval.yml",
+                include_str!("../../../.github/workflows/promotion-approval.yml"),
+                "      proposal_provider_archive_sha256:",
+            ),
+            (
+                "nightly.yml",
+                include_str!("../../../.github/workflows/nightly.yml"),
+                "      proposal_provider_archive_sha256:",
+            ),
+            (
+                "promotion-proposal.yml",
+                include_str!("../../../.github/workflows/promotion-proposal.yml"),
+                "      evidence_provider_archive_sha256:",
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+                "      primary_packet_archive_sha256:",
+            ),
+            (
+                "collection-activation-preparation.yml",
+                include_str!("../../../.github/workflows/collection-activation-preparation.yml"),
+                "      expected_archive_sha256:",
+            ),
+            (
+                "collection-activation.yml",
+                include_str!("../../../.github/workflows/collection-activation.yml"),
+                "      proposal_archive_sha256:",
+            ),
+            (
+                "collection-custody-integration.yml",
+                include_str!("../../../.github/workflows/collection-custody-integration.yml"),
+                "      expected_worm_archive_sha256:",
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_external_consumer_archive_binding(&path, workflow, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            let mutant = workflow.replacen(marker, "      unbound_archive_sha256:", 1);
+            let mut failures = Vec::new();
+            check_external_consumer_archive_binding(&path, &mutant, &mut failures);
+            assert!(!failures.is_empty(), "accepted archive omission in {name}");
+        }
+        let path = workflow_path("promotion-evidence-review.yml");
+        let workflow = include_str!("../../../.github/workflows/promotion-evidence-review.yml");
+        let mutant = format!("{workflow}\n      oracle_event:\n        type: string\n");
+        let mut failures = Vec::new();
+        check_external_consumer_archive_binding(&path, &mutant, &mut failures);
+        assert!(
+            !failures.is_empty(),
+            "accepted split evidence source schema"
+        );
+    }
+
+    fn provider_selector_mutants(name: &str, workflow: &str) -> Vec<(&'static str, String)> {
+        if name == "promotion-initial-public-finalize.yml" {
+            return vec![
+                (
+                    "completion-verifier-omission",
+                    workflow.replacen(
+                        "custody-ops workflow-prepare-provider-selector",
+                        "custody-ops workflow-complete-initial-activation",
+                        1,
+                    ),
+                ),
+                (
+                    "completion-verifier-after-credentials",
+                    workflow.replacen(
+                        "      - name: Seal exact completed-publication provider selector before credentials\n        env:\n          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}\n          CUSTODY_PROVIDER_OPERATION: complete-initial-publication\n          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}\n          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}\n        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector\n",
+                        "",
+                        1,
+                    ),
+                ),
+                (
+                    "completion-source-id-substitution",
+                    workflow.replacen(
+                        "artifact-ids: ${{ needs.finalize-completed-publication.outputs.completion_artifact_id }}",
+                        "artifact-ids: ${{ needs.finalize-completed-publication.outputs.completion_artifact_digest }}",
+                        1,
+                    ),
+                ),
+            ];
+        }
+        vec![
+            (
+                "selector-omission",
+                workflow.replacen(
+                    "custody-ops workflow-prepare-provider-selector",
+                    "custody-ops workflow-surveillance-retrieve",
+                    1,
+                ),
+            ),
+            (
+                "selector-operation-omission",
+                workflow.replacen(
+                    "CUSTODY_PROVIDER_OPERATION:",
+                    "CUSTODY_PROVIDER_MODE:",
+                    1,
+                ),
+            ),
+            (
+                "selector-provider-substitution",
+                workflow.replacen(
+                    "CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}",
+                    "CUSTODY_EXPECTED_PROVIDER: primary-worm",
+                    1,
+                ),
+            ),
+            (
+                "selector-receipt-substitution",
+                workflow.replacen(
+                    "ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}",
+                    "ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars.ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT }}",
+                    1,
+                ),
+            ),
+            (
+                "selector-trust-domain-substitution",
+                workflow.replacen(
+                    "trust-domain: organization-secondary",
+                    "trust-domain: organization-primary",
+                    1,
+                ),
+            ),
+            (
+                "selector-matrix-receipt-substitution",
+                workflow.replacen(
+                    "default-receipt-variable: ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT",
+                    "default-receipt-variable: ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn campaign_external_handoffs_expose_artifact_archive_and_directory_identities() {
+        for (name, workflow) in [
+            (
+                "nightly.yml",
+                include_str!("../../../.github/workflows/nightly.yml"),
+            ),
+            (
+                "promotion-evidence-review.yml",
+                include_str!("../../../.github/workflows/promotion-evidence-review.yml"),
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+            (
+                "mutation.yml",
+                include_str!("../../../.github/workflows/mutation.yml"),
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+            ),
+            (
+                "oracle-reproduce.yml",
+                include_str!("../../../.github/workflows/oracle-reproduce.yml"),
+            ),
+            (
+                "claim-applicability-decisions.yml",
+                include_str!("../../../.github/workflows/claim-applicability-decisions.yml"),
+            ),
+            (
+                "artifact-independent-acquisition.yml",
+                include_str!("../../../.github/workflows/artifact-independent-acquisition.yml"),
+            ),
+            (
+                "artifact-authenticity-review.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-review.yml"),
+            ),
+            (
+                "promotion-surveillance.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "promotion-surveillance-watchdog.yml",
+                include_str!("../../../.github/workflows/promotion-surveillance-watchdog.yml"),
+            ),
+            (
+                "promotion-initial-public-finalize.yml",
+                include_str!("../../../.github/workflows/promotion-initial-public-finalize.yml"),
+            ),
+        ] {
+            let path = workflow_path(name);
+            let mut failures = Vec::new();
+            check_campaign_external_handoffs(&path, workflow, &mut failures);
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            for (label, mutant) in campaign_handoff_mutants(name, workflow) {
+                let mut failures = Vec::new();
+                check_campaign_external_handoffs(&path, &mutant, &mut failures);
+                assert!(!failures.is_empty(), "accepted {label} in {name}");
+            }
+        }
+    }
+
+    fn campaign_handoff_mutants(name: &str, workflow: &str) -> Vec<(&'static str, String)> {
+        if let Some(mutants) = special_campaign_handoff_mutants(name, workflow) {
+            return mutants;
+        }
+        let (upload, bind) = match name {
+            "promotion-evidence-review.yml" => ("upload-reviewed", "bind-reviewed"),
+            "mutation.yml" => ("upload-mutation", "bind-mutation"),
+            "artifact-authenticity-finalize.yml" => ("upload-authenticity", "bind-authenticity"),
+            "claim-applicability-decisions.yml" => ("upload-decisions", "bind-decisions"),
+            "artifact-independent-acquisition.yml" => ("upload-acquisition", "bind-acquisition"),
+            "artifact-authenticity-review.yml" => ("upload-packet", "bind-packet"),
+            "promotion-surveillance.yml" => ("upload", "bind-execution"),
+            "promotion-surveillance-watchdog.yml" => ("upload-transition", "bind-transition"),
+            "promotion-initial-public-finalize.yml" => ("upload-completion", "bind-completion"),
+            _ => unreachable!("campaign handoff fixture name is exact"),
+        };
+        vec![
+            (
+                "artifact-id-archive-substitution",
+                workflow.replacen(
+                    &format!("steps.{upload}.outputs.artifact-id"),
+                    &format!("steps.{upload}.outputs.artifact-digest"),
+                    1,
+                ),
+            ),
+            (
+                "directory-archive-substitution",
+                workflow.replacen(
+                    &format!("steps.{bind}.outputs.directory_sha256"),
+                    &format!("steps.{upload}.outputs.artifact-digest"),
+                    1,
+                ),
+            ),
+            (
+                "typed-directory-binder-omission",
+                workflow.replacen(
+                    &format!("        id: {bind}"),
+                    "        id: unbound-directory",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn special_campaign_handoff_mutants(
+        name: &str,
+        workflow: &str,
+    ) -> Option<Vec<(&'static str, String)>> {
+        let replacements = match name {
+            "nightly.yml" => [
+                (
+                    "native-artifact-id-archive-substitution",
+                    "native_artifact_id: ${{ steps.upload-native.outputs.artifact-id }}",
+                    "native_artifact_id: ${{ steps.upload-native.outputs.artifact-digest }}",
+                ),
+                (
+                    "promotion-record-directory-archive-substitution",
+                    "promotion_record_directory_sha256: ${{ steps.bind-final-record.outputs.directory_sha256 }}",
+                    "promotion_record_directory_sha256: ${{ steps.final-record.outputs.artifact-digest }}",
+                ),
+                (
+                    "promotion-record-binder-omission",
+                    "        id: bind-final-record",
+                    "        id: unbound-directory",
+                ),
+            ],
+            "oracle-reproduce.yml" => [
+                (
+                    "artifact-id-archive-substitution",
+                    "macos_artifact_id: ${{ steps.upload-macos.outputs.artifact-id }}",
+                    "macos_artifact_id: ${{ steps.upload-macos.outputs.artifact-digest }}",
+                ),
+                (
+                    "directory-archive-substitution",
+                    "macos_directory_sha256: ${{ steps.bind-macos.outputs.directory_sha256 }}",
+                    "macos_directory_sha256: ${{ steps.upload-macos.outputs.artifact-digest }}",
+                ),
+                (
+                    "typed-directory-binder-omission",
+                    "        id: bind-macos",
+                    "        id: unbound-directory",
+                ),
+            ],
+            "evidence-custody.yml" => [
+                (
+                    "reviewed-artifact-id-archive-substitution",
+                    "reviewed_artifact_id: ${{ steps.upload-reviewed.outputs.artifact-id }}",
+                    "reviewed_artifact_id: ${{ steps.upload-reviewed.outputs.artifact-digest }}",
+                ),
+                (
+                    "primary-scrub-directory-archive-substitution",
+                    "primary_directory_sha256: ${{ steps.bind-primary.outputs.directory_sha256 }}",
+                    "primary_directory_sha256: ${{ steps.upload-primary.outputs.artifact-digest }}",
+                ),
+                (
+                    "secondary-scrub-binder-omission",
+                    "        id: bind-secondary",
+                    "        id: unbound-directory",
+                ),
+            ],
+            _ => return None,
+        };
+        Some(
+            replacements
+                .map(|(label, source, replacement)| {
+                    (label, workflow.replacen(source, replacement, 1))
+                })
+                .into(),
+        )
+    }
+
+    fn trusted_driver_mutants(name: &str, workflow: &str) -> Vec<(&'static str, String)> {
+        let omitted = workflow.replace("ref: ${{ github.sha }}", "ref: HEAD");
+        let mut mutants = vec![
+            ("checkout-ref-omission", omitted),
+            (
+                "checkout-head-substitution",
+                workflow.replacen(
+                    "--candidate-commit \"$TRUSTED_DRIVER_SHA\"",
+                    "--candidate-commit HEAD",
+                    1,
+                ),
+            ),
+            (
+                "checkout-verification-reordered",
+                workflow.replacen(
+                    "        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit \"$TRUSTED_DRIVER_SHA\"",
+                    "        run: true",
+                    1,
+                ),
+            ),
+        ];
+        if name == "nightly.yml" {
+            mutants.push((
+                "candidate-driver-head-split",
+                workflow.replacen(" && inputs.candidate_sha == github.sha", "", 1),
+            ));
+        }
+        if name == "promotion-surveillance.yml" {
+            mutants.push((
+                "active-subject-head-substitution",
+                workflow.replacen(
+                    "--input ci-work/candidate --candidate-commit \"$ACTIVE_SUBJECT_SHA\"",
+                    "--input . --candidate-commit \"$ACTIVE_SUBJECT_SHA\"",
+                    1,
+                ),
+            ));
+        }
+        mutants
+    }
+
+    fn promotion_handoff_mutants(name: &str, workflow: &str) -> Vec<(&'static str, String)> {
+        let (upload, bind, checkout) = if name == "promotion-proposal.yml" {
+            (
+                "upload-proposal",
+                "bind-proposal",
+                "collection-authority verify-checkout --input . --candidate-commit \"$PROMOTION_CANDIDATE_SHA\"",
+            )
+        } else {
+            (
+                "upload-approved",
+                "bind-approved",
+                "collection-authority verify-checkout --input . --candidate-commit \"$PROMOTION_CANDIDATE_SHA\"",
+            )
+        };
+        vec![
+            (
+                "artifact-id-archive-substitution",
+                workflow.replacen(
+                    &format!("steps.{upload}.outputs.artifact-id"),
+                    &format!("steps.{upload}.outputs.artifact-digest"),
+                    1,
+                ),
+            ),
+            (
+                "directory-archive-substitution",
+                workflow.replacen(
+                    &format!("steps.{bind}.outputs.directory_sha256"),
+                    &format!("steps.{upload}.outputs.artifact-digest"),
+                    1,
+                ),
+            ),
+            (
+                "typed-directory-binding-omission",
+                workflow.replacen(
+                    "run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards",
+                    "run: true",
+                    1,
+                ),
+            ),
+            (
+                "upload-step-id-omission",
+                workflow.replacen(&format!("        id: {upload}\n"), "", 1),
+            ),
+            (
+                "exact-checkout-omission",
+                workflow.replacen(checkout, "true", 1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn collection_activation_manifest_is_exact_atomic_and_fail_closed() {
+        let dormant = include_str!("../../../compat/collection-activation.toml");
+        let dormant_provenance =
+            include_bytes!("../../../compat/collection-activation-provenance.json");
+        let dormant_claims = include_bytes!("../../../compat/collection-activation-claims.json");
+        assert!(collection_activation_manifest_is_exact(dormant));
+        assert_eq!(
+            hell_testkit::verify_collection_activation_state(
+                dormant.as_bytes(),
+                dormant_provenance,
+                dormant_claims,
+            ),
+            Ok(false)
+        );
+        let active = dormant
+            .replace("map712 = false", "map712 = true")
+            .replace("set479 = false", "set479 = true");
+        assert!(collection_activation_manifest_is_exact(&active));
+        assert!(
+            hell_testkit::verify_collection_activation_state(
+                active.as_bytes(),
+                dormant_provenance,
+                dormant_claims,
+            )
+            .is_err(),
+            "a flag-only activation must not reuse dormant provenance"
+        );
+        assert!(
+            hell_testkit::verify_collection_activation_state(
+                dormant.as_bytes(),
+                b"{\"state\":\"forged\"}\n",
+                dormant_claims,
+            )
+            .is_err(),
+            "dormant activation must retain its exact provenance"
+        );
+        assert!(
+            hell_testkit::verify_collection_activation_state(
+                dormant.as_bytes(),
+                dormant_provenance,
+                b"{\"state\":\"forged\"}\n",
+            )
+            .is_err(),
+            "dormant activation must retain exact empty claims"
+        );
+        for mutant in [
+            dormant.replace("map712 = false", "map712 = true"),
+            dormant.replace("set479 = false", "set479 = true"),
+            dormant.replace("map712", "map711"),
+            dormant.replace(
+                "Map.adjust|pure-runtime|upstream|linux,macos,windows\", ",
+                "",
+            ),
+            dormant.replace("Map.adjust", "Map.lookup"),
+            dormant.replace("fresh_collection_required = true", "fresh_collection_required = false"),
+            dormant.replace("fresh_collection_required = true\n", ""),
+            dormant.replace(
+                "Map.adjust|pure-runtime|upstream|linux,macos,windows\", \"Map.delete",
+                "Map.delete|pure-runtime|upstream|linux,macos,windows\", \"Map.adjust",
+            ),
+            dormant.replace(
+                "Set.union|pure-runtime|upstream|linux,macos,windows\"]",
+                "Set.union|pure-runtime|upstream|linux,macos,windows\", \"Map.singleton|pure-runtime|upstream|linux,macos,windows\"]",
+            ),
+            format!("{dormant}promotion_authority = true\n"),
+        ] {
+            assert!(!collection_activation_manifest_is_exact(&mutant));
+        }
+    }
+
+    #[test]
+    fn collection_activation_preparation_is_provider_bound_and_non_authoritative() {
+        let workflow =
+            include_str!("../../../.github/workflows/collection-activation-preparation.yml");
+        assert!(
+            collection_activation_preparation_policy(workflow).is_empty(),
+            "{:?}",
+            collection_activation_preparation_policy(workflow)
+        );
+        for (label, mutant) in activation_preparation_provider_mutants(workflow)
+            .into_iter()
+            .chain(activation_preparation_control_mutants(workflow))
+        {
+            assert!(
+                !collection_activation_preparation_policy(&mutant).is_empty(),
+                "accepted collection activation preparation mutant {label}"
+            );
+        }
+    }
+
+    fn activation_preparation_provider_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "provider-run",
+                workflow.replacen(
+                    "--run-id \"$COLLECTION_ACTIVATION_RUN_ID\"",
+                    "--run-id 1",
+                    1,
+                ),
+            ),
+            (
+                "provider-attempt",
+                workflow.replacen(
+                    "--run-attempt \"$COLLECTION_ACTIVATION_RUN_ATTEMPT\"",
+                    "--run-attempt 1",
+                    1,
+                ),
+            ),
+            (
+                "artifact-id",
+                workflow.replacen(
+                    "--artifact-id \"$COLLECTION_ACTIVATION_ARTIFACT_ID\"",
+                    "--artifact-id 1",
+                    1,
+                ),
+            ),
+            (
+                "directory-digest",
+                workflow.replacen(
+                    "--expected-directory-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\"",
+                    "--expected-directory-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"",
+                    1,
+                ),
+            ),
+            (
+                "archive-digest",
+                workflow.replacen(
+                    "--expected-archive-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"",
+                    "--expected-archive-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\"",
+                    1,
+                ),
+            ),
+            (
+                "base-head",
+                workflow.replacen(
+                    "--candidate-commit \"$COLLECTION_ACTIVATION_SHA\"",
+                    "--candidate-commit HEAD",
+                    1,
+                ),
+            ),
+            (
+                "verification-omission",
+                workflow.replacen(
+                    "        run: ./target/ci/hell-ci collection-authority verify-activation-artifact --input ci-in/collection-custody-activation/collection-custody-activation-token.json --report ci-in/collection-custody-activation/collection-custody-admission.json\n",
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "prepare-before-verify",
+                workflow
+                    .replace(
+                        "run: ./target/ci/hell-ci collection-authority verify-activation-artifact --input ci-in/collection-custody-activation/collection-custody-activation-token.json --report ci-in/collection-custody-activation/collection-custody-admission.json",
+                        "run: __COLLECTION_ACTIVATION_VERIFY__",
+                    )
+                    .replace(
+                        "run: ./target/ci/hell-ci collection-authority prepare-activation --input ci-in/collection-custody-activation --output ci-out/collection-activation-proposal --run-id \"$COLLECTION_ACTIVATION_RUN_ID\" --run-attempt \"$COLLECTION_ACTIVATION_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_ACTIVATION_ARTIFACT_ID\" --expected-directory-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"",
+                        "run: ./target/ci/hell-ci collection-authority verify-activation-artifact --input ci-in/collection-custody-activation/collection-custody-activation-token.json --report ci-in/collection-custody-activation/collection-custody-admission.json",
+                    )
+                    .replace(
+                        "run: __COLLECTION_ACTIVATION_VERIFY__",
+                        "run: ./target/ci/hell-ci collection-authority prepare-activation --input ci-in/collection-custody-activation --output ci-out/collection-activation-proposal --run-id \"$COLLECTION_ACTIVATION_RUN_ID\" --run-attempt \"$COLLECTION_ACTIVATION_RUN_ATTEMPT\" --artifact-id \"$COLLECTION_ACTIVATION_ARTIFACT_ID\" --expected-directory-sha256 \"$COLLECTION_ACTIVATION_DIRECTORY_SHA256\" --expected-archive-sha256 \"$COLLECTION_ACTIVATION_ARCHIVE_SHA256\"",
+                    ),
+            ),
+        ]
+    }
+
+    fn activation_preparation_control_mutants(workflow: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "download-before-build",
+                workflow.replacen(
+                    "        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+                    "        run: true\n      - name: Late trusted build\n        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci",
+                    1,
+                ),
+            ),
+            (
+                "trigger",
+                workflow.replacen("  workflow_dispatch:", "  push:\n  workflow_dispatch:", 1),
+            ),
+            (
+                "optional-input",
+                workflow.replacen("required: true", "required: false", 1),
+            ),
+            (
+                "concurrency",
+                workflow.replacen("cancel-in-progress: false", "cancel-in-progress: true", 1),
+            ),
+            (
+                "checkout-ref",
+                workflow.replacen("ref: ${{ inputs.activation_sha }}", "ref: main", 1),
+            ),
+            (
+                "direct-interpolation",
+                workflow.replacen(
+                    "--run-id \"$COLLECTION_ACTIVATION_RUN_ID\"",
+                    "--run-id \"${{ inputs.source_run_id }}\"",
+                    1,
+                ),
+            ),
+            (
+                "authority",
+                format!("{workflow}\n# promotionAuthority: true\n"),
+            ),
+            (
+                "credential",
+                format!("{workflow}\n# secrets.UNREVIEWED\n"),
+            ),
+            (
+                "automatic-commit",
+                format!("{workflow}\n# git commit activation\n"),
+            ),
+            (
+                "partial-target-cache",
+                workflow.replacen(
+                    "key: v2-${{ runner.os }}-${{ runner.arch }}-collection-activation-preparation-target-",
+                    "restore-keys: v2-collection-activation-preparation-target-",
+                    1,
+                ),
+            ),
+            (
+                "output-id",
+                workflow.replacen(
+                    "steps.upload-proposal.outputs.artifact-id",
+                    "steps.bind-proposal.outputs.artifact-id",
+                    1,
+                ),
+            ),
+            (
+                "output-directory-digest",
+                workflow.replacen(
+                    "steps.bind-proposal.outputs.directory_sha256",
+                    "steps.upload-proposal.outputs.artifact-digest",
+                    1,
+                ),
+            ),
+            (
+                "output-path",
+                workflow.replacen(
+                    "path: ci-out/collection-activation-proposal",
+                    "path: ci-out",
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn protected_review_signing_credentials_require_exact_packet_finalization() {
+        let workflows = [
+            (
+                "promotion-approval.yml",
+                include_str!("../../../.github/workflows/promotion-approval.yml"),
+            ),
+            (
+                "mutation.yml",
+                include_str!("../../../.github/workflows/mutation.yml"),
+            ),
+            (
+                "oracle-reproduce.yml",
+                include_str!("../../../.github/workflows/oracle-reproduce.yml"),
+            ),
+            (
+                "artifact-authenticity-finalize.yml",
+                include_str!("../../../.github/workflows/artifact-authenticity-finalize.yml"),
+            ),
+            (
+                "promotion-evidence-review.yml",
+                include_str!("../../../.github/workflows/promotion-evidence-review.yml"),
+            ),
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+            ),
+        ];
+        for (path, workflow) in workflows {
+            let mutant = workflow.replacen(
+                "run: ./target/ci/hell-ci review-packet ",
+                "run: ./target/ci/hell-ci review-sign ",
+                1,
+            );
+            let mut failures = Vec::new();
+            check_workflow(&workflow_path(path), &mutant, &mut failures);
+            assert!(
+                failures.iter().any(|failure| failure.contains(
+                    "must download and authorize its exact subject, finalize its review packet"
+                )),
+                "accepted credentials-before-finalization mutant in {path}: {}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn surveillance_transition_packets_precede_state_signing_credentials() {
+        for (name, job, workflow) in [
+            (
+                "promotion-surveillance.yml",
+                "verify-and-transition",
+                include_str!("../../../.github/workflows/promotion-surveillance.yml"),
+            ),
+            (
+                "promotion-surveillance-watchdog.yml",
+                "deadline",
+                include_str!("../../../.github/workflows/promotion-surveillance-watchdog.yml"),
+            ),
+        ] {
+            let lines = workflow_job_lines(workflow, job).unwrap();
+            let mut failures = Vec::new();
+            check_state_transition_signing_order(
+                &workflow_path(name),
+                job,
+                &lines,
+                0,
+                &mut failures,
+            );
+            assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+            let body = lines.join("\n");
+            let credential = body.find("uses: webfactory/ssh-agent@").unwrap();
+            let packet = body
+                .find("run: ./target/ci/hell-ci custody-ops workflow-transition-packet")
+                .unwrap();
+            let mut mutant = body.clone();
+            let credential_line = body[credential..].lines().next().unwrap();
+            let packet_line = body[packet..].lines().next().unwrap();
+            mutant = mutant
+                .replacen(credential_line, "uses: reordered-credential", 1)
+                .replacen(packet_line, credential_line, 1)
+                .replacen("uses: reordered-credential", packet_line, 1);
+            let mutant_lines = mutant.lines().collect::<Vec<_>>();
+            let mut failures = Vec::new();
+            check_state_transition_signing_order(
+                &workflow_path(name),
+                job,
+                &mutant_lines,
+                0,
+                &mut failures,
+            );
+            assert!(
+                !failures.is_empty(),
+                "accepted reordered credentials in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn custody_provider_signing_keys_load_only_after_typed_receipt_packets() {
+        for (path, workflow, packet) in [
+            (
+                "evidence-custody.yml",
+                include_str!("../../../.github/workflows/evidence-custody.yml"),
+                "run: ./target/ci/hell-ci custody-ops workflow-upload-packet",
+            ),
+            (
+                "custody-scrub.yml",
+                include_str!("../../../.github/workflows/custody-scrub.yml"),
+                "run: ./target/ci/hell-ci custody-ops workflow-maintenance-packet",
+            ),
+        ] {
+            let mutant = workflow.replacen(packet, "run: true", 1);
+            let mut failures = Vec::new();
+            check_workflow(&workflow_path(path), &mutant, &mut failures);
+            assert!(
+                failures.iter().any(|failure| failure.contains(
+                    "must finalize its typed receipt packet before loading signing credentials"
+                )),
+                "accepted provider credential ordering mutant in {path}: {}",
+                failures.join("\n")
+            );
         }
     }
 

@@ -26,6 +26,30 @@ on:
         description: Signed dual-activation correlation digest
         required: true
         type: string
+      selector_run_id:
+        description: Evidence custody run that sealed the activated provider selectors
+        required: true
+        type: string
+      selector_run_attempt:
+        description: Exact evidence custody selector run attempt
+        required: true
+        type: string
+      selector_artifact_id:
+        description: Immutable activated selector aggregate artifact ID
+        required: true
+        type: string
+      selector_archive_sha256:
+        description: Exact activated selector aggregate provider archive digest
+        required: true
+        type: string
+      selector_directory_sha256:
+        description: Exact activated selector aggregate canonical directory digest
+        required: true
+        type: string
+      selector_source_sha:
+        description: Exact evidence custody provider workflow HEAD
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -36,7 +60,7 @@ concurrency:
 
 jobs:
   retrieve-active:
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || (inputs.candidate_sha == github.sha && inputs.selector_source_sha == github.sha)) }}
     permissions:
       actions: read
       contents: read
@@ -46,13 +70,17 @@ jobs:
       matrix:
         include:
           - provider: primary-worm
+            trust-domain: organization-primary
             environment: custody-primary-surveillance
             runner-label: custody-primary-retrieval
+            default-receipt-variable: ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT
             role-variable: CUSTODY_PRIMARY_SURVEILLANCE_ROLE
             region-variable: CUSTODY_PRIMARY_REGION
           - provider: secondary-worm
+            trust-domain: organization-secondary
             environment: custody-secondary-surveillance
             runner-label: custody-secondary-retrieval
+            default-receipt-variable: ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT
             role-variable: CUSTODY_SECONDARY_SURVEILLANCE_ROLE
             region-variable: CUSTODY_SECONDARY_REGION
     environment: ${{ matrix.environment }}
@@ -64,6 +92,7 @@ jobs:
       - name: Check out surveillance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Restore surveillance Cargo dependencies
@@ -83,6 +112,41 @@ jobs:
           key: promotion-surveillance-retrieve-target-v1-${{ matrix.provider }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
       - name: Build surveillance driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted surveillance retrieval driver HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
+      - name: Download exact activated provider selector aggregate
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.selector_run_id }}
+          artifact-ids: ${{ inputs.selector_artifact_id }}
+          path: ci-in/provider-selector-updates
+      - name: Verify activated provider selector update barrier before credentials
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT: ${{ vars.ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT }}
+          ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT: ${{ vars.ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT }}
+          CUSTODY_SELECTOR_AGGREGATE_ARCHIVE_SHA256: ${{ inputs.selector_archive_sha256 }}
+          CUSTODY_SELECTOR_AGGREGATE_ARTIFACT_ID: ${{ inputs.selector_artifact_id }}
+          CUSTODY_SELECTOR_AGGREGATE_CANDIDATE: ${{ inputs.selector_source_sha }}
+          CUSTODY_SELECTOR_AGGREGATE_DIRECTORY_SHA256: ${{ inputs.selector_directory_sha256 }}
+          CUSTODY_SELECTOR_AGGREGATE_EVENT: workflow_dispatch
+          CUSTODY_SELECTOR_AGGREGATE_RUN_ATTEMPT: ${{ inputs.selector_run_attempt }}
+          CUSTODY_SELECTOR_AGGREGATE_RUN_ID: ${{ inputs.selector_run_id }}
+          CUSTODY_SELECTOR_AGGREGATE_WORKFLOW: .github/workflows/evidence-custody.yml
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/hell-ci custody-ops workflow-verify-provider-selector-update-barrier
+      - name: Seal exact active surveillance provider selector before credentials
+        env:
+          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}
+          CUSTODY_PROVIDER_OPERATION: surveillance
+          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}
+          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}
+        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector
       - name: Configure protected read-only provider identity
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -92,25 +156,27 @@ jobs:
       - name: Install pinned maintenance signature verifier
         if: ${{ always() }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Retrieve exact active immutable package or retain typed failure
         if: ${{ always() }}
         run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieve
-      - name: Load protected primary surveillance signer
-        if: ${{ always() && matrix.provider == 'primary-worm' }}
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.CUSTODY_PRIMARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
-      - name: Load protected secondary surveillance signer
-        if: ${{ always() && matrix.provider == 'secondary-worm' }}
-        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
-        with:
-          ssh-private-key: ${{ secrets.CUSTODY_SECONDARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
       - name: Prepare exact signed primary provider observation packet
         if: ${{ always() && matrix.provider == 'primary-worm' }}
         run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieval-packet-primary
       - name: Prepare exact signed secondary provider observation packet
         if: ${{ always() && matrix.provider == 'secondary-worm' }}
         run: ./target/ci/hell-ci custody-ops workflow-surveillance-retrieval-packet-secondary
+      - name: Load protected primary surveillance signer after packet finalization
+        if: ${{ always() && matrix.provider == 'primary-worm' }}
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CUSTODY_PRIMARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
+      - name: Load protected secondary surveillance signer after packet finalization
+        if: ${{ always() && matrix.provider == 'secondary-worm' }}
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CUSTODY_SECONDARY_SURVEILLANCE_SSH_PRIVATE_KEY }}
       - name: Sign exact provider observation
         if: ${{ always() }}
         run: ./target/ci/hell-ci review-sign --input ci-out/custody-maintenance/provider-observation-packet.json --output ci-out/custody-maintenance/provider-observation.dsse.json --role custody-provider --decision accept --policy compat/reviews.allowed_signers
@@ -148,16 +214,23 @@ jobs:
     timeout-minutes: 120
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      directory_sha256: ${{ steps.bind-execution.outputs.directory_sha256 }}
     steps:
       - name: Check out trusted current surveillance harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Build current unprivileged harness before subject materialization
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Build current unprivileged process helper before subject materialization
         run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Verify exact trusted current surveillance harness HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
       - name: Download primary active provider evidence
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
         with:
@@ -170,6 +243,8 @@ jobs:
           path: ci-out/active-secondary
       - name: Install pinned signature verifier
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Derive exact signed active subject without credentials
         id: active
         run: ./target/ci/hell-ci surveillance-ops workflow-compare-active
@@ -177,41 +252,48 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.active.outputs.candidate }}
-          path: ci-work/active-subject
+          path: ci-work/candidate
           fetch-depth: 1
           persist-credentials: false
+      - name: Verify exact isolated active candidate HEAD
+        env:
+          ACTIVE_SUBJECT_SHA: ${{ steps.active.outputs.candidate }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input ci-work/candidate --candidate-commit "$ACTIVE_SUBJECT_SHA"
       - name: Build exact active subject executable without credentials
-        working-directory: ci-work/active-subject
+        working-directory: ci-work/candidate
         run: cargo build --locked --release --package hell-cli --bin hell
       - name: Retain exact active-subject dependency facts
-        working-directory: ci-work/active-subject
+        working-directory: ci-work/candidate
         run: ../../target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation.json
       - name: Retain signed active Linux oracle bytes for subject execution
-        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle ci-work/active-subject/ci-out/linux-release-oracle
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle ci-work/candidate/ci-out/linux-release-oracle
       - name: Retain signed active Linux oracle provider facts
-        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-provider.json ci-work/active-subject/ci-out/linux-release-provider.json
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-provider.json ci-work/candidate/ci-out/linux-release-provider.json
       - name: Retain signed active Linux oracle receipt
-        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-receipt.json ci-work/active-subject/ci-out/linux-release-oracle-receipt.json
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-receipt.json ci-work/candidate/ci-out/linux-release-oracle-receipt.json
       - name: Retain signed active Linux oracle acquisition attestation
-        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-acquisition.dsse.json ci-work/active-subject/ci-out/linux-release-oracle-acquisition.dsse.json
+        run: install -D ci-out/active-promotion-record/approved-proposal/linux-amd64/linux-release-oracle-acquisition.dsse.json ci-work/candidate/ci-out/linux-release-oracle-acquisition.dsse.json
       - name: Execute active subject through current retained harness
-        working-directory: ci-work/active-subject
+        working-directory: ci-work/candidate
         run: ../../target/ci/hell-ci nightly-surveillance-subject --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
       - name: Execute active subject mutation catalog without credentials
-        working-directory: ci-work/active-subject
+        working-directory: ci-work/candidate
         run: ../../target/ci/hell-ci mutation run-surveillance --output ci-out/mutation/mutation-score.pending.json --github-dispatch-inputs
       - name: Retain exact active mutation catalog authority
-        run: install -D ci-work/active-subject/compat/mutants.toml ci-work/active-subject/ci-out/subject-policy/compat/mutants.toml
+        run: install -D ci-work/candidate/compat/mutants.toml ci-work/candidate/ci-out/subject-policy/compat/mutants.toml
       - name: Retain exact active mutation threshold authority
-        run: install -D ci-work/active-subject/compat/mutation-policy.toml ci-work/active-subject/ci-out/subject-policy/compat/mutation-policy.toml
+        run: install -D ci-work/candidate/compat/mutation-policy.toml ci-work/candidate/ci-out/subject-policy/compat/mutation-policy.toml
       - name: Retain the exact executed active binary
-        run: install -D ci-work/active-subject/target/release/hell ci-work/active-subject/ci-out/candidate/hell
+        run: install -D ci-work/candidate/target/release/hell ci-work/candidate/ci-out/candidate/hell
+      - name: Bind exact active subject execution directory
+        id: bind-execution
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-work/candidate/ci-out
       - name: Upload immutable active subject execution
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ephemeralEvidence-active-subject-execution
-          path: ci-work/active-subject/ci-out
+          path: ci-work/candidate/ci-out
           if-no-files-found: error
           retention-days: 14
 
@@ -232,10 +314,13 @@ jobs:
       public_report_exposes_current_state: ${{ steps.objective.outputs.public_report_exposes_current_state }}
       require_signed_governance_action: ${{ steps.objective.outputs.require_signed_governance_action }}
       transition_artifact_id: ${{ steps.upload-transition.outputs.artifact-id }}
+      transition_artifact_digest: ${{ steps.upload-transition.outputs.artifact-digest }}
+      transition_directory_sha256: ${{ steps.bind-transition.outputs.directory_sha256 }}
     steps:
       - name: Check out surveillance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Restore surveillance Cargo dependencies
@@ -273,10 +358,16 @@ jobs:
           path: ci-out/surveillance/active-subject
       - name: Install pinned signature verifier
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Build surveillance driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Build trusted current process helper before subject download
         run: cargo build --locked --profile ci --package hell-testkit --bin hell-test-helper
+      - name: Verify exact trusted surveillance transition driver HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
       - name: Retain exact current governance source
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -289,6 +380,7 @@ jobs:
         continue-on-error: true
         env:
           ACTIVE_SUBJECT_ARTIFACT_ID: ${{ needs.execute-active-subject.outputs.artifact_id }}
+          ACTIVE_SUBJECT_ARCHIVE_SHA256: ${{ needs.execute-active-subject.outputs.artifact_digest }}
           GITHUB_TOKEN: ${{ github.token }}
         run: ./target/ci/hell-ci surveillance-ops workflow-active-subject-selection
       - name: Reverify stable public state against both provider heads
@@ -336,20 +428,24 @@ jobs:
       - name: Derive fail-closed promotion state transition
         if: ${{ always() }}
         run: ./target/ci/hell-ci surveillance-ops workflow-observe
-      - name: Load protected surveillance state signer
+      - name: Prepare exact transition review packet
+        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
+        run: ./target/ci/hell-ci custody-ops workflow-transition-packet
+      - name: Load protected surveillance state signer after packet finalization
         if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
         uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
         with:
           ssh-private-key: ${{ secrets.SURVEILLANCE_STATE_SSH_PRIVATE_KEY }}
-      - name: Prepare exact transition review packet
-        if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
-        run: ./target/ci/hell-ci custody-ops workflow-transition-packet
       - name: Sign exact promotion state transition
         if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
         run: ./target/ci/hell-ci review-sign --input ci-out/surveillance/promotion-transition-packet.json --output ci-out/surveillance/promotion-transition.dsse.json --role custody-reviewer --decision accept --policy ci-out/surveillance/current-governance-source/compat/reviews.allowed_signers
       - name: Verify signed promotion state transition
         if: ${{ always() && steps.objective.outputs.require_signed_governance_action == 'true' }}
         run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy ci-out/surveillance/current-governance-source/compat/reviews.allowed_signers --role custody-reviewer
+      - name: Bind exact surveillance transition directory
+        id: bind-transition
+        if: ${{ always() }}
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/surveillance
       - name: Upload surveillance transition and objective inputs
         id: upload-transition
         if: ${{ always() }}
@@ -390,13 +486,17 @@ jobs:
       matrix:
         include:
           - provider: primary-worm
+            trust-domain: organization-primary
             environment: custody-primary-state-publication
             runner-label: custody-primary-activation
+            default-receipt-variable: ACTIVE_CUSTODY_PRIMARY_UPLOAD_RECEIPT
             role-variable: CUSTODY_PRIMARY_STATE_PUBLICATION_ROLE
             region-variable: CUSTODY_PRIMARY_REGION
           - provider: secondary-worm
+            trust-domain: organization-secondary
             environment: custody-secondary-state-publication
             runner-label: custody-secondary-activation
+            default-receipt-variable: ACTIVE_CUSTODY_SECONDARY_UPLOAD_RECEIPT
             role-variable: CUSTODY_SECONDARY_STATE_PUBLICATION_ROLE
             region-variable: CUSTODY_SECONDARY_REGION
     environment: ${{ matrix.environment }}
@@ -408,10 +508,15 @@ jobs:
       - name: Check out surveillance source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Build state publication driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted state publication driver HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
       - name: Download signed surveillance transition
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
         with:
@@ -419,17 +524,47 @@ jobs:
           path: ci-out/surveillance
       - name: Install pinned state signature verifier
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Verify transition before provider publication
         if: ${{ always() }}
         run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy compat/reviews.allowed_signers --role custody-reviewer
+      - name: Seal exact transition publication provider selector before credentials
+        env:
+          ACTIVE_CUSTODY_PROVIDER_SELECTOR: ${{ vars[matrix.default-receipt-variable] }}
+          CUSTODY_PROVIDER_OPERATION: transition-publication
+          CUSTODY_EXPECTED_PROVIDER: ${{ matrix.provider }}
+          CUSTODY_EXPECTED_TRUST_DOMAIN: ${{ matrix.trust-domain }}
+        run: ./target/ci/hell-ci custody-ops workflow-prepare-provider-selector
       - name: Configure protected state publication identity
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ vars[matrix.role-variable] }}
           aws-region: ${{ vars[matrix.region-variable] }}
       - name: Publish exact signed current state immutably
+        id: publish-transition
         if: ${{ always() }}
         run: ./target/ci/hell-ci custody-ops workflow-publish-transition
+      - name: Bind exact updated provider selector directory
+        id: bind-selector-update
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/provider-selector-update
+      - name: Upload exact updated provider selector
+        id: upload-selector-update
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: custody-provider-selector-update-${{ matrix.provider }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/provider-selector-update
+          if-no-files-found: error
+          retention-days: 90
+
+  seal-provider-selector-updates:
+    needs: publish-current-state
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/custody-provider-selector-seal.yml
+    with:
+      source_workflow: .github/workflows/promotion-surveillance.yml
 
   publish-public-report:
     if: ${{ always() && github.ref == 'refs/heads/main' && needs.verify-and-transition.outputs.public_report_exposes_current_state == 'true' && needs.publish-current-state.result == 'success' }}
@@ -447,10 +582,15 @@ jobs:
       - name: Check out trusted public report publisher
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Build trusted public report publisher
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted public report publisher HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
       - name: Download signed surveillance transition for public report
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
         with:
@@ -458,6 +598,8 @@ jobs:
           path: ci-out/surveillance
       - name: Install pinned public report signature verifier
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Verify transition before public publication
         run: ./target/ci/hell-ci review-verify --input ci-out/surveillance/promotion-transition.dsse.json --policy compat/reviews.allowed_signers --role custody-reviewer
       - name: Verify exact immutable public source artifact
@@ -465,6 +607,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           PUBLIC_REPORT_SOURCE_ARTIFACT_ID: ${{ needs.verify-and-transition.outputs.transition_artifact_id }}
         run: ./target/ci/hell-ci custody-ops workflow-verify-public-source-artifact
+      - name: Seal exact public report destination before credentials
+        env:
+          PUBLIC_COMPATIBILITY_REPORT_BUCKET: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BUCKET }}
+          PUBLIC_COMPATIBILITY_REPORT_BASE_URL: ${{ vars.PUBLIC_COMPATIBILITY_REPORT_BASE_URL }}
+        run: ./target/ci/hell-ci custody-ops workflow-prepare-public-publication-selector
       - name: Configure protected public report identity
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -509,6 +656,7 @@ jobs:
       - name: Check out incident adapter source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Restore incident adapter Cargo dependencies
@@ -528,6 +676,10 @@ jobs:
           key: promotion-surveillance-incident-target-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/**', '.github/workflows/promotion-surveillance.yml') }}
       - name: Build typed incident adapter
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact trusted incident adapter HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
       - name: Upsert promotion surveillance incident
         env:
           GITHUB_TOKEN: ${{ github.token }}

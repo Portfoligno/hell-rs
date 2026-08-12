@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "kind": "catalog-digests",
+  "baseline": "2026-05-29",
+  "candidateCommitBinding": "collection-time",
+  "catalogSetSha256": "f438538a803d5d075829077d2b0c365bd719d393c251d32bf690df631e3b7f36",
+  "catalogs": {
+    "compat/acquisition-sources.toml": "5b2c15e35754a89efc3f9efcfb65dc83a73f801ed88f1e3fa74113f9f3e7f7e4",
+    "compat/assurance-policy.toml": "c357cd00c7d9b8e2c7f9165e3a0a25297e28d887f43d71956ed724c33d828887",
+    "compat/claim-rules.toml": "a2ebed69ea2bc64d610af676470ddbe02c09c61b551dafd8d6e1ae312dff27e4",
+    "compat/claims/2026-05-29.toml": "6de839034501103f733f15e923cafc5f7181826e958da63a32213efbb6dc8e85",
+    "compat/collection-activation-claims.json": "9317bd11816468e73de9a17c0713d550beed945f4e1b22e4b8e1ed13a7e0b80e",
+    "compat/collection-activation-provenance.json": "6c4eed795194adcf30bb6eb8b04ff8eb6aeef635de38ec2e07b2505f5afdc5e1",
+    "compat/collection-activation.toml": "73315ba13514692dbe067b26ee852ab95bf21830cb8d9aca4c44dec04fb230f3",
+    "compat/corpus-obligations.toml": "f34a329da29c9dcf683864968cc2d4b0431d74e87db043a94156985ac67c1e5f",
+    "compat/custody-policy.toml": "e818162808d06482dcc2489c7a315393665d2c5077653072bf7f86ba367996e5",
+    "compat/divergences.toml": "7ae8c3d70baa62f0caa201dd9936168f89b5392463f7feba1ae8d26d71b990c0",
+    "compat/mutants.toml": "6fbad168846e03a9ecfbef5f44f7aa23a288653d8376044a3120e775558250d2",
+    "compat/mutation-policy.toml": "9cfe340768897218b44a25e44929297dbfe17acbb2269b4e7296acc1dfe80624",
+    "compat/normalizers.toml": "30db1c78a2fc9e4c8b7b5b4ea5280265adeff0f04ae9f4aa5fa269e4b36f330b",
+    "compat/promotion-policy.toml": "f757c44ab61bb590ed6a9ac0453a5a218d564d0c04fd3f340ebb248ee0149708",
+    "compat/regression-corpus.tsv": "f36dcec499beea48418dc7ea6a50d8259c5fc904bfde17a1569b18cfaa88ef5b",
+    "compat/review-policy.toml": "afe5d547f035ccd901b0e4a8ecea48f0975563ceaa1a16b577fe0d5821883d73",
+    "compat/reviews.allowed_signers": "839f9bdecfbf84e64325af17550cfbfbf9633ee4d24307e4cb647eba3fb9304c",
+    "compat/surveillance-policy.toml": "f9733aa4d2ddeff99dd6cbf9e926dd85ff85e5e9e54353216a7609a0094c7291",
+    "compat/trust-roots.toml": "aca2ace48380438f9bca6115c57140128cfece747d5c8adb1173c1c9b23c1168"
+  }
+}

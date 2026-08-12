@@ -6,6 +6,9 @@ on:
       packet_artifact_id:
         type: string
         required: true
+      packet_artifact_digest:
+        type: string
+        required: true
       packet_directory_sha256:
         type: string
         required: true
@@ -18,12 +21,17 @@ on:
       subject_artifact_id:
         type: string
         required: true
+      subject_artifact_digest:
+        type: string
+        required: true
       subject_directory_sha256:
         type: string
         required: true
     outputs:
       artifact_id:
         value: ${{ jobs.sign.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.sign.outputs.artifact_digest }}
       directory_sha256:
         value: ${{ jobs.sign.outputs.directory_sha256 }}
 
@@ -40,6 +48,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       directory_sha256: ${{ steps.digest.outputs.directory_sha256 }}
     steps:
       - name: Check out trusted current isolated signer A
@@ -60,6 +69,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ inputs.packet_artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: assurance-transport-readiness-packets-${{ inputs.parent_run_id }}-${{ inputs.parent_run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ inputs.packet_artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ inputs.packet_directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -77,6 +87,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REGRESSION_PROVIDER_ARTIFACT_ID: ${{ inputs.subject_artifact_id }}
           REGRESSION_PROVIDER_ARTIFACT_NAME: assurance-transport-readiness-subject-${{ inputs.parent_run_id }}-${{ inputs.parent_run_attempt }}
+          REGRESSION_PROVIDER_ARCHIVE_SHA256: ${{ inputs.subject_artifact_digest }}
           REGRESSION_PROVIDER_DIRECTORY_SHA256: ${{ inputs.subject_directory_sha256 }}
           REGRESSION_PROVIDER_EVENT: workflow_dispatch
           REGRESSION_PROVIDER_HEAD_SHA: ${{ github.sha }}
@@ -88,6 +99,8 @@ jobs:
         run: ./target/ci/hell-ci auth-transport-probe context-verify --input ci-in/transport-packets/context.json --program ci-in/transport-subject --from ci-in/transport-packets/subject-selection
       - name: Install pinned Sigstore signer A
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Load dedicated protected SSH probe key A
         uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
         with:

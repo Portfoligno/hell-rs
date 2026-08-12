@@ -833,6 +833,30 @@ pub fn verify_observation_bundle_manifest_bytes(bytes: &[u8]) -> std::io::Result
     parse_bundle_manifest(document).map(|_| ())
 }
 
+/// Parses a canonical schema-v4 observation-bundle manifest and returns its
+/// exact ordered portable path/digest inventory without dereferencing paths.
+///
+/// # Errors
+///
+/// Returns an error for invalid UTF-8, a malformed/noncanonical manifest,
+/// a nonportable path, or an invalid digest.
+pub fn verified_observation_bundle_manifest_files(
+    bytes: &[u8],
+) -> std::io::Result<Vec<(String, Digest)>> {
+    let document = std::str::from_utf8(bytes)
+        .map_err(|_| std::io::Error::other("bundle manifest is not canonical UTF-8"))?;
+    parse_bundle_manifest(document).and_then(|(_, files)| {
+        files
+            .into_iter()
+            .map(|(path, digest)| {
+                Digest::from_hex(&digest)
+                    .map(|digest| (path, digest))
+                    .map_err(std::io::Error::other)
+            })
+            .collect()
+    })
+}
+
 fn parse_bundle_manifest(
     manifest: &str,
 ) -> std::io::Result<(BundleManifestIdentity<'_>, Vec<(String, String)>)> {

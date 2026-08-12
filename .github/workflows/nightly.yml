@@ -35,6 +35,10 @@ on:
         description: Immutable approved-proposal provider artifact ID
         required: true
         type: string
+      proposal_provider_archive_sha256:
+        description: Exact approved-proposal provider archive digest
+        required: true
+        type: string
       proposal_package_sha256:
         description: Expected canonical approved-proposal directory SHA-256
         required: true
@@ -167,6 +171,8 @@ jobs:
           path: ci-out
       - name: Install pinned Sigstore signer
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Sign exact verified Linux release acquisition
         run: ./target/ci/hell-ci release-oracle attest --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json --attestation ci-out/linux-release-oracle-acquisition.dsse.json
       - name: Upload immutable signed Linux acquisition
@@ -186,7 +192,7 @@ jobs:
       actions: read
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Check out exact candidate for unprivileged execution
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -260,6 +266,10 @@ jobs:
         with:
           artifact-ids: ${{ needs.sign-linux-acquisition.outputs.artifact_id }}
           path: ci-out
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Collect Linux release and stress evidence
         run: ./target/ci/hell-ci nightly --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
       - name: Minimize every scheduled generated mismatch as unreviewed non-claim evidence
@@ -284,7 +294,7 @@ jobs:
       actions: read
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Check out exact branch candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -301,6 +311,10 @@ jobs:
         with:
           artifact-ids: ${{ needs.linux-acquisition-subject.outputs.artifact_id }}
           path: ci-out
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Collect explicitly non-promotable branch Linux evidence
         run: ./target/ci/hell-ci nightly-exploratory --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly.json
       - name: Upload unprivileged branch Linux evidence
@@ -315,7 +329,7 @@ jobs:
   native-oracle-macos:
     name: Native oracle shard / macOS arm64
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 180
     if: ${{ github.event_name == 'push' || !inputs.require_promotion }}
     steps:
       - name: Check out candidate source
@@ -397,6 +411,11 @@ jobs:
       - name: Retain dependency policy attestation
         run: ./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-attestation-report.json
 
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
+
       - name: Build pinned oracle and run native shard
         run: ./target/ci/hell-ci native-oracle-shard --source ci-work/oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/shards/macos-arm64/report.json
 
@@ -451,7 +470,7 @@ jobs:
   native-oracle-windows:
     name: Native oracle shard / Windows amd64
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 180
     if: ${{ github.event_name == 'push' || !inputs.require_promotion }}
     steps:
       - name: Check out candidate source
@@ -533,6 +552,11 @@ jobs:
       - name: Retain dependency policy attestation
         run: .\target\ci\hell-ci.exe dependency-attestation --output ci-out\dependency-policy.json --report ci-out\dependency-attestation-report.json
 
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
+
       - name: Build pinned oracle and run native shard
         run: .\target\ci\hell-ci.exe native-oracle-shard --source ci-work\oracle-source --platform windows-amd64 --dependency-attestation ci-out\dependency-policy.json --report ci-out\shards\windows-amd64\report.json
 
@@ -588,6 +612,10 @@ jobs:
     name: Merge native oracle evidence / Linux
     needs: [evidence-collection-linux, native-oracle-macos, native-oracle-windows]
     if: ${{ always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.require_promotion) }}
+    outputs:
+      native_artifact_id: ${{ steps.upload-native.outputs.artifact-id }}
+      native_artifact_digest: ${{ steps.upload-native.outputs.artifact-digest }}
+      native_directory_sha256: ${{ steps.bind-native.outputs.directory_sha256 }}
     permissions:
       attestations: write
       contents: read
@@ -643,6 +671,11 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
+
       - name: Verify and merge native shards
         run: ./target/ci/hell-ci merge-native-shards --input ci-out/native-shards --report ci-out/native-shards/merge-report.json
 
@@ -660,7 +693,12 @@ jobs:
         with:
           subject-path: ci-out/native-shards/provider-attestation-subject.json
 
+      - name: Bind exact merged native evidence directory
+        id: bind-native
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/native-shards
+
       - name: Upload merged native evidence
+        id: upload-native
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -719,17 +757,25 @@ jobs:
           path: ci-out/native-shards/windows-amd64
       - name: Build unprivileged branch merge verifier
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
       - name: Validate the exact three-platform branch merge without promotion output
         run: ./target/ci/hell-ci merge-native-shards --input ci-out/native-shards --report ci-out/native-shards/merge-report.json
 
   promotion-gate:
     name: Promotion gate / Linux
     needs: merge-native-evidence
-    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.require_promotion }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.require_promotion && inputs.candidate_sha == github.sha }}
     permissions:
       actions: read
       contents: read
     environment: compatibility-promotion
+    outputs:
+      promotion_record_artifact_id: ${{ steps.final-record.outputs.artifact-id }}
+      promotion_record_artifact_digest: ${{ steps.final-record.outputs.artifact-digest }}
+      promotion_record_directory_sha256: ${{ steps.bind-final-record.outputs.directory_sha256 }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -772,6 +818,16 @@ jobs:
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
 
+      - name: Verify trusted gate and approved-provider workflow source share the exact candidate HEAD
+        env:
+          TRUSTED_DRIVER_SHA: ${{ github.sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$TRUSTED_DRIVER_SHA"
+
+      - name: Install pinned active-review verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.4.3
+
       - name: Reverify durable regression signatures and current governance revocations
         run: ./target/ci/hell-ci regression-import verify-committed-structural
 
@@ -786,6 +842,10 @@ jobs:
 
       - name: Assemble exact final promotion record
         run: ./target/ci/hell-ci surveillance-ops workflow-final-record
+
+      - name: Bind exact final promotion record directory
+        id: bind-final-record
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/promotion-record
 
       - name: Upload final record for protected durable custody
         id: final-record

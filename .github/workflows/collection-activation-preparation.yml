@@ -1,0 +1,122 @@
+name: Collection Activation Preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      activation_sha:
+        description: Exact main commit at which the non-authoritative activation proposal is prepared
+        required: true
+        type: string
+      source_run_id:
+        description: Exact protected integration run containing the custody admission artifact
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact protected integration run attempt containing the custody admission artifact
+        required: true
+        type: string
+      artifact_id:
+        description: Immutable custody admission artifact ID
+        required: true
+        type: string
+      expected_directory_sha256:
+        description: Exact canonical extracted custody admission directory SHA-256
+        required: true
+        type: string
+      expected_archive_sha256:
+        description: Exact GitHub custody admission archive SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collection-activation-preparation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-non-authoritative-activation:
+    name: Prepare non-authoritative collection activation proposal
+    if: ${{ github.ref == 'refs/heads/main' && inputs.activation_sha == github.sha }}
+    permissions:
+      actions: read
+      contents: read
+    environment: collection-activation-preparation
+    outputs:
+      proposal_artifact_id: ${{ steps.upload-proposal.outputs.artifact-id }}
+      proposal_artifact_digest: ${{ steps.upload-proposal.outputs.artifact-digest }}
+      proposal_directory_sha256: ${{ steps.bind-proposal.outputs.directory_sha256 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact protected activation base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.activation_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore activation preparation Cargo dependency cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-collection-activation-preparation-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Restore activation preparation compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: v2-${{ runner.os }}-${{ runner.arch }}-collection-activation-preparation-target-${{ inputs.activation_sha }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/collection-activation-preparation.yml') }}
+      - name: Build trusted activation preparation driver
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Verify exact protected activation base
+        env:
+          COLLECTION_ACTIVATION_SHA: ${{ inputs.activation_sha }}
+        run: ./target/ci/hell-ci collection-authority verify-checkout --input . --candidate-commit "$COLLECTION_ACTIVATION_SHA"
+      - name: Download immutable verified custody admission artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id }}
+          artifact-ids: ${{ inputs.artifact_id }}
+          path: ci-in/collection-custody-activation
+      - name: Validate exact custody admission artifact before proposal preparation
+        run: ./target/ci/hell-ci collection-authority verify-activation-artifact --input ci-in/collection-custody-activation/collection-custody-activation-token.json --report ci-in/collection-custody-activation/collection-custody-admission.json
+      - name: Prepare provider-authenticated non-authoritative activation proposal
+        env:
+          COLLECTION_ACTIVATION_ARTIFACT_ID: ${{ inputs.artifact_id }}
+          COLLECTION_ACTIVATION_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}
+          COLLECTION_ACTIVATION_DIRECTORY_SHA256: ${{ inputs.expected_directory_sha256 }}
+          COLLECTION_ACTIVATION_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          COLLECTION_ACTIVATION_RUN_ID: ${{ inputs.source_run_id }}
+        run: ./target/ci/hell-ci collection-authority prepare-activation --input ci-in/collection-custody-activation --output ci-out/collection-activation-proposal --run-id "$COLLECTION_ACTIVATION_RUN_ID" --run-attempt "$COLLECTION_ACTIVATION_RUN_ATTEMPT" --artifact-id "$COLLECTION_ACTIVATION_ARTIFACT_ID" --expected-directory-sha256 "$COLLECTION_ACTIVATION_DIRECTORY_SHA256" --expected-archive-sha256 "$COLLECTION_ACTIVATION_ARCHIVE_SHA256"
+      - name: Bind exact activation proposal directory
+        id: bind-proposal
+        run: ./target/ci/hell-ci regression-import emit-directory-output --input ci-out/collection-activation-proposal
+      - name: Upload immutable non-authoritative activation proposal
+        id: upload-proposal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: collection-activation-proposal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-out/collection-activation-proposal
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save activation preparation Cargo dependency cache
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: v2-${{ runner.os }}-${{ runner.arch }}-collection-activation-preparation-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Save activation preparation compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ci
+          key: v2-${{ runner.os }}-${{ runner.arch }}-collection-activation-preparation-target-${{ inputs.activation_sha }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/collection-activation-preparation.yml') }}
