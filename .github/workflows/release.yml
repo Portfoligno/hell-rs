@@ -17,9 +17,6 @@ concurrency:
   group: release-${{ github.repository }}
   cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   resolve:
     name: Resolve and plan
@@ -60,7 +57,7 @@ jobs:
       - name: Resolve candidate branch
         id: resolve
         env:
-          HELL_GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release resolve --output release-state/resolution.json
       - name: Check out exact candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +69,7 @@ jobs:
       - name: Create canonical release and conformance plans
         id: plan
         env:
-          HELL_GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json
       - name: Upload exact release plan
         id: upload
@@ -417,15 +414,17 @@ jobs:
         working-directory: automation
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Assemble, derive, and verify exact release set
-        env:
-          HELL_GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release assemble --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-input/platforms --output release-bundle --report release-reports/assembly.json
-      - name: Retain conformance assembly diagnostics
+      - name: Recheck remote state after assembly
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/post-assembly-remote-state.json
+      - name: Retain release assembly diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-conformance-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-reports/assembly.json
+          path: release-reports
           if-no-files-found: error
           retention-days: 30
       - name: Upload exact release bundle
@@ -490,29 +489,26 @@ jobs:
         working-directory: automation
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Independently verify release bundle before attestation
-        env:
-          HELL_GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release verify-bundle --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-bundle --report release-reports/prepublish.json
+      - name: Recheck remote state before attestation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/pre-attestation-remote-state.json
       - name: Attest release subjects with build provenance
-        id: provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-checksums: release-bundle/SUBJECTS.sha256
       - name: Attest release subjects with the release-gate predicate
-        id: gate
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-checksums: release-bundle/SUBJECTS.sha256
           predicate-type: https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2
           predicate-path: release-bundle/release-gate.json
       - name: Stage exact attestation bundles
-        env:
-          HELL_PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
-          HELL_RELEASE_GATE_BUNDLE: ${{ steps.gate.outputs.bundle-path }}
         run: ./automation/target/ci/hell-ci release stage-attestations --input release-bundle
       - name: Publish exact immutable release
         env:
-          HELL_GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release publish --plan release-input/plan/release-plan.json --input release-bundle --report release-reports/publication.json
       - name: Save trusted Cargo downloads
         if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}

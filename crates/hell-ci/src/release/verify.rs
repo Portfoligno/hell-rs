@@ -12,6 +12,12 @@ const ATTESTATIONS: [&str; 2] = [
     "github-release-gate.sigstore.json",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BundleKind {
+    Technical,
+    Publication,
+}
+
 pub(crate) fn bundle(
     plan_path: PathBuf,
     conformance_plan_path: PathBuf,
@@ -23,8 +29,7 @@ pub(crate) fn bundle(
         Some(&conformance_plan_path),
         &input,
         &report,
-        false,
-        true,
+        BundleKind::Technical,
     )
 }
 
@@ -39,8 +44,7 @@ pub(super) fn technical_bundle(
         Some(&conformance_plan_path),
         &input,
         &report,
-        false,
-        false,
+        BundleKind::Technical,
     )
 }
 
@@ -49,16 +53,15 @@ pub(crate) fn publication_bundle(
     input: PathBuf,
     report: PathBuf,
 ) -> Result<String, String> {
-    verify_bundle(&plan_path, None, &input, &report, true, false)
+    verify_bundle(&plan_path, None, &input, &report, BundleKind::Publication)
 }
 
 fn verify_bundle(
     plan_path: &Path,
-    external_conformance_plan: Option<&PathBuf>,
+    external_conformance_plan: Option<&Path>,
     input: &Path,
     report: &Path,
-    with_attestations: bool,
-    verify_remote: bool,
+    kind: BundleKind,
 ) -> Result<String, String> {
     let plan = ReleasePlan::parse(&read_json(plan_path)?)?;
     require_real_directory(input)?;
@@ -80,7 +83,7 @@ fn verify_bundle(
     let mut top_level = required_subjects.clone();
     top_level.insert("SUBJECTS.sha256".to_owned());
     top_level.insert("release-gate.json".to_owned());
-    if with_attestations {
+    if kind == BundleKind::Publication {
         top_level.extend(ATTESTATIONS.iter().map(|name| (*name).to_owned()));
     }
     if directory_entries(input)? != top_level {
@@ -248,9 +251,6 @@ fn verify_bundle(
         &evidence_sha256,
         &report_sha256,
     )?;
-    if verify_remote {
-        verify_remote_stability(&plan)?;
-    }
     write_json(
         report,
         &object([
@@ -265,24 +265,6 @@ fn verify_bundle(
         ]),
     )?;
     Ok("independently reconstructed and verified exact release bundle".to_owned())
-}
-
-fn verify_remote_stability(plan: &ReleasePlan) -> Result<(), String> {
-    let client = super::github::GitHubClient::from_environment()?;
-    if client.branch_head(
-        &plan.resolution.repository,
-        &plan.resolution.candidate_branch,
-    )? != plan.resolution.candidate_sha
-    {
-        return Err("candidate branch moved before release attestation".to_owned());
-    }
-    if client
-        .tag_commit(&plan.resolution.repository, &plan.tag)?
-        .is_some()
-    {
-        return Err("release tag exists before release attestation".to_owned());
-    }
-    Ok(())
 }
 
 fn required_subjects(plan: &ReleasePlan) -> BTreeSet<String> {

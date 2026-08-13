@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::json::{JsonValue, canonical_json_bytes, parse_json};
 
@@ -20,6 +21,12 @@ pub(crate) fn read_json(path: &Path) -> Result<JsonValue, String> {
 pub(crate) fn write_json(path: &Path, value: &JsonValue) -> Result<Vec<u8>, String> {
     let bytes = canonical_json_bytes(value)?;
     write_atomic(path, &bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn write_json_new(path: &Path, value: &JsonValue) -> Result<Vec<u8>, String> {
+    let bytes = canonical_json_bytes(value)?;
+    write_atomic_new(path, &bytes)?;
     Ok(bytes)
 }
 
@@ -82,4 +89,47 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     drop(file);
     fs::rename(&temporary, path)
         .map_err(|error| format!("cannot install {}: {error}", path.display()))
+}
+
+pub(crate) fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "output path has no filename".to_owned())?;
+    let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = name.to_os_string();
+    temporary_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+    let temporary = path.with_file_name(temporary_name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
+    use std::io::Write as _;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("cannot write {}: {error}", temporary.display()));
+    }
+    drop(file);
+    if let Err(error) = fs::hard_link(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("cannot install {}: {error}", path.display()));
+    }
+    if let Err(error) = fs::remove_file(&temporary) {
+        return match fs::remove_file(path) {
+            Ok(()) => Err(format!("cannot remove {}: {error}", temporary.display())),
+            Err(rollback_error) => Err(format!(
+                "cannot remove {}: {error}; cannot roll back {}: {rollback_error}",
+                temporary.display(),
+                path.display()
+            )),
+        };
+    }
+    Ok(())
 }

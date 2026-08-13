@@ -21,6 +21,8 @@ const NIGHTLY_ORACLE_ACQUIRE: &str = "./target/ci/hell-ci oracle-acquire acquire
 const NIGHTLY_DIVERGENCE_PROTOTYPES: &str = "./target/ci/hell-ci divergence-prototype verify";
 const NIGHTLY_REGRESSION_PRODUCER: &str = "./target/ci/hell-ci nightly --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly-linux.json";
 const NIGHTLY_REGRESSION_CONSUMER: &str = "./target/ci/hell-ci regression-import explore-generated --input ci-out --output ci-out/regression-exploration";
+const RELEASE_RESOLVE_COMMAND: &str =
+    "./automation/target/ci/hell-ci release resolve --output release-state/resolution.json";
 const RELEASE_PLAN_COMMAND: &str = "./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json";
 const READINESS_PLAN_COMMAND: &str = "./automation/target/ci/hell-ci readiness plan --repository-root candidate --output readiness-plan";
 const READINESS_LINUX_COMMAND: &str = "./automation/target/ci/hell-ci readiness platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan readiness-input/readiness-plan.json --conformance-plan readiness-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out";
@@ -31,10 +33,13 @@ const LINUX_PLATFORM_COMMAND: &str = "./automation/target/ci/hell-ci release pla
 const MACOS_PLATFORM_COMMAND: &str = "./automation/target/ci/hell-ci release platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out";
 const WINDOWS_PLATFORM_COMMAND: &str = ".\\automation\\target\\ci\\hell-ci.exe release platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input\\release-plan.json --conformance-plan release-input\\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out";
 const ASSEMBLE_COMMAND: &str = "./automation/target/ci/hell-ci release assemble --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-input/platforms --output release-bundle --report release-reports/assembly.json";
+const POST_ASSEMBLY_REMOTE_COMMAND: &str = "./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/post-assembly-remote-state.json";
 const VERIFY_BUNDLE_COMMAND: &str = "./automation/target/ci/hell-ci release verify-bundle --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-bundle --report release-reports/prepublish.json";
+const PRE_ATTESTATION_REMOTE_COMMAND: &str = "./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/pre-attestation-remote-state.json";
 const STAGE_ATTESTATIONS_COMMAND: &str =
     "./automation/target/ci/hell-ci release stage-attestations --input release-bundle";
 const PUBLISH_COMMAND: &str = "./automation/target/ci/hell-ci release publish --plan release-input/plan/release-plan.json --input release-bundle --report release-reports/publication.json";
+const GITHUB_TOKEN_EXPRESSION: &str = "${{ github.token }}";
 const RELEASE_GATE_PREDICATE_V2: &str =
     "https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2";
 const RETIRED_AUTHORITY_COMMANDS: [&str; 5] = [
@@ -47,6 +52,34 @@ const RETIRED_AUTHORITY_COMMANDS: [&str; 5] = [
 const CHECKOUT_ACTION: &str = "actions/checkout";
 const CACHE_RESTORE_ACTION: &str = "actions/cache/restore";
 const CACHE_SAVE_ACTION: &str = "actions/cache/save";
+
+struct TokenStep {
+    job: &'static str,
+    command: &'static str,
+}
+
+const TOKEN_STEPS: [TokenStep; 5] = [
+    TokenStep {
+        job: "resolve",
+        command: RELEASE_RESOLVE_COMMAND,
+    },
+    TokenStep {
+        job: "resolve",
+        command: RELEASE_PLAN_COMMAND,
+    },
+    TokenStep {
+        job: "assemble",
+        command: POST_ASSEMBLY_REMOTE_COMMAND,
+    },
+    TokenStep {
+        job: "publish",
+        command: PRE_ATTESTATION_REMOTE_COMMAND,
+    },
+    TokenStep {
+        job: "publish",
+        command: PUBLISH_COMMAND,
+    },
+];
 
 const LINUX_GATES: [&str; 22] = [
     "runner-identity",
@@ -164,6 +197,25 @@ pub(super) fn check(root: &Path, tracked: &[PathBuf], failures: &mut Vec<String>
         .iter()
         .filter(|path| path.parent() == Some(Path::new(".github/workflows")))
         .collect::<Vec<_>>();
+    let actual_paths = workflow_paths
+        .iter()
+        .filter_map(|path| path.to_str())
+        .collect::<BTreeSet<_>>();
+    let expected_paths = [
+        CI_PATH,
+        MUTATION_PATH,
+        NIGHTLY_PATH,
+        REGRESSION_CORPUS_PATH,
+        REGRESSION_SUBJECT_PATH,
+        RELEASE_PATH,
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if actual_paths != expected_paths {
+        failures.push(format!(
+            "workflow files must be exactly {expected_paths:?}, found {actual_paths:?}"
+        ));
+    }
     let mut parsed = BTreeMap::new();
     let mut dispatches = Vec::new();
     for path in workflow_paths {
@@ -920,7 +972,7 @@ fn check_nightly(workflow: &Workflow, failures: &mut Vec<String>) {
 
 fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
     touch_workflow_fields(workflow);
-    check_no_source_commit_env(path, "workflow", workflow.env.as_ref(), failures);
+    check_environment_contract(path, workflow, failures);
     if path != Path::new(RELEASE_PATH) && has_write_permission(workflow.permissions.as_ref()) {
         failures.push(format!(
             "{} has release write permission at workflow scope",
@@ -929,7 +981,6 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
     }
     for (job_name, job) in &workflow.jobs {
         touch_job_fields(job);
-        check_no_source_commit_env(path, job_name, job.env.as_ref(), failures);
         if let Some(action) = job.uses.as_ref().and_then(Value::as_str) {
             check_action_pin(path, job_name, action, failures);
         }
@@ -946,7 +997,6 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
         }
         for step in job.steps.as_deref().unwrap_or_default() {
             touch_step_fields(step);
-            check_no_source_commit_env(path, job_name, step.env.as_ref(), failures);
             if step.shell.is_some() {
                 failures.push(format!(
                     "{} job {job_name:?} declares an explicit shell",
@@ -974,6 +1024,14 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
             }
             if let Some(action) = &step.uses {
                 check_action_pin(path, job_name, action, failures);
+                if action_name(action) == Some("actions/attest")
+                    && (path != Path::new(RELEASE_PATH) || job_name != "publish")
+                {
+                    failures.push(format!(
+                        "{} job {job_name:?} must not create attestations",
+                        path.display()
+                    ));
+                }
                 if action_name(action) == Some("sigstore/cosign-installer") {
                     failures.push(format!(
                         "{} job {job_name:?} installs the retired review verifier",
@@ -994,21 +1052,120 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
     }
 }
 
-fn check_no_source_commit_env(
-    path: &Path,
-    scope: &str,
-    environment: Option<&Value>,
-    failures: &mut Vec<String>,
-) {
-    if environment
-        .and_then(Value::as_mapping)
-        .is_some_and(|values| contains_key(values, "HELL_SOURCE_COMMIT"))
-    {
+fn check_environment_contract(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
+    if workflow.env.is_some() {
         failures.push(format!(
-            "{} {scope:?} injects retired HELL_SOURCE_COMMIT ambient input",
+            "{} must not define workflow-level environment variables",
             path.display()
         ));
     }
+
+    for (job_name, job) in &workflow.jobs {
+        if job.env.is_some() {
+            failures.push(format!(
+                "{} job {job_name:?} must not define job-level environment variables",
+                path.display()
+            ));
+        }
+        for step in job.steps.as_deref().unwrap_or_default() {
+            let Some(environment) = step.env.as_ref() else {
+                continue;
+            };
+            let allowed = path == Path::new(RELEASE_PATH)
+                && exact_github_token_environment(environment)
+                && step.uses.is_none()
+                && step.condition.is_none()
+                && step.working_directory.is_none()
+                && step.run.as_deref().is_some_and(|command| {
+                    TOKEN_STEPS
+                        .iter()
+                        .any(|allowed| allowed.job == job_name && allowed.command == command)
+                });
+            if !allowed {
+                failures.push(format!(
+                    "{} job {job_name:?} has a forbidden step environment mapping",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if path == Path::new(RELEASE_PATH) {
+        for allowed in &TOKEN_STEPS {
+            let count = workflow
+                .jobs
+                .get(allowed.job)
+                .and_then(|job| job.steps.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .filter(|step| {
+                    step.run.as_deref() == Some(allowed.command)
+                        && step
+                            .env
+                            .as_ref()
+                            .is_some_and(exact_github_token_environment)
+                        && step.uses.is_none()
+                        && step.condition.is_none()
+                        && step.working_directory.is_none()
+                })
+                .count();
+            if count != 1 {
+                failures.push(format!(
+                    "release job {:?} must expose the automatic GitHub token to the exact trusted command once, found {count}",
+                    allowed.job
+                ));
+            }
+        }
+    }
+
+    let retired_plumbing = [
+        "HELL_",
+        "CARGO_TERM_COLOR",
+        "GITHUB_ENV",
+        "steps.provenance.outputs.bundle-path",
+        "steps.gate.outputs.bundle-path",
+    ];
+    if retired_plumbing
+        .iter()
+        .any(|needle| workflow_contains_text(workflow, &|value| value.contains(needle)))
+    {
+        failures.push(format!(
+            "{} contains retired environment-variable plumbing",
+            path.display()
+        ));
+    }
+    if path == Path::new(RELEASE_PATH)
+        && workflow_contains_text(workflow, &|value| {
+            value.to_ascii_lowercase().contains("vars.")
+        })
+    {
+        failures
+            .push("release workflow must not reference repository or organization vars".to_owned());
+    }
+    if path == Path::new(RELEASE_PATH)
+        && workflow_contains_text(workflow, &|value| {
+            value.to_ascii_lowercase().contains("secrets.")
+        })
+    {
+        failures.push(
+            "release workflow must not reference repository or organization secrets".to_owned(),
+        );
+    }
+    if path == Path::new(RELEASE_PATH) {
+        let occurrences = workflow_text_occurrence_count(workflow, GITHUB_TOKEN_EXPRESSION);
+        if occurrences != TOKEN_STEPS.len() {
+            failures.push(format!(
+                "release workflow must contain the automatic GitHub token expression exactly {} times in approved step environments, found {occurrences}",
+                TOKEN_STEPS.len()
+            ));
+        }
+    }
+}
+
+fn exact_github_token_environment(environment: &Value) -> bool {
+    environment.as_mapping().is_some_and(|values| {
+        values.len() == 1 && scalar(get(values, "GITHUB_TOKEN")) == Some(GITHUB_TOKEN_EXPRESSION)
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1131,13 +1288,12 @@ fn check_release(workflow: &Workflow, failures: &mut Vec<String>) {
     ] {
         check_exact_upload(workflow, job_name, path, failures);
     }
-    check_exact_command(
-        workflow,
-        "resolve",
-        RELEASE_PLAN_COMMAND,
-        "canonical isolated release plan",
-        failures,
-    );
+    for (command, label) in [
+        (RELEASE_RESOLVE_COMMAND, "exact candidate resolution"),
+        (RELEASE_PLAN_COMMAND, "canonical isolated release plan"),
+    ] {
+        check_exact_command(workflow, "resolve", command, label, failures);
+    }
     for job_name in ["resolve", "linux", "macos", "windows", "assemble"] {
         if workflow
             .jobs
@@ -1342,6 +1498,14 @@ fn check_assemble(workflow: &Workflow, failures: &mut Vec<String>) {
         "the exact conformance assembly",
         failures,
     );
+    check_exact_command(
+        workflow,
+        "assemble",
+        POST_ASSEMBLY_REMOTE_COMMAND,
+        "the post-assembly remote-state gate",
+        failures,
+    );
+    let steps = job.steps.as_deref().unwrap_or_default();
     let diagnostic_uploads = job
         .steps
         .as_deref()
@@ -1350,13 +1514,40 @@ fn check_assemble(workflow: &Workflow, failures: &mut Vec<String>) {
         .filter(|step| {
             step.uses.as_deref().and_then(action_name) == Some("actions/upload-artifact")
                 && scalar(step.condition.as_ref()) == Some("${{ always() }}")
-                && with_scalar(step, "path") == Some("release-reports/assembly.json")
+                && with_scalar(step, "path") == Some("release-reports")
                 && with_scalar(step, "if-no-files-found") == Some("error")
         })
         .count();
     if diagnostic_uploads != 1 {
         failures.push(
-            "assemble must retain the exact blocked conformance diagnostic under always()"
+            "assemble must retain the exact release diagnostics directory under always()"
+                .to_owned(),
+        );
+    }
+    let assemble_index = exact_run_index(steps, ASSEMBLE_COMMAND);
+    let remote_index = exact_run_index(steps, POST_ASSEMBLY_REMOTE_COMMAND);
+    let diagnostic_index = unique_step_index(steps, |step| {
+        step.uses.as_deref().and_then(action_name) == Some("actions/upload-artifact")
+            && scalar(step.condition.as_ref()) == Some("${{ always() }}")
+            && with_scalar(step, "path") == Some("release-reports")
+            && with_scalar(step, "if-no-files-found") == Some("error")
+    });
+    let bundle_upload_index = unique_step_index(steps, |step| {
+        step.uses.as_deref().and_then(action_name) == Some("actions/upload-artifact")
+            && with_scalar(step, "path") == Some("release-bundle")
+    });
+    if !matches!(
+        (
+            assemble_index,
+            remote_index,
+            diagnostic_index,
+            bundle_upload_index
+        ),
+        (Some(assemble), Some(remote), Some(diagnostic), Some(upload))
+            if assemble < remote && remote < diagnostic && diagnostic < upload
+    ) {
+        failures.push(
+            "assemble must order assembly, remote-state gate, diagnostics, then bundle upload"
                 .to_owned(),
         );
     }
@@ -1421,25 +1612,55 @@ fn check_publish(workflow: &Workflow, failures: &mut Vec<String>) {
     }
     for (command, label) in [
         (VERIFY_BUNDLE_COMMAND, "independent bundle verification"),
+        (
+            PRE_ATTESTATION_REMOTE_COMMAND,
+            "the pre-attestation remote-state gate",
+        ),
         (STAGE_ATTESTATIONS_COMMAND, "exact attestation staging"),
         (PUBLISH_COMMAND, "exact immutable publication"),
     ] {
         check_exact_command(workflow, "publish", command, label, failures);
     }
     let verify_index = exact_run_index(steps, VERIFY_BUNDLE_COMMAND);
+    let remote_index = exact_run_index(steps, PRE_ATTESTATION_REMOTE_COMMAND);
     let stage_index = exact_run_index(steps, STAGE_ATTESTATIONS_COMMAND);
     let publish_index = exact_run_index(steps, PUBLISH_COMMAND);
     let provenance_index = attestation_steps.first().map(|(index, _)| *index);
     let gate_index = attestation_steps.get(1).map(|(index, _)| *index);
     if !matches!(
-        (verify_index, provenance_index, gate_index, stage_index, publish_index),
-        (Some(verify), Some(provenance), Some(gate), Some(stage), Some(publish))
-            if verify < provenance && provenance < gate && gate < stage && stage < publish
+        (
+            verify_index,
+            remote_index,
+            provenance_index,
+            gate_index,
+            stage_index,
+            publish_index
+        ),
+        (
+            Some(verify),
+            Some(remote),
+            Some(provenance),
+            Some(gate),
+            Some(stage),
+            Some(publish)
+        ) if verify < remote
+            && remote + 1 == provenance
+            && provenance + 1 == gate
+            && gate + 1 == stage
+            && stage < publish
     ) {
         failures.push(
-            "publish steps must order verify-bundle, provenance, gate-v2, staging, then publication"
-                .to_owned(),
+            "publish steps must order verification, remote-state gate, adjacent attestations, staging, then publication".to_owned(),
         );
+    }
+    for (_, attestation) in &attestation_steps {
+        if attestation.id.is_some() || attestation.condition.is_some() || attestation.env.is_some()
+        {
+            failures.push(
+                "attestation steps must be unconditional and have no id or environment mapping"
+                    .to_owned(),
+            );
+        }
     }
     if let Some((_, provenance)) = attestation_steps.first()
         && !exact_with(
@@ -1581,6 +1802,16 @@ fn exact_run_index(steps: &[Step], expected: &str) -> Option<usize> {
     matches.next().is_none().then_some(index)
 }
 
+fn unique_step_index(steps: &[Step], mut predicate: impl FnMut(&Step) -> bool) -> Option<usize> {
+    let mut matches = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| predicate(step))
+        .map(|(index, _)| index);
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
 fn exact_with(step: &Step, expected: &[(&str, &str)]) -> bool {
     step.with.as_ref().is_some_and(|values| {
         values.len() == expected.len()
@@ -1670,6 +1901,7 @@ fn workflow_contains_text(workflow: &Workflow, predicate: &impl Fn(&str) -> bool
     [
         workflow.name.as_ref(),
         workflow.run_name.as_ref(),
+        Some(&workflow.triggers),
         workflow.permissions.as_ref(),
         workflow.concurrency.as_ref(),
         workflow.env.as_ref(),
@@ -1681,6 +1913,7 @@ fn workflow_contains_text(workflow: &Workflow, predicate: &impl Fn(&str) -> bool
             [
                 job.name.as_ref(),
                 job.runs_on.as_ref(),
+                job.timeout_minutes.as_ref(),
                 job.outputs.as_ref(),
                 job.permissions.as_ref(),
                 job.condition.as_ref(),
@@ -1700,8 +1933,11 @@ fn workflow_contains_text(workflow: &Workflow, predicate: &impl Fn(&str) -> bool
                             step.name.as_ref(),
                             step.id.as_ref(),
                             step.condition.as_ref(),
+                            step.shell.as_ref(),
                             step.working_directory.as_ref(),
                             step.env.as_ref(),
+                            step.continue_on_error.as_ref(),
+                            step.timeout_minutes.as_ref(),
                         ]
                         .into_iter()
                         .flatten()
@@ -1714,6 +1950,117 @@ fn workflow_contains_text(workflow: &Workflow, predicate: &impl Fn(&str) -> bool
                         })
                 })
         })
+}
+
+fn workflow_text_occurrence_count(workflow: &Workflow, needle: &str) -> usize {
+    [
+        workflow.name.as_ref(),
+        workflow.run_name.as_ref(),
+        Some(&workflow.triggers),
+        workflow.permissions.as_ref(),
+        workflow.concurrency.as_ref(),
+        workflow.env.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value_occurrence_count(value, needle))
+    .sum::<usize>()
+        + workflow
+            .jobs
+            .values()
+            .map(|job| {
+                [
+                    job.name.as_ref(),
+                    job.runs_on.as_ref(),
+                    job.timeout_minutes.as_ref(),
+                    job.outputs.as_ref(),
+                    job.permissions.as_ref(),
+                    job.condition.as_ref(),
+                    job.env.as_ref(),
+                    job.strategy.as_ref(),
+                    job.uses.as_ref(),
+                    job.with.as_ref(),
+                    job.secrets.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|value| value_occurrence_count(value, needle))
+                .sum::<usize>()
+                    + job
+                        .needs
+                        .as_ref()
+                        .map(|needs| {
+                            needs
+                                .values()
+                                .iter()
+                                .map(|value| value.matches(needle).count())
+                                .sum::<usize>()
+                        })
+                        .unwrap_or_default()
+                    + job
+                        .steps
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|step| {
+                            step.uses
+                                .as_deref()
+                                .map(|value| value.matches(needle).count())
+                                .unwrap_or_default()
+                                + step
+                                    .run
+                                    .as_deref()
+                                    .map(|value| value.matches(needle).count())
+                                    .unwrap_or_default()
+                                + [
+                                    step.name.as_ref(),
+                                    step.id.as_ref(),
+                                    step.condition.as_ref(),
+                                    step.shell.as_ref(),
+                                    step.working_directory.as_ref(),
+                                    step.env.as_ref(),
+                                    step.continue_on_error.as_ref(),
+                                    step.timeout_minutes.as_ref(),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .map(|value| value_occurrence_count(value, needle))
+                                .sum::<usize>()
+                                + step
+                                    .with
+                                    .as_ref()
+                                    .map(|values| {
+                                        values
+                                            .iter()
+                                            .map(|(key, value)| {
+                                                value_occurrence_count(key, needle)
+                                                    + value_occurrence_count(value, needle)
+                                            })
+                                            .sum::<usize>()
+                                    })
+                                    .unwrap_or_default()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
+fn value_occurrence_count(value: &Value, needle: &str) -> usize {
+    match value {
+        Value::String(value) => value.matches(needle).count(),
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| value_occurrence_count(value, needle))
+            .sum(),
+        Value::Mapping(values) => values
+            .iter()
+            .map(|(key, value)| {
+                value_occurrence_count(key, needle) + value_occurrence_count(value, needle)
+            })
+            .sum(),
+        Value::Tagged(value) => value_occurrence_count(&value.value, needle),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
 }
 
 fn check_trusted_driver_cache_inputs(workflow: &Workflow, failures: &mut Vec<String>) {
@@ -1869,7 +2216,7 @@ fn check_run(path: &Path, job: &str, command: &str, failures: &mut Vec<String>) 
             | "perl"
     );
     if command.is_empty()
-        || command.contains(['\n', ';', '|', '`'])
+        || command.contains(['\n', ';', '|', '`', '&', '(', ')', '!'])
         || command.contains("&&")
         || command.contains("$(")
         || command.contains(['$', '>', '<', '*', '?', '\'', '"'])
@@ -2281,7 +2628,7 @@ mod tests {
                 1,
             ),
             source.replacen(
-                "          path: release-reports/assembly.json",
+                "          path: release-reports",
                 "          path: release-bundle",
                 1,
             ),
@@ -2428,6 +2775,30 @@ mod tests {
                 ),
             ),
             (
+                "background operator",
+                source.replacen(
+                    "run: rustup show active-toolchain",
+                    "run: rustup show active-toolchain &",
+                    1,
+                ),
+            ),
+            (
+                "subshell grouping",
+                source.replacen(
+                    "run: rustup show active-toolchain",
+                    "run: (rustup show active-toolchain)",
+                    1,
+                ),
+            ),
+            (
+                "history negation",
+                source.replacen(
+                    "run: rustup show active-toolchain",
+                    "run: '! rustup show active-toolchain'",
+                    1,
+                ),
+            ),
+            (
                 "credential persistence",
                 source.replacen("persist-credentials: false", "persist-credentials: true", 1),
             ),
@@ -2445,6 +2816,219 @@ mod tests {
             check_common(Path::new(RELEASE_PATH), &workflow, &mut actual);
             check_release(&workflow, &mut actual);
             assert!(!actual.is_empty(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn workflow_environment_contract_mutants_fail_closed() {
+        let source = release_source();
+        let token = "GITHUB_TOKEN: ${{ github.token }}";
+        for (label, mutant) in [
+            (
+                "workflow environment",
+                source.replacen("jobs:\n", "env:\n  CARGO_TERM_COLOR: always\n\njobs:\n", 1),
+            ),
+            (
+                "empty workflow environment",
+                source.replacen("jobs:\n", "env: {}\n\njobs:\n", 1),
+            ),
+            (
+                "job environment",
+                mutate_job(
+                    &source,
+                    "assemble",
+                    "    runs-on: ubuntu-24.04\n",
+                    "    runs-on: ubuntu-24.04\n    env:\n      GITHUB_TOKEN: ${{ github.token }}\n",
+                ),
+            ),
+            (
+                "custom token alias",
+                source.replacen(token, "HELL_GITHUB_TOKEN: ${{ github.token }}", 1),
+            ),
+            (
+                "alternate standard token alias",
+                source.replacen(token, "GH_TOKEN: ${{ github.token }}", 1),
+            ),
+            (
+                "configuration variable token",
+                source.replacen(token, "GITHUB_TOKEN: ${{ vars.GITHUB_TOKEN }}", 1),
+            ),
+            (
+                "configuration variable action input",
+                source.replacen(
+                    "          retention-days: 30\n",
+                    "          retention-days: ${{ vars.RELEASE_RETENTION_DAYS }}\n",
+                    1,
+                ),
+            ),
+            (
+                "configuration variable dispatch default",
+                source.replacen(
+                    "        type: string\n",
+                    "        type: string\n        default: ${{ vars.RELEASE_BRANCH }}\n",
+                    1,
+                ),
+            ),
+            (
+                "secret dispatch default",
+                source.replacen(
+                    "        type: string\n",
+                    "        type: string\n        default: ${{ secrets.RELEASE_BRANCH }}\n",
+                    1,
+                ),
+            ),
+            (
+                "secret top-level run name",
+                source.replacen(
+                    "run-name: Release candidate ${{ inputs.candidate_branch }} by @${{ github.actor }}",
+                    "run-name: Release candidate ${{ secrets.RELEASE_BRANCH }}",
+                    1,
+                ),
+            ),
+            (
+                "automatic token action input",
+                source.replacen(
+                    "          stack-version: 3.11.1\n",
+                    "          stack-version: 3.11.1\n          token: ${{ github.token }}\n",
+                    1,
+                ),
+            ),
+            (
+                "literal token",
+                source.replacen(token, "GITHUB_TOKEN: literal", 1),
+            ),
+            (
+                "second environment key",
+                source.replacen(
+                    token,
+                    "GITHUB_TOKEN: ${{ github.token }}\n          EXTRA_TOKEN: forbidden",
+                    1,
+                ),
+            ),
+            (
+                "token on assembly",
+                mutate_job(
+                    &source,
+                    "assemble",
+                    "      - name: Assemble, derive, and verify exact release set\n",
+                    "      - name: Assemble, derive, and verify exact release set\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n",
+                ),
+            ),
+            (
+                "token on pure verification",
+                mutate_job(
+                    &source,
+                    "publish",
+                    "      - name: Independently verify release bundle before attestation\n",
+                    "      - name: Independently verify release bundle before attestation\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n",
+                ),
+            ),
+            (
+                "token on candidate platform",
+                mutate_job(
+                    &source,
+                    "linux",
+                    "      - name: Run Linux release gate, collect conformance evidence, and package\n",
+                    "      - name: Run Linux release gate, collect conformance evidence, and package\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n",
+                ),
+            ),
+            (
+                "token on action",
+                mutate_job(
+                    &source,
+                    "resolve",
+                    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
+                    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n",
+                ),
+            ),
+        ] {
+            assert_ne!(mutant, source, "mutant replaced nothing: {label}");
+            assert!(!failures(&mutant).is_empty(), "accepted {label}");
+        }
+    }
+
+    #[test]
+    fn remote_state_and_attestation_plumbing_mutants_fail_closed() {
+        let source = release_source();
+        let post_assembly = format!(
+            "      - name: Recheck remote state after assembly\n        env:\n          GITHUB_TOKEN: ${{{{ github.token }}}}\n        run: {POST_ASSEMBLY_REMOTE_COMMAND}\n"
+        );
+        let pre_attestation = format!(
+            "      - name: Recheck remote state before attestation\n        env:\n          GITHUB_TOKEN: ${{{{ github.token }}}}\n        run: {PRE_ATTESTATION_REMOTE_COMMAND}\n"
+        );
+        let provenance = "      - name: Attest release subjects with build provenance\n        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1\n        with:\n          subject-checksums: release-bundle/SUBJECTS.sha256\n";
+        let reordered = source
+            .replacen(&pre_attestation, "__REMOTE_STATE_STEP__\n", 1)
+            .replacen(provenance, &pre_attestation, 1)
+            .replacen("__REMOTE_STATE_STEP__\n", provenance, 1);
+        for (label, mutant) in [
+            (
+                "missing post-assembly remote check",
+                source.replacen(&post_assembly, "", 1),
+            ),
+            (
+                "missing pre-attestation remote check",
+                source.replacen(&pre_attestation, "", 1),
+            ),
+            ("remote check after provenance", reordered),
+            (
+                "third attestation action",
+                mutate_job(
+                    &source,
+                    "publish",
+                    "      - name: Stage exact attestation bundles\n",
+                    &format!("{provenance}      - name: Stage exact attestation bundles\n"),
+                ),
+            ),
+            (
+                "attestation id",
+                source.replacen(
+                    "      - name: Attest release subjects with build provenance\n",
+                    "      - name: Attest release subjects with build provenance\n        id: provenance\n",
+                    1,
+                ),
+            ),
+            (
+                "attestation output aliases",
+                mutate_job(
+                    &source,
+                    "publish",
+                    "      - name: Stage exact attestation bundles\n",
+                    "      - name: Stage exact attestation bundles\n        env:\n          HELL_PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}\n          HELL_RELEASE_GATE_BUNDLE: ${{ steps.gate.outputs.bundle-path }}\n",
+                ),
+            ),
+            (
+                "attestation output interpolation",
+                source.replacen(
+                    STAGE_ATTESTATIONS_COMMAND,
+                    "./automation/target/ci/hell-ci release stage-attestations --input ${{ steps.provenance.outputs.bundle-path }}",
+                    1,
+                ),
+            ),
+            (
+                "GITHUB_ENV relay",
+                source.replacen(
+                    STAGE_ATTESTATIONS_COMMAND,
+                    "echo provenance=path >>$GITHUB_ENV",
+                    1,
+                ),
+            ),
+            (
+                "interpreter staging",
+                source.replacen(STAGE_ATTESTATIONS_COMMAND, "python3 stage.py", 1),
+            ),
+            (
+                "attestation outside publisher",
+                mutate_job(
+                    &source,
+                    "assemble",
+                    "      - name: Build trusted release driver\n",
+                    &format!("{provenance}      - name: Build trusted release driver\n"),
+                ),
+            ),
+        ] {
+            assert_ne!(mutant, source, "mutant replaced nothing: {label}");
+            assert!(!failures(&mutant).is_empty(), "accepted {label}");
         }
     }
 
@@ -2733,7 +3317,7 @@ mod tests {
         assert!(
             actual
                 .iter()
-                .any(|failure| failure.contains("HELL_SOURCE_COMMIT ambient input"))
+                .any(|failure| failure.contains("workflow-level environment variables"))
         );
     }
 

@@ -18,14 +18,7 @@ pub(crate) fn run(
     output: PathBuf,
     report: PathBuf,
 ) -> Result<String, String> {
-    run_with_verification(
-        plan_path,
-        conformance_plan_path,
-        input,
-        output,
-        report,
-        true,
-    )
+    run_with_verification(plan_path, conformance_plan_path, input, output, report)
 }
 
 pub(crate) fn run_readiness(
@@ -35,14 +28,7 @@ pub(crate) fn run_readiness(
     output: PathBuf,
     report: PathBuf,
 ) -> Result<String, String> {
-    run_with_verification(
-        plan_path,
-        conformance_plan_path,
-        input,
-        output,
-        report,
-        false,
-    )
+    run_with_verification(plan_path, conformance_plan_path, input, output, report)
 }
 
 fn run_with_verification(
@@ -51,7 +37,6 @@ fn run_with_verification(
     input: PathBuf,
     output: PathBuf,
     report: PathBuf,
-    verify_remote: bool,
 ) -> Result<String, String> {
     let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
     let conformance_plan =
@@ -372,21 +357,12 @@ fn run_with_verification(
     )?;
 
     let verification_report = report.with_file_name("release-assembly-verification.json");
-    if verify_remote {
-        verify::bundle(
-            plan_path,
-            conformance_plan_path,
-            output,
-            verification_report,
-        )?;
-    } else {
-        verify::technical_bundle(
-            plan_path,
-            conformance_plan_path,
-            output,
-            verification_report,
-        )?;
-    }
+    verify::technical_bundle(
+        plan_path,
+        conformance_plan_path,
+        output,
+        verification_report,
+    )?;
     let _ = reports;
     Ok("assembled independently admitted three-platform release bundle".to_owned())
 }

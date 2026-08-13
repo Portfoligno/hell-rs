@@ -59,8 +59,38 @@ the assembled bundle and plan by numeric artifact ID, and never executes the
 candidate binary, package scripts, or candidate build code.
 
 Only the publication job has `contents: write`, `id-token: write`,
-`attestations: write`, and `artifact-metadata: write`. The job-scoped GitHub
-token is used only after local verification succeeds.
+`attestations: write`, and `artifact-metadata: write`. GitHub API authority is
+exposed only through the standard step-local `GITHUB_TOKEN` name to five exact
+trusted commands: candidate resolution, plan creation, the post-assembly remote
+check, the pre-attestation remote check, and final publication. Candidate jobs,
+assembly, and independent bundle verification have no token mapping.
+
+## Workflow data and credential boundaries
+
+The release path separates four data planes. Dispatch inputs, step and job
+outputs, `needs`, action inputs, permissions, and numeric artifact IDs form the
+workflow-control plane. Canonical plans, reports, evidence, archives, checksums,
+and attestations form the artifact plane. GitHub-defined paths and metadata such
+as `GITHUB_EVENT_PATH`, `GITHUB_OUTPUT`, `GITHUB_API_URL`, `GITHUB_WORKSPACE`,
+and `RUNNER_TEMP` form the runner-contract plane. The automatic job token is the
+credential plane and is never copied into an argument, output, artifact, cache,
+or project-specific environment alias.
+
+Workflow and job environment mappings are forbidden. A step environment is
+either absent or is the exact one-entry `GITHUB_TOKEN: ${{ github.token }}`
+mapping on one of the five trusted commands above. The typed Rust workflow
+policy enforces the exact command, job, mapping, count, and ordering, so a new
+custom environment key fails without requiring a denylist update. Contributors
+should carry operator data through workflow inputs, internal scalars through
+step or job outputs, action configuration through `with:`, and process-visible
+structured data through canonical artifact files.
+
+Assembly and bundle reconstruction are deterministic and credential-free.
+Remote branch and tag state is checked after assembly before bundle upload,
+again after independent reconstruction before attestation, and finally inside
+publication to close the remaining race. A missing or invalid token, API
+failure, moved candidate branch, or existing tag fails closed at the applicable
+remote checkpoint.
 
 ## Candidate-specific conformance decision
 
@@ -135,6 +165,16 @@ list with build provenance and the
 `https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2`
 predicate. The Rust publisher verifies the staged bundles, candidate head, tag
 state, asset inventory, and immutable-release capability before publishing.
+
+Each pinned attestation action appends its generated bundle path to
+`RUNNER_TEMP/created_attestation_paths.txt`. The trusted Rust staging command
+requires exactly two ordered entries, verifies that the registry and source
+files are bounded real files beneath `RUNNER_TEMP`, rejects duplicates and
+pre-existing destinations, parses the JSON, and preserves the signed bytes
+under the two fixed release-bundle names. Missing, extra, reordered, external,
+or malformed entries fail closed. Workflow policy requires the two exact
+attestation actions to remain adjacent to staging, and publication independently
+validates their subject and predicate semantics.
 
 The publisher is idempotent: an exact machine-marked draft can be resumed and
 an exact already-published immutable release can be verified after an ambiguous

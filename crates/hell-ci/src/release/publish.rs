@@ -1,36 +1,243 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::command::CommandSpec;
 use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
 
 use super::github::GitHubClient;
-use super::manifest::{read_json, read_regular, write_atomic, write_json};
+use super::manifest::{read_json, read_regular, write_atomic_new, write_json};
 use super::schema::{ReleasePlan, number, object, string};
 use super::verify;
 
+const ATTESTATION_REGISTRY: &str = "created_attestation_paths.txt";
+const MAX_ATTESTATION_REGISTRY_BYTES: u64 = 64 * 1024;
+const MAX_ATTESTATION_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+const ATTESTATION_DESTINATIONS: [&str; 2] = [
+    "github-provenance.sigstore.json",
+    "github-release-gate.sigstore.json",
+];
+
 pub(crate) fn stage_attestations(input: PathBuf) -> Result<String, String> {
-    for (variable, name) in [
-        ("HELL_PROVENANCE_BUNDLE", "github-provenance.sigstore.json"),
-        (
-            "HELL_RELEASE_GATE_BUNDLE",
-            "github-release-gate.sigstore.json",
-        ),
-    ] {
-        let source =
-            PathBuf::from(env::var_os(variable).ok_or_else(|| format!("{variable} is required"))?);
-        let bytes = read_regular(&source)?;
-        // GitHub's attestation action owns this serialization.  Preserve the
-        // exact signed bytes; do not impose this repository's canonical JSON
-        // formatting on an external Sigstore bundle.
-        let document =
-            std::str::from_utf8(&bytes).map_err(|_| format!("{variable} is not UTF-8 JSON"))?;
-        parse_json(document).map_err(|error| format!("{variable} is not valid JSON: {error}"))?;
-        write_atomic(&input.join(name), &bytes)?;
+    let runner_temp = PathBuf::from(
+        env::var_os("RUNNER_TEMP").ok_or_else(|| "RUNNER_TEMP is required".to_owned())?,
+    );
+    let registry = runner_temp.join(ATTESTATION_REGISTRY);
+    stage_attestations_from_registry(&input, &runner_temp, &registry)
+}
+
+fn stage_attestations_from_registry(
+    input: &Path,
+    runner_temp: &Path,
+    registry: &Path,
+) -> Result<String, String> {
+    if !runner_temp.is_absolute() {
+        return Err("RUNNER_TEMP must be absolute".to_owned());
     }
+    require_real_directory(runner_temp, "RUNNER_TEMP")?;
+    if registry != runner_temp.join(ATTESTATION_REGISTRY) {
+        return Err("attestation registry path differs from the runner contract".to_owned());
+    }
+    let canonical_runner_temp = fs::canonicalize(runner_temp)
+        .map_err(|_| "RUNNER_TEMP cannot be canonicalized".to_owned())?;
+    let registry_bytes = read_bounded_real_file(
+        registry,
+        MAX_ATTESTATION_REGISTRY_BYTES,
+        "attestation registry",
+    )?;
+    let registry_text = std::str::from_utf8(&registry_bytes)
+        .map_err(|_| "attestation registry is not UTF-8".to_owned())?;
+    let sources = parse_attestation_registry(registry_text)?;
+    let bundles = [
+        read_attestation_bundle(1, &sources[0], &canonical_runner_temp)?,
+        read_attestation_bundle(2, &sources[1], &canonical_runner_temp)?,
+    ];
+
+    require_real_directory(input, "attestation destination")?;
+    let destination_identity =
+        fs::symlink_metadata(input).map_err(|_| "attestation destination is missing".to_owned())?;
+    let canonical_destination = fs::canonicalize(input)
+        .map_err(|_| "attestation destination cannot be canonicalized".to_owned())?;
+    let destinations = ATTESTATION_DESTINATIONS.map(|name| input.join(name));
+    for destination in &destinations {
+        require_absent_destination(destination)?;
+    }
+    let mut installed = Vec::new();
+    for (destination, bytes) in destinations.iter().zip(bundles.iter()) {
+        require_same_destination_directory(input, &destination_identity, &canonical_destination)?;
+        if let Err(error) = write_atomic_new(destination, bytes) {
+            for created in installed {
+                if let Err(rollback_error) = fs::remove_file(&created) {
+                    return Err(format!(
+                        "{error}; cannot roll back staged attestation: {rollback_error}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        installed.push(destination.clone());
+    }
+    require_same_destination_directory(input, &destination_identity, &canonical_destination)?;
     Ok("staged exact GitHub attestation bundles".to_owned())
+}
+
+fn parse_attestation_registry(text: &str) -> Result<[PathBuf; 2], String> {
+    let mut lines = text.split('\n').collect::<Vec<_>>();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.len() != 2 {
+        return Err("attestation registry must contain exactly two entries".to_owned());
+    }
+    let mut entries = Vec::with_capacity(2);
+    for (index, line) in lines.into_iter().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            return Err(format!("attestation registry entry {} is empty", index + 1));
+        }
+        if line.chars().any(char::is_control) {
+            return Err(format!(
+                "attestation registry entry {} contains a control character",
+                index + 1
+            ));
+        }
+        let path = PathBuf::from(line);
+        if !path.is_absolute() {
+            return Err(format!(
+                "attestation registry entry {} must be absolute",
+                index + 1
+            ));
+        }
+        entries.push(path);
+    }
+    let entries: [PathBuf; 2] = entries
+        .try_into()
+        .map_err(|_| "attestation registry must contain exactly two entries".to_owned())?;
+    if entries[0] == entries[1] {
+        return Err("attestation registry entries must be distinct".to_owned());
+    }
+    Ok(entries)
+}
+
+fn read_attestation_bundle(
+    index: usize,
+    source: &Path,
+    canonical_runner_temp: &Path,
+) -> Result<Vec<u8>, String> {
+    let canonical_source = fs::canonicalize(source)
+        .map_err(|_| format!("attestation registry entry {index} cannot be canonicalized"))?;
+    if !canonical_source.starts_with(canonical_runner_temp) {
+        return Err(format!(
+            "attestation registry entry {index} is outside RUNNER_TEMP"
+        ));
+    }
+    let label = format!("attestation bundle {index}");
+    let bytes = read_bounded_real_file(source, MAX_ATTESTATION_BUNDLE_BYTES, &label)?;
+    let canonical_after = fs::canonicalize(source)
+        .map_err(|_| format!("attestation registry entry {index} changed while being read"))?;
+    if canonical_after != canonical_source {
+        return Err(format!(
+            "attestation registry entry {index} changed while being read"
+        ));
+    }
+    let document = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("attestation bundle {index} is not UTF-8 JSON"))?;
+    parse_json(document).map_err(|_| format!("attestation bundle {index} is not valid JSON"))?;
+    Ok(bytes)
+}
+
+fn read_bounded_real_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
+    let before = fs::symlink_metadata(path).map_err(|_| format!("{label} is missing"))?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(format!("{label} must be a real regular file"));
+    }
+    if before.len() > maximum {
+        return Err(format!("{label} exceeds the size limit"));
+    }
+    let mut file = fs::File::open(path).map_err(|_| format!("{label} cannot be opened"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| format!("{label} cannot be inspected after opening"))?;
+    if !same_file_observation(&before, &opened) {
+        return Err(format!("{label} changed while being opened"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("{label} cannot be read"))?;
+    if u64::try_from(bytes.len())
+        .ok()
+        .is_none_or(|length| length > maximum)
+    {
+        return Err(format!("{label} exceeds the size limit"));
+    }
+    let after =
+        fs::symlink_metadata(path).map_err(|_| format!("{label} changed while being read"))?;
+    if !same_file_observation(&opened, &after)
+        || u64::try_from(bytes.len()).ok() != Some(opened.len())
+    {
+        return Err(format!("{label} changed while being read"));
+    }
+    Ok(bytes)
+}
+
+fn same_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    same_file_identity(left, right)
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    // Stable Rust does not expose a portable file identity on these targets.
+    // Staging is currently Linux-only, so fail closed rather than substitute
+    // timestamps or permissions for identity.
+    false
+}
+
+fn require_real_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| format!("{label} is missing"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{label} must be a real directory"));
+    }
+    Ok(())
+}
+
+fn require_absent_destination(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err("attestation destination already exists".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("attestation destination cannot be inspected".to_owned()),
+    }
+}
+
+fn require_same_destination_directory(
+    path: &Path,
+    expected_metadata: &fs::Metadata,
+    expected_canonical: &Path,
+) -> Result<(), String> {
+    let observed_metadata = fs::symlink_metadata(path)
+        .map_err(|_| "attestation destination changed while staging".to_owned())?;
+    let observed_canonical = fs::canonicalize(path)
+        .map_err(|_| "attestation destination changed while staging".to_owned())?;
+    if observed_metadata.file_type().is_symlink()
+        || !observed_metadata.is_dir()
+        || !same_file_identity(expected_metadata, &observed_metadata)
+        || observed_canonical != expected_canonical
+    {
+        return Err("attestation destination changed while staging".to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn run(plan_path: PathBuf, input: PathBuf, report: PathBuf) -> Result<String, String> {
@@ -42,7 +249,7 @@ pub(crate) fn run(plan_path: PathBuf, input: PathBuf, report: PathBuf) -> Result
     )
     .and_then(|_| verify_attestations(&plan, &input));
     verification?;
-    let client = GitHubClient::from_environment()?;
+    let client = GitHubClient::from_actions_environment()?;
     publish_after_verification(&plan, &input, &report, &client, Ok(()))
 }
 
@@ -676,7 +883,7 @@ enum ExistingReleaseState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};

@@ -8,6 +8,7 @@ pub(crate) mod manifest;
 pub(crate) mod plan;
 pub(crate) mod platform;
 mod publish;
+mod remote_state;
 pub(crate) mod schema;
 mod verify;
 
@@ -69,6 +70,10 @@ pub(crate) fn run(arguments: &[OsString]) -> Result<String, String> {
             required(options.plan, "--plan")?,
             required(options.conformance_plan, "--conformance-plan")?,
             required(options.input, "--input")?,
+            required(options.report, "--report")?,
+        ),
+        "check-remote-state" => remote_state::check(
+            required(options.plan, "--plan")?,
             required(options.report, "--report")?,
         ),
         "stage-attestations" => publish::stage_attestations(required(options.input, "--input")?),
@@ -142,5 +147,5 @@ fn set_path(target: &mut Option<PathBuf>, value: &OsString, flag: &str) -> Resul
 }
 
 fn usage() -> String {
-    "usage: hell-ci release resolve|plan|platform|assemble|verify-bundle|stage-attestations|publish [options]".to_owned()
+    "usage: hell-ci release resolve|plan|platform|assemble|verify-bundle|check-remote-state|stage-attestations|publish [options]".to_owned()
 }

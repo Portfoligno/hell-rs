@@ -56,7 +56,7 @@ pub(crate) fn resolve(output: PathBuf) -> Result<String, String> {
     if required_env("GITHUB_REPOSITORY")? != repository_name {
         return Err("event repository differs from GITHUB_REPOSITORY".to_owned());
     }
-    let client = GitHubClient::from_environment()?;
+    let client = GitHubClient::from_actions_environment()?;
     let candidate_sha = client.branch_head(&repository_name, &candidate_branch)?;
     require_sha(&candidate_sha, "candidate SHA")?;
 

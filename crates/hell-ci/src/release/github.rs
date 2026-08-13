@@ -1,4 +1,4 @@
-use std::env;
+use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
@@ -34,14 +34,16 @@ impl GitHubClient {
                 .into(),
         }
     }
-    pub(crate) fn from_environment() -> Result<Self, String> {
-        let api =
-            env::var("GITHUB_API_URL").map_err(|_| "GITHUB_API_URL is required".to_owned())?;
-        let token = env::var("HELL_GITHUB_TOKEN")
-            .map_err(|_| "HELL_GITHUB_TOKEN is required".to_owned())?;
-        if token.is_empty() || token.contains(['\r', '\n']) {
-            return Err("HELL_GITHUB_TOKEN is invalid".to_owned());
-        }
+    pub(crate) fn from_actions_environment() -> Result<Self, String> {
+        Self::from_actions_values(
+            std::env::var_os("GITHUB_API_URL"),
+            std::env::var_os("GITHUB_TOKEN"),
+        )
+    }
+
+    fn from_actions_values(api: Option<OsString>, token: Option<OsString>) -> Result<Self, String> {
+        let api = required_environment_value(api, "GITHUB_API_URL")?;
+        let token = required_environment_value(token, "GITHUB_TOKEN")?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
@@ -344,6 +346,17 @@ impl GitHubClient {
     }
 }
 
+fn required_environment_value(value: Option<OsString>, name: &str) -> Result<String, String> {
+    let value = value.ok_or_else(|| format!("{name} is required"))?;
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} must be UTF-8"))?;
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err(format!("{name} is invalid"));
+    }
+    Ok(value)
+}
+
 fn repository_segments<const N: usize>(
     repository: &str,
     suffix: [&str; N],
@@ -365,20 +378,27 @@ impl HttpEndpoint {
             return Err("GITHUB_API_URL is unsupported".to_owned());
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if authority.is_empty()
-            || authority.contains(['@', '[', ']'])
-            || authority != "api.github.com"
-        {
+        if !valid_https_authority(authority) {
             return Err("GITHUB_API_URL authority is invalid".to_owned());
+        }
+        let base_path = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if base_path.iter().any(|part| {
+            part == "."
+                || part == ".."
+                || !part.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+                })
+        }) {
+            return Err("GITHUB_API_URL path is invalid".to_owned());
         }
         Ok(Self {
             scheme: scheme.to_owned(),
             authority: authority.to_owned(),
-            base_path: path
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_owned)
-                .collect(),
+            base_path,
         })
     }
 
@@ -407,11 +427,31 @@ impl HttpEndpoint {
             .unwrap_or_default();
         authority == self.authority
             || (self.authority == "api.github.com" && authority == "uploads.github.com")
-            || self
-                .authority
-                .strip_prefix("api.")
-                .is_some_and(|suffix| authority == format!("uploads.{suffix}"))
     }
+}
+
+fn valid_https_authority(authority: &str) -> bool {
+    if authority.is_empty() || authority.contains(['@', '[', ']']) || !authority.is_ascii() {
+        return false;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if host.is_empty()
+        || authority.matches(':').count() > 1
+        || port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
 }
 
 fn encode_segment(value: &str) -> String {
@@ -469,6 +509,80 @@ mod tests {
             endpoint.url(&["release/a b".to_owned()]),
             "https://api.github.com/repos/release%2Fa%20b"
         );
+    }
+
+    #[test]
+    fn github_enterprise_api_url_retains_its_https_authority_and_base_path() {
+        let endpoint = HttpEndpoint::parse("https://github.example.test/api/v3").unwrap();
+        assert_eq!(
+            endpoint.url(&["owner".to_owned(), "repo".to_owned()]),
+            "https://github.example.test/api/v3/repos/owner/repo"
+        );
+        assert!(endpoint.trusted_upload_url("https://github.example.test/uploads/1"));
+        assert!(!endpoint.trusted_upload_url("https://uploads.example.test/uploads/1"));
+    }
+
+    #[test]
+    fn actions_environment_values_are_validated_without_process_environment_mutation() {
+        let accepted = GitHubClient::from_actions_values(
+            Some(OsString::from("https://github.example.test/api/v3")),
+            Some(OsString::from("standard-token")),
+        );
+        assert!(accepted.is_ok());
+        for (api, token, expected) in [
+            (
+                None,
+                Some(OsString::from("token")),
+                "GITHUB_API_URL is required",
+            ),
+            (
+                Some(OsString::from("not-absolute")),
+                Some(OsString::from("token")),
+                "GITHUB_API_URL",
+            ),
+            (
+                Some(OsString::from("https://api.github.com")),
+                None,
+                "GITHUB_TOKEN is required",
+            ),
+            (
+                Some(OsString::from("https://api.github.com")),
+                Some(OsString::new()),
+                "GITHUB_TOKEN is invalid",
+            ),
+            (
+                Some(OsString::from("https://api.github.com")),
+                Some(OsString::from("bad\rvalue")),
+                "GITHUB_TOKEN is invalid",
+            ),
+            (
+                Some(OsString::from("https://api.github.com")),
+                Some(OsString::from("bad\nvalue")),
+                "GITHUB_TOKEN is invalid",
+            ),
+        ] {
+            let error = GitHubClient::from_actions_values(api, token)
+                .err()
+                .expect("invalid Actions values must fail");
+            assert!(error.contains(expected));
+            assert!(!error.contains("standard-token"));
+            assert!(!error.contains("bad\rvalue"));
+            assert!(!error.contains("bad\nvalue"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_actions_token_is_rejected_without_echoing_its_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let error = GitHubClient::from_actions_values(
+            Some(OsString::from("https://api.github.com")),
+            Some(OsString::from_vec(vec![0xff, 0xfe])),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "GITHUB_TOKEN must be UTF-8");
     }
 
     #[test]

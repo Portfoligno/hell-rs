@@ -58,7 +58,7 @@ enum Invocation {
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH\n       hell-ci conformance audit --candidate-root PATH --output PATH\n       hell-ci readiness plan|platform|verify [options]\n       hell-ci release resolve|plan|platform|assemble|verify-bundle|stage-attestations|publish [options]"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH\n       hell-ci conformance audit --candidate-root PATH --output PATH\n       hell-ci readiness plan|platform|verify [options]\n       hell-ci release resolve|plan|platform|assemble|verify-bundle|check-remote-state|stage-attestations|publish [options]"
 }
 
 #[allow(clippy::too_many_lines)]

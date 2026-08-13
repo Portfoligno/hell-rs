@@ -82,6 +82,12 @@ the verified bundle by numeric artifact ID. No repository secret, AWS resource,
 SSH key, personal access token, deploy key, self-hosted signer, or GitHub
 Environment approval is part of this path.
 
+The release workflow requires no custom Actions variables. Workflow metadata
+travels through typed inputs, outputs, action inputs, numeric artifact IDs, and
+canonical artifact files. Only five trusted Rust API steps receive the automatic
+job token, under the standard step-local `GITHUB_TOKEN` name; candidate builds,
+bundle assembly, and independent bundle verification remain credential-free.
+
 Before dispatching:
 
 1. Set a coherent workspace version on the candidate branch.

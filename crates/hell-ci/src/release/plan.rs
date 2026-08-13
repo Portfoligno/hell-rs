@@ -82,7 +82,7 @@ pub(crate) fn create(
     let exemptions = crate::conformance::parse_release_exemptions(&read_regular(
         &trusted_root.join(".github/release/conformance-exemptions.toml"),
     )?)?;
-    let release_evaluation_instant = super::github::GitHubClient::from_environment()?
+    let release_evaluation_instant = super::github::GitHubClient::from_actions_environment()?
         .workflow_run_created_at(
             &resolution.repository,
             resolution.repository_id,
@@ -432,7 +432,7 @@ fn changelog_section(path: &Path, version: &str) -> Result<String, String> {
 }
 
 fn validate_remote_tag_and_release(resolution: &Resolution, tag: &str) -> Result<(), String> {
-    let client = super::github::GitHubClient::from_environment()?;
+    let client = super::github::GitHubClient::from_actions_environment()?;
     if client.tag_commit(&resolution.repository, tag)?.is_some() {
         return Err("planned release tag already exists".to_owned());
     }
