@@ -1,0 +1,525 @@
+name: Release
+run-name: Release candidate ${{ inputs.candidate_branch }} by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_branch:
+        description: Same-repository branch to resolve and release
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve and plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
+      build_inputs_digest: ${{ steps.plan.outputs.build_inputs_digest }}
+      conformance_plan_digest: ${{ steps.plan.outputs.conformance_plan_digest }}
+      trusted_conformance_inputs_digest: ${{ steps.plan.outputs.trusted_conformance_inputs_digest }}
+      plan_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore trusted Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-resolve-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build trusted release driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Resolve candidate branch
+        id: resolve
+        env:
+          HELL_GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release resolve --output release-state/resolution.json
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve.outputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Create canonical release and conformance plans
+        id: plan
+        env:
+          HELL_GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json
+      - name: Upload exact release plan
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-plan
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save trusted Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-resolve-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}
+
+  linux:
+    name: Release gate / Linux x86_64
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.resolve.outputs.plan_artifact_id }}
+          path: release-input
+      - name: Install pinned Stack
+        id: setup-stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Install pinned cargo-deny
+        working-directory: automation
+        run: cargo install cargo-deny --locked --version 0.20.2 --force
+      - name: Build trusted release driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run Linux release gate, collect conformance evidence, and package
+        run: ./automation/target/ci/hell-ci release platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact Linux result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }}
+
+  macos:
+    name: Release gate / macOS aarch64
+    needs: resolve
+    runs-on: macos-15
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.resolve.outputs.plan_artifact_id }}
+          path: release-input
+      - name: Install pinned Stack
+        id: setup-stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-macos-target-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build trusted release driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run macOS release gate, collect conformance evidence, and package
+        run: ./automation/target/ci/hell-ci release platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact macOS result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-macos-target-${{ needs.resolve.outputs.build_inputs_digest }}
+
+  windows:
+    name: Release gate / Windows x86_64
+    needs: resolve
+    runs-on: windows-2025
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.resolve.outputs.plan_artifact_id }}
+          path: release-input
+      - name: Install pinned Stack
+        id: setup-stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-windows-cargo-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-windows-target-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build trusted release driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run Windows release gate, collect conformance evidence, and package
+        run: .\automation\target\ci\hell-ci.exe release platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input\release-plan.json --conformance-plan release-input\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact Windows result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-windows-cargo-${{ needs.resolve.outputs.build_inputs_digest }}
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: release-windows-target-${{ needs.resolve.outputs.build_inputs_digest }}
+
+  assemble:
+    name: Assemble exact release bundle
+    needs: [resolve, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.resolve.outputs.plan_artifact_id }}
+          path: release-input/plan
+      - name: Download exact Linux result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.linux.outputs.artifact_id }}
+          path: release-input/platforms/linux-x86_64
+      - name: Download exact macOS result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.macos.outputs.artifact_id }}
+          path: release-input/platforms/macos-aarch64
+      - name: Download exact Windows result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.windows.outputs.artifact_id }}
+          path: release-input/platforms/windows-x86_64
+      - name: Restore trusted Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-assemble-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}
+      - name: Build trusted release driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Assemble, derive, and verify exact release set
+        env:
+          HELL_GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release assemble --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-input/platforms --output release-bundle --report release-reports/assembly.json
+      - name: Retain conformance assembly diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-conformance-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-reports/assembly.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload exact release bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-bundle
+          if-no-files-found: error
+          retention-days: 90
+      - name: Save trusted Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-assemble-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}
+
+  publish:
+    name: Attest and publish immutable release
+    needs: [resolve, assemble]
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact release plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.resolve.outputs.plan_artifact_id }}
+          path: release-input/plan
+      - name: Download exact assembled release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble.outputs.artifact_id }}
+          path: release-bundle
+      - name: Restore trusted Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-publish-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}
+      - name: Build trusted publisher
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Independently verify release bundle before attestation
+        env:
+          HELL_GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release verify-bundle --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --input release-bundle --report release-reports/prepublish.json
+      - name: Attest release subjects with build provenance
+        id: provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: release-bundle/SUBJECTS.sha256
+      - name: Attest release subjects with the release-gate predicate
+        id: gate
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: release-bundle/SUBJECTS.sha256
+          predicate-type: https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2
+          predicate-path: release-bundle/release-gate.json
+      - name: Stage exact attestation bundles
+        env:
+          HELL_PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          HELL_RELEASE_GATE_BUNDLE: ${{ steps.gate.outputs.bundle-path }}
+        run: ./automation/target/ci/hell-ci release stage-attestations --input release-bundle
+      - name: Publish exact immutable release
+        env:
+          HELL_GITHUB_TOKEN: ${{ github.token }}
+        run: ./automation/target/ci/hell-ci release publish --plan release-input/plan/release-plan.json --input release-bundle --report release-reports/publication.json
+      - name: Save trusted Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-publish-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}

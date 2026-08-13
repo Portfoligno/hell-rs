@@ -6,6 +6,7 @@ mod corpus;
 mod reviewed_set;
 mod runtime_obligations;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -21,23 +22,134 @@ use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
 use hell_builtins::CompatibilityDimension;
 pub use hell_builtins::{BuiltinId, ClaimPlatform, ExecutionProfile, NormalizerId};
 
+/// Environment names that a release-candidate child may inherit from the
+/// trusted driver. Values are selected from the trusted parent's environment;
+/// all other names are cleared before spawn.
+pub const RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "APPDATA",
+    "CARGO_HOME",
+    "CARGO_TERM_COLOR",
+    "CI",
+    "ComSpec",
+    "DEVELOPER_DIR",
+    "GITHUB_ACTIONS",
+    "HOME",
+    "ImageOS",
+    "ImageVersion",
+    "LANG",
+    "LC_ALL",
+    "LIB",
+    "LIBPATH",
+    "LIBRARY_PATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "RUNNER_ARCH",
+    "RUNNER_OS",
+    "RUSTC_WRAPPER",
+    "RUSTUP_HOME",
+    "SCCACHE_DIR",
+    "SDKROOT",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "UniversalCRTSdkDir",
+    "UCRTVersion",
+    "USERPROFILE",
+    "VCINSTALLDIR",
+    "VCToolsInstallDir",
+    "VisualStudioVersion",
+    "VSINSTALLDIR",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+    "__DOTNET_ADD_64BIT",
+    "__DOTNET_PREFERRED_BITNESS",
+];
+
+/// Environment names explicitly carried through the POSIX privilege boundary.
+/// The trusted adapter clears sudo's synthesized environment before executing
+/// the requested program, so this is both the preservation and final-child
+/// allowlist.
+#[cfg(unix)]
+pub const POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT: &str = concat!(
+    "--preserve-env=",
+    "CARGO_HOME,CARGO_INCREMENTAL,CARGO_TARGET_DIR,CARGO_TERM_COLOR,CI,DEVELOPER_DIR,",
+    "GITHUB_ACTIONS,HOME,ImageOS,ImageVersion,LANG,LC_ALL,LIBRARY_PATH,PATH,RUNNER_ARCH,",
+    "RUNNER_OS,RUSTC_WRAPPER,RUSTDOCFLAGS,RUSTUP_HOME,SCCACHE_DIR,SDKROOT,SOURCE_DATE_EPOCH,",
+    "TEMP,TMP,TMPDIR,USERPROFILE,HELL_EVIDENCE_RESOURCE_AUDIT,HELL_EVIDENCE_SEMANTIC_TRACE,",
+    "HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID,HELL_VISIBLE_SENTINEL"
+);
+
+/// Exact POSIX child environment names accepted by the trusted adapter.
+#[cfg(unix)]
+pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_INCREMENTAL",
+    "CARGO_TARGET_DIR",
+    "CARGO_TERM_COLOR",
+    "CI",
+    "DEVELOPER_DIR",
+    "GITHUB_ACTIONS",
+    "HOME",
+    "ImageOS",
+    "ImageVersion",
+    "LANG",
+    "LC_ALL",
+    "LIBRARY_PATH",
+    "PATH",
+    "RUNNER_ARCH",
+    "RUNNER_OS",
+    "RUSTC_WRAPPER",
+    "RUSTDOCFLAGS",
+    "RUSTUP_HOME",
+    "SCCACHE_DIR",
+    "SDKROOT",
+    "SOURCE_DATE_EPOCH",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "HELL_EVIDENCE_RESOURCE_AUDIT",
+    "HELL_EVIDENCE_SEMANTIC_TRACE",
+    "HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID",
+    "HELL_VISIBLE_SENTINEL",
+];
+
+/// Clears a child environment and restores only the release build allowlist.
+pub fn configure_release_child_environment(command: &mut Command) {
+    let retained = RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    command.envs(retained);
+}
+
 pub use artifact::{
     EvidenceSummary, NATIVE_BUILD_ENVIRONMENT_NAMES, NativeExecutionEnvironment,
     NativeExecutionEnvironmentInputs, ObservationEquivalence, RetainedBundleOutcomeFacts,
     RetainedEnvironmentVariableFact, RetainedMismatchFact, RetainedNativeEnvironmentFacts,
     RetainedObservationClassification, RetainedReachedClaimTarget, RetainedSideOutcomeFacts,
-    RetainedVerifiedProfileFacts, case_execution_input_sha256,
-    classify_observation_bundle_for_case,
+    RetainedVerifiedProfileFacts, canonical_conformance_observation_json, case_descriptor_sha256,
+    case_execution_input_sha256, classify_observation_bundle_for_case,
     classify_retained_alternate_executable_observation_against_oracle,
     classify_retained_observation_bundle, classify_retained_profile_observation_against_oracle,
-    collection_black_box_shard_for_bundle, collection_bundle_facts, retain_mismatch_bundle,
-    retain_observation_bundle, retain_reviewed_regression_bundle,
+    collection_black_box_shard_for_bundle, collection_bundle_facts, replay_conformance_stderr,
+    retain_mismatch_bundle, retain_observation_bundle, retain_reviewed_regression_bundle,
     retain_verified_profile_observation, retained_bundle_outcome_facts,
     retained_reached_claim_targets, retained_regression_reached_claim_targets,
     retained_regression_reviewed_claim_targets, reviewed_regression_case_from_bundle,
-    runtime_platform_shard_for_bundle, verified_observation_bundle_manifest_files,
-    verify_observation_bundle, verify_observation_bundle_for_case,
-    verify_observation_bundle_manifest_bytes, verify_regression_observation_bundle_for_case,
+    runtime_platform_shard_for_bundle, validate_conformance_semantic_obligation,
+    verified_observation_bundle_manifest_files, verify_observation_bundle,
+    verify_observation_bundle_for_case, verify_observation_bundle_manifest_bytes,
+    verify_regression_observation_bundle_for_case,
     verify_retained_alternate_executable_observation_against_bundle,
     verify_retained_native_environment, verify_retained_profile_observation,
     verify_retained_profile_observation_against_bundle, write_evidence_summary,
@@ -73,6 +185,277 @@ const CAPTURE_EDGE_BYTES: usize = 256 * 1024;
 const FILE_INLINE_BYTES: usize = 64 * 1024;
 const FILESYSTEM_ENTRY_LIMIT: usize = 4_096;
 const FILESYSTEM_HASH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A trusted, typed launcher policy for release candidate and oracle children.
+#[derive(Clone, Debug)]
+pub struct CandidateLaunchPolicy {
+    #[cfg(unix)]
+    launcher: PathBuf,
+    #[cfg(unix)]
+    adapter: PathBuf,
+    #[cfg(unix)]
+    principal: Arc<str>,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    group: Arc<str>,
+    #[cfg(windows)]
+    launcher: PathBuf,
+    writable_roots: Arc<[PathBuf]>,
+}
+
+thread_local! {
+    static CANDIDATE_LAUNCH_POLICY: RefCell<Option<CandidateLaunchPolicy>> = const { RefCell::new(None) };
+}
+
+impl CandidateLaunchPolicy {
+    /// Creates a POSIX policy after the trusted driver has established the
+    /// separate account and filesystem ownership boundary.
+    #[cfg(unix)]
+    pub fn posix(
+        launcher: PathBuf,
+        adapter: PathBuf,
+        principal: String,
+        uid: u32,
+        group: String,
+        writable_roots: Vec<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let launcher = fs::canonicalize(launcher)?;
+        let adapter = fs::canonicalize(adapter)?;
+        if principal.is_empty()
+            || group.is_empty()
+            || !principal.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !group.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || writable_roots.is_empty()
+            || writable_roots.iter().any(|path| !path.is_absolute())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate launch policy is not canonical",
+            ));
+        }
+        Ok(Self {
+            launcher,
+            adapter,
+            principal: principal.into(),
+            uid,
+            group: group.into(),
+            writable_roots: writable_roots.into(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn windows(launcher: PathBuf, writable_roots: Vec<PathBuf>) -> std::io::Result<Self> {
+        let launcher = fs::canonicalize(launcher)?;
+        if writable_roots.is_empty() || writable_roots.iter().any(|path| !path.is_absolute()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate launch policy is not canonical",
+            ));
+        }
+        Ok(Self {
+            launcher,
+            writable_roots: writable_roots.into(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn wrap(&self, command: &mut Command) -> std::io::Result<()> {
+        let program = resolve_parent_program(command.get_program())?;
+        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let directory = command.get_current_dir().map(Path::to_owned);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
+            .collect::<Vec<_>>();
+        let mut wrapped = Command::new(&self.launcher);
+        wrapped
+            .arg("-n")
+            .arg(POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT)
+            .arg("-u")
+            .arg(self.principal.as_ref())
+            .arg("--")
+            .arg(&self.adapter)
+            .arg("__release-posix-child")
+            .arg(program)
+            .args(arguments)
+            .env_clear();
+        for (name, value) in &environment {
+            if let Some(value) = value {
+                wrapped.env(name, value);
+            }
+        }
+        if let Some(directory) = directory {
+            wrapped.current_dir(directory);
+        }
+        *command = wrapped;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn wrap(&self, command: &mut Command) -> std::io::Result<()> {
+        let program = resolve_parent_program(command.get_program())?;
+        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let directory = command.get_current_dir().map(Path::to_owned);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
+            .collect::<Vec<_>>();
+        let mut wrapped = Command::new(&self.launcher);
+        wrapped
+            .arg("__release-restricted-child")
+            .arg(program)
+            .args(arguments)
+            .env_clear();
+        for (name, value) in environment {
+            if let Some(value) = value {
+                wrapped.env(name, value);
+            }
+        }
+        if let Some(directory) = directory {
+            wrapped.current_dir(directory);
+        }
+        *command = wrapped;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn require_quiescence(&self) -> std::io::Result<()> {
+        let uid = self.uid.to_string();
+        for _ in 0..8 {
+            let _ = Command::new(&self.launcher)
+                .args(["-n", "--", "/usr/bin/pkill", "-KILL", "-U"])
+                .arg(&uid)
+                .status()?;
+            let output = Command::new("/bin/ps")
+                .args(["-U", uid.as_str(), "-o", "pid="])
+                .output()?;
+            if output.status.success() && output.stdout.iter().all(u8::is_ascii_whitespace) {
+                return Ok(());
+            }
+        }
+        Err(std::io::Error::other(
+            "candidate principal retained a process after the bounded UID sweep",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn require_quiescence(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Grants the already-created sandbox to the exact candidate group.
+    #[cfg(unix)]
+    fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()> {
+        if !path.is_absolute()
+            || !self
+                .writable_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "candidate writable directory is outside the exact policy roots",
+            ));
+        }
+        let status = Command::new(&self.launcher)
+            .args(["-n", "--", "/usr/bin/chgrp"])
+            .arg(self.group.as_ref())
+            .arg(path)
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other("cannot bind candidate sandbox group"));
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o2770))
+    }
+
+    #[cfg(not(unix))]
+    fn prepare_writable_directory(&self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Installs one launch policy for the duration of a synchronous operation.
+pub fn with_candidate_launch_policy<T>(
+    policy: &CandidateLaunchPolicy,
+    operation: impl FnOnce() -> T,
+) -> T {
+    CANDIDATE_LAUNCH_POLICY.with(|slot| {
+        struct Restore<'a> {
+            slot: &'a RefCell<Option<CandidateLaunchPolicy>>,
+            previous: Option<CandidateLaunchPolicy>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.replace(self.previous.take());
+            }
+        }
+        let previous = slot.replace(Some(policy.clone()));
+        let _restore = Restore { slot, previous };
+        operation()
+    })
+}
+
+fn resolve_parent_program(program: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        let absolute = fs::canonicalize(path)?;
+        let metadata = fs::symlink_metadata(&absolute)?;
+        return metadata.is_file().then_some(absolute).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "program is not a file")
+        });
+    }
+    let search = std::env::var_os("PATH")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is unavailable"))?;
+    for directory in std::env::split_paths(&search) {
+        let candidate = directory.join(path);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "trusted parent could not resolve child program",
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod candidate_launch_policy_tests {
+    use super::*;
+
+    #[test]
+    fn posix_wrapper_uses_fixed_preservation_contract_and_trusted_adapter() {
+        let launcher = fs::canonicalize("/usr/bin/true").unwrap();
+        let adapter = std::env::current_exe().unwrap();
+        let policy = CandidateLaunchPolicy::posix(
+            launcher.clone(),
+            adapter.clone(),
+            "hellreltest".to_owned(),
+            61_001,
+            "hellreltest".to_owned(),
+            vec![std::env::temp_dir()],
+        )
+        .unwrap();
+        let mut command = Command::new("/usr/bin/true");
+        command.env_clear().env("HOME", "/isolated/home");
+        policy.wrap(&mut command).unwrap();
+        assert_eq!(command.get_program(), launcher);
+        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(arguments[0], "-n");
+        assert_eq!(arguments[1], POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT);
+        assert_eq!(arguments[2], "-u");
+        assert_eq!(arguments[3], "hellreltest");
+        assert_eq!(arguments[4], "--");
+        assert_eq!(arguments[5], adapter);
+        assert_eq!(arguments[6], "__release-posix-child");
+        assert_eq!(arguments[7], "/usr/bin/true");
+        assert!(
+            command.get_envs().any(|(name, value)| name == "HOME"
+                && value == Some(std::ffi::OsStr::new("/isolated/home")))
+        );
+    }
+}
 
 /// Computes the SHA-256 digest of in-memory evidence bytes.
 #[must_use]
@@ -5105,46 +5488,24 @@ fn probe_identity(
 
 fn probe_lines(path: &Path, argument: &str) -> std::io::Result<Vec<Arc<str>>> {
     let mut command = Command::new(path);
-    command
-        .arg(argument)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = SupervisedChild::spawn(&mut command)?;
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| std::io::Error::other("version probe stdout was unavailable"))?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| std::io::Error::other("version probe stderr was unavailable"))?;
-    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(5))
-        .ok_or_else(|| std::io::Error::other("version probe deadline overflowed"))?;
-    let status = match child.wait_until(deadline)? {
-        WaitOutcome::Exited(status) => {
-            let _ = child.terminate()?;
-            status
-        }
-        WaitOutcome::DeadlineExpired => {
-            let _ = child.terminate()?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "version probe exceeded five seconds",
-            ));
-        }
-    };
-    let stdout = join_reader(stdout_reader, "version stdout")?;
-    let stderr = join_reader(stderr_reader, "version stderr")?;
-    if !status.success() {
+    scrub_ci_authority_environment(&mut command);
+    command.arg(argument);
+    let output = run_supervised_command(&mut command, &[], Duration::from_secs(5))?;
+    if output.timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "version probe exceeded five seconds",
+        ));
+    }
+    if !output.status.success() {
         return Err(std::io::Error::other(format!(
             "{argument} failed with status {:?}: {}",
-            status.code(),
-            String::from_utf8_lossy(&stderr.mismatch_bytes())
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr.mismatch_bytes())
         )));
     }
-    let complete = stdout
+    let complete = output
+        .stdout
         .complete
         .ok_or_else(|| std::io::Error::other("version probe exceeded its capture bound"))?;
     let text = std::str::from_utf8(&complete)
@@ -5191,6 +5552,19 @@ pub fn run_supervised_command(
     input: &[u8],
     timeout: Duration,
 ) -> std::io::Result<SupervisedOutput> {
+    let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
+    if let Some(policy) = &launch_policy {
+        policy.wrap(command)?;
+    }
+    struct QuiescenceGuard(Option<CandidateLaunchPolicy>);
+    impl Drop for QuiescenceGuard {
+        fn drop(&mut self) {
+            if let Some(policy) = self.0.take() {
+                let _ = policy.require_quiescence();
+            }
+        }
+    }
+    let mut quiescence = QuiescenceGuard(launch_policy);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5235,18 +5609,22 @@ pub fn run_supervised_command(
             (status, true, Some(termination))
         }
     };
+    if let Some(policy) = quiescence.0.take() {
+        policy.require_quiescence()?;
+    }
     let stdout = join_reader(stdout_reader, "stdout")?;
     let stderr = join_reader(stderr_reader, "stderr")?;
     stdin_writer
         .join()
         .map_err(|_| std::io::Error::other("stdin writer thread panicked"))??;
-    Ok(SupervisedOutput {
+    let output = SupervisedOutput {
         status,
         stdout,
         stderr,
         timed_out,
         termination,
-    })
+    };
+    Ok(output)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5296,6 +5674,8 @@ fn capture_process(
         }
         EnvironmentProfile::NativePlatform => {
             command.envs(std::env::vars_os());
+            scrub_ci_authority_environment(&mut command);
+            configure_evidence_native_environment(&mut command, working_directory)?;
         }
         EnvironmentProfile::Explicit => {
             command.envs(case.environment.iter().cloned());
@@ -5321,6 +5701,38 @@ fn capture_process(
         stderr: captured.stderr,
         timed_out: captured.timed_out,
     })
+}
+
+fn scrub_ci_authority_environment(command: &mut Command) {
+    configure_release_child_environment(command);
+}
+
+fn configure_evidence_native_environment(
+    command: &mut Command,
+    working_directory: &Path,
+) -> std::io::Result<()> {
+    for (name, relative) in [
+        ("HOME", ".evidence-home"),
+        ("USERPROFILE", ".evidence-home"),
+        ("APPDATA", ".evidence-home/appdata"),
+        ("LOCALAPPDATA", ".evidence-home/local-appdata"),
+        ("CARGO_HOME", ".evidence-cache/cargo"),
+        ("RUSTUP_HOME", ".evidence-cache/rustup"),
+        ("SCCACHE_DIR", ".evidence-cache/sccache"),
+        ("TEMP", ".evidence-tmp"),
+        ("TMP", ".evidence-tmp"),
+        ("TMPDIR", ".evidence-tmp"),
+    ] {
+        let path = working_directory.join(relative);
+        fs::create_dir_all(&path)?;
+        CANDIDATE_LAUNCH_POLICY.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map_or(Ok(()), |policy| policy.prepare_writable_directory(&path))
+        })?;
+        command.env(name, path);
+    }
+    Ok(())
 }
 
 fn typed_result_target(case: &DifferentialCase) -> std::io::Result<Option<BuiltinId>> {
@@ -5444,7 +5856,7 @@ fn snapshot_filesystem(root: &Path) -> std::io::Result<Vec<FilesystemEntry>> {
                     sha256: None,
                     truncated: false,
                 });
-            } else {
+            } else if file_type.is_file() {
                 let size = metadata.len();
                 hashed_bytes = hashed_bytes.checked_add(size).ok_or_else(|| {
                     std::io::Error::other("filesystem hashed-byte count overflowed")
@@ -5466,6 +5878,11 @@ fn snapshot_filesystem(root: &Path) -> std::io::Result<Vec<FilesystemEntry>> {
                     sha256: Some(capture.sha256),
                     truncated: size > u64::try_from(FILE_INLINE_BYTES).unwrap_or(u64::MAX),
                 });
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "filesystem observation contains a special entry",
+                ));
             }
         }
     }
@@ -5499,11 +5916,24 @@ struct Sandbox {
 impl Sandbox {
     fn new(label: &str) -> std::io::Result<Self> {
         let sequence = NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "hell-rs-differential-{}-{sequence}-{label}",
-            std::process::id()
-        ));
+        let sandbox_root = CANDIDATE_LAUNCH_POLICY.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|policy| policy.writable_roots.first().cloned())
+                .map(|root| root.join("release-child-environment/tmp"))
+        });
+        let path = sandbox_root
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "hell-rs-differential-{}-{sequence}-{label}",
+                std::process::id()
+            ));
         fs::create_dir(&path)?;
+        CANDIDATE_LAUNCH_POLICY.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map_or(Ok(()), |policy| policy.prepare_writable_directory(&path))
+        })?;
         Ok(Self { path })
     }
 }
@@ -5599,6 +6029,62 @@ impl Iterator for DeterministicUtf8 {
             }
             text
         })
+    }
+}
+
+#[cfg(test)]
+mod authority_environment_tests {
+    use super::{
+        Command, configure_evidence_native_environment, configure_release_child_environment,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_authority_environment_is_absent_in_actual_child() {
+        let mut command = Command::new("env");
+        command.env("GITHUB_TOKEN", "secret");
+        command.env("ACTIONS_RUNTIME_TOKEN", "secret");
+        command.env("GITHUB_OUTPUT", "secret");
+        command.env("HELL_VISIBLE_SENTINEL", "also-secret");
+        configure_release_child_environment(&mut command);
+        let output = command.output().expect("spawn environment probe");
+        assert!(output.status.success());
+        let visible = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        assert!(!visible.contains("GITHUB_TOKEN="));
+        assert!(!visible.contains("ACTIONS_RUNTIME_TOKEN="));
+        assert!(!visible.contains("GITHUB_OUTPUT="));
+        assert!(!visible.contains("HELL_VISIBLE_SENTINEL="));
+    }
+
+    #[test]
+    fn native_evidence_home_cache_and_temp_are_per_case() {
+        let root = std::env::temp_dir().join(format!(
+            "hell-testkit-native-evidence-env-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let mut command = Command::new("unused");
+        configure_evidence_native_environment(&mut command, &root).unwrap();
+        let environment = command
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "SCCACHE_DIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::path::Path::new(&environment[std::ffi::OsStr::new(name)]).starts_with(&root)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

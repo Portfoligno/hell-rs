@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use hell_builtins::{
-    ClaimPlatform, ClaimStatus, ClassHeadKind, CompatibilityDimension, ExecutionProfile, Fixity,
-    TypeClass, Visibility, WiringStatus,
+    ClassHeadKind, CompatibilityDimension, ExecutionProfile, Fixity, RequirementPlatform,
+    RequirementStrategy, TypeClass, Visibility, WiringStatus,
 };
 
 #[must_use]
@@ -182,9 +182,9 @@ pub fn render_compatibility_json() -> String {
             optional_json_string(term.implementation)
         )
         .expect("writing to String");
-        let claim = hell_builtins::compatibility_claim(term.id)
-            .expect("every registry term has a compatibility claim");
-        for (claim_index, dimension) in claim.dimensions.iter().enumerate() {
+        let requirement = hell_builtins::compatibility_requirement(term.id)
+            .expect("every registry term has compatibility requirements");
+        for (requirement_index, dimension) in requirement.dimensions.iter().enumerate() {
             writeln!(
                 output,
                 "      {{ \"dimension\": \"{}\", \"scopes\": [",
@@ -194,14 +194,14 @@ pub fn render_compatibility_json() -> String {
             for (scope_index, scope) in dimension.scopes.iter().enumerate() {
                 writeln!(
                     output,
-                    "        {{ \"status\": \"{}\", \"profiles\": {}, \"platforms\": {}, \"evidence\": {}, \"normalizers\": {}, \"rationale\": {}, \"issue\": {} }}{}",
-                    status_name(scope.status),
+                    "        {{ \"strategy\": \"{}\", \"profiles\": {}, \"platforms\": {}, \"evidence\": {}, \"normalizers\": {}, \"rationale\": {}, \"trackingIssue\": \"{}\" }}{}",
+                    strategy_name(scope.strategy),
                     json_array(scope.profiles.iter().copied().map(profile_name)),
                     json_array(scope.platforms.iter().copied().map(platform_name)),
                     json_array(scope.evidence.iter().copied()),
                     json_array(scope.normalizers.iter().map(|normalizer| normalizer.as_str())),
-                    optional_json_string(scope.rationale),
-                    optional_json_string(scope.issue),
+                    optional_json_string(Some(scope.rationale)),
+                    json_escape(scope.tracking_issue),
                     comma(scope_index, dimension.scopes.len())
                 )
                 .expect("writing to String");
@@ -209,7 +209,7 @@ pub fn render_compatibility_json() -> String {
             writeln!(
                 output,
                 "      ] }}{}",
-                comma(claim_index, claim.dimensions.len())
+                comma(requirement_index, requirement.dimensions.len())
             )
             .expect("writing to String");
         }
@@ -501,14 +501,13 @@ fn dimension_name(dimension: CompatibilityDimension) -> &'static str {
     }
 }
 
-fn status_name(status: ClaimStatus) -> &'static str {
-    match status {
-        ClaimStatus::Exact => "exact",
-        ClaimStatus::Normalized => "normalized",
-        ClaimStatus::PlatformDependent => "platform-dependent",
-        ClaimStatus::DeliberateDivergence => "deliberate-divergence",
-        ClaimStatus::Unverified => "unverified",
-        ClaimStatus::NotApplicable => "not-applicable",
+fn strategy_name(strategy: RequirementStrategy) -> &'static str {
+    match strategy {
+        RequirementStrategy::NativeOracle => "native-oracle",
+        RequirementStrategy::PortableStatic => "portable-static",
+        RequirementStrategy::StructuralInvariant => "structural-invariant",
+        RequirementStrategy::CommittedDifferentialCorpus => "committed-differential-corpus",
+        RequirementStrategy::CrossPlatformRelation => "cross-platform-relation",
     }
 }
 
@@ -519,12 +518,11 @@ fn profile_name(profile: ExecutionProfile) -> &'static str {
     }
 }
 
-fn platform_name(platform: ClaimPlatform) -> &'static str {
+fn platform_name(platform: RequirementPlatform) -> &'static str {
     match platform {
-        ClaimPlatform::All => "all",
-        ClaimPlatform::Linux => "linux",
-        ClaimPlatform::MacOs => "macos",
-        ClaimPlatform::Windows => "windows",
+        RequirementPlatform::LinuxX86_64 => "linux-x86_64",
+        RequirementPlatform::MacosAarch64 => "macos-aarch64",
+        RequirementPlatform::WindowsX86_64 => "windows-x86_64",
     }
 }
 

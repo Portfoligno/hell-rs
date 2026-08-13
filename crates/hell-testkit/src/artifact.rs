@@ -39,6 +39,446 @@ pub fn case_execution_input_sha256(case: &DifferentialCase) -> std::io::Result<D
     Ok(sha256_bytes(execution_input_json(case)?.as_bytes()))
 }
 
+/// Hashes the complete canonical committed-case descriptor without executing it.
+#[must_use]
+pub fn case_descriptor_sha256(case: &DifferentialCase) -> Digest {
+    sha256_bytes(case_descriptor(case).as_bytes())
+}
+
+/// Encodes the exact bounded comparison observation consumed by trusted
+/// release-conformance derivation.
+///
+/// # Errors
+///
+/// Returns an error rather than serializing truncated captures, timeouts, or
+/// process states that cannot be represented without information loss.
+pub fn canonical_conformance_observation_json(
+    observation: &Observation,
+) -> std::io::Result<Vec<u8>> {
+    if observation.stdout.truncated || observation.stderr.truncated {
+        return Err(std::io::Error::other(
+            "conformance observation capture is truncated",
+        ));
+    }
+    let stdout = observation
+        .stdout
+        .complete
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("conformance stdout is incomplete"))?;
+    let stderr = observation
+        .stderr
+        .complete
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("conformance stderr is incomplete"))?;
+    let raw_stderr = observation
+        .raw_stderr
+        .complete
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("conformance raw stderr is incomplete"))?;
+    if observation.filesystem.iter().any(|entry| entry.truncated) {
+        return Err(std::io::Error::other(
+            "conformance filesystem observation is truncated",
+        ));
+    }
+    let mut output = String::from("{\"diagnostic\":");
+    push_json_string(&mut output, &format!("{:?}", observation.diagnostic));
+    output.push_str(",\"exit\":{");
+    match observation.status.code {
+        Some(code) if code >= 0 => {
+            output.push_str("\"kind\":\"code\",\"value\":");
+            write!(output, "{code}").expect("writing to String cannot fail");
+        }
+        Some(code) => {
+            output.push_str("\"kind\":\"signal\",\"value\":");
+            push_json_string(&mut output, &format!("platform-status-{code}"));
+        }
+        None => {
+            output.push_str("\"kind\":\"signal\",\"value\":\"unknown-signal\"");
+        }
+    }
+    output.push_str("},\"filesystem\":");
+    push_json_string(&mut output, &format!("{:?}", observation.filesystem));
+    output.push_str(",\"mode\":");
+    push_json_string(&mut output, &format!("{:?}", observation.mode));
+    output.push_str(",\"normalizerContext\":{\"sandbox\":");
+    push_json_string(
+        &mut output,
+        observation.normalizer_sandbox.to_string_lossy().as_ref(),
+    );
+    output.push_str(",\"script\":");
+    push_json_string(
+        &mut output,
+        observation.normalizer_script.to_string_lossy().as_ref(),
+    );
+    output.push('}');
+    push_conformance_capture(&mut output, "rawStderr", raw_stderr);
+    output.push_str(",\"resourceAudit\":");
+    push_json_string(&mut output, &format!("{:?}", observation.resource_audit));
+    output.push_str(",\"schemaVersion\":3,\"semanticTrace\":[");
+    if observation.semantic.is_some() {
+        push_json_string(&mut output, &conformance_semantic_document(observation)?);
+    }
+    output.push(']');
+    output.push_str(",\"statusSuccess\":");
+    output.push_str(if observation.status.success {
+        "true"
+    } else {
+        "false"
+    });
+    push_conformance_capture(&mut output, "stderr", stderr);
+    push_conformance_capture(&mut output, "stdout", stdout);
+    output.push_str(",\"termination\":\"");
+    output.push_str(if observation.timed_out {
+        "timed-out"
+    } else if observation.status.code.is_some_and(|code| code >= 0) {
+        "exited"
+    } else {
+        "signaled"
+    });
+    output.push_str("\"}\n");
+    if observation.timed_out {
+        return Err(std::io::Error::other("conformance observation timed out"));
+    }
+    Ok(output.into_bytes())
+}
+
+/// Replays the exact production harness and reviewed claim-normalizer closure
+/// over raw stderr retained by a conformance observation.
+///
+/// # Errors
+///
+/// Returns an error for an unauthorized/reordered closure or a non-idempotent
+/// production normalizer pass.
+pub fn replay_conformance_stderr(
+    raw_stderr: &[u8],
+    sandbox: &Path,
+    script: &Path,
+    case: &DifferentialCase,
+    normalizers: &[NormalizerId],
+) -> std::io::Result<Vec<u8>> {
+    if normalizers != applied_claim_normalizers(case) {
+        return Err(std::io::Error::other(
+            "conformance normalizer closure differs from the reviewed case",
+        ));
+    }
+    let mut output = crate::diagnostic_sandbox_path_v1(raw_stderr, sandbox, script);
+    for (from, to) in &case.normalization.stderr_replacements {
+        output = crate::replace_all(&output, from, to);
+    }
+    for normalizer in normalizers {
+        let passes = crate::apply_retained_normalizer_twice(crate::RetainedNormalizerInput {
+            normalizer: *normalizer,
+            observation: &output,
+            sandbox,
+            script,
+        });
+        if passes.first_pass != passes.second_pass {
+            return Err(std::io::Error::other(
+                "conformance normalizer is not idempotent",
+            ));
+        }
+        output = passes.first_pass;
+    }
+    Ok(output)
+}
+
+fn conformance_semantic_document(observation: &Observation) -> std::io::Result<String> {
+    let mut output = String::from("{\n  \"schemaVersion\": 1");
+    push_semantic_json(&mut output, observation);
+    output.push_str(",\n  \"semanticTypedResultHex\": ");
+    if let Some(canonical) = observation
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.typed_result_canonical.as_deref())
+    {
+        crate::validate_canonical_typed_value(canonical)?;
+        push_json_string(&mut output, &crate::encode_callback_result(canonical));
+    } else {
+        output.push_str("null");
+    }
+    let stdout = observation
+        .stdout
+        .complete
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("conformance stdout is incomplete"))?;
+    let raw_stderr = observation
+        .raw_stderr
+        .complete
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("conformance raw stderr is incomplete"))?;
+    output.push_str(",\n  \"rawPresentationSha256\": \"");
+    output.push_str(&raw_presentation_sha256(stdout, raw_stderr).hex());
+    output.push_str("\"");
+    output.push_str(",\n  \"normalizedPresentationLineEndingsSha256\": ");
+    match normalized_presentation_shadow_sha256(
+        PresentationShadowNormalizerId::LineEndingsV1,
+        stdout,
+        raw_stderr,
+    ) {
+        Ok(digest) => {
+            output.push('"');
+            output.push_str(&digest.hex());
+            output.push('"');
+        }
+        Err(_) => output.push_str("null"),
+    }
+    output.push_str(",\n  \"resourceAuditFailures\": ");
+    write!(
+        output,
+        "{}",
+        observation
+            .resource_audit
+            .as_ref()
+            .map_or(usize::MAX, ResourceAudit::failure_count)
+    )
+    .expect("writing to String cannot fail");
+    push_status_json(&mut output, observation);
+    output.push_str("\n}\n");
+    Ok(output)
+}
+
+/// Replays one exact reviewed runtime obligation from the canonical
+/// semantic document retained inside a release-conformance observation.
+///
+/// The document contains raw typed trace facts, not a producer verdict.  This
+/// function reparses those facts, validates their causal structure and exact
+/// descriptor expectations, and then runs the same obligation-specific
+/// validator used by retained differential bundles.
+///
+/// # Errors
+///
+/// Returns an error for an unknown/ambiguous target, malformed or forged
+/// semantic facts, a descriptor mismatch, or an obligation without a trusted
+/// in-memory validator.
+pub fn validate_conformance_semantic_obligation(
+    document: &str,
+    case: &DifferentialCase,
+    builtin_name: &str,
+    dimension: hell_builtins::CompatibilityDimension,
+    obligation: &str,
+) -> std::io::Result<()> {
+    validate_conformance_semantic_document_shape(document)?;
+    let descriptor = case
+        .claim_evidence
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("conformance case has no reviewed descriptor"))?;
+    crate::validate_case_descriptor(case, descriptor).map_err(std::io::Error::other)?;
+    crate::validate_legacy_targets(case, descriptor).map_err(std::io::Error::other)?;
+    crate::validate_semantic_targets(case, descriptor).map_err(std::io::Error::other)?;
+    crate::validate_callback_contracts(case, descriptor).map_err(std::io::Error::other)?;
+    let mut targets = descriptor.semantic_targets.iter().filter(|target| {
+        target.builtin.as_ref() == builtin_name
+            && target.dimension == dimension
+            && target
+                .obligations
+                .iter()
+                .any(|value| value.0.as_ref() == obligation)
+    });
+    let target = targets.next().ok_or_else(|| {
+        std::io::Error::other("reviewed descriptor does not authorize the exact obligation")
+    })?;
+    if targets.next().is_some() {
+        return Err(std::io::Error::other(
+            "reviewed descriptor ambiguously authorizes the obligation",
+        ));
+    }
+    let builtin = hell_builtins::lookup(builtin_name)
+        .ok_or_else(|| std::io::Error::other("conformance target builtin disappeared"))?;
+    let observed = parse_semantic_coverage(document)?;
+    let typed_result = parse_optional_digest_field(document, "semanticTypedResultSha256")?;
+    let typed_result_builtin = parse_optional_u16_field(document, "semanticTypedResultBuiltinId")?;
+    validate_conformance_typed_result(document, typed_result, typed_result_builtin)?;
+    let boundaries = parse_semantic_boundaries(document)?;
+    let event_order = parse_semantic_event_order(document)?;
+    let effect_trace = parse_semantic_effect_trace(document)?;
+    let task_trace = parse_semantic_task_trace(document)?;
+    let resource_trace = parse_semantic_resource_trace(document)?;
+    let obligation_trace = parse_semantic_obligation_trace(document)?;
+    let conformance_facts = ConformanceObservationFacts {
+        raw_presentation_sha256: parse_required_digest_field(document, "rawPresentationSha256")?,
+        normalized_line_endings_sha256: parse_optional_digest_field(
+            document,
+            "normalizedPresentationLineEndingsSha256",
+        )?,
+        resource_audit_failures: parse_canonical_u64_field(document, "resourceAuditFailures")?,
+    };
+    validate_task_causality(&task_trace, &observed)?;
+    validate_obligation_causality(&obligation_trace, &task_trace)?;
+    validate_nested_ord_comparator_evidence(&obligation_trace)?;
+    validate_effect_causality(&effect_trace, &task_trace, &observed)?;
+    if event_order.is_empty() {
+        return Err(std::io::Error::other("semantic event order is empty"));
+    }
+    validate_semantic_event_classes(
+        &event_order,
+        &observed,
+        typed_result.is_some(),
+        boundaries.len(),
+        obligation_trace.len(),
+    )?;
+    validate_expected_instance_target(target, builtin.id, &obligation_trace)?;
+    validate_expected_comparator_trace(target, builtin.id, &obligation_trace)?;
+    validate_exact_lazy_adapter_entry_target(target, builtin, &boundaries, &obligation_trace)?;
+    validate_runtime_scope_binding(
+        case,
+        target,
+        document,
+        &observed,
+        &obligation_trace,
+        Path::new(""),
+        Some(&conformance_facts),
+    )?;
+    if !target_has_causal_signal(target.causal_signal, builtin.id, &observed)? {
+        return Err(std::io::Error::other(
+            "candidate observation lacks exact target causal evidence",
+        ));
+    }
+    if let Some(expected) = target.expected_typed_result_sha256
+        && (typed_result != Some(expected) || typed_result_builtin != Some(builtin.id.0))
+    {
+        return Err(std::io::Error::other(
+            "candidate typed result differs from the reviewed expectation",
+        ));
+    }
+    validate_expected_lazy_argument_exit(target, builtin.id, &boundaries)?;
+    validate_expected_single_task_lifecycle(target, builtin.id, &task_trace, &effect_trace)?;
+    validate_expected_task_trace(target, builtin.id, &task_trace)?;
+    if let Some(expected) = target.expected_process_status_sha256 {
+        let (success, code) = parse_observation_process_status(document)?;
+        if crate::process_status_sha256(success, code) != expected {
+            return Err(std::io::Error::other(
+                "candidate process status differs from the reviewed expectation",
+            ));
+        }
+    }
+    validate_expected_single_effect_lifecycle(target, builtin.id, &effect_trace)?;
+    validate_obligation_semantics(
+        obligation,
+        dimension,
+        builtin.id,
+        document,
+        Path::new(""),
+        &observed,
+        &effect_trace,
+        &task_trace,
+        &resource_trace,
+        &obligation_trace,
+        typed_result,
+        typed_result_builtin,
+        &boundaries,
+        &target.platforms,
+        target.expected_raw_presentation_sha256,
+        target.expected_presentation_shadow_normalizer,
+        target.expected_normalized_presentation_sha256,
+        Some(&conformance_facts),
+    )?;
+    validate_retained_callback_contracts(descriptor, &obligation_trace)
+}
+
+fn validate_conformance_semantic_document_shape(document: &str) -> std::io::Result<()> {
+    const FIELDS: [&str; 17] = [
+        "schemaVersion",
+        "semanticCoverage",
+        "semanticTypedResultSha256",
+        "semanticTypedResultBuiltinId",
+        "semanticBoundaries",
+        "semanticObligationTrace",
+        "semanticEventOrder",
+        "semanticEffectTrace",
+        "semanticTaskTrace",
+        "semanticResourceTrace",
+        "semanticTypedResultHex",
+        "rawPresentationSha256",
+        "normalizedPresentationLineEndingsSha256",
+        "resourceAuditFailures",
+        "status",
+        "timedOut",
+        "diagnostic",
+    ];
+    let lines = document.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"{") || lines.last() != Some(&"}") || lines.len() != FIELDS.len() + 2
+    {
+        return Err(std::io::Error::other(
+            "conformance semantic document has an unsupported shape",
+        ));
+    }
+    for (line, field) in lines[1..lines.len() - 1].iter().zip(FIELDS) {
+        if !line.starts_with(&format!("  \"{field}\": ")) {
+            return Err(std::io::Error::other(
+                "conformance semantic document fields are missing or reordered",
+            ));
+        }
+    }
+    if lines[1] != "  \"schemaVersion\": 1," {
+        return Err(std::io::Error::other(
+            "conformance semantic document schema is unsupported",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_conformance_typed_result(
+    document: &str,
+    digest: Option<Digest>,
+    builtin: Option<u16>,
+) -> std::io::Result<()> {
+    let value = exact_observation_field(document, "semanticTypedResultHex")?;
+    match (digest, builtin, value) {
+        (None, None, "null") => Ok(()),
+        (Some(expected), Some(_), value) => {
+            let encoded = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .ok_or_else(|| std::io::Error::other("typed result hex is malformed"))?;
+            let bytes = crate::decode_canonical_hex(encoded)
+                .ok_or_else(|| std::io::Error::other("typed result hex is noncanonical"))?;
+            let canonical = std::str::from_utf8(&bytes)
+                .map_err(|_| std::io::Error::other("typed result is not UTF-8"))?;
+            crate::validate_canonical_typed_value(canonical)?;
+            if sha256_bytes(canonical.as_bytes()) != expected {
+                return Err(std::io::Error::other(
+                    "typed result digest does not bind its canonical value",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(std::io::Error::other(
+            "typed result retained identity is incomplete",
+        )),
+    }
+}
+
+fn push_conformance_capture(output: &mut String, field: &str, bytes: &[u8]) {
+    output.push_str(",\"");
+    output.push_str(field);
+    output.push_str("\":{\"encoding\":\"base64\",\"value\":\"");
+    push_base64(output, bytes);
+    output.push_str("\"}");
+}
+
+fn push_base64(output: &mut String, bytes: &[u8]) {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(char::from(TABLE[usize::from(first >> 2)]));
+        output.push(char::from(
+            TABLE[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        output.push(if chunk.len() > 1 {
+            char::from(TABLE[usize::from(((second & 0x0f) << 2) | (third >> 6))])
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            char::from(TABLE[usize::from(third & 0x3f)])
+        } else {
+            '='
+        });
+    }
+}
+
 /// Retains one candidate observation under one explicit compiler/runtime profile.
 ///
 /// # Errors
@@ -666,6 +1106,7 @@ fn derive_regression_case_from_oracle(
                     Some(candidate_raw),
                     None,
                     None,
+                    None,
                 )
                 .is_ok()
             })
@@ -1224,6 +1665,7 @@ fn validate_regression_claim_sources(
         if !validate_raw_presentation(
             &directory.join("oracle"),
             target.expected_raw_presentation_sha256,
+            None,
         )? {
             return Err(std::io::Error::other(format!(
                 "regression oracle raw expectation differs for {:?}/{:?}",
@@ -1365,6 +1807,7 @@ fn retained_reached_claim_targets_for_side(
                     typed_result_builtin,
                     &boundaries,
                     &cell.platforms,
+                    None,
                     None,
                     None,
                     None,
@@ -2602,6 +3045,7 @@ fn validate_claim_semantics(
             &observed,
             &obligation_trace,
             observation_directory,
+            None,
         )?;
         if !target_has_causal_signal(target.causal_signal, builtin.id, &observed)? {
             return Err(std::io::Error::other(format!(
@@ -2650,6 +3094,7 @@ fn validate_claim_semantics(
                 target.expected_raw_presentation_sha256,
                 target.expected_presentation_shadow_normalizer,
                 target.expected_normalized_presentation_sha256,
+                None,
             )?;
         }
     }
@@ -2769,12 +3214,16 @@ fn validate_retained_target_expectations(
     if let Some(expected) = target.expected_typed_result_sha256
         && (typed_result != Some(expected) || typed_result_builtin != Some(builtin.0))
     {
-        return Err(target_expectation_error(target, "retained typed result"));
+        return Err(std::io::Error::other(format!(
+            "retained typed result disagrees for {:?}/{:?}: expected {expected:?}, observed {typed_result:?}/{typed_result_builtin:?}",
+            target.builtin, target.dimension
+        )));
     }
     if target.expected_raw_presentation_sha256.is_some()
         && !validate_raw_presentation(
             observation_directory,
             target.expected_raw_presentation_sha256,
+            None,
         )?
     {
         return Err(target_expectation_error(
@@ -2787,6 +3236,7 @@ fn validate_retained_target_expectations(
             observation_directory,
             target.expected_presentation_shadow_normalizer,
             target.expected_normalized_presentation_sha256,
+            None,
         )?
     {
         return Err(target_expectation_error(
@@ -2841,10 +3291,24 @@ fn validate_expected_instance_target(
         .iter()
         .filter(|event| event.builtin == builtin)
         .collect::<Vec<_>>();
-    if matching.is_empty()
+    let permitted_nested = target
+        .expected_instance_premises
+        .iter()
+        .map(|premise| premise.target.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_events = matching
+        .iter()
+        .filter(|event| event.instance_target.as_deref() == Some(expected))
+        .collect::<Vec<_>>();
+    if expected_events.is_empty()
+        || expected_events
+            .iter()
+            .any(|event| event.instance_premises != target.expected_instance_premises)
         || matching.iter().any(|event| {
-            event.instance_target.as_deref() != Some(expected)
-                || event.instance_premises != target.expected_instance_premises
+            event
+                .instance_target
+                .as_deref()
+                .is_none_or(|instance| instance != expected && !permitted_nested.contains(instance))
         })
     {
         return Err(std::io::Error::other(format!(
@@ -3213,6 +3677,7 @@ fn validate_runtime_scope_binding(
     observed: &[CoverageEvent],
     obligation_trace: &[crate::ObligationTraceEvent],
     observation_directory: &Path,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<()> {
     if target.boundary_classes.len() > 1 {
         return Err(std::io::Error::other(
@@ -3228,6 +3693,7 @@ fn validate_runtime_scope_binding(
             observed,
             obligation_trace,
             observation_directory,
+            conformance_facts,
         )?;
     }
     for interaction in &target.interaction_obligations {
@@ -3244,6 +3710,7 @@ fn validate_runtime_boundary_binding(
     observed: &[CoverageEvent],
     obligation_trace: &[crate::ObligationTraceEvent],
     observation_directory: &Path,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<()> {
     let builtin_case = match target.builtin.as_ref() {
         "Options.flag'" => "options-flag-prime".to_owned(),
@@ -3327,13 +3794,14 @@ fn validate_runtime_boundary_binding(
             "runtime boundary retained the wrong typed outcome",
         ));
     }
-    validate_runtime_boundary_outputs(target, document, observation_directory)
+    validate_runtime_boundary_outputs(target, document, observation_directory, conformance_facts)
 }
 
 fn validate_runtime_boundary_outputs(
     target: &crate::EvidenceTargetV2,
     document: &str,
     observation_directory: &Path,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<()> {
     if let Some(expected) = target.expected_typed_result_sha256 {
         let observed = parse_optional_digest_field(document, "semanticTypedResultSha256")?
@@ -3350,6 +3818,7 @@ fn validate_runtime_boundary_outputs(
         && !validate_raw_presentation(
             observation_directory,
             target.expected_raw_presentation_sha256,
+            conformance_facts,
         )?
     {
         return Err(std::io::Error::other(
@@ -3847,6 +4316,13 @@ fn validate_obligation_causality(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ConformanceObservationFacts {
+    raw_presentation_sha256: Digest,
+    normalized_line_endings_sha256: Option<Digest>,
+    resource_audit_failures: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_obligation_semantics(
     obligation: &str,
@@ -3866,6 +4342,7 @@ fn validate_obligation_semantics(
     expected_raw_presentation_sha256: Option<Digest>,
     expected_presentation_shadow_normalizer: Option<PresentationShadowNormalizerId>,
     expected_normalized_presentation_sha256: Option<Digest>,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<()> {
     use hell_builtins::CompatibilityDimension;
     let effect = |lifecycle: &str| {
@@ -3913,7 +4390,8 @@ fn validate_obligation_semantics(
                 complete_task_lifecycle(&tasks) && tasks.iter().any(|event| event.2 == "cancelled")
             }
             (CompatibilityDimension::Concurrency, "scope-cleanup") => {
-                complete_task_lifecycle(&tasks) && zero_resource_audit(observation_directory)?
+                complete_task_lifecycle(&tasks)
+                    && zero_resource_audit(observation_directory, conformance_facts)?
             }
             (CompatibilityDimension::Presentation, obligation) => validate_presentation_obligation(
                 obligation,
@@ -3922,6 +4400,7 @@ fn validate_obligation_semantics(
                 expected_raw_presentation_sha256,
                 expected_presentation_shadow_normalizer,
                 expected_normalized_presentation_sha256,
+                conformance_facts,
             )?,
             (CompatibilityDimension::Platform, "three-platform-observation") => {
                 required_platforms_present(platforms)
@@ -3940,10 +4419,13 @@ fn validate_obligation_semantics(
                         .iter()
                         .any(|event| event.materialized_after >= event.materialized_before)
                 };
-                success && entered && materialization && zero_resource_audit(observation_directory)?
+                success
+                    && entered
+                    && materialization
+                    && zero_resource_audit(observation_directory, conformance_facts)?
             }
             (CompatibilityDimension::ResourceBehavior, "resource-audit") => {
-                entered && zero_resource_audit(observation_directory)?
+                entered && zero_resource_audit(observation_directory, conformance_facts)?
             }
             (CompatibilityDimension::ResourceBehavior, "cleanup-trace") => {
                 if hell_builtins::registry()
@@ -3951,9 +4433,15 @@ fn validate_obligation_semantics(
                     .find(|spec| spec.id == builtin)
                     .is_some_and(|spec| spec.name.starts_with("Async."))
                 {
-                    complete_task_lifecycle(&tasks) && zero_resource_audit(observation_directory)?
+                    complete_task_lifecycle(&tasks)
+                        && zero_resource_audit(observation_directory, conformance_facts)?
                 } else {
-                    target_resource_lifecycle(builtin, &resources, observation_directory)?
+                    target_resource_lifecycle(
+                        builtin,
+                        &resources,
+                        observation_directory,
+                        conformance_facts,
+                    )?
                 }
             }
             _ => false,
@@ -3976,16 +4464,20 @@ fn validate_presentation_obligation(
     expected_raw: Option<Digest>,
     normalizer: Option<PresentationShadowNormalizerId>,
     expected_shadow: Option<Digest>,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<bool> {
     if !presented {
         return Ok(false);
     }
     match obligation {
-        "raw-observation" => validate_raw_presentation(observation_directory, expected_raw),
+        "raw-observation" => {
+            validate_raw_presentation(observation_directory, expected_raw, conformance_facts)
+        }
         "normalized-shadow-diff" => validate_normalized_presentation_shadow(
             observation_directory,
             normalizer,
             expected_shadow,
+            conformance_facts,
         ),
         _ => Ok(false),
     }
@@ -3994,10 +4486,14 @@ fn validate_presentation_obligation(
 fn validate_raw_presentation(
     observation_directory: &Path,
     expected: Option<Digest>,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<bool> {
     let Some(expected) = expected else {
         return Ok(false);
     };
+    if let Some(facts) = conformance_facts {
+        return Ok(facts.raw_presentation_sha256 == expected);
+    }
     let bundle = observation_directory
         .parent()
         .ok_or_else(|| std::io::Error::other("observation has no bundle parent"))?;
@@ -4020,10 +4516,18 @@ fn validate_normalized_presentation_shadow(
     observation_directory: &Path,
     normalizer: Option<PresentationShadowNormalizerId>,
     expected: Option<Digest>,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<bool> {
     let (Some(normalizer), Some(expected)) = (normalizer, expected) else {
         return Ok(false);
     };
+    if let Some(facts) = conformance_facts {
+        return Ok(match normalizer {
+            PresentationShadowNormalizerId::LineEndingsV1 => {
+                facts.normalized_line_endings_sha256 == Some(expected)
+            }
+        });
+    }
     let bundle = observation_directory
         .parent()
         .ok_or_else(|| std::io::Error::other("observation has no bundle parent"))?;
@@ -4548,6 +5052,7 @@ fn target_resource_lifecycle(
     builtin: hell_builtins::BuiltinId,
     events: &[&(u64, hell_builtins::BuiltinId, Option<u64>, String)],
     observation_directory: &Path,
+    conformance_facts: Option<&ConformanceObservationFacts>,
 ) -> std::io::Result<bool> {
     let builtin_name = hell_builtins::registry()
         .get(usize::from(builtin.0))
@@ -4559,10 +5064,16 @@ fn target_resource_lifecycle(
         "IO.hClose" | "Process.useHandleClose" => events.len() == 1 && events[0].3 == "close",
         _ => return Ok(complete_resource_lifecycle(events)),
     };
-    Ok(exact_segment && zero_resource_audit(observation_directory)?)
+    Ok(exact_segment && zero_resource_audit(observation_directory, conformance_facts)?)
 }
 
-fn zero_resource_audit(directory: &Path) -> std::io::Result<bool> {
+fn zero_resource_audit(
+    directory: &Path,
+    conformance_facts: Option<&ConformanceObservationFacts>,
+) -> std::io::Result<bool> {
+    if let Some(facts) = conformance_facts {
+        return Ok(facts.resource_audit_failures == 0);
+    }
     let audit = fs::read_to_string(directory.join("resource-audit.json"))?;
     Ok(audit == resource_audit_json(&ResourceAudit::default()))
 }
@@ -5091,6 +5602,20 @@ fn parse_optional_digest_field(document: &str, field: &str) -> std::io::Result<O
     Digest::from_hex(value)
         .map(Some)
         .map_err(|error| std::io::Error::other(format!("invalid {field}: {error}")))
+}
+
+fn parse_required_digest_field(document: &str, field: &str) -> std::io::Result<Digest> {
+    parse_optional_digest_field(document, field)?
+        .ok_or_else(|| std::io::Error::other(format!("{field} must not be null")))
+}
+
+fn parse_canonical_u64_field(document: &str, field: &str) -> std::io::Result<u64> {
+    let value = exact_observation_field(document, field)?;
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .ok_or_else(|| std::io::Error::other(format!("{field} is not a canonical integer")))
 }
 
 fn parse_semantic_coverage(document: &str) -> std::io::Result<Vec<CoverageEvent>> {
@@ -7235,6 +7760,178 @@ mod tests {
     }
 
     #[test]
+    fn conformance_observation_retains_nonstream_comparison_state() {
+        let baseline = observation(crate::ExecutableRole::Candidate);
+        let baseline_bytes = canonical_conformance_observation_json(&baseline).unwrap();
+        let mut diagnostic = baseline.clone();
+        diagnostic.diagnostic = Some(crate::DiagnosticObservation {
+            phase: crate::DiagnosticPhase::Parse,
+            code: "H0200".into(),
+            category: crate::DiagnosticCategory::Syntax,
+            protected_message: "syntax-error".into(),
+            line: 1,
+            column: 1,
+        });
+        assert_ne!(
+            baseline_bytes,
+            canonical_conformance_observation_json(&diagnostic).unwrap()
+        );
+        let mut filesystem = baseline.clone();
+        filesystem.filesystem.push(crate::FilesystemEntry {
+            relative_path: PathBuf::from("result.bin"),
+            kind: crate::FilesystemEntryKind::File,
+            contents: b"result".to_vec(),
+            size: 6,
+            sha256: Some(sha256_bytes(b"result")),
+            truncated: false,
+        });
+        assert_ne!(
+            baseline_bytes,
+            canonical_conformance_observation_json(&filesystem).unwrap()
+        );
+        let mut raw = baseline;
+        raw.raw_stderr = BoundedCapture::from_bytes(b"producer-only raw difference".to_vec());
+        assert_ne!(
+            baseline_bytes,
+            canonical_conformance_observation_json(&raw).unwrap()
+        );
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn conformance_semantic_document_replays_reviewed_bool_obligations() {
+        let case = crate::committed_differential_cases()
+            .into_iter()
+            .find(|case| case.id.as_ref() == "bool-ordinary-success")
+            .unwrap();
+        let root = root("conformance-semantic-bool");
+        let (_, status, semantic, stdout, stderr) =
+            execute_runtime_interaction_with_status(&case, &root);
+        let mut observed = observation(crate::ExecutableRole::Candidate);
+        observed.case_id = Arc::clone(&case.id);
+        observed.status = status;
+        observed.stdout = BoundedCapture::from_bytes(stdout);
+        observed.raw_stderr = BoundedCapture::from_bytes(stderr.clone());
+        observed.claim_input_stderr = BoundedCapture::from_bytes(stderr.clone());
+        observed.stderr = BoundedCapture::from_bytes(stderr);
+        observed.semantic = Some(semantic);
+        let document = conformance_semantic_document(&observed).unwrap();
+        let target = case
+            .claim_evidence
+            .as_ref()
+            .unwrap()
+            .semantic_targets
+            .iter()
+            .find(|target| target.builtin.as_ref() == "Bool.bool")
+            .unwrap();
+        for obligation in &target.obligations {
+            validate_conformance_semantic_obligation(
+                &document,
+                &case,
+                "Bool.bool",
+                hell_builtins::CompatibilityDimension::PureRuntime,
+                &obligation.0,
+            )
+            .unwrap();
+        }
+        let forged = document.replacen(
+            "\"semanticTypedResultSha256\": \"",
+            "\"semanticTypedResultSha256\": \"0",
+            1,
+        );
+        assert!(
+            validate_conformance_semantic_obligation(
+                &forged,
+                &case,
+                "Bool.bool",
+                hell_builtins::CompatibilityDimension::PureRuntime,
+                &target.obligations[0].0,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn conformance_semantic_document_replays_each_runtime_dimension() {
+        let dimensions = [
+            hell_builtins::CompatibilityDimension::PureRuntime,
+            hell_builtins::CompatibilityDimension::Effects,
+            hell_builtins::CompatibilityDimension::Concurrency,
+            hell_builtins::CompatibilityDimension::Presentation,
+            hell_builtins::CompatibilityDimension::Platform,
+            hell_builtins::CompatibilityDimension::ResourceBehavior,
+        ];
+        let cases = crate::committed_differential_cases();
+        for dimension in dimensions {
+            let (case, target) = cases
+                .iter()
+                .find_map(|case| {
+                    (case.environment_profile != crate::EnvironmentProfile::ProcessCapable)
+                        .then(|| {
+                            case.claim_evidence.as_ref().and_then(|descriptor| {
+                                descriptor
+                                    .semantic_targets
+                                    .iter()
+                                    .find(|target| target.dimension == dimension)
+                                    .map(|target| (case, target))
+                            })
+                        })
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("no executable reviewed case for {dimension:?}"));
+            let case_root = root(&format!("conformance-semantic-{dimension:?}"));
+            let (_, status, semantic, stdout, stderr) =
+                execute_runtime_interaction_with_status(case, &case_root);
+            let mut observed = observation(crate::ExecutableRole::Candidate);
+            observed.case_id = Arc::clone(&case.id);
+            observed.status = status;
+            observed.stdout = BoundedCapture::from_bytes(stdout);
+            observed.raw_stderr = BoundedCapture::from_bytes(stderr.clone());
+            observed.claim_input_stderr = BoundedCapture::from_bytes(stderr.clone());
+            observed.stderr = BoundedCapture::from_bytes(stderr);
+            observed.semantic = Some(semantic);
+            observed.resource_audit = Some(ResourceAudit::default());
+            let document = conformance_semantic_document(&observed).unwrap();
+            for obligation in &target.obligations {
+                validate_conformance_semantic_obligation(
+                    &document,
+                    case,
+                    &target.builtin,
+                    dimension,
+                    &obligation.0,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}/{dimension:?}/{} did not replay: {error}",
+                        target.builtin, obligation.0
+                    )
+                });
+            }
+            if dimension == hell_builtins::CompatibilityDimension::Presentation {
+                let forged = document.replacen(
+                    "\"rawPresentationSha256\": \"",
+                    "\"rawPresentationSha256\": \"0",
+                    1,
+                );
+                assert!(
+                    validate_conformance_semantic_obligation(
+                        &forged,
+                        case,
+                        &target.builtin,
+                        dimension,
+                        &target.obligations[0].0,
+                    )
+                    .is_err(),
+                    "presentation descriptor accepted forged raw bytes"
+                );
+            }
+            fs::remove_dir_all(case_root).unwrap();
+        }
+    }
+
+    #[test]
     fn rejects_case_ids_that_can_escape_the_artifact_root() {
         assert!(validate_case_id("json-number-large").is_ok());
         assert!(validate_case_id("../outside").is_err());
@@ -8266,6 +8963,7 @@ mod tests {
             &entered,
             std::slice::from_ref(&value_event),
             Path::new("."),
+            None,
         )
         .unwrap();
         let wrong_case = DifferentialCase {
@@ -8280,6 +8978,7 @@ mod tests {
                 &entered,
                 std::slice::from_ref(&value_event),
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8291,6 +8990,7 @@ mod tests {
                 &[],
                 std::slice::from_ref(&value_event),
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8302,6 +9002,7 @@ mod tests {
                 &entered,
                 std::slice::from_ref(&value_event),
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8317,6 +9018,7 @@ mod tests {
                 &entered,
                 std::slice::from_ref(&value_event),
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8354,6 +9056,7 @@ mod tests {
             &participants,
             &[],
             Path::new("."),
+            None,
         )
         .unwrap();
         assert!(
@@ -8364,6 +9067,7 @@ mod tests {
                 &participants[..1],
                 &[],
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8448,6 +9152,7 @@ mod tests {
             &[CoverageEvent::EnteredAdapter(builtin.id)],
             std::slice::from_ref(&event),
             Path::new("."),
+            None,
         )
         .unwrap();
         let relabelled = document.replace(
@@ -8462,6 +9167,7 @@ mod tests {
                 &[CoverageEvent::EnteredAdapter(builtin.id)],
                 std::slice::from_ref(&event),
                 Path::new("."),
+                None,
             )
             .is_err()
         );
@@ -8703,7 +9409,13 @@ mod tests {
         let typed_target = crate::typed_result_target(case)
             .unwrap_or_else(|error| panic!("{} typed-result target is invalid: {error}", case.id));
         let outcome = if let Some(target) = typed_target {
-            hell_runtime::run_main_with_semantic_trace_target(program, context, &trace, target)
+            if let Some(instance) = typed_target_instance(case, target) {
+                hell_runtime::run_main_with_semantic_trace_target_instance(
+                    program, context, &trace, target, instance,
+                )
+            } else {
+                hell_runtime::run_main_with_semantic_trace_target(program, context, &trace, target)
+            }
         } else {
             hell_runtime::run_main_with_semantic_trace(program, context, &trace)
         };
@@ -8738,21 +9450,7 @@ mod tests {
         });
         let semantic = crate::parse_semantic_trace(&trace_bytes)
             .unwrap_or_else(|error| panic!("{} has an invalid semantic trace: {error}", case.id));
-        if case.id.ends_with("http-stream-disconnect") {
-            let http_run = hell_builtins::lookup("Http.run")
-                .expect("HTTP interaction target")
-                .id;
-            assert!(semantic.task_trace.iter().any(|event| matches!(
-                event,
-                crate::LogicalTraceEvent::TaskEvent { event, .. }
-                    if event.as_ref() == "cancelled"
-            )));
-            assert!(semantic.effect_trace.iter().any(|event| matches!(
-                event,
-                crate::LogicalTraceEvent::HostEffect { builtin, effect, .. }
-                    if *builtin == http_run && effect.as_ref() == "failed"
-            )));
-        }
+        assert_http_disconnect_trace(case, &semantic);
         (
             runtime_success,
             status,
@@ -8760,6 +9458,43 @@ mod tests {
             stdout.bytes(),
             stderr.bytes(),
         )
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn assert_http_disconnect_trace(
+        case: &crate::DifferentialCase,
+        semantic: &crate::SemanticObservation,
+    ) {
+        if !case.id.ends_with("http-stream-disconnect") {
+            return;
+        }
+        let http_run = hell_builtins::lookup("Http.run")
+            .expect("HTTP interaction target")
+            .id;
+        assert!(semantic.task_trace.iter().any(|event| matches!(
+            event,
+            crate::LogicalTraceEvent::TaskEvent { event, .. } if event.as_ref() == "cancelled"
+        )));
+        assert!(semantic.effect_trace.iter().any(|event| matches!(
+            event,
+            crate::LogicalTraceEvent::HostEffect { builtin, effect, .. }
+                if *builtin == http_run && effect.as_ref() == "failed"
+        )));
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn typed_target_instance(
+        case: &crate::DifferentialCase,
+        target: hell_builtins::BuiltinId,
+    ) -> Option<Arc<str>> {
+        case.claim_evidence
+            .iter()
+            .flat_map(|descriptor| &descriptor.semantic_targets)
+            .find(|evidence| {
+                hell_builtins::lookup(&evidence.builtin).map(|builtin| builtin.id) == Some(target)
+                    && evidence.expected_typed_result_sha256.is_some()
+            })
+            .and_then(|evidence| evidence.expected_instance_target.clone())
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -11468,7 +12203,9 @@ mod tests {
         let event = semantic
             .obligation_trace
             .iter_mut()
-            .find(|event| event.builtin == builtin)
+            .find(|event| {
+                event.builtin == builtin && event.instance_target.as_deref() == Some(expected)
+            })
             .expect("resolved instance-bound event");
         assert_eq!(event.instance_target.as_deref(), Some(expected));
         event.instance_target = Some(Arc::from(substituted));

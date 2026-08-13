@@ -161,12 +161,26 @@ fn core_data_obligation_cases_run_with_target_scoped_traces() {
                     .iter()
                     .any(|obligation| obligation.0.as_ref() == "typed-result")
             })
-            .map(|target| hell_builtins::lookup(&target.builtin).unwrap().id)
+            .map(|target| {
+                (
+                    hell_builtins::lookup(&target.builtin).unwrap().id,
+                    target.expected_instance_target.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         let context = typed_case_runtime_context(&case, &case_directory);
         let outcome = match typed_targets.as_slice() {
             [] => hell_runtime::run_main_with_semantic_trace(program, context, &trace_path),
-            [target] => hell_runtime::run_main_with_semantic_trace_target(
+            [(target, Some(instance))] => {
+                hell_runtime::run_main_with_semantic_trace_target_instance(
+                    program,
+                    context,
+                    &trace_path,
+                    *target,
+                    instance.clone(),
+                )
+            }
+            [(target, None)] => hell_runtime::run_main_with_semantic_trace_target(
                 program,
                 context,
                 &trace_path,
@@ -496,6 +510,43 @@ fn repeated_typed_result_target_invocation_is_rejected() {
         "typed-result target must be invoked exactly once"
     );
     std::fs::remove_dir_all(directory).expect("remove repeated target trace directory");
+}
+
+#[cfg(feature = "compat-tracing")]
+#[test]
+fn dynamically_reused_typed_result_target_invocation_is_rejected() {
+    let source = concat!(
+        "build = \\entries -> Map.fromList entries\n",
+        "main = do\n",
+        "  IO.print $ Map.size $ Main.build [(1,\"a\")]\n",
+        "  IO.print $ Map.size $ Main.build [(2,\"b\")]\n",
+    );
+    let program = compile_source(
+        &mut CompilerSession::upstream(),
+        "dynamically-reused-map-adapter-typed-result",
+        source,
+    )
+    .expect("dynamically reused Map.fromList source compiles");
+    let target = hell_builtins::lookup("Map.fromList").expect("Map.fromList registry entry");
+    let directory = std::env::temp_dir().join(format!(
+        "hell-dynamically-reused-map-adapter-typed-result-{}",
+        std::process::id()
+    ));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).expect("create dynamically reused target trace directory");
+    let trace_path = directory.join("trace.json");
+    let error = hell_runtime::run_main_with_semantic_trace_target(
+        program,
+        hell_runtime::RuntimeContext::new(Vec::new(), Vec::<u8>::new()),
+        &trace_path,
+        target.id,
+    )
+    .expect_err("dynamically reused typed-result target must fail closed");
+    assert_eq!(
+        error.message.as_ref(),
+        "typed-result target must be invoked exactly once"
+    );
+    std::fs::remove_dir_all(directory).expect("remove dynamically reused target trace directory");
 }
 
 #[cfg(feature = "compat-tracing")]

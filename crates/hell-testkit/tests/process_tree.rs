@@ -53,6 +53,37 @@ fn exited_leader_cannot_leave_descendant_capture_pipes_open() {
     assert!(!marker.exists(), "pipe-holding descendant escaped cleanup");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn setsid_double_fork_fixture_escapes_a_process_group_and_retains_pipes() {
+    let marker = std::env::temp_dir().join(format!(
+        "hell-testkit-setsid-descendant-{}-{}.marker",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut command = Command::new(helper());
+    command
+        .arg("escape-session-double-fork")
+        .arg("100")
+        .arg(&marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = SupervisedChild::spawn(&mut command).expect("spawn escaped-child fixture");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert!(matches!(
+        child.wait_until(deadline).expect("wait for fixture leader"),
+        WaitOutcome::Exited(_)
+    ));
+    let _ = child.terminate().expect("close original process group");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        marker.exists(),
+        "fixture did not escape via setsid/double-fork"
+    );
+    std::fs::remove_file(marker).unwrap();
+}
+
 #[test]
 fn timeout_kills_the_descendant_tree() {
     let marker = std::env::temp_dir().join(format!(

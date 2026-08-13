@@ -1,0 +1,82 @@
+schema_version = 2
+repository = "Portfoligno/hell-rs"
+tag_prefix = "v"
+release_package = "hell-cli"
+release_binary = "hell"
+workflow_path = ".github/workflows/release.yml"
+require_default_branch_workflow = true
+require_candidate_head_stability = true
+require_immutable_release = true
+require_changelog = true
+
+[conformance]
+standard = "upstream-release-v1"
+required_profiles = ["upstream"]
+excluded_profiles = ["sandboxed"]
+required_platforms = [
+  "linux-x86_64",
+  "macos-aarch64",
+  "windows-x86_64",
+]
+require_complete_partition = true
+require_candidate_bound_evidence = true
+require_all_required_cells_resolved = true
+allow_exact_reviewed_exemptions = true
+require_exemption_expiry = true
+allow_exemption_wildcards = false
+reject_unclassified_mismatches = true
+unknown_applicability_is_required = true
+producer_acceptance_fields_forbidden = true
+
+[conformance.inputs]
+registry = "compat/builtin-registry.json"
+requirements = "compat/requirements/2026-05-29.toml"
+applicability_rules = "compat/claim-rules.toml"
+corpus_obligations = "compat/corpus-obligations.toml"
+normalizers = "compat/normalizers.toml"
+divergences = "compat/divergences.toml"
+expected_mismatches = "compat/expected-mismatches.toml"
+release_exemptions = ".github/release/conformance-exemptions.toml"
+
+[upstream_oracle]
+repository = "chrisdone/hell"
+commit = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+stack_version = "3.11.1"
+linux_release_sha256 = "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9"
+
+[[platforms]]
+id = "linux-x86_64"
+runner = "ubuntu-24.04"
+archive = "tar-gzip"
+
+[[platforms]]
+id = "macos-aarch64"
+runner = "macos-15"
+archive = "tar-gzip"
+
+[[platforms]]
+id = "windows-x86_64"
+runner = "windows-2025"
+archive = "tar-gzip"
+
+[release_gates]
+conformance_policy = true
+conformance_plan_binding = true
+case_catalog = true
+normalizer_catalog = true
+divergence_catalog = true
+format = true
+clippy = true
+workspace_tests = true
+documentation = true
+dependency_policy = true
+release_examples = true
+release_mutation_catalog = true
+native_oracle_linux = true
+native_oracle_macos = true
+native_oracle_windows = true
+conformance_evidence_linux = true
+conformance_evidence_macos = true
+conformance_evidence_windows = true
+conformance_acceptance = true
+package_smoke = true

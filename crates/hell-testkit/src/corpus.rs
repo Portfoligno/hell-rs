@@ -16692,9 +16692,10 @@ fn attach_legacy_map_callback_comparator(
             reviewed_comparator_contract(1, "Ord.lt", &two, &one, false),
             reviewed_comparator_contract(2, "Ord.gt", &two, &one, true),
         ],
-        ("Map.unionWith", "finite-input") => {
-            vec![reviewed_comparator_contract(1, "Ord.lt", &one, &two, true)]
-        }
+        ("Map.unionWith", "finite-input") => vec![
+            reviewed_comparator_contract(1, "Ord.lt", &one, &two, true),
+            reviewed_comparator_contract(2, "Ord.lt", &two, &ord_list_int(3), true),
+        ],
         _ => Vec::new(),
     };
     for target in &mut descriptor.semantic_targets {
@@ -19870,9 +19871,10 @@ fn legacy_collection_boundary_comparators(
             compare(3, &three, &two, "Ord.lt", false),
             compare(4, &three, &two, "Ord.gt", true),
         ],
-        ("Set.intersection", "finite-input") => {
-            vec![compare(1, &one, &two, "Ord.lt", true)]
-        }
+        ("Set.intersection", "finite-input") => vec![
+            compare(1, &one, &two, "Ord.lt", true),
+            compare(2, &two, &three, "Ord.lt", true),
+        ],
         _ => Vec::new(),
     }
 }

@@ -1,0 +1,18 @@
+schema_version = 3
+baseline = "2026-05-29"
+registry = "compat/builtin-registry.json"
+dimensions = ["parse", "static-semantics", "pure-runtime", "effects", "concurrency", "presentation", "platform", "resource-behavior"]
+
+[default_requirement]
+profiles = ["upstream", "sandboxed"]
+platforms = ["linux-x86_64", "macos-aarch64", "windows-x86_64"]
+applicability_rule = "catalog-default-review-required"
+evidence_strategy = "committed-differential-corpus"
+evidence = []
+normalizers = []
+obligations = []
+rationale = "Malformed regression input."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "compatibility"
+
+this line is deliberately malformed and must return an error

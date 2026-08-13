@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::command::{CommandResult, CommandSpec};
 use crate::policy::normalized_relative_path;
@@ -137,7 +136,10 @@ pub fn run_examples(
     let fixture_root = root.join(FIXTURE_DIRECTORY);
     let cases = load_cases(&fixture_root)?;
     let executable_name = if cfg!(windows) { "hell.exe" } else { "hell" };
-    let executable = root.join("target").join(profile).join(executable_name);
+    let executable = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root.join("target"), PathBuf::from)
+        .join(profile)
+        .join(executable_name);
     let executable = fs::canonicalize(&executable)
         .map_err(|error| format!("cannot locate {}: {error}", executable.display()))?;
     let mut detailed_failures = 0;
@@ -499,19 +501,6 @@ fn platform_selected(platforms: &[String]) -> bool {
         .any(|platform| platform == "all" || platform == current)
 }
 
-pub fn timed_check(report: &mut Report, root: &Path) {
-    let started = Instant::now();
-    let result = validate_inventory(root);
-    report.check("fixture-inventory", started.elapsed(), result);
-}
-
-pub fn profile_argument(profile: &str) -> Result<OsString, String> {
-    match profile {
-        "ci" | "release" => Ok(OsString::from(profile)),
-        _ => Err(format!("profile must be ci or release, got {profile}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,13 +509,6 @@ mod tests {
     fn manifest_has_exactly_the_pinned_cases() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         validate_inventory(&root).unwrap();
-    }
-
-    #[test]
-    fn only_known_profiles_are_accepted() {
-        assert!(profile_argument("ci").is_ok());
-        assert!(profile_argument("release").is_ok());
-        assert!(profile_argument("debug").is_err());
     }
 
     #[test]

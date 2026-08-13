@@ -7,23 +7,26 @@ use std::path::{Path, PathBuf};
 use hell_digest as digest;
 
 const CATALOGS: &[(&str, &[&str])] = &[
-    ("CLAIM_CATALOG", &["compat", "claims", "2026-05-29.toml"]),
+    (
+        "REQUIREMENT_CATALOG",
+        &["compat", "requirements", "2026-05-29.toml"],
+    ),
     ("CLAIM_RULES", &["compat", "claim-rules.toml"]),
     ("NORMALIZER_CATALOG", &["compat", "normalizers.toml"]),
     ("OBLIGATION_CATALOG", &["compat", "corpus-obligations.toml"]),
     ("DIVERGENCE_CATALOG", &["compat", "divergences.toml"]),
 ];
 
-const CLAIM_SCOPE_KEYS: &[&str] = &[
+const REQUIREMENT_SCOPE_KEYS: &[&str] = &[
     "profiles",
     "platforms",
-    "status",
+    "applicability_rule",
+    "evidence_strategy",
     "evidence",
     "normalizers",
     "obligations",
-    "applicability_rule",
     "rationale",
-    "issue",
+    "tracking_issue",
     "review_group",
 ];
 
@@ -52,13 +55,13 @@ struct Section {
 struct ClaimScope {
     profiles: Vec<String>,
     platforms: Vec<String>,
-    status: String,
+    evidence_strategy: String,
     evidence: Vec<String>,
     normalizers: Vec<String>,
     obligations: Vec<String>,
     applicability_rule: String,
     rationale: String,
-    issue: String,
+    tracking_issue: String,
     review_group: String,
 }
 
@@ -125,7 +128,9 @@ fn main() {
         .expect("obligation catalog source");
     let obligation_ids = obligation_ids(obligation_source);
     let claims = parse_claims(
-        sources.get("CLAIM_CATALOG").expect("claim catalog source"),
+        sources
+            .get("REQUIREMENT_CATALOG")
+            .expect("requirement catalog source"),
         &normalizer_ids,
         &obligation_ids,
     );
@@ -234,6 +239,7 @@ fn parse_claims(
         .unwrap_or_else(|error| panic!("{error}"))
 }
 
+#[allow(clippy::too_many_lines)]
 fn try_parse_claims(
     source: &str,
     normalizer_ids: &BTreeSet<&str>,
@@ -241,23 +247,48 @@ fn try_parse_claims(
 ) -> Result<Claims, String> {
     let sections = try_parse_document(source)?;
     if sections.len() < 2 {
-        return Err("claim catalog lacks default scope".to_owned());
+        return Err("requirement catalog lacks default requirement".to_owned());
     }
     if !sections[0].header.is_empty() {
         return Err("claim catalog preamble is missing".to_owned());
     }
     try_expect_keys(
         &sections[0].values,
-        &["schema_version", "baseline"],
-        "claim catalog preamble",
+        &["schema_version", "baseline", "registry", "dimensions"],
+        "requirement catalog preamble",
     )?;
-    try_require_unsigned(&sections[0].values, "schema_version", "claim catalog", 2)?;
+    try_require_unsigned(
+        &sections[0].values,
+        "schema_version",
+        "requirement catalog",
+        3,
+    )?;
     let baseline = try_string(
-        try_value(&sections[0].values, "baseline", "claim catalog")?,
+        try_value(&sections[0].values, "baseline", "requirement catalog")?,
         "baseline",
     )?;
-    if sections[1].header != "default_scope" {
-        return Err("claim catalog must declare [default_scope] before overrides".to_owned());
+    if try_string(
+        try_value(&sections[0].values, "registry", "requirement catalog")?,
+        "registry",
+    )? != "compat/builtin-registry.json"
+    {
+        return Err("requirement catalog registry path differs".to_owned());
+    }
+    let catalog_dimensions = try_array(
+        try_value(&sections[0].values, "dimensions", "requirement catalog")?,
+        "dimensions",
+    )?;
+    if catalog_dimensions
+        .iter()
+        .map(String::as_str)
+        .ne(dimensions().iter().copied())
+    {
+        return Err("requirement catalog dimension order differs".to_owned());
+    }
+    if sections[1].header != "default_requirement" {
+        return Err(
+            "requirement catalog must declare [default_requirement] before overrides".to_owned(),
+        );
     }
     let default_scope = try_parse_claim_scope(
         &sections[1].values,
@@ -270,41 +301,51 @@ fn try_parse_claims(
     let mut index = 2;
     while index < sections.len() {
         let claim = &sections[index];
-        if claim.header != "claim" {
-            return Err("expected [[claim]] section".to_owned());
+        if claim.header != "overrides" {
+            return Err("expected [[overrides]] section".to_owned());
         }
-        try_expect_keys(&claim.values, &["builtin", "dimension"], "claim")?;
-        let builtin = try_string(try_value(&claim.values, "builtin", "claim")?, "builtin")?;
+        try_expect_keys(
+            &claim.values,
+            &["builtin", "dimensions"],
+            "requirement override",
+        )?;
+        let builtin = try_string(
+            try_value(&claim.values, "builtin", "requirement override")?,
+            "builtin",
+        )?;
         if builtin.is_empty() {
             return Err("claim builtin must not be empty".to_owned());
         }
-        let dimension = try_string(try_value(&claim.values, "dimension", "claim")?, "dimension")?;
-        if !dimensions().contains(&dimension.as_str()) {
-            return Err(format!("unknown claim dimension {dimension:?}"));
-        }
-        if !seen_cells.insert((builtin.clone(), dimension.clone())) {
-            return Err(format!("duplicate claim cell {builtin}/{dimension}"));
-        }
+        let override_dimensions = try_array(
+            try_value(&claim.values, "dimensions", "requirement override")?,
+            "dimensions",
+        )?;
+        try_validate_unique_members(&override_dimensions, dimensions(), "requirement dimensions")?;
         index += 1;
         let mut scopes = Vec::new();
-        while index < sections.len() && sections[index].header == "claim.scope" {
+        while index < sections.len() && sections[index].header == "overrides.scopes" {
             scopes.push(try_parse_claim_scope(
                 &sections[index].values,
-                &format!("claim scope {builtin}/{dimension}"),
+                &format!("requirement scope {builtin}"),
                 normalizer_ids,
                 obligation_ids,
             )?);
             index += 1;
         }
         if scopes.is_empty() {
-            return Err(format!("claim {builtin}/{dimension} lacks a scope"));
+            return Err(format!("requirement {builtin} lacks a scope"));
         }
-        try_validate_nonoverlapping_scopes(&scopes, &builtin, &dimension)?;
-        overrides.push(ClaimOverride {
-            builtin,
-            dimension,
-            scopes,
-        });
+        for dimension in override_dimensions {
+            if !seen_cells.insert((builtin.clone(), dimension.clone())) {
+                return Err(format!("duplicate requirement cell {builtin}/{dimension}"));
+            }
+            try_validate_nonoverlapping_scopes(&scopes, &builtin, &dimension)?;
+            overrides.push(ClaimOverride {
+                builtin: builtin.clone(),
+                dimension,
+                scopes: scopes.clone(),
+            });
+        }
     }
     Ok(Claims {
         baseline,
@@ -319,11 +360,14 @@ fn try_parse_claim_scope(
     normalizer_ids: &BTreeSet<&str>,
     obligation_ids: &BTreeSet<String>,
 ) -> Result<ClaimScope, String> {
-    try_expect_keys(values, CLAIM_SCOPE_KEYS, context)?;
+    try_expect_keys(values, REQUIREMENT_SCOPE_KEYS, context)?;
     let scope = ClaimScope {
         profiles: try_array(try_value(values, "profiles", context)?, "profiles")?,
         platforms: try_array(try_value(values, "platforms", context)?, "platforms")?,
-        status: try_string(try_value(values, "status", context)?, "status")?,
+        evidence_strategy: try_string(
+            try_value(values, "evidence_strategy", context)?,
+            "evidence_strategy",
+        )?,
         evidence: try_array(try_value(values, "evidence", context)?, "evidence")?,
         normalizers: try_array(try_value(values, "normalizers", context)?, "normalizers")?,
         obligations: try_array(try_value(values, "obligations", context)?, "obligations")?,
@@ -332,7 +376,10 @@ fn try_parse_claim_scope(
             "applicability_rule",
         )?,
         rationale: try_string(try_value(values, "rationale", context)?, "rationale")?,
-        issue: try_string(try_value(values, "issue", context)?, "issue")?,
+        tracking_issue: try_string(
+            try_value(values, "tracking_issue", context)?,
+            "tracking_issue",
+        )?,
         review_group: try_string(try_value(values, "review_group", context)?, "review_group")?,
     };
     if scope.profiles.is_empty() {
@@ -342,9 +389,16 @@ fn try_parse_claim_scope(
         return Err(format!("{context} has no platforms"));
     }
     try_validate_unique_members(&scope.profiles, profiles(), "claim profiles")?;
-    try_validate_unique_members(&scope.platforms, platforms(), "claim platforms")?;
-    if !statuses().contains(&scope.status.as_str()) {
-        return Err(format!("unknown claim status {:?}", scope.status));
+    try_validate_unique_members(
+        &scope.platforms,
+        requirement_platforms(),
+        "requirement platforms",
+    )?;
+    if !evidence_strategies().contains(&scope.evidence_strategy.as_str()) {
+        return Err(format!(
+            "unknown requirement evidence strategy {:?}",
+            scope.evidence_strategy
+        ));
     }
     try_validate_unique(&scope.evidence, "claim evidence")?;
     try_validate_unique(&scope.normalizers, "claim normalizers")?;
@@ -363,40 +417,12 @@ fn try_parse_claim_scope(
     {
         return Err(format!("{context} names an unknown obligation"));
     }
-    if scope.applicability_rule.is_empty() || scope.rationale.is_empty() {
-        return Err(format!("{context} lacks applicability or rationale"));
-    }
-    match scope.status.as_str() {
-        "exact" if scope.evidence.is_empty() || !scope.normalizers.is_empty() => {
-            return Err(format!(
-                "exact {context} needs evidence and cannot use a normalizer"
-            ));
-        }
-        "normalized" if scope.evidence.is_empty() || scope.normalizers.is_empty() => {
-            return Err(format!(
-                "normalized {context} needs evidence and a normalizer"
-            ));
-        }
-        "platform-dependent" | "deliberate-divergence"
-            if scope.evidence.is_empty() || scope.issue.is_empty() =>
-        {
-            return Err(format!("divergent {context} needs evidence and an issue"));
-        }
-        "unverified"
-            if !scope.evidence.is_empty()
-                || !scope.normalizers.is_empty()
-                || scope.issue.is_empty() =>
-        {
-            return Err(format!(
-                "unverified {context} must remain evidence-free and issue-bound"
-            ));
-        }
-        "not-applicable" if !scope.evidence.is_empty() || !scope.normalizers.is_empty() => {
-            return Err(format!(
-                "not-applicable {context} needs a rule and no evidence"
-            ));
-        }
-        _ => {}
+    if scope.applicability_rule.is_empty()
+        || scope.rationale.is_empty()
+        || scope.tracking_issue.is_empty()
+        || scope.review_group.is_empty()
+    {
+        return Err(format!("{context} lacks required review metadata"));
     }
     Ok(scope)
 }
@@ -638,6 +664,7 @@ fn validate_flat_catalogs(sources: &BTreeMap<&str, String>) {
     try_validate_flat_catalogs(sources).unwrap_or_else(|error| panic!("{error}"));
 }
 
+#[allow(clippy::too_many_lines)]
 fn try_validate_flat_catalogs(sources: &BTreeMap<&str, String>) -> Result<(), String> {
     let claim_rules = sources
         .get("CLAIM_RULES")
@@ -651,19 +678,28 @@ fn try_validate_flat_catalogs(sources: &BTreeMap<&str, String>) -> Result<(), St
         &[
             "schema_version",
             "default_decision",
-            "mechanical_public_parse",
-            "mechanical_all_static",
-            "family_pure_runtime",
-            "family_effects",
-            "family_concurrency",
-            "family_presentation",
-            "family_platform",
-            "family_resource",
             "automatic_not_applicable",
+            "unknown_builtin_family",
+            "unknown_dimension",
         ],
         "claim rules",
     )?;
-    try_require_unsigned(&rules[0].values, "schema_version", "claim rules", 1)?;
+    try_require_unsigned(&rules[0].values, "schema_version", "claim rules", 3)?;
+    if try_string(
+        try_value(&rules[0].values, "default_decision", "claim rules")?,
+        "default_decision",
+    )? != "applicable-review-required"
+        || try_string(
+            try_value(&rules[0].values, "unknown_builtin_family", "claim rules")?,
+            "unknown_builtin_family",
+        )? != "applicable-review-required"
+        || try_string(
+            try_value(&rules[0].values, "unknown_dimension", "claim rules")?,
+            "unknown_dimension",
+        )? != "reject"
+    {
+        return Err("claim rules do not use the exact fail-closed decisions".to_owned());
+    }
     if try_boolean(
         try_value(&rules[0].values, "automatic_not_applicable", "claim rules")?,
         "automatic_not_applicable",
@@ -756,7 +792,7 @@ pub fn fuzz_validate_catalog(kind: &str, source: &str) -> Result<(), String> {
         return Err("catalog is not canonical newline-terminated text".to_owned());
     }
     match kind {
-        "claim" => {
+        "requirement" => {
             let implementation = include_bytes!("../hell-testkit/src/lib.rs");
             let normalizers = parse_normalizers(
                 include_str!("../../compat/normalizers.toml"),
@@ -791,22 +827,22 @@ pub fn fuzz_validate_catalog(kind: &str, source: &str) -> Result<(), String> {
 fn emit_claims(generated: &mut String, claims: &Claims) {
     writeln!(
         generated,
-        "pub const CLAIM_BASELINE: &str = {:?};",
+        "pub const REQUIREMENT_BASELINE: &str = {:?};",
         claims.baseline
     )
     .expect("write claim baseline");
     generated.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
-    generated.push_str("pub struct GeneratedClaimScope { pub profiles: &'static [&'static str], pub platforms: &'static [&'static str], pub status: &'static str, pub evidence: &'static [&'static str], pub normalizers: &'static [&'static str], pub obligations: &'static [&'static str], pub applicability_rule: &'static str, pub rationale: &'static str, pub issue: &'static str, pub review_group: &'static str }\n");
+    generated.push_str("pub struct GeneratedRequirementScope { pub profiles: &'static [&'static str], pub platforms: &'static [&'static str], pub evidence_strategy: &'static str, pub evidence: &'static [&'static str], pub normalizers: &'static [&'static str], pub obligations: &'static [&'static str], pub applicability_rule: &'static str, pub rationale: &'static str, pub tracking_issue: &'static str, pub review_group: &'static str }\n");
     generated.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
-    generated.push_str("pub struct GeneratedClaim { pub builtin: &'static str, pub dimension: &'static str, pub scopes: &'static [GeneratedClaimScope] }\n");
-    generated.push_str("pub const DEFAULT_CLAIM_SCOPE: GeneratedClaimScope = ");
+    generated.push_str("pub struct GeneratedRequirement { pub builtin: &'static str, pub dimension: &'static str, pub scopes: &'static [GeneratedRequirementScope] }\n");
+    generated.push_str("pub const DEFAULT_REQUIREMENT_SCOPE: GeneratedRequirementScope = ");
     emit_scope(generated, &claims.default_scope);
     generated.push_str(";\n");
-    generated.push_str("pub const CLAIM_OVERRIDES: &[GeneratedClaim] = &[\n");
+    generated.push_str("pub const REQUIREMENT_OVERRIDES: &[GeneratedRequirement] = &[\n");
     for claim in &claims.overrides {
         write!(
             generated,
-            "GeneratedClaim {{ builtin: {:?}, dimension: {:?}, scopes: &[",
+            "GeneratedRequirement {{ builtin: {:?}, dimension: {:?}, scopes: &[",
             claim.builtin, claim.dimension
         )
         .expect("write claim override");
@@ -820,17 +856,22 @@ fn emit_claims(generated: &mut String, claims: &Claims) {
 }
 
 fn emit_scope(generated: &mut String, scope: &ClaimScope) {
-    generated.push_str("GeneratedClaimScope {");
+    generated.push_str("GeneratedRequirementScope {");
     emit_string_slice_field(generated, "profiles", &scope.profiles);
     emit_string_slice_field(generated, "platforms", &scope.platforms);
-    write!(generated, "status: {:?},", scope.status).expect("write scope status");
+    write!(
+        generated,
+        "evidence_strategy: {:?},",
+        scope.evidence_strategy
+    )
+    .expect("write evidence strategy");
     emit_string_slice_field(generated, "evidence", &scope.evidence);
     emit_string_slice_field(generated, "normalizers", &scope.normalizers);
     emit_string_slice_field(generated, "obligations", &scope.obligations);
     write!(
         generated,
-        "applicability_rule: {:?},rationale: {:?},issue: {:?},review_group: {:?}",
-        scope.applicability_rule, scope.rationale, scope.issue, scope.review_group
+        "applicability_rule: {:?},rationale: {:?},tracking_issue: {:?},review_group: {:?}",
+        scope.applicability_rule, scope.rationale, scope.tracking_issue, scope.review_group
     )
     .expect("write scope metadata");
     generated.push('}');
@@ -934,14 +975,8 @@ fn emit_flat_constants(generated: &mut String, sources: &BTreeMap<&str, String>)
     let rules = &rules[0].values;
     for (constant, key) in [
         ("DEFAULT_APPLICABILITY_DECISION", "default_decision"),
-        ("PUBLIC_PARSE_DECISION", "mechanical_public_parse"),
-        ("STATIC_SEMANTICS_DECISION", "mechanical_all_static"),
-        ("PURE_RUNTIME_DECISION", "family_pure_runtime"),
-        ("EFFECTS_DECISION", "family_effects"),
-        ("CONCURRENCY_DECISION", "family_concurrency"),
-        ("PRESENTATION_DECISION", "family_presentation"),
-        ("PLATFORM_DECISION", "family_platform"),
-        ("RESOURCE_DECISION", "family_resource"),
+        ("UNKNOWN_BUILTIN_DECISION", "unknown_builtin_family"),
+        ("UNKNOWN_DIMENSION_DECISION", "unknown_dimension"),
     ] {
         writeln!(
             generated,
@@ -1032,9 +1067,29 @@ fn try_parse_document(source: &str) -> Result<Vec<Section>, String> {
         header: String::new(),
         values: BTreeMap::new(),
     }];
+    let mut pending_array = None::<(String, String, usize)>;
     for (line_index, raw) in source.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((_key, value, start)) = pending_array.as_mut() {
+            if line.starts_with('[') {
+                return Err(format!("table inside array starting at line {start}"));
+            }
+            value.push(' ');
+            value.push_str(line);
+            if line.ends_with(']') {
+                let (key, value, _) = pending_array.take().expect("pending array exists");
+                let prior = sections
+                    .last_mut()
+                    .ok_or_else(|| "document has no preamble".to_owned())?
+                    .values
+                    .insert(key.clone(), value);
+                if prior.is_some() {
+                    return Err(format!("duplicate key {key}"));
+                }
+            }
             continue;
         }
         if let Some(header) = line
@@ -1074,6 +1129,10 @@ fn try_parse_document(source: &str) -> Result<Vec<Section>, String> {
         if raw_value.is_empty() {
             return Err(format!("empty value for {key}"));
         }
+        if raw_value.starts_with('[') && !raw_value.ends_with(']') {
+            pending_array = Some((key.to_owned(), raw_value.to_owned(), line_index + 1));
+            continue;
+        }
         let prior = sections
             .last_mut()
             .ok_or_else(|| "document has no preamble".to_owned())?
@@ -1082,6 +1141,9 @@ fn try_parse_document(source: &str) -> Result<Vec<Section>, String> {
         if prior.is_some() {
             return Err(format!("duplicate key {key}"));
         }
+    }
+    if let Some((key, _, start)) = pending_array {
+        return Err(format!("unterminated array {key} starting at line {start}"));
     }
     Ok(sections)
 }
@@ -1123,7 +1185,12 @@ fn try_array(value: &str, key: &str) -> Result<Vec<String>, String> {
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .ok_or_else(|| format!("{key} must be a single-line array"))?;
-    if inner.trim().is_empty() {
+    let inner = inner
+        .trim()
+        .strip_suffix(',')
+        .unwrap_or(inner.trim())
+        .trim();
+    if inner.is_empty() {
         return Ok(Vec::new());
     }
     inner
@@ -1272,6 +1339,10 @@ fn platforms() -> &'static [&'static str] {
     &["linux", "macos", "windows"]
 }
 
+fn requirement_platforms() -> &'static [&'static str] {
+    &["linux-x86_64", "macos-aarch64", "windows-x86_64"]
+}
+
 fn dimensions() -> &'static [&'static str] {
     &[
         "parse",
@@ -1285,14 +1356,13 @@ fn dimensions() -> &'static [&'static str] {
     ]
 }
 
-fn statuses() -> &'static [&'static str] {
+fn evidence_strategies() -> &'static [&'static str] {
     &[
-        "exact",
-        "normalized",
-        "platform-dependent",
-        "deliberate-divergence",
-        "unverified",
-        "not-applicable",
+        "native-oracle",
+        "portable-static",
+        "structural-invariant",
+        "committed-differential-corpus",
+        "cross-platform-relation",
     ]
 }
 

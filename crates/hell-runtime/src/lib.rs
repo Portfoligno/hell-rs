@@ -1154,7 +1154,9 @@ struct EvidenceTrace {
     entered_adapters: Vec<BuiltinId>,
     forced_arguments: Vec<ForcedArgumentEvidence>,
     typed_result_target: Option<BuiltinId>,
+    typed_result_target_instance: Option<Arc<str>>,
     typed_result_target_invocations: u64,
+    typed_result_target_program_occurrences: u64,
     typed_results: Vec<(BuiltinId, usize, &'static str, ThunkRef)>,
     effect_events: Vec<EffectEvidence>,
     task_events: Vec<(BuiltinId, u64, &'static str)>,
@@ -1195,6 +1197,7 @@ struct ActiveAdapterObligation {
     sequence: u64,
     parent_sequence: Option<u64>,
     materialized_elements: u64,
+    typed_result_root: bool,
 }
 
 #[cfg(feature = "compat-tracing")]
@@ -1273,12 +1276,44 @@ impl EvidenceTrace {
     fn from_program_and_typed_target(
         program: &ExecutableProgram,
         typed_result_target: Option<BuiltinId>,
+        typed_result_target_instance: Option<Arc<str>>,
     ) -> Self {
+        let typed_result_target = typed_result_target.or_else(evidence_typed_result_target);
+        let typed_result_target_program_occurrences = typed_result_target.map_or(0, |target| {
+            u64::try_from(
+                program
+                    .nodes()
+                    .iter()
+                    .filter(|node| core_node_builtin(&node.kind) == Some(target))
+                    .count(),
+            )
+            .unwrap_or(u64::MAX)
+        });
         Self {
-            typed_result_target: typed_result_target.or_else(evidence_typed_result_target),
+            typed_result_target,
+            typed_result_target_instance,
+            typed_result_target_program_occurrences,
             ..Self::from_program(program)
         }
     }
+}
+
+#[cfg(feature = "compat-tracing")]
+fn core_node_builtin(kind: &CoreKind) -> Option<BuiltinId> {
+    let name = match kind {
+        CoreKind::Builtin { builtin, .. } => return Some(*builtin),
+        CoreKind::RecordGet { .. } => "Record.get",
+        CoreKind::RecordSet { .. } => "Record.set",
+        CoreKind::RecordModify { .. } => "Record.modify",
+        CoreKind::Tuple { elements } => match elements.len() {
+            2 => "Tuple.(,)",
+            3 => "Tuple.(,,)",
+            4 => "Tuple.(,,,)",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    hell_builtins::lookup(name).map(|builtin| builtin.id)
 }
 
 #[cfg(feature = "compat-tracing")]
@@ -2878,9 +2913,29 @@ impl Evaluator {
     ) -> RuntimeResult<()> {
         if let Some(trace) = &self.evidence_trace {
             let owner_task = self.current_evidence_task;
+            let recursive_target = self
+                .adapter_obligation_stack
+                .iter()
+                .any(|parent| parent.builtin == builtin)
+                || self
+                    .pending_adapter_parent
+                    .is_some_and(|parent| parent.builtin == builtin);
             let mut trace = trace
                 .lock()
                 .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
+            let invocation_instance = instance_evidence
+                .as_ref()
+                .map(|evidence| Arc::clone(&evidence.target));
+            let instance_matches = trace
+                .typed_result_target_instance
+                .as_ref()
+                .is_none_or(|expected| invocation_instance.as_ref() == Some(expected));
+            let typed_result_root =
+                trace.typed_result_target == Some(builtin) && instance_matches && !recursive_target;
+            if typed_result_root {
+                trace.typed_result_target_invocations =
+                    trace.typed_result_target_invocations.saturating_add(1);
+            }
             let sequence = trace.adapter_sequences.entry(owner_task).or_default();
             *sequence = sequence.saturating_add(1);
             let sequence = *sequence;
@@ -2906,6 +2961,7 @@ impl Evaluator {
                 sequence,
                 parent_sequence,
                 materialized_elements: 0,
+                typed_result_root,
             });
         }
         if let Some(trace) = &self.evidence_trace {
@@ -4803,20 +4859,20 @@ impl Evaluator {
             {
                 trace.presentation_fields.push((builtin, "rendered-output"));
             }
-            if trace.typed_result_target == Some(builtin) {
-                trace.typed_result_target_invocations =
-                    trace.typed_result_target_invocations.saturating_add(1);
+            if active.typed_result_root {
+                let retained = match &outcome {
+                    Ok(ForceOutcome::Value(value)) => {
+                        Thunk::allocate(ThunkState::Evaluated(Arc::clone(value)))
+                    }
+                    Ok(ForceOutcome::Alias(target)) => Arc::clone(target),
+                    Err(error) => Thunk::failed_without_admission(Arc::clone(error)),
+                };
                 if trace.typed_results.is_empty() {
-                    let retained = match &outcome {
-                        Ok(ForceOutcome::Value(value)) => {
-                            Thunk::allocate(ThunkState::Evaluated(Arc::clone(value)))
-                        }
-                        Ok(ForceOutcome::Alias(target)) => Arc::clone(target),
-                        Err(error) => Thunk::failed_without_admission(Arc::clone(error)),
-                    };
                     trace
                         .typed_results
                         .push((builtin, 0, "adapter-result", retained));
+                } else {
+                    trace.typed_results[0] = (builtin, 0, "adapter-result", retained);
                 }
             }
             let outcome_name = match &outcome {
@@ -7152,7 +7208,7 @@ fn int_to_double(value: i64) -> f64 {
 /// failure encountered while evaluating and executing the action.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_main(program: VerifiedProgram, context: RuntimeContext) -> RuntimeResult<()> {
-    run_main_inner(program, context, None, None)
+    run_main_inner(program, context, None, None, None)
 }
 
 /// Executes `main` while retaining its canonical semantic trace at an explicit
@@ -7168,7 +7224,7 @@ pub fn run_main_with_semantic_trace(
     context: RuntimeContext,
     trace_path: &Path,
 ) -> RuntimeResult<()> {
-    run_main_inner(program, context, Some(trace_path), None)
+    run_main_inner(program, context, Some(trace_path), None, None)
 }
 
 /// Executes `main` while retaining a canonical typed result for one exact
@@ -7190,6 +7246,31 @@ pub fn run_main_with_semantic_trace_target(
         context,
         Some(trace_path),
         Some(typed_result_target),
+        None,
+    )
+}
+
+/// Executes `main` while retaining a typed result for one exact overloaded
+/// adapter and resolved instance root.
+///
+/// # Errors
+///
+/// Returns any execution error or an error retaining the canonical trace.
+#[cfg(feature = "compat-tracing")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_main_with_semantic_trace_target_instance(
+    program: VerifiedProgram,
+    context: RuntimeContext,
+    trace_path: &Path,
+    typed_result_target: BuiltinId,
+    typed_result_instance: Arc<str>,
+) -> RuntimeResult<()> {
+    run_main_inner(
+        program,
+        context,
+        Some(trace_path),
+        Some(typed_result_target),
+        Some(typed_result_instance),
     )
 }
 
@@ -7200,6 +7281,8 @@ fn run_main_inner(
     #[cfg_attr(not(feature = "compat-tracing"), allow(unused_variables))] trace_path: Option<&Path>,
     #[cfg_attr(not(feature = "compat-tracing"), allow(unused_variables))]
     typed_result_target: Option<BuiltinId>,
+    #[cfg_attr(not(feature = "compat-tracing"), allow(unused_variables))]
+    typed_result_target_instance: Option<Arc<str>>,
 ) -> RuntimeResult<()> {
     let executable = Arc::new(program.executable().clone());
     let mut evaluator = Evaluator::new(Arc::clone(&executable))
@@ -7207,7 +7290,11 @@ fn run_main_inner(
     #[cfg(feature = "compat-tracing")]
     if trace_path.is_some() || typed_result_target.is_some() {
         evaluator.evidence_trace = Some(Arc::new(Mutex::new(
-            EvidenceTrace::from_program_and_typed_target(&executable, typed_result_target),
+            EvidenceTrace::from_program_and_typed_target(
+                &executable,
+                typed_result_target,
+                typed_result_target_instance,
+            ),
         )));
     }
     if let Some(max_concurrent_actions) = context.max_concurrent_actions {
@@ -7337,7 +7424,9 @@ struct CanonicalTraceEvent {
 #[cfg(feature = "compat-tracing")]
 fn canonical_semantic_event_arrays(trace: &EvidenceTrace) -> RuntimeResult<[String; 11]> {
     if trace.typed_result_target.is_some()
-        && (trace.typed_result_target_invocations != 1 || trace.typed_results.len() != 1)
+        && (trace.typed_result_target_program_occurrences > 1
+            || trace.typed_result_target_invocations != 1
+            || trace.typed_results.len() != 1)
     {
         return Err(RuntimeError::internal(
             "typed-result target must be invoked exactly once",

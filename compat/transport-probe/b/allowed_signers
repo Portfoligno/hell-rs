@@ -1,2 +1,0 @@
-# REVIEW_REQUIRED: replace with the independently controlled protected-environment B public key.
-assurance-transport-probe-b:probe-b ssh-ed25519 AAAA

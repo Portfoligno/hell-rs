@@ -6,16 +6,15 @@ syntax, type inference, independent core verification, call-by-need evaluation,
 host adapters, and the CLI behind separate crate boundaries.
 
 This is not yet a complete replacement for the pinned implementation. All
-355/355 registry entries now have executable compiler/runtime adapters, and the
+355/355 registry entries have executable compiler/runtime adapters, and the
 current compiler smoke suite accepts 44/44 pinned upstream examples with
-`--check`. Wiring is not a semantic compatibility claim: the dimensioned
-compatibility report conservatively records behavior as unverified until a
-retained oracle-versus-candidate evidence record supports promotion.
-Records, user sums/cases, laziness regressions, global expansion, the core
-verification boundary, process/file/temp adapters, JSON, time, concurrency, and
-a bounded collection/type-class surface have direct regressions. Compatibility
-coverage is still incomplete: executable adapters need broader differential
-edge-case, cancellation, platform, and resource-behavior evidence.
+`--check`. Wiring and smoke tests are not semantic compatibility claims. The
+release workflow separately requires a candidate-bound conformance partition
+to admit the candidate. Records, user sums/cases,
+laziness regressions, global expansion, process/file/temp adapters, JSON, time,
+concurrency, and a limited collection/type-class surface have direct
+regressions; broader differential edge-case and resource-behavior coverage is
+still required.
 
 The executable supports:
 
@@ -36,15 +35,10 @@ Build the Rust CI driver:
 cargo build --locked --profile ci --package hell-ci --bin hell-ci
 ```
 
-Run repository policy checks:
+Run repository policy and Linux verification:
 
 ```text
 target/ci/hell-ci policy --report ci-out/policy.json
-```
-
-Reproduce Linux verification:
-
-```text
 target/ci/hell-ci verify --report ci-out/verify-local.json
 ```
 
@@ -54,60 +48,69 @@ Run the portability suite:
 target/ci/hell-ci portability --report ci-out/portability-local.json
 ```
 
-Run release and stress gates:
+CI runs on pushes to every branch except tag pushes and on pull requests.
+Extended, mutation, and regression workflows run directly on the pushed commit.
+For a branch push, the complete green check suite means that exact pushed
+commit satisfies the technical release-readiness predicate: full blocker-zero
+conformance on all three native platforms, confinement, mutation, tests,
+documentation, dependency policy, evidence reconstruction, and package smoke.
+The readiness run creates no release state and performs no version, changelog,
+tag, attestation, or publication operation. No workflow is relayed through
+another workflow's completion, and no Actions workflow uses a scheduled
+trigger.
 
-```text
-target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-policy-report.json
-target/ci/hell-ci nightly --oracle /path/to/pinned/hell --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly-local.json
-```
-
-The nightly command validates and retains one evidence shard. Its shard summary
-records `promotionReady: false` because no single platform can establish global
-readiness. Missing reviewed claim mappings and required platform records remain
-truthful counters without becoming collection failures. Build, differential,
-policy, resource, and dependency failures still fail the command.
-
-After all three native shard artifacts have been retained and reviewed, verify
-the committed source/catalog locks and apply the distinct fail-closed promotion
-gate explicitly with the exact candidate, epoch, and proposal identities:
-
-```text
-target/ci/hell-ci catalog-lock verify
-target/ci/hell-ci promotion-gate --input ci-out/native-shards --proposal ci-out/promotion-proposal.json --expect-source GIT_SHA --expect-epoch SHA256 --expect-proposal SHA256 --explain --report ci-out/promotion-gate.json
-```
-
-This command is read-only with respect to its retained input, revalidates shard
-digests, bundle contents, claim mappings, resource audits, dependency policy,
-and native provenance, and fails until every required counter is clean. It
-writes `promotion-gate.sha256` beside the report. The committed review record
-must still declare fresh collection required and must not pre-claim a gate
-pass; the report is the record of the eventual explicit pass.
-
-Generate the deterministic review worklist without changing claim source:
-
-```text
-target/ci/hell-ci promotion-worklist --profile upstream --output ci-out/promotion-worklist.csv --report ci-out/promotion-worklist-report.json
-```
-
-The repository intentionally ships with every compatibility claim unverified,
-the macOS and Windows oracle records unavailable, and the promotion review
-pending. Promotion requires an independent reviewer to download and hash the
-bootstrap artifacts, inspect their inner manifests and native provenance,
-retain a durable copy, commit reviewed metadata, and then collect fresh shards
-for that exact commit. Do not replace review placeholders or availability
-states with inferred values.
-
-The complete collection, independent acquisition, provenance review, semantic
-coverage, custody, promotion, bounded-report, surveillance, and revocation
-procedure is documented in
-[`spec/promotion-assurance.md`](spec/promotion-assurance.md). A green workflow
-is transport and mechanical evidence, not a substitute for the signed decisions
-listed in that runbook.
-
-The reviewed Linux amd64 oracle is the `hell-linux-amd64` asset from the
+The reviewed Linux x86_64 oracle is the `hell-linux-amd64` asset from the
 upstream `2026-05-29` release. Its source, executable digest, and pinned build
-inputs are recorded in `crates/hell-ci/oracle/linux-amd64.toml`; verify the
-downloaded executable against that record before invoking the gate.
+inputs are recorded in `crates/hell-ci/oracle/linux-amd64.toml`.
 
-On Windows, invoke the built driver directly as
-`target\ci\hell-ci.exe`, using the same subcommands and arguments.
+On Windows, invoke the built driver directly as `target\ci\hell-ci.exe`, using
+the same subcommands and arguments.
+
+## Release
+
+The GitHub **Release** workflow is the sole manual release gate. It must be run
+from the protected default branch and accepts one required input: the name of a
+same-repository candidate branch. The trusted workflow resolves that branch to
+an exact commit, derives its version and tag, independently reruns every
+technical readiness gate on
+Linux, macOS, and Windows, assembles an exact release bundle, creates GitHub
+artifact attestations, and publishes an immutable GitHub Release.
+
+Candidate code runs only in read-only jobs without OIDC permissions. The final
+publisher checks out only the trusted default-branch automation and downloads
+the verified bundle by numeric artifact ID. No repository secret, AWS resource,
+SSH key, personal access token, deploy key, self-hosted signer, or GitHub
+Environment approval is part of this path.
+
+Before dispatching:
+
+1. Set a coherent workspace version on the candidate branch.
+2. Add a non-empty exact-version section to `CHANGELOG.md`.
+3. Open **Actions → Release → Run workflow** on the default branch.
+4. Enter the candidate branch name and dispatch once.
+
+The release is evaluated against `upstream-release-v1`: every required
+upstream-profile cell on Linux x86-64, macOS ARM64, and Windows x86-64 must be
+verified or covered by one exact, candidate-bound, expiring reviewed exemption.
+Unknown applicability, missing evidence, semantic mismatches, invalid evidence,
+and generated mismatches block publication. The sandboxed profile is explicitly
+excluded and is never counted as verified.
+
+Inspect `conformance-plan.json`, `conformance-report.json`,
+`conformance-acceptance.json`, and `conformance-evidence.tar.gz` for the exact
+scope, partition, decision, and retained raw evidence. Excluded,
+not-applicable, and exempted cells remain distinct from verified cells. The
+cell model and evidence rules are documented in
+[`spec/compatibility.md`](spec/compatibility.md).
+
+Verify a published release and an asset with GitHub CLI:
+
+```text
+gh release verify v0.1.0
+gh release verify-asset v0.1.0 hell-v0.1.0-linux-x86_64.tar.gz
+```
+
+Also compare the published checksums, inspect `release-manifest.json`, and
+verify the artifact attestations against `Portfoligno/hell-rs`. The complete
+trust boundary, failure behavior, and operator procedure are documented in
+[`spec/release-assurance.md`](spec/release-assurance.md).

@@ -2,48 +2,436 @@ name: CI
 
 on:
   push:
-  workflow_dispatch:
+    branches: ['**']
+    tags-ignore: ['**']
+  pull_request:
 
 permissions:
+  actions: read
   contents: read
-
-env:
-  HELL_SOURCE_COMMIT: ${{ github.sha }}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  dependency-policy:
-    name: Dependency advisories and licenses
+  plan:
+    name: Bind exact candidate readiness plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      trusted_sha: ${{ steps.plan.outputs.trusted_sha }}
+      readiness_plan_digest: ${{ steps.plan.outputs.readiness_plan_digest }}
+      conformance_plan_digest: ${{ steps.plan.outputs.conformance_plan_digest }}
+      trusted_conformance_inputs_digest: ${{ steps.plan.outputs.trusted_conformance_inputs_digest }}
     steps:
-      - name: Check out source
+      - name: Check out trusted readiness automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: automation
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Check advisories, licenses, bans, and sources
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          command: check
-          arguments: --all-features
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-plan-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}
+      - name: Restore compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-plan-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build readiness driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Create candidate-bound readiness and conformance plans
+        id: plan
+        run: ./automation/target/ci/hell-ci readiness plan --repository-root candidate --output readiness-plan
+      - name: Upload exact readiness plan
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: readiness-plan
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-plan-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}
+      - name: Save compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-plan-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}
+
+  linux:
+    name: Technical readiness / Linux x86_64
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted readiness automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact readiness plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: readiness-input
+      - name: Install pinned Stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Restore trusted automation compilation cache
+        id: automation-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Install pinned cargo-deny
+        working-directory: automation
+        run: cargo install cargo-deny --locked --version 0.20.2 --force
+      - name: Build readiness driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run Linux technical readiness gate
+        run: ./automation/target/ci/hell-ci readiness platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan readiness-input/readiness-plan.json --conformance-plan readiness-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact Linux readiness result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Save trusted automation compilation cache
+        if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+
+  macos:
+    name: Technical readiness / macOS aarch64
+    needs: plan
+    runs-on: macos-15
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted readiness automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact readiness plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: readiness-input
+      - name: Install pinned Stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Restore trusted automation compilation cache
+        id: automation-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build readiness driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run macOS technical readiness gate
+        run: ./automation/target/ci/hell-ci readiness platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan readiness-input/readiness-plan.json --conformance-plan readiness-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact macOS readiness result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Save trusted automation compilation cache
+        if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+
+  windows:
+    name: Technical readiness / Windows x86_64
+    needs: plan
+    runs-on: windows-2025
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out trusted readiness automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.trusted_sha }}
+          path: automation
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out pinned upstream oracle source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisdone/hell
+          ref: 8e952cf9de4ab25d7716982a9ca234f9bdcf1bff
+          path: oracle-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact readiness plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: readiness-input
+      - name: Install pinned Stack
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-version: 3.11.1
+      - name: Restore Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}
+      - name: Restore candidate compilation cache
+        id: target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Restore trusted automation compilation cache
+        id: automation-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+      - name: Resolve pinned Rust toolchain
+        working-directory: automation
+        run: rustup show active-toolchain
+      - name: Build readiness driver
+        working-directory: automation
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+      - name: Run Windows technical readiness gate
+        run: .\automation\target\ci\hell-ci.exe readiness platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan readiness-input\readiness-plan.json --conformance-plan readiness-input\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
+      - name: Upload exact Windows readiness result
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-out
+          if-no-files-found: error
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}
+      - name: Save candidate compilation cache
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: candidate-target
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
+      - name: Save trusted automation compilation cache
+        if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: automation/target
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
 
   verify:
-    name: Verify / Linux
+    name: Blocker-zero technical release eligibility
+    needs: [plan, linux, macos, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Check out source
+      - name: Check out trusted readiness verifier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.plan.outputs.trusted_sha }}
+          path: automation
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Restore Cargo download cache
+      - name: Download exact readiness plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: readiness-input/plan
+      - name: Download exact Linux result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.linux.outputs.artifact_id }}
+          path: readiness-input/platforms/linux-x86_64
+      - name: Download exact macOS result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.macos.outputs.artifact_id }}
+          path: readiness-input/platforms/macos-aarch64
+      - name: Download exact Windows result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.windows.outputs.artifact_id }}
+          path: readiness-input/platforms/windows-x86_64
+      - name: Restore Cargo downloads
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -51,211 +439,38 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-
-
+          key: readiness-verify-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}
       - name: Restore compilation cache
         id: target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
-
-      - name: Resolve pinned Rust toolchain
-        run: rustup show active-toolchain
-
-      - name: Build CI driver
+          path: automation/target
+          key: readiness-verify-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}
+      - name: Build readiness verifier
+        working-directory: automation
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-
-      - name: Install pinned active-review verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.4.3
-
-      - name: Verify fail-closed assurance policy
-        run: ./target/ci/hell-ci assurance-verify --output ci-out/assurance-policy.json
-
-      - name: Verify applicability derivation
-        run: ./target/ci/hell-ci applicability verify
-
-      - name: Verify descriptor-v3 case catalog
-        run: ./target/ci/hell-ci case-catalog verify
-
-      - name: Verify typed normalizer catalog
-        run: ./target/ci/hell-ci normalizer-audit verify
-
-      - name: Verify divergence-v2 catalog
-        run: ./target/ci/hell-ci divergence-verify verify
-
-      - name: Run Linux verification suite
-        run: ./target/ci/hell-ci verify --report ci-out/verify-linux.json
-
-      - name: Upload failure report
-        if: ${{ failure() }}
+      - name: Reconstruct blocker-zero technical eligibility
+        run: ./automation/target/ci/hell-ci readiness verify --plan readiness-input/plan/readiness-plan.json --conformance-plan readiness-input/plan/conformance-plan.json --input readiness-input/platforms --output readiness-result
+      - name: Retain exact readiness decision
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: verify-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out
+          name: readiness-decision-${{ github.run_id }}-${{ github.run_attempt }}
+          path: readiness-result
           if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Save Cargo download cache
-        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
+          retention-days: 30
+      - name: Save Cargo downloads
+        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-
+          key: readiness-verify-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}
       - name: Save compilation cache
-        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && hashFiles('target/**') != '' }}
+        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-verify-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
-
-  portability-macos:
-    name: Portability / macOS
-    runs-on: macos-15
-    timeout-minutes: 35
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Restore Cargo download cache
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-
-
-      - name: Restore compilation cache
-        id: target-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
-
-      - name: Resolve pinned Rust toolchain
-        run: rustup show active-toolchain
-
-      - name: Build CI driver
-        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-
-      - name: Install pinned active-review verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.4.3
-
-      - name: Run macOS portability suite
-        run: ./target/ci/hell-ci portability --report ci-out/portability-macos.json
-
-      - name: Upload failure report
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: portability-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Save Cargo download cache
-        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-
-      - name: Save compilation cache
-        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && hashFiles('target/**') != '' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
-
-  portability-windows:
-    name: Portability / Windows
-    runs-on: windows-2025
-    timeout-minutes: 40
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Restore Cargo download cache
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-          restore-keys: |
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
-            v2-${{ runner.os }}-${{ runner.arch }}-cargo-
-
-      - name: Restore compilation cache
-        id: target-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
-
-      - name: Resolve pinned Rust toolchain
-        run: rustup show active-toolchain
-
-      - name: Build CI driver
-        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
-
-      - name: Install pinned active-review verifier
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.4.3
-
-      - name: Run Windows portability suite
-        run: .\target\ci\hell-ci.exe portability --report ci-out\portability-windows.json
-
-      - name: Upload failure report
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: portability-windows-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-out
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Save Cargo download cache
-        if: ${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' && hashFiles('Cargo.lock') != '' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: v2-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
-
-      - name: Save compilation cache
-        if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && hashFiles('target/**') != '' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: v2-${{ runner.os }}-${{ runner.arch }}-portability-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'rustfmt.toml', '.rustfmt.toml', 'clippy.toml', '.clippy.toml') }}-${{ hashFiles('crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'spec/**', '.github/workflows/ci.yml') }}
+          path: automation/target
+          key: readiness-verify-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}

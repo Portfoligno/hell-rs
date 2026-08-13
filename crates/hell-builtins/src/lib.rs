@@ -24,7 +24,7 @@ pub use manifest::{
     type_constructor, type_constructors,
 };
 
-pub const LANGUAGE_VERSION: &str = assurance_catalogs::CLAIM_BASELINE;
+pub const LANGUAGE_VERSION: &str = assurance_catalogs::REQUIREMENT_BASELINE;
 pub const UPSTREAM_COMMIT: &str = "d4d028609ed46a560c62caea8c70e7e91d1afd29";
 pub const UPSTREAM_SOURCE_SHA256: &str =
     "6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9";
@@ -126,13 +126,12 @@ impl CompatibilityDimension {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ClaimStatus {
-    Exact,
-    Normalized,
-    PlatformDependent,
-    DeliberateDivergence,
-    Unverified,
-    NotApplicable,
+pub enum RequirementStrategy {
+    NativeOracle,
+    PortableStatic,
+    StructuralInvariant,
+    CommittedDifferentialCorpus,
+    CrossPlatformRelation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,6 +151,17 @@ impl ExecutionProfile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RequirementPlatform {
+    LinuxX86_64,
+    MacosAarch64,
+    WindowsX86_64,
+}
+
+/// Historical evidence-campaign platform vocabulary.
+///
+/// This type is retained for collection artifacts only. It has no release
+/// scope or final-disposition authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClaimPlatform {
     All,
     Linux,
@@ -160,34 +170,34 @@ pub enum ClaimPlatform {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScopedClaim {
-    pub status: ClaimStatus,
+pub struct ScopedRequirement {
     pub profiles: &'static [ExecutionProfile],
-    pub platforms: &'static [ClaimPlatform],
+    pub platforms: &'static [RequirementPlatform],
+    pub strategy: RequirementStrategy,
     pub evidence: &'static [&'static str],
     pub normalizers: &'static [NormalizerId],
     pub obligations: &'static [&'static str],
     pub applicability_rule: &'static str,
-    pub rationale: Option<&'static str>,
-    pub issue: Option<&'static str>,
-    pub review_group: Option<&'static str>,
+    pub rationale: &'static str,
+    pub tracking_issue: &'static str,
+    pub review_group: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DimensionClaim {
+pub struct DimensionRequirement {
     pub dimension: CompatibilityDimension,
-    pub scopes: &'static [ScopedClaim],
+    pub scopes: &'static [ScopedRequirement],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompatibilityClaim {
+pub struct CompatibilityRequirement {
     pub builtin: BuiltinId,
     pub baseline: &'static str,
-    pub dimensions: [DimensionClaim; CompatibilityDimension::ALL.len()],
+    pub dimensions: [DimensionRequirement; CompatibilityDimension::ALL.len()],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimValidationError {
+pub enum RequirementValidationError {
     RegistryLength,
     BuiltinOrder,
     Baseline,
@@ -197,7 +207,7 @@ pub enum ClaimValidationError {
     MissingScope,
     MissingNormalizer,
     MissingRationale,
-    MissingIssue,
+    MissingTrackingIssue,
     DuplicateProfile,
     DuplicatePlatform,
     DuplicateEvidence,
@@ -205,7 +215,7 @@ pub enum ClaimValidationError {
     OverlappingScope,
     MissingApplicabilityRule,
     InvalidNormalizerScope,
-    InvalidStatusMetadata,
+    MissingReviewGroup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2002,15 +2012,14 @@ pub fn source_annotation_scheme(name: &str) -> Option<&'static str> {
     }
 }
 
-fn catalog_scope(source: &assurance_catalogs::GeneratedClaimScope) -> ScopedClaim {
-    let status = match source.status {
-        "exact" => ClaimStatus::Exact,
-        "normalized" => ClaimStatus::Normalized,
-        "platform-dependent" => ClaimStatus::PlatformDependent,
-        "deliberate-divergence" => ClaimStatus::DeliberateDivergence,
-        "unverified" => ClaimStatus::Unverified,
-        "not-applicable" => ClaimStatus::NotApplicable,
-        value => panic!("generated claim catalog contains unknown status {value:?}"),
+fn catalog_scope(source: &assurance_catalogs::GeneratedRequirementScope) -> ScopedRequirement {
+    let strategy = match source.evidence_strategy {
+        "native-oracle" => RequirementStrategy::NativeOracle,
+        "portable-static" => RequirementStrategy::PortableStatic,
+        "structural-invariant" => RequirementStrategy::StructuralInvariant,
+        "committed-differential-corpus" => RequirementStrategy::CommittedDifferentialCorpus,
+        "cross-platform-relation" => RequirementStrategy::CrossPlatformRelation,
+        value => panic!("generated requirement catalog contains unknown strategy {value:?}"),
     };
     let profiles = source
         .profiles
@@ -2026,11 +2035,10 @@ fn catalog_scope(source: &assurance_catalogs::GeneratedClaimScope) -> ScopedClai
         .platforms
         .iter()
         .map(|value| match *value {
-            "all" => ClaimPlatform::All,
-            "linux" => ClaimPlatform::Linux,
-            "macos" => ClaimPlatform::MacOs,
-            "windows" => ClaimPlatform::Windows,
-            other => panic!("generated claim catalog contains unknown platform {other:?}"),
+            "linux-x86_64" => RequirementPlatform::LinuxX86_64,
+            "macos-aarch64" => RequirementPlatform::MacosAarch64,
+            "windows-x86_64" => RequirementPlatform::WindowsX86_64,
+            other => panic!("generated requirement catalog contains unknown platform {other:?}"),
         })
         .collect::<Vec<_>>()
         .leak();
@@ -2046,37 +2054,39 @@ fn catalog_scope(source: &assurance_catalogs::GeneratedClaimScope) -> ScopedClai
         })
         .collect::<Vec<_>>()
         .leak();
-    ScopedClaim {
-        status,
+    ScopedRequirement {
         profiles,
         platforms,
+        strategy,
         evidence: source.evidence,
         normalizers,
         obligations: source.obligations,
         applicability_rule: source.applicability_rule,
-        rationale: (!source.rationale.is_empty()).then_some(source.rationale),
-        issue: (!source.issue.is_empty()).then_some(source.issue),
-        review_group: (!source.review_group.is_empty()).then_some(source.review_group),
+        rationale: source.rationale,
+        tracking_issue: source.tracking_issue,
+        review_group: source.review_group,
     }
 }
 
-fn catalog_dimension(spec: &BuiltinSpec, dimension: CompatibilityDimension) -> DimensionClaim {
-    let generated = assurance_catalogs::CLAIM_OVERRIDES
+fn catalog_dimension(
+    spec: &BuiltinSpec,
+    dimension: CompatibilityDimension,
+) -> DimensionRequirement {
+    let generated = assurance_catalogs::REQUIREMENT_OVERRIDES
         .iter()
         .find(|claim| claim.builtin == spec.name && claim.dimension == dimension.as_str());
     let sources = generated.map_or_else(
-        || std::slice::from_ref(&assurance_catalogs::DEFAULT_CLAIM_SCOPE),
+        || std::slice::from_ref(&assurance_catalogs::DEFAULT_REQUIREMENT_SCOPE),
         |claim| claim.scopes,
     );
     let scopes = sources.iter().map(catalog_scope).collect::<Vec<_>>().leak();
-    DimensionClaim { dimension, scopes }
+    DimensionRequirement { dimension, scopes }
 }
 
-/// Returns the conservative, dimensioned compatibility claim for every term.
+/// Returns the conservative, dimensioned compatibility requirement for every term.
 ///
-/// Wiring and semantic equivalence are deliberately independent. Until a
-/// retained pinned-oracle evidence record is available, executable terms stay
-/// `Unverified` in every observable dimension.
+/// Wiring and semantic equivalence are deliberately independent. Requirements
+/// describe obligations; they never author a candidate's final disposition.
 ///
 /// # Panics
 ///
@@ -2084,10 +2094,10 @@ fn catalog_dimension(spec: &BuiltinSpec, dimension: CompatibilityDimension) -> D
 /// canonical registry. The build-time catalog validation and focused drift
 /// tests make that a repository-integrity failure rather than runtime input.
 #[must_use]
-pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
-    static CLAIMS: OnceLock<Vec<CompatibilityClaim>> = OnceLock::new();
-    CLAIMS.get_or_init(|| {
-        for generated in assurance_catalogs::CLAIM_OVERRIDES {
+pub fn compatibility_requirements() -> &'static [CompatibilityRequirement] {
+    static REQUIREMENTS: OnceLock<Vec<CompatibilityRequirement>> = OnceLock::new();
+    REQUIREMENTS.get_or_init(|| {
+        for generated in assurance_catalogs::REQUIREMENT_OVERRIDES {
             assert!(
                 registry().iter().any(|spec| spec.name == generated.builtin),
                 "generated claim catalog names unknown builtin {:?}",
@@ -2096,9 +2106,9 @@ pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
         }
         registry()
             .iter()
-            .map(|spec| CompatibilityClaim {
+            .map(|spec| CompatibilityRequirement {
                 builtin: spec.id,
-                baseline: assurance_catalogs::CLAIM_BASELINE,
+                baseline: assurance_catalogs::REQUIREMENT_BASELINE,
                 dimensions: CompatibilityDimension::ALL
                     .map(|dimension| catalog_dimension(spec, dimension)),
             })
@@ -2107,34 +2117,31 @@ pub fn compatibility_claims() -> &'static [CompatibilityClaim] {
 }
 
 #[must_use]
-pub fn compatibility_claim(id: BuiltinId) -> Option<&'static CompatibilityClaim> {
-    compatibility_claims().get(usize::from(id.0))
+pub fn compatibility_requirement(id: BuiltinId) -> Option<&'static CompatibilityRequirement> {
+    compatibility_requirements().get(usize::from(id.0))
 }
 
-/// Validates the fail-closed promotion invariants for compatibility claims.
-///
-/// Development snapshots may contain `Unverified` claims. Evidence-bearing
-/// statuses may not omit their evidence or normalization/rationale metadata.
+/// Validates the fail-closed invariants for compatibility requirements.
 ///
 /// # Errors
 ///
 /// Returns the first structural or fail-closed promotion violation.
-pub fn validate_compatibility_claims(
-    claims: &[CompatibilityClaim],
-) -> Result<(), ClaimValidationError> {
+pub fn validate_compatibility_requirements(
+    claims: &[CompatibilityRequirement],
+) -> Result<(), RequirementValidationError> {
     if claims.len() != registry().len() {
-        return Err(ClaimValidationError::RegistryLength);
+        return Err(RequirementValidationError::RegistryLength);
     }
     for (index, claim) in claims.iter().enumerate() {
         if usize::from(claim.builtin.0) != index {
-            return Err(ClaimValidationError::BuiltinOrder);
+            return Err(RequirementValidationError::BuiltinOrder);
         }
         if claim.baseline != LANGUAGE_VERSION {
-            return Err(ClaimValidationError::Baseline);
+            return Err(RequirementValidationError::Baseline);
         }
         for (slot, dimension) in claim.dimensions.iter().enumerate() {
             if dimension.dimension != CompatibilityDimension::ALL[slot] {
-                return Err(ClaimValidationError::DimensionOrder);
+                return Err(RequirementValidationError::DimensionOrder);
             }
             validate_scopes(dimension.dimension, dimension.scopes)?;
         }
@@ -2144,10 +2151,10 @@ pub fn validate_compatibility_claims(
 
 fn validate_scopes(
     dimension: CompatibilityDimension,
-    scopes: &[ScopedClaim],
-) -> Result<(), ClaimValidationError> {
+    scopes: &[ScopedRequirement],
+) -> Result<(), RequirementValidationError> {
     if scopes.is_empty() {
-        return Err(ClaimValidationError::MissingScope);
+        return Err(RequirementValidationError::MissingScope);
     }
     for (index, scope) in scopes.iter().enumerate() {
         validate_scope(dimension, scope)?;
@@ -2161,7 +2168,7 @@ fn validate_scopes(
                     .iter()
                     .any(|platform| platforms_overlap(*platform, other.platforms))
             {
-                return Err(ClaimValidationError::OverlappingScope);
+                return Err(RequirementValidationError::OverlappingScope);
             }
         }
     }
@@ -2170,30 +2177,28 @@ fn validate_scopes(
 
 fn validate_scope(
     dimension: CompatibilityDimension,
-    scope: &ScopedClaim,
-) -> Result<(), ClaimValidationError> {
+    scope: &ScopedRequirement,
+) -> Result<(), RequirementValidationError> {
     if scope.profiles.is_empty() || scope.platforms.is_empty() {
-        return Err(ClaimValidationError::MissingScope);
+        return Err(RequirementValidationError::MissingScope);
     }
     if has_duplicates(scope.profiles) {
-        return Err(ClaimValidationError::DuplicateProfile);
+        return Err(RequirementValidationError::DuplicateProfile);
     }
-    if has_duplicates(scope.platforms)
-        || (scope.platforms.contains(&ClaimPlatform::All) && scope.platforms.len() != 1)
-    {
-        return Err(ClaimValidationError::DuplicatePlatform);
+    if has_duplicates(scope.platforms) {
+        return Err(RequirementValidationError::DuplicatePlatform);
     }
     if has_duplicates(scope.evidence) {
-        return Err(ClaimValidationError::DuplicateEvidence);
+        return Err(RequirementValidationError::DuplicateEvidence);
     }
     if has_duplicates(scope.normalizers) {
-        return Err(ClaimValidationError::MissingNormalizer);
+        return Err(RequirementValidationError::MissingNormalizer);
     }
     if has_duplicates(scope.obligations) {
-        return Err(ClaimValidationError::DuplicateObligation);
+        return Err(RequirementValidationError::DuplicateObligation);
     }
     if scope.applicability_rule.is_empty() {
-        return Err(ClaimValidationError::MissingApplicabilityRule);
+        return Err(RequirementValidationError::MissingApplicabilityRule);
     }
     if scope.normalizers.iter().any(|normalizer| {
         assurance_catalogs::NORMALIZER_CONTRACTS
@@ -2201,74 +2206,23 @@ fn validate_scope(
             .find(|contract| contract.id == *normalizer)
             .is_none_or(|contract| !contract.allowed_dimensions.contains(&dimension))
     }) {
-        return Err(ClaimValidationError::InvalidNormalizerScope);
+        return Err(RequirementValidationError::InvalidNormalizerScope);
     }
     if scope
         .evidence
         .iter()
         .any(|reference| parse_differential_reference(reference).is_err())
     {
-        return Err(ClaimValidationError::InvalidEvidence);
+        return Err(RequirementValidationError::InvalidEvidence);
     }
-    let rationale_missing = scope.rationale.is_none_or(str::is_empty);
-    let issue_missing = scope.issue.is_none_or(str::is_empty);
-    let explicit_platforms = !scope.platforms.contains(&ClaimPlatform::All);
-    match scope.status {
-        ClaimStatus::Exact => {
-            if scope.evidence.is_empty() {
-                return Err(ClaimValidationError::MissingEvidence);
-            }
-            if !scope.normalizers.is_empty() || !explicit_platforms {
-                return Err(ClaimValidationError::InvalidStatusMetadata);
-            }
-        }
-        ClaimStatus::Normalized => {
-            if scope.evidence.is_empty() {
-                return Err(ClaimValidationError::MissingEvidence);
-            }
-            if scope.normalizers.is_empty() {
-                return Err(ClaimValidationError::MissingNormalizer);
-            }
-            if rationale_missing {
-                return Err(ClaimValidationError::MissingRationale);
-            }
-            if !explicit_platforms {
-                return Err(ClaimValidationError::InvalidStatusMetadata);
-            }
-        }
-        ClaimStatus::PlatformDependent | ClaimStatus::DeliberateDivergence => {
-            if scope.evidence.is_empty() {
-                return Err(ClaimValidationError::MissingEvidence);
-            }
-            if rationale_missing {
-                return Err(ClaimValidationError::MissingRationale);
-            }
-            if issue_missing {
-                return Err(ClaimValidationError::MissingIssue);
-            }
-            if !explicit_platforms {
-                return Err(ClaimValidationError::InvalidStatusMetadata);
-            }
-        }
-        ClaimStatus::Unverified => {
-            if !scope.evidence.is_empty() || !scope.normalizers.is_empty() {
-                return Err(ClaimValidationError::InvalidStatusMetadata);
-            }
-            if rationale_missing {
-                return Err(ClaimValidationError::MissingRationale);
-            }
-            if issue_missing {
-                return Err(ClaimValidationError::MissingIssue);
-            }
-        }
-        ClaimStatus::NotApplicable => {
-            if !scope.evidence.is_empty() || !scope.normalizers.is_empty() {
-                return Err(ClaimValidationError::InvalidStatusMetadata);
-            }
-            if rationale_missing {
-                return Err(ClaimValidationError::MissingRationale);
-            }
-        }
+    if scope.rationale.is_empty() {
+        return Err(RequirementValidationError::MissingRationale);
+    }
+    if scope.tracking_issue.is_empty() {
+        return Err(RequirementValidationError::MissingTrackingIssue);
+    }
+    if scope.review_group.is_empty() {
+        return Err(RequirementValidationError::MissingReviewGroup);
     }
     Ok(())
 }
@@ -2280,27 +2234,25 @@ fn has_duplicates<T: PartialEq>(values: &[T]) -> bool {
         .any(|(index, value)| values[..index].contains(value))
 }
 
-fn platforms_overlap(platform: ClaimPlatform, others: &[ClaimPlatform]) -> bool {
-    platform == ClaimPlatform::All
-        || others.contains(&ClaimPlatform::All)
-        || others.contains(&platform)
+fn platforms_overlap(platform: RequirementPlatform, others: &[RequirementPlatform]) -> bool {
+    others.contains(&platform)
 }
 
 /// Parses one canonical, path-safe retained differential reference.
 ///
 /// # Errors
 ///
-/// Returns [`ClaimValidationError::InvalidEvidence`] for an unknown prefix or
+/// Returns [`RequirementValidationError::InvalidEvidence`] for an unknown prefix or
 /// an unsafe/empty case identifier.
 pub fn parse_differential_reference(
     reference: &str,
-) -> Result<DifferentialReference<'_>, ClaimValidationError> {
+) -> Result<DifferentialReference<'_>, RequirementValidationError> {
     let case_id = reference
         .strip_prefix("differential:")
-        .ok_or(ClaimValidationError::InvalidEvidence)?;
+        .ok_or(RequirementValidationError::InvalidEvidence)?;
     validate_case_id(case_id)
         .then_some(DifferentialReference { case_id })
-        .ok_or(ClaimValidationError::InvalidEvidence)
+        .ok_or(RequirementValidationError::InvalidEvidence)
 }
 
 /// Whether a differential case identifier is canonical and path-safe.

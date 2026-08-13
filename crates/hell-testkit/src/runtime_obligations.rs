@@ -286,16 +286,31 @@ fn validate_runtime_obligation_target(
             target.builtin
         ));
     }
-    if let Some(expected) = target.expected_instance_target.as_deref()
-        && matching_events.iter().any(|event| {
-            event.instance_target.as_deref() != Some(expected)
-                || event.instance_premises != target.expected_instance_premises
-        })
-    {
-        return Err(format!(
-            "runtime trace instance target disagrees for {:?}",
-            target.builtin
-        ));
+    if let Some(expected) = target.expected_instance_target.as_deref() {
+        let permitted_nested = target
+            .expected_instance_premises
+            .iter()
+            .map(|premise| premise.target.as_ref())
+            .collect::<BTreeSet<_>>();
+        let expected_events = matching_events
+            .iter()
+            .filter(|event| event.instance_target.as_deref() == Some(expected))
+            .collect::<Vec<_>>();
+        if expected_events.is_empty()
+            || expected_events
+                .iter()
+                .any(|event| event.instance_premises != target.expected_instance_premises)
+            || matching_events.iter().any(|event| {
+                event.instance_target.as_deref().is_none_or(|instance| {
+                    instance != expected && !permitted_nested.contains(instance)
+                })
+            })
+        {
+            return Err(format!(
+                "runtime trace instance target disagrees for {:?}",
+                target.builtin
+            ));
+        }
     }
     validate_trace_comparator_digest(target, &matching_events, adapter_events)?;
     if target.dimension == CompatibilityDimension::PureRuntime

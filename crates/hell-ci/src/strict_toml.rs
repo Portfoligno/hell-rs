@@ -152,15 +152,6 @@ pub(crate) fn boolean(value: &str) -> Result<bool, String> {
     }
 }
 
-pub(crate) fn unsigned(value: &str) -> Result<u64, String> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("expected unsigned integer, observed {value:?}"));
-    }
-    value
-        .parse()
-        .map_err(|_| format!("unsigned integer is out of range: {value}"))
-}
-
 pub(crate) fn string_array(value: &str) -> Result<Vec<String>, String> {
     let inner = value
         .strip_prefix('[')
@@ -178,7 +169,7 @@ pub(crate) fn string_array(value: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-pub(crate) fn unsigned_array(value: &str) -> Result<Vec<u64>, String> {
+pub(crate) fn boolean_array(value: &str) -> Result<Vec<bool>, String> {
     let inner = value
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
@@ -188,7 +179,7 @@ pub(crate) fn unsigned_array(value: &str) -> Result<Vec<u64>, String> {
     if inner.is_empty() {
         return Ok(Vec::new());
     }
-    inner.split(',').map(|item| unsigned(item.trim())).collect()
+    inner.split(',').map(|item| boolean(item.trim())).collect()
 }
 
 pub(crate) fn take(values: &mut BTreeMap<String, String>, key: &str) -> Result<String, String> {
@@ -197,27 +188,16 @@ pub(crate) fn take(values: &mut BTreeMap<String, String>, key: &str) -> Result<S
         .ok_or_else(|| format!("missing required TOML key {key}"))
 }
 
-pub(crate) fn finish(values: &BTreeMap<String, String>) -> Result<(), String> {
-    if values.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "unknown TOML keys: {}",
-            values.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
     #[test]
-    fn fuzz_targets_claim_normalizer_and_divergence_toml_are_panic_free_and_fail_closed() {
+    fn fuzz_targets_requirement_normalizer_and_divergence_toml_are_panic_free_and_fail_closed() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for relative in [
-            "compat/claims/2026-05-29.toml",
+            "compat/requirements/2026-05-29.toml",
             "compat/normalizers.toml",
             "compat/divergences.toml",
         ] {

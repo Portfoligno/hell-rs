@@ -1,15 +1,15 @@
 {
-  "schemaVersion": 8,
-  "parsedBuiltins": [{"eventId": 1, "builtinId": 116}, {"eventId": 2, "builtinId": 271}, {"eventId": 3, "builtinId": 288}, {"eventId": 4, "builtinId": 324}],
-  "resolvedBuiltins": [{"eventId": 5, "builtinId": 116}, {"eventId": 6, "builtinId": 271}, {"eventId": 7, "builtinId": 288}, {"eventId": 8, "builtinId": 324}],
-  "specializedBuiltins": [{"eventId": 9, "builtinId": 116}, {"eventId": 10, "builtinId": 271}, {"eventId": 11, "builtinId": 288}, {"eventId": 12, "builtinId": 324}],
-  "enteredAdapters": [{"eventId": 13, "builtinId": 116}, {"eventId": 14, "builtinId": 271}, {"eventId": 15, "builtinId": 288}, {"eventId": 16, "builtinId": 324}],
-  "forcedArguments": [{"eventId": 17, "builtinId": 116, "argument": 0, "boundaryClass": "io-execution-complete", "outcome": "value"}, {"eventId": 18, "builtinId": 271, "argument": 0, "boundaryClass": "lazy-adapter-entry", "outcome": "not-forced"}, {"eventId": 19, "builtinId": 271, "argument": 0, "boundaryClass": "lazy-adapter-exit", "outcome": "not-forced"}, {"eventId": 20, "builtinId": 271, "argument": 1, "boundaryClass": "lazy-adapter-entry", "outcome": "not-forced"}, {"eventId": 21, "builtinId": 271, "argument": 1, "boundaryClass": "lazy-adapter-exit", "outcome": "not-forced"}, {"eventId": 22, "builtinId": 288, "argument": 0, "boundaryClass": "lazy-adapter-entry", "outcome": "not-forced"}, {"eventId": 23, "builtinId": 288, "argument": 0, "boundaryClass": "lazy-adapter-exit", "outcome": "not-forced"}, {"eventId": 24, "builtinId": 324, "argument": 0, "boundaryClass": "lazy-adapter-entry", "outcome": "not-forced"}, {"eventId": 25, "builtinId": 324, "argument": 0, "boundaryClass": "lazy-adapter-exit", "outcome": "value"}],
+  "schemaVersion": 9,
+  "parsedBuiltins": [],
+  "resolvedBuiltins": [],
+  "specializedBuiltins": [],
+  "enteredAdapters": [],
+  "forcedArguments": [],
   "typedResults": [],
-  "effectEvents": [{"eventId": 26, "builtinId": 116, "ownerTaskId": null, "sequence": 1, "parentSequence": null, "effect": "started"}, {"eventId": 27, "builtinId": 116, "ownerTaskId": null, "sequence": 1, "parentSequence": null, "effect": "completed"}],
+  "effectEvents": [],
   "taskEvents": [],
   "presentationFields": [],
   "resourceEvents": [],
-  "obligationEvents": [{"eventId": 28, "builtinId": 271, "ownerTaskId": null, "sequence": 1, "parentSequence": null, "instanceTarget": null, "instancePremises": [], "outcome": "alias", "nestedAdapters": 1, "materializedBefore": 0, "materializedAfter": 0, "callbackInvocations": [{"invocation":1,"callbackArgument":0,"branch":"function","canonicalArgumentHex":["7b2274797065223a224d61796265222c227061796c6f6164223a7b2274797065223a224d61796265222c227061796c6f6164223a7b2274797065223a22496e74222c2276616c7565223a2233227d7d7d"],"outcome":"value","canonicalResultHex":"7b2274797065223a22496f416374696f6e227d"}]}, {"eventId": 29, "builtinId": 116, "ownerTaskId": null, "sequence": 2, "parentSequence": 1, "instanceTarget": "Maybe", "instancePremises": [], "outcome": "io-action", "nestedAdapters": 0, "materializedBefore": 0, "materializedAfter": 0, "callbackInvocations": []}, {"eventId": 30, "builtinId": 324, "ownerTaskId": null, "sequence": 3, "parentSequence": null, "instanceTarget": "Maybe", "instancePremises": [], "outcome": "value", "nestedAdapters": 1, "materializedBefore": 0, "materializedAfter": 0, "callbackInvocations": []}, {"eventId": 31, "builtinId": 288, "ownerTaskId": null, "sequence": 4, "parentSequence": 3, "instanceTarget": null, "instancePremises": [], "outcome": "value", "nestedAdapters": 0, "materializedBefore": 0, "materializedAfter": 0, "callbackInvocations": []}],
+  "obligationEvents": [],
   "finalResourceCounts": {"acquired": 0, "live": 0, "cleanupFailures": 0, "materializedElements": 0}
 }

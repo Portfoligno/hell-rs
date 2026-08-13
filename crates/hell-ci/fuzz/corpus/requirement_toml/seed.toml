@@ -1,0 +1,53 @@
+schema_version = 3
+baseline = "2026-05-29"
+registry = "compat/builtin-registry.json"
+dimensions = [
+  "parse",
+  "static-semantics",
+  "pure-runtime",
+  "effects",
+  "concurrency",
+  "presentation",
+  "platform",
+  "resource-behavior",
+]
+
+[default_requirement]
+profiles = ["upstream", "sandboxed"]
+platforms = ["linux-x86_64", "macos-aarch64", "windows-x86_64"]
+applicability_rule = "catalog-default-review-required"
+evidence_strategy = "committed-differential-corpus"
+evidence = []
+normalizers = []
+obligations = []
+rationale = "No release evidence mapping has been approved for this cell."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "compatibility"
+
+[[overrides]]
+builtin = "Bool.bool"
+dimensions = ["pure-runtime"]
+
+[[overrides.scopes]]
+profiles = ["upstream"]
+platforms = ["linux-x86_64", "macos-aarch64", "windows-x86_64"]
+applicability_rule = "pure-runtime-value"
+evidence_strategy = "native-oracle"
+evidence = []
+normalizers = []
+obligations = ["adapter-success", "lazy-boundary", "conditional-selected", "conditional-unselected", "typed-result", "constructor-eliminator"]
+rationale = "The builtin produces an observable value on every release platform, but no committed release evidence cases are approved yet."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "bool-conditional-v1"
+
+[[overrides.scopes]]
+profiles = ["sandboxed"]
+platforms = ["linux-x86_64", "macos-aarch64", "windows-x86_64"]
+applicability_rule = "sandboxed-profile-review-required"
+evidence_strategy = "committed-differential-corpus"
+evidence = []
+normalizers = []
+obligations = []
+rationale = "The sandboxed profile is outside upstream-release-v1 and has no approved release evidence mapping."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "compatibility"

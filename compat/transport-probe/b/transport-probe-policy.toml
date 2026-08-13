@@ -1,6 +1,0 @@
-schema_version = 1
-state = "review-required"
-repository_id = 0
-environment = "compatibility-transport-probe-b"
-reviewer_principal = "assurance-transport-probe-b:probe-b"
-artifact_prefix = "assurance-transport-readiness-envelope-b-"

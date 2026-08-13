@@ -151,10 +151,44 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     if command == "spawn-grandchild-and-exit" {
         return spawn_marker_child(arguments, false);
     }
+    #[cfg(unix)]
+    if command == "escape-session-double-fork" {
+        return escape_session_double_fork(arguments);
+    }
     Err(format!(
         "unknown helper subcommand {}",
         command.to_string_lossy()
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn escape_session_double_fork(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let milliseconds = parse_usize(arguments.next(), "MILLISECONDS")?;
+    let marker = arguments
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| "escaped descendant fixture requires MARKER".to_owned())?;
+    ensure_empty(arguments)?;
+    // The grandchild deliberately retains inherited stdout/stderr while
+    // escaping the original process group. Release supervision must sweep the
+    // unique candidate UID before joining its capture readers.
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Command::new("/usr/bin/setsid")
+        .arg(executable)
+        .arg("spawn-grandchild-and-exit")
+        .arg(milliseconds.to_string())
+        .arg(marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn escape_session_double_fork(_arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
+    Err("setsid escaped-child fixture is available on Linux".to_owned())
 }
 
 fn run_environment_command(

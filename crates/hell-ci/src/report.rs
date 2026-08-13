@@ -45,12 +45,6 @@ impl Report {
                 .all(|step| matches!(step.status, StepStatus::Passed))
     }
 
-    pub fn has_failed_command(&self) -> bool {
-        self.steps
-            .iter()
-            .any(|step| step.program.is_some() && matches!(step.status, StepStatus::Failed))
-    }
-
     pub fn command(&mut self, name: impl Into<String>, spec: &CommandSpec, result: &CommandResult) {
         let passed = result.status.success() && !result.timed_out;
         let name = name.into();
@@ -118,7 +112,7 @@ impl Report {
         fs::rename(temporary, path)
     }
 
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         let mut json = String::from("{\n  \"schemaVersion\": 1,\n  \"suite\": ");
         push_json_string(&mut json, &self.suite);
         json.push_str(",\n  \"passed\": ");
