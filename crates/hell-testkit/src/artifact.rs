@@ -17,6 +17,14 @@ use crate::{
     normalized_presentation_shadow_sha256, raw_presentation_sha256, sha256_bytes, sha256_file,
 };
 
+type RetainedSemanticBoundary = (
+    hell_builtins::BuiltinId,
+    u16,
+    String,
+    String,
+    Option<String>,
+);
+
 /// Identity facts rederived from one retained explicit-profile observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetainedVerifiedProfileFacts {
@@ -208,7 +216,7 @@ fn conformance_semantic_document(observation: &Observation) -> std::io::Result<S
         .ok_or_else(|| std::io::Error::other("conformance raw stderr is incomplete"))?;
     output.push_str(",\n  \"rawPresentationSha256\": \"");
     output.push_str(&raw_presentation_sha256(stdout, raw_stderr).hex());
-    output.push_str("\"");
+    output.push('"');
     output.push_str(",\n  \"normalizedPresentationLineEndingsSha256\": ");
     match normalized_presentation_shadow_sha256(
         PresentationShadowNormalizerId::LineEndingsV1,
@@ -250,6 +258,7 @@ fn conformance_semantic_document(observation: &Observation) -> std::io::Result<S
 /// Returns an error for an unknown/ambiguous target, malformed or forged
 /// semantic facts, a descriptor mismatch, or an obligation without a trusted
 /// in-memory validator.
+#[allow(clippy::too_many_lines)]
 pub fn validate_conformance_semantic_obligation(
     document: &str,
     case: &DifferentialCase,
@@ -305,6 +314,7 @@ pub fn validate_conformance_semantic_obligation(
     validate_task_causality(&task_trace, &observed)?;
     validate_obligation_causality(&obligation_trace, &task_trace)?;
     validate_nested_ord_comparator_evidence(&obligation_trace)?;
+    validate_force_only_target(target, builtin.id, &observed, &obligation_trace)?;
     validate_effect_causality(&effect_trace, &task_trace, &observed)?;
     if event_order.is_empty() {
         return Err(std::io::Error::other("semantic event order is empty"));
@@ -341,6 +351,8 @@ pub fn validate_conformance_semantic_obligation(
         ));
     }
     validate_expected_lazy_argument_exit(target, builtin.id, &boundaries)?;
+    validate_expected_whnf_argument_failure(target, builtin.id, &boundaries)?;
+    validate_expected_nonproductive_trace(target, builtin.id, &boundaries)?;
     validate_expected_single_task_lifecycle(target, builtin.id, &task_trace, &effect_trace)?;
     validate_expected_task_trace(target, builtin.id, &task_trace)?;
     if let Some(expected) = target.expected_process_status_sha256 {
@@ -939,7 +951,17 @@ pub fn retain_observation_bundle(
         &directory.join("normalized.diff"),
         format!("{:#?}\n", report.mismatches).as_bytes(),
     )?;
-    let mismatch_sides = recompute_mismatch_sides(&directory)?;
+    let (comparison_projection, mismatch_sides) =
+        recompute_projected_mismatch_sides(&directory, case)?;
+    if comparison_projection != report.comparison_projection {
+        return Err(std::io::Error::other(
+            "differential comparison projection disagrees with retained observations",
+        ));
+    }
+    write_atomic(
+        &directory.join("comparison-projection.json"),
+        comparison_projection_json(&comparison_projection).as_bytes(),
+    )?;
     let declared_categories = report
         .mismatches
         .iter()
@@ -1231,7 +1253,7 @@ pub fn verify_observation_bundle(directory: &Path) -> std::io::Result<Digest> {
         identity.process_helper_path,
         identity.process_helper_sha256,
     )?;
-    verify_retained_mismatch_summary(directory)?;
+    verify_retained_mismatch_summary_schema(directory)?;
     let manifest_digest = sha256_bytes(manifest.as_bytes());
     let candidate_observation =
         fs::read_to_string(directory.join("candidate").join("observation.json"))?;
@@ -1360,18 +1382,22 @@ fn parse_bundle_manifest(
     Ok((identity, declared))
 }
 
-fn verify_retained_mismatch_summary(directory: &Path) -> std::io::Result<()> {
+fn verify_retained_mismatch_summary_schema(directory: &Path) -> std::io::Result<()> {
     let document = fs::read_to_string(directory.join("mismatch-summary.json"))?;
     let facts = parse_mismatch_summary(&document)?;
     verify_mismatch_fact_bytes(directory, &facts)?;
-    let recomputed = recompute_mismatch_sides(directory)?
-        .into_iter()
-        .map(|side| side.fact)
-        .collect::<Vec<_>>();
-    if recomputed != facts {
-        return Err(std::io::Error::other(
-            "retained mismatch summary omits or substitutes an observation difference",
-        ));
+    let projection_document = fs::read_to_string(directory.join("comparison-projection.json"))?;
+    let projection = parse_comparison_projection_json(&projection_document)?;
+    if matches!(projection, crate::DifferentialComparisonProjection::Exact) {
+        let recomputed = recompute_mismatch_sides(directory)?
+            .into_iter()
+            .map(|side| side.fact)
+            .collect::<Vec<_>>();
+        if recomputed != facts {
+            return Err(std::io::Error::other(
+                "retained mismatch summary omits or substitutes an observation difference",
+            ));
+        }
     }
     Ok(())
 }
@@ -1608,6 +1634,7 @@ fn verify_observation_bundle_case_bytes(
         manifest_identity.process_helper_sha256,
         !regression_oracle,
     )?;
+    verify_case_comparison_projection(directory, case)?;
     if regression_oracle {
         validate_regression_claim_sources(directory, case)?;
     }
@@ -1620,6 +1647,43 @@ fn verify_observation_bundle_case_bytes(
         }
     }
     Ok(digest)
+}
+
+fn verify_case_comparison_projection(
+    directory: &Path,
+    case: &DifferentialCase,
+) -> std::io::Result<()> {
+    let retained = fs::read_to_string(directory.join("comparison-projection.json"))?;
+    let retained = parse_comparison_projection_json(&retained)?;
+    let (recomputed, mismatch_sides) = recompute_projected_mismatch_sides(directory, case)?;
+    if retained != recomputed {
+        return Err(std::io::Error::other(
+            "retained comparison projection is not derived from current case authority and evidence",
+        ));
+    }
+    let summary = fs::read_to_string(directory.join("mismatch-summary.json"))?;
+    let facts = parse_mismatch_summary(&summary)?;
+    let recomputed_facts = mismatch_sides
+        .iter()
+        .map(|side| side.fact.clone())
+        .collect::<Vec<_>>();
+    if facts != recomputed_facts {
+        return Err(std::io::Error::other(
+            "retained mismatch summary omits or substitutes an in-scope observation difference",
+        ));
+    }
+    if matches!(
+        retained,
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+    ) {
+        let raw = raw_mismatch_facts(directory)?;
+        if raw.len() != 1 || raw[0].category != crate::MismatchKind::Stderr {
+            return Err(std::io::Error::other(
+                "reviewed failure projection does not retain exactly one raw stderr difference",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_regression_claim_sources(
@@ -1637,6 +1701,8 @@ fn validate_regression_claim_sources(
         target.expected_presentation_shadow_normalizer = None;
         target.expected_normalized_presentation_sha256 = None;
         target.expected_lazy_argument_exit_sha256 = None;
+        target.expected_whnf_argument_failure_sha256 = None;
+        target.expected_nonproductive_trace_sha256 = None;
         target.expected_single_task_lifecycle_sha256 = None;
         target.expected_task_trace_sha256 = None;
         target.expected_process_status_sha256 = None;
@@ -2330,6 +2396,7 @@ fn runtime_causal_signal(signal: CausalSignal) -> bool {
         signal,
         CausalSignal::RuntimeAdapter
             | CausalSignal::RuntimeAdapterAndForceTrace
+            | CausalSignal::ForceTrace
             | CausalSignal::EffectEvent
             | CausalSignal::TaskAndCancellation
             | CausalSignal::PresentationField
@@ -2361,6 +2428,9 @@ pub enum ObservationEquivalence {
     Exact,
     /// The declared typed claim normalizers are required for equality.
     Normalized(Vec<NormalizerId>),
+    /// A reviewed failing runtime case differs only in host error prose that
+    /// is outside every declared Presentation target.
+    ReviewedRuntimeFailureStderr(Vec<RetainedMismatchFact>),
 }
 
 /// One canonical retained mismatch category and its bounded side digests.
@@ -2375,6 +2445,9 @@ pub struct RetainedMismatchFact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RetainedObservationClassification {
     Exact,
+    ProjectedRuntimeFailureStderr {
+        raw_mismatches: Vec<RetainedMismatchFact>,
+    },
     Normalized {
         normalizers: Vec<NormalizerId>,
         raw_mismatches: Vec<RetainedMismatchFact>,
@@ -2406,7 +2479,8 @@ pub fn classify_retained_observation_bundle(
     let summary = fs::read_to_string(directory.join("mismatch-summary.json"))?;
     let normalized_mismatches = parse_mismatch_summary(&summary)?;
     verify_mismatch_fact_bytes(directory, &normalized_mismatches)?;
-    let recomputed = recompute_mismatch_sides(directory)?
+    let (projection, recomputed) = recompute_projected_mismatch_sides(directory, case)?;
+    let recomputed = recomputed
         .into_iter()
         .map(|side| side.fact)
         .collect::<Vec<_>>();
@@ -2422,7 +2496,19 @@ pub fn classify_retained_observation_bundle(
         &raw_mismatches,
         &normalized_mismatches,
     );
-    if normalized_mismatches.is_empty() {
+    if normalized_mismatches.is_empty()
+        && matches!(
+            projection,
+            crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+        )
+    {
+        if raw_mismatches.len() != 1 || raw_mismatches[0].category != crate::MismatchKind::Stderr {
+            return Err(std::io::Error::other(
+                "reviewed failure projection lacks its retained raw stderr difference",
+            ));
+        }
+        Ok(RetainedObservationClassification::ProjectedRuntimeFailureStderr { raw_mismatches })
+    } else if normalized_mismatches.is_empty() {
         if raw_mismatches.is_empty() {
             Ok(RetainedObservationClassification::Exact)
         } else if normalizers.is_empty() {
@@ -2461,6 +2547,167 @@ struct ObservationComparisonFields<'a> {
 
 fn recompute_mismatch_sides(directory: &Path) -> std::io::Result<Vec<RetainedMismatchSide>> {
     recompute_mismatch_sides_between(&directory.join("oracle"), &directory.join("candidate"))
+}
+
+fn recompute_projected_mismatch_sides(
+    directory: &Path,
+    case: &DifferentialCase,
+) -> std::io::Result<(
+    crate::DifferentialComparisonProjection,
+    Vec<RetainedMismatchSide>,
+)> {
+    let mut mismatches = recompute_mismatch_sides(directory)?;
+    let projection = retained_runtime_failure_stderr_projection(directory, case)?;
+    if !matches!(projection, crate::DifferentialComparisonProjection::Exact) {
+        mismatches.retain(|mismatch| mismatch.fact.category != crate::MismatchKind::Stderr);
+    }
+    Ok((projection, mismatches))
+}
+
+fn retained_runtime_failure_stderr_projection(
+    directory: &Path,
+    case: &DifferentialCase,
+) -> std::io::Result<crate::DifferentialComparisonProjection> {
+    let Some(builtin) = crate::reviewed_runtime_failure_stderr_builtin(case) else {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    };
+    let oracle_directory = directory.join("oracle");
+    let candidate_directory = directory.join("candidate");
+    let oracle_document = fs::read_to_string(oracle_directory.join("observation.json"))?;
+    let candidate_document = fs::read_to_string(candidate_directory.join("observation.json"))?;
+    let oracle = observation_comparison_fields(&oracle_document)?;
+    let candidate = observation_comparison_fields(&candidate_document)?;
+    if oracle.mode != "Run"
+        || candidate.mode != "Run"
+        || oracle.timed_out
+        || candidate.timed_out
+        || observation_status_success(oracle.status)?
+        || observation_status_success(candidate.status)?
+        || oracle.status != candidate.status
+        || oracle.filesystem != candidate.filesystem
+        || fs::read(oracle_directory.join("stdout.bin"))?
+            != fs::read(candidate_directory.join("stdout.bin"))?
+    {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    let oracle_stderr = fs::read(oracle_directory.join("stderr.bin"))?;
+    let candidate_stderr = fs::read(candidate_directory.join("stderr.bin"))?;
+    let (oracle_bytes, oracle_sha256, oracle_truncated) =
+        observation_capture_summary(&oracle_document, "stderr")?;
+    let (candidate_bytes, candidate_sha256, candidate_truncated) =
+        observation_capture_summary(&candidate_document, "stderr")?;
+    if oracle_truncated || candidate_truncated {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    if u64::try_from(oracle_stderr.len()).unwrap_or(u64::MAX) != oracle_bytes
+        || u64::try_from(candidate_stderr.len()).unwrap_or(u64::MAX) != candidate_bytes
+        || sha256_bytes(&oracle_stderr) != oracle_sha256
+        || sha256_bytes(&candidate_stderr) != candidate_sha256
+    {
+        return Err(std::io::Error::other(
+            "retained stderr bytes disagree with their observation identity",
+        ));
+    }
+    if oracle_stderr == candidate_stderr {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    if !parse_semantic_coverage(&candidate_document)?
+        .contains(&CoverageEvent::EnteredAdapter(builtin))
+    {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    let expected_task_trace = crate::reviewed_runtime_failure_expected_task_trace(case, builtin)
+        .map_err(|()| std::io::Error::other("reviewed failure task authority is inconsistent"))?;
+    if let Some(expected) = expected_task_trace {
+        let mut tasks = Vec::<u64>::new();
+        let mut events = Vec::new();
+        for (task, event_builtin, event) in parse_semantic_task_trace(&candidate_document)? {
+            if event_builtin != builtin {
+                continue;
+            }
+            let index = tasks
+                .iter()
+                .position(|candidate| *candidate == task)
+                .unwrap_or_else(|| {
+                    tasks.push(task);
+                    tasks.len() - 1
+                });
+            events.push((index, event));
+        }
+        if crate::task_trace_sha256(events.iter().map(|(task, event)| (*task, event.as_str())))
+            != expected
+        {
+            return Ok(crate::DifferentialComparisonProjection::Exact);
+        }
+    }
+    let effects = parse_semantic_effect_trace(&candidate_document)?
+        .into_iter()
+        .filter(|event| event.builtin == builtin)
+        .collect::<Vec<_>>();
+    if effects.len() != 2
+        || effects[0].owner_task != effects[1].owner_task
+        || effects[0].sequence != effects[1].sequence
+        || effects[0].parent_sequence != effects[1].parent_sequence
+        || effects[0].lifecycle != "started"
+        || effects[1].lifecycle != "failed"
+    {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    Ok(
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        },
+    )
+}
+
+fn observation_status_success(status: &str) -> std::io::Result<bool> {
+    status
+        .strip_prefix("{\"success\": ")
+        .and_then(|status| status.split_once(", \"code\": "))
+        .and_then(|(success, _)| match success {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+        .ok_or_else(|| std::io::Error::other("observation status success is malformed"))
+}
+
+fn observation_capture_summary(
+    document: &str,
+    field: &str,
+) -> std::io::Result<(u64, Digest, bool)> {
+    let value = exact_observation_field(document, field)?;
+    let (total_bytes, value) = value
+        .strip_prefix("{\"totalBytes\": ")
+        .and_then(|value| value.split_once(", \"sha256\": \""))
+        .ok_or_else(|| std::io::Error::other("observation capture is malformed"))?;
+    let (sha256, truncated) = value
+        .split_once("\", \"truncated\": ")
+        .and_then(|(sha256, truncated)| {
+            truncated
+                .strip_suffix('}')
+                .map(|truncated| (sha256, truncated))
+        })
+        .ok_or_else(|| std::io::Error::other("observation capture is malformed"))?;
+    let total_bytes = total_bytes
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == total_bytes)
+        .ok_or_else(|| std::io::Error::other("observation capture size is noncanonical"))?;
+    let sha256 = Digest::from_hex(sha256).map_err(std::io::Error::other)?;
+    let truncated = match truncated {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(std::io::Error::other(
+                "observation capture truncation is malformed",
+            ));
+        }
+    };
+    Ok((total_bytes, sha256, truncated))
 }
 
 fn recompute_mismatch_sides_between(
@@ -2826,6 +3073,103 @@ fn mismatch_summary_json(facts: &[RetainedMismatchFact]) -> String {
     output
 }
 
+fn comparison_projection_json(projection: &crate::DifferentialComparisonProjection) -> String {
+    match projection {
+        crate::DifferentialComparisonProjection::Exact => concat!(
+            "{\n",
+            "  \"schemaVersion\": 1,\n",
+            "  \"kind\": \"exact\"\n",
+            "}\n"
+        )
+        .to_owned(),
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        } => format!(
+            concat!(
+                "{{\n",
+                "  \"schemaVersion\": 1,\n",
+                "  \"kind\": \"reviewed-runtime-failure-stderr-out-of-scope\",\n",
+                "  \"field\": \"stderr\",\n",
+                "  \"oracleSha256\": \"{}\",\n",
+                "  \"candidateSha256\": \"{}\",\n",
+                "  \"oracleBytes\": {},\n",
+                "  \"candidateBytes\": {}\n",
+                "}}\n"
+            ),
+            oracle_sha256.hex(),
+            candidate_sha256.hex(),
+            oracle_bytes,
+            candidate_bytes,
+        ),
+    }
+}
+
+fn parse_comparison_projection_json(
+    document: &str,
+) -> std::io::Result<crate::DifferentialComparisonProjection> {
+    let exact = crate::DifferentialComparisonProjection::Exact;
+    if document == comparison_projection_json(&exact) {
+        return Ok(exact);
+    }
+    let mut lines = document.lines();
+    if lines.next() != Some("{")
+        || lines.next() != Some("  \"schemaVersion\": 1,")
+        || lines.next() != Some("  \"kind\": \"reviewed-runtime-failure-stderr-out-of-scope\",")
+        || lines.next() != Some("  \"field\": \"stderr\",")
+    {
+        return Err(std::io::Error::other(
+            "comparison projection schema is malformed",
+        ));
+    }
+    let oracle_sha256 = projection_digest_line(lines.next(), "oracleSha256")?;
+    let candidate_sha256 = projection_digest_line(lines.next(), "candidateSha256")?;
+    let oracle_bytes = projection_u64_line(lines.next(), "oracleBytes")?;
+    let candidate_bytes = projection_u64_line(lines.next(), "candidateBytes")?;
+    if lines.next() != Some("}") || lines.next().is_some() {
+        return Err(std::io::Error::other(
+            "comparison projection has unknown fields",
+        ));
+    }
+    let projection = crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+        oracle_sha256,
+        candidate_sha256,
+        oracle_bytes,
+        candidate_bytes,
+    };
+    if comparison_projection_json(&projection) != document {
+        return Err(std::io::Error::other(
+            "comparison projection is noncanonical",
+        ));
+    }
+    Ok(projection)
+}
+
+fn projection_digest_line(line: Option<&str>, field: &str) -> std::io::Result<Digest> {
+    let prefix = format!("  \"{field}\": \"");
+    let value = line
+        .and_then(|line| line.strip_suffix(','))
+        .and_then(|line| line.strip_prefix(&prefix))
+        .and_then(|line| line.strip_suffix('"'))
+        .ok_or_else(|| std::io::Error::other("comparison projection digest is malformed"))?;
+    Digest::from_hex(value).map_err(std::io::Error::other)
+}
+
+fn projection_u64_line(line: Option<&str>, field: &str) -> std::io::Result<u64> {
+    let prefix = format!("  \"{field}\": ");
+    let value = line
+        .map(|line| line.strip_suffix(',').unwrap_or(line))
+        .and_then(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| std::io::Error::other("comparison projection size is malformed"))?;
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .ok_or_else(|| std::io::Error::other("comparison projection size is noncanonical"))
+}
+
 fn parse_mismatch_summary(document: &str) -> std::io::Result<Vec<RetainedMismatchFact>> {
     let mut lines = document.lines();
     if lines.next() != Some("{") || lines.next() != Some("  \"schemaVersion\": 1,") {
@@ -2954,6 +3298,9 @@ pub fn classify_observation_bundle_for_case(
 ) -> std::io::Result<ObservationEquivalence> {
     match classify_retained_observation_bundle(directory, case)? {
         RetainedObservationClassification::Exact => Ok(ObservationEquivalence::Exact),
+        RetainedObservationClassification::ProjectedRuntimeFailureStderr { raw_mismatches } => Ok(
+            ObservationEquivalence::ReviewedRuntimeFailureStderr(raw_mismatches),
+        ),
         RetainedObservationClassification::Normalized { normalizers, .. } => {
             Ok(ObservationEquivalence::Normalized(normalizers))
         }
@@ -3062,7 +3409,10 @@ fn validate_claim_semantics(
             &obligation_trace,
             &effect_trace,
         )?;
+        validate_force_only_target(target, builtin.id, &observed, &obligation_trace)?;
         validate_expected_lazy_argument_exit(target, builtin.id, &boundaries)?;
+        validate_expected_whnf_argument_failure(target, builtin.id, &boundaries)?;
+        validate_expected_nonproductive_trace(target, builtin.id, &boundaries)?;
         validate_expected_single_task_lifecycle(target, builtin.id, &task_trace, &effect_trace)?;
         validate_expected_task_trace(target, builtin.id, &task_trace)?;
         if let Some(expected) = target.expected_process_status_sha256 {
@@ -3202,6 +3552,29 @@ fn validate_nested_ord_comparator_evidence(
     Ok(())
 }
 
+fn validate_force_only_target(
+    target: &crate::EvidenceTargetV2,
+    builtin: hell_builtins::BuiltinId,
+    observed: &[CoverageEvent],
+    obligation_trace: &[crate::ObligationTraceEvent],
+) -> std::io::Result<()> {
+    if target.causal_signal != CausalSignal::ForceTrace {
+        return Ok(());
+    }
+    if observed.contains(&CoverageEvent::EnteredAdapter(builtin))
+        || obligation_trace
+            .iter()
+            .any(|event| event.builtin == builtin)
+        || target.expected_instance_target.is_some()
+        || !target.expected_instance_premises.is_empty()
+        || target.expected_comparator_trace_sha256.is_some()
+        || target.expected_typed_result_sha256.is_some()
+    {
+        return Err(target_expectation_error(target, "pre-adapter force trace"));
+    }
+    Ok(())
+}
+
 fn validate_retained_target_expectations(
     target: &crate::EvidenceTargetV2,
     builtin: hell_builtins::BuiltinId,
@@ -3257,7 +3630,13 @@ fn target_expectation_error(target: &crate::EvidenceTargetV2, label: &str) -> st
 fn validate_exact_lazy_adapter_entry_target(
     target: &crate::EvidenceTargetV2,
     builtin: &hell_builtins::BuiltinSpec,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
     obligation_trace: &[crate::ObligationTraceEvent],
 ) -> std::io::Result<()> {
     if target.dimension != hell_builtins::CompatibilityDimension::PureRuntime
@@ -3265,10 +3644,14 @@ fn validate_exact_lazy_adapter_entry_target(
     {
         return Ok(());
     }
-    let invocation_count = obligation_trace
-        .iter()
-        .filter(|event| event.builtin == builtin.id)
-        .count();
+    let invocation_count = if target.causal_signal == CausalSignal::ForceTrace {
+        1
+    } else {
+        obligation_trace
+            .iter()
+            .filter(|event| event.builtin == builtin.id)
+            .count()
+    };
     if exact_lazy_adapter_entry_states(builtin.id, boundaries, invocation_count) {
         Ok(())
     } else {
@@ -3414,19 +3797,89 @@ fn validate_expected_comparator_trace(
 fn validate_expected_lazy_argument_exit(
     target: &crate::EvidenceTargetV2,
     builtin: hell_builtins::BuiltinId,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
 ) -> std::io::Result<()> {
     let Some(expected) = target.expected_lazy_argument_exit_sha256 else {
         return Ok(());
     };
     let states = boundaries
         .iter()
-        .filter(|(id, _, class, _)| *id == builtin && class == "lazy-adapter-exit")
-        .map(|(_, argument, _, outcome)| (*argument, outcome.as_str()))
+        .filter(|(id, _, class, _, _)| *id == builtin && class == "lazy-adapter-exit")
+        .map(|(_, argument, _, outcome, _)| (*argument, outcome.as_str()))
         .collect::<Vec<_>>();
     if states.is_empty() || crate::lazy_argument_exit_sha256(states) != expected {
         return Err(std::io::Error::other(format!(
             "retained lazy argument exit states disagree for {:?}/{:?}",
+            target.builtin, target.dimension
+        )));
+    }
+    Ok(())
+}
+
+fn validate_expected_whnf_argument_failure(
+    target: &crate::EvidenceTargetV2,
+    builtin: hell_builtins::BuiltinId,
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
+) -> std::io::Result<()> {
+    let Some(expected) = target.expected_whnf_argument_failure_sha256 else {
+        return Ok(());
+    };
+    let failures = boundaries
+        .iter()
+        .filter(|(id, _, class, _, _)| *id == builtin && class == "whnf-force-failed")
+        .map(|(_, argument, _, outcome, error_code)| {
+            (
+                *argument,
+                outcome.as_str(),
+                error_code.as_deref().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() || crate::whnf_argument_failure_sha256(failures) != expected {
+        return Err(std::io::Error::other(format!(
+            "retained WHNF argument failure disagrees for {:?}/{:?}",
+            target.builtin, target.dimension
+        )));
+    }
+    Ok(())
+}
+
+fn validate_expected_nonproductive_trace(
+    target: &crate::EvidenceTargetV2,
+    builtin: hell_builtins::BuiltinId,
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
+) -> std::io::Result<()> {
+    let Some(expected) = target.expected_nonproductive_trace_sha256 else {
+        return Ok(());
+    };
+    let events = boundaries
+        .iter()
+        .filter(|(id, argument, class, _, _)| {
+            *id == builtin && *argument == 0 && class.starts_with("nonproductive-")
+        })
+        .map(|(_, _, class, outcome, _)| (class.as_str(), outcome.as_str()))
+        .collect::<Vec<_>>();
+    if events.is_empty() || crate::nonproductive_trace_sha256(events) != expected {
+        return Err(std::io::Error::other(format!(
+            "retained nonproductive trace disagrees for {:?}/{:?}",
             target.builtin, target.dimension
         )));
     }
@@ -3462,23 +3915,7 @@ fn validate_expected_single_task_lifecycle(
         .last()
         .map(|entry| entry.1)
         .ok_or_else(|| std::io::Error::other("target task lifecycle is empty"))?;
-    let expected_effect = match terminal {
-        "completed" => "completed",
-        "cancelled"
-            if hell_builtins::registry()
-                .iter()
-                .find(|spec| spec.id == builtin)
-                .is_some_and(|spec| spec.name == "Timeout.timeout") =>
-        {
-            "completed"
-        }
-        "failed" | "cancelled" => "failed",
-        _ => {
-            return Err(std::io::Error::other(
-                "target task lifecycle lacks an exact terminal",
-            ));
-        }
-    };
+    let expected_effect = expected_effect_terminal_for_task(builtin, terminal)?;
     if !effect_trace
         .iter()
         .any(|entry| entry.builtin == builtin && entry.lifecycle == expected_effect)
@@ -3488,6 +3925,27 @@ fn validate_expected_single_task_lifecycle(
         ));
     }
     Ok(())
+}
+
+fn expected_effect_terminal_for_task(
+    builtin: hell_builtins::BuiltinId,
+    task_terminal: &str,
+) -> std::io::Result<&'static str> {
+    let builtin_name = hell_builtins::registry()
+        .iter()
+        .find(|spec| spec.id == builtin)
+        .map(|spec| spec.name);
+    match (task_terminal, builtin_name) {
+        ("completed", _) | ("cancelled", Some("Timeout.timeout")) => Ok("completed"),
+        ("failed", _) => Ok("failed"),
+        ("cancelled", Some("Concurrent.threadDelay")) => Ok("cancelled"),
+        ("cancelled", _) => Err(std::io::Error::other(
+            "target task cancellation has no reviewed effect correlation",
+        )),
+        _ => Err(std::io::Error::other(
+            "target task lifecycle lacks an exact terminal",
+        )),
+    }
 }
 
 fn validate_expected_task_trace(
@@ -3702,6 +4160,7 @@ fn validate_runtime_scope_binding(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_runtime_boundary_binding(
     case: &DifferentialCase,
     target: &crate::EvidenceTargetV2,
@@ -4323,7 +4782,7 @@ struct ConformanceObservationFacts {
     resource_audit_failures: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_obligation_semantics(
     obligation: &str,
     dimension: hell_builtins::CompatibilityDimension,
@@ -4337,7 +4796,13 @@ fn validate_obligation_semantics(
     obligation_trace: &[crate::ObligationTraceEvent],
     typed_result: Option<Digest>,
     typed_result_builtin: Option<u16>,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
     platforms: &[hell_builtins::ClaimPlatform],
     expected_raw_presentation_sha256: Option<Digest>,
     expected_presentation_shadow_normalizer: Option<PresentationShadowNormalizerId>,
@@ -4369,19 +4834,31 @@ fn validate_obligation_semantics(
         .collect::<Vec<_>>();
     let entered = observed.contains(&CoverageEvent::EnteredAdapter(builtin));
     let success = parse_observation_success(document)?;
+    let result_force_failed = typed_adapter_result_is_force_error(
+        document,
+        observation_directory,
+        typed_result,
+        typed_result_builtin,
+        builtin,
+    )?;
     let satisfied = if dimension == CompatibilityDimension::PureRuntime {
         let flags = u8::from(success)
             | (u8::from(entered) << 1)
             | (u8::from(effect("started")) << 2)
             | (u8::from(typed_result.is_some() && typed_result_builtin == Some(builtin.0)) << 3)
-            | (u8::from(effect("failed")) << 4);
+            | (u8::from(effect("failed")) << 4)
+            | (u8::from(result_force_failed) << 5);
         evaluate_pure_runtime_obligation(obligation, flags, &adapter_events, boundaries, builtin)
     } else {
         match (dimension, obligation) {
             (CompatibilityDimension::Effects, "effect-success") => success && effect("completed"),
             (CompatibilityDimension::Effects, "effect-failure") => !success && effect("failed"),
+            (CompatibilityDimension::Effects, "effect-cancellation") => {
+                success && effect("cancelled")
+            }
             (CompatibilityDimension::Effects, "effect-ordering") => {
-                effect("started") && (effect("completed") || effect("failed"))
+                effect("started")
+                    && (effect("completed") || effect("failed") || effect("cancelled"))
             }
             (CompatibilityDimension::Concurrency, "task-lifecycle") => {
                 complete_task_lifecycle(&tasks)
@@ -4455,6 +4932,47 @@ fn validate_obligation_semantics(
             "{dimension:?} obligation {obligation} for {builtin_name} lacks target-scoped semantic evidence"
         )))
     }
+}
+
+fn typed_adapter_result_is_force_error(
+    document: &str,
+    observation_directory: &Path,
+    digest: Option<Digest>,
+    typed_builtin: Option<u16>,
+    builtin: hell_builtins::BuiltinId,
+) -> std::io::Result<bool> {
+    if digest.is_none() || typed_builtin != Some(builtin.0) {
+        return Ok(false);
+    }
+    let canonical = if observation_directory.as_os_str().is_empty() {
+        let encoded = exact_observation_field(document, "semanticTypedResultHex")?
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| std::io::Error::other("typed result hex is malformed"))?;
+        String::from_utf8(
+            crate::decode_canonical_hex(encoded)
+                .ok_or_else(|| std::io::Error::other("typed result hex is noncanonical"))?,
+        )
+        .map_err(|_| std::io::Error::other("typed result is not UTF-8"))?
+    } else {
+        fs::read_to_string(observation_directory.join("semantic-typed-result.json"))?
+            .strip_suffix('\n')
+            .ok_or_else(|| {
+                std::io::Error::other("retained typed result lacks one trailing newline")
+            })?
+            .to_owned()
+    };
+    crate::validate_canonical_typed_value(&canonical)?;
+    if Some(sha256_bytes(canonical.as_bytes())) != digest {
+        return Err(std::io::Error::other(
+            "typed adapter result bytes disagree with their digest",
+        ));
+    }
+    Ok(canonical.starts_with(concat!(
+        "{\"type\":\"TypedResult\",\"argument\":0,",
+        "\"boundary\":\"adapter-result\",\"value\":",
+        "{\"type\":\"ForceBoundary\",\"outcome\":\"error\",\"code\":\"",
+    )))
 }
 
 fn validate_presentation_obligation(
@@ -4832,9 +5350,31 @@ fn evaluate_pure_runtime_obligation(
     obligation: &str,
     flags: u8,
     events: &[&crate::ObligationTraceEvent],
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
     builtin: hell_builtins::BuiltinId,
 ) -> bool {
+    let pre_adapter_whnf_failure = flags & 0b10 == 0
+        && events.is_empty()
+        && boundaries
+            .iter()
+            .any(|(id, _, class, outcome, error_code)| {
+                *id == builtin
+                    && class == "whnf-force-failed"
+                    && outcome == "error"
+                    && error_code.is_some()
+            });
+    if obligation == "whnf-failure-boundary" {
+        return flags & 0b01 == 0 && pre_adapter_whnf_failure;
+    }
+    if obligation == "lazy-boundary" && pre_adapter_whnf_failure {
+        return exact_lazy_adapter_entry_states(builtin, boundaries, 1);
+    }
     pure_runtime_obligation_satisfied(
         obligation,
         &PureRuntimeFacts {
@@ -4864,7 +5404,13 @@ fn evaluate_pure_runtime_obligation(
 
 fn exact_demand_argument_states(
     builtin: hell_builtins::BuiltinId,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
     demand: hell_builtins::Demand,
     class: &str,
 ) -> bool {
@@ -4877,16 +5423,16 @@ fn exact_demand_argument_states(
         .collect::<Vec<_>>();
     let observed = boundaries
         .iter()
-        .filter(|(id, _, observed_class, _)| *id == builtin && observed_class == class)
+        .filter(|(id, _, observed_class, _, _)| *id == builtin && observed_class == class)
         .collect::<Vec<_>>();
     !expected.is_empty()
         && observed.len() == expected.len()
         && expected.iter().all(|argument| {
             observed
                 .iter()
-                .any(|(_, observed, _, _)| observed == argument)
+                .any(|(_, observed, _, _, _)| observed == argument)
         })
-        && observed.iter().all(|(_, argument, _, outcome)| {
+        && observed.iter().all(|(_, argument, _, outcome, _)| {
             expected.contains(argument)
                 && match demand {
                     hell_builtins::Demand::OnIoExecution => {
@@ -4899,7 +5445,13 @@ fn exact_demand_argument_states(
 
 fn exact_conditional_branch_partition(
     builtin: hell_builtins::BuiltinId,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
 ) -> bool {
     let expected = hell_builtins::registry()[usize::from(builtin.0)]
         .demand
@@ -4910,33 +5462,39 @@ fn exact_conditional_branch_partition(
         .collect::<Vec<_>>();
     let observed = boundaries
         .iter()
-        .filter(|(id, _, class, _)| *id == builtin && class == "conditional-branch")
+        .filter(|(id, _, class, _, _)| *id == builtin && class == "conditional-branch")
         .collect::<Vec<_>>();
     expected.len() == 2
         && observed.len() == 2
         && observed
             .iter()
-            .filter(|(_, _, _, outcome)| outcome == "value")
+            .filter(|(_, _, _, outcome, _)| outcome == "value")
             .count()
             == 1
         && observed
             .iter()
-            .filter(|(_, _, _, outcome)| outcome == "not-forced")
+            .filter(|(_, _, _, outcome, _)| outcome == "not-forced")
             .count()
             == 1
         && expected.iter().all(|argument| {
             observed
                 .iter()
-                .any(|(_, observed, _, _)| observed == argument)
+                .any(|(_, observed, _, _, _)| observed == argument)
         })
         && observed
             .iter()
-            .all(|(_, argument, _, _)| expected.contains(argument))
+            .all(|(_, argument, _, _, _)| expected.contains(argument))
 }
 
 fn exact_lazy_adapter_entry_states(
     builtin: hell_builtins::BuiltinId,
-    boundaries: &[(hell_builtins::BuiltinId, u16, String, String)],
+    boundaries: &[(
+        hell_builtins::BuiltinId,
+        u16,
+        String,
+        String,
+        Option<String>,
+    )],
     invocation_count: usize,
 ) -> bool {
     let spec = &hell_builtins::registry()[usize::from(builtin.0)];
@@ -4949,7 +5507,7 @@ fn exact_lazy_adapter_entry_states(
         .collect::<Vec<_>>();
     let observed = boundaries
         .iter()
-        .filter(|(id, _, class, _)| *id == builtin && class == "lazy-adapter-entry")
+        .filter(|(id, _, class, _, _)| *id == builtin && class == "lazy-adapter-entry")
         .collect::<Vec<_>>();
     !expected.is_empty()
         && invocation_count != 0
@@ -4957,13 +5515,13 @@ fn exact_lazy_adapter_entry_states(
         && expected.iter().all(|argument| {
             observed
                 .iter()
-                .filter(|(_, observed, _, _)| observed == argument)
+                .filter(|(_, observed, _, _, _)| observed == argument)
                 .count()
                 == invocation_count
         })
-        && observed
-            .iter()
-            .all(|(_, argument, _, outcome)| expected.contains(argument) && outcome == "not-forced")
+        && observed.iter().all(|(_, argument, _, outcome, _)| {
+            expected.contains(argument) && outcome == "not-forced"
+        })
 }
 
 fn pure_runtime_obligation_satisfied(obligation: &str, facts: &PureRuntimeFacts<'_>) -> bool {
@@ -4972,6 +5530,7 @@ fn pure_runtime_obligation_satisfied(obligation: &str, facts: &PureRuntimeFacts<
     let effect_started = facts.flags & 4 != 0;
     let typed_result_matches = facts.flags & 8 != 0;
     let effect_failed = facts.flags & 16 != 0;
+    let result_force_failed = facts.flags & 32 != 0;
     let events = facts.events;
     let boundaries = facts.boundaries;
     match obligation {
@@ -4982,6 +5541,13 @@ fn pure_runtime_obligation_satisfied(obligation: &str, facts: &PureRuntimeFacts<
             !success
                 && entered
                 && (effect_failed || events.iter().any(|event| event.outcome.as_ref() == "error"))
+        }
+        "result-force-failure" => {
+            !success
+                && entered
+                && result_force_failed
+                && events.len() == 1
+                && events[0].outcome.as_ref() == "alias"
         }
         "lazy-boundary" => boundaries[0],
         "whnf-boundary" => boundaries[1],
@@ -5100,6 +5666,9 @@ fn target_has_causal_signal(
                 |event| matches!(event, CoverageEvent::ForcedArgument(id, _) if *id == builtin),
             )
         }
+        CausalSignal::ForceTrace => observed
+            .iter()
+            .any(|event| matches!(event, CoverageEvent::ForcedArgument(id, _) if *id == builtin)),
         CausalSignal::EffectEvent => observed
             .iter()
             .any(|event| matches!(event, CoverageEvent::ExecutedEffect(id, _) if *id == builtin)),
@@ -5514,9 +6083,7 @@ fn parse_optional_u16_field(document: &str, field: &str) -> std::io::Result<Opti
         .map_err(|_| std::io::Error::other(format!("{field} is not a builtin ID")))
 }
 
-fn parse_semantic_boundaries(
-    document: &str,
-) -> std::io::Result<Vec<(hell_builtins::BuiltinId, u16, String, String)>> {
+fn parse_semantic_boundaries(document: &str) -> std::io::Result<Vec<RetainedSemanticBoundary>> {
     let prefix = "  \"semanticBoundaries\": [";
     let mut lines = document
         .lines()
@@ -5542,10 +6109,24 @@ fn parse_semantic_boundaries(
             let (argument, entry) = entry
                 .split_once(", \"class\": \"")
                 .ok_or_else(|| std::io::Error::other("semantic boundary is malformed"))?;
-            let (class, outcome) = entry
+            let (class, outcome_fields) = entry
                 .split_once("\", \"outcome\": \"")
-                .and_then(|(class, outcome)| outcome.strip_suffix('"').map(|value| (class, value)))
                 .ok_or_else(|| std::io::Error::other("semantic boundary is malformed"))?;
+            let (outcome, error_code) = if let Some((outcome, error_code)) =
+                outcome_fields.split_once("\", \"errorCode\": \"")
+            {
+                let error_code = error_code
+                    .strip_suffix('"')
+                    .ok_or_else(|| std::io::Error::other("semantic boundary is malformed"))?;
+                (outcome, Some(error_code))
+            } else {
+                (
+                    outcome_fields
+                        .strip_suffix('"')
+                        .ok_or_else(|| std::io::Error::other("semantic boundary is malformed"))?,
+                    None,
+                )
+            };
             let builtin = builtin
                 .parse::<u16>()
                 .map_err(|_| std::io::Error::other("semantic boundary builtin is malformed"))?;
@@ -5557,6 +6138,7 @@ fn parse_semantic_boundaries(
                 argument,
                 class.to_owned(),
                 outcome.to_owned(),
+                error_code.map(str::to_owned),
             ))
         })
         .collect()
@@ -6562,8 +7144,25 @@ fn push_semantic_target_descriptor(output: &mut String, target: &crate::Evidence
         push_toml_string(output, "");
     }
     push_presentation_target_descriptor(output, target);
+    push_runtime_target_digests(output, target);
+    output.push('\n');
+}
+
+fn push_runtime_target_digests(output: &mut String, target: &crate::EvidenceTargetV2) {
     output.push_str("\nexpected_lazy_argument_exit_sha256 = ");
     if let Some(digest) = target.expected_lazy_argument_exit_sha256 {
+        push_toml_string(output, &digest.hex());
+    } else {
+        push_toml_string(output, "");
+    }
+    output.push_str("\nexpected_whnf_argument_failure_sha256 = ");
+    if let Some(digest) = target.expected_whnf_argument_failure_sha256 {
+        push_toml_string(output, &digest.hex());
+    } else {
+        push_toml_string(output, "");
+    }
+    output.push_str("\nexpected_nonproductive_trace_sha256 = ");
+    if let Some(digest) = target.expected_nonproductive_trace_sha256 {
         push_toml_string(output, &digest.hex());
     } else {
         push_toml_string(output, "");
@@ -6598,7 +7197,6 @@ fn push_semantic_target_descriptor(output: &mut String, target: &crate::Evidence
     } else {
         push_toml_string(output, "");
     }
-    output.push('\n');
 }
 
 fn push_presentation_target_descriptor(output: &mut String, target: &crate::EvidenceTargetV2) {
@@ -6666,6 +7264,7 @@ fn causal_signal_name(signal: CausalSignal) -> &'static str {
         CausalSignal::SpecializedBuiltin => "specialized-builtin",
         CausalSignal::RuntimeAdapter => "runtime-adapter",
         CausalSignal::RuntimeAdapterAndForceTrace => "runtime-adapter-and-force-trace",
+        CausalSignal::ForceTrace => "force-trace",
         CausalSignal::EffectEvent => "effect-event",
         CausalSignal::TaskAndCancellation => "task-and-cancellation",
         CausalSignal::PresentationField => "presentation-field",
@@ -7076,7 +7675,11 @@ fn push_semantic_results(output: &mut String, observation: &Observation) {
         for events in semantic.force_trace.chunks_exact(2) {
             if let [
                 LogicalTraceEvent::ForceBuiltinArgument { builtin, argument },
-                LogicalTraceEvent::CompleteThunk { label, outcome },
+                LogicalTraceEvent::CompleteThunk {
+                    label,
+                    outcome,
+                    error_code,
+                },
             ] = events
             {
                 if index != 0 {
@@ -7091,6 +7694,10 @@ fn push_semantic_results(output: &mut String, observation: &Observation) {
                 push_json_string(output, label);
                 output.push_str(", \"outcome\": ");
                 push_json_string(output, outcome);
+                if let Some(error_code) = error_code {
+                    output.push_str(", \"errorCode\": ");
+                    push_json_string(output, error_code);
+                }
                 output.push('}');
                 index += 1;
             }
@@ -7454,6 +8061,7 @@ fn write_bundle_manifest(
         "candidate/stderr.raw.bin".to_owned(),
         "candidate/stdout.bin".to_owned(),
         "case.toml".to_owned(),
+        "comparison-projection.json".to_owned(),
         "execution-input.json".to_owned(),
         "filesystem.diff".to_owned(),
         "main.hell".to_owned(),
@@ -7755,6 +8363,7 @@ mod tests {
         DifferentialReport {
             oracle: observation(crate::ExecutableRole::Oracle),
             candidate: observation(crate::ExecutableRole::Candidate),
+            comparison_projection: crate::DifferentialComparisonProjection::Exact,
             mismatches: Vec::new(),
         }
     }
@@ -8473,6 +9082,7 @@ mod tests {
                 LogicalTraceEvent::CompleteThunk {
                     label: "conditional-selection".into(),
                     outcome: "value".into(),
+                    error_code: None,
                 },
             ],
             effect_trace: vec![
@@ -9082,7 +9692,7 @@ mod tests {
         let source_root = root("http-stream-target-omission-source");
         let (success, mut semantic, stdout) =
             execute_runtime_interaction_with_stdout(case, &source_root);
-        assert!(!success);
+        assert!(success);
         let response_stream = hell_builtins::lookup("Http.responseStream")
             .expect("HTTP stream target")
             .id;
@@ -9409,16 +10019,26 @@ mod tests {
         let typed_target = crate::typed_result_target(case)
             .unwrap_or_else(|error| panic!("{} typed-result target is invalid: {error}", case.id));
         let outcome = if let Some(target) = typed_target {
-            if let Some(instance) = typed_target_instance(case, target) {
+            if let Some(instance) = target.instance {
                 hell_runtime::run_main_with_semantic_trace_target_instance(
-                    program, context, &trace, target, instance,
+                    program,
+                    context,
+                    &trace,
+                    target.builtin,
+                    instance,
                 )
             } else {
-                hell_runtime::run_main_with_semantic_trace_target(program, context, &trace, target)
+                hell_runtime::run_main_with_semantic_trace_target(
+                    program,
+                    context,
+                    &trace,
+                    target.builtin,
+                )
             }
         } else {
             hell_runtime::run_main_with_semantic_trace(program, context, &trace)
         };
+        retain_runtime_error_presentation(&outcome, &stderr);
         let status = match &outcome {
             Ok(()) => crate::ProcessStatus {
                 success: true,
@@ -9461,6 +10081,22 @@ mod tests {
     }
 
     #[cfg(feature = "compat-tracing")]
+    fn retain_runtime_error_presentation(
+        outcome: &hell_runtime::RuntimeResult<()>,
+        stderr: &SharedOutput,
+    ) {
+        let Err(error) = outcome else {
+            return;
+        };
+        if matches!(error.kind, hell_runtime::RuntimeErrorKind::Exit(_)) {
+            return;
+        }
+        let mut retained_stderr = stderr.clone();
+        std::io::Write::write_all(&mut retained_stderr, format!("{error}\n").as_bytes())
+            .expect("retain runtime error presentation");
+    }
+
+    #[cfg(feature = "compat-tracing")]
     fn assert_http_disconnect_trace(
         case: &crate::DifferentialCase,
         semantic: &crate::SemanticObservation,
@@ -9478,23 +10114,13 @@ mod tests {
         assert!(semantic.effect_trace.iter().any(|event| matches!(
             event,
             crate::LogicalTraceEvent::HostEffect { builtin, effect, .. }
+                if *builtin == http_run && effect.as_ref() == "completed"
+        )));
+        assert!(!semantic.effect_trace.iter().any(|event| matches!(
+            event,
+            crate::LogicalTraceEvent::HostEffect { builtin, effect, .. }
                 if *builtin == http_run && effect.as_ref() == "failed"
         )));
-    }
-
-    #[cfg(feature = "compat-tracing")]
-    fn typed_target_instance(
-        case: &crate::DifferentialCase,
-        target: hell_builtins::BuiltinId,
-    ) -> Option<Arc<str>> {
-        case.claim_evidence
-            .iter()
-            .flat_map(|descriptor| &descriptor.semantic_targets)
-            .find(|evidence| {
-                hell_builtins::lookup(&evidence.builtin).map(|builtin| builtin.id) == Some(target)
-                    && evidence.expected_typed_result_sha256.is_some()
-            })
-            .and_then(|evidence| evidence.expected_instance_target.clone())
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -9552,7 +10178,8 @@ mod tests {
             bind_test_process_helpers(std::slice::from_mut(&mut case));
         }
         let root = root(case_id);
-        let (success, semantic, stdout) = execute_runtime_interaction_with_stdout(&case, &root);
+        let (success, status, semantic, stdout, stderr) =
+            execute_runtime_interaction_with_status(&case, &root);
         assert_eq!(success, !runtime_case_expects_failure(&case));
         let mut retained = report();
         for observation in [&mut retained.oracle, &mut retained.candidate] {
@@ -9560,10 +10187,10 @@ mod tests {
             observation.environment_profile = case.environment_profile;
             observation.process_helper_sha256 = case.process_helper_sha256;
             observation.stdout = BoundedCapture::from_bytes(stdout.clone());
-            observation.status = crate::ProcessStatus {
-                success,
-                code: Some(i32::from(!success)),
-            };
+            observation.raw_stderr = BoundedCapture::from_bytes(stderr.clone());
+            observation.claim_input_stderr = BoundedCapture::from_bytes(stderr.clone());
+            observation.stderr = BoundedCapture::from_bytes(stderr.clone());
+            observation.status = status.clone();
         }
         retained.candidate.semantic = Some(semantic);
         let directory =
@@ -9578,6 +10205,14 @@ mod tests {
                 path.display()
             )
         });
+        assert!(
+            typed.contains(original),
+            "typed substitution source was not present"
+        );
+        assert!(
+            !typed.contains(replacement),
+            "typed substitution replacement was already present"
+        );
         let substituted = typed.replace(original, replacement);
         assert_ne!(typed, substituted, "typed substitution did not match");
         fs::write(path, substituted).unwrap();
@@ -9619,8 +10254,8 @@ mod tests {
             ),
             (
                 "runtime-typed-process-set-env",
-                "\"valueHex\":\"626f756e64\"",
-                "\"valueHex\":\"626f756e65\"",
+                "\"environment\":[{\"nameHex\":\"4c435f414c4c\",\"valueHex\":\"43\"}]",
+                "\"environment\":[{\"nameHex\":\"4c435f414c4c\",\"valueHex\":\"504f534958\"}]",
             ),
         ] {
             assert_runtime_typed_substitution_rejected(case_id, original, replacement);
@@ -9694,8 +10329,24 @@ mod tests {
             ("runtime-file-exists-true", b"False\n".as_slice()),
             ("runtime-file-exists-false", b"True\n".as_slice()),
             ("runtime-current-directory-roundtrip", b"forged".as_slice()),
+            (
+                "runtime-current-directory-upstream-available",
+                b"forged".as_slice(),
+            ),
+            (
+                "runtime-directory-exists-invalid-path-false",
+                b"True\n".as_slice(),
+            ),
+            (
+                "runtime-directory-file-exists-invalid-path-false",
+                b"True\n".as_slice(),
+            ),
             ("runtime-directory-get-home-home-a", b"forged-a".as_slice()),
             ("runtime-directory-get-home-home-b", b"forged-b".as_slice()),
+            (
+                "runtime-directory-get-home-platform-fallback",
+                b"True\n".as_slice(),
+            ),
         ] {
             let case = cases
                 .iter()
@@ -9719,44 +10370,40 @@ mod tests {
             "runtime-directory-list-directory-failure",
             "runtime-directory-remove-directory-failure",
             "runtime-directory-set-current-directory-failure",
-            "runtime-directory-get-home-failure",
-            "runtime-current-directory-sandbox-denied",
-            "runtime-directory-exists-invalid-path-failure",
-            "runtime-directory-file-exists-invalid-path-failure",
         ] {
             assert_runtime_failed_effect_substitution_rejected(&cases, case_id);
         }
-        let denied = cases
+        let available = cases
             .iter()
-            .find(|case| case.id.as_ref() == "runtime-current-directory-sandbox-denied")
-            .expect("sandboxed current-directory denial case");
+            .find(|case| case.id.as_ref() == "runtime-current-directory-upstream-available")
+            .expect("upstream current-directory availability case");
         assert_rehashed_process_status_substitution_rejected(
-            denied,
-            "current-directory-denied-status",
-            (false, 1),
+            available,
+            "current-directory-available-status",
             (true, 0),
+            (false, 1),
         );
     }
 
     #[cfg(feature = "compat-tracing")]
     #[test]
-    fn current_directory_denial_rejects_rehashed_profile_substitution() {
+    fn current_directory_availability_rejects_rehashed_profile_substitution() {
         let cases = crate::committed_differential_cases();
         let case = cases
             .iter()
-            .find(|case| case.id.as_ref() == "runtime-current-directory-sandbox-denied")
-            .expect("sandboxed current-directory denial case");
+            .find(|case| case.id.as_ref() == "runtime-current-directory-upstream-available")
+            .expect("upstream current-directory availability case");
         assert_eq!(
             case.claim_evidence.as_ref().unwrap().profile,
-            hell_builtins::ExecutionProfile::Sandboxed
+            hell_builtins::ExecutionProfile::Upstream
         );
         let (root, directory) =
-            retain_executed_runtime_case(case, "current-directory-denied-profile");
+            retain_executed_runtime_case(case, "current-directory-available-profile");
         let descriptor = directory.join("case.toml");
         let document = fs::read_to_string(&descriptor).unwrap();
         let substituted = document.replace(
-            "execution_profile = \"sandboxed\"",
             "execution_profile = \"upstream\"",
+            "execution_profile = \"sandboxed\"",
         );
         assert_ne!(document, substituted, "profile substitution did not match");
         fs::write(descriptor, substituted).unwrap();
@@ -9776,9 +10423,9 @@ mod tests {
             ("runtime-io-pure-success", b"41\n".as_slice()),
             ("runtime-io-pure-text", b"forged\n".as_slice()),
             ("runtime-io-pure-ignored-bottom", b"before".as_slice()),
-            ("runtime-io-buffering-block", b"pending".as_slice()),
-            ("runtime-io-buffering-line", b"line\npending".as_slice()),
-            ("runtime-io-buffering-none", b"".as_slice()),
+            ("runtime-io-buffering-block", b"1\npending".as_slice()),
+            ("runtime-io-buffering-line", b"5\nline\npending".as_slice()),
+            ("runtime-io-buffering-none", b"0\npending".as_slice()),
         ] {
             let case = cases
                 .iter()
@@ -9909,7 +10556,7 @@ mod tests {
         let (argument, outcome) = parse_semantic_boundaries(&document)
             .expect("retained semantic boundaries parse")
             .iter()
-            .find_map(|(id, argument, observed_class, outcome)| {
+            .find_map(|(id, argument, observed_class, outcome, _)| {
                 (*id == spec.id && observed_class == class).then_some((*argument, outcome.clone()))
             })
             .unwrap_or_else(|| panic!("{case_id}/{builtin} retains no {class} state"));
@@ -9948,7 +10595,7 @@ mod tests {
         let outcome = parse_semantic_boundaries(&document)
             .expect("retained semantic boundaries parse")
             .iter()
-            .find_map(|(id, observed_argument, observed_class, outcome)| {
+            .find_map(|(id, observed_argument, observed_class, outcome, _)| {
                 (*id == spec.id && *observed_argument == argument && observed_class == class)
                     .then_some(outcome.clone())
             })
@@ -10103,6 +10750,256 @@ mod tests {
         ] {
             assert_runtime_failed_effect_substitution_rejected(&cases, case_id);
         }
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn result_force_failure_requires_one_exact_lazy_adapter_result() {
+        let builtin = hell_builtins::lookup("List.cycle")
+            .expect("List.cycle builtin")
+            .id;
+        let event = |outcome: &'static str| crate::ObligationTraceEvent {
+            builtin,
+            instance_target: None,
+            instance_premises: Vec::new(),
+            owner_task: None,
+            sequence: 1,
+            parent_sequence: None,
+            outcome: Arc::from(outcome),
+            nested_adapters: 0,
+            materialized_before: 0,
+            materialized_after: 0,
+            callbacks: Vec::new(),
+            comparators: Vec::new(),
+        };
+        let alias = event("alias");
+        let flags = 0b10 | 0b10_0000;
+        let one = [&alias];
+        let one_facts = PureRuntimeFacts {
+            flags,
+            events: &one,
+            boundaries: [false; 6],
+        };
+        assert!(pure_runtime_obligation_satisfied(
+            "result-force-failure",
+            &one_facts,
+        ));
+        assert!(!pure_runtime_obligation_satisfied(
+            "result-force-failure",
+            &PureRuntimeFacts {
+                flags,
+                events: &[],
+                boundaries: [false; 6],
+            },
+        ));
+        let duplicate = [&alias, &alias];
+        assert!(!pure_runtime_obligation_satisfied(
+            "result-force-failure",
+            &PureRuntimeFacts {
+                flags,
+                events: &duplicate,
+                boundaries: [false; 6],
+            },
+        ));
+        for wrong in [event("value"), event("error")] {
+            let wrong_events = [&wrong];
+            assert!(!pure_runtime_obligation_satisfied(
+                "result-force-failure",
+                &PureRuntimeFacts {
+                    flags,
+                    events: &wrong_events,
+                    boundaries: [false; 6],
+                },
+            ));
+        }
+        assert!(!pure_runtime_obligation_satisfied(
+            "result-force-failure",
+            &PureRuntimeFacts {
+                flags: flags | 1,
+                events: &[&alias],
+                boundaries: [false; 6],
+            },
+        ));
+        assert!(!pure_runtime_obligation_satisfied(
+            "result-force-failure",
+            &PureRuntimeFacts {
+                flags: 0b10,
+                events: &[&alias],
+                boundaries: [false; 6],
+            },
+        ));
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn list_cycle_empty_rejects_rehashed_failure_presentation_status_and_adapter_mutants() {
+        let cases = crate::committed_differential_cases();
+        let case = runtime_case(&cases, "list-cycle-boundary-empty-input");
+
+        for (name, replacement) in [
+            ("missing-stderr", b"".as_slice()),
+            ("wrong-stderr", b"hell: forged cycle failure\n".as_slice()),
+        ] {
+            let (root, directory) = retain_executed_runtime_case(case, name);
+            for role in ["candidate", "oracle"] {
+                fs::write(directory.join(role).join("stderr.raw.bin"), replacement).unwrap();
+            }
+            rehash_runtime_bundle(&directory, case);
+            assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        assert_rehashed_process_status_substitution_rejected(
+            case,
+            "list-cycle-wrong-status",
+            (false, 1),
+            (true, 0),
+        );
+
+        for (name, replacement) in [("value-outcome", "value"), ("error-outcome", "error")] {
+            let (root, directory) = retain_executed_runtime_case(case, name);
+            let path = directory.join("candidate").join("observation.json");
+            let document = fs::read_to_string(&path).unwrap();
+            let trace = document
+                .find("\"semanticObligationTrace\": [")
+                .expect("semantic obligation trace");
+            let builtin = hell_builtins::lookup("List.cycle")
+                .expect("List.cycle builtin")
+                .id
+                .0;
+            let event = document[trace..]
+                .find(&format!("{{\"builtinId\": {builtin}, "))
+                .map(|offset| trace + offset)
+                .expect("List.cycle adapter event");
+            let outcome = document[event..]
+                .find("\"outcome\": \"alias\"")
+                .map(|offset| event + offset)
+                .expect("List.cycle lazy result adapter");
+            let end = outcome + "\"outcome\": \"alias\"".len();
+            let mut changed = document.clone();
+            changed.replace_range(outcome..end, &format!("\"outcome\": \"{replacement}\""));
+            fs::write(path, changed).unwrap();
+            rehash_runtime_bundle(&directory, case);
+            assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (root, directory) = retain_executed_runtime_case(case, "missing-adapter-target");
+        let path = directory.join("candidate").join("observation.json");
+        let document = fs::read_to_string(&path).unwrap();
+        let trace = document
+            .find("\"semanticObligationTrace\": [")
+            .expect("semantic obligation trace");
+        let cycle = hell_builtins::lookup("List.cycle")
+            .expect("List.cycle builtin")
+            .id
+            .0;
+        let take = hell_builtins::lookup("List.take")
+            .expect("List.take builtin")
+            .id
+            .0;
+        let event = document[trace..]
+            .find(&format!("{{\"builtinId\": {cycle}, "))
+            .map(|offset| trace + offset)
+            .expect("List.cycle adapter event");
+        let end = event + format!("{{\"builtinId\": {cycle}").len();
+        let mut changed = document.clone();
+        changed.replace_range(event..end, &format!("{{\"builtinId\": {take}"));
+        fs::write(path, changed).unwrap();
+        rehash_runtime_bundle(&directory, case);
+        assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, directory) = retain_executed_runtime_case(case, "duplicate-adapter-target");
+        let path = directory.join("candidate").join("observation.json");
+        let document = fs::read_to_string(&path).unwrap();
+        let trace = document
+            .find("\"semanticObligationTrace\": [")
+            .expect("semantic obligation trace");
+        let cycle = hell_builtins::lookup("List.cycle")
+            .expect("List.cycle builtin")
+            .id
+            .0;
+        let event = document[trace..]
+            .find(&format!("{{\"builtinId\": {cycle}, "))
+            .map(|offset| trace + offset)
+            .expect("List.cycle adapter event");
+        let event_end = document[event..]
+            .find("}],\n  \"semanticEventOrder\"")
+            .map(|offset| event + offset + 1)
+            .expect("List.cycle adapter event end");
+        let duplicate = document[event..event_end].to_owned();
+        let mut changed = document.clone();
+        changed.insert_str(event_end, &format!(", {duplicate}"));
+        fs::write(path, changed).unwrap();
+        rehash_runtime_bundle(&directory, case);
+        assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn list_cycle_empty_rejects_coherent_typed_result_identity_and_shape_mutants() {
+        let cases = crate::committed_differential_cases();
+        let case = runtime_case(&cases, "list-cycle-boundary-empty-input");
+        for (name, original, replacement) in [
+            ("argument", "\"argument\":0", "\"argument\":1"),
+            (
+                "boundary",
+                "\"boundary\":\"adapter-result\"",
+                "\"boundary\":\"conditional-selected\"",
+            ),
+            ("code", "\"code\":\"H0901\"", "\"code\":\"H0902\""),
+            (
+                "outcome",
+                "{\"type\":\"ForceBoundary\",\"outcome\":\"error\",\"code\":\"H0901\"}",
+                "{\"type\":\"ForceBoundary\",\"outcome\":\"not-forced\"}",
+            ),
+        ] {
+            let (root, directory) = retain_executed_runtime_case(case, name);
+            let typed_path = directory
+                .join("candidate")
+                .join("semantic-typed-result.json");
+            let typed = fs::read_to_string(&typed_path).unwrap();
+            let changed = typed.replacen(original, replacement, 1);
+            assert_ne!(typed, changed, "typed result mutation did not match");
+            fs::write(&typed_path, &changed).unwrap();
+            let old_digest = sha256_bytes(typed.trim_end().as_bytes()).hex();
+            let new_digest = sha256_bytes(changed.trim_end().as_bytes()).hex();
+            let observation = directory.join("candidate").join("observation.json");
+            let document = fs::read_to_string(&observation).unwrap();
+            let changed_document = document.replacen(&old_digest, &new_digest, 1);
+            assert_ne!(
+                document, changed_document,
+                "typed digest mutation did not match"
+            );
+            fs::write(observation, changed_document).unwrap();
+            rehash_runtime_bundle(&directory, case);
+            assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (root, directory) = retain_executed_runtime_case(case, "typed-builtin");
+        let observation = directory.join("candidate").join("observation.json");
+        let document = fs::read_to_string(&observation).unwrap();
+        let cycle = hell_builtins::lookup("List.cycle")
+            .expect("List.cycle builtin")
+            .id
+            .0;
+        let take = hell_builtins::lookup("List.take")
+            .expect("List.take builtin")
+            .id
+            .0;
+        let changed = document.replacen(
+            &format!("\"semanticTypedResultBuiltinId\": {cycle}"),
+            &format!("\"semanticTypedResultBuiltinId\": {take}"),
+            1,
+        );
+        assert_ne!(document, changed, "typed builtin mutation did not match");
+        fs::write(observation, changed).unwrap();
+        rehash_runtime_bundle(&directory, case);
+        assert!(verify_observation_bundle_for_case(&directory, case).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -11308,6 +12205,193 @@ mod tests {
         assert_thread_delay_failure_substitutions_rejected(&cases);
     }
 
+    #[test]
+    fn task_terminal_effect_correlation_is_closed_world() {
+        let thread_delay = hell_builtins::lookup("Concurrent.threadDelay").unwrap().id;
+        let timeout = hell_builtins::lookup("Timeout.timeout").unwrap().id;
+        let async_race = hell_builtins::lookup("Async.race").unwrap().id;
+        assert_eq!(
+            expected_effect_terminal_for_task(thread_delay, "completed").unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            expected_effect_terminal_for_task(thread_delay, "failed").unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            expected_effect_terminal_for_task(thread_delay, "cancelled").unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            expected_effect_terminal_for_task(timeout, "cancelled").unwrap(),
+            "completed"
+        );
+        assert!(expected_effect_terminal_for_task(async_race, "cancelled").is_err());
+        assert!(
+            expected_effect_terminal_for_task(hell_builtins::BuiltinId(u16::MAX), "cancelled")
+                .is_err()
+        );
+        assert!(expected_effect_terminal_for_task(thread_delay, "started").is_err());
+
+        assert_cancelled_task_effect_correlations(thread_delay, timeout);
+        assert_exact_cancelled_effect_cardinality(thread_delay);
+        assert_cancelled_task_cardinality(thread_delay);
+    }
+
+    fn lifecycle_task_trace(
+        builtin: hell_builtins::BuiltinId,
+        terminal: &str,
+    ) -> Vec<(u64, hell_builtins::BuiltinId, String)> {
+        vec![
+            (1, builtin, "started".to_owned()),
+            (1, builtin, terminal.to_owned()),
+        ]
+    }
+
+    fn lifecycle_effect_trace(
+        builtin: hell_builtins::BuiltinId,
+        terminal: &str,
+    ) -> Vec<RetainedEffectEvent> {
+        ["started", terminal]
+            .into_iter()
+            .map(|lifecycle| RetainedEffectEvent {
+                builtin,
+                owner_task: Some(1),
+                sequence: 1,
+                parent_sequence: None,
+                lifecycle: lifecycle.to_owned(),
+            })
+            .collect()
+    }
+
+    fn lifecycle_coverage(
+        builtin: hell_builtins::BuiltinId,
+        task_terminal: &str,
+        effect_terminal: &str,
+    ) -> Vec<CoverageEvent> {
+        vec![
+            CoverageEvent::TaskEvent(builtin, Arc::from("started")),
+            CoverageEvent::TaskEvent(builtin, Arc::from(task_terminal)),
+            CoverageEvent::ExecutedEffect(builtin, Arc::from("started")),
+            CoverageEvent::ExecutedEffect(builtin, Arc::from(effect_terminal)),
+        ]
+    }
+
+    fn cancelled_task_target(builtin_name: &str) -> crate::EvidenceTargetV2 {
+        let mut target = crate::EvidenceTargetV2::new(
+            builtin_name,
+            hell_builtins::CompatibilityDimension::PureRuntime,
+            Vec::new(),
+            crate::CausalSignal::RuntimeAdapter,
+            vec![hell_builtins::ClaimPlatform::All],
+        );
+        target.expected_single_task_lifecycle_sha256 = Some(crate::single_task_lifecycle_sha256([
+            "started",
+            "cancelled",
+        ]));
+        target
+    }
+
+    fn assert_cancelled_task_effect_correlations(
+        thread_delay: hell_builtins::BuiltinId,
+        timeout: hell_builtins::BuiltinId,
+    ) {
+        for (builtin, name, expectations) in [
+            (
+                thread_delay,
+                "Concurrent.threadDelay",
+                [("cancelled", true), ("failed", false), ("completed", false)],
+            ),
+            (
+                timeout,
+                "Timeout.timeout",
+                [("completed", true), ("cancelled", false), ("failed", false)],
+            ),
+        ] {
+            let target = cancelled_task_target(name);
+            for (effect_terminal, expected_success) in expectations {
+                let tasks = lifecycle_task_trace(builtin, "cancelled");
+                let effects = lifecycle_effect_trace(builtin, effect_terminal);
+                let joined = lifecycle_coverage(builtin, "cancelled", effect_terminal);
+                validate_task_causality(&tasks, &joined).unwrap();
+                validate_effect_causality(&effects, &tasks, &joined).unwrap();
+                assert_eq!(
+                    validate_expected_single_task_lifecycle(&target, builtin, &tasks, &effects)
+                        .is_ok(),
+                    expected_success,
+                    "{name} cancelled task/effect={effect_terminal}"
+                );
+            }
+        }
+        let target = cancelled_task_target("Concurrent.threadDelay");
+        let tasks = lifecycle_task_trace(thread_delay, "completed");
+        let effects = lifecycle_effect_trace(thread_delay, "cancelled");
+        let joined = lifecycle_coverage(thread_delay, "completed", "cancelled");
+        validate_task_causality(&tasks, &joined).unwrap();
+        validate_effect_causality(&effects, &tasks, &joined).unwrap();
+        assert!(
+            validate_expected_single_task_lifecycle(&target, thread_delay, &tasks, &effects)
+                .is_err()
+        );
+    }
+
+    fn assert_exact_cancelled_effect_cardinality(thread_delay: hell_builtins::BuiltinId) {
+        let mut target = cancelled_task_target("Concurrent.threadDelay");
+        target.expected_single_effect_lifecycle_sha256 =
+            Some(crate::single_effect_lifecycle_sha256([
+                "started",
+                "cancelled",
+            ]));
+        let tasks = lifecycle_task_trace(thread_delay, "cancelled");
+        let effects = lifecycle_effect_trace(thread_delay, "cancelled");
+        assert!(validate_expected_single_effect_lifecycle(&target, thread_delay, &effects).is_ok());
+        let mut extra_effects = effects.clone();
+        extra_effects.extend(
+            lifecycle_effect_trace(thread_delay, "cancelled")
+                .into_iter()
+                .map(|mut event| {
+                    event.sequence = 2;
+                    event
+                }),
+        );
+        let mut coverage = lifecycle_coverage(thread_delay, "cancelled", "cancelled");
+        coverage.extend([
+            CoverageEvent::ExecutedEffect(thread_delay, Arc::from("started")),
+            CoverageEvent::ExecutedEffect(thread_delay, Arc::from("cancelled")),
+        ]);
+        validate_effect_causality(&extra_effects, &tasks, &coverage).unwrap();
+        assert!(
+            validate_expected_single_effect_lifecycle(&target, thread_delay, &extra_effects)
+                .is_err()
+        );
+        let missing_effect = vec![RetainedEffectEvent {
+            builtin: thread_delay,
+            owner_task: Some(1),
+            sequence: 1,
+            parent_sequence: None,
+            lifecycle: "started".to_owned(),
+        }];
+        let missing_coverage = vec![CoverageEvent::ExecutedEffect(
+            thread_delay,
+            Arc::from("started"),
+        )];
+        assert!(validate_effect_causality(&missing_effect, &tasks, &missing_coverage).is_err());
+    }
+
+    fn assert_cancelled_task_cardinality(thread_delay: hell_builtins::BuiltinId) {
+        let missing_task = vec![(1, thread_delay, "started".to_owned())];
+        let missing_coverage = vec![CoverageEvent::TaskEvent(thread_delay, Arc::from("started"))];
+        assert!(validate_task_causality(&missing_task, &missing_coverage).is_err());
+        let mut extra_task = lifecycle_task_trace(thread_delay, "cancelled");
+        extra_task.push((1, thread_delay, "cancelled".to_owned()));
+        let mut extra_coverage = lifecycle_coverage(thread_delay, "cancelled", "cancelled");
+        extra_coverage.push(CoverageEvent::TaskEvent(
+            thread_delay,
+            Arc::from("cancelled"),
+        ));
+        assert!(validate_task_causality(&extra_task, &extra_coverage).is_err());
+    }
+
     #[cfg(feature = "compat-tracing")]
     #[test]
     fn timeout_rejects_rehashed_branch_raw_status_effect_and_task_substitutions() {
@@ -11682,6 +12766,19 @@ mod tests {
                 success,
                 &format!("{case_id}-effect"),
             );
+            let timeout = hell_builtins::lookup("Timeout.timeout").unwrap().id;
+            let mut missing_effect = semantic.clone();
+            missing_effect.effect_trace.retain(|event| {
+                !matches!(event, crate::LogicalTraceEvent::HostEffect { builtin, effect: retained, .. }
+                    if *builtin == timeout && retained.as_ref() == effect)
+            });
+            assert_rehashed_runtime_semantic_rejected(
+                case,
+                missing_effect,
+                &stdout,
+                success,
+                &format!("{case_id}-effect-missing"),
+            );
             for replacement in other_terminals {
                 let mut changed_task = semantic.clone();
                 mutate_target_task(&mut changed_task, "Timeout.timeout", terminal, replacement);
@@ -11766,23 +12863,170 @@ mod tests {
         assert!(verify_observation_bundle_for_case(&directory, timeout).is_err());
         fs::remove_dir_all(timeout_root).unwrap();
         let timeout_trace_root = root("thread-delay-timeout-trace");
-        let (success, mut semantic, stdout) =
+        let (success, semantic, stdout) =
             execute_runtime_interaction_with_stdout(timeout, &timeout_trace_root);
         assert!(success);
+        assert_thread_delay_timeout_terminal_substitutions_rejected(timeout, &semantic, &stdout);
+        assert_thread_delay_timeout_extra_substitutions_rejected(timeout, &semantic, &stdout);
+        fs::remove_dir_all(timeout_trace_root).unwrap();
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn assert_thread_delay_timeout_terminal_substitutions_rejected(
+        timeout: &crate::DifferentialCase,
+        semantic: &crate::SemanticObservation,
+        stdout: &[u8],
+    ) {
+        for replacement in ["failed", "completed"] {
+            let mut changed_effect = semantic.clone();
+            mutate_target_effect(
+                &mut changed_effect,
+                "Concurrent.threadDelay",
+                "cancelled",
+                replacement,
+            );
+            assert_rehashed_runtime_semantic_rejected(
+                timeout,
+                changed_effect,
+                stdout,
+                true,
+                &format!("thread-delay-timeout-effect-{replacement}"),
+            );
+        }
+        let thread_delay = hell_builtins::lookup("Concurrent.threadDelay").unwrap().id;
+        let mut missing_effect = semantic.clone();
+        missing_effect.effect_trace.retain(|event| {
+            !matches!(event, crate::LogicalTraceEvent::HostEffect { builtin, effect, .. }
+                if *builtin == thread_delay && effect.as_ref() == "cancelled")
+        });
+        let missing_effect_coverage = missing_effect
+            .coverage
+            .iter()
+            .position(|event| {
+                matches!(event, crate::CoverageEvent::ExecutedEffect(builtin, effect)
+                    if *builtin == thread_delay && effect.as_ref() == "cancelled")
+            })
+            .expect("threadDelay cancelled effect coverage");
+        missing_effect.coverage.remove(missing_effect_coverage);
+        assert_rehashed_runtime_semantic_rejected(
+            timeout,
+            missing_effect,
+            stdout,
+            true,
+            "thread-delay-timeout-effect-missing",
+        );
+        let mut changed_task = semantic.clone();
         mutate_target_task(
-            &mut semantic,
+            &mut changed_task,
             "Concurrent.threadDelay",
             "cancelled",
             "completed",
         );
         assert_rehashed_runtime_semantic_rejected(
             timeout,
-            semantic,
-            &stdout,
+            changed_task,
+            stdout,
             true,
             "thread-delay-timeout-task-completed",
         );
-        fs::remove_dir_all(timeout_trace_root).unwrap();
+        let mut missing_task = semantic.clone();
+        missing_task.task_trace.retain(|event| {
+            !matches!(event, crate::LogicalTraceEvent::TaskEvent { builtin, event, .. }
+                if *builtin == thread_delay && event.as_ref() == "cancelled")
+        });
+        let missing_task_coverage = missing_task
+            .coverage
+            .iter()
+            .position(|event| {
+                matches!(event, crate::CoverageEvent::TaskEvent(builtin, event)
+                    if *builtin == thread_delay && event.as_ref() == "cancelled")
+            })
+            .expect("threadDelay cancelled task coverage");
+        missing_task.coverage.remove(missing_task_coverage);
+        assert_rehashed_runtime_semantic_rejected(
+            timeout,
+            missing_task,
+            stdout,
+            true,
+            "thread-delay-timeout-task-missing",
+        );
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn assert_thread_delay_timeout_extra_substitutions_rejected(
+        timeout: &crate::DifferentialCase,
+        semantic: &crate::SemanticObservation,
+        stdout: &[u8],
+    ) {
+        let thread_delay = hell_builtins::lookup("Concurrent.threadDelay").unwrap().id;
+        let mut extra_task = semantic.clone();
+        let terminal = extra_task
+            .task_trace
+            .iter()
+            .find(|event| {
+                matches!(event, crate::LogicalTraceEvent::TaskEvent { builtin, event, .. }
+                    if *builtin == thread_delay && event.as_ref() == "cancelled")
+            })
+            .expect("threadDelay cancelled task")
+            .clone();
+        extra_task.task_trace.push(terminal);
+        extra_task.coverage.push(crate::CoverageEvent::TaskEvent(
+            thread_delay,
+            Arc::from("cancelled"),
+        ));
+        assert_rehashed_runtime_semantic_rejected(
+            timeout,
+            extra_task,
+            stdout,
+            true,
+            "thread-delay-timeout-task-extra",
+        );
+        let mut extra_effect = semantic.clone();
+        let next_sequence = extra_effect
+            .effect_trace
+            .iter()
+            .filter_map(|event| match event {
+                crate::LogicalTraceEvent::HostEffect {
+                    builtin, sequence, ..
+                } if *builtin == thread_delay => Some(*sequence),
+                _ => None,
+            })
+            .max()
+            .expect("threadDelay effect sequence")
+            .saturating_add(1);
+        let duplicated = extra_effect
+            .effect_trace
+            .iter()
+            .filter_map(|event| match event {
+                crate::LogicalTraceEvent::HostEffect {
+                    builtin,
+                    owner_task,
+                    parent_sequence,
+                    effect,
+                    ..
+                } if *builtin == thread_delay => Some(crate::LogicalTraceEvent::HostEffect {
+                    builtin: *builtin,
+                    owner_task: *owner_task,
+                    sequence: next_sequence,
+                    parent_sequence: *parent_sequence,
+                    effect: Arc::clone(effect),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicated.len(), 2);
+        extra_effect.effect_trace.extend(duplicated);
+        extra_effect.coverage.extend([
+            crate::CoverageEvent::ExecutedEffect(thread_delay, Arc::from("started")),
+            crate::CoverageEvent::ExecutedEffect(thread_delay, Arc::from("cancelled")),
+        ]);
+        assert_rehashed_runtime_semantic_rejected(
+            timeout,
+            extra_effect,
+            stdout,
+            true,
+            "thread-delay-timeout-effect-extra",
+        );
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -11935,6 +13179,18 @@ mod tests {
             unreachable!("matched target effect event")
         };
         *effect = Arc::from(replacement);
+        let coverage = semantic
+            .coverage
+            .iter_mut()
+            .find(|event| {
+                matches!(event, crate::CoverageEvent::ExecutedEffect(id, lifecycle)
+                    if *id == builtin && lifecycle.as_ref() == original)
+            })
+            .expect("target effect coverage event");
+        let crate::CoverageEvent::ExecutedEffect(_, lifecycle) = coverage else {
+            unreachable!("matched target effect coverage event")
+        };
+        *lifecycle = Arc::from(replacement);
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -11959,6 +13215,18 @@ mod tests {
             unreachable!("matched target task event")
         };
         *event = Arc::from(replacement);
+        let coverage = semantic
+            .coverage
+            .iter_mut()
+            .find(|coverage| {
+                matches!(coverage, crate::CoverageEvent::TaskEvent(id, lifecycle)
+                    if *id == builtin && lifecycle.as_ref() == original)
+            })
+            .expect("target task coverage event");
+        let crate::CoverageEvent::TaskEvent(_, lifecycle) = coverage else {
+            unreachable!("matched target task coverage event")
+        };
+        *lifecycle = Arc::from(replacement);
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -12220,7 +13488,7 @@ mod tests {
         let trace_path = source_root.join(format!("{}.json", case.id));
         let trace = fs::read_to_string(&trace_path).expect("retained runtime trace");
         assert!(crate::parse_semantic_trace(trace.as_bytes()).is_ok());
-        let old_schema = trace.replace("\"schemaVersion\": 9", "\"schemaVersion\": 8");
+        let old_schema = trace.replace("\"schemaVersion\": 10", "\"schemaVersion\": 9");
         assert!(crate::parse_semantic_trace(old_schema.as_bytes()).is_err());
         let field = format!(", \"instanceTarget\": \"{expected}\"");
         let missing = trace.replace(&field, "");
@@ -13292,7 +14560,7 @@ mod tests {
 
         let trace_path = trace_root.join(format!("{}.json", case.id));
         let trace = fs::read_to_string(&trace_path).unwrap();
-        let old_schema = trace.replacen("\"schemaVersion\": 9", "\"schemaVersion\": 8", 1);
+        let old_schema = trace.replacen("\"schemaVersion\": 10", "\"schemaVersion\": 9", 1);
         assert!(crate::parse_semantic_trace(old_schema.as_bytes()).is_err());
         let missing_premises = trace.replacen("\"instancePremises\": [", "\"premises\": [", 1);
         assert!(crate::parse_semantic_trace(missing_premises.as_bytes()).is_err());
@@ -13802,7 +15070,7 @@ mod tests {
 
     #[cfg(feature = "compat-tracing")]
     #[test]
-    fn retained_singleton_constructor_matrix_executes_every_ord_scope_and_nonforce_path() {
+    fn retained_singleton_constructor_matrix_executes_every_ord_scope_and_strictness_path() {
         let cases = crate::committed_differential_cases();
         let singleton_cases = cases
             .iter()
@@ -13811,7 +15079,7 @@ mod tests {
                     || case.id.starts_with("runtime-typed-set-singleton-")
             })
             .collect::<Vec<_>>();
-        assert_eq!(singleton_cases.len(), 42);
+        assert_eq!(singleton_cases.len(), 43);
         for case in singleton_cases {
             let name = format!("retained-{}", case.id);
             let (root, _) = retain_executed_runtime_case(case, &name);
@@ -13971,12 +15239,17 @@ mod tests {
     fn assert_singleton_target_and_transport_mutants(cases: &[crate::DifferentialCase]) {
         for (case_id, original, replacement) in [
             (
-                "runtime-typed-map-singleton-nonforce",
+                "runtime-typed-map-singleton-key-strict",
                 "Map.singleton",
                 "Set.singleton",
             ),
             (
-                "runtime-typed-set-singleton-nonforce",
+                "runtime-typed-map-singleton-value-nonforce",
+                "Map.singleton",
+                "Set.singleton",
+            ),
+            (
+                "runtime-typed-set-singleton-element-strict",
                 "Set.singleton",
                 "Map.singleton",
             ),
@@ -14018,12 +15291,24 @@ mod tests {
             execute_runtime_interaction_with_stdout(case, &source_root);
         let original = hell_builtins::lookup(original).unwrap().id;
         let replacement = hell_builtins::lookup(replacement).unwrap().id;
-        semantic
+        if let Some(event) = semantic
             .obligation_trace
             .iter_mut()
             .find(|event| event.builtin == original)
-            .expect("singleton target event")
-            .builtin = replacement;
+        {
+            event.builtin = replacement;
+        } else {
+            let mut changed = false;
+            for event in &mut semantic.force_trace {
+                if let LogicalTraceEvent::ForceBuiltinArgument { builtin, .. } = event
+                    && *builtin == original
+                {
+                    *builtin = replacement;
+                    changed = true;
+                }
+            }
+            assert!(changed, "singleton force-only target event");
+        }
         assert_rehashed_runtime_semantic_rejected(
             case,
             semantic,
@@ -14066,20 +15351,18 @@ mod tests {
     #[cfg(feature = "compat-tracing")]
     fn assert_singleton_demand_mutants(cases: &[crate::DifferentialCase]) {
         for class in ["lazy-adapter-entry", "lazy-adapter-exit"] {
-            for argument in [0, 1] {
-                assert_demand_argument_state_substitution_rejected(
-                    cases,
-                    "runtime-typed-map-singleton-nonforce",
-                    "Map.singleton",
-                    argument,
-                    class,
-                );
-            }
             assert_demand_argument_state_substitution_rejected(
                 cases,
-                "runtime-typed-set-singleton-nonforce",
-                "Set.singleton",
-                0,
+                "runtime-typed-map-singleton-value-nonforce",
+                "Map.singleton",
+                1,
+                class,
+            );
+            assert_demand_argument_state_substitution_rejected(
+                cases,
+                "runtime-typed-map-singleton-key-strict",
+                "Map.singleton",
+                1,
                 class,
             );
         }
@@ -15364,11 +16647,11 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "compat-tracing")]
     fn runtime_case_expects_failure(case: &crate::DifferentialCase) -> bool {
         !case.expected_runtime_completion
             || runtime_descriptor_expects_failure(case)
             || case.id.ends_with("list-laziness-error")
-            || case.id.ends_with("http-stream-disconnect")
             || case.id.as_ref() == "runtime-parser-observable-flag-help"
             || case.id.as_ref() == "runtime-parser-observable-option-help"
             || case.id.as_ref() == "runtime-parser-observable-argument-metavar"
@@ -15393,10 +16676,8 @@ mod tests {
             || case.id.as_ref() == "runtime-typed-exit-die"
             || case.id.as_ref() == "runtime-typed-exit-with-failure"
             || case.id.as_ref() == "runtime-typed-exit-with-success"
-            || case.id.as_ref() == "runtime-typed-alternative-many-maybe-nonproductive"
             || case.id.as_ref() == "runtime-typed-alternative-optional-parser-partial"
             || case.id.as_ref() == "runtime-typed-alternative-many-parser-partial"
-            || case.id.as_ref() == "runtime-typed-alternative-many-parser-nonproductive"
             || case.id.as_ref() == "runtime-environment-get-env-missing"
             || (case.id.starts_with("runtime-directory-") && case.id.ends_with("-failure"))
             || (case.id.starts_with("runtime-io-") && case.id.ends_with("-failure"))
@@ -15465,6 +16746,7 @@ mod tests {
             )
     }
 
+    #[cfg(feature = "compat-tracing")]
     fn runtime_descriptor_expects_failure(case: &crate::DifferentialCase) -> bool {
         case.claim_evidence.as_ref().is_some_and(|descriptor| {
             descriptor.semantic_targets.iter().any(|target| {
@@ -16002,7 +17284,7 @@ mod tests {
 
     #[cfg(feature = "compat-tracing")]
     #[test]
-    fn iterate_lazy_prefix_rejects_an_injected_callback_after_rehash() {
+    fn iterate_lazy_prefix_binds_one_callback_and_rejects_rehashed_mutations() {
         let cases = crate::committed_differential_cases();
         let finite = cases
             .iter()
@@ -16013,18 +17295,77 @@ mod tests {
             .find(|case| case.id.as_ref() == "runtime-list-iterate-undemanded-tail")
             .expect("lazy List.iterate' case");
         let source_root = root("list-iterate-lazy-callback-source");
-        let (finite_success, mut finite_semantic) =
-            execute_runtime_interaction(finite, &source_root);
-        let (lazy_success, mut lazy_semantic) = execute_runtime_interaction(lazy, &source_root);
+        let (bundle_root, directory) =
+            retain_executed_runtime_case(lazy, "list-iterate-lazy-callback-baseline");
+        verify_observation_bundle_for_case(&directory, lazy)
+            .expect("reviewed lazy iterate baseline bundle");
+        fs::remove_dir_all(bundle_root).unwrap();
+
+        let (finite_success, finite_semantic) = execute_runtime_interaction(finite, &source_root);
+        let (lazy_success, lazy_semantic) = execute_runtime_interaction(lazy, &source_root);
         assert!(finite_success && lazy_success);
-        let injected = callback_events_mut(&mut finite_semantic, "List.iterate'").remove(0);
-        let lazy_callbacks = callback_events_mut(&mut lazy_semantic, "List.iterate'");
-        assert!(lazy_callbacks.is_empty());
-        lazy_callbacks.push(injected);
+        let callbacks = callback_events_mut(&mut lazy_semantic.clone(), "List.iterate'").clone();
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(
+            callbacks[0].canonical_arguments[0].as_ref(),
+            "{\"type\":\"Int\",\"value\":\"7\"}"
+        );
+        assert_eq!(
+            callbacks[0].canonical_result.as_ref(),
+            "{\"type\":\"Int\",\"value\":\"8\"}"
+        );
+
+        let mut omitted = lazy_semantic.clone();
+        callback_events_mut(&mut omitted, "List.iterate'").clear();
         assert_rehashed_callback_semantic_rejected(
             lazy,
-            lazy_semantic,
-            "list-iterate-undemanded-callback",
+            omitted,
+            "list-iterate-lazy-callback-omitted",
+        );
+
+        let mut wrong_argument = lazy_semantic.clone();
+        callback_events_mut(&mut wrong_argument, "List.iterate'")[0].canonical_arguments[0] =
+            Arc::from("{\"type\":\"Int\",\"value\":\"6\"}");
+        assert_rehashed_callback_semantic_rejected(
+            lazy,
+            wrong_argument,
+            "list-iterate-lazy-callback-argument",
+        );
+
+        let mut wrong_result = lazy_semantic.clone();
+        callback_events_mut(&mut wrong_result, "List.iterate'")[0].canonical_result =
+            Arc::from("{\"type\":\"Int\",\"value\":\"9\"}");
+        assert_rehashed_callback_semantic_rejected(
+            lazy,
+            wrong_result,
+            "list-iterate-lazy-callback-result",
+        );
+
+        let mut extra = lazy_semantic.clone();
+        let callbacks = callback_events_mut(&mut extra, "List.iterate'");
+        let mut duplicate = callbacks[0].clone();
+        duplicate.invocation = 2;
+        callbacks.push(duplicate);
+        assert_rehashed_callback_semantic_rejected(lazy, extra, "list-iterate-lazy-callback-extra");
+
+        let mut wrong_callback = lazy_semantic;
+        callback_events_mut(&mut wrong_callback, "List.iterate'")[0] =
+            callback_events_mut(&mut finite_semantic.clone(), "List.iterate'")[0].clone();
+        assert_rehashed_callback_semantic_rejected(
+            lazy,
+            wrong_callback,
+            "list-iterate-lazy-callback-finite-substitution",
+        );
+
+        let mut reordered = finite_semantic;
+        let callbacks = callback_events_mut(&mut reordered, "List.iterate'");
+        callbacks.swap(0, 1);
+        callbacks[0].invocation = 1;
+        callbacks[1].invocation = 2;
+        assert_rehashed_callback_semantic_rejected(
+            finite,
+            reordered,
+            "list-iterate-finite-callback-order",
         );
         fs::remove_dir_all(source_root).unwrap();
     }
@@ -16295,6 +17636,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "compat-tracing")]
     fn typed_result_case(name: &str, source: &str) -> DifferentialCase {
         let builtin = hell_builtins::lookup("Bool.bool").unwrap();
         DifferentialCase {
@@ -17078,9 +18420,33 @@ mod tests {
         let cases = crate::corpus::runtime_async_pooled_cases();
         let pooled = cases.iter().collect::<Vec<_>>();
         assert_eq!(pooled.len(), 12);
-        for case in pooled {
+        for case in &pooled {
             let (root, _) = retain_executed_runtime_case(case, case.id.as_ref());
             fs::remove_dir_all(root).unwrap();
+        }
+        let failures = pooled
+            .into_iter()
+            .filter(|case| case.id.ends_with("-failure"))
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 4);
+        for case in failures {
+            for (suffix, replacement) in [
+                ("missing-stderr", &b""[..]),
+                ("wrong-stderr", &b"hell: forged pooled failure\n"[..]),
+            ] {
+                let (root, directory) =
+                    retain_executed_runtime_case(case, &format!("{}-{suffix}", case.id));
+                for role in ["candidate", "oracle"] {
+                    fs::write(directory.join(role).join("stderr.raw.bin"), replacement).unwrap();
+                }
+                rehash_runtime_bundle(&directory, case);
+                assert!(
+                    verify_observation_bundle_for_case(&directory, case).is_err(),
+                    "{} accepted {suffix}",
+                    case.id
+                );
+                fs::remove_dir_all(root).unwrap();
+            }
         }
     }
 

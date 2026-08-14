@@ -17,6 +17,8 @@ const FAILURE_LIMIT: usize = 32;
 const UPSTREAM_COMMIT: &str = "d4d028609ed46a560c62caea8c70e7e91d1afd29";
 const LANGUAGE_VERSION: &str = "2026-05-29";
 const SOURCE_SHA256: &str = "6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9";
+const ADAPTED_ENV_EXAMPLE_SHA256: &str =
+    "17b35986cfbf8a198430d16ad7d4e210d1d9c78ee974dee835769130e76d02d1";
 
 static SANDBOX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -117,10 +119,16 @@ pub fn validate_inventory(root: &Path) -> Result<(), String> {
         UPSTREAM_COMMIT,
         LANGUAGE_VERSION,
         SOURCE_SHA256,
+        ADAPTED_ENV_EXAMPLE_SHA256,
     ] {
         if !notice.contains(expected) {
             return Err(format!("fixture NOTICE omits provenance value {expected}"));
         }
+    }
+    let adapted_example = fs::read(fixture_root.join("examples/11-env-vars.hell"))
+        .map_err(|error| format!("cannot read adapted environment example: {error}"))?;
+    if hell_testkit::sha256_bytes(&adapted_example).hex() != ADAPTED_ENV_EXAMPLE_SHA256 {
+        return Err("adapted environment example differs from its reviewed digest".to_owned());
     }
     Ok(())
 }
@@ -265,8 +273,8 @@ fn run_and_record(
     case_id: &str,
     failure_count: &mut usize,
 ) -> Result<CommandResult, String> {
-    let result = command
-        .run()
+    let result = report
+        .run_command(name.as_str(), command)
         .map_err(|error| format!("cannot run {name}: {error}"))?;
     if (!result.status.success() || result.timed_out) && *failure_count < FAILURE_LIMIT {
         write_capture(failures_directory, case_id, "stdout", &result.stdout)?;
@@ -275,7 +283,6 @@ fn run_and_record(
     if !result.status.success() || result.timed_out {
         *failure_count += 1;
     }
-    report.command(name, command, &result);
     Ok(result)
 }
 

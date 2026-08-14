@@ -84,14 +84,23 @@ impl CancellationToken {
     }
 
     fn cancel_once(&self, reason: CancelReason) -> bool {
-        if self.state.reason.set(reason).is_ok() {
+        let changed = self
+            .state
+            .changed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = if self.state.reason.set(reason).is_ok() {
             self.state.generation.fetch_add(1, Ordering::AcqRel);
             self.state.waiters.notify_all();
-            notify_descendants(&self.state);
             true
         } else {
             false
+        };
+        drop(changed);
+        if cancelled {
+            notify_descendants(&self.state);
         }
+        cancelled
     }
 
     #[must_use]
@@ -128,18 +137,18 @@ impl CancellationToken {
     /// Poisoned wait state is recovered because cancellation remains monotonic.
     #[must_use]
     pub fn wait_timeout(&self, duration: Duration) -> bool {
-        if self.is_cancelled() {
-            return true;
-        }
         let state = self
             .state
             .changed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = self
+        if self.is_cancelled() {
+            return true;
+        }
+        let (_state, _timeout) = self
             .state
             .waiters
-            .wait_timeout(state, duration)
+            .wait_timeout_while(state, duration, |()| !self.is_cancelled())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.is_cancelled()
     }
@@ -171,8 +180,13 @@ fn notify_descendants(state: &CancellationState) {
             .collect::<Vec<_>>()
     };
     for child in children {
+        let changed = child
+            .changed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         child.generation.fetch_add(1, Ordering::AcqRel);
         child.waiters.notify_all();
+        drop(changed);
         notify_descendants(&child);
     }
 }
@@ -1079,6 +1093,7 @@ fn combine_failures(
         code: primary.code,
         kind: primary.kind.clone(),
         message: Arc::clone(&primary.message),
+        presentation: primary.presentation.clone(),
         suppressed: suppressed.into(),
     })
 }

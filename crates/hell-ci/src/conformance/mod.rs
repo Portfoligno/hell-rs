@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 pub(crate) use derive::derive_partition;
 pub(crate) use evidence::{
     CaseSource, EXPLORATORY_GENERATOR_COUNT, EXPLORATORY_GENERATOR_SEED,
-    EXPLORATORY_GENERATOR_VERSION, EvidenceManifest, EvidenceMember, EvidenceRecord,
-    EvidenceRepository, EvidenceTarget, ExploratoryRecord, Observation, OracleBinding,
-    TrustedEvidenceBindings, assigned_obligation_count,
+    EXPLORATORY_GENERATOR_VERSION, EvidenceManifest, EvidenceManifestInput, EvidenceMember,
+    EvidenceRecord, EvidenceRepository, EvidenceTarget, ExploratoryRecord, Observation,
+    OracleBinding, TrustedEvidenceBindings, assigned_obligation_count,
 };
 pub(crate) use exemptions::parse_release_exemptions;
 pub(crate) use inputs::{build_trusted_inputs, parse_trusted_inputs};
@@ -181,37 +181,37 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
                     }
                     for obligation in scope.obligations {
                         mapped_obligations += 1;
-                        if !semantic_validator_available(dimension.dimension) {
-                            unavailable_validators += 1;
-                        } else if scope.evidence.iter().all(|reference| {
-                            hell_builtins::parse_differential_reference(reference)
-                                .ok()
-                                .and_then(|reference| {
-                                    cases
-                                        .iter()
-                                        .find(|case| case.id.as_ref() == reference.case_id)
-                                })
-                                .is_none_or(|case| {
-                                    !case_authorizes(
-                                        case,
-                                        &CellKey::new(
-                                            hell_builtins::registry()
-                                                [usize::from(requirement.builtin.0)]
-                                            .name,
-                                            dimension.dimension,
-                                            profile,
-                                            platform,
-                                        )
-                                        .expect("registry builtin produces a safe key"),
-                                        obligation,
-                                        &scope
-                                            .normalizers
+                        let unavailable = !semantic_validator_available(dimension.dimension)
+                            || scope.evidence.iter().all(|reference| {
+                                hell_builtins::parse_differential_reference(reference)
+                                    .ok()
+                                    .and_then(|reference| {
+                                        cases
                                             .iter()
-                                            .map(|value| value.as_str().to_owned())
-                                            .collect::<Vec<_>>(),
-                                    )
-                                })
-                        }) {
+                                            .find(|case| case.id.as_ref() == reference.case_id)
+                                    })
+                                    .is_none_or(|case| {
+                                        !case_authorizes(
+                                            case,
+                                            &CellKey::new(
+                                                hell_builtins::registry()
+                                                    [usize::from(requirement.builtin.0)]
+                                                .name,
+                                                dimension.dimension,
+                                                profile,
+                                                platform,
+                                            )
+                                            .expect("registry builtin produces a safe key"),
+                                            obligation,
+                                            &scope
+                                                .normalizers
+                                                .iter()
+                                                .map(|value| value.as_str().to_owned())
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    })
+                            });
+                        if unavailable {
                             unavailable_validators += 1;
                         }
                     }
@@ -373,7 +373,19 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
         .enumerate()
         .map(|(index, case)| (case.id.to_string(), index))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let expected_obligations = hell_testkit::applicable_runtime_obligation_cells()
+    let semantic_obligations = hell_testkit::applicable_runtime_obligation_cells()
+        .into_iter()
+        .map(|cell| {
+            (
+                (cell.builtin.to_string(), cell.dimension.as_str()),
+                cell.obligations
+                    .into_iter()
+                    .map(|obligation| obligation.0.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let portable_obligations = hell_testkit::portable_native_oracle_obligation_cells()
         .into_iter()
         .map(|cell| {
             (
@@ -438,7 +450,7 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             .get(usize::from(builtin_id))
             .ok_or_else(|| "reviewed mapping builtin disappeared".to_owned())?;
         let dimension = hell_builtins::CompatibilityDimension::ALL[dimension_index];
-        let expected = expected_obligations
+        let portable_expected = portable_obligations
             .get(&(builtin.name.to_owned(), dimension.as_str()))
             .ok_or_else(|| {
                 format!(
@@ -447,16 +459,35 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
                     dimension.as_str()
                 )
             })?;
+        let semantic_expected = semantic_obligations
+            .get(&(builtin.name.to_owned(), dimension.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "reviewed mapping has no semantic obligation authority for {}/{}",
+                    builtin.name,
+                    dimension.as_str()
+                )
+            })?;
+        if groups
+            .values()
+            .any(|group| portable_failure_gap_is_stale(builtin.name, dimension, &group.obligations))
+        {
+            return Err(format!(
+                "portable native-oracle failure gap for {}/{} is stale because reviewed failure evidence now exists",
+                builtin.name,
+                dimension.as_str()
+            ));
+        }
         let complete = groups
             .into_iter()
             .filter_map(|(normalizers, group)| {
-                expected
+                portable_expected
                     .iter()
                     .all(|obligation| group.obligations.contains(obligation))
                     .then(|| GeneratedMapping {
                         evidence: group.evidence.into_iter().collect(),
                         normalizers,
-                        obligations: expected.clone(),
+                        obligations: semantic_expected.clone(),
                     })
             })
             .collect::<Vec<_>>();
@@ -544,17 +575,34 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
                         format!("differential:{case_id}")
                     })
                     .collect::<Vec<_>>();
+                let portable_failure_gap = hell_testkit::portable_native_oracle_failure_unavailable(
+                    builtin.name,
+                    *dimension,
+                );
+                let (applicability_rule, rationale, review_group) = if portable_failure_gap {
+                    (
+                        "portable-native-oracle-host-failure-unavailable",
+                        "The operation remains semantically fallible, but no deterministic portable native-oracle failure trigger exists; available success/order evidence is mapped while effect-failure remains missing and release-blocking.",
+                        "portable-native-oracle-host-failure-gap",
+                    )
+                } else {
+                    (
+                        "descriptor-v8-reviewed-runtime-target",
+                        "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations.",
+                        "descriptor-v8-runtime-authority",
+                    )
+                };
                 write_requirement_scope(
                     &mut output,
                     &["upstream"],
                     &platforms,
-                    "descriptor-v8-reviewed-runtime-target",
+                    applicability_rule,
                     "native-oracle",
                     &evidence,
                     &mapping.normalizers,
                     &mapping.obligations,
-                    "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations.",
-                    "descriptor-v8-runtime-authority",
+                    rationale,
+                    review_group,
                 );
                 mapped_cells = mapped_cells.saturating_add(
                     u64::try_from(platforms.len()).map_err(|_| "mapped platform count overflow")?,
@@ -608,6 +656,15 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             conflicting_cells,
         },
     ))
+}
+
+fn portable_failure_gap_is_stale(
+    builtin: &str,
+    dimension: hell_builtins::CompatibilityDimension,
+    observed: &std::collections::BTreeSet<String>,
+) -> bool {
+    hell_testkit::portable_native_oracle_failure_unavailable(builtin, dimension)
+        && observed.contains("effect-failure")
 }
 
 fn target_supports_platform(
@@ -869,8 +926,7 @@ fn audit_scope_matches(
 }
 
 pub(crate) fn mutant_active(id: &str) -> bool {
-    cfg!(feature = "mutation-testing")
-        && std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref() == Ok(id)
+    crate::mutation::active(id)
 }
 
 pub(crate) fn build_release_conformance_plan(
@@ -1292,8 +1348,8 @@ mod tests {
         let (first, summary) = generated_requirements_catalog().unwrap();
         let (second, repeated) = generated_requirements_catalog().unwrap();
         assert_eq!(first, second);
-        assert_eq!(summary.mapped_cells, 2_262);
-        assert_eq!(summary.referenced_cases, 2_642);
+        assert_eq!(summary.mapped_cells, 2_265);
+        assert_eq!(summary.referenced_cases, 2_644);
         assert_eq!(summary.conflicting_cells, 0);
         assert_eq!(summary.mapped_cells, repeated.mapped_cells);
         assert_eq!(summary.referenced_cases, repeated.referenced_cases);
@@ -1312,6 +1368,86 @@ mod tests {
         assert!(first.contains("  \"task-lifecycle\",\n"));
         assert!(first.contains("  \"raw-observation\",\n"));
         assert!(first.contains("  \"resource-audit\",\n"));
+        assert_eq!(
+            first
+                .matches("applicability_rule = \"portable-native-oracle-host-failure-unavailable\"")
+                .count(),
+            2
+        );
+        assert!(first.contains("differential:runtime-current-directory-upstream-available"));
+        assert!(first.contains("differential:runtime-directory-get-home-platform-fallback"));
+        assert!(!first.contains("runtime-current-directory-sandbox-denied"));
+    }
+
+    #[test]
+    fn portable_directory_failure_gaps_retain_full_blocking_obligations() {
+        let plan = build_release_conformance_plan(
+            &"a".repeat(40),
+            &"b".repeat(40),
+            "2026-08-13T00:00:00Z",
+            &"c".repeat(64),
+            &"d".repeat(64),
+            Vec::new(),
+        )
+        .unwrap();
+        for builtin in [
+            "Directory.getCurrentDirectory",
+            "Directory.getHomeDirectory",
+        ] {
+            for platform in ConformancePlatform::ALL {
+                let cell = plan
+                    .cells
+                    .iter()
+                    .find(|cell| {
+                        cell.key.builtin == builtin
+                            && cell.key.dimension == hell_builtins::CompatibilityDimension::Effects
+                            && cell.key.profile == ProfileId::Upstream
+                            && cell.key.platform == platform
+                    })
+                    .unwrap_or_else(|| panic!("missing portable failure-gap cell {builtin}"));
+                assert_eq!(
+                    cell.scope,
+                    ScopeDisposition::Required {
+                        decision_id: "portable-native-oracle-host-failure-unavailable".to_owned(),
+                    }
+                );
+                let obligation = |id: &str| {
+                    cell.obligations
+                        .iter()
+                        .find(|obligation| obligation.id == id)
+                        .unwrap_or_else(|| panic!("missing {builtin} obligation {id}"))
+                };
+                assert!(!obligation("effect-success").case_ids.is_empty());
+                assert!(!obligation("effect-ordering").case_ids.is_empty());
+                assert!(obligation("effect-failure").case_ids.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn future_portable_directory_failure_evidence_makes_the_gap_marker_stale() {
+        let failure = std::collections::BTreeSet::from(["effect-failure".to_owned()]);
+        let success = std::collections::BTreeSet::from(["effect-success".to_owned()]);
+        for builtin in [
+            "Directory.getCurrentDirectory",
+            "Directory.getHomeDirectory",
+        ] {
+            assert!(portable_failure_gap_is_stale(
+                builtin,
+                hell_builtins::CompatibilityDimension::Effects,
+                &failure
+            ));
+            assert!(!portable_failure_gap_is_stale(
+                builtin,
+                hell_builtins::CompatibilityDimension::Effects,
+                &success
+            ));
+        }
+        assert!(!portable_failure_gap_is_stale(
+            "Directory.setCurrentDirectory",
+            hell_builtins::CompatibilityDimension::Effects,
+            &failure
+        ));
     }
 
     #[test]

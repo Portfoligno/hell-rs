@@ -4322,7 +4322,11 @@ impl InferContext<'_> {
                 self.types.function(int, callback)
             }
             "IO.stdin" | "IO.stdout" | "IO.stderr" | "Process.nullStream" => handle,
-            "IO.NoBuffering" | "IO.LineBuffering" | "IO.BlockBuffering" => buffer_mode,
+            "IO.NoBuffering" | "IO.LineBuffering" => buffer_mode,
+            "IO.BlockBuffering" => {
+                let size = self.apply_named_type("Maybe", &[int]);
+                self.types.function(size, buffer_mode)
+            }
             "IO.ReadMode" | "IO.WriteMode" | "IO.AppendMode" | "IO.ReadWriteMode" => file_mode,
             "IO.openFile" => {
                 let action = self.types.io(handle, self.kinds);
@@ -5381,21 +5385,17 @@ impl InferContext<'_> {
             }
             "IO.mapM_" => {
                 let a = self.fresh_binder(&mut binders);
-                let b = self.fresh_binder(&mut binders);
-                let io_b = self.types.io(b, self.kinds);
-                let callback = self.types.function(a, io_b);
-                let list = self.types.list(a, self.kinds);
                 let io_unit = self.types.io(unit, self.kinds);
+                let callback = self.types.function(a, io_unit);
+                let list = self.types.list(a, self.kinds);
                 let tail = self.types.function(list, io_unit);
                 self.types.function(callback, tail)
             }
             "IO.forM_" => {
                 let a = self.fresh_binder(&mut binders);
-                let b = self.fresh_binder(&mut binders);
                 let list = self.types.list(a, self.kinds);
-                let io_b = self.types.io(b, self.kinds);
-                let callback = self.types.function(a, io_b);
                 let io_unit = self.types.io(unit, self.kinds);
+                let callback = self.types.function(a, io_unit);
                 let tail = self.types.function(callback, io_unit);
                 self.types.function(list, tail)
             }

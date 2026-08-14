@@ -315,6 +315,8 @@ mod tests {
             candidate_executable_sha256: trusted.candidate_executable_sha256
                 [&ConformancePlatform::LinuxX86_64]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&ConformancePlatform::LinuxX86_64].clone(),
             platform: ConformancePlatform::LinuxX86_64,
@@ -477,6 +479,8 @@ mod tests {
             candidate_executable_sha256: trusted.candidate_executable_sha256
                 [&ConformancePlatform::LinuxX86_64]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&ConformancePlatform::LinuxX86_64].clone(),
             platform: ConformancePlatform::LinuxX86_64,
@@ -669,6 +673,8 @@ mod tests {
                 candidate_executable_sha256: trusted.candidate_executable_sha256
                     [&ConformancePlatform::LinuxX86_64]
                     .clone(),
+                candidate_build_info_schema_version: 2,
+                candidate_compat_tracing: true,
                 oracle: trusted.oracle[&ConformancePlatform::LinuxX86_64].clone(),
                 candidate_observation_sha256: agreement.sha256.clone(),
                 oracle_observation_sha256: agreement.sha256,

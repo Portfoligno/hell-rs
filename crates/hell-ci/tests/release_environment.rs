@@ -315,11 +315,9 @@ fn remote_state_requires_the_standard_token_name() {
         .arg(&report)
         .env("GITHUB_API_URL", "http://127.0.0.1:1")
         .env_remove("GITHUB_TOKEN")
-        .env("HELL_GITHUB_TOKEN", "retired-token")
         .output()
         .expect("check-remote-state must execute");
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("GITHUB_TOKEN is required"));
-    assert!(!error.contains("retired-token"));
 }

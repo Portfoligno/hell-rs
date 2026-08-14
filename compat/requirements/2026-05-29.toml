@@ -1071,6 +1071,7 @@ obligations = [
   "adapter-success",
   "whnf-boundary",
   "collection-interaction",
+  "result-force-failure",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -10654,6 +10655,7 @@ platforms = [
 applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
+  "differential:runtime-typed-text-drop",
   "differential:text-drop-boundary-empty-input",
   "differential:text-drop-boundary-ascii",
   "differential:text-drop-boundary-unicode",
@@ -16171,6 +16173,7 @@ evidence = [
 normalizers = []
 obligations = [
   "adapter-success",
+  "whnf-boundary",
   "typed-result",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
@@ -19814,14 +19817,17 @@ evidence = [
   "differential:runtime-typed-map-singleton-tree",
   "differential:runtime-typed-map-singleton-vector",
   "differential:runtime-typed-map-singleton-list",
-  "differential:runtime-typed-map-singleton-nonforce",
+  "differential:runtime-typed-map-singleton-key-strict",
+  "differential:runtime-typed-map-singleton-value-nonforce",
 ]
 normalizers = []
 obligations = [
   "adapter-success",
+  "whnf-boundary",
   "lazy-boundary",
   "typed-result",
   "collection-interaction",
+  "whnf-failure-boundary",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -20898,6 +20904,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-exists-true",
   "differential:runtime-directory-exists-false",
+  "differential:runtime-directory-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -20946,12 +20953,11 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-exists-true",
   "differential:runtime-directory-exists-false",
-  "differential:runtime-directory-exists-invalid-path-failure",
+  "differential:runtime-directory-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
   "effect-success",
-  "effect-failure",
   "effect-ordering",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
@@ -20996,6 +21002,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-exists-true",
   "differential:runtime-directory-exists-false",
+  "differential:runtime-directory-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -21043,6 +21050,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-exists-true",
   "differential:runtime-directory-exists-false",
+  "differential:runtime-directory-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -21090,6 +21098,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-file-exists-true",
   "differential:runtime-file-exists-false",
+  "differential:runtime-directory-file-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -21138,12 +21147,11 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-file-exists-true",
   "differential:runtime-file-exists-false",
-  "differential:runtime-directory-file-exists-invalid-path-failure",
+  "differential:runtime-directory-file-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
   "effect-success",
-  "effect-failure",
   "effect-ordering",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
@@ -21188,6 +21196,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-file-exists-true",
   "differential:runtime-file-exists-false",
+  "differential:runtime-directory-file-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -21235,6 +21244,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-file-exists-true",
   "differential:runtime-file-exists-false",
+  "differential:runtime-directory-file-exists-invalid-path-false",
 ]
 normalizers = []
 obligations = [
@@ -21281,6 +21291,7 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-current-directory-roundtrip",
+  "differential:runtime-current-directory-upstream-available",
 ]
 normalizers = []
 obligations = [
@@ -21289,6 +21300,55 @@ obligations = [
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
 review_group = "descriptor-v8-runtime-authority"
+
+[[overrides.scopes]]
+profiles = [
+  "sandboxed",
+]
+platforms = [
+  "linux-x86_64",
+  "macos-aarch64",
+  "windows-x86_64",
+]
+applicability_rule = "sandboxed-profile-review-required"
+evidence_strategy = "committed-differential-corpus"
+evidence = []
+normalizers = []
+obligations = []
+rationale = "The sandboxed profile is outside upstream-release-v1 and has no approved release evidence mapping."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "compatibility"
+
+[[overrides]]
+builtin = "Directory.getCurrentDirectory"
+dimensions = [
+  "effects",
+]
+
+[[overrides.scopes]]
+profiles = [
+  "upstream",
+]
+platforms = [
+  "linux-x86_64",
+  "macos-aarch64",
+  "windows-x86_64",
+]
+applicability_rule = "portable-native-oracle-host-failure-unavailable"
+evidence_strategy = "native-oracle"
+evidence = [
+  "differential:runtime-current-directory-roundtrip",
+  "differential:runtime-current-directory-upstream-available",
+]
+normalizers = []
+obligations = [
+  "effect-success",
+  "effect-failure",
+  "effect-ordering",
+]
+rationale = "The operation remains semantically fallible, but no deterministic portable native-oracle failure trigger exists; available success/order evidence is mapped while effect-failure remains missing and release-blocking."
+tracking_issue = "COMPAT-EVIDENCE"
+review_group = "portable-native-oracle-host-failure-gap"
 
 [[overrides.scopes]]
 profiles = [
@@ -21327,6 +21387,7 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-current-directory-roundtrip",
+  "differential:runtime-current-directory-upstream-available",
 ]
 normalizers = []
 obligations = [
@@ -21373,6 +21434,7 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-current-directory-roundtrip",
+  "differential:runtime-current-directory-upstream-available",
 ]
 normalizers = []
 obligations = [
@@ -21608,6 +21670,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-get-home-home-a",
   "differential:runtime-directory-get-home-home-b",
+  "differential:runtime-directory-get-home-platform-fallback",
 ]
 normalizers = []
 obligations = [
@@ -21650,12 +21713,12 @@ platforms = [
   "macos-aarch64",
   "windows-x86_64",
 ]
-applicability_rule = "descriptor-v8-reviewed-runtime-target"
+applicability_rule = "portable-native-oracle-host-failure-unavailable"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-get-home-home-a",
   "differential:runtime-directory-get-home-home-b",
-  "differential:runtime-directory-get-home-failure",
+  "differential:runtime-directory-get-home-platform-fallback",
 ]
 normalizers = []
 obligations = [
@@ -21663,9 +21726,9 @@ obligations = [
   "effect-failure",
   "effect-ordering",
 ]
-rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
+rationale = "The operation remains semantically fallible, but no deterministic portable native-oracle failure trigger exists; available success/order evidence is mapped while effect-failure remains missing and release-blocking."
 tracking_issue = "COMPAT-EVIDENCE"
-review_group = "descriptor-v8-runtime-authority"
+review_group = "portable-native-oracle-host-failure-gap"
 
 [[overrides.scopes]]
 profiles = [
@@ -21705,6 +21768,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-get-home-home-a",
   "differential:runtime-directory-get-home-home-b",
+  "differential:runtime-directory-get-home-platform-fallback",
 ]
 normalizers = []
 obligations = [
@@ -21752,6 +21816,7 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-directory-get-home-home-a",
   "differential:runtime-directory-get-home-home-b",
+  "differential:runtime-directory-get-home-platform-fallback",
 ]
 normalizers = []
 obligations = [
@@ -22906,6 +22971,7 @@ normalizers = []
 obligations = [
   "effect-success",
   "effect-failure",
+  "effect-cancellation",
   "effect-ordering",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
@@ -24558,11 +24624,13 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-process-run-success",
   "differential:runtime-process-run-nonzero",
+  "differential:runtime-process-run-failure",
 ]
 normalizers = []
 obligations = [
   "adapter-success",
   "io-execution-boundary",
+  "adapter-failure",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -24749,6 +24817,7 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-process-run-checked-success",
+  "differential:runtime-process-run-checked-failure",
   "differential:runtime-interaction-timeout-process",
   "differential:runtime-interaction-cwd-child-process",
 ]
@@ -24756,6 +24825,7 @@ normalizers = []
 obligations = [
   "adapter-success",
   "io-execution-boundary",
+  "adapter-failure",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -26242,14 +26312,15 @@ evidence = [
   "differential:runtime-typed-set-singleton-tree",
   "differential:runtime-typed-set-singleton-vector",
   "differential:runtime-typed-set-singleton-list",
-  "differential:runtime-typed-set-singleton-nonforce",
+  "differential:runtime-typed-set-singleton-element-strict",
 ]
 normalizers = []
 obligations = [
   "adapter-success",
-  "lazy-boundary",
+  "whnf-boundary",
   "typed-result",
   "collection-interaction",
+  "whnf-failure-boundary",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -32717,11 +32788,14 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-concurrently-right-completes-first",
   "differential:runtime-typed-async-concurrently-left-completes-first",
+  "differential:runtime-typed-async-concurrently-left-fails",
+  "differential:runtime-typed-async-concurrently-right-fails",
 ]
 normalizers = []
 obligations = [
   "adapter-success",
   "io-execution-boundary",
+  "adapter-failure",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -32816,6 +32890,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-concurrently-right-completes-first",
   "differential:runtime-typed-async-concurrently-left-completes-first",
+  "differential:runtime-typed-async-concurrently-left-fails",
+  "differential:runtime-typed-async-concurrently-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -32864,6 +32940,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-concurrently-right-completes-first",
   "differential:runtime-typed-async-concurrently-left-completes-first",
+  "differential:runtime-typed-async-concurrently-left-fails",
+  "differential:runtime-typed-async-concurrently-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -32911,6 +32989,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-concurrently-right-completes-first",
   "differential:runtime-typed-async-concurrently-left-completes-first",
+  "differential:runtime-typed-async-concurrently-left-fails",
+  "differential:runtime-typed-async-concurrently-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -32959,12 +33039,15 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-race-left-completes",
   "differential:runtime-typed-async-race-right-completes",
+  "differential:runtime-typed-async-race-left-fails",
+  "differential:runtime-typed-async-race-right-fails",
   "differential:runtime-interaction-race-temporary-resource",
 ]
 normalizers = []
 obligations = [
   "adapter-success",
   "io-execution-boundary",
+  "adapter-failure",
 ]
 rationale = "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations."
 tracking_issue = "COMPAT-EVIDENCE"
@@ -33059,6 +33142,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-race-left-completes",
   "differential:runtime-typed-async-race-right-completes",
+  "differential:runtime-typed-async-race-left-fails",
+  "differential:runtime-typed-async-race-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -33108,6 +33193,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-race-left-completes",
   "differential:runtime-typed-async-race-right-completes",
+  "differential:runtime-typed-async-race-left-fails",
+  "differential:runtime-typed-async-race-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -33155,6 +33242,8 @@ evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-async-race-left-completes",
   "differential:runtime-typed-async-race-right-completes",
+  "differential:runtime-typed-async-race-left-fails",
+  "differential:runtime-typed-async-race-right-fails",
 ]
 normalizers = []
 obligations = [
@@ -38446,6 +38535,8 @@ evidence = [
   "differential:runtime-typed-timeout-positive-completed",
   "differential:runtime-typed-timeout-positive-expired",
   "differential:runtime-typed-timeout-positive-action-failure",
+  "differential:runtime-typed-alternative-many-maybe-nonproductive",
+  "differential:runtime-typed-alternative-many-parser-nonproductive",
   "differential:runtime-interaction-timeout-process",
 ]
 normalizers = []
@@ -38496,6 +38587,8 @@ evidence = [
   "differential:runtime-typed-timeout-positive-completed",
   "differential:runtime-typed-timeout-positive-expired",
   "differential:runtime-typed-timeout-positive-action-failure",
+  "differential:runtime-typed-alternative-many-maybe-nonproductive",
+  "differential:runtime-typed-alternative-many-parser-nonproductive",
 ]
 normalizers = []
 obligations = [
@@ -38544,6 +38637,8 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-timeout-positive-expired",
+  "differential:runtime-typed-alternative-many-maybe-nonproductive",
+  "differential:runtime-typed-alternative-many-parser-nonproductive",
 ]
 normalizers = []
 obligations = [
@@ -38592,6 +38687,8 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-timeout-positive-expired",
+  "differential:runtime-typed-alternative-many-maybe-nonproductive",
+  "differential:runtime-typed-alternative-many-parser-nonproductive",
 ]
 normalizers = []
 obligations = [
@@ -38638,6 +38735,8 @@ applicability_rule = "descriptor-v8-reviewed-runtime-target"
 evidence_strategy = "native-oracle"
 evidence = [
   "differential:runtime-typed-timeout-positive-expired",
+  "differential:runtime-typed-alternative-many-maybe-nonproductive",
+  "differential:runtime-typed-alternative-many-parser-nonproductive",
 ]
 normalizers = []
 obligations = [

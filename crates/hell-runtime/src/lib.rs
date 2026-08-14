@@ -32,8 +32,8 @@ use std::time::SystemTime;
 
 use hell_builtins::BuiltinId;
 use hell_core::{
-    CaseBranch, ClassEvidence, Constant, CoreId, CoreKind, ExecutableProgram, Projection,
-    RecordLayout, VariantLayout, VerifiedProgram,
+    CaseBranch, ClassEvidence, Constant, CoreId, CoreKind, ExecutableProgram,
+    InstanceEvidencePlanId, Projection, RecordLayout, VariantLayout, VerifiedProgram,
 };
 use hell_host::{HostServices, SupervisedChild};
 use native_handle::{BufferMode, FileMode, HostHandle};
@@ -46,7 +46,23 @@ use typeclasses::{
 
 #[cfg(feature = "mutation-testing")]
 pub(crate) fn semantic_mutant_active(id: &str) -> bool {
-    std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref() == Ok(id)
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let marker_count = arguments
+        .iter()
+        .filter(|argument| *argument == "__hell_mutant")
+        .count();
+    if marker_count == 0 {
+        return false;
+    }
+    let selections = arguments
+        .windows(4)
+        .filter(|window| {
+            window[0] == "--skip" && window[1] == "__hell_mutant" && window[2] == "--skip"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(marker_count, 1, "mutation argv marker must be unique");
+    assert_eq!(selections.len(), 1, "mutation argv is malformed");
+    selections[0][3] == id
 }
 
 #[cfg(not(feature = "mutation-testing"))]
@@ -66,6 +82,7 @@ pub type EvaluationId = NonZeroU64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeErrorKind {
     UserError,
+    OptionParse,
     BlackHole,
     Cancelled,
     Exit(i32),
@@ -75,11 +92,55 @@ pub enum RuntimeErrorKind {
     InternalInvariant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeErrorPresentation {
+    ListCycleEmpty,
+    TextInvalidUtf8 {
+        byte: u8,
+    },
+    TextGetLineEndOfFile,
+    FileNotFound {
+        path: Arc<str>,
+        operation: RuntimeFileOperation,
+    },
+    ProcessNotFound {
+        command: Arc<str>,
+    },
+    EnvironmentVariableNotFound {
+        name: Arc<str>,
+    },
+    DirectoryOperation {
+        operation: RuntimeDirectoryOperation,
+        path: Arc<str>,
+        target: Option<Arc<str>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFileOperation {
+    WithBinaryFile,
+    OpenFile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeDirectoryOperation {
+    CopyFile,
+    CreateDirectory,
+    CreateDirectoryIfMissing,
+    GetFileSize,
+    RemoveFile,
+    RenameFile,
+    ListDirectory,
+    RemoveDirectory,
+    SetCurrentDirectory,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeError {
     pub code: &'static str,
     pub kind: RuntimeErrorKind,
     pub message: Arc<str>,
+    pub presentation: Option<RuntimeErrorPresentation>,
     pub suppressed: Arc<[Arc<RuntimeError>]>,
 }
 
@@ -89,6 +150,27 @@ impl RuntimeError {
             code: "H0901",
             kind: RuntimeErrorKind::UserError,
             message: message.into(),
+            presentation: None,
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn list_cycle_empty() -> Arc<Self> {
+        Arc::new(Self {
+            code: "H0901",
+            kind: RuntimeErrorKind::UserError,
+            message: "List.cycle: empty list".into(),
+            presentation: Some(RuntimeErrorPresentation::ListCycleEmpty),
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn option_parse(message: impl Into<Arc<str>>) -> Arc<Self> {
+        Arc::new(Self {
+            code: "H0901",
+            kind: RuntimeErrorKind::OptionParse,
+            message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -98,6 +180,7 @@ impl RuntimeError {
             code: "H9001",
             kind: RuntimeErrorKind::InternalInvariant,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -107,6 +190,7 @@ impl RuntimeError {
             code: "H0803",
             kind: RuntimeErrorKind::ResourceLimit,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -116,6 +200,7 @@ impl RuntimeError {
             code: "H0906",
             kind: RuntimeErrorKind::Cancelled,
             message: "IO action was cancelled".into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -125,6 +210,7 @@ impl RuntimeError {
             code: "H0909",
             kind: RuntimeErrorKind::CancellationStalled,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -134,6 +220,7 @@ impl RuntimeError {
             code: "H0907",
             kind: RuntimeErrorKind::Exit(status),
             message: "guest requested process exit".into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -143,6 +230,7 @@ impl RuntimeError {
             code: "H9004",
             kind: RuntimeErrorKind::InternalInvariant,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -152,6 +240,7 @@ impl RuntimeError {
             code: "H0908",
             kind: RuntimeErrorKind::Io,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
@@ -161,13 +250,123 @@ impl RuntimeError {
             code: "H0909",
             kind: RuntimeErrorKind::Io,
             message: message.into(),
+            presentation: None,
             suppressed: Arc::from([]),
         })
     }
 }
 
+impl RuntimeErrorPresentation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ListCycleEmpty => f.write_str(concat!(
+                "hell: Prelude.cycle: empty list\n",
+                "CallStack (from HasCallStack):\n",
+                "  error, called at libraries/base/GHC/List.hs:2004:3 in base:GHC.List\n",
+                "  errorEmptyList, called at libraries/base/GHC/List.hs:972:27 in base:GHC.List\n",
+                "  cycle, called at src/Hell.hs:1953:4 in main:Main",
+            )),
+            Self::TextInvalidUtf8 { byte } => write!(
+                f,
+                "hell: Cannot decode byte '\\x{byte:02x}': Data.Text.Encoding: Invalid UTF-8 stream"
+            ),
+            Self::TextGetLineEndOfFile => {
+                f.write_str("hell: <stdin>: Data.ByteString.hGetLine: end of file")
+            }
+            Self::FileNotFound { path, operation } => {
+                let operation = match operation {
+                    RuntimeFileOperation::WithBinaryFile => "withBinaryFile",
+                    RuntimeFileOperation::OpenFile => "openFile",
+                };
+                write!(
+                    f,
+                    "hell: {path}: {operation}: does not exist (No such file or directory)"
+                )
+            }
+            Self::ProcessNotFound { command } => {
+                #[cfg(unix)]
+                let launch_operation = "posix_spawnp";
+                #[cfg(windows)]
+                let launch_operation = "CreateProcess";
+                write!(
+                    f,
+                    "hell: {command}: startProcess: {launch_operation}: does not exist \
+                     (No such file or directory)"
+                )
+            }
+            Self::EnvironmentVariableNotFound { name } => write!(
+                f,
+                "hell: {name}: getEnv: does not exist (no environment variable)"
+            ),
+            Self::DirectoryOperation {
+                operation,
+                path,
+                target,
+            } => Self::fmt_directory(f, *operation, path, target.as_deref()),
+        }
+    }
+
+    fn fmt_directory(
+        f: &mut fmt::Formatter<'_>,
+        operation: RuntimeDirectoryOperation,
+        path: &str,
+        target: Option<&str>,
+    ) -> fmt::Result {
+        let missing = "does not exist (No such file or directory)";
+        match operation {
+            RuntimeDirectoryOperation::CopyFile => write!(
+                f,
+                "hell: {path}: copyFile:atomicCopyFileContents:withReplacementFile:\
+                 copyFileToHandle:openFdAt: {missing}"
+            ),
+            RuntimeDirectoryOperation::CreateDirectory => {
+                write!(
+                    f,
+                    "hell: {path}: createDirectory: already exists (File exists)"
+                )
+            }
+            RuntimeDirectoryOperation::CreateDirectoryIfMissing => {
+                write!(f, "hell: {path}: createDirectory: {missing}")
+            }
+            RuntimeDirectoryOperation::GetFileSize => {
+                write!(f, "hell: {path}: getFileSize:getFileStatus: {missing}")
+            }
+            RuntimeDirectoryOperation::RemoveFile => {
+                write!(f, "hell: {path}: removeLink: {missing}")
+            }
+            RuntimeDirectoryOperation::RenameFile => write!(
+                f,
+                "hell: renameFile:renamePath:rename '{path}' to '{}': {missing}",
+                target.expect("rename presentation has a target path")
+            ),
+            RuntimeDirectoryOperation::ListDirectory => {
+                write!(
+                    f,
+                    "hell: {path}: getDirectoryContents:openDirStream: {missing}"
+                )
+            }
+            RuntimeDirectoryOperation::RemoveDirectory => {
+                write!(f, "hell: {path}: removeDirectory: {missing}")
+            }
+            RuntimeDirectoryOperation::SetCurrentDirectory => {
+                write!(f, "hell: {path}: changeWorkingDirectory: {missing}")
+            }
+        }
+    }
+}
+
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(presentation) = &self.presentation {
+            return presentation.fmt(f);
+        }
+        if self.kind == RuntimeErrorKind::UserError {
+            return write!(
+                f,
+                "hell: {}\nCallStack (from HasCallStack):\n  error, called at src/Hell.hs:1953:4 in main:Main",
+                self.message
+            );
+        }
         write!(f, "{}: {}", self.code, self.message)
     }
 }
@@ -471,25 +670,97 @@ impl RuntimeContext {
             .collect()
     }
 
+    fn resolve_process_command(
+        &self,
+        operation: &'static str,
+        command: &str,
+    ) -> RuntimeResult<PathBuf> {
+        let guest = Path::new(command);
+        let mut components = guest.components();
+        let bare = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if !bare {
+            #[cfg(windows)]
+            if !guest
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(is_native_windows_executable_extension)
+            {
+                return Err(Self::io_error(
+                    operation,
+                    format!(
+                        "explicit process command `{command}` is not a native COM/EXE executable"
+                    ),
+                ));
+            }
+            return Ok(guest.to_path_buf());
+        }
+        let path = self
+            .captured_environment_value("PATH")
+            .ok_or_else(|| Self::process_path_not_found(operation, Arc::from(command)))?;
+        let cwd = self
+            .cwd
+            .lock()
+            .map_err(|_| RuntimeError::internal("working-directory mutex was poisoned"))?
+            .clone();
+        for directory in std::env::split_paths(path) {
+            let directory = if directory.as_os_str().is_empty() {
+                cwd.clone()
+            } else if directory.is_absolute() {
+                directory
+            } else {
+                cwd.join(directory)
+            };
+            #[cfg(unix)]
+            let candidates = process_command_candidates(&directory, command);
+            #[cfg(windows)]
+            let candidates = process_command_candidates(
+                &directory,
+                command,
+                self.captured_environment_value("PATHEXT"),
+            );
+            for candidate in candidates {
+                // PATH is the context's admitted parent snapshot. Canonicalizing binds a
+                // selected symlink target and ensures the child never re-searches its
+                // replacement environment. The final open remains the operating system's
+                // ordinary spawn-time TOCTOU inside those trusted PATH directories.
+                let Ok(canonical) = candidate.canonicalize() else {
+                    continue;
+                };
+                if process_command_is_executable(&canonical) {
+                    return Ok(canonical);
+                }
+            }
+        }
+        Err(Self::process_path_not_found(operation, Arc::from(command)))
+    }
+
+    fn captured_environment_value(&self, name: &str) -> Option<&str> {
+        self.environment
+            .iter()
+            .rev()
+            .find(|(candidate, _)| environment_names_equal(candidate, name))
+            .map(|(_, value)| value.as_ref())
+    }
+
     fn read_stdin_line(&self, operation: &'static str) -> RuntimeResult<Arc<str>> {
         let mut input = self
             .stdin
             .lock()
             .map_err(|_| RuntimeError::internal("stdin mutex was poisoned"))?;
-        let mut line = String::new();
+        let mut line = Vec::new();
         let read = input
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
             .map_err(|error| Self::io_error(operation, error))?;
         if read == 0 {
-            return Err(Self::io_error(operation, "end of input"));
+            return Err(Self::text_get_line_end_of_file());
         }
-        if line.ends_with('\n') {
+        if line.ends_with(b"\n") {
             line.pop();
-            if line.ends_with('\r') {
-                line.pop();
-            }
         }
-        Ok(line.into())
+        let text = std::str::from_utf8(&line)
+            .map_err(|error| Self::text_invalid_utf8(operation, &line, error))?;
+        Ok(text.into())
     }
 
     fn read_stdin_up_to(&self, operation: &'static str, amount: usize) -> RuntimeResult<Vec<u8>> {
@@ -537,6 +808,126 @@ impl RuntimeContext {
             code: "H0903",
             kind: RuntimeErrorKind::Io,
             message: format!("{operation}: {error}").into(),
+            presentation: None,
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn text_invalid_utf8(
+        operation: &'static str,
+        bytes: &[u8],
+        error: std::str::Utf8Error,
+    ) -> Arc<RuntimeError> {
+        let offset = error.valid_up_to();
+        let byte = *bytes
+            .get(offset)
+            .expect("invalid UTF-8 reports the first unavailable decoded byte");
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: format!("{operation}: invalid UTF-8 at byte {offset}").into(),
+            presentation: Some(RuntimeErrorPresentation::TextInvalidUtf8 { byte }),
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn text_get_line_end_of_file() -> Arc<RuntimeError> {
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: "Text.getLine: end of input".into(),
+            presentation: Some(RuntimeErrorPresentation::TextGetLineEndOfFile),
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn file_io_error(
+        operation: &'static str,
+        guest_path: Arc<str>,
+        presentation_operation: RuntimeFileOperation,
+        error: &std::io::Error,
+    ) -> Arc<RuntimeError> {
+        let presentation = (error.kind() == std::io::ErrorKind::NotFound).then_some({
+            RuntimeErrorPresentation::FileNotFound {
+                path: guest_path,
+                operation: presentation_operation,
+            }
+        });
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: format!("{operation}: {error}").into(),
+            presentation,
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn process_spawn_error(
+        operation: &'static str,
+        guest_command: Arc<str>,
+        error: &std::io::Error,
+    ) -> Arc<RuntimeError> {
+        let presentation = (error.kind() == std::io::ErrorKind::NotFound).then_some(
+            RuntimeErrorPresentation::ProcessNotFound {
+                command: guest_command,
+            },
+        );
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: format!("{operation}: {error}").into(),
+            presentation,
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn process_path_not_found(
+        operation: &'static str,
+        guest_command: Arc<str>,
+    ) -> Arc<RuntimeError> {
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: format!(
+                "{operation}: executable `{guest_command}` was not found in captured parent PATH"
+            )
+            .into(),
+            presentation: Some(RuntimeErrorPresentation::ProcessNotFound {
+                command: guest_command,
+            }),
+            suppressed: Arc::from([]),
+        })
+    }
+
+    fn directory_io_error(
+        operation: &'static str,
+        presentation_operation: RuntimeDirectoryOperation,
+        guest_path: Arc<str>,
+        guest_target: Option<Arc<str>>,
+        error: &std::io::Error,
+    ) -> Arc<RuntimeError> {
+        let expected_kind = match presentation_operation {
+            RuntimeDirectoryOperation::CreateDirectory => std::io::ErrorKind::AlreadyExists,
+            RuntimeDirectoryOperation::CopyFile
+            | RuntimeDirectoryOperation::CreateDirectoryIfMissing
+            | RuntimeDirectoryOperation::GetFileSize
+            | RuntimeDirectoryOperation::RemoveFile
+            | RuntimeDirectoryOperation::RenameFile
+            | RuntimeDirectoryOperation::ListDirectory
+            | RuntimeDirectoryOperation::RemoveDirectory
+            | RuntimeDirectoryOperation::SetCurrentDirectory => std::io::ErrorKind::NotFound,
+        };
+        Arc::new(RuntimeError {
+            code: "H0903",
+            kind: RuntimeErrorKind::Io,
+            message: format!("{operation}: {error}").into(),
+            presentation: (error.kind() == expected_kind).then_some(
+                RuntimeErrorPresentation::DirectoryOperation {
+                    operation: presentation_operation,
+                    path: guest_path,
+                    target: guest_target,
+                },
+            ),
             suppressed: Arc::from([]),
         })
     }
@@ -674,10 +1065,10 @@ impl IoAction {
         if let Some(effect) = effect {
             evaluator.record_effect_terminal(
                 effect,
-                if result.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
+                match &result {
+                    Ok(_) => "completed",
+                    Err(error) if error.kind == RuntimeErrorKind::Cancelled => "cancelled",
+                    Err(_) => "failed",
                 },
             )?;
         }
@@ -905,10 +1296,15 @@ enum Suspension {
         remaining: i64,
         list: ThunkRef,
     },
+    ListRepeat {
+        item: ThunkRef,
+        nonproductive: bool,
+        #[cfg(feature = "compat-tracing")]
+        nonproductive_origin: Option<NonproductiveListOrigin>,
+    },
     ListIterate {
         function: ThunkRef,
         current: ThunkRef,
-        force_current: bool,
         #[cfg(feature = "compat-tracing")]
         callback_parent: Option<AdapterCausalIdentity>,
     },
@@ -948,11 +1344,33 @@ enum Suspension {
         callback_argument: u16,
         branch: &'static str,
     },
+    #[cfg(feature = "compat-tracing")]
+    DeferredAdapterAlias {
+        target: ThunkRef,
+        parent: AdapterCausalIdentity,
+    },
     Fix {
         function: ThunkRef,
         recursive: Weak<Thunk>,
     },
     Native(Arc<NativeThunkOperation>),
+}
+
+#[cfg(feature = "compat-tracing")]
+#[derive(Clone, Debug)]
+pub struct NonproductiveListOrigin {
+    identity: AdapterCausalIdentity,
+    builtin: BuiltinId,
+    argument: usize,
+    source: ThunkRef,
+}
+
+#[cfg(feature = "compat-tracing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonproductivePhase {
+    OriginRecorded,
+    Pending,
+    Cancelled,
 }
 
 #[cfg(feature = "compat-tracing")]
@@ -1101,6 +1519,7 @@ fn register_wait(waiter: EvaluationId, owner: EvaluationId) -> RuntimeResult<Wai
                 code: "H0902",
                 kind: RuntimeErrorKind::BlackHole,
                 message: "cross-evaluator black hole detected in thunk wait graph".into(),
+                presentation: None,
                 suppressed: Arc::from([]),
             }));
         }
@@ -1170,7 +1589,6 @@ struct EvidenceTrace {
     pooled_task_ordinals: HashMap<u64, (BuiltinId, u64)>,
     adapter_sequences: HashMap<Option<u64>, u64>,
     effect_sequences: HashMap<Option<u64>, u64>,
-    deferred_adapter_parents: HashMap<usize, AdapterCausalIdentity>,
     resource_ids: HashMap<usize, u64>,
     live_resources: HashSet<u64>,
 }
@@ -1189,6 +1607,7 @@ struct AdapterObligationEvidence {
 }
 
 #[cfg(feature = "compat-tracing")]
+#[derive(Clone)]
 struct ActiveAdapterObligation {
     builtin: BuiltinId,
     instance_target: Option<Arc<str>>,
@@ -1201,11 +1620,83 @@ struct ActiveAdapterObligation {
 }
 
 #[cfg(feature = "compat-tracing")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdapterCausalIdentity {
     builtin: BuiltinId,
     owner_task: Option<u64>,
     sequence: u64,
+}
+
+#[cfg(feature = "compat-tracing")]
+fn adapter_identity_descends_from(
+    trace: &EvidenceTrace,
+    active: &[ActiveAdapterObligation],
+    child: AdapterCausalIdentity,
+    ancestor: AdapterCausalIdentity,
+) -> bool {
+    if child.owner_task != ancestor.owner_task || child.sequence <= ancestor.sequence {
+        return false;
+    }
+    let mut current = child;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.sequence) {
+            return false;
+        }
+        let parent_sequence = trace
+            .obligation_events
+            .iter()
+            .find(|event| {
+                event.owner_task == current.owner_task
+                    && event.sequence == current.sequence
+                    && event.builtin == current.builtin
+            })
+            .and_then(|event| event.parent_sequence)
+            .or_else(|| {
+                active
+                    .iter()
+                    .find(|candidate| {
+                        candidate.owner_task == current.owner_task
+                            && candidate.sequence == current.sequence
+                            && candidate.builtin == current.builtin
+                    })
+                    .and_then(|candidate| candidate.parent_sequence)
+            });
+        let Some(parent_sequence) = parent_sequence else {
+            return false;
+        };
+        if parent_sequence >= current.sequence {
+            return false;
+        }
+        let retained_parent = trace
+            .obligation_events
+            .iter()
+            .find(|candidate| {
+                candidate.owner_task == current.owner_task && candidate.sequence == parent_sequence
+            })
+            .map(|parent| AdapterCausalIdentity {
+                builtin: parent.builtin,
+                owner_task: parent.owner_task,
+                sequence: parent.sequence,
+            });
+        let active_parent = active
+            .iter()
+            .find(|candidate| {
+                candidate.owner_task == current.owner_task && candidate.sequence == parent_sequence
+            })
+            .map(|parent| AdapterCausalIdentity {
+                builtin: parent.builtin,
+                owner_task: parent.owner_task,
+                sequence: parent.sequence,
+            });
+        let Some(parent) = retained_parent.or(active_parent) else {
+            return false;
+        };
+        if parent_sequence == ancestor.sequence {
+            return parent == ancestor;
+        }
+        current = parent;
+    }
 }
 
 #[cfg(feature = "compat-tracing")]
@@ -1259,16 +1750,36 @@ struct ForcedArgumentEvidence {
     boundary_class: &'static str,
     thunk: ThunkRef,
     snapshot_outcome: Option<&'static str>,
+    snapshot_error_code: Option<&'static str>,
 }
 
 #[cfg(feature = "compat-tracing")]
 impl EvidenceTrace {
+    fn push_forced_argument(
+        &mut self,
+        builtin: BuiltinId,
+        argument: usize,
+        boundary_class: &'static str,
+        thunk: &ThunkRef,
+        snapshot_outcome: Option<&'static str>,
+        snapshot_error_code: Option<&'static str>,
+    ) {
+        self.forced_arguments.push(ForcedArgumentEvidence {
+            builtin,
+            argument,
+            boundary_class,
+            thunk: Arc::clone(thunk),
+            snapshot_outcome,
+            snapshot_error_code,
+        });
+    }
+
     fn from_program(program: &ExecutableProgram) -> Self {
         Self {
             parsed_builtins: program.compiler_evidence().parsed.clone(),
             resolved_builtins: program.compiler_evidence().resolved.clone(),
             specialized_builtins: program.compiler_evidence().specialized.clone(),
-            typed_result_target: evidence_typed_result_target(),
+            typed_result_target: None,
             ..Self::default()
         }
     }
@@ -1278,7 +1789,6 @@ impl EvidenceTrace {
         typed_result_target: Option<BuiltinId>,
         typed_result_target_instance: Option<Arc<str>>,
     ) -> Self {
-        let typed_result_target = typed_result_target.or_else(evidence_typed_result_target);
         let typed_result_target_program_occurrences = typed_result_target.map_or(0, |target| {
             u64::try_from(
                 program
@@ -1316,13 +1826,6 @@ fn core_node_builtin(kind: &CoreKind) -> Option<BuiltinId> {
     hell_builtins::lookup(name).map(|builtin| builtin.id)
 }
 
-#[cfg(feature = "compat-tracing")]
-fn evidence_typed_result_target() -> Option<BuiltinId> {
-    let raw = std::env::var("HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID").ok()?;
-    let raw = raw.parse::<u16>().ok()?;
-    (usize::from(raw) < hell_builtins::registry().len()).then_some(BuiltinId(raw))
-}
-
 enum Control {
     Evaluate {
         node: CoreId,
@@ -1345,8 +1848,9 @@ enum Frame {
         evidence: Option<ClassEvidence>,
     },
     #[cfg(feature = "compat-tracing")]
-    RestoreAdapterParent {
-        parent: Option<AdapterCausalIdentity>,
+    FinishDeferredAdapterAlias {
+        prior: Option<AdapterCausalIdentity>,
+        parent: AdapterCausalIdentity,
     },
     #[cfg(feature = "compat-tracing")]
     FinishCallback {
@@ -1385,6 +1889,7 @@ enum Frame {
     ListIterateCurrent {
         function: ThunkRef,
         current: ThunkRef,
+        next: ThunkRef,
         #[cfg(feature = "compat-tracing")]
         callback_parent: Option<AdapterCausalIdentity>,
     },
@@ -1427,9 +1932,6 @@ impl Evaluator {
             Arc::clone(&budget),
             cancellation.clone(),
         );
-        #[cfg(feature = "compat-tracing")]
-        let evidence_trace = std::env::var_os("HELL_EVIDENCE_SEMANTIC_TRACE")
-            .map(|_| Arc::new(Mutex::new(EvidenceTrace::from_program(&program))));
         Self {
             program,
             evaluation_id: next_evaluation_id(),
@@ -1441,7 +1943,7 @@ impl Evaluator {
             max_concurrent_actions: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             #[cfg(feature = "compat-tracing")]
-            evidence_trace,
+            evidence_trace: None,
             #[cfg(feature = "compat-tracing")]
             current_evidence_task: None,
             #[cfg(feature = "compat-tracing")]
@@ -1467,9 +1969,6 @@ impl Evaluator {
             Arc::clone(&budget),
             cancellation.clone(),
         );
-        #[cfg(feature = "compat-tracing")]
-        let evidence_trace = std::env::var_os("HELL_EVIDENCE_SEMANTIC_TRACE")
-            .map(|_| Arc::new(Mutex::new(EvidenceTrace::from_program(&program))));
         Self {
             program,
             evaluation_id: next_evaluation_id(),
@@ -1481,7 +1980,7 @@ impl Evaluator {
             max_concurrent_actions: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             #[cfg(feature = "compat-tracing")]
-            evidence_trace,
+            evidence_trace: None,
             #[cfg(feature = "compat-tracing")]
             current_evidence_task: None,
             #[cfg(feature = "compat-tracing")]
@@ -1577,6 +2076,168 @@ impl Evaluator {
         }
     }
 
+    #[cfg(feature = "compat-tracing")]
+    fn nonproductive_list_origin(
+        &self,
+        source: ThunkRef,
+        boundary: &'static str,
+    ) -> RuntimeResult<Option<NonproductiveListOrigin>> {
+        if self.evidence_trace.is_none() {
+            return Ok(None);
+        }
+        let identity = self.active_adapter_identity()?;
+        let builtin = hell_builtins::lookup("Alternative.many")
+            .ok_or_else(|| RuntimeError::internal("Alternative.many disappeared from registry"))?
+            .id;
+        if identity.builtin != builtin {
+            return Err(RuntimeError::internal(
+                "nonproductive list origin is not Alternative.many",
+            ));
+        }
+        self.record_argument_snapshot(builtin, 0, boundary, &source)?;
+        Ok(Some(NonproductiveListOrigin {
+            identity,
+            builtin,
+            argument: 0,
+            source,
+        }))
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn suspended_nonproductive_list_origin(
+        thunk: &ThunkRef,
+    ) -> RuntimeResult<Option<NonproductiveListOrigin>> {
+        let thunk = Self::underlying_adapter_view_thunk(thunk)?;
+        let state = thunk
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::internal("thunk mutex was poisoned"))?;
+        Ok(match &*state {
+            ThunkState::Suspended(Suspension::ListRepeat {
+                nonproductive_origin,
+                ..
+            }) => nonproductive_origin.clone(),
+            _ => None,
+        })
+    }
+
+    fn is_suspended_nonproductive_list(thunk: &ThunkRef) -> RuntimeResult<bool> {
+        #[cfg(feature = "compat-tracing")]
+        let thunk = Self::underlying_adapter_view_thunk(thunk)?;
+        #[cfg(not(feature = "compat-tracing"))]
+        let thunk = Arc::clone(thunk);
+        let state = thunk
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::internal("thunk mutex was poisoned"))?;
+        Ok(matches!(
+            &*state,
+            ThunkState::Suspended(Suspension::ListRepeat {
+                nonproductive: true,
+                ..
+            })
+        ))
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn underlying_adapter_view_thunk(thunk: &ThunkRef) -> RuntimeResult<ThunkRef> {
+        let mut current = Arc::clone(thunk);
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(Arc::as_ptr(&current) as usize) {
+                return Err(RuntimeError::internal(
+                    "deferred adapter alias chain is cyclic",
+                ));
+            }
+            let state = current
+                .state
+                .lock()
+                .map_err(|_| RuntimeError::internal("thunk mutex was poisoned"))?;
+            let next = match &*state {
+                ThunkState::Suspended(Suspension::DeferredAdapterAlias { target, .. })
+                | ThunkState::Indirection(target) => Some(Arc::clone(target)),
+                _ => None,
+            };
+            drop(state);
+            let Some(next) = next else {
+                return Ok(current);
+            };
+            current = next;
+        }
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn record_nonproductive_list_state(
+        &self,
+        origin: &NonproductiveListOrigin,
+        phase: &mut NonproductivePhase,
+        boundary: &'static str,
+    ) -> RuntimeResult<()> {
+        if origin.identity.builtin != origin.builtin {
+            return Err(RuntimeError::internal(
+                "nonproductive list identity changed after construction",
+            ));
+        }
+        let next = match (*phase, boundary) {
+            (NonproductivePhase::OriginRecorded, "nonproductive-pending") => {
+                NonproductivePhase::Pending
+            }
+            (NonproductivePhase::Pending, "nonproductive-cancelled") => {
+                NonproductivePhase::Cancelled
+            }
+            _ => {
+                return Err(RuntimeError::internal(
+                    "nonproductive list lifecycle is out of order",
+                ));
+            }
+        };
+        self.record_argument_snapshot(origin.builtin, origin.argument, boundary, &origin.source)?;
+        *phase = next;
+        Ok(())
+    }
+
+    fn wait_for_nonproductive_many<T>(
+        &self,
+        source: &ThunkRef,
+        #[cfg(feature = "compat-tracing")] origin: Option<&NonproductiveListOrigin>,
+    ) -> RuntimeResult<T> {
+        let _ = source;
+        #[cfg(feature = "compat-tracing")]
+        {
+            let mut phase = NonproductivePhase::OriginRecorded;
+            if let Some(origin) = origin {
+                self.record_nonproductive_list_state(origin, &mut phase, "nonproductive-pending")?;
+            }
+            loop {
+                if self
+                    .cancellation
+                    .wait_timeout(std::time::Duration::from_millis(10))
+                {
+                    if let Some(origin) = origin {
+                        self.record_nonproductive_list_state(
+                            origin,
+                            &mut phase,
+                            "nonproductive-cancelled",
+                        )?;
+                    }
+                    return Err(RuntimeError::cancelled());
+                }
+            }
+        }
+        #[cfg(not(feature = "compat-tracing"))]
+        {
+            let _ = source;
+            loop {
+                if self
+                    .cancellation
+                    .wait_timeout(std::time::Duration::from_millis(10))
+                {
+                    return Err(RuntimeError::cancelled());
+                }
+            }
+        }
+    }
+
     #[allow(clippy::unused_self)]
     fn expression_thunk(&self, node: CoreId, environment: Environment) -> ThunkRef {
         let _budget = ActiveBudgetGuard::enter(&self.budget);
@@ -1632,10 +2293,6 @@ impl Evaluator {
                             continue;
                         }
                     }
-                    #[cfg(feature = "compat-tracing")]
-                    if let Some(parent) = self.pending_adapter_parent {
-                        self.register_deferred_adapter_parent(&target, parent)?;
-                    }
                     control = Control::Enter(target);
                 }
                 Control::Return(ForceOutcome::Value(value)) => {
@@ -1679,8 +2336,26 @@ impl Evaluator {
                     }
                 }
                 #[cfg(feature = "compat-tracing")]
-                Frame::RestoreAdapterParent { parent } => {
-                    self.pending_adapter_parent = parent;
+                Frame::InvokeNative {
+                    builtin,
+                    arguments,
+                    next_demand,
+                    ..
+                } => {
+                    if let Err(trace_error) =
+                        self.record_whnf_argument_failure(builtin, &arguments, next_demand, &error)
+                    {
+                        error = trace_error;
+                    }
+                    if let Err(trace_error) =
+                        self.record_lazy_argument_exit_states(builtin, &arguments)
+                    {
+                        error = trace_error;
+                    }
+                }
+                #[cfg(feature = "compat-tracing")]
+                Frame::FinishDeferredAdapterAlias { prior, .. } => {
+                    self.pending_adapter_parent = prior;
                 }
                 #[cfg(feature = "compat-tracing")]
                 Frame::FinishCallback { identity } => {
@@ -1718,6 +2393,7 @@ impl Evaluator {
                         code: "H0902",
                         kind: RuntimeErrorKind::BlackHole,
                         message: "black hole while forcing a recursive thunk".into(),
+                        presentation: None,
                         suppressed: Arc::from([]),
                     })));
                 }
@@ -1750,28 +2426,6 @@ impl Evaluator {
                         return Err(RuntimeError::internal("invalid thunk transition"));
                     };
                     drop(state);
-                    #[cfg(feature = "compat-tracing")]
-                    let prior_parent = {
-                        let inherited = self
-                            .evidence_trace
-                            .as_ref()
-                            .and_then(|trace| trace.lock().ok())
-                            .and_then(|trace| {
-                                trace
-                                    .deferred_adapter_parents
-                                    .get(&(Arc::as_ptr(&current) as usize))
-                                    .copied()
-                            });
-                        let prior = self.pending_adapter_parent;
-                        if inherited.is_some() {
-                            self.pending_adapter_parent = inherited;
-                        }
-                        prior
-                    };
-                    #[cfg(feature = "compat-tracing")]
-                    stack.push(Frame::RestoreAdapterParent {
-                        parent: prior_parent,
-                    });
                     stack.push(Frame::Update(ThunkUpdateGuard::new(Arc::clone(&current))));
                     return self.enter_suspension(suspension, stack);
                 }
@@ -1803,30 +2457,22 @@ impl Evaluator {
                 callback_argument,
                 branch,
             } => self.enter_callback_force(target, parent, callback_argument, branch, stack),
+            #[cfg(feature = "compat-tracing")]
+            Suspension::DeferredAdapterAlias { target, parent } => {
+                let prior = self.pending_adapter_parent;
+                self.pending_adapter_parent = Some(parent);
+                self.push_frame(stack, Frame::FinishDeferredAdapterAlias { prior, parent })?;
+                Ok(Control::Enter(target))
+            }
             Suspension::Fix {
                 function,
                 recursive,
-            } => {
-                let recursive = recursive.upgrade().ok_or_else(|| {
-                    RuntimeError::internal("Function.fix recursive thunk was released")
-                })?;
-                #[cfg(feature = "compat-tracing")]
-                {
-                    let callback =
-                        self.callback_application(function, &[recursive], 0, "recursive")?;
-                    Ok(Control::Enter(callback))
-                }
+            } => self.enter_fix(
+                function,
+                &recursive,
                 #[cfg(not(feature = "compat-tracing"))]
-                {
-                    self.push_frame(
-                        stack,
-                        Frame::Apply {
-                            argument: recursive,
-                        },
-                    )?;
-                    Ok(Control::Enter(function))
-                }
-            }
+                stack,
+            ),
             Suspension::ListLiteral {
                 nodes,
                 index,
@@ -1835,16 +2481,25 @@ impl Evaluator {
             Suspension::ListTake { remaining, list } => {
                 self.enter_list_take(remaining, list, stack)
             }
+            Suspension::ListRepeat {
+                item,
+                nonproductive,
+                #[cfg(feature = "compat-tracing")]
+                nonproductive_origin,
+            } => Ok(Self::enter_list_repeat(
+                item,
+                nonproductive,
+                #[cfg(feature = "compat-tracing")]
+                nonproductive_origin,
+            )),
             Suspension::ListIterate {
                 function,
                 current,
-                force_current,
                 #[cfg(feature = "compat-tracing")]
                 callback_parent,
             } => self.enter_list_iterate(
                 function,
-                current,
-                force_current,
+                &current,
                 #[cfg(feature = "compat-tracing")]
                 callback_parent,
                 stack,
@@ -1876,6 +2531,47 @@ impl Evaluator {
                 .map(ForceOutcome::Value)
                 .map(Control::Return),
         }
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn enter_fix(&mut self, function: ThunkRef, recursive: &Weak<Thunk>) -> RuntimeResult<Control> {
+        let recursive = recursive
+            .upgrade()
+            .ok_or_else(|| RuntimeError::internal("Function.fix recursive thunk was released"))?;
+        let callback = self.callback_application(function, &[recursive], 0, "recursive")?;
+        Ok(Control::Enter(callback))
+    }
+
+    #[cfg(not(feature = "compat-tracing"))]
+    fn enter_fix(
+        &mut self,
+        function: ThunkRef,
+        recursive: &Weak<Thunk>,
+        stack: &mut Vec<Frame>,
+    ) -> RuntimeResult<Control> {
+        let recursive = recursive
+            .upgrade()
+            .ok_or_else(|| RuntimeError::internal("Function.fix recursive thunk was released"))?;
+        self.push_frame(
+            stack,
+            Frame::Apply {
+                argument: recursive,
+            },
+        )?;
+        Ok(Control::Enter(function))
+    }
+
+    fn enter_list_repeat(
+        item: ThunkRef,
+        nonproductive: bool,
+        #[cfg(feature = "compat-tracing")] nonproductive_origin: Option<NonproductiveListOrigin>,
+    ) -> Control {
+        Control::Return(ForceOutcome::Value(Self::repeat_cell(
+            item,
+            nonproductive,
+            #[cfg(feature = "compat-tracing")]
+            nonproductive_origin,
+        )))
     }
 
     fn enter_list_literal(
@@ -1917,29 +2613,34 @@ impl Evaluator {
     fn enter_list_iterate(
         &mut self,
         function: ThunkRef,
-        current: ThunkRef,
-        force_current: bool,
+        current: &ThunkRef,
         #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
         stack: &mut Vec<Frame>,
     ) -> RuntimeResult<Control> {
-        if !force_current {
-            return Ok(Control::Return(ForceOutcome::Value(Self::iterate_cell(
-                function,
-                current,
-                #[cfg(feature = "compat-tracing")]
-                callback_parent,
-            ))));
-        }
+        #[cfg(feature = "compat-tracing")]
+        let next = Self::callback_application_for_optional_parent(
+            callback_parent,
+            Arc::clone(&function),
+            &[Arc::clone(current)],
+            0,
+            "element",
+        );
+        #[cfg(not(feature = "compat-tracing"))]
+        let next = Thunk::suspended(Suspension::Apply {
+            function: Arc::clone(&function),
+            argument: Arc::clone(current),
+        });
         self.push_frame(
             stack,
             Frame::ListIterateCurrent {
                 function,
-                current: Arc::clone(&current),
+                current: Arc::clone(current),
+                next: Arc::clone(&next),
                 #[cfg(feature = "compat-tracing")]
                 callback_parent,
             },
         )?;
-        Ok(Control::Enter(current))
+        Ok(Control::Enter(next))
     }
 
     fn enter_semigroup_append(
@@ -2263,12 +2964,6 @@ impl Evaluator {
     ) -> RuntimeResult<Control> {
         match frame {
             Frame::Update(mut update) => {
-                #[cfg(feature = "compat-tracing")]
-                if let Some(parent) = self.pending_adapter_parent {
-                    for child in evidence_value_children(&value) {
-                        self.register_deferred_adapter_parent(child, parent)?;
-                    }
-                }
                 let result = Ok(ForceOutcome::Value(Arc::clone(&value)));
                 update.store(&result)?;
                 Ok(Control::Return(ForceOutcome::Value(value)))
@@ -2281,9 +2976,10 @@ impl Evaluator {
                 evidence,
             } => self.schedule_native(builtin, &arguments, next_demand, evidence, stack),
             #[cfg(feature = "compat-tracing")]
-            Frame::RestoreAdapterParent { parent } => {
-                self.pending_adapter_parent = parent;
-                Ok(Control::Return(ForceOutcome::Value(value)))
+            Frame::FinishDeferredAdapterAlias { prior, parent } => {
+                let contextual = self.contextual_adapter_value(&value, parent);
+                self.pending_adapter_parent = prior;
+                Ok(Control::Return(ForceOutcome::Value(contextual?)))
             }
             #[cfg(feature = "compat-tracing")]
             Frame::FinishCallback { identity } => {
@@ -2469,11 +3165,13 @@ impl Evaluator {
             Frame::ListIterateCurrent {
                 function,
                 current,
+                next,
                 #[cfg(feature = "compat-tracing")]
                 callback_parent,
             } => Ok(Control::Return(ForceOutcome::Value(Self::iterate_cell(
                 function,
                 current,
+                next,
                 #[cfg(feature = "compat-tracing")]
                 callback_parent,
             )))),
@@ -2764,6 +3462,10 @@ impl Evaluator {
         evidence: Option<ClassEvidence>,
         stack: &mut Vec<Frame>,
     ) -> RuntimeResult<Control> {
+        #[cfg(feature = "compat-tracing")]
+        if next_demand == 0 {
+            self.record_lazy_argument_entry_states(builtin, arguments)?;
+        }
         let spec = hell_builtins::registry()
             .get(builtin.0 as usize)
             .ok_or_else(|| RuntimeError::internal("unknown built-in id"))?;
@@ -2771,18 +3473,10 @@ impl Evaluator {
         // adapter. Its typed force helpers then hit memoized values instead of
         // nesting evaluator calls on the Rust stack. Subtraction is a pinned
         // flipped primitive, so its observable failure order is right-to-left.
-        let reverse_binary = matches!(
-            spec.implementation,
-            Some("int_subtract" | "integer_subtract" | "double_subtract")
-        );
         #[cfg(feature = "compat-tracing")]
         if next_demand > 0 {
             let position = next_demand - 1;
-            let index = if reverse_binary {
-                arguments.len() - position - 1
-            } else {
-                position
-            };
+            let index = native_demand_argument_index(spec, arguments.len(), position);
             let boundary_class = match spec.demand[index] {
                 hell_builtins::Demand::Whnf => Some("whnf-force-complete"),
                 hell_builtins::Demand::Conditional => Some("conditional-force-complete"),
@@ -2795,11 +3489,7 @@ impl Evaluator {
             }
         }
         for position in next_demand..arguments.len() {
-            let index = if reverse_binary {
-                arguments.len() - position - 1
-            } else {
-                position
-            };
+            let index = native_demand_argument_index(spec, arguments.len(), position);
             if matches!(
                 spec.demand.get(index),
                 Some(
@@ -2820,32 +3510,26 @@ impl Evaluator {
                 return Ok(Control::Enter(Arc::clone(&arguments[index])));
             }
         }
-        self.apply_native(builtin, arguments, evidence)
+        #[cfg(feature = "compat-tracing")]
+        {
+            let instance_evidence = evidence
+                .map(|evidence| typeclasses::retained_instance_evidence(self, evidence))
+                .transpose()?;
+            self.begin_adapter_obligation(builtin, instance_evidence)?;
+        }
+        self.apply_native_after_entry(builtin, arguments, evidence)
             .map(Control::Return)
     }
 
     fn iterate_cell(
         function: ThunkRef,
         current: ThunkRef,
+        next: ThunkRef,
         #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
     ) -> ValueRef {
-        #[cfg(feature = "compat-tracing")]
-        let next = Self::callback_application_for_optional_parent(
-            callback_parent,
-            Arc::clone(&function),
-            &[Arc::clone(&current)],
-            0,
-            "element",
-        );
-        #[cfg(not(feature = "compat-tracing"))]
-        let next = Thunk::suspended(Suspension::Apply {
-            function: Arc::clone(&function),
-            argument: Arc::clone(&current),
-        });
         let tail = Thunk::suspended(Suspension::ListIterate {
             function,
             current: next,
-            force_current: true,
             #[cfg(feature = "compat-tracing")]
             callback_parent,
         });
@@ -2853,6 +3537,33 @@ impl Evaluator {
             head: current,
             tail,
         }))
+    }
+
+    fn repeat_cell(
+        item: ThunkRef,
+        nonproductive: bool,
+        #[cfg(feature = "compat-tracing")] nonproductive_origin: Option<NonproductiveListOrigin>,
+    ) -> ValueRef {
+        let tail = Thunk::suspended(Suspension::ListRepeat {
+            item: Arc::clone(&item),
+            nonproductive,
+            #[cfg(feature = "compat-tracing")]
+            nonproductive_origin,
+        });
+        Arc::new(Value::List(ListCell::Cons { head: item, tail }))
+    }
+
+    fn repeat_list(
+        item: ThunkRef,
+        nonproductive: bool,
+        #[cfg(feature = "compat-tracing")] nonproductive_origin: Option<NonproductiveListOrigin>,
+    ) -> ThunkRef {
+        Thunk::suspended(Suspension::ListRepeat {
+            item,
+            nonproductive,
+            #[cfg(feature = "compat-tracing")]
+            nonproductive_origin,
+        })
     }
 
     fn apply_native(
@@ -2868,12 +3579,25 @@ impl Evaluator {
         #[cfg(feature = "compat-tracing")]
         self.begin_adapter_obligation(builtin, instance_evidence)?;
         #[cfg(feature = "compat-tracing")]
-        self.record_lazy_argument_entry_states(builtin, arguments)?;
+        if let Err(error) = self.record_lazy_argument_entry_states(builtin, arguments) {
+            return self.finish_native_outcome(builtin, Err(error));
+        }
+        self.apply_native_after_entry(builtin, arguments, evidence)
+    }
+
+    fn apply_native_after_entry(
+        &mut self,
+        builtin: BuiltinId,
+        arguments: &[ThunkRef],
+        evidence: Option<ClassEvidence>,
+    ) -> RuntimeResult<ForceOutcome> {
         let outcome = self.apply_native_inner(builtin, arguments, evidence);
         #[cfg(feature = "compat-tracing")]
         let outcome = Self::attach_io_execution_argument_evidence(builtin, arguments, outcome);
         #[cfg(feature = "compat-tracing")]
-        self.record_lazy_argument_exit_states(builtin, arguments)?;
+        if let Err(error) = self.record_lazy_argument_exit_states(builtin, arguments) {
+            return self.finish_native_outcome(builtin, Err(error));
+        }
         self.finish_native_outcome(builtin, outcome)
     }
 
@@ -2946,7 +3670,6 @@ impl Evaluator {
                 .map(|parent| parent.sequence);
             let inherited_parent = self
                 .pending_adapter_parent
-                .take()
                 .filter(|parent| parent.owner_task == owner_task)
                 .map(|parent| parent.sequence);
             let parent_sequence = stack_parent.or(inherited_parent);
@@ -2984,14 +3707,14 @@ impl Evaluator {
             trace
                 .lock()
                 .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?
-                .forced_arguments
-                .push(ForcedArgumentEvidence {
+                .push_forced_argument(
                     builtin,
                     argument,
-                    boundary_class: "lazy-adapter-entry",
-                    thunk: Arc::clone(thunk),
-                    snapshot_outcome: Some(evidence_thunk_outcome(thunk).0),
-                });
+                    "lazy-adapter-entry",
+                    thunk,
+                    Some(evidence_thunk_outcome(thunk).0),
+                    None,
+                );
         }
         Ok(())
     }
@@ -3126,12 +3849,8 @@ impl Evaluator {
                 self.force_int(&arguments[0])?.to_string().into(),
             )),
             "int_read_maybe" => {
-                let parsed = self
-                    .force_text(&arguments[0])?
-                    .trim()
-                    .parse::<i64>()
-                    .ok()
-                    .map(|number| Thunk::evaluated(Value::Int(number)));
+                let parsed = BigInteger::parse(&self.force_text(&arguments[0])?)
+                    .map(|number| Thunk::evaluated(Value::Int(number.wrapping_i64())));
                 value(Value::Maybe(parsed))
             }
             "int_to_integer" => value(Value::Integer(Arc::new(BigInteger::from_i64(
@@ -3208,7 +3927,9 @@ impl Evaluator {
                 };
                 value(Value::Text(format!("{rendered}{suffix}").into()))
             }
-            "show" => value(Value::Text(self.show_value(&arguments[0])?.into())),
+            "show" => value(Value::Text(
+                self.show_value(&arguments[0], evidence)?.into(),
+            )),
             "text_eq" => {
                 let left = self.force_text(&arguments[0])?;
                 let right = self.force_text(&arguments[1])?;
@@ -3299,14 +4020,8 @@ impl Evaluator {
             }))),
             "text_get_contents" => value(Value::Io(IoAction::new(|_, context| {
                 let bytes = context.read_stdin_all("Text.getContents")?;
-                let text = String::from_utf8(bytes).map_err(|error| {
-                    RuntimeContext::io_error(
-                        "Text.getContents",
-                        format!(
-                            "input is not valid UTF-8 at byte {}",
-                            error.utf8_error().valid_up_to()
-                        ),
-                    )
+                let text = std::str::from_utf8(&bytes).map_err(|error| {
+                    RuntimeContext::text_invalid_utf8("Text.getContents", &bytes, error)
                 })?;
                 Ok(Thunk::evaluated(Value::Text(text.into())))
             }))),
@@ -3530,10 +4245,7 @@ impl Evaluator {
             "text_decode_utf8" => {
                 let bytes = self.force_bytes(&arguments[0])?;
                 let text = std::str::from_utf8(&bytes).map_err(|error| {
-                    RuntimeContext::io_error(
-                        "Text.decodeUtf8",
-                        format!("invalid UTF-8 at byte {}", error.valid_up_to()),
-                    )
+                    RuntimeContext::text_invalid_utf8("Text.decodeUtf8", &bytes, error)
                 })?;
                 value(Value::Text(Arc::from(text)))
             }
@@ -3639,6 +4351,7 @@ impl Evaluator {
                                 error.utf8_error().valid_up_to()
                             )
                             .into(),
+                            presentation: None,
                             suppressed: Arc::from([]),
                         })
                     })?;
@@ -3655,20 +4368,33 @@ impl Evaluator {
                     } else {
                         "Text.writeFile"
                     };
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path(operation, &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path(operation, &guest_path)?;
                     let contents = evaluator.force_text(&contents)?;
                     if append {
                         let mut file = OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(path)
-                            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                            .map_err(|error| {
+                                RuntimeContext::file_io_error(
+                                    operation,
+                                    Arc::clone(&guest_path),
+                                    RuntimeFileOperation::WithBinaryFile,
+                                    &error,
+                                )
+                            })?;
                         file.write_all(contents.as_bytes())
                             .map_err(|error| RuntimeContext::io_error(operation, error))?;
                     } else {
-                        std::fs::write(path, contents.as_bytes())
-                            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                        std::fs::write(path, contents.as_bytes()).map_err(|error| {
+                            RuntimeContext::file_io_error(
+                                operation,
+                                Arc::clone(&guest_path),
+                                RuntimeFileOperation::WithBinaryFile,
+                                &error,
+                            )
+                        })?;
                     }
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
@@ -3676,10 +4402,16 @@ impl Evaluator {
             "bytes_read_file" => {
                 let path = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("ByteString.readFile", &path)?;
-                    let bytes = std::fs::read(path)
-                        .map_err(|error| RuntimeContext::io_error("ByteString.readFile", error))?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path("ByteString.readFile", &guest_path)?;
+                    let bytes = std::fs::read(path).map_err(|error| {
+                        RuntimeContext::file_io_error(
+                            "ByteString.readFile",
+                            Arc::clone(&guest_path),
+                            RuntimeFileOperation::WithBinaryFile,
+                            &error,
+                        )
+                    })?;
                     Ok(Thunk::evaluated(Value::ByteString(bytes.into())))
                 })))
             }
@@ -3687,11 +4419,17 @@ impl Evaluator {
                 let path = Arc::clone(&arguments[0]);
                 let contents = Arc::clone(&arguments[1]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("ByteString.writeFile", &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path("ByteString.writeFile", &guest_path)?;
                     let contents = evaluator.force_bytes(&contents)?;
-                    std::fs::write(path, contents.as_ref())
-                        .map_err(|error| RuntimeContext::io_error("ByteString.writeFile", error))?;
+                    std::fs::write(path, contents.as_ref()).map_err(|error| {
+                        RuntimeContext::file_io_error(
+                            "ByteString.writeFile",
+                            Arc::clone(&guest_path),
+                            RuntimeFileOperation::WithBinaryFile,
+                            &error,
+                        )
+                    })?;
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
             }
@@ -3700,7 +4438,20 @@ impl Evaluator {
             "io_stderr" => value(Value::Handle(HostHandle::Stderr)),
             "io_no_buffering" => value(Value::BufferMode(BufferMode::None)),
             "io_line_buffering" => value(Value::BufferMode(BufferMode::Line)),
-            "io_block_buffering" => value(Value::BufferMode(BufferMode::Block)),
+            "io_block_buffering" => {
+                let size = self.force_optional_int(&arguments[0])?;
+                let size = size
+                    .map(|size| {
+                        usize::try_from(size)
+                            .ok()
+                            .filter(|size| *size > 0)
+                            .ok_or_else(|| {
+                                RuntimeError::internal("block-buffer size must be positive")
+                            })
+                    })
+                    .transpose()?;
+                value(Value::BufferMode(BufferMode::Block(size)))
+            }
             "io_read_mode" => value(Value::FileMode(FileMode::Read)),
             "io_write_mode" => value(Value::FileMode(FileMode::Write)),
             "io_append_mode" => value(Value::FileMode(FileMode::Append)),
@@ -3709,12 +4460,19 @@ impl Evaluator {
                 let path = Arc::clone(&arguments[0]);
                 let mode = Arc::clone(&arguments[1]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
+                    let guest_path = evaluator.force_text(&path)?;
                     let mode = evaluator.force_file_mode(&mode)?;
-                    let path = context.resolve_path("IO.openFile", &path)?;
+                    let path = context.resolve_path("IO.openFile", &guest_path)?;
                     let permit = context.budget.acquire_handle()?;
-                    let handle = native_handle::FileHandle::open(&path, mode, permit)
-                        .map_err(|error| RuntimeContext::io_error("IO.openFile", error))?;
+                    let handle =
+                        native_handle::FileHandle::open(&path, mode, permit).map_err(|error| {
+                            RuntimeContext::file_io_error(
+                                "IO.openFile",
+                                Arc::clone(&guest_path),
+                                RuntimeFileOperation::OpenFile,
+                                &error,
+                            )
+                        })?;
                     evaluator
                         .execution_scope()
                         .register(ScopedFileResource(Arc::clone(&handle)))?;
@@ -4114,8 +4872,9 @@ impl Evaluator {
             }
             "io_print" => {
                 let argument = Arc::clone(&arguments[0]);
+                let show_plan = self.show_plan(evidence)?;
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let rendered = evaluator.show_value(&argument)?;
+                    let rendered = evaluator.show_value_with_plan(&argument, show_plan)?;
                     context.write(rendered.as_bytes())?;
                     context.write(b"\n")?;
                     Ok(Thunk::evaluated(Value::Unit))
@@ -4139,7 +4898,6 @@ impl Evaluator {
                     Suspension::ListIterate {
                         function: Arc::clone(&arguments[0]),
                         current: Arc::clone(&arguments[1]),
-                        force_current: false,
                         #[cfg(feature = "compat-tracing")]
                         callback_parent,
                     },
@@ -4523,6 +5281,11 @@ impl Evaluator {
                                 code: "H0903",
                                 kind: RuntimeErrorKind::Io,
                                 message: format!("environment variable `{name}` is not set").into(),
+                                presentation: Some(
+                                    RuntimeErrorPresentation::EnvironmentVariableNotFound {
+                                        name: Arc::clone(&name),
+                                    },
+                                ),
                                 suppressed: Arc::from([]),
                             })
                         })?;
@@ -4586,14 +5349,28 @@ impl Evaluator {
                     };
                     let source = evaluator.force_text(&source)?;
                     let target = evaluator.force_text(&target)?;
-                    let source = context.resolve_path(operation, &source)?;
-                    let target = context.resolve_path(operation, &target)?;
+                    let source_path = context.resolve_path(operation, &source)?;
+                    let target_path = context.resolve_path(operation, &target)?;
                     if rename {
-                        std::fs::rename(source, target)
-                            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                        std::fs::rename(source_path, target_path).map_err(|error| {
+                            RuntimeContext::directory_io_error(
+                                operation,
+                                RuntimeDirectoryOperation::RenameFile,
+                                Arc::clone(&source),
+                                Some(Arc::clone(&target)),
+                                &error,
+                            )
+                        })?;
                     } else {
-                        let _bytes = std::fs::copy(source, target)
-                            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+                        let _bytes = std::fs::copy(source_path, target_path).map_err(|error| {
+                            RuntimeContext::directory_io_error(
+                                operation,
+                                RuntimeDirectoryOperation::CopyFile,
+                                Arc::clone(&source),
+                                Some(Arc::clone(&target)),
+                                &error,
+                            )
+                        })?;
                     }
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
@@ -4607,15 +5384,29 @@ impl Evaluator {
                     _ => unreachable!("directory operation implementation matched"),
                 };
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path(operation, &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path(operation, &guest_path)?;
                     let result = match operation {
                         "Directory.createDirectory" => std::fs::create_dir(path),
                         "Directory.removeDirectory" => std::fs::remove_dir(path),
                         "Directory.removeFile" => std::fs::remove_file(path),
                         _ => unreachable!("directory operation selected"),
                     };
-                    result.map_err(|error| RuntimeContext::io_error(operation, error))?;
+                    let presentation_operation = match operation {
+                        "Directory.createDirectory" => RuntimeDirectoryOperation::CreateDirectory,
+                        "Directory.removeDirectory" => RuntimeDirectoryOperation::RemoveDirectory,
+                        "Directory.removeFile" => RuntimeDirectoryOperation::RemoveFile,
+                        _ => unreachable!("directory operation selected"),
+                    };
+                    result.map_err(|error| {
+                        RuntimeContext::directory_io_error(
+                            operation,
+                            presentation_operation,
+                            Arc::clone(&guest_path),
+                            None,
+                            &error,
+                        )
+                    })?;
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
             }
@@ -4624,15 +5415,22 @@ impl Evaluator {
                 let path = Arc::clone(&arguments[1]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
                     let parents = evaluator.force_bool(&parents)?;
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("Directory.createDirectoryIfMissing", &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path =
+                        context.resolve_path("Directory.createDirectoryIfMissing", &guest_path)?;
                     let result = if parents {
                         std::fs::create_dir_all(path)
                     } else {
                         std::fs::create_dir(path)
                     };
                     result.map_err(|error| {
-                        RuntimeContext::io_error("Directory.createDirectoryIfMissing", error)
+                        RuntimeContext::directory_io_error(
+                            "Directory.createDirectoryIfMissing",
+                            RuntimeDirectoryOperation::CreateDirectoryIfMissing,
+                            Arc::clone(&guest_path),
+                            None,
+                            &error,
+                        )
                     })?;
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
@@ -4660,7 +5458,11 @@ impl Evaluator {
                         }
                         Ok(metadata) if implementation == "directory_is_file" => metadata.is_file(),
                         Ok(metadata) => metadata.file_type().is_symlink(),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        // The upstream existence predicates deliberately
+                        // collapse every post-admission metadata failure to
+                        // `False`, including invalid paths and inaccessible
+                        // parents. `pathIsSymbolicLink` remains fallible.
+                        Err(_) if implementation != "directory_is_symlink" => false,
                         Err(error) => return Err(RuntimeContext::io_error(operation, error)),
                     };
                     Ok(Thunk::evaluated(Value::Bool(matches)))
@@ -4669,10 +5471,18 @@ impl Evaluator {
             "directory_file_size" => {
                 let path = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("Directory.getFileSize", &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path("Directory.getFileSize", &guest_path)?;
                     let size = std::fs::metadata(path)
-                        .map_err(|error| RuntimeContext::io_error("Directory.getFileSize", error))?
+                        .map_err(|error| {
+                            RuntimeContext::directory_io_error(
+                                "Directory.getFileSize",
+                                RuntimeDirectoryOperation::GetFileSize,
+                                Arc::clone(&guest_path),
+                                None,
+                                &error,
+                            )
+                        })?
                         .len();
                     Ok(Thunk::evaluated(Value::Integer(Arc::new(
                         BigInteger::from_u64(size),
@@ -4696,11 +5506,17 @@ impl Evaluator {
             "directory_list" => {
                 let path = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("Directory.listDirectory", &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path = context.resolve_path("Directory.listDirectory", &guest_path)?;
                     let entries = std::fs::read_dir(path)
                         .map_err(|error| {
-                            RuntimeContext::io_error("Directory.listDirectory", error)
+                            RuntimeContext::directory_io_error(
+                                "Directory.listDirectory",
+                                RuntimeDirectoryOperation::ListDirectory,
+                                Arc::clone(&guest_path),
+                                None,
+                                &error,
+                            )
                         })?
                         .map(|entry| {
                             let entry = entry.map_err(|error| {
@@ -4724,10 +5540,17 @@ impl Evaluator {
             "directory_set_current" => {
                 let path = Arc::clone(&arguments[0]);
                 value(Value::Io(IoAction::new(move |evaluator, context| {
-                    let path = evaluator.force_text(&path)?;
-                    let path = context.resolve_path("Directory.setCurrentDirectory", &path)?;
+                    let guest_path = evaluator.force_text(&path)?;
+                    let path =
+                        context.resolve_path("Directory.setCurrentDirectory", &guest_path)?;
                     let path = std::fs::canonicalize(path).map_err(|error| {
-                        RuntimeContext::io_error("Directory.setCurrentDirectory", error)
+                        RuntimeContext::directory_io_error(
+                            "Directory.setCurrentDirectory",
+                            RuntimeDirectoryOperation::SetCurrentDirectory,
+                            Arc::clone(&guest_path),
+                            None,
+                            &error,
+                        )
                     })?;
                     if !path.is_dir() {
                         return Err(RuntimeContext::io_error(
@@ -4805,49 +5628,55 @@ impl Evaluator {
     fn finish_native_outcome(
         &mut self,
         builtin: BuiltinId,
-        outcome: RuntimeResult<ForceOutcome>,
+        #[allow(unused_mut)] mut outcome: RuntimeResult<ForceOutcome>,
     ) -> RuntimeResult<ForceOutcome> {
         #[cfg(not(feature = "compat-tracing"))]
         std::hint::black_box(self.evaluation_id);
         #[cfg(feature = "compat-tracing")]
         if let Some(trace) = &self.evidence_trace {
-            let active = self.adapter_obligation_stack.pop().ok_or_else(|| {
-                RuntimeError::internal("semantic adapter outcome has no active invocation")
-            })?;
+            let active = self
+                .adapter_obligation_stack
+                .last()
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::internal("semantic adapter outcome has no active invocation")
+                })?;
             if active.builtin != builtin {
                 return Err(RuntimeError::internal(
                     "semantic adapter outcome does not match its active invocation",
                 ));
             }
-            if let Ok(ForceOutcome::Alias(target)) = &outcome {
-                let mut trace = trace
-                    .lock()
-                    .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
-                trace.deferred_adapter_parents.insert(
-                    Arc::as_ptr(target) as usize,
-                    AdapterCausalIdentity {
-                        builtin,
-                        owner_task: active.owner_task,
-                        sequence: active.sequence,
-                    },
-                );
-                drop(trace);
-            }
-            if let Ok(ForceOutcome::Value(value)) = &outcome {
-                let identity = AdapterCausalIdentity {
-                    builtin,
-                    owner_task: active.owner_task,
-                    sequence: active.sequence,
-                };
-                let mut trace = trace
-                    .lock()
-                    .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
-                for child in evidence_value_children(value) {
-                    trace
-                        .deferred_adapter_parents
-                        .insert(Arc::as_ptr(child) as usize, identity);
+            let identity = AdapterCausalIdentity {
+                builtin,
+                owner_task: active.owner_task,
+                sequence: active.sequence,
+            };
+            let typed_result = active.typed_result_root.then(|| match &outcome {
+                Ok(ForceOutcome::Value(value)) => {
+                    Thunk::allocate(ThunkState::Evaluated(Arc::clone(value)))
                 }
-                drop(trace);
+                Ok(ForceOutcome::Alias(target)) => Arc::clone(target),
+                Err(error) => Thunk::failed_without_admission(Arc::clone(error)),
+            });
+            outcome = match outcome {
+                Ok(ForceOutcome::Alias(target)) => self
+                    .contextual_adapter_alias(&target, identity)
+                    .map(ForceOutcome::Alias),
+                Ok(ForceOutcome::Value(value)) => self
+                    .contextual_adapter_value(&value, identity)
+                    .map(ForceOutcome::Value),
+                Err(error) => Err(error),
+            };
+            let finished = self.adapter_obligation_stack.pop().ok_or_else(|| {
+                RuntimeError::internal("semantic adapter outcome lost its active invocation")
+            })?;
+            if finished.builtin != active.builtin
+                || finished.owner_task != active.owner_task
+                || finished.sequence != active.sequence
+            {
+                return Err(RuntimeError::internal(
+                    "semantic adapter outcome changed its active invocation",
+                ));
             }
             let mut trace = trace
                 .lock()
@@ -4860,13 +5689,7 @@ impl Evaluator {
                 trace.presentation_fields.push((builtin, "rendered-output"));
             }
             if active.typed_result_root {
-                let retained = match &outcome {
-                    Ok(ForceOutcome::Value(value)) => {
-                        Thunk::allocate(ThunkState::Evaluated(Arc::clone(value)))
-                    }
-                    Ok(ForceOutcome::Alias(target)) => Arc::clone(target),
-                    Err(error) => Thunk::failed_without_admission(Arc::clone(error)),
-                };
+                let retained = typed_result.expect("typed root retained before contextualization");
                 if trace.typed_results.is_empty() {
                     trace
                         .typed_results
@@ -4899,26 +5722,152 @@ impl Evaluator {
     }
 
     #[cfg(feature = "compat-tracing")]
-    fn register_deferred_adapter_parent(
+    fn contextual_adapter_alias(
         &self,
         thunk: &ThunkRef,
         parent: AdapterCausalIdentity,
-    ) -> RuntimeResult<()> {
-        let Some(trace) = &self.evidence_trace else {
-            return Ok(());
-        };
-        trace
-            .lock()
-            .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?
-            .deferred_adapter_parents
-            .insert(Arc::as_ptr(thunk) as usize, parent);
-        Ok(())
+    ) -> RuntimeResult<ThunkRef> {
+        let mut current = Arc::clone(thunk);
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(Arc::as_ptr(&current) as usize) {
+                return Err(RuntimeError::internal(
+                    "deferred adapter alias chain is cyclic",
+                ));
+            }
+            let state = current
+                .state
+                .lock()
+                .map_err(|_| RuntimeError::internal("thunk mutex was poisoned"))?;
+            let (next, retained) = match &*state {
+                ThunkState::Suspended(Suspension::DeferredAdapterAlias {
+                    target,
+                    parent: retained,
+                }) => (Some(Arc::clone(target)), Some(*retained)),
+                ThunkState::Indirection(target) => (Some(Arc::clone(target)), None),
+                _ => (None, None),
+            };
+            drop(state);
+            if let Some(retained) = retained {
+                let preserve = if retained == parent {
+                    true
+                } else {
+                    let trace = self
+                        .evidence_trace
+                        .as_ref()
+                        .expect("contextual aliases require a semantic trace")
+                        .lock()
+                        .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
+                    adapter_identity_descends_from(
+                        &trace,
+                        &self.adapter_obligation_stack,
+                        retained,
+                        parent,
+                    )
+                };
+                if preserve {
+                    return Ok(Arc::clone(&current));
+                }
+            }
+            let Some(next) = next else {
+                return Ok(Thunk::suspended(Suspension::DeferredAdapterAlias {
+                    target: current,
+                    parent,
+                }));
+            };
+            current = next;
+        }
     }
 
     #[cfg(feature = "compat-tracing")]
-    fn register_current_adapter_child(&self, thunk: &ThunkRef) -> RuntimeResult<()> {
+    fn contextual_adapter_value(
+        &self,
+        value: &ValueRef,
+        parent: AdapterCausalIdentity,
+    ) -> RuntimeResult<ValueRef> {
+        let expected_children = evidence_value_children(value).len();
+        let wrap = |child: &ThunkRef| self.contextual_adapter_alias(child, parent);
+        let contextual = match value.as_ref() {
+            Value::CaseInsensitive(value) => Value::CaseInsensitive(CaseInsensitiveValue {
+                original: wrap(&value.original)?,
+                folded: wrap(&value.folded)?,
+            }),
+            Value::Tree(value) => Value::Tree(TreeValue {
+                root: wrap(&value.root)?,
+                children: wrap(&value.children)?,
+            }),
+            Value::Tuple(values) => Value::Tuple(
+                values
+                    .iter()
+                    .map(wrap)
+                    .collect::<RuntimeResult<Vec<_>>>()?
+                    .into(),
+            ),
+            Value::Record { layout, fields } => Value::Record {
+                layout: Arc::clone(layout),
+                fields: fields
+                    .iter()
+                    .map(wrap)
+                    .collect::<RuntimeResult<Vec<_>>>()?
+                    .into(),
+            },
+            Value::Variant {
+                layout,
+                constructor_index,
+                payload,
+            } => Value::Variant {
+                layout: Arc::clone(layout),
+                constructor_index: *constructor_index,
+                payload: payload.as_ref().map(wrap).transpose()?,
+            },
+            Value::Maybe(payload) => Value::Maybe(payload.as_ref().map(wrap).transpose()?),
+            Value::PrimitiveVariant(value) => Value::PrimitiveVariant(PrimitiveVariantValue {
+                family: value.family,
+                constructor_index: value.constructor_index,
+                payloads: value
+                    .payloads
+                    .iter()
+                    .map(wrap)
+                    .collect::<RuntimeResult<Vec<_>>>()?
+                    .into(),
+            }),
+            Value::List(ListCell::Cons { head, tail }) => Value::List(ListCell::Cons {
+                head: wrap(head)?,
+                tail: wrap(tail)?,
+            }),
+            Value::Vector(values) => Value::Vector(
+                values
+                    .iter()
+                    .map(wrap)
+                    .collect::<RuntimeResult<Vec<_>>>()?
+                    .into(),
+            ),
+            Value::Map(value) => {
+                let entries =
+                    value.map_preserving_shape(|(key, item)| Ok((wrap(key)?, wrap(item)?)))?;
+                Value::Map(Arc::new(entries))
+            }
+            Value::Set(value) => {
+                let elements = value.map_preserving_shape(wrap)?;
+                Value::Set(Arc::new(elements))
+            }
+            _ => {
+                validate_contextual_adapter_child_arity(expected_children, 0)?;
+                return Ok(Arc::clone(value));
+            }
+        };
+        let contextual = Arc::new(contextual);
+        validate_contextual_adapter_child_arity(
+            expected_children,
+            evidence_value_children(&contextual).len(),
+        )?;
+        Ok(contextual)
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn register_current_adapter_child(&self, thunk: &ThunkRef) -> RuntimeResult<ThunkRef> {
         if self.evidence_trace.is_none() {
-            return Ok(());
+            return Ok(Arc::clone(thunk));
         }
         let parent = self
             .adapter_obligation_stack
@@ -4930,7 +5879,7 @@ impl Evaluator {
             })
             .or(self.pending_adapter_parent)
             .ok_or_else(|| RuntimeError::internal("deferred child has no logical adapter"))?;
-        self.register_deferred_adapter_parent(thunk, parent)
+        self.contextual_adapter_alias(thunk, parent)
     }
 
     #[cfg(feature = "compat-tracing")]
@@ -5446,13 +6395,7 @@ impl Evaluator {
             let mut trace = trace
                 .lock()
                 .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
-            trace.forced_arguments.push(ForcedArgumentEvidence {
-                builtin,
-                argument,
-                boundary_class,
-                thunk: Arc::clone(thunk),
-                snapshot_outcome: None,
-            });
+            trace.push_forced_argument(builtin, argument, boundary_class, thunk, None, None);
         }
         Ok(())
     }
@@ -5472,13 +6415,14 @@ impl Evaluator {
             .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
         for (argument, (demand, thunk)) in spec.demand.iter().zip(arguments).enumerate() {
             if *demand == hell_builtins::Demand::Lazy {
-                trace.forced_arguments.push(ForcedArgumentEvidence {
+                trace.push_forced_argument(
                     builtin,
                     argument,
-                    boundary_class: "lazy-adapter-exit",
-                    thunk: Arc::clone(thunk),
-                    snapshot_outcome: Some(evidence_thunk_outcome(thunk).0),
-                });
+                    "lazy-adapter-exit",
+                    thunk,
+                    Some(evidence_thunk_outcome(thunk).0),
+                    None,
+                );
             }
         }
         Ok(())
@@ -5499,13 +6443,14 @@ impl Evaluator {
             .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
         for (argument, (demand, thunk)) in spec.demand.iter().zip(arguments).enumerate() {
             if *demand == hell_builtins::Demand::Lazy {
-                trace.forced_arguments.push(ForcedArgumentEvidence {
+                trace.push_forced_argument(
                     builtin,
                     argument,
-                    boundary_class: "lazy-adapter-entry",
-                    thunk: Arc::clone(thunk),
-                    snapshot_outcome: Some(evidence_thunk_outcome(thunk).0),
-                });
+                    "lazy-adapter-entry",
+                    thunk,
+                    Some(evidence_thunk_outcome(thunk).0),
+                    None,
+                );
             }
         }
         Ok(())
@@ -5525,14 +6470,47 @@ impl Evaluator {
         trace
             .lock()
             .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?
-            .forced_arguments
-            .push(ForcedArgumentEvidence {
+            .push_forced_argument(
                 builtin,
                 argument,
                 boundary_class,
-                thunk: Arc::clone(thunk),
-                snapshot_outcome: Some(evidence_thunk_outcome(thunk).0),
-            });
+                thunk,
+                Some(evidence_thunk_outcome(thunk).0),
+                None,
+            );
+        Ok(())
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    fn record_whnf_argument_failure(
+        &self,
+        builtin: BuiltinId,
+        arguments: &[ThunkRef],
+        next_demand: usize,
+        error: &RuntimeError,
+    ) -> RuntimeResult<()> {
+        let Some(trace) = &self.evidence_trace else {
+            return Ok(());
+        };
+        let spec = &hell_builtins::registry()[usize::from(builtin.0)];
+        let position = next_demand
+            .checked_sub(1)
+            .ok_or_else(|| RuntimeError::internal("scheduled demand position is missing"))?;
+        let argument = native_demand_argument_index(spec, arguments.len(), position);
+        if spec.demand.get(argument) != Some(&hell_builtins::Demand::Whnf) {
+            return Ok(());
+        }
+        trace
+            .lock()
+            .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?
+            .push_forced_argument(
+                builtin,
+                argument,
+                "whnf-force-failed",
+                &arguments[argument],
+                Some("error"),
+                Some(error.code),
+            );
         Ok(())
     }
 
@@ -5860,6 +6838,15 @@ impl Evaluator {
         let mut elements = Vec::new();
         let mut list = Arc::clone(thunk);
         loop {
+            if Self::is_suspended_nonproductive_list(&list)? {
+                #[cfg(feature = "compat-tracing")]
+                let origin = Self::suspended_nonproductive_list_origin(&list)?;
+                return self.wait_for_nonproductive_many(
+                    &list,
+                    #[cfg(feature = "compat-tracing")]
+                    origin.as_ref(),
+                );
+            }
             match self.force(&list)?.as_ref() {
                 Value::List(ListCell::Nil) => return Ok(elements),
                 Value::List(ListCell::Cons { head, tail }) => {
@@ -5931,41 +6918,145 @@ impl Evaluator {
         }
     }
 
-    fn show_value(&mut self, thunk: &ThunkRef) -> RuntimeResult<String> {
-        self.show_value_at(thunk, 0)
+    fn show_plan(&self, evidence: Option<ClassEvidence>) -> RuntimeResult<InstanceEvidencePlanId> {
+        let evidence = evidence
+            .ok_or_else(|| RuntimeError::internal("Show invocation lacks class evidence"))?;
+        if evidence.class != hell_builtins::TypeClass::Show {
+            return Err(RuntimeError::internal(
+                "Show invocation retained the wrong evidence class",
+            ));
+        }
+        let plan = self
+            .program
+            .instance_evidence(evidence.plan)
+            .ok_or_else(|| RuntimeError::internal("Show evidence plan disappeared"))?;
+        if plan.class != evidence.class || plan.head != evidence.head.raw() {
+            return Err(RuntimeError::internal(
+                "Show evidence root does not match its retained plan",
+            ));
+        }
+        Ok(evidence.plan)
+    }
+
+    fn show_value(
+        &mut self,
+        thunk: &ThunkRef,
+        evidence: Option<ClassEvidence>,
+    ) -> RuntimeResult<String> {
+        let plan = self.show_plan(evidence)?;
+        self.show_value_with_plan(thunk, plan)
+    }
+
+    fn show_value_with_plan(
+        &mut self,
+        thunk: &ThunkRef,
+        plan: InstanceEvidencePlanId,
+    ) -> RuntimeResult<String> {
+        self.show_value_at(thunk, 0, Some(plan))
+    }
+
+    fn show_plan_premises(
+        &self,
+        plan: Option<InstanceEvidencePlanId>,
+        expected_target: &str,
+        expected_count: usize,
+    ) -> RuntimeResult<Option<Arc<[InstanceEvidencePlanId]>>> {
+        let Some(plan_id) = plan else {
+            return Ok(None);
+        };
+        let target = typeclasses::instance_plan_target(self, plan_id)?;
+        let plan = self
+            .program
+            .instance_evidence(plan_id)
+            .ok_or_else(|| RuntimeError::internal("Show evidence plan disappeared"))?;
+        if plan.class != hell_builtins::TypeClass::Show
+            || target.as_ref() != expected_target
+            || plan.premises.len() != expected_count
+        {
+            return Err(RuntimeError::internal(format!(
+                "Show {expected_target} evidence has an inconsistent retained plan"
+            )));
+        }
+        Ok(Some(Arc::clone(&plan.premises)))
     }
 
     #[allow(clippy::too_many_lines)]
-    fn show_value_at(&mut self, thunk: &ThunkRef, precedence: u8) -> RuntimeResult<String> {
+    fn show_value_at(
+        &mut self,
+        thunk: &ThunkRef,
+        precedence: u8,
+        plan: Option<InstanceEvidencePlanId>,
+    ) -> RuntimeResult<String> {
         match self.force(thunk)?.as_ref() {
             Value::Unit => Ok("()".into()),
             Value::Bool(value) => Ok(if *value { "True" } else { "False" }.into()),
-            Value::Int(value) => Ok(value.to_string()),
-            Value::Integer(value) => Ok(value.to_string()),
-            Value::Double(value) => Ok(show_double(*value)),
-            Value::JsonNumber(value) => Ok(value.as_json().to_owned()),
+            Value::Int(value) => Ok(parenthesize_negative_numeric(value.to_string(), precedence)),
+            Value::Integer(value) => {
+                Ok(parenthesize_negative_numeric(value.to_string(), precedence))
+            }
+            Value::Double(value) => Ok(parenthesize_negative_numeric(
+                show_double(*value),
+                precedence,
+            )),
+            Value::JsonNumber(value) => Ok(parenthesize_negative_numeric(
+                value.as_json().to_owned(),
+                precedence,
+            )),
             Value::JsonDocument(document, index) => self.show_value_at(
                 &Thunk::evaluated(json_document_value(document, *index)?),
                 precedence,
+                plan,
             ),
-            Value::Character(value) => Ok(format!("{value:?}")),
-            Value::Builder(value) | Value::ByteString(value) => Ok(format!("{value:?}")),
-            Value::CaseInsensitive(value) => self.show_value_at(&value.original, precedence),
-            Value::Tree(value) => Ok(format!(
-                "Node {{rootLabel = {}, subForest = {}}}",
-                self.show_value_at(&value.root, 0)?,
-                self.show_value_at(&value.children, 0)?
-            )),
+            Value::Character(value) => Ok(show_haskell_literal(std::iter::once(*value), '\'')),
+            Value::Builder(value) => {
+                self.show_plan_premises(plan, "Builder", 0)?;
+                Ok(show_haskell_literal(
+                    value.iter().copied().map(char::from),
+                    '"',
+                ))
+            }
+            Value::ByteString(value) => {
+                self.show_plan_premises(plan, "ByteString", 0)?;
+                Ok(show_haskell_literal(
+                    value.iter().copied().map(char::from),
+                    '"',
+                ))
+            }
+            Value::CaseInsensitive(value) => {
+                let premise = self
+                    .show_plan_premises(plan, "CI", 1)?
+                    .map(|premises| premises[0]);
+                self.show_value_at(&value.original, precedence, premise)
+            }
+            Value::Tree(value) => {
+                let premise = self
+                    .show_plan_premises(plan, "Tree", 1)?
+                    .map(|premises| premises[0]);
+                let children = if let Some(tree_plan) = plan {
+                    self.show_tree_children(&value.children, tree_plan)?
+                } else {
+                    self.show_value_at(&value.children, 0, None)?
+                };
+                Ok(parenthesize_application(
+                    format!(
+                        "Node {{rootLabel = {}, subForest = {children}}}",
+                        self.show_value_at(&value.root, 0, premise)?,
+                    ),
+                    precedence,
+                ))
+            }
             Value::Day(value) => Ok(value.to_string()),
             Value::DayOfWeek(value) => Ok(value.to_string()),
             Value::UtcTime(value) => Ok(value.to_string()),
             Value::TimeOfDay(value) => Ok(value.to_string()),
-            Value::Text(value) => Ok(format!("{value:?}")),
+            Value::Text(value) => Ok(show_haskell_literal(value.chars(), '"')),
             Value::Tuple(elements) => {
                 let elements = elements.clone();
+                let premises = self.show_plan_premises(plan, "(,)", elements.len())?;
                 let mut rendered = Vec::with_capacity(elements.len());
-                for element in elements.iter() {
-                    rendered.push(self.show_value_at(element, 0)?);
+                for (index, element) in elements.iter().enumerate() {
+                    let premise = premises.as_ref().map(|premises| premises[index]);
+                    rendered.push(self.show_value_at(element, 0, premise)?);
                 }
                 Ok(format!("({})", rendered.join(",")))
             }
@@ -5975,7 +7066,7 @@ impl Evaluator {
                     rendered.push(format!(
                         "{} = {}",
                         field.name,
-                        self.show_value_at(value, 0)?
+                        self.show_value_at(value, 0, None)?
                     ));
                 }
                 Ok(parenthesize_application(
@@ -5996,25 +7087,49 @@ impl Evaluator {
                     })?;
                 if let Some(payload) = payload {
                     Ok(parenthesize_application(
-                        format!("{} {}", constructor.name, self.show_value_at(payload, 11)?),
+                        format!(
+                            "{} {}",
+                            constructor.name,
+                            self.show_value_at(payload, 11, None)?
+                        ),
                         precedence,
                     ))
                 } else {
                     Ok(constructor.name.to_string())
                 }
             }
-            Value::Maybe(None) => Ok("Nothing".into()),
-            Value::Maybe(Some(payload)) => Ok(parenthesize_application(
-                format!("Just {}", self.show_value_at(payload, 11)?),
-                precedence,
-            )),
+            Value::Maybe(payload) => {
+                let premise = self
+                    .show_plan_premises(plan, "Maybe", 1)?
+                    .map(|premises| premises[0]);
+                if let Some(payload) = payload {
+                    Ok(parenthesize_application(
+                        format!("Just {}", self.show_value_at(payload, 11, premise)?),
+                        precedence,
+                    ))
+                } else {
+                    Ok("Nothing".into())
+                }
+            }
             Value::PrimitiveVariant(variant) => {
                 let name = variant.constructor_name().ok_or_else(|| {
                     RuntimeError::internal("primitive constructor is out of bounds")
                 })?;
+                let premises = if variant.family == PrimitiveFamily::Either {
+                    self.show_plan_premises(plan, "Either", 2)?
+                } else {
+                    None
+                };
                 let mut rendered = Vec::with_capacity(variant.payloads.len());
-                for payload in variant.payloads.iter() {
-                    rendered.push(self.show_value_at(payload, 11)?);
+                for (index, payload) in variant.payloads.iter().enumerate() {
+                    let premise = premises.as_ref().map(|premises| {
+                        if variant.family == PrimitiveFamily::Either {
+                            premises[usize::from(variant.constructor_index)]
+                        } else {
+                            premises[index]
+                        }
+                    });
+                    rendered.push(self.show_value_at(payload, 11, premise)?);
                 }
                 if rendered.is_empty() {
                     Ok(name.into())
@@ -6027,9 +7142,12 @@ impl Evaluator {
             }
             Value::Vector(elements) => {
                 let elements = elements.clone();
+                let premise = self
+                    .show_plan_premises(plan, "Vector", 1)?
+                    .map(|premises| premises[0]);
                 let mut rendered = Vec::with_capacity(elements.len());
                 for element in elements.iter() {
-                    rendered.push(self.show_value_at(element, 0)?);
+                    rendered.push(self.show_value_at(element, 0, premise)?);
                 }
                 Ok(format!("[{}]", rendered.join(",")))
             }
@@ -6039,8 +7157,8 @@ impl Evaluator {
                 for (key, item) in entries.iter() {
                     rendered.push(format!(
                         "({},{})",
-                        self.show_value_at(key, 0)?,
-                        self.show_value_at(item, 0)?
+                        self.show_value_at(key, 0, None)?,
+                        self.show_value_at(item, 0, None)?
                     ));
                 }
                 Ok(parenthesize_application(
@@ -6050,23 +7168,81 @@ impl Evaluator {
             }
             Value::Set(elements) => {
                 let elements = Arc::clone(elements);
-                let mut rendered = Vec::with_capacity(elements.len());
-                for element in elements.iter() {
-                    rendered.push(self.show_value_at(element, 0)?);
-                }
+                let premise = self
+                    .show_plan_premises(plan, "Set", 1)?
+                    .map(|premises| premises[0]);
+                let character_set = premise
+                    .map(|plan| typeclasses::instance_plan_target(self, plan))
+                    .transpose()?
+                    .is_some_and(|target| target.as_ref() == "Char");
+                let rendered = if character_set {
+                    let plan = premise.expect("character-set evidence has an element plan");
+                    let plan = self
+                        .program
+                        .instance_evidence(plan)
+                        .ok_or_else(|| RuntimeError::internal("Show Char evidence disappeared"))?;
+                    if plan.class != hell_builtins::TypeClass::Show || !plan.premises.is_empty() {
+                        return Err(RuntimeError::internal(
+                            "Show Char evidence has an inconsistent retained plan",
+                        ));
+                    }
+                    let mut characters = String::with_capacity(elements.len());
+                    for element in elements.iter() {
+                        characters.push(self.force_character(element)?);
+                    }
+                    show_haskell_literal(characters.chars(), '"')
+                } else {
+                    let mut rendered = Vec::with_capacity(elements.len());
+                    for element in elements.iter() {
+                        rendered.push(self.show_value_at(element, 0, premise)?);
+                    }
+                    format!("[{}]", rendered.join(","))
+                };
                 Ok(parenthesize_application(
-                    format!("fromList [{}]", rendered.join(",")),
+                    format!("fromList {rendered}"),
                     precedence,
                 ))
             }
             Value::List(_) => {
+                let element_plan = self
+                    .show_plan_premises(plan, "[]", 1)?
+                    .map(|premises| premises[0]);
+                let character_list = element_plan
+                    .map(|plan| typeclasses::instance_plan_target(self, plan))
+                    .transpose()?
+                    .is_some_and(|target| target.as_ref() == "Char");
+                if character_list {
+                    let plan = element_plan.expect("character-list evidence has an element plan");
+                    let plan = self
+                        .program
+                        .instance_evidence(plan)
+                        .ok_or_else(|| RuntimeError::internal("Show Char evidence disappeared"))?;
+                    if plan.class != hell_builtins::TypeClass::Show || !plan.premises.is_empty() {
+                        return Err(RuntimeError::internal(
+                            "Show Char evidence has an inconsistent retained plan",
+                        ));
+                    }
+                    let mut characters = String::new();
+                    let mut current = Arc::clone(thunk);
+                    loop {
+                        match self.force(&current)?.as_ref() {
+                            Value::List(ListCell::Nil) => break,
+                            Value::List(ListCell::Cons { head, tail }) => {
+                                characters.push(self.force_character(head)?);
+                                current = Arc::clone(tail);
+                            }
+                            _ => return Err(RuntimeError::internal("malformed list spine")),
+                        }
+                    }
+                    return Ok(show_haskell_literal(characters.chars(), '"'));
+                }
                 let mut rendered = Vec::new();
                 let mut current = Arc::clone(thunk);
                 loop {
                     match self.force(&current)?.as_ref() {
                         Value::List(ListCell::Nil) => break,
                         Value::List(ListCell::Cons { head, tail }) => {
-                            rendered.push(self.show_value_at(head, 0)?);
+                            rendered.push(self.show_value_at(head, 0, element_plan)?);
                             current = Arc::clone(tail);
                         }
                         _ => return Err(RuntimeError::internal("malformed list spine")),
@@ -6093,6 +7269,26 @@ impl Evaluator {
                 "no Show evidence exists for this runtime value",
             )),
         }
+    }
+
+    fn show_tree_children(
+        &mut self,
+        children: &ThunkRef,
+        tree_plan: InstanceEvidencePlanId,
+    ) -> RuntimeResult<String> {
+        let mut rendered = Vec::new();
+        let mut current = Arc::clone(children);
+        loop {
+            match self.force(&current)?.as_ref() {
+                Value::List(ListCell::Nil) => break,
+                Value::List(ListCell::Cons { head, tail }) => {
+                    rendered.push(self.show_value_at(head, 0, Some(tree_plan))?);
+                    current = Arc::clone(tail);
+                }
+                _ => return Err(RuntimeError::internal("malformed Tree subForest spine")),
+            }
+        }
+        Ok(format!("[{}]", rendered.join(",")))
     }
 
     // Hell's `Eq Double` is exact IEEE equality; approximate comparison would
@@ -6402,6 +7598,16 @@ impl Evaluator {
 }
 
 #[cfg(feature = "compat-tracing")]
+fn validate_contextual_adapter_child_arity(expected: usize, actual: usize) -> RuntimeResult<()> {
+    if expected != actual {
+        return Err(RuntimeError::internal(format!(
+            "structural adapter view changed its evidence-child arity from {expected} to {actual}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "compat-tracing")]
 fn evidence_value_children(value: &ValueRef) -> Vec<&ThunkRef> {
     match value.as_ref() {
         Value::CaseInsensitive(value) => vec![&value.original, &value.folded],
@@ -6419,6 +7625,14 @@ fn evidence_value_children(value: &ValueRef) -> Vec<&ThunkRef> {
 
 fn parenthesize_application(rendered: String, precedence: u8) -> String {
     if precedence > 10 {
+        format!("({rendered})")
+    } else {
+        rendered
+    }
+}
+
+fn parenthesize_negative_numeric(rendered: String, precedence: u8) -> String {
+    if precedence > 6 && rendered.starts_with('-') {
         format!("({rendered})")
     } else {
         rendered
@@ -6517,6 +7731,7 @@ fn error_with_suppressed(
         code: primary.code,
         kind: primary.kind.clone(),
         message: Arc::clone(&primary.message),
+        presentation: primary.presentation.clone(),
         suppressed: suppressed.into(),
     })
 }
@@ -6725,6 +7940,71 @@ impl scope::ScopedResource for ScopedProcessResource {
     }
 }
 
+#[cfg(unix)]
+fn environment_names_equal(candidate: &str, expected: &str) -> bool {
+    candidate == expected
+}
+
+#[cfg(windows)]
+fn environment_names_equal(candidate: &str, expected: &str) -> bool {
+    candidate.eq_ignore_ascii_case(expected)
+}
+
+#[cfg(unix)]
+fn process_command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    vec![directory.join(command)]
+}
+
+#[cfg(windows)]
+fn process_command_candidates(
+    directory: &Path,
+    command: &str,
+    path_extensions: Option<&str>,
+) -> Vec<PathBuf> {
+    let command = Path::new(command);
+    if let Some(extension) = command.extension().and_then(std::ffi::OsStr::to_str) {
+        return is_native_windows_executable_extension(extension)
+            .then(|| directory.join(command))
+            .into_iter()
+            .collect();
+    }
+    path_extensions
+        .unwrap_or(".COM;.EXE")
+        .split(';')
+        .filter(|extension| is_native_windows_executable_extension(extension))
+        .map(|extension| {
+            let mut candidate = directory.join(command);
+            candidate.set_extension(extension.trim_start_matches('.'));
+            candidate
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn is_native_windows_executable_extension(extension: &str) -> bool {
+    matches!(
+        extension
+            .trim_start_matches('.')
+            .to_ascii_uppercase()
+            .as_str(),
+        "COM" | "EXE"
+    )
+}
+
+#[cfg(unix)]
+fn process_command_is_executable(path: &Path) -> bool {
+    use nix::fcntl::AtFlags;
+    use nix::unistd::{AccessFlags, faccessat};
+
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && faccessat(None, path, AccessFlags::X_OK, AtFlags::AT_EACCESS).is_ok()
+}
+
+#[cfg(windows)]
+fn process_command_is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_child_process(
     process: &ProcessSpec,
@@ -6738,7 +8018,8 @@ fn run_child_process(
     let _permit = context.budget.acquire_process()?;
     validate_process_streams(process)?;
 
-    let mut command = Command::new(process.command.as_ref());
+    let resolved_command = context.resolve_process_command(operation, process.command.as_ref())?;
+    let mut command = Command::new(resolved_command);
     command.args(process.arguments.iter().map(AsRef::as_ref));
     let working_directory = if let Some(directory) = &process.working_directory {
         context.resolve_path(operation, directory)?
@@ -6784,8 +8065,9 @@ fn run_child_process(
             .stderr(process_output_stdio(&process.stderr, false, operation)?);
     }
     let body = (|| {
-        let child = SupervisedChild::spawn(&mut command)
-            .map_err(|error| RuntimeContext::io_error(operation, error))?;
+        let child = SupervisedChild::spawn(&mut command).map_err(|error| {
+            RuntimeContext::process_spawn_error(operation, Arc::clone(&process.command), &error)
+        })?;
         let child = execution_scope.register(ScopedProcessResource::new(child))?;
 
         let stdout = child.resource().take_stdout().map(|stdout| {
@@ -7122,6 +8404,72 @@ fn show_double(value: f64) -> String {
     rendered
 }
 
+const ASCII_CONTROL_NAMES: [&str; 32] = [
+    "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL", "BS", "HT", "LF", "VT", "FF", "CR",
+    "SO", "SI", "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB", "CAN", "EM", "SUB", "ESC",
+    "FS", "GS", "RS", "US",
+];
+
+fn show_haskell_literal(characters: impl Iterator<Item = char>, delimiter: char) -> String {
+    let mut characters = characters.peekable();
+    let mut rendered = String::new();
+    rendered.push(delimiter);
+    while let Some(character) = characters.next() {
+        push_haskell_literal_character(
+            &mut rendered,
+            character,
+            delimiter,
+            characters.peek().copied(),
+        );
+    }
+    rendered.push(delimiter);
+    rendered
+}
+
+fn push_haskell_literal_character(
+    rendered: &mut String,
+    character: char,
+    delimiter: char,
+    next: Option<char>,
+) {
+    if character == delimiter {
+        rendered.push('\\');
+        rendered.push(character);
+    } else if character > '\u{7f}' {
+        rendered.push('\\');
+        rendered.push_str(&u32::from(character).to_string());
+        if next.is_some_and(|value| value.is_ascii_digit()) {
+            rendered.push_str("\\&");
+        }
+    } else if character == '\u{7f}' {
+        rendered.push_str("\\DEL");
+    } else if character == '\\' {
+        rendered.push_str("\\\\");
+    } else if character >= ' ' {
+        rendered.push(character);
+    } else {
+        match character {
+            '\u{7}' => rendered.push_str("\\a"),
+            '\u{8}' => rendered.push_str("\\b"),
+            '\u{c}' => rendered.push_str("\\f"),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            '\u{b}' => rendered.push_str("\\v"),
+            '\u{e}' => {
+                rendered.push_str("\\SO");
+                if next == Some('H') {
+                    rendered.push_str("\\&");
+                }
+            }
+            value => {
+                rendered.push('\\');
+                rendered.push_str(ASCII_CONTROL_NAMES[u32::from(value) as usize]);
+            }
+        }
+    }
+}
+
 fn checked_precision(precision: i64, limit: Limit<u32>) -> RuntimeResult<usize> {
     let precision = precision.max(0);
     if limit
@@ -7177,10 +8525,108 @@ fn show_double_fixed(
     Ok(match precision {
         Some(precision) => {
             let precision = checked_precision(precision, limit)?;
-            format!("{value:.precision$}")
+            format_shortest_decimal_fixed(value, precision)
         }
         None => format_double_fixed(value),
     })
+}
+
+fn format_shortest_decimal_fixed(value: f64, precision: usize) -> String {
+    let shortest = value.abs().to_string();
+    let (mantissa, exponent) = shortest.split_once(['e', 'E']).map_or(
+        (shortest.as_str(), 0_i64),
+        |(mantissa, exponent)| {
+            (
+                mantissa,
+                exponent
+                    .parse::<i64>()
+                    .expect("finite f64 exponent is a signed decimal integer"),
+            )
+        },
+    );
+    let decimal_point = mantissa.find('.').unwrap_or(mantissa.len());
+    let digits = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    let first_significant = digits
+        .iter()
+        .position(|digit| *digit != b'0')
+        .unwrap_or(digits.len());
+    let significant = &digits[first_significant..];
+    let decimal_position = i64::try_from(decimal_point)
+        .expect("f64 decimal mantissa length fits i64")
+        .saturating_add(exponent)
+        .saturating_sub(i64::try_from(first_significant).expect("f64 leading zero count fits i64"));
+    let retained_places = decimal_position.saturating_add(
+        i64::try_from(precision).expect("bounded floating-point precision fits i64"),
+    );
+    let scaled = round_shortest_decimal(significant, retained_places);
+    render_scaled_decimal(scaled, precision, value.is_sign_negative())
+}
+
+fn round_shortest_decimal(significant: &[u8], retained_places: i64) -> Vec<u8> {
+    if retained_places < 0 || significant.is_empty() {
+        return vec![b'0'];
+    }
+    let retained = usize::try_from(retained_places).expect("nonnegative retained places fit usize");
+    let mut rounded = significant
+        .iter()
+        .copied()
+        .take(retained)
+        .collect::<Vec<_>>();
+    rounded.resize(retained, b'0');
+    let discarded = significant.get(retained..).unwrap_or_default();
+    let last = rounded.last().copied().unwrap_or(b'0');
+    if round_decimal_up(discarded, last) {
+        increment_decimal_digits(&mut rounded);
+    }
+    if rounded.is_empty() {
+        rounded.push(b'0');
+    }
+    rounded
+}
+
+fn round_decimal_up(discarded: &[u8], retained_last: u8) -> bool {
+    let Some(first) = discarded.first() else {
+        return false;
+    };
+    *first > b'5'
+        || (*first == b'5'
+            && (discarded[1..].iter().any(|digit| *digit != b'0')
+                || (retained_last - b'0') % 2 == 1))
+}
+
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit != b'9' {
+            *digit += 1;
+            return;
+        }
+        *digit = b'0';
+    }
+    digits.insert(0, b'1');
+}
+
+fn render_scaled_decimal(mut digits: Vec<u8>, precision: usize, negative: bool) -> String {
+    if precision != 0 && digits.len() <= precision {
+        let mut padded = vec![b'0'; precision + 1 - digits.len()];
+        padded.extend(digits);
+        digits = padded;
+    }
+    let mut rendered = String::with_capacity(digits.len() + usize::from(negative) + 1);
+    if negative {
+        rendered.push('-');
+    }
+    if precision == 0 {
+        rendered.push_str(std::str::from_utf8(&digits).expect("decimal digits are UTF-8"));
+        return rendered;
+    }
+    let point = digits.len() - precision;
+    rendered.push_str(std::str::from_utf8(&digits[..point]).expect("decimal digits are UTF-8"));
+    rendered.push('.');
+    rendered.push_str(std::str::from_utf8(&digits[point..]).expect("decimal digits are UTF-8"));
+    rendered
 }
 
 fn format_double_fixed(value: f64) -> String {
@@ -7208,7 +8654,58 @@ fn int_to_double(value: i64) -> f64 {
 /// failure encountered while evaluating and executing the action.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_main(program: VerifiedProgram, context: RuntimeContext) -> RuntimeResult<()> {
-    run_main_inner(program, context, None, None, None)
+    run_main_inner(program, context, None, None, None, None)
+}
+
+/// Executes `main` while retaining an optional resource audit at an explicit
+/// caller-selected path.
+///
+/// # Errors
+///
+/// Returns any execution error or an error retaining the resource audit.
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_main_with_resource_audit(
+    program: VerifiedProgram,
+    context: RuntimeContext,
+    resource_audit_path: Option<&Path>,
+) -> RuntimeResult<()> {
+    run_main_inner(program, context, resource_audit_path, None, None, None)
+}
+
+/// Executes `main` while retaining an explicit resource audit and optional
+/// semantic trace selected by the typed caller.
+///
+/// # Errors
+///
+/// Returns any execution error or an error retaining either evidence file.
+#[cfg(feature = "compat-tracing")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_main_with_evidence(
+    program: VerifiedProgram,
+    context: RuntimeContext,
+    resource_audit_path: Option<&Path>,
+    semantic_trace_path: Option<&Path>,
+    typed_result_target: Option<BuiltinId>,
+    typed_result_target_instance: Option<Arc<str>>,
+) -> RuntimeResult<()> {
+    if typed_result_target_instance.is_some() && typed_result_target.is_none() {
+        return Err(RuntimeError::internal(
+            "typed result instance evidence requires a typed result target",
+        ));
+    }
+    if typed_result_target.is_some() && semantic_trace_path.is_none() {
+        return Err(RuntimeError::internal(
+            "typed result evidence requires a semantic trace path",
+        ));
+    }
+    run_main_inner(
+        program,
+        context,
+        resource_audit_path,
+        semantic_trace_path,
+        typed_result_target,
+        typed_result_target_instance,
+    )
 }
 
 /// Executes `main` while retaining its canonical semantic trace at an explicit
@@ -7224,7 +8721,7 @@ pub fn run_main_with_semantic_trace(
     context: RuntimeContext,
     trace_path: &Path,
 ) -> RuntimeResult<()> {
-    run_main_inner(program, context, Some(trace_path), None, None)
+    run_main_inner(program, context, None, Some(trace_path), None, None)
 }
 
 /// Executes `main` while retaining a canonical typed result for one exact
@@ -7244,6 +8741,7 @@ pub fn run_main_with_semantic_trace_target(
     run_main_inner(
         program,
         context,
+        None,
         Some(trace_path),
         Some(typed_result_target),
         None,
@@ -7268,6 +8766,7 @@ pub fn run_main_with_semantic_trace_target_instance(
     run_main_inner(
         program,
         context,
+        None,
         Some(trace_path),
         Some(typed_result_target),
         Some(typed_result_instance),
@@ -7278,6 +8777,7 @@ pub fn run_main_with_semantic_trace_target_instance(
 fn run_main_inner(
     program: VerifiedProgram,
     context: RuntimeContext,
+    resource_audit_path: Option<&Path>,
     #[cfg_attr(not(feature = "compat-tracing"), allow(unused_variables))] trace_path: Option<&Path>,
     #[cfg_attr(not(feature = "compat-tracing"), allow(unused_variables))]
     typed_result_target: Option<BuiltinId>,
@@ -7329,17 +8829,16 @@ fn run_main_inner(
             1_usize.saturating_add(error.suppressed.len())
         }
     });
-    write_evidence_resource_audit(&after, cleanup_failures)?;
+    if let Some(path) = resource_audit_path {
+        write_evidence_resource_audit_to(&after, cleanup_failures, path)?;
+    }
     #[cfg(feature = "compat-tracing")]
     if let Some(trace) = &evaluator.evidence_trace {
         let trace = trace
             .lock()
             .map_err(|_| RuntimeError::internal("semantic trace lock was poisoned"))?;
-        if let Some(path) = trace_path {
-            write_evidence_semantic_trace_to(&trace, path)?;
-        } else {
-            write_evidence_semantic_trace(&trace)?;
-        }
+        let path = trace_path.expect("semantic trace activation has an explicit output path");
+        write_evidence_semantic_trace_to(&trace, path)?;
     }
     let budget = &after.budget;
     let leaked = after.child_scopes != 0
@@ -7358,14 +8857,6 @@ fn run_main_inner(
         ))),
         Err(error) => Err(error),
     }
-}
-
-#[cfg(feature = "compat-tracing")]
-fn write_evidence_semantic_trace(trace: &EvidenceTrace) -> RuntimeResult<()> {
-    let Some(path) = std::env::var_os("HELL_EVIDENCE_SEMANTIC_TRACE").map(PathBuf::from) else {
-        return Ok(());
-    };
-    write_evidence_semantic_trace_to(trace, &path)
 }
 
 #[cfg(feature = "compat-tracing")]
@@ -7403,7 +8894,7 @@ fn semantic_trace_contents(trace: &EvidenceTrace) -> RuntimeResult<String> {
         .filter(|event| event.3 == "cleanup-failure")
         .count();
     Ok(format!(
-        "{{\n  \"schemaVersion\": 9,\n  \"parsedBuiltins\": [{parsed}],\n  \"resolvedBuiltins\": [{resolved}],\n  \"specializedBuiltins\": [{specialized}],\n  \"enteredAdapters\": [{entered}],\n  \"forcedArguments\": [{forced}],\n  \"typedResults\": [{typed}],\n  \"effectEvents\": [{effects}],\n  \"taskEvents\": [{tasks}],\n  \"presentationFields\": [{presentation}],\n  \"resourceEvents\": [{resources}],\n  \"obligationEvents\": [{obligations}],\n  \"finalResourceCounts\": {{\"acquired\": {}, \"live\": {}, \"cleanupFailures\": {cleanup_failures}, \"materializedElements\": {}}}\n}}\n",
+        "{{\n  \"schemaVersion\": 10,\n  \"parsedBuiltins\": [{parsed}],\n  \"resolvedBuiltins\": [{resolved}],\n  \"specializedBuiltins\": [{specialized}],\n  \"enteredAdapters\": [{entered}],\n  \"forcedArguments\": [{forced}],\n  \"typedResults\": [{typed}],\n  \"effectEvents\": [{effects}],\n  \"taskEvents\": [{tasks}],\n  \"presentationFields\": [{presentation}],\n  \"resourceEvents\": [{resources}],\n  \"obligationEvents\": [{obligations}],\n  \"finalResourceCounts\": {{\"acquired\": {}, \"live\": {}, \"cleanupFailures\": {cleanup_failures}, \"materializedElements\": {}}}\n}}\n",
         trace.next_resource_id,
         trace.live_resources.len(),
         trace
@@ -7443,15 +8934,36 @@ fn canonical_semantic_event_arrays(trace: &EvidenceTrace) -> RuntimeResult<[Stri
         let outcome = event
             .snapshot_outcome
             .unwrap_or_else(|| evidence_thunk_outcome(&event.thunk).0);
+        let nonproductive_phase = match event.boundary_class {
+            "nonproductive-repeat" | "nonproductive-parser-node" => Some(0),
+            "nonproductive-pending" => Some(1),
+            "nonproductive-cancelled" => Some(2),
+            _ => None,
+        };
+        let key = if let Some(phase) = nonproductive_phase {
+            format!(
+                "{:05}\0{:020}\01\0{phase:02}\0{}\0{}",
+                event.builtin.0, event.argument, event.boundary_class, outcome
+            )
+        } else {
+            format!(
+                "{:05}\0{:020}\00\0{}\0{}\0{}",
+                event.builtin.0,
+                event.argument,
+                event.boundary_class,
+                outcome,
+                event.snapshot_error_code.unwrap_or_default()
+            )
+        };
+        let error_code = event
+            .snapshot_error_code
+            .map_or_else(String::new, |code| format!(", \"errorCode\": \"{code}\""));
         events.push(CanonicalTraceEvent {
             field: 4,
-            key: format!(
-                "{:05}\0{:020}\0{}\0{}",
-                event.builtin.0, event.argument, event.boundary_class, outcome
-            ),
+            key,
             body: format!(
-                "\"builtinId\": {}, \"argument\": {}, \"boundaryClass\": \"{}\", \"outcome\": \"{}\"",
-                event.builtin.0, event.argument, event.boundary_class, outcome
+                "\"builtinId\": {}, \"argument\": {}, \"boundaryClass\": \"{}\", \"outcome\": \"{}\"{}",
+                event.builtin.0, event.argument, event.boundary_class, outcome, error_code
             ),
         });
     }
@@ -7582,21 +9094,17 @@ fn push_canonical_task_events(
     trace: &EvidenceTrace,
     task_ids: &HashMap<u64, u64>,
 ) -> RuntimeResult<()> {
-    for (event_index, (builtin, task, lifecycle)) in trace.task_events.iter().enumerate() {
+    for (builtin, task, lifecycle) in &trace.task_events {
         let canonical_task = task_ids.get(task).ok_or_else(|| {
             RuntimeError::internal("semantic task lacks a canonical logical identity")
         })?;
         output.push(CanonicalTraceEvent {
             field: 7,
-            key: if task_event_order_sensitive(*builtin) {
-                format!("0\0{:05}\0{event_index:020}", builtin.0)
-            } else {
-                format!(
-                    "1\0{canonical_task:020}\0{}\0{:05}",
-                    lifecycle_rank(lifecycle),
-                    builtin.0
-                )
-            },
+            key: format!(
+                "{canonical_task:020}\0{}\0{:05}",
+                lifecycle_rank(lifecycle),
+                builtin.0
+            ),
             body: format!(
                 "\"builtinId\": {}, \"taskId\": {canonical_task}, \"event\": \"{lifecycle}\"",
                 builtin.0
@@ -8121,10 +9629,30 @@ fn evidence_thunk_outcome(thunk: &ThunkRef) -> (&'static str, Option<String>) {
                 drop(state);
                 current = next;
             }
+            ThunkState::Suspended(Suspension::DeferredAdapterAlias { target, .. }) => {
+                let target = Arc::clone(target);
+                drop(state);
+                current = target;
+            }
             ThunkState::Failed(_) => return ("error", canonical),
             ThunkState::Suspended(_) => return ("not-forced", canonical),
             ThunkState::Evaluating { .. } => return ("in-progress", canonical),
         }
+    }
+}
+
+fn native_demand_argument_index(
+    spec: &hell_builtins::BuiltinSpec,
+    argument_count: usize,
+    position: usize,
+) -> usize {
+    if matches!(
+        spec.implementation,
+        Some("int_subtract" | "integer_subtract" | "double_subtract")
+    ) {
+        argument_count - position - 1
+    } else {
+        position
     }
 }
 
@@ -8153,6 +9681,11 @@ fn canonical_evidence_thunk(
             let next = Arc::clone(next);
             drop(state);
             canonical_evidence_thunk(&next, stack, depth.saturating_add(1))
+        }
+        ThunkState::Suspended(Suspension::DeferredAdapterAlias { target, .. }) => {
+            let target = Arc::clone(target);
+            drop(state);
+            canonical_evidence_thunk(&target, stack, depth.saturating_add(1))
         }
         ThunkState::Failed(error) => Some(format!(
             "{{\"type\":\"ForceBoundary\",\"outcome\":\"error\",\"code\":\"{}\"}}",
@@ -8483,7 +10016,7 @@ fn canonical_evidence_runtime_enum(value: &Value) -> Option<String> {
             match mode {
                 BufferMode::None => "none",
                 BufferMode::Line => "line",
-                BufferMode::Block => "block",
+                BufferMode::Block(_) => "block",
             },
         ),
         Value::FileMode(mode) => (
@@ -8531,7 +10064,7 @@ fn canonical_list(cell: &ListCell, stack: &mut HashSet<usize>, depth: usize) -> 
     const MAX_ELEMENTS: usize = 1_024;
     let mut current = cell.clone();
     let mut elements = Vec::new();
-    let termination = loop {
+    let termination = 'list: loop {
         match current {
             ListCell::Nil => break "nil".to_owned(),
             ListCell::Cons { head, tail } => {
@@ -8543,22 +10076,37 @@ fn canonical_list(cell: &ListCell, stack: &mut HashSet<usize>, depth: usize) -> 
                     stack,
                     depth.saturating_add(1),
                 )?);
-                let state = tail.state.lock().ok()?;
-                match &*state {
-                    ThunkState::Evaluated(value) => {
-                        let Value::List(next) = value.as_ref() else {
-                            return None;
-                        };
-                        current = next.clone();
+                let mut tail = tail;
+                loop {
+                    let state = tail.state.lock().ok()?;
+                    match &*state {
+                        ThunkState::Evaluated(value) => {
+                            let Value::List(next) = value.as_ref() else {
+                                return None;
+                            };
+                            current = next.clone();
+                            break;
+                        }
+                        ThunkState::Indirection(next) => {
+                            let encoded =
+                                canonical_evidence_thunk(next, stack, depth.saturating_add(1))?;
+                            break 'list format!("indirection:{encoded}");
+                        }
+                        ThunkState::Failed(error) => {
+                            break 'list format!("error:{}", error.code);
+                        }
+                        ThunkState::Suspended(Suspension::DeferredAdapterAlias {
+                            target, ..
+                        }) => {
+                            let target = Arc::clone(target);
+                            drop(state);
+                            tail = target;
+                        }
+                        ThunkState::Suspended(_) => break 'list "not-forced".to_owned(),
+                        ThunkState::Evaluating { .. } => {
+                            break 'list "in-progress".to_owned();
+                        }
                     }
-                    ThunkState::Indirection(next) => {
-                        let encoded =
-                            canonical_evidence_thunk(next, stack, depth.saturating_add(1))?;
-                        break format!("indirection:{encoded}");
-                    }
-                    ThunkState::Failed(error) => break format!("error:{}", error.code),
-                    ThunkState::Suspended(_) => break "not-forced".to_owned(),
-                    ThunkState::Evaluating { .. } => break "in-progress".to_owned(),
                 }
             }
         }
@@ -8590,13 +10138,11 @@ fn evidence_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn write_evidence_resource_audit(
+fn write_evidence_resource_audit_to(
     snapshot: &scope::ScopeSnapshot,
     cleanup_failures: usize,
+    path: &Path,
 ) -> RuntimeResult<()> {
-    let Some(path) = std::env::var_os("HELL_EVIDENCE_RESOURCE_AUDIT").map(PathBuf::from) else {
-        return Ok(());
-    };
     let contents = evidence_resource_audit_contents(snapshot, cleanup_failures);
     let mut temporary = path.as_os_str().to_os_string();
     temporary.push(".tmp");
@@ -8604,7 +10150,7 @@ fn write_evidence_resource_audit(
     std::fs::write(&temporary, contents.as_bytes()).map_err(|error| {
         RuntimeError::internal(format!("cannot write evidence resource audit: {error}"))
     })?;
-    std::fs::rename(&temporary, &path).map_err(|error| {
+    std::fs::rename(&temporary, path).map_err(|error| {
         RuntimeError::internal(format!("cannot retain evidence resource audit: {error}"))
     })
 }
@@ -8644,8 +10190,11 @@ fn evidence_resource_audit_contents(
 #[cfg(all(test, feature = "compat-tracing"))]
 mod semantic_trace_tests {
     use super::{
-        EffectCausalIdentity, EffectEvidence, Evaluator, EvidenceTrace, RuntimeContext, Thunk,
-        Value, canonical_semantic_event_arrays, semantic_trace_contents,
+        ActiveAdapterObligation, AdapterCausalIdentity, AdapterObligationEvidence,
+        EffectCausalIdentity, EffectEvidence, Evaluator, EvidenceTrace, ForceOutcome, ListCell,
+        OrderedMap, OrderedSet, RuntimeContext, RuntimeError, Suspension, Thunk, ThunkRef,
+        ThunkState, Value, canonical_semantic_event_arrays, semantic_trace_contents,
+        validate_contextual_adapter_child_arity,
     };
     use hell_builtins::lookup;
     use hell_compiler::{CompilerSession, compile_source};
@@ -8665,6 +10214,20 @@ mod semantic_trace_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn tracing_evaluator() -> (Evaluator, Arc<Mutex<EvidenceTrace>>) {
+        let program = compile_source(
+            &mut CompilerSession::upstream(),
+            "deferred-parent.hell",
+            "main = IO.pure ()\n".to_owned(),
+        )
+        .expect("deferred-parent fixture compiles");
+        let executable = Arc::new(program.executable().clone());
+        let trace = Arc::new(Mutex::new(EvidenceTrace::from_program(&executable)));
+        let mut evaluator = Evaluator::new(executable);
+        evaluator.evidence_trace = Some(Arc::clone(&trace));
+        (evaluator, trace)
     }
 
     fn execute_main(
@@ -8733,8 +10296,8 @@ mod semantic_trace_tests {
             task_events: vec![
                 (task_builtin, 4, "started"),
                 (task_builtin, 8, "started"),
-                (task_builtin, 8, "completed"),
                 (task_builtin, 4, "completed"),
+                (task_builtin, 8, "completed"),
             ],
             resource_events: vec![
                 (resource_builtin, 3, Some(8), "acquire"),
@@ -8747,7 +10310,503 @@ mod semantic_trace_tests {
             canonical_semantic_event_arrays(&first).expect("first canonical trace"),
             canonical_semantic_event_arrays(&second).expect("second canonical trace")
         );
+    }
 
+    #[test]
+    fn canonical_task_identities_preserve_terminal_roles() {
+        let task_builtin = lookup("Async.concurrently")
+            .expect("concurrency builtin")
+            .id;
+        let race_builtin = lookup("Async.race").expect("race builtin").id;
+        let left_wins = EvidenceTrace {
+            task_events: vec![
+                (race_builtin, 1, "started"),
+                (race_builtin, 2, "started"),
+                (race_builtin, 1, "completed"),
+                (race_builtin, 2, "cancelled"),
+            ],
+            ..EvidenceTrace::default()
+        };
+        let right_wins = EvidenceTrace {
+            task_events: vec![
+                (race_builtin, 1, "started"),
+                (race_builtin, 2, "started"),
+                (race_builtin, 2, "completed"),
+                (race_builtin, 1, "cancelled"),
+            ],
+            ..EvidenceTrace::default()
+        };
+        assert_ne!(
+            canonical_semantic_event_arrays(&left_wins).expect("left-winner canonical trace"),
+            canonical_semantic_event_arrays(&right_wins).expect("right-winner canonical trace"),
+            "canonical task identities must preserve the race winner"
+        );
+
+        let left_fails = EvidenceTrace {
+            task_events: vec![
+                (task_builtin, 1, "started"),
+                (task_builtin, 2, "started"),
+                (task_builtin, 1, "failed"),
+                (task_builtin, 2, "completed"),
+            ],
+            ..EvidenceTrace::default()
+        };
+        let right_fails = EvidenceTrace {
+            task_events: vec![
+                (task_builtin, 1, "started"),
+                (task_builtin, 2, "started"),
+                (task_builtin, 2, "failed"),
+                (task_builtin, 1, "completed"),
+            ],
+            ..EvidenceTrace::default()
+        };
+        assert_ne!(
+            canonical_semantic_event_arrays(&left_fails).expect("left-failure canonical trace"),
+            canonical_semantic_event_arrays(&right_fails).expect("right-failure canonical trace"),
+            "canonical task identities must preserve the failing side"
+        );
+    }
+
+    #[test]
+    fn canonical_obligation_parentage_preserves_alias_causality() {
+        let parent_builtin = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let child_builtin = lookup("Text.putStr").expect("Text.putStr builtin").id;
+        let obligation = |builtin, sequence, parent_sequence| AdapterObligationEvidence {
+            builtin,
+            instance_target: None,
+            instance_premises: Vec::new(),
+            outcome: if builtin == child_builtin {
+                "io-action"
+            } else {
+                "alias"
+            },
+            owner_task: None,
+            sequence,
+            parent_sequence,
+            materialized_before: 0,
+            materialized_after: 0,
+        };
+        let nested = EvidenceTrace {
+            obligation_events: vec![
+                obligation(parent_builtin, 1, None),
+                obligation(child_builtin, 2, Some(1)),
+            ],
+            ..EvidenceTrace::default()
+        };
+        let detached = EvidenceTrace {
+            obligation_events: vec![
+                obligation(parent_builtin, 1, None),
+                obligation(child_builtin, 2, None),
+            ],
+            ..EvidenceTrace::default()
+        };
+        assert_ne!(
+            canonical_semantic_event_arrays(&nested).expect("nested alias trace is canonical"),
+            canonical_semantic_event_arrays(&detached).expect("detached alias trace is canonical"),
+            "alias parentage and nested-adapter count are causal evidence"
+        );
+
+        let future_parent = EvidenceTrace {
+            obligation_events: vec![
+                obligation(parent_builtin, 1, None),
+                obligation(child_builtin, 2, Some(2)),
+            ],
+            ..EvidenceTrace::default()
+        };
+        assert!(
+            canonical_semantic_event_arrays(&future_parent)
+                .expect_err("an adapter cannot parent itself or an earlier invocation")
+                .message
+                .contains("does not precede")
+        );
+    }
+
+    #[test]
+    fn contextual_adapter_aliases_are_reference_local_and_preserve_real_descendants() {
+        let (mut evaluator, trace) = tracing_evaluator();
+        let maybe = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let text = lookup("Text.putStr").expect("Text.putStr builtin").id;
+        let show = lookup("Show.show").expect("Show.show builtin").id;
+        let identity = |builtin, sequence| AdapterCausalIdentity {
+            builtin,
+            owner_task: None,
+            sequence,
+        };
+        let event = |builtin, sequence, parent_sequence| AdapterObligationEvidence {
+            builtin,
+            instance_target: None,
+            instance_premises: Vec::new(),
+            outcome: "value",
+            owner_task: None,
+            sequence,
+            parent_sequence,
+            materialized_before: 0,
+            materialized_after: 0,
+        };
+        let ancestor = identity(maybe, 1);
+        let descendant = identity(text, 2);
+        let sibling = identity(show, 3);
+        trace.lock().expect("trace lock").obligation_events = vec![
+            event(maybe, 1, None),
+            event(text, 2, Some(1)),
+            event(show, 3, None),
+        ];
+
+        let target = Thunk::evaluated(Value::Maybe(Some(Thunk::evaluated(Value::Int(7)))));
+        let descendant_view = evaluator
+            .contextual_adapter_alias(&target, descendant)
+            .expect("descendant view");
+        assert!(
+            Arc::ptr_eq(
+                &evaluator
+                    .contextual_adapter_alias(&descendant_view, ancestor)
+                    .expect("real descendant survives"),
+                &descendant_view
+            ),
+            "a proven descendant view must not be replaced by its ancestor"
+        );
+
+        let ancestor_view = evaluator
+            .contextual_adapter_alias(&target, ancestor)
+            .expect("ancestor view");
+        let refreshed_descendant = evaluator
+            .contextual_adapter_alias(&ancestor_view, descendant)
+            .expect("ancestor is stale at a descendant use");
+        let sibling_view = evaluator
+            .contextual_adapter_alias(&target, sibling)
+            .expect("sibling view");
+        let refreshed_ancestor = evaluator
+            .contextual_adapter_alias(&sibling_view, ancestor)
+            .expect("sibling is stale at an ancestor use");
+
+        let alias = |thunk: &ThunkRef| {
+            let state = thunk.state.lock().expect("alias state");
+            let ThunkState::Suspended(Suspension::DeferredAdapterAlias { target, parent }) =
+                &*state
+            else {
+                panic!("expected a deferred adapter alias");
+            };
+            (Arc::clone(target), *parent)
+        };
+        let (descendant_target, descendant_parent) = alias(&refreshed_descendant);
+        let (ancestor_target, ancestor_parent) = alias(&refreshed_ancestor);
+        assert!(Arc::ptr_eq(&descendant_target, &target));
+        assert!(Arc::ptr_eq(&ancestor_target, &target));
+        assert_eq!(descendant_parent, descendant);
+        assert_eq!(ancestor_parent, ancestor);
+        assert!(
+            !Arc::ptr_eq(&refreshed_descendant, &refreshed_ancestor),
+            "diamond uses receive immutable reference-local views"
+        );
+
+        let stale_outer = Thunk::suspended(Suspension::DeferredAdapterAlias {
+            target: Arc::clone(&descendant_view),
+            parent: sibling,
+        });
+        let recovered_descendant = evaluator
+            .contextual_adapter_alias(&stale_outer, ancestor)
+            .expect("stale outer alias is peeled");
+        assert!(
+            Arc::ptr_eq(&recovered_descendant, &descendant_view),
+            "peeling a stale outer alias retains the genuine inner descendant"
+        );
+        let value = evaluator
+            .force(&recovered_descendant)
+            .expect("descendant structural result");
+        let Value::Maybe(Some(child)) = value.as_ref() else {
+            panic!("descendant Maybe result");
+        };
+        let (_, child_parent) = alias(child);
+        assert_eq!(child_parent, descendant);
+    }
+
+    #[test]
+    fn contextual_adapter_parent_is_not_consumed_by_one_descendant() {
+        let (mut evaluator, trace) = tracing_evaluator();
+        let maybe = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let text = lookup("Text.putStr").expect("Text.putStr builtin").id;
+        let show = lookup("Show.show").expect("Show.show builtin").id;
+        let ancestor = AdapterCausalIdentity {
+            builtin: maybe,
+            owner_task: None,
+            sequence: 1,
+        };
+        let event = |builtin, sequence, parent_sequence| AdapterObligationEvidence {
+            builtin,
+            instance_target: None,
+            instance_premises: Vec::new(),
+            outcome: "value",
+            owner_task: None,
+            sequence,
+            parent_sequence,
+            materialized_before: 0,
+            materialized_after: 0,
+        };
+        let mut retained = trace.lock().expect("trace lock");
+        retained.obligation_events = vec![
+            event(maybe, 1, None),
+            event(text, 2, Some(1)),
+            event(show, 3, None),
+        ];
+        retained.adapter_sequences.insert(None, 3);
+        drop(retained);
+        evaluator.pending_adapter_parent = Some(ancestor);
+        for expected_sequence in [4, 5] {
+            evaluator
+                .begin_adapter_obligation(show, None)
+                .expect("sibling descendant begins");
+            evaluator
+                .finish_native_outcome(
+                    show,
+                    Ok(ForceOutcome::Value(Arc::new(Value::Int(expected_sequence)))),
+                )
+                .expect("sibling descendant finishes");
+            assert_eq!(
+                evaluator.pending_adapter_parent,
+                Some(ancestor),
+                "one descendant must not consume the alias-scoped parent"
+            );
+        }
+        let trace = trace.lock().expect("trace lock");
+        let siblings = trace
+            .obligation_events
+            .iter()
+            .filter(|event| event.sequence >= 4)
+            .collect::<Vec<_>>();
+        assert_eq!(siblings.len(), 2);
+        assert!(siblings.iter().all(|event| {
+            event.builtin == show && event.parent_sequence == Some(ancestor.sequence)
+        }));
+    }
+
+    #[test]
+    fn finish_native_preserves_a_completed_descendant_view_while_parent_is_active() {
+        let (mut evaluator, trace) = tracing_evaluator();
+        let parent_builtin = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let child_builtin = lookup("Text.putStr").expect("Text.putStr builtin").id;
+        let parent = AdapterCausalIdentity {
+            builtin: parent_builtin,
+            owner_task: None,
+            sequence: 1,
+        };
+        let child = AdapterCausalIdentity {
+            builtin: child_builtin,
+            owner_task: None,
+            sequence: 2,
+        };
+        trace
+            .lock()
+            .expect("trace lock")
+            .obligation_events
+            .push(AdapterObligationEvidence {
+                builtin: child_builtin,
+                instance_target: None,
+                instance_premises: Vec::new(),
+                outcome: "value",
+                owner_task: None,
+                sequence: 2,
+                parent_sequence: Some(1),
+                materialized_before: 0,
+                materialized_after: 0,
+            });
+        evaluator
+            .adapter_obligation_stack
+            .push(ActiveAdapterObligation {
+                builtin: parent_builtin,
+                instance_target: None,
+                instance_premises: Vec::new(),
+                owner_task: None,
+                sequence: 1,
+                parent_sequence: None,
+                materialized_elements: 0,
+                typed_result_root: false,
+            });
+        let target = Thunk::evaluated(Value::Int(7));
+        let child_view = evaluator
+            .contextual_adapter_alias(&target, child)
+            .expect("child view");
+        let outcome = evaluator
+            .finish_native_outcome(
+                parent_builtin,
+                Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(
+                    Arc::clone(&child_view),
+                ))))),
+            )
+            .expect("parent outcome");
+        let ForceOutcome::Value(value) = outcome else {
+            panic!("parent value outcome");
+        };
+        let Value::Maybe(Some(retained_child)) = value.as_ref() else {
+            panic!("parent Maybe result");
+        };
+        assert!(Arc::ptr_eq(retained_child, &child_view));
+        assert!(evaluator.adapter_obligation_stack.is_empty());
+        let trace = trace.lock().expect("trace lock");
+        let parent_event = trace
+            .obligation_events
+            .iter()
+            .find(|event| event.sequence == parent.sequence)
+            .expect("parent event recorded after contextualization");
+        assert_eq!(parent_event.builtin, parent_builtin);
+        assert_eq!(parent_event.parent_sequence, None);
+    }
+
+    #[test]
+    fn contextual_structural_views_preserve_order_memoization_and_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut evaluator, _trace) = tracing_evaluator();
+        let maybe = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let show = lookup("Show.show").expect("Show.show builtin").id;
+        let left_parent = AdapterCausalIdentity {
+            builtin: maybe,
+            owner_task: None,
+            sequence: 1,
+        };
+        let right_parent = AdapterCausalIdentity {
+            builtin: show,
+            owner_task: None,
+            sequence: 2,
+        };
+        let forces = Arc::new(AtomicUsize::new(0));
+        let counted = {
+            let forces = Arc::clone(&forces);
+            Thunk::deferred(move |_| {
+                forces.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(Value::Int(7)))
+            })
+        };
+        let list = Arc::new(Value::List(ListCell::Cons {
+            head: Arc::clone(&counted),
+            tail: Thunk::evaluated(Value::List(ListCell::Nil)),
+        }));
+        let left = evaluator
+            .contextual_adapter_value(&list, left_parent)
+            .expect("left structural view");
+        let right = evaluator
+            .contextual_adapter_value(&list, right_parent)
+            .expect("right structural view");
+        assert_eq!(forces.load(Ordering::SeqCst), 0, "cloning never forces");
+
+        let Value::List(ListCell::Cons {
+            head: left_head, ..
+        }) = left.as_ref()
+        else {
+            panic!("left list view");
+        };
+        let Value::List(ListCell::Cons {
+            head: right_head, ..
+        }) = right.as_ref()
+        else {
+            panic!("right list view");
+        };
+        assert!(matches!(
+            evaluator.force(left_head).expect("left force").as_ref(),
+            Value::Int(7)
+        ));
+        assert!(matches!(
+            evaluator.force(right_head).expect("right force").as_ref(),
+            Value::Int(7)
+        ));
+        assert_eq!(
+            forces.load(Ordering::SeqCst),
+            1,
+            "reference-local views memoize the same original target exactly once"
+        );
+    }
+
+    #[test]
+    fn contextual_collection_views_preserve_order_and_failures() {
+        let (mut evaluator, _trace) = tracing_evaluator();
+        let maybe = lookup("Maybe.maybe").expect("Maybe.maybe builtin").id;
+        let left_parent = AdapterCausalIdentity {
+            builtin: maybe,
+            owner_task: None,
+            sequence: 1,
+        };
+        let first = Thunk::evaluated(Value::Int(1));
+        let second = Thunk::evaluated(Value::Int(2));
+        let map = Arc::new(Value::Map(Arc::new(OrderedMap::from_sorted(&[
+            (Arc::clone(&first), Arc::clone(&second)),
+            (Arc::clone(&second), Arc::clone(&first)),
+        ]))));
+        let set = Arc::new(Value::Set(Arc::new(OrderedSet::from_sorted(&[
+            Arc::clone(&first),
+            Arc::clone(&second),
+        ]))));
+        let map_view = evaluator
+            .contextual_adapter_value(&map, left_parent)
+            .expect("map view");
+        let set_view = evaluator
+            .contextual_adapter_value(&set, left_parent)
+            .expect("set view");
+        let Value::Map(map_view) = map_view.as_ref() else {
+            panic!("map view");
+        };
+        let Value::Set(set_view) = set_view.as_ref() else {
+            panic!("set view");
+        };
+        assert_eq!(map_view.len(), 2);
+        assert_eq!(set_view.len(), 2);
+        assert_eq!(
+            map_view
+                .iter()
+                .map(|(key, _)| evaluator.force(key).expect("map key"))
+                .map(|value| match value.as_ref() {
+                    Value::Int(value) => *value,
+                    _ => panic!("map key is Int"),
+                })
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            set_view
+                .iter()
+                .map(|element| evaluator.force(element).expect("set element"))
+                .map(|value| match value.as_ref() {
+                    Value::Int(value) => *value,
+                    _ => panic!("set element is Int"),
+                })
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        let scalar = Arc::new(Value::Int(9));
+        assert!(Arc::ptr_eq(
+            &evaluator
+                .contextual_adapter_value(&scalar, left_parent)
+                .expect("scalar view"),
+            &scalar
+        ));
+        let failed = Thunk::failed_without_admission(RuntimeError::user("expected failure"));
+        let failed_view = evaluator
+            .contextual_adapter_alias(&failed, left_parent)
+            .expect("failed view");
+        let error = evaluator
+            .force(&failed_view)
+            .expect_err("failure passes through its contextual view");
+        assert_eq!(error.code, "H0901");
+        assert_eq!(error.message.as_ref(), "expected failure");
+        assert!(
+            validate_contextual_adapter_child_arity(1, 0)
+                .expect_err("an omitted structural child must fail closed")
+                .message
+                .contains("from 1 to 0")
+        );
+        assert!(
+            validate_contextual_adapter_child_arity(1, 2)
+                .expect_err("an inserted structural child must fail closed")
+                .message
+                .contains("from 1 to 2")
+        );
+    }
+
+    #[test]
+    fn malformed_task_and_resource_lifecycles_are_rejected() {
+        let task_builtin = lookup("Async.concurrently")
+            .expect("concurrency builtin")
+            .id;
+        let resource_builtin = lookup("IO.openFile").expect("resource builtin").id;
         let terminal_before_start = EvidenceTrace {
             task_events: vec![(task_builtin, 1, "completed"), (task_builtin, 1, "started")],
             ..EvidenceTrace::default()
@@ -8755,6 +10814,20 @@ mod semantic_trace_tests {
         assert!(
             canonical_semantic_event_arrays(&terminal_before_start)
                 .expect_err("terminal-before-start must be rejected")
+                .message
+                .contains("start-to-terminal")
+        );
+        let duplicate_terminal = EvidenceTrace {
+            task_events: vec![
+                (task_builtin, 1, "started"),
+                (task_builtin, 1, "completed"),
+                (task_builtin, 1, "completed"),
+            ],
+            ..EvidenceTrace::default()
+        };
+        assert!(
+            canonical_semantic_event_arrays(&duplicate_terminal)
+                .expect_err("duplicate terminal must be rejected")
                 .message
                 .contains("start-to-terminal")
         );

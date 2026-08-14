@@ -166,6 +166,8 @@ name = "hell-host"
 version = "0.1.0"
 dependencies = [
  "command-group",
+ "nix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -195,6 +197,7 @@ dependencies = [
  "hell-host",
  "hell-http-host",
  "hell-types",
+ "nix",
 ]
 
 [[package]]
@@ -210,6 +213,7 @@ dependencies = [
  "hell-digest",
  "hell-platform",
  "tar",
+ "windows-sys",
 ]
 
 [[package]]

@@ -84,11 +84,10 @@ fn get_env_reads_the_process_environment_and_reports_missing_names() {
 
     let missing = run_source("missing-env", source, &[]);
     assert_eq!(missing.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&missing.stderr);
-    assert!(stderr.contains("H0903"), "expected H0903, got: {stderr}");
-    assert!(
-        stderr.contains("HOME"),
-        "expected variable name, got: {stderr}"
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        missing.stderr,
+        b"hell: HOME: getEnv: does not exist (no environment variable)\n"
     );
 }
 

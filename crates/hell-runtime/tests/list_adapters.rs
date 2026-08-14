@@ -2,7 +2,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use hell_compiler::{CompilerSession, compile_source};
-use hell_runtime::{RuntimeContext, run_main};
+use hell_runtime::{
+    RuntimeContext, RuntimeErrorKind, RuntimeErrorPresentation, RuntimeResult, run_main,
+};
 
 #[derive(Clone)]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -27,6 +29,53 @@ fn run(source: &str) -> String {
     )
     .unwrap();
     String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+}
+
+fn run_result(source: &str) -> (RuntimeResult<()>, String) {
+    let program = compile_source(&mut CompilerSession::default(), "lists.hell", source).unwrap();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let result = run_main(
+        program,
+        RuntimeContext::new(Vec::new(), SharedWriter(Arc::clone(&bytes))),
+    );
+    let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    (result, output)
+}
+
+#[test]
+fn cycle_empty_uses_the_pinned_base_origin_without_changing_user_error_identity() {
+    let expected = concat!(
+        "hell: Prelude.cycle: empty list\n",
+        "CallStack (from HasCallStack):\n",
+        "  error, called at libraries/base/GHC/List.hs:2004:3 in base:GHC.List\n",
+        "  errorEmptyList, called at libraries/base/GHC/List.hs:972:27 in base:GHC.List\n",
+        "  cycle, called at src/Hell.hs:1953:4 in main:Main",
+    );
+    for source in [
+        "main = IO.print $ List.take 1 $ List.cycle ([] :: [Int])\n",
+        "main = IO.print $ List.take 1 $ List.cycle $ List.drop 1 [1]\n",
+    ] {
+        let (result, output) = run_result(source);
+        let error = result.expect_err("forcing an empty cycle must fail");
+        assert!(output.is_empty());
+        assert_eq!(error.code, "H0901");
+        assert_eq!(error.kind, RuntimeErrorKind::UserError);
+        assert_eq!(error.message.as_ref(), "List.cycle: empty list");
+        assert_eq!(
+            error.presentation,
+            Some(RuntimeErrorPresentation::ListCycleEmpty)
+        );
+        assert_eq!(error.to_string(), expected);
+    }
+
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  IO.print $ List.take 3 $ List.cycle [7]\n",
+            "  IO.print $ List.take 5 $ List.cycle [1,2]\n",
+        )),
+        "[7,7,7]\n[1,2,1,2,1]\n"
+    );
 }
 
 #[test]

@@ -657,7 +657,10 @@ fn host_failure_applicable(implementation: Option<&str>) -> bool {
                 | "async_pooled_map_"
                 | "async_pooled_for_"
         )
-    ) || implementation.is_some_and(|value| value.starts_with("directory_"))
+    ) || implementation.is_some_and(|value| {
+        value.starts_with("directory_")
+            && !matches!(value, "directory_is_directory" | "directory_is_file")
+    })
 }
 
 fn assurance_compatibility_quirks(name: &str) -> &'static [&'static str] {
@@ -1054,7 +1057,7 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
         "IO.stderr" => ("Handle", 0, &[], "io_stderr"),
         "IO.NoBuffering" => ("BufferMode", 0, &[], "io_no_buffering"),
         "IO.LineBuffering" => ("BufferMode", 0, &[], "io_line_buffering"),
-        "IO.BlockBuffering" => ("BufferMode", 0, &[], "io_block_buffering"),
+        "IO.BlockBuffering" => ("Maybe Int -> BufferMode", 1, WHNF, "io_block_buffering"),
         "IO.ReadMode" => ("FileMode", 0, &[], "io_read_mode"),
         "IO.WriteMode" => ("FileMode", 0, &[], "io_write_mode"),
         "IO.AppendMode" => ("FileMode", 0, &[], "io_append_mode"),
@@ -1364,7 +1367,7 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
         "Map.singleton" => (
             "forall k v. Ord k => k -> v -> Map k v",
             2,
-            TWO_LAZY,
+            &[Demand::Whnf, Demand::Lazy],
             "map_singleton",
         ),
         "Map.size" => ("forall k v. Map k v -> Int", 1, WHNF, "map_size"),
@@ -1448,7 +1451,7 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
             },
         ),
         "Set.size" => ("forall a. Set a -> Int", 1, WHNF, "set_size"),
-        "Set.singleton" => ("forall a. Ord a => a -> Set a", 1, LAZY, "set_singleton"),
+        "Set.singleton" => ("forall a. Ord a => a -> Set a", 1, WHNF, "set_singleton"),
         "Maybe.Nothing" => ("forall a. Maybe a", 0, &[], "maybe_nothing"),
         "Maybe.Just" => ("forall a. a -> Maybe a", 1, LAZY, "maybe_just"),
         "Maybe.maybe" => (
@@ -1565,13 +1568,13 @@ fn executable(name: &str) -> Option<(&'static str, u8, &'static [Demand], &'stat
             "http_run",
         ),
         "IO.mapM_" => (
-            "forall a b. (a -> IO b) -> [a] -> IO ()",
+            "forall a. (a -> IO ()) -> [a] -> IO ()",
             2,
             IO_TWO,
             "io_map_m_",
         ),
         "IO.forM_" => (
-            "forall a b. [a] -> (a -> IO b) -> IO ()",
+            "forall a. [a] -> (a -> IO ()) -> IO ()",
             2,
             IO_TWO,
             "io_for_m_",
@@ -2437,5 +2440,35 @@ mod assurance_metadata_tests {
                 .sensitivities
                 .contains(&AssuranceSensitivity::Concurrency)
         );
+    }
+
+    #[test]
+    fn directory_host_failure_applicability_distinguishes_bool_predicates() {
+        for name in ["Directory.doesDirectoryExist", "Directory.doesFileExist"] {
+            assert!(
+                !lookup(name)
+                    .expect("directory existence predicate")
+                    .assurance_metadata()
+                    .host_failure_applicable,
+                "{name} returns False after admitted metadata failures"
+            );
+        }
+        for name in [
+            "Directory.getCurrentDirectory",
+            "Directory.getHomeDirectory",
+            "Directory.pathIsSymbolicLink",
+            "Directory.copyFile",
+            "Directory.getFileSize",
+            "Directory.listDirectory",
+            "Directory.setCurrentDirectory",
+        ] {
+            assert!(
+                lookup(name)
+                    .expect("fallible directory operation")
+                    .assurance_metadata()
+                    .host_failure_applicable,
+                "{name} remains semantically fallible"
+            );
+        }
     }
 }

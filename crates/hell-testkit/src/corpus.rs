@@ -946,7 +946,13 @@ const RUNTIME_TYPED_RESULT_CASES: &[(&str, &str)] = &[
     ("IO.stderr", "main = Text.hPutStr IO.stderr \"\"\n"),
     (
         "Process.nullStream",
-        "main = do\n  bytes <- ByteString.hGet Process.nullStream 1\n  ByteString.hPutStr IO.stdout bytes\n",
+        concat!(
+            "main = do\n",
+            "  helpers <- Environment.getArgs\n",
+            "  Monad.forM_ helpers \\helper ->\n",
+            "    Process.runProcess_ $ Process.setStdout Process.nullStream $\n",
+            "      Process.proc helper [\"emit-hex\",\"\"]\n",
+        ),
     ),
     (
         "Json.Null",
@@ -1134,7 +1140,7 @@ const RUNTIME_TYPED_RESULT_CASES: &[(&str, &str)] = &[
     ),
     (
         "IO.BlockBuffering",
-        "main = IO.hSetBuffering IO.stdout IO.BlockBuffering\n",
+        "main = IO.hSetBuffering IO.stdout $ IO.BlockBuffering Maybe.Nothing\n",
     ),
     (
         "IO.ReadMode",
@@ -1172,17 +1178,33 @@ fn runtime_core_typed_result_cases() -> Vec<DifferentialCase> {
             }
             if matches!(builtin, "Map.singleton" | "Set.singleton") {
                 for target in &mut descriptor.semantic_targets {
+                    target.obligations.retain(|obligation| {
+                        !matches!(
+                            obligation.0.as_ref(),
+                            "adapter-failure" | "whnf-failure-boundary"
+                        )
+                    });
                     target.expected_instance_target = Some(Arc::from("Int"));
                     target.expected_comparator_trace_sha256 =
                         Some(crate::comparator_trace_sha256(builtin, 1, "Int", &[], &[]));
                 }
             }
+            let (arguments, environment_profile) = if builtin == "Process.nullStream" {
+                (
+                    vec!["hell-test-helper".into()],
+                    EnvironmentProfile::ProcessCapable,
+                )
+            } else {
+                (Vec::new(), EnvironmentProfile::Explicit)
+            };
             DifferentialCase {
                 id: Arc::from(format!(
                     "runtime-typed-{}",
                     implementation.replace('_', "-")
                 )),
                 source: Arc::from(source),
+                arguments,
+                environment_profile,
                 claim_evidence: Some(descriptor),
                 ..DifferentialCase::default()
             }
@@ -1655,7 +1677,8 @@ fn runtime_typed_raw_presentation(builtin: &str) -> Option<&'static [u8]> {
         "Json.Number" => Some(b"1.5"),
         "Json.Array" => Some(b"[null]"),
         "Json.Object" => Some(b"{\"key\":null}"),
-        "Text.decodeUtf8" => Some("\"aβ\"\n".as_bytes()),
+        "Text.decodeUtf8" => Some(b"\"a\\946\"\n"),
+        "Text.drop" => Some(b"\"\\946\"\n"),
         _ => None,
     }
 }
@@ -1989,7 +2012,7 @@ fn runtime_text_decode_utf8_boundary_cases() -> Vec<DifferentialCase> {
             "unicode",
             "main = IO.print $ Text.decodeUtf8 $ Text.encodeUtf8 \"aβ\"\n",
             Vec::new(),
-            Some("\"aβ\"\n".as_bytes()),
+            Some(b"\"a\\946\"\n"),
         ),
         (
             "invalid-encoding",
@@ -2061,7 +2084,7 @@ fn runtime_text_stdio_input_boundary_cases() -> Vec<DifferentialCase> {
         (
             "unicode",
             "aβ\r\nrest".as_bytes().to_vec(),
-            Some("aβ".as_bytes().to_vec()),
+            Some("aβ\r".as_bytes().to_vec()),
         ),
         ("invalid-encoding", vec![0xff, b'A', b'\n'], None),
     ] {
@@ -2254,6 +2277,9 @@ fn runtime_file_writer_boundary_cases(
     .collect::<Vec<_>>();
     let mut descriptor = runtime_all_obligation_descriptor(builtin, failure_source);
     descriptor
+        .targets
+        .retain(|target| target.dimension != hell_builtins::CompatibilityDimension::Presentation);
+    descriptor
         .semantic_targets
         .retain(|target| target.dimension != hell_builtins::CompatibilityDimension::Presentation);
     descriptor.semantic_targets.iter_mut().for_each(|target| {
@@ -2261,6 +2287,10 @@ fn runtime_file_writer_boundary_cases(
             target
                 .obligations
                 .retain(|obligation| obligation.0.as_ref() != "effect-success");
+        } else if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
+            target
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != "adapter-success");
         }
     });
     cases.push(DifferentialCase {
@@ -2429,6 +2459,7 @@ fn runtime_read_process_cases(
             arguments: vec!["hell-test-helper".into()],
             stdin,
             environment_profile: EnvironmentProfile::ProcessCapable,
+            expected_runtime_completion: !fails,
             claim_evidence: Some(descriptor),
             ..DifferentialCase::default()
         }
@@ -2437,6 +2468,9 @@ fn runtime_read_process_cases(
     if !text_output {
         let source = runtime_missing_process_source(builtin);
         let mut descriptor = runtime_all_obligation_descriptor(builtin, &source);
+        descriptor.targets.retain(|target| {
+            target.dimension != hell_builtins::CompatibilityDimension::Presentation
+        });
         descriptor.semantic_targets.retain(|target| {
             target.dimension != hell_builtins::CompatibilityDimension::Presentation
         });
@@ -2445,6 +2479,10 @@ fn runtime_read_process_cases(
                 target
                     .obligations
                     .retain(|obligation| obligation.0.as_ref() != "effect-success");
+            } else if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
+                target
+                    .obligations
+                    .retain(|obligation| obligation.0.as_ref() != "adapter-success");
             }
         });
         cases.push(DifferentialCase {
@@ -2521,7 +2559,11 @@ fn runtime_process_boundary_descriptor(
     for target in &mut descriptor.semantic_targets {
         if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
             target.boundary_classes = vec![Arc::from(boundary)];
-            if !fails {
+            if fails {
+                target
+                    .obligations
+                    .retain(|obligation| obligation.0.as_ref() != "adapter-success");
+            } else {
                 target.expected_raw_presentation_sha256 =
                     Some(crate::raw_presentation_sha256(stdout, b""));
                 target
@@ -2545,6 +2587,9 @@ fn runtime_process_boundary_descriptor(
         }
     }
     if fails {
+        descriptor.targets.retain(|target| {
+            target.dimension != hell_builtins::CompatibilityDimension::Presentation
+        });
         descriptor.semantic_targets.retain(|target| {
             target.dimension != hell_builtins::CompatibilityDimension::Presentation
         });
@@ -2604,7 +2649,7 @@ fn runtime_process_execution_cases() -> Vec<DifferentialCase> {
             )
             .to_owned()
         };
-        let mut case = runtime_io_failure_case(builtin, id, &source);
+        let mut case = runtime_adapter_failure_case(builtin, id, &source);
         if builtin == "Process.runProcess_" {
             case.arguments = vec!["hell-test-helper".into()];
         }
@@ -3007,9 +3052,12 @@ fn show_instance_descriptor(
             }
         }
         if target.dimension == CompatibilityDimension::PureRuntime {
-            target
-                .obligations
-                .retain(|obligation| obligation.0.as_ref() != "adapter-failure");
+            target.obligations.retain(|obligation| {
+                !matches!(
+                    obligation.0.as_ref(),
+                    "adapter-failure" | "whnf-failure-boundary"
+                )
+            });
         }
         if target.dimension == CompatibilityDimension::Effects {
             target
@@ -3092,7 +3140,7 @@ fn show_basic_instance_definitions() -> Vec<ShowInstanceDefinition> {
         show_definition!(
             "builder",
             "Builder.byteString $ Text.encodeUtf8 \"aβ\"",
-            "[97, 206, 178]",
+            r#""a\206\178""#,
             "Builder",
             SHOW_NO_PREMISES
         ),
@@ -3100,14 +3148,14 @@ fn show_basic_instance_definitions() -> Vec<ShowInstanceDefinition> {
             "builder-arbitrary-bytes",
             stdin: &[0xff, 0x41, 0xfe, 0x42],
             "Builder.byteString value",
-            "[255, 65, 254, 66]",
+            r#""\255A\254B""#,
             "Builder",
             SHOW_NO_PREMISES
         ),
         show_definition!(
             "byte-string",
             "Text.encodeUtf8 \"aβ\"",
-            "[97, 206, 178]",
+            r#""a\206\178""#,
             "ByteString",
             SHOW_NO_PREMISES
         ),
@@ -3115,11 +3163,11 @@ fn show_basic_instance_definitions() -> Vec<ShowInstanceDefinition> {
             "byte-string-arbitrary-bytes",
             stdin: &[0xff, 0x41, 0xfe, 0x42],
             "value",
-            "[255, 65, 254, 66]",
+            r#""\255A\254B""#,
             "ByteString",
             SHOW_NO_PREMISES
         ),
-        show_definition!("char", "'β'", "'β'", "Char", SHOW_NO_PREMISES),
+        show_definition!("char", "'β'", "'\\946'", "Char", SHOW_NO_PREMISES),
         show_definition!("char-quote", r"'\''", r"'\''", "Char", SHOW_NO_PREMISES),
         show_definition!("char-backslash", r"'\\'", r"'\\'", "Char", SHOW_NO_PREMISES),
         show_definition!("char-control", r"'\n'", r"'\n'", "Char", SHOW_NO_PREMISES),
@@ -3189,7 +3237,7 @@ fn show_scalar_instance_definitions() -> Vec<ShowInstanceDefinition> {
             "Integer",
             SHOW_NO_PREMISES
         ),
-        show_definition!("text", "\"aβ\"", "\"aβ\"", "Text", SHOW_NO_PREMISES),
+        show_definition!("text", "\"aβ\"", "\"a\\946\"", "Text", SHOW_NO_PREMISES),
         show_definition!(
             "text-escaping",
             r#""\"\\\n\t""#,
@@ -3213,7 +3261,7 @@ fn show_json_instance_definitions() -> Vec<ShowInstanceDefinition> {
         show_definition!(
             "value-string",
             "Json.String \"aβ\"",
-            "String \"aβ\"",
+            "String \"a\\946\"",
             "Value",
             SHOW_NO_PREMISES
         ),
@@ -4428,8 +4476,7 @@ fn runtime_singleton_constructor_cases() -> Vec<DifferentialCase> {
             ]
         })
         .collect::<Vec<_>>();
-    cases.push(runtime_singleton_nonforce_case("Map.singleton"));
-    cases.push(runtime_singleton_nonforce_case("Set.singleton"));
+    cases.extend(runtime_singleton_strictness_cases());
     cases
 }
 
@@ -4455,7 +4502,11 @@ fn runtime_singleton_constructor_case(
             "{}main = IO.print $ Set.singleton ({})\n",
             definition.value.prelude, definition.value.expression
         );
-        let stdout = format!("fromList [{}]\n", definition.value.rendered);
+        let stdout = if definition.value.target == "Char" {
+            "fromList \"\\946\"\n".to_owned()
+        } else {
+            format!("fromList [{}]\n", definition.value.rendered)
+        };
         let typed_value = format!(
             "{{\"type\":\"Set\",\"elements\":[{}]}}",
             definition.canonical
@@ -4483,15 +4534,23 @@ fn runtime_singleton_constructor_case(
         ));
         target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
         if target.dimension == CompatibilityDimension::PureRuntime {
+            target.obligations.retain(|obligation| {
+                !matches!(
+                    obligation.0.as_ref(),
+                    "adapter-failure" | "whnf-failure-boundary"
+                )
+            });
             target.expected_raw_presentation_sha256 =
                 Some(crate::raw_presentation_sha256(stdout.as_bytes(), b""));
             let exits: &[(u16, &str)] = if builtin == "Map.singleton" {
-                &[(0, "not-forced"), (1, "not-forced")]
+                &[(1, "not-forced")]
             } else {
-                &[(0, "not-forced")]
+                &[]
             };
-            target.expected_lazy_argument_exit_sha256 =
-                Some(crate::lazy_argument_exit_sha256(exits.iter().copied()));
+            if !exits.is_empty() {
+                target.expected_lazy_argument_exit_sha256 =
+                    Some(crate::lazy_argument_exit_sha256(exits.iter().copied()));
+            }
             let typed = format!(
                 "{{\"type\":\"TypedResult\",\"argument\":0,\"boundary\":\"adapter-result\",\"value\":{typed_value}}}"
             );
@@ -4510,25 +4569,59 @@ fn runtime_singleton_constructor_case(
     }
 }
 
-fn runtime_singleton_nonforce_case(builtin: &'static str) -> DifferentialCase {
-    let (source, exits) = if builtin == "Map.singleton" {
-        (
-            concat!(
-                "main = IO.print $ Map.size $ Map.singleton ",
-                "(Error.error \"singleton key forced\" :: Int) ",
-                "(Error.error \"singleton value forced\" :: Text)\n",
-            ),
-            &[(0, "not-forced"), (1, "not-forced")][..],
-        )
-    } else {
-        (
-            concat!(
-                "main = IO.print $ Set.size $ Set.singleton ",
-                "(Error.error \"singleton element forced\" :: Int)\n",
-            ),
-            &[(0, "not-forced")][..],
-        )
-    };
+fn runtime_singleton_strictness_cases() -> Vec<DifferentialCase> {
+    const MAP_KEY_STRICT_SOURCE: &str = concat!(
+        "main = IO.print $ Map.size $ Map.singleton ",
+        "(Error.error \"singleton key forced\" :: Int) \"value\"\n",
+    );
+    const MAP_VALUE_LAZY_SOURCE: &str = concat!(
+        "main = IO.print $ Map.size $ Map.singleton (1 :: Int) ",
+        "(Error.error \"singleton value forced\" :: Text)\n",
+    );
+    const SET_ELEMENT_STRICT_SOURCE: &str = concat!(
+        "main = IO.print $ Set.size $ Set.singleton ",
+        "(Error.error \"singleton element forced\" :: Int)\n",
+    );
+    vec![
+        runtime_singleton_strictness_case(
+            "Map.singleton",
+            "runtime-typed-map-singleton-key-strict",
+            MAP_KEY_STRICT_SOURCE,
+            &[(1, "not-forced")],
+            false,
+            b"",
+            Some("singleton key forced"),
+        ),
+        runtime_singleton_strictness_case(
+            "Map.singleton",
+            "runtime-typed-map-singleton-value-nonforce",
+            MAP_VALUE_LAZY_SOURCE,
+            &[(1, "not-forced")],
+            true,
+            b"1\n",
+            None,
+        ),
+        runtime_singleton_strictness_case(
+            "Set.singleton",
+            "runtime-typed-set-singleton-element-strict",
+            SET_ELEMENT_STRICT_SOURCE,
+            &[],
+            false,
+            b"",
+            Some("singleton element forced"),
+        ),
+    ]
+}
+
+fn runtime_singleton_strictness_case(
+    builtin: &'static str,
+    id: &'static str,
+    source: &'static str,
+    exits: &[(u16, &'static str)],
+    expected_completion: bool,
+    stdout: &'static [u8],
+    error_message: Option<&'static str>,
+) -> DifferentialCase {
     let mut descriptor = runtime_all_obligation_descriptor(builtin, source);
     descriptor
         .targets
@@ -4537,27 +4630,64 @@ fn runtime_singleton_nonforce_case(builtin: &'static str) -> DifferentialCase {
         if target.dimension != CompatibilityDimension::PureRuntime {
             return false;
         }
-        target
-            .obligations
-            .retain(|obligation| obligation.0.as_ref() == "lazy-boundary");
-        target.expected_instance_target = Some(Arc::from("Int"));
-        target.expected_comparator_trace_sha256 =
-            Some(crate::comparator_trace_sha256(builtin, 1, "Int", &[], &[]));
-        target.expected_raw_presentation_sha256 = Some(crate::raw_presentation_sha256(b"1\n", b""));
-        target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
-        target.expected_lazy_argument_exit_sha256 =
-            Some(crate::lazy_argument_exit_sha256(exits.iter().copied()));
+        target.obligations.retain(|obligation| {
+            matches!(
+                obligation.0.as_ref(),
+                "adapter-success" | "whnf-boundary" | "whnf-failure-boundary" | "lazy-boundary"
+            )
+        });
+        if expected_completion {
+            target.obligations.retain(|obligation| {
+                !matches!(
+                    obligation.0.as_ref(),
+                    "adapter-failure" | "whnf-failure-boundary"
+                )
+            });
+            target.expected_instance_target = Some(Arc::from("Int"));
+            target.expected_comparator_trace_sha256 =
+                Some(crate::comparator_trace_sha256(builtin, 1, "Int", &[], &[]));
+        } else {
+            target.obligations.retain(|obligation| {
+                matches!(
+                    obligation.0.as_ref(),
+                    "whnf-failure-boundary" | "lazy-boundary"
+                )
+            });
+            target.causal_signal = crate::CausalSignal::ForceTrace;
+            target.expected_instance_target = None;
+            target.expected_instance_premises.clear();
+            target.expected_comparator_trace_sha256 = None;
+            target.expected_typed_result_sha256 = None;
+            target.expected_whnf_argument_failure_sha256 =
+                Some(crate::whnf_argument_failure_sha256([(0, "error", "H0901")]));
+        }
+        let stderr = error_message.map_or_else(Vec::new, pinned_user_error_stderr);
+        target.expected_raw_presentation_sha256 =
+            Some(crate::raw_presentation_sha256(stdout, &stderr));
+        target.expected_process_status_sha256 = Some(crate::process_status_sha256(
+            expected_completion,
+            Some(i32::from(!expected_completion)),
+        ));
+        if !exits.is_empty() {
+            target.expected_lazy_argument_exit_sha256 =
+                Some(crate::lazy_argument_exit_sha256(exits.iter().copied()));
+        }
         true
     });
     DifferentialCase {
-        id: Arc::from(format!(
-            "runtime-typed-{}-nonforce",
-            builtin.replace('.', "-").to_ascii_lowercase()
-        )),
+        id: Arc::from(id),
         source: Arc::from(source),
+        expected_runtime_completion: expected_completion,
         claim_evidence: Some(descriptor),
         ..DifferentialCase::default()
     }
+}
+
+fn pinned_user_error_stderr(message: &str) -> Vec<u8> {
+    format!(
+        "hell: {message}\nCallStack (from HasCallStack):\n  error, called at src/Hell.hs:1953:4 in main:Main\n"
+    )
+    .into_bytes()
 }
 
 fn singleton_ord_definitions() -> Vec<SingletonOrdDefinition> {
@@ -4747,10 +4877,17 @@ enum OrdListPath {
 struct OrdListCaseFacts<'a> {
     path: &'a str,
     boundary: Option<&'a str>,
+    output_shape: OrdListOutputShape,
     source: String,
     values: Vec<OrdListValue>,
     invocations: Vec<CallbackInvocationContract>,
     stdin: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrdListOutputShape {
+    Elements,
+    KeyedTuples,
 }
 
 fn runtime_ord_list_case(
@@ -4776,6 +4913,11 @@ fn runtime_ord_list_case(
         OrdListCaseFacts {
             path,
             boundary,
+            output_shape: if builtin == "List.sortOn" {
+                OrdListOutputShape::KeyedTuples
+            } else {
+                OrdListOutputShape::Elements
+            },
             source,
             values,
             invocations,
@@ -4914,6 +5056,7 @@ fn ord_list_case_from_facts(
     let OrdListCaseFacts {
         path,
         boundary,
+        output_shape,
         source,
         values,
         invocations,
@@ -4951,7 +5094,7 @@ fn ord_list_case_from_facts(
         "{{\"type\":\"TypedResult\",\"argument\":0,\"boundary\":\"adapter-result\",\"value\":{canonical}}}"
     );
     target.expected_typed_result_sha256 = Some(sha256_bytes(typed.as_bytes()));
-    let stdout = ord_list_stdout(builtin, &values);
+    let stdout = ord_list_stdout(definition, output_shape, &values);
     target.expected_raw_presentation_sha256 =
         Some(crate::raw_presentation_sha256(stdout.as_bytes(), b""));
     target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
@@ -4979,7 +5122,19 @@ fn ord_list_canonical(values: &[OrdListValue]) -> String {
     )
 }
 
-fn ord_list_stdout(_builtin: &str, values: &[OrdListValue]) -> String {
+fn ord_list_stdout(
+    definition: &OrdListDefinition,
+    output_shape: OrdListOutputShape,
+    values: &[OrdListValue],
+) -> String {
+    if output_shape == OrdListOutputShape::Elements
+        && definition.target == "Char"
+        && values
+            .iter()
+            .all(|value| reviewed_character_code_point(&value.canonical).is_some())
+    {
+        return format!("{}\n", reviewed_haskell_character_sequence(values));
+    }
     format!(
         "[{}]\n",
         values
@@ -4988,6 +5143,34 @@ fn ord_list_stdout(_builtin: &str, values: &[OrdListValue]) -> String {
             .collect::<Vec<_>>()
             .join(","),
     )
+}
+
+fn reviewed_character_code_point(canonical: &str) -> Option<u32> {
+    canonical
+        .strip_prefix("{\"type\":\"Character\",\"codePoint\":")?
+        .strip_suffix('}')?
+        .parse()
+        .ok()
+}
+
+fn reviewed_haskell_character_sequence(values: &[OrdListValue]) -> String {
+    let canonicals = values
+        .iter()
+        .map(|value| value.canonical.as_str())
+        .collect::<Vec<_>>();
+    reviewed_haskell_character_canonicals(&canonicals)
+}
+
+fn reviewed_haskell_character_canonicals(canonicals: &[&str]) -> String {
+    let code_points = canonicals
+        .iter()
+        .map(|canonical| {
+            reviewed_character_code_point(canonical)
+                .expect("Char sequence authority contains only canonical Character values")
+        })
+        .collect::<Vec<_>>();
+    crate::reviewed_haskell_string_literal(&code_points)
+        .expect("canonical Character code points are valid")
 }
 
 fn ord_list_definitions() -> Vec<OrdListDefinition> {
@@ -5041,12 +5224,12 @@ fn ord_list_primitive_head_definitions() -> Vec<OrdListDefinition> {
             EQ_NO_PREMISES,
             ord_list_value(
                 "Text.encodeUtf8 \"a\"",
-                "[97]",
+                "\"a\"",
                 "{\"type\":\"ByteString\",\"hex\":\"61\"}",
             ),
             ord_list_value(
                 "Text.encodeUtf8 \"b\"",
-                "[98]",
+                "\"b\"",
                 "{\"type\":\"ByteString\",\"hex\":\"62\"}",
             ),
         ),
@@ -5066,7 +5249,11 @@ fn ord_list_primitive_head_definitions() -> Vec<OrdListDefinition> {
             "Char",
             EQ_NO_PREMISES,
             ord_list_value("'a'", "'a'", "{\"type\":\"Character\",\"codePoint\":97}"),
-            ord_list_value("'β'", "'β'", "{\"type\":\"Character\",\"codePoint\":946}"),
+            ord_list_value(
+                "'β'",
+                "'\\946'",
+                "{\"type\":\"Character\",\"codePoint\":946}",
+            ),
         ),
         ord_list_definition(
             "day",
@@ -5490,6 +5677,11 @@ fn runtime_ord_list_ci_stability_cases() -> Vec<DifferentialCase> {
                 OrdListCaseFacts {
                     path: "ci-folded-stability",
                     boundary: None,
+                    output_shape: if builtin == "List.sortOn" {
+                        OrdListOutputShape::KeyedTuples
+                    } else {
+                        OrdListOutputShape::Elements
+                    },
                     source,
                     values,
                     invocations,
@@ -5560,6 +5752,7 @@ fn runtime_ord_list_double_exception_cases() -> Vec<DifferentialCase> {
         OrdListCaseFacts {
             path: "nan-finite-set-routing",
             boundary: None,
+            output_shape: OrdListOutputShape::Elements,
             source,
             values: vec![
                 ord_list_double_value("1.25", "1.25", "3ff4000000000000"),
@@ -5581,17 +5774,17 @@ fn runtime_ord_list_invalid_byte_cases() -> Vec<DifferentialCase> {
         .expect("ByteString is an Ord list scope");
     let first = ord_list_value(
         "first",
-        "[255, 65]",
+        r#""\255A""#,
         "{\"type\":\"ByteString\",\"hex\":\"ff41\"}",
     );
     let middle = ord_list_value(
         "middle",
-        "[254, 66]",
+        r#""\254B""#,
         "{\"type\":\"ByteString\",\"hex\":\"fe42\"}",
     );
     let last = ord_list_value(
         "last",
-        "[255, 65]",
+        r#""\255A""#,
         "{\"type\":\"ByteString\",\"hex\":\"ff41\"}",
     );
     ["List.sort", "List.nubOrd", "List.sortOn"]
@@ -5637,6 +5830,11 @@ fn runtime_ord_list_invalid_byte_cases() -> Vec<DifferentialCase> {
                 OrdListCaseFacts {
                     path: "invalid-bytes",
                     boundary: None,
+                    output_shape: if builtin == "List.sortOn" {
+                        OrdListOutputShape::KeyedTuples
+                    } else {
+                        OrdListOutputShape::Elements
+                    },
                     source,
                     values,
                     invocations,
@@ -5725,6 +5923,11 @@ fn runtime_ord_list_double_case(
         OrdListCaseFacts {
             path,
             boundary: None,
+            output_shape: if builtin == "List.sortOn" {
+                OrdListOutputShape::KeyedTuples
+            } else {
+                OrdListOutputShape::Elements
+            },
             source,
             values,
             invocations,
@@ -5782,6 +5985,11 @@ fn runtime_ord_list_double_two_value_cases(
                 OrdListCaseFacts {
                     path,
                     boundary: None,
+                    output_shape: if builtin == "List.sortOn" {
+                        OrdListOutputShape::KeyedTuples
+                    } else {
+                        OrdListOutputShape::Elements
+                    },
                     source,
                     values,
                     invocations,
@@ -5847,6 +6055,11 @@ fn runtime_ord_list_double_shape_cases(
             OrdListCaseFacts {
                 path: "nan-alternating-runs",
                 boundary: None,
+                output_shape: if builtin == "List.sortOn" {
+                    OrdListOutputShape::KeyedTuples
+                } else {
+                    OrdListOutputShape::Elements
+                },
                 source,
                 values,
                 invocations,
@@ -5874,6 +6087,7 @@ fn runtime_ord_list_double_shape_cases(
         OrdListCaseFacts {
             path: "nan-size-balanced-routing",
             boundary: None,
+            output_shape: OrdListOutputShape::Elements,
             source: format!(
                 concat!(
                     "{}main = IO.print $ List.nubOrd ",
@@ -5955,7 +6169,7 @@ fn runtime_ord_set_case(
         OrdSetResult::Set(values) => (
             format!("Set.toList $ {}", observation.expression),
             ord_set_canonical(values),
-            ord_set_stdout(values),
+            ord_sequence_stdout(definition, values),
         ),
         OrdSetResult::Bool(value) => (
             observation.expression.clone(),
@@ -6253,7 +6467,10 @@ fn ord_set_canonical(values: &[OrdListValue]) -> String {
     )
 }
 
-fn ord_set_stdout(values: &[OrdListValue]) -> String {
+fn ord_sequence_stdout(definition: &OrdListDefinition, values: &[OrdListValue]) -> String {
+    if definition.target == "Char" {
+        return format!("{}\n", reviewed_haskell_character_sequence(values));
+    }
     format!(
         "[{}]\n",
         values
@@ -6922,7 +7139,7 @@ fn ord_set_auxiliary_case(
         OrdSetResult::Set(values) => (
             format!("Set.toList $ {}", observation.expression),
             ord_set_canonical(values),
-            ord_set_stdout(values),
+            ord_sequence_stdout(definition, values),
         ),
         OrdSetResult::Bool(value) => (
             observation.expression.clone(),
@@ -7266,6 +7483,11 @@ fn runtime_io_success_case(
             target.expected_raw_presentation_sha256 =
                 Some(crate::raw_presentation_sha256(stdout, b""));
         }
+        if target.dimension == CompatibilityDimension::PureRuntime {
+            target
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != "adapter-failure");
+        }
         if target.dimension == CompatibilityDimension::Effects {
             target
                 .obligations
@@ -7312,6 +7534,11 @@ fn runtime_thread_delay_cases() -> Vec<DifferentialCase> {
         }
         target.expected_raw_presentation_sha256 =
             Some(crate::raw_presentation_sha256(b"False\n", b""));
+        target.expected_single_effect_lifecycle_sha256 =
+            Some(crate::single_effect_lifecycle_sha256([
+                "started",
+                "cancelled",
+            ]));
         true
     });
     let mut timeout = DifferentialCase {
@@ -7503,8 +7730,8 @@ fn runtime_async_race_cases() -> Vec<DifferentialCase> {
             stdout: Some(b"Left 7\n"),
             task_trace: &[
                 (0, "started"),
-                (1, "started"),
                 (0, "completed"),
+                (1, "started"),
                 (1, "cancelled"),
             ],
         },
@@ -7521,9 +7748,9 @@ fn runtime_async_race_cases() -> Vec<DifferentialCase> {
             stdout: Some(b"Right 9\n"),
             task_trace: &[
                 (0, "started"),
+                (0, "cancelled"),
                 (1, "started"),
                 (1, "completed"),
-                (0, "cancelled"),
             ],
         },
         RuntimeRaceDefinition {
@@ -7539,8 +7766,8 @@ fn runtime_async_race_cases() -> Vec<DifferentialCase> {
             stdout: None,
             task_trace: &[
                 (0, "started"),
-                (1, "started"),
                 (0, "failed"),
+                (1, "started"),
                 (1, "cancelled"),
             ],
         },
@@ -7557,9 +7784,9 @@ fn runtime_async_race_cases() -> Vec<DifferentialCase> {
             stdout: None,
             task_trace: &[
                 (0, "started"),
+                (0, "cancelled"),
                 (1, "started"),
                 (1, "failed"),
-                (0, "cancelled"),
             ],
         },
     ]
@@ -7583,9 +7810,9 @@ fn runtime_async_concurrently_cases() -> Vec<DifferentialCase> {
             stdout: Some(b"(7,9)\n"),
             task_trace: &[
                 (0, "started"),
+                (0, "completed"),
                 (1, "started"),
                 (1, "completed"),
-                (0, "completed"),
             ],
         },
         RuntimeRaceDefinition {
@@ -7601,8 +7828,8 @@ fn runtime_async_concurrently_cases() -> Vec<DifferentialCase> {
             stdout: Some(b"(7,9)\n"),
             task_trace: &[
                 (0, "started"),
-                (1, "started"),
                 (0, "completed"),
+                (1, "started"),
                 (1, "completed"),
             ],
         },
@@ -7619,8 +7846,8 @@ fn runtime_async_concurrently_cases() -> Vec<DifferentialCase> {
             stdout: None,
             task_trace: &[
                 (0, "started"),
-                (1, "started"),
                 (0, "failed"),
+                (1, "started"),
                 (1, "cancelled"),
             ],
         },
@@ -7637,9 +7864,9 @@ fn runtime_async_concurrently_cases() -> Vec<DifferentialCase> {
             stdout: None,
             task_trace: &[
                 (0, "started"),
+                (0, "cancelled"),
                 (1, "started"),
                 (1, "failed"),
-                (0, "cancelled"),
             ],
         },
     ]
@@ -7650,7 +7877,7 @@ fn runtime_async_concurrently_cases() -> Vec<DifferentialCase> {
     .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 #[derive(Clone, Copy)]
 struct RuntimePooledDefinition {
     builtin: &'static str,
@@ -7659,7 +7886,7 @@ struct RuntimePooledDefinition {
     discard: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 pub(crate) fn runtime_async_pooled_cases() -> Vec<DifferentialCase> {
     [
         RuntimePooledDefinition {
@@ -7698,7 +7925,7 @@ pub(crate) fn runtime_async_pooled_cases() -> Vec<DifferentialCase> {
     .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_case(
     definition: RuntimePooledDefinition,
     path: &'static str,
@@ -7728,8 +7955,13 @@ fn runtime_async_pooled_case(
         target.expected_task_trace_sha256 =
             Some(crate::task_trace_sha256(task_trace.iter().copied()));
         if target.dimension == CompatibilityDimension::PureRuntime {
+            let stderr = if path == "failure" {
+                pinned_user_error_stderr("pooled failure")
+            } else {
+                Vec::new()
+            };
             target.expected_raw_presentation_sha256 =
-                Some(crate::raw_presentation_sha256(stdout, b""));
+                Some(crate::raw_presentation_sha256(stdout, &stderr));
             if path == "empty" {
                 target.obligations.retain(|obligation| {
                     !matches!(
@@ -7770,7 +8002,7 @@ fn runtime_async_pooled_case(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 struct RuntimePooledPath {
     source: String,
     stdout: &'static [u8],
@@ -7779,7 +8011,7 @@ struct RuntimePooledPath {
     callbacks: Vec<CallbackInvocationContract>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_path(definition: RuntimePooledDefinition, path: &str) -> RuntimePooledPath {
     match path {
         "success" => runtime_async_pooled_success_path(definition),
@@ -7789,7 +8021,7 @@ fn runtime_async_pooled_path(definition: RuntimePooledDefinition, path: &str) ->
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_call(
     definition: RuntimePooledDefinition,
     callback: &str,
@@ -7802,7 +8034,7 @@ fn runtime_async_pooled_call(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_success_path(definition: RuntimePooledDefinition) -> RuntimePooledPath {
     let callback = if definition.discard {
         "\\value -> do { Concurrent.threadDelay (if Int.eq value 3 then 3000 else if Int.eq value 2 then 2000 else 1000); IO.pure () }"
@@ -7835,7 +8067,7 @@ fn runtime_async_pooled_success_path(definition: RuntimePooledDefinition) -> Run
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_empty_path(definition: RuntimePooledDefinition) -> RuntimePooledPath {
     let result = if definition.discard { "()" } else { "Int" };
     let callback = format!("\\_ -> Error.error \"forged pooled callback\" :: IO {result}");
@@ -7858,7 +8090,7 @@ fn runtime_async_pooled_empty_path(definition: RuntimePooledDefinition) -> Runti
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_failure_path(definition: RuntimePooledDefinition) -> RuntimePooledPath {
     let result = if definition.discard { "()" } else { "Int" };
     let first_value = if definition.discard { "()" } else { "10" };
@@ -7887,7 +8119,7 @@ fn runtime_async_pooled_failure_path(definition: RuntimePooledDefinition) -> Run
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat-tracing"))]
 fn runtime_async_pooled_callbacks<const N: usize>(
     definition: RuntimePooledDefinition,
     values: [i64; N],
@@ -7920,15 +8152,7 @@ fn runtime_async_pair_case(
 ) -> DifferentialCase {
     let success = definition.stdout.is_some();
     let mut descriptor = runtime_all_obligation_descriptor(builtin, definition.source);
-    if !success {
-        descriptor
-            .targets
-            .retain(|target| target.dimension == CompatibilityDimension::Effects);
-    }
     descriptor.semantic_targets.retain_mut(|target| {
-        if !success && target.dimension != CompatibilityDimension::Effects {
-            return false;
-        }
         target.expected_process_status_sha256 = Some(crate::process_status_sha256(
             success,
             Some(i32::from(!success)),
@@ -7941,6 +8165,16 @@ fn runtime_async_pair_case(
         {
             target.expected_raw_presentation_sha256 =
                 Some(crate::raw_presentation_sha256(stdout, b""));
+        }
+        if target.dimension == CompatibilityDimension::PureRuntime {
+            let omitted = if success {
+                "adapter-failure"
+            } else {
+                "adapter-success"
+            };
+            target
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != omitted);
         }
         if target.dimension == CompatibilityDimension::Effects {
             let omitted = if success {
@@ -9832,6 +10066,7 @@ struct RuntimeFunctorDefinition {
     source: String,
     arguments: Vec<OsString>,
     stdout: &'static [u8],
+    stderr: &'static [u8],
     completion: bool,
     exit_states: &'static [(u16, &'static str)],
     invocations: Vec<CallbackInvocationContract>,
@@ -9862,8 +10097,10 @@ fn runtime_functor_case(
         }
     });
     target.expected_instance_target = Some(Arc::from(definition.instance));
-    target.expected_raw_presentation_sha256 =
-        Some(crate::raw_presentation_sha256(definition.stdout, b""));
+    target.expected_raw_presentation_sha256 = Some(crate::raw_presentation_sha256(
+        definition.stdout,
+        definition.stderr,
+    ));
     target.expected_process_status_sha256 = Some(crate::process_status_sha256(
         definition.completion,
         Some(i32::from(!definition.completion)),
@@ -9983,6 +10220,7 @@ fn runtime_functor_parser_tree_definitions(builtin: &str) -> Vec<RuntimeFunctorD
             ),
             arguments: vec!["--name".into(), "alpha".into()],
             stdout: b"5\n",
+            stderr: b"",
             completion: true,
             exit_states: CONTAINER,
             invocations: vec![callback_contract_invocation(
@@ -10000,6 +10238,7 @@ fn runtime_functor_parser_tree_definitions(builtin: &str) -> Vec<RuntimeFunctorD
             ),
             arguments: Vec::new(),
             stdout: b"",
+            stderr: b"Missing: --name ARG\n\nUsage: hell --name ARG\n",
             completion: false,
             exit_states: CONTAINER,
             invocations: Vec::new(),
@@ -10137,6 +10376,7 @@ fn runtime_functor_definition(
         source,
         arguments: Vec::new(),
         stdout,
+        stderr: b"",
         completion,
         exit_states,
         invocations,
@@ -10232,6 +10472,7 @@ struct RuntimeApplicativeDefinition {
     source: String,
     arguments: Vec<OsString>,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     success: bool,
     typed_value: Option<String>,
     exit_states: Vec<(u16, &'static str)>,
@@ -10274,8 +10515,10 @@ fn runtime_applicative_case(definition: RuntimeApplicativeDefinition) -> Differe
             .retain(|obligation| obligation.0.as_ref() != "lazy-boundary");
     }
     target.expected_instance_target = Some(Arc::from(definition.instance));
-    target.expected_raw_presentation_sha256 =
-        Some(crate::raw_presentation_sha256(&definition.stdout, b""));
+    target.expected_raw_presentation_sha256 = Some(crate::raw_presentation_sha256(
+        &definition.stdout,
+        &definition.stderr,
+    ));
     target.expected_process_status_sha256 = Some(crate::process_status_sha256(
         definition.success,
         Some(i32::from(!definition.success)),
@@ -10345,6 +10588,7 @@ fn runtime_applicative_pure_definitions() -> Vec<RuntimeApplicativeDefinition> {
         source: source.to_owned(),
         arguments: Vec::new(),
         stdout: stdout.to_vec(),
+        stderr: Vec::new(),
         success: true,
         typed_value,
         exit_states: vec![(0, "not-forced")],
@@ -10373,6 +10617,7 @@ macro_rules! runtime_applicative_definition {
             source: $source,
             arguments: Vec::new(),
             stdout: $stdout.to_vec(),
+            stderr: Vec::new(),
             success: $success,
             typed_value: $typed_value,
             exit_states: $exit_states,
@@ -10498,6 +10743,7 @@ fn runtime_applicative_maybe_either_definitions(
             source: format!("main = IO.print ({either_short} :: Either Text Int)\n"),
             arguments: Vec::new(),
             stdout: format!("Left \"{left_text}\"\n").into_bytes(),
+            stderr: Vec::new(),
             success: true,
             typed_value: Some(left),
             exit_states: vec![(0, "value"), (1, "not-forced")],
@@ -10624,6 +10870,7 @@ fn runtime_applicative_parser_definitions(
                 "xy".into(),
             ],
             stdout: b"5\n".to_vec(),
+            stderr: Vec::new(),
             success: true,
             typed_value: None,
             exit_states: vec![(0, "value"), (1, "value")],
@@ -10636,6 +10883,7 @@ fn runtime_applicative_parser_definitions(
             source: source.clone(),
             arguments: Vec::new(),
             stdout: Vec::new(),
+            stderr: runtime_applicative_parser_stderr(builtin, "absent"),
             success: false,
             typed_value: None,
             exit_states: vec![(0, "value"), (1, "value")],
@@ -10652,12 +10900,24 @@ fn runtime_applicative_parser_definitions(
                 vec!["--function".into(), "xy".into()]
             },
             stdout: Vec::new(),
+            stderr: runtime_applicative_parser_stderr(builtin, "consumed-missing"),
             success: false,
             typed_value: None,
             exit_states: vec![(0, "value"), (1, "value")],
             callbacks: Vec::new(),
         },
     ]
+}
+
+fn runtime_applicative_parser_stderr(builtin: &str, path: &str) -> Vec<u8> {
+    let (usage, missing) = match (builtin, path) {
+        ("<*>", "absent") => ("--function ARG --value ARG", "--function ARG --value ARG"),
+        ("<*>", "consumed-missing") => ("--function ARG --value ARG", "--value ARG"),
+        ("<**>", "absent") => ("--value ARG --function ARG", "--value ARG --function ARG"),
+        ("<**>", "consumed-missing") => ("--value ARG --function ARG", "--function ARG"),
+        _ => unreachable!("parser diagnostic authority is a closed matrix"),
+    };
+    format!("Missing: {missing}\n\nUsage: hell {usage}\n").into_bytes()
 }
 
 fn runtime_applicative_apply(builtin: &str, function: &str, value: &str) -> String {
@@ -10861,10 +11121,10 @@ fn runtime_semigroup_sequence_definitions() -> Vec<RuntimeSemigroupDefinition> {
         runtime_semigroup_definition!("text", "Text", "unicode", "main = Text.putStrLn $ \"aβ\" <> \"🙂\"\n", "aβ🙂\n".as_bytes(), text("aβ🙂")),
         runtime_semigroup_definition!("text", "Text", "left-empty", "main = Text.putStrLn $ \"\" <> \"right\"\n", b"right\n", text("right")),
         runtime_semigroup_definition!("text", "Text", "right-empty", "main = Text.putStrLn $ \"left\" <> \"\"\n", b"left\n", text("left")),
-        runtime_semigroup_definition!("builder", "Builder", "ordered", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"ab\")) <> (Builder.byteString (Text.encodeUtf8 \"cd\"))\n", b"[97, 98, 99, 100]\n", builder("abcd")),
-        runtime_semigroup_definition!("builder", "Builder", "left-empty", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"\")) <> (Builder.byteString (Text.encodeUtf8 \"right\"))\n", b"[114, 105, 103, 104, 116]\n", builder("right")),
-        runtime_semigroup_definition!("builder", "Builder", "right-empty", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"left\")) <> (Builder.byteString (Text.encodeUtf8 \"\"))\n", b"[108, 101, 102, 116]\n", builder("left")),
-        RuntimeSemigroupDefinition { slug: "builder", target: "Builder", path: "arbitrary-bytes", source: "main = do { left <- ByteString.hGet IO.stdin 2; right <- ByteString.hGet IO.stdin 2; IO.print $ Builder.byteString left <> Builder.byteString right }\n".to_owned(), arguments: Vec::new(), stdin: vec![0xff, 0x41, 0xfe, 0x42], stdout: b"[255, 65, 254, 66]\n".to_vec(), runtime_completion: true, status_success: true, status_code: 0, typed_value: "{\"type\":\"Builder\",\"hex\":\"ff41fe42\"}".to_owned(), premises: &[] },
+        runtime_semigroup_definition!("builder", "Builder", "ordered", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"ab\")) <> (Builder.byteString (Text.encodeUtf8 \"cd\"))\n", b"\"abcd\"\n", builder("abcd")),
+        runtime_semigroup_definition!("builder", "Builder", "left-empty", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"\")) <> (Builder.byteString (Text.encodeUtf8 \"right\"))\n", b"\"right\"\n", builder("right")),
+        runtime_semigroup_definition!("builder", "Builder", "right-empty", "main = IO.print $ (Builder.byteString (Text.encodeUtf8 \"left\")) <> (Builder.byteString (Text.encodeUtf8 \"\"))\n", b"\"left\"\n", builder("left")),
+        RuntimeSemigroupDefinition { slug: "builder", target: "Builder", path: "arbitrary-bytes", source: "main = do { left <- ByteString.hGet IO.stdin 2; right <- ByteString.hGet IO.stdin 2; IO.print $ Builder.byteString left <> Builder.byteString right }\n".to_owned(), arguments: Vec::new(), stdin: vec![0xff, 0x41, 0xfe, 0x42], stdout: b"\"\\255A\\254B\"\n".to_vec(), runtime_completion: true, status_success: true, status_code: 0, typed_value: "{\"type\":\"Builder\",\"hex\":\"ff41fe42\"}".to_owned(), premises: &[] },
         runtime_semigroup_definition!("vector", "Vector", "ordered", "main = IO.print $ Vector.toList $ Vector.fromList [1,2] <> Vector.fromList [3,4]\n", b"[1,2,3,4]\n", vector(&[1,2,3,4])),
         runtime_semigroup_definition!("vector", "Vector", "left-empty", "main = IO.print $ Vector.toList $ Vector.fromList ([] :: [Int]) <> Vector.fromList [3,4]\n", b"[3,4]\n", vector(&[3,4])),
         runtime_semigroup_definition!("vector", "Vector", "right-empty", "main = IO.print $ Vector.toList $ Vector.fromList [1,2] <> Vector.fromList ([] :: [Int])\n", b"[1,2]\n", vector(&[1,2])),
@@ -10959,11 +11219,11 @@ fn runtime_semigroup_options_definitions() -> Vec<RuntimeSemigroupDefinition> {
         )
     };
     vec![
-        RuntimeSemigroupDefinition { slug: "options-mod", target: "Options.Mod", path: "left-right", source: option_source("one", "two"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"Usage: [OPTIONS]\n\nAvailable options:\n  --one|--two\n  -h, --help  Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: option_mod("one", "two"), premises: &[] },
-        RuntimeSemigroupDefinition { slug: "options-mod", target: "Options.Mod", path: "right-left", source: option_source("two", "one"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"Usage: [OPTIONS]\n\nAvailable options:\n  --two|--one\n  -h, --help  Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: option_mod("two", "one"), premises: &[] },
-        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "right-precedence", source: info_source("left", "right"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"right\n\nUsage: [OPTIONS]\n\nAvailable options:\n  --flag\n  -h, --help  Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(false, "right"), premises: &[] },
-        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "reversed-precedence", source: info_source("right", "left"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"left\n\nUsage: [OPTIONS]\n\nAvailable options:\n  --flag\n  -h, --help  Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(false, "left"), premises: &[] },
-        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "full-description", source: "parser = Options.switch (Flag.long \"flag\")\nmain = do { _ <- Options.execParser $ Options.info (Main.parser <**> Options.helper) (Options.fullDesc <> Options.header \"head\"); IO.pure () }\n".to_owned(), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"head\n\nUsage: [OPTIONS]\n\nAvailable options:\n  --flag\n  -h, --help  Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(true, "head"), premises: &[] },
+        RuntimeSemigroupDefinition { slug: "options-mod", target: "Options.Mod", path: "left-right", source: option_source("one", "two"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"Usage: hell [--one|--two]\n\nAvailable options:\n  -h,--help                Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: option_mod("one", "two"), premises: &[] },
+        RuntimeSemigroupDefinition { slug: "options-mod", target: "Options.Mod", path: "right-left", source: option_source("two", "one"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"Usage: hell [--one|--two]\n\nAvailable options:\n  -h,--help                Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: option_mod("two", "one"), premises: &[] },
+        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "right-precedence", source: info_source("left", "right"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"right\n\nUsage: hell [--flag]\n\nAvailable options:\n  -h,--help                Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(false, "right"), premises: &[] },
+        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "reversed-precedence", source: info_source("right", "left"), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"left\n\nUsage: hell [--flag]\n\nAvailable options:\n  -h,--help                Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(false, "left"), premises: &[] },
+        RuntimeSemigroupDefinition { slug: "options-info-mod", target: "Options.InfoMod", path: "full-description", source: "parser = Options.switch (Flag.long \"flag\")\nmain = do { _ <- Options.execParser $ Options.info (Main.parser <**> Options.helper) (Options.fullDesc <> Options.header \"head\"); IO.pure () }\n".to_owned(), arguments: vec!["--help".into()], stdin: Vec::new(), stdout: b"head\n\nUsage: hell [--flag]\n\nAvailable options:\n  -h,--help                Show this help text\n".to_vec(), runtime_completion: false, status_success: true, status_code: 0, typed_value: info_mod(true, "head"), premises: &[] },
     ]
 }
 
@@ -11067,18 +11327,30 @@ fn runtime_alternative_maybe_cases() -> Vec<DifferentialCase> {
 }
 
 fn runtime_alternative_many_nonproductive_case() -> DifferentialCase {
-    const SOURCE: &str = "main = IO.print $ Alternative.many (Maybe.Just 1 :: Maybe Int)\n";
+    const SOURCE: &str = concat!(
+        "main = do\n",
+        "  result <- Timeout.timeout 100000 $ ",
+        "Maybe.maybe (IO.pure ()) ",
+        "(\\values -> Monad.forM_ values (\\_ -> IO.pure ())) $ ",
+        "Alternative.many (Maybe.Just 1 :: Maybe Int)\n",
+        "  Maybe.maybe (Text.putStr \"timeout\") ",
+        "(\\_ -> Text.putStr \"completed\") result\n",
+    );
     let mut descriptor = runtime_all_obligation_descriptor("Alternative.many", SOURCE);
-    descriptor.semantic_targets[0].expected_instance_target = Some(Arc::from("Maybe"));
-    descriptor.semantic_targets[0]
-        .obligations
-        .retain(|obligation| obligation.0.as_ref() == "lazy-boundary");
-    descriptor.semantic_targets[0].expected_process_status_sha256 =
-        Some(crate::process_status_sha256(false, Some(1)));
+    let target = &mut descriptor.semantic_targets[0];
+    target.expected_instance_target = Some(Arc::from("Maybe"));
+    target.expected_raw_presentation_sha256 = Some(crate::raw_presentation_sha256(b"timeout", b""));
+    target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
+
+    target.expected_nonproductive_trace_sha256 = Some(crate::nonproductive_trace_sha256([
+        ("nonproductive-repeat", "value"),
+        ("nonproductive-pending", "value"),
+        ("nonproductive-cancelled", "value"),
+    ]));
+    append_expired_timeout_descriptor(&mut descriptor, SOURCE, b"timeout");
     DifferentialCase {
         id: Arc::from("runtime-typed-alternative-many-maybe-nonproductive"),
         source: Arc::from(SOURCE),
-        expected_runtime_completion: false,
         claim_evidence: Some(descriptor),
         ..DifferentialCase::default()
     }
@@ -11164,26 +11436,111 @@ fn runtime_alternative_parser_cases() -> Vec<DifferentialCase> {
             concat!(
                 "parser = Alternative.many $ Applicative.pure \"value\"\n",
                 "main = do\n",
-                "  values <- Options.execParser $ Options.info Main.parser Options.fullDesc\n",
-                "  IO.print $ List.length values\n",
+                "  result <- Timeout.timeout 100000 $ ",
+                "Options.execParser $ Options.info Main.parser Options.fullDesc\n",
+                "  Maybe.maybe (Text.putStr \"timeout\") ",
+                "(\\values -> IO.print $ List.length values) result\n",
             ),
             Vec::<OsString>::new(),
-            None,
+            Some(b"timeout".as_slice()),
         ),
     ]
     .into_iter()
     .map(|(builtin, id, source, arguments, stdout)| {
-        let descriptor = runtime_alternative_parser_descriptor(builtin, source, stdout);
-        DifferentialCase {
-            id: Arc::from(id),
-            source: Arc::from(source),
-            arguments,
-            expected_runtime_completion: stdout.is_some(),
-            claim_evidence: Some(descriptor),
-            ..DifferentialCase::default()
-        }
+        runtime_alternative_parser_case(builtin, id, source, arguments, stdout)
     })
     .collect()
+}
+
+fn runtime_alternative_parser_case(
+    builtin: &'static str,
+    id: &'static str,
+    source: &'static str,
+    arguments: Vec<OsString>,
+    stdout: Option<&'static [u8]>,
+) -> DifferentialCase {
+    let mut descriptor = runtime_alternative_parser_descriptor(builtin, source, stdout);
+    if id == "runtime-typed-alternative-many-parser-nonproductive" {
+        for target in &mut descriptor.semantic_targets {
+            if target.builtin.as_ref() == "Options.execParser"
+                && target.dimension == CompatibilityDimension::Effects
+            {
+                target.obligations.retain(|obligation| {
+                    !matches!(obligation.0.as_ref(), "effect-success" | "effect-failure")
+                });
+                target
+                    .obligations
+                    .push(ObligationId(Arc::from("effect-cancellation")));
+                target.expected_single_effect_lifecycle_sha256 =
+                    Some(crate::single_effect_lifecycle_sha256([
+                        "started",
+                        "cancelled",
+                    ]));
+            }
+        }
+        append_expired_timeout_descriptor(&mut descriptor, source, b"timeout");
+        descriptor.semantic_targets[0].expected_nonproductive_trace_sha256 =
+            Some(crate::nonproductive_trace_sha256([
+                ("nonproductive-parser-node", "not-forced"),
+                ("nonproductive-pending", "value"),
+                ("nonproductive-cancelled", "value"),
+            ]));
+    }
+    DifferentialCase {
+        id: Arc::from(id),
+        source: Arc::from(source),
+        arguments,
+        expected_runtime_completion: stdout.is_some(),
+        claim_evidence: Some(descriptor),
+        ..DifferentialCase::default()
+    }
+}
+
+fn append_expired_timeout_descriptor(
+    descriptor: &mut ClaimEvidenceDescriptor,
+    source: &str,
+    stdout: &[u8],
+) {
+    let mut timeout = runtime_all_obligation_descriptor("Timeout.timeout", source);
+    timeout.targets.retain(|target| {
+        matches!(
+            target.dimension,
+            CompatibilityDimension::PureRuntime
+                | CompatibilityDimension::Effects
+                | CompatibilityDimension::Concurrency
+                | CompatibilityDimension::Platform
+                | CompatibilityDimension::ResourceBehavior
+        )
+    });
+    timeout.semantic_targets.retain_mut(|target| {
+        if !timeout.targets.iter().any(|retained| {
+            retained.builtin == target.builtin && retained.dimension == target.dimension
+        }) {
+            return false;
+        }
+        target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
+        if target.dimension == CompatibilityDimension::PureRuntime {
+            target.expected_raw_presentation_sha256 =
+                Some(crate::raw_presentation_sha256(stdout, b""));
+        }
+        if target.dimension == CompatibilityDimension::Effects {
+            target
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != "effect-failure");
+            target.expected_single_effect_lifecycle_sha256 =
+                Some(crate::single_effect_lifecycle_sha256([
+                    "started",
+                    "completed",
+                ]));
+        }
+        target.expected_single_task_lifecycle_sha256 = Some(crate::single_task_lifecycle_sha256([
+            "started",
+            "cancelled",
+        ]));
+        true
+    });
+    descriptor.targets.extend(timeout.targets);
+    descriptor.semantic_targets.extend(timeout.semantic_targets);
 }
 
 fn runtime_alternative_parser_descriptor(
@@ -11217,9 +11574,10 @@ fn runtime_alternative_parser_descriptor(
         } else {
             "effect-success"
         };
-        target
-            .obligations
-            .retain(|obligation| obligation.0.as_ref() != omitted);
+        target.obligations.retain(|obligation| {
+            let value = obligation.0.as_ref();
+            value != omitted && value != "effect-cancellation"
+        });
         target.expected_single_effect_lifecycle_sha256 =
             Some(crate::single_effect_lifecycle_sha256(if success {
                 ["started", "completed"]
@@ -11237,14 +11595,24 @@ fn runtime_alternative_parser_descriptor(
 
 fn runtime_io_buffering_cases() -> Vec<DifferentialCase> {
     [
-        ("block", "IO.BlockBuffering", "pending", b"".as_slice()),
+        (
+            "block",
+            "(IO.BlockBuffering Maybe.Nothing)",
+            "pending",
+            b"0\npending".as_slice(),
+        ),
         (
             "line",
             "IO.LineBuffering",
             "line\npending",
-            b"line\n".as_slice(),
+            b"12\nline\npending".as_slice(),
         ),
-        ("none", "IO.NoBuffering", "pending", b"pending".as_slice()),
+        (
+            "none",
+            "IO.NoBuffering",
+            "pending",
+            b"7\npending".as_slice(),
+        ),
     ]
     .into_iter()
     .map(|(id, mode, input, stdout)| {
@@ -11254,9 +11622,11 @@ fn runtime_io_buffering_cases() -> Vec<DifferentialCase> {
                 "  handle <- IO.openFile \"buffered.txt\" IO.WriteMode\n",
                 "  IO.hSetBuffering handle {mode}\n",
                 "  Text.hPutStr handle {input:?}\n",
-                "  visible <- Text.readFile \"buffered.txt\"\n",
+                "  visible <- Directory.getFileSize \"buffered.txt\"\n",
                 "  IO.hClose handle\n",
-                "  Text.putStr visible\n",
+                "  contents <- Text.readFile \"buffered.txt\"\n",
+                "  IO.print visible\n",
+                "  Text.putStr contents\n",
             ),
             mode = mode,
             input = input,
@@ -11274,8 +11644,10 @@ fn runtime_io_buffering_cases() -> Vec<DifferentialCase> {
 fn runtime_list_iterate_exact_cases() -> Vec<DifferentialCase> {
     const FINITE_SOURCE: &str = "main = IO.print $ List.take 4 $ List.iterate' (Int.plus 1) 0\n";
     const LAZY_SOURCE: &str = concat!(
+        "step = \\x -> if Int.eq x 7 then 8 else ",
+        "Error.error \"undemanded-iterate-deeper-tail\"\n",
         "main = IO.print $ List.take 1 $ ",
-        "List.iterate' (\\_ -> Error.error \"undemanded-iterate-tail\") 7\n",
+        "List.iterate' Main.step 7\n",
     );
     let int = |value: i64| format!("{{\"type\":\"Int\",\"value\":\"{value}\"}}");
     let mut finite = runtime_single_typed_target_descriptor("List.iterate'", FINITE_SOURCE);
@@ -11283,7 +11655,7 @@ fn runtime_list_iterate_exact_cases() -> Vec<DifferentialCase> {
         Some(crate::raw_presentation_sha256(b"[0,1,2,3]\n", b""));
     finite.callback_contracts = vec![CallbackContract {
         builtin: Arc::from("List.iterate'"),
-        invocations: [0, 1, 2]
+        invocations: [0, 1, 2, 3]
             .into_iter()
             .map(|value| {
                 callback_contract_invocation(0, "element", &[&int(value)], &int(value + 1))
@@ -11298,7 +11670,12 @@ fn runtime_list_iterate_exact_cases() -> Vec<DifferentialCase> {
         .retain(|obligation| matches!(obligation.0.as_ref(), "callback-order" | "lazy-boundary"));
     lazy.callback_contracts = vec![CallbackContract {
         builtin: Arc::from("List.iterate'"),
-        invocations: Vec::new(),
+        invocations: vec![callback_contract_invocation(
+            0,
+            "element",
+            &[&int(7)],
+            &int(8),
+        )],
     }];
     vec![
         DifferentialCase {
@@ -11330,6 +11707,49 @@ fn runtime_io_failure_case(builtin: &str, id: &str, source: &str) -> Differentia
             .retain(|obligation| obligation.0.as_ref() != "effect-success");
         true
     });
+    DifferentialCase {
+        id: Arc::from(id),
+        source: Arc::from(source),
+        expected_runtime_completion: false,
+        claim_evidence: Some(descriptor),
+        ..DifferentialCase::default()
+    }
+}
+
+fn runtime_adapter_failure_case(builtin: &str, id: &str, source: &str) -> DifferentialCase {
+    let mut descriptor = runtime_all_obligation_descriptor(builtin, source);
+    descriptor.targets.retain(|target| {
+        matches!(
+            target.dimension,
+            CompatibilityDimension::PureRuntime | CompatibilityDimension::Effects
+        )
+    });
+    descriptor
+        .semantic_targets
+        .retain_mut(|target| match target.dimension {
+            CompatibilityDimension::PureRuntime => {
+                target
+                    .obligations
+                    .retain(|obligation| obligation.0.as_ref() != "adapter-success");
+                if !target
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.0.as_ref() == "adapter-failure")
+                {
+                    target
+                        .obligations
+                        .push(ObligationId(Arc::from("adapter-failure")));
+                }
+                true
+            }
+            CompatibilityDimension::Effects => {
+                target
+                    .obligations
+                    .retain(|obligation| obligation.0.as_ref() != "effect-success");
+                true
+            }
+            _ => false,
+        });
     DifferentialCase {
         id: Arc::from(id),
         source: Arc::from(source),
@@ -11437,54 +11857,54 @@ fn runtime_directory_observation_cases() -> Vec<DifferentialCase> {
         case
     })
     .collect::<Vec<_>>();
-    cases.push(runtime_current_directory_sandbox_failure_case());
+    cases.push(runtime_current_directory_upstream_success_case());
     cases.extend([
-        runtime_io_failure_case(
+        runtime_io_success_case(
             "Directory.doesDirectoryExist",
-            "runtime-directory-exists-invalid-path-failure",
+            "runtime-directory-exists-invalid-path-false",
             "main = do\n  exists <- Directory.doesDirectoryExist \"\\0\"\n  IO.print exists\n",
+            b"False\n",
         ),
-        runtime_io_failure_case(
+        runtime_io_success_case(
             "Directory.doesFileExist",
-            "runtime-directory-file-exists-invalid-path-failure",
+            "runtime-directory-file-exists-invalid-path-false",
             "main = do\n  exists <- Directory.doesFileExist \"\\0\"\n  IO.print exists\n",
+            b"False\n",
         ),
     ]);
     cases.extend(runtime_home_directory_cases());
     cases
 }
 
-fn runtime_current_directory_sandbox_failure_case() -> DifferentialCase {
+fn runtime_current_directory_upstream_success_case() -> DifferentialCase {
     const SOURCE: &str = concat!(
         "main = do\n",
-        "  current <- Directory.getCurrentDirectory\n",
-        "  Text.putStr current\n",
+        "  _current <- Directory.getCurrentDirectory\n",
+        "  Text.putStr \"available\"\n",
     );
-    let mut descriptor = runtime_all_obligation_descriptor("Directory.getCurrentDirectory", SOURCE);
-    descriptor.profile = ExecutionProfile::Sandboxed;
-    descriptor
-        .targets
-        .retain(|target| target.dimension == CompatibilityDimension::Effects);
-    descriptor.semantic_targets.retain_mut(|target| {
-        if target.dimension != CompatibilityDimension::Effects {
-            return false;
-        }
-        target
-            .obligations
-            .retain(|obligation| obligation.0.as_ref() != "effect-success");
-        target.expected_process_status_sha256 = Some(crate::process_status_sha256(false, Some(1)));
-        target.expected_single_effect_lifecycle_sha256 =
-            Some(crate::single_effect_lifecycle_sha256(["started", "failed"]));
-        true
-    });
-    descriptor.review_statement = Arc::from("runtime-current-directory-sandbox-denial-review-v1");
-    DifferentialCase {
-        id: Arc::from("runtime-current-directory-sandbox-denied"),
-        source: Arc::from(SOURCE),
-        expected_runtime_completion: false,
-        claim_evidence: Some(descriptor),
-        ..DifferentialCase::default()
-    }
+    let mut case = runtime_io_success_case(
+        "Directory.getCurrentDirectory",
+        "runtime-current-directory-upstream-available",
+        SOURCE,
+        b"available",
+    );
+    let descriptor = case
+        .claim_evidence
+        .as_mut()
+        .expect("current-directory descriptor");
+    descriptor.review_statement =
+        Arc::from("runtime-current-directory-upstream-availability-review-v1");
+    let target = descriptor
+        .semantic_targets
+        .iter_mut()
+        .find(|target| target.dimension == CompatibilityDimension::Effects)
+        .expect("current-directory Effects target");
+    target.expected_process_status_sha256 = Some(crate::process_status_sha256(true, Some(0)));
+    target.expected_single_effect_lifecycle_sha256 = Some(crate::single_effect_lifecycle_sha256([
+        "started",
+        "completed",
+    ]));
+    case
 }
 
 fn runtime_home_directory_cases() -> Vec<DifferentialCase> {
@@ -11516,10 +11936,15 @@ fn runtime_home_directory_cases() -> Vec<DifferentialCase> {
             case
         })
         .collect::<Vec<_>>();
-    cases.push(runtime_io_failure_case(
+    cases.push(runtime_io_success_case(
         "Directory.getHomeDirectory",
-        "runtime-directory-get-home-failure",
-        "main = do\n  _home <- Directory.getHomeDirectory\n  IO.pure ()\n",
+        "runtime-directory-get-home-platform-fallback",
+        concat!(
+            "main = do\n",
+            "  _home <- Directory.getHomeDirectory\n",
+            "  Text.putStr \"available\"\n",
+        ),
+        b"available",
     ));
     cases
 }
@@ -11793,12 +12218,12 @@ fn runtime_process_builder_definitions() -> Vec<(&'static str, &'static str, &'s
                 "  helpers <- Environment.getArgs\n",
                 "  Monad.forM_ helpers \\helper ->\n",
                 "    Process.runProcess_ $\n",
-                "      Process.setEnv [(\"HELL_TESTKIT_SENTINEL\",\"bound\")] $\n",
-                "        Process.proc helper [\"assert-env\",\"HELL_TESTKIT_SENTINEL\",\"bound\"]\n",
+                "      Process.setEnv [(\"LC_ALL\",\"C\")] $\n",
+                "        Process.proc helper [\"assert-env\",\"LC_ALL\",\"C\"]\n",
             ),
             runtime_process_value(&RuntimeProcessValue {
-                arguments: &["assert-env", "HELL_TESTKIT_SENTINEL", "bound"],
-                environment: Some(&[("HELL_TESTKIT_SENTINEL", "bound")]),
+                arguments: &["assert-env", "LC_ALL", "C"],
+                environment: Some(&[("LC_ALL", "C")]),
                 ..RuntimeProcessValue::new(&[])
             }),
         ),
@@ -12001,7 +12426,11 @@ fn runtime_interact_cases(
         for target in &mut descriptor.semantic_targets {
             if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
                 target.boundary_classes = vec![Arc::from(boundary)];
-                if !fails {
+                if fails {
+                    target
+                        .obligations
+                        .retain(|obligation| obligation.0.as_ref() != "adapter-success");
+                } else {
                     target.expected_raw_presentation_sha256 =
                         Some(crate::raw_presentation_sha256(&stdout, b""));
                     target
@@ -12025,6 +12454,9 @@ fn runtime_interact_cases(
             }
         }
         if fails {
+            descriptor.targets.retain(|target| {
+                target.dimension != hell_builtins::CompatibilityDimension::Presentation
+            });
             descriptor.semantic_targets.retain(|target| {
                 target.dimension != hell_builtins::CompatibilityDimension::Presentation
             });
@@ -12033,6 +12465,7 @@ fn runtime_interact_cases(
             id: Arc::from(format!("{prefix}-boundary-{boundary}")),
             source: Arc::from(source),
             stdin,
+            expected_runtime_completion: !fails,
             claim_evidence: Some(descriptor),
             ..DifferentialCase::default()
         }
@@ -12066,6 +12499,9 @@ fn runtime_reader_boundary_cases(
         format!("main = do\n  output <- {builtin} \"missing.bin\"\n  {consumer}\n");
     let mut descriptor = runtime_all_obligation_descriptor(builtin, &failure_source);
     descriptor
+        .targets
+        .retain(|target| target.dimension != hell_builtins::CompatibilityDimension::Presentation);
+    descriptor
         .semantic_targets
         .retain(|target| target.dimension != hell_builtins::CompatibilityDimension::Presentation);
     descriptor.semantic_targets.iter_mut().for_each(|target| {
@@ -12073,6 +12509,10 @@ fn runtime_reader_boundary_cases(
             target
                 .obligations
                 .retain(|obligation| obligation.0.as_ref() != "effect-success");
+        } else if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
+            target
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != "adapter-success");
         }
     });
     cases.push(DifferentialCase {
@@ -12098,7 +12538,11 @@ fn runtime_reader_boundary_case(
     for target in &mut descriptor.semantic_targets {
         if target.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
             target.boundary_classes = vec![Arc::from(boundary)];
-            if !fails {
+            if fails {
+                target
+                    .obligations
+                    .retain(|obligation| obligation.0.as_ref() != "adapter-success");
+            } else {
                 target.expected_raw_presentation_sha256 =
                     Some(crate::raw_presentation_sha256(&stdin, b""));
                 target
@@ -12122,6 +12566,9 @@ fn runtime_reader_boundary_case(
         }
     }
     if fails {
+        descriptor.targets.retain(|target| {
+            target.dimension != hell_builtins::CompatibilityDimension::Presentation
+        });
         descriptor.semantic_targets.retain(|target| {
             target.dimension != hell_builtins::CompatibilityDimension::Presentation
         });
@@ -12130,6 +12577,7 @@ fn runtime_reader_boundary_case(
         id: Arc::from(format!("{prefix}-boundary-{boundary}")),
         source: Arc::from(source),
         stdin,
+        expected_runtime_completion: !fails,
         claim_evidence: Some(descriptor),
         ..DifferentialCase::default()
     }
@@ -12314,9 +12762,12 @@ fn runtime_exec_parser_descriptor(
     for mut target in full.semantic_targets {
         let retain = match (stdout, target.dimension) {
             (Some(_), CompatibilityDimension::Effects) => {
-                target
-                    .obligations
-                    .retain(|obligation| obligation.0.as_ref() != "effect-failure");
+                target.obligations.retain(|obligation| {
+                    !matches!(
+                        obligation.0.as_ref(),
+                        "effect-failure" | "effect-cancellation"
+                    )
+                });
                 true
             }
             (
@@ -12324,9 +12775,12 @@ fn runtime_exec_parser_descriptor(
                 CompatibilityDimension::Platform | CompatibilityDimension::ResourceBehavior,
             ) => true,
             (None, CompatibilityDimension::Effects) => {
-                target
-                    .obligations
-                    .retain(|obligation| obligation.0.as_ref() != "effect-success");
+                target.obligations.retain(|obligation| {
+                    !matches!(
+                        obligation.0.as_ref(),
+                        "effect-success" | "effect-cancellation"
+                    )
+                });
                 true
             }
             _ => false,
@@ -12671,10 +13125,10 @@ fn runtime_flag_help_observable_case() -> DifferentialCase {
         "  IO.print flag\n",
     );
     let stdout = concat!(
-        "Usage: [OPTIONS]\n\n",
+        "Usage: hell [--verbose]\n\n",
         "Available options:\n",
-        "  --verbose  verbosity\n",
-        "  -h, --help  Show this help text\n",
+        "  --verbose                verbosity\n",
+        "  -h,--help                Show this help text\n",
     )
     .as_bytes();
     let mut descriptor = runtime_all_obligation_descriptor("Flag.help", source);
@@ -12700,10 +13154,10 @@ fn runtime_option_help_observable_case() -> DifferentialCase {
         "  Text.putStrLn value\n",
     );
     let stdout = concat!(
-        "Usage: [OPTIONS]\n\n",
+        "Usage: hell --name ARG\n\n",
         "Available options:\n",
-        "  --name argument  chosen name\n",
-        "  -h, --help  Show this help text\n",
+        "  --name ARG               chosen name\n",
+        "  -h,--help                Show this help text\n",
     )
     .as_bytes();
     let mut descriptor = runtime_all_obligation_descriptor("Option.help", source);
@@ -12922,7 +13376,7 @@ fn runtime_argument_metavar_observable_case() -> DifferentialCase {
         "Argument.metavar",
         "runtime-parser-observable-argument-metavar",
         "Argument.metavar \"ITEM\"",
-        "Usage: [OPTIONS] ARGUMENTS\n\nAvailable options:\n  ITEM\n  -h, --help  Show this help text\n",
+        "Usage: hell ITEM\n\nAvailable options:\n  -h,--help                Show this help text\n",
     )
 }
 
@@ -12931,7 +13385,7 @@ fn runtime_argument_help_observable_case() -> DifferentialCase {
         "Argument.help",
         "runtime-parser-observable-argument-help",
         "Argument.help \"chosen item\" <> Argument.metavar \"ITEM\"",
-        "Usage: [OPTIONS] ARGUMENTS\n\nAvailable options:\n  ITEM  chosen item\n  -h, --help  Show this help text\n",
+        "Usage: hell ITEM\n\nAvailable options:\n  ITEM                     chosen item\n  -h,--help                Show this help text\n",
     )
 }
 
@@ -13244,19 +13698,19 @@ fn runtime_options_metadata_observable_cases() -> Vec<DifferentialCase> {
             "Options.header",
             "runtime-parser-observable-options-header",
             "Options.header \"reviewed header\"",
-            "reviewed header\n\nUsage: [OPTIONS]\n\nAvailable options:\n  --verbose\n  -h, --help  Show this help text\n",
+            "reviewed header\n\nUsage: hell [--verbose]\n\nAvailable options:\n  -h,--help                Show this help text\n",
         ),
         (
             "Options.progDesc",
             "runtime-parser-observable-options-progdesc",
             "Options.progDesc \"reviewed description\"",
-            "Usage: [OPTIONS]\n\nreviewed description\n\nAvailable options:\n  --verbose\n  -h, --help  Show this help text\n",
+            "Usage: hell [--verbose]\n\n  reviewed description\n\nAvailable options:\n  -h,--help                Show this help text\n",
         ),
         (
             "Options.helper",
             "runtime-parser-observable-options-helper",
             "Options.fullDesc",
-            "Usage: [OPTIONS]\n\nAvailable options:\n  --verbose\n  -h, --help  Show this help text\n",
+            "Usage: hell [--verbose]\n\nAvailable options:\n  -h,--help                Show this help text\n",
         ),
     ]
     .into_iter()
@@ -13350,10 +13804,9 @@ const OPTIONS_BASE_SOURCE: &str = concat!(
     "main = do { _ <- Options.execParser $ Options.info Main.parser Options.fullDesc; IO.pure () }\n",
 );
 const OPTIONS_BASE_HELP: &[u8] = concat!(
-    "Usage: [OPTIONS]\n\n",
+    "Usage: hell [--verbose]\n\n",
     "Available options:\n",
-    "  --verbose\n",
-    "  -h, --help  Show this help text\n",
+    "  -h,--help                Show this help text\n",
 )
 .as_bytes();
 const OPTIONS_FLAG_SOURCE: &str = concat!(
@@ -13364,15 +13817,20 @@ const OPTIONS_FLAG_PRIME_SOURCE: &str = concat!(
     "parser = Options.flag' Bool.True (Flag.long \"verbose\") <**> Options.helper\n",
     "main = do { _ <- Options.execParser $ Options.info Main.parser Options.fullDesc; IO.pure () }\n",
 );
+const OPTIONS_FLAG_PRIME_HELP: &[u8] = concat!(
+    "Usage: hell --verbose\n\n",
+    "Available options:\n",
+    "  -h,--help                Show this help text\n",
+)
+.as_bytes();
 const OPTIONS_STR_OPTION_SOURCE: &str = concat!(
     "parser = Options.strOption (Option.long \"name\") <**> Options.helper\n",
     "main = do { _ <- Options.execParser $ Options.info Main.parser Options.fullDesc; IO.pure () }\n",
 );
 const OPTIONS_STR_OPTION_HELP: &[u8] = concat!(
-    "Usage: [OPTIONS]\n\n",
+    "Usage: hell --name ARG\n\n",
     "Available options:\n",
-    "  --name argument\n",
-    "  -h, --help  Show this help text\n",
+    "  -h,--help                Show this help text\n",
 )
 .as_bytes();
 const OPTIONS_STR_ARGUMENT_SOURCE: &str = concat!(
@@ -13380,10 +13838,9 @@ const OPTIONS_STR_ARGUMENT_SOURCE: &str = concat!(
     "main = do { _ <- Options.execParser $ Options.info Main.parser Options.fullDesc; IO.pure () }\n",
 );
 const OPTIONS_STR_ARGUMENT_HELP: &[u8] = concat!(
-    "Usage: [OPTIONS] ARGUMENTS\n\n",
+    "Usage: hell ITEM\n\n",
     "Available options:\n",
-    "  ITEM\n",
-    "  -h, --help  Show this help text\n",
+    "  -h,--help                Show this help text\n",
 )
 .as_bytes();
 const OPTIONS_HEADER_SOURCE: &str = concat!(
@@ -13391,10 +13848,9 @@ const OPTIONS_HEADER_SOURCE: &str = concat!(
     "main = do { _ <- Options.execParser $ Options.info Main.parser (Options.header \"reviewed header\"); IO.pure () }\n",
 );
 const OPTIONS_HEADER_HELP: &[u8] = concat!(
-    "reviewed header\n\nUsage: [OPTIONS]\n\n",
+    "reviewed header\n\nUsage: hell [--verbose]\n\n",
     "Available options:\n",
-    "  --verbose\n",
-    "  -h, --help  Show this help text\n",
+    "  -h,--help                Show this help text\n",
 )
 .as_bytes();
 const OPTIONS_DESCRIPTION_SOURCE: &str = concat!(
@@ -13402,10 +13858,9 @@ const OPTIONS_DESCRIPTION_SOURCE: &str = concat!(
     "main = do { _ <- Options.execParser $ Options.info Main.parser (Options.progDesc \"reviewed description\"); IO.pure () }\n",
 );
 const OPTIONS_DESCRIPTION_HELP: &[u8] = concat!(
-    "Usage: [OPTIONS]\n\nreviewed description\n\n",
+    "Usage: hell [--verbose]\n\n  reviewed description\n\n",
     "Available options:\n",
-    "  --verbose\n",
-    "  -h, --help  Show this help text\n",
+    "  -h,--help                Show this help text\n",
 )
 .as_bytes();
 const OPTIONS_COMMAND_SOURCE: &str = concat!(
@@ -13413,11 +13868,11 @@ const OPTIONS_COMMAND_SOURCE: &str = concat!(
     "main = do { _ <- Options.execParser $ Options.info Main.parser Options.fullDesc; IO.pure () }\n",
 );
 const OPTIONS_COMMAND_HELP: &[u8] = concat!(
-    "Usage: [OPTIONS] COMMAND\n\n",
+    "Usage: hell COMMAND\n\n",
     "Available options:\n",
-    "  -h, --help  Show this help text\n\n",
+    "  -h,--help                Show this help text\n\n",
     "Available commands:\n",
-    "  run  run it\n",
+    "  run                      run it\n",
 )
 .as_bytes();
 
@@ -13445,7 +13900,7 @@ fn options_presentation_definitions() -> [OptionsPresentationDefinition; 13] {
             "Options.flag'",
             "flag-prime",
             OPTIONS_FLAG_PRIME_SOURCE,
-            OPTIONS_BASE_HELP,
+            OPTIONS_FLAG_PRIME_HELP,
         ),
         options_presentation_definition(
             "Options.fullDesc",
@@ -14394,6 +14849,17 @@ fn runtime_interaction_descriptor(
                         .obligations
                         .retain(|obligation| obligation.0.as_ref() != "adapter-failure");
                 }
+                if matches!(
+                    target.builtin.as_ref(),
+                    "Process.runProcess"
+                        | "Process.runProcess_"
+                        | "Async.race"
+                        | "Async.concurrently"
+                ) {
+                    target
+                        .obligations
+                        .retain(|obligation| obligation.0.as_ref() != "adapter-failure");
+                }
                 if cell.dimension == hell_builtins::CompatibilityDimension::PureRuntime {
                     Some(target.with_runtime_scope(std::iter::empty::<&str>(), [interaction]))
                 } else {
@@ -14589,6 +15055,14 @@ fn runtime_list_boundary_cases() -> Vec<DifferentialCase> {
 }
 
 fn runtime_cycle_boundary_cases() -> Vec<DifferentialCase> {
+    const EMPTY_STDERR: &[u8] = concat!(
+        "hell: Prelude.cycle: empty list\n",
+        "CallStack (from HasCallStack):\n",
+        "  error, called at libraries/base/GHC/List.hs:2004:3 in base:GHC.List\n",
+        "  errorEmptyList, called at libraries/base/GHC/List.hs:972:27 in base:GHC.List\n",
+        "  cycle, called at src/Hell.hs:1953:4 in main:Main\n",
+    )
+    .as_bytes();
     [
         (
             "empty-input",
@@ -14611,16 +15085,35 @@ fn runtime_cycle_boundary_cases() -> Vec<DifferentialCase> {
         ),
     ]
     .into_iter()
-    .map(|(boundary, source, expected)| DifferentialCase {
-        id: Arc::from(format!("list-cycle-boundary-{boundary}")),
-        source: Arc::from(source),
-        claim_evidence: Some(expected.map_or_else(
+    .map(|(boundary, source, expected)| {
+        let mut descriptor = expected.map_or_else(
             || runtime_builtin_boundary_descriptor("List.cycle", boundary, source),
             |expected| {
                 runtime_expected_boundary_descriptor("List.cycle", boundary, source, expected)
             },
-        )),
-        ..DifferentialCase::default()
+        );
+        let empty = boundary == "empty-input";
+        if empty {
+            let target = descriptor
+                .semantic_targets
+                .first_mut()
+                .expect("List.cycle empty boundary target");
+            target.expected_process_status_sha256 =
+                Some(crate::process_status_sha256(false, Some(1)));
+            target.expected_raw_presentation_sha256 =
+                Some(crate::raw_presentation_sha256(b"", EMPTY_STDERR));
+        } else {
+            descriptor.semantic_targets[0]
+                .obligations
+                .retain(|obligation| obligation.0.as_ref() != "result-force-failure");
+        }
+        DifferentialCase {
+            id: Arc::from(format!("list-cycle-boundary-{boundary}")),
+            source: Arc::from(source),
+            claim_evidence: Some(descriptor),
+            expected_runtime_completion: !empty,
+            ..DifferentialCase::default()
+        }
     })
     .collect()
 }
@@ -15774,46 +16267,55 @@ fn runtime_double_comparison_and_show_boundary_cases() -> Vec<DifferentialCase> 
 }
 
 fn runtime_double_show_f_boundary_cases() -> Vec<DifferentialCase> {
+    const MAX_FIXED_TWO: &str = concat!(
+        "1797693134862315700000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000.00",
+    );
+    const NEGATIVE_MAX_FIXED_TWO: &str = concat!(
+        "-1797693134862315700000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000.00",
+    );
     [
         (
             "negative-value",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) (Double.fromInt $ Int.subtract 1 0) \"\"\n",
-            -1.0,
+            "-1.00",
         ),
         (
             "zero-value",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) 0.0 \"\"\n",
-            0.0,
+            "0.00",
         ),
         (
             "positive-value",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) 1.0 \"\"\n",
-            1.0,
+            "1.00",
         ),
         (
             "minimum-value",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) (Double.mult (Double.fromInt $ Int.subtract 1 0) 1.7976931348623157e308) \"\"\n",
-            -f64::MAX,
+            NEGATIVE_MAX_FIXED_TWO,
         ),
         (
             "maximum-value",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) 1.7976931348623157e308 \"\"\n",
-            f64::MAX,
+            MAX_FIXED_TWO,
         ),
         (
             "overflow",
             "main = IO.print $ Double.showFFloat (Maybe.Just 2) (Double.plus 1.7976931348623157e308 1.7976931348623157e308) \"\"\n",
-            f64::INFINITY,
+            "Infinity",
         ),
     ]
     .into_iter()
-    .map(|(boundary, source, value)| {
-        let expected = if value == f64::INFINITY {
-            "Infinity".to_owned()
-        } else {
-            format!("{value:.2}")
-        };
-        let encoded = utf8_hex(&expected);
+    .map(|(boundary, source, expected)| {
+        let encoded = utf8_hex(expected);
         let typed = format!("{{\"type\":\"Text\",\"utf8Hex\":\"{encoded}\"}}");
         DifferentialCase {
             id: Arc::from(format!("double-showffloat-boundary-{boundary}")),
@@ -16189,28 +16691,27 @@ fn runtime_text_value_boundary_cases() -> Vec<DifferentialCase> {
 fn runtime_text_value_stdout(builtin: &str, index: usize) -> &'static str {
     let outputs = match builtin {
         "Text.length" => ["0\n", "3\n", "2\n"],
-        "Text.reverse" => ["\"\"\n", "\"cba\"\n", "\"βa\"\n"],
-        "Text.toLower" => ["\"\"\n", "\"abc\"\n", "\"aβ\"\n"],
-        "Text.toUpper" => ["\"\"\n", "\"ABC\"\n", "\"AΒ\"\n"],
-        "Text.strip" => ["\"\"\n", "\"abc\"\n", "\"β\"\n"],
-        "Text.take" => ["\"\"\n", "\"a\"\n", "\"β\"\n"],
+        "Text.reverse" => ["\"\"\n", "\"cba\"\n", "\"\\946a\"\n"],
+        "Text.toLower" | "Text.unpack" => ["\"\"\n", "\"abc\"\n", "\"a\\946\"\n"],
+        "Text.toUpper" => ["\"\"\n", "\"ABC\"\n", "\"A\\914\"\n"],
+        "Text.strip" => ["\"\"\n", "\"abc\"\n", "\"\\946\"\n"],
+        "Text.take" => ["\"\"\n", "\"a\"\n", "\"\\946\"\n"],
         "Text.drop" => ["\"\"\n", "\"bc\"\n", "\"x\"\n"],
         "Text.eq" => ["False\n", "False\n", "False\n"],
-        "Text.breakOn" => ["(\"\",\"\")\n", "(\"a\",\"bc\")\n", "(\"a\",\"βc\")\n"],
+        "Text.breakOn" => ["(\"\",\"\")\n", "(\"a\",\"bc\")\n", "(\"a\",\"\\946c\")\n"],
         "Text.dropEnd" => ["\"\"\n", "\"ab\"\n", "\"a\"\n"],
         "Text.isInfixOf" | "Text.isPrefixOf" | "Text.isSuffixOf" => ["False\n", "True\n", "True\n"],
         "Text.stripPrefix" => ["Nothing\n", "Just \"bc\"\n", "Just \"x\"\n"],
         "Text.stripSuffix" => ["Nothing\n", "Just \"ab\"\n", "Just \"a\"\n"],
-        "Text.takeEnd" => ["\"\"\n", "\"c\"\n", "\"β\"\n"],
-        "Text.concat" | "Text.pack" => ["\"\"\n", "\"ab\"\n", "\"aβ\"\n"],
-        "Text.intercalate" => ["\"\"\n", "\"a-b\"\n", "\"aβc\"\n"],
-        "Text.lines" | "Text.words" => ["[]\n", "[\"a\",\"b\"]\n", "[\"a\",\"β\"]\n"],
+        "Text.takeEnd" => ["\"\"\n", "\"c\"\n", "\"\\946\"\n"],
+        "Text.concat" | "Text.pack" => ["\"\"\n", "\"ab\"\n", "\"a\\946\"\n"],
+        "Text.intercalate" => ["\"\"\n", "\"a-b\"\n", "\"a\\946c\"\n"],
+        "Text.lines" | "Text.words" => ["[]\n", "[\"a\",\"b\"]\n", "[\"a\",\"\\946\"]\n"],
         "Text.splitOn" => ["[\"\"]\n", "[\"a\",\"b\"]\n", "[\"a\",\"c\"]\n"],
-        "Text.unlines" => ["\"\"\n", "\"a\\nb\\n\"\n", "\"a\\nβ\\n\"\n"],
-        "Text.unwords" => ["\"\"\n", "\"a b\"\n", "\"a β\"\n"],
-        "Text.encodeUtf8" => ["[]\n", "[97, 98, 99]\n", "[97, 206, 178]\n"],
+        "Text.unlines" => ["\"\"\n", "\"a\\nb\\n\"\n", "\"a\\n\\946\\n\"\n"],
+        "Text.unwords" => ["\"\"\n", "\"a b\"\n", "\"a \\946\"\n"],
+        "Text.encodeUtf8" => ["\"\"\n", "\"abc\"\n", "\"a\\206\\178\"\n"],
         "Text.replace" => ["\"\"\n", "\"axc\"\n", "\"axc\"\n"],
-        "Text.unpack" => ["[]\n", "['a','b','c']\n", "['a','β']\n"],
         _ => panic!("missing exact Text presentation output for {builtin}"),
     };
     outputs[index]
@@ -16354,7 +16855,7 @@ fn runtime_text_filter_boundary_cases() -> Vec<DifferentialCase> {
         let rendered = match boundary {
             "empty-input" => b"\"\"\n".as_slice(),
             "ascii" => b"\"a\"\n".as_slice(),
-            "unicode" => "\"aβ\"\n".as_bytes(),
+            "unicode" => b"\"a\\946\"\n",
             _ => unreachable!("fixed Text.filter boundary"),
         };
         attach_raw_presentation_target(&mut descriptor, "Text.filter", rendered);
@@ -17501,10 +18002,18 @@ fn eq_list_aggregate_boundary_observation(
         ),
         ("List.group", "singleton-input") => {
             let group = eq_list_canonical_list(std::slice::from_ref(&value.first_canonical));
+            let stdout = if value.definition.target == "Char" {
+                format!(
+                    "[{}]\n",
+                    reviewed_haskell_character_canonicals(&[&value.first_canonical])
+                )
+            } else {
+                format!("[[{}]]\n", value.first_rendered)
+            };
             (
                 format!("List.group [({first})]"),
                 eq_list_canonical_list(&[group]),
-                format!("[[{}]]\n", value.first_rendered),
+                stdout,
             )
         }
         ("List.group", "finite-input") => eq_list_group_finite_observation(value),
@@ -17517,16 +18026,27 @@ fn eq_list_group_finite_observation(value: &EqListBoundaryValue) -> (String, Str
         eq_list_canonical_list(&[value.first_canonical.clone(), value.first_canonical.clone()]);
     let second_group = eq_list_canonical_list(std::slice::from_ref(&value.second_canonical));
     let separated = eq_list_canonical_list(std::slice::from_ref(&value.first_canonical));
+    let stdout = if value.definition.target == "Char" {
+        let first = reviewed_haskell_character_canonicals(&[
+            &value.first_canonical,
+            &value.first_canonical,
+        ]);
+        let second = reviewed_haskell_character_canonicals(&[&value.second_canonical]);
+        let separated = reviewed_haskell_character_canonicals(&[&value.first_canonical]);
+        format!("[{first},{second},{separated}]\n")
+    } else {
+        format!(
+            "[[{0},{0}],[{1}],[{0}]]\n",
+            value.first_rendered, value.second_rendered
+        )
+    };
     (
         format!(
             "List.group [({0}),({0}),({1}),({0})]",
             value.first, value.second
         ),
         eq_list_canonical_list(&[first_group, second_group, separated]),
-        format!(
-            "[[{0},{0}],[{1}],[{0}]]\n",
-            value.first_rendered, value.second_rendered
-        ),
+        stdout,
     )
 }
 
@@ -17657,7 +18177,7 @@ fn eq_list_scalar_value_data(slug: &str) -> Option<EqListValueData> {
                 "{\"type\":\"ByteString\",\"hex\":\"61ceb2\"}".to_owned(),
                 "{\"type\":\"ByteString\",\"hex\":\"6162\"}".to_owned(),
             ),
-            ("[97, 206, 178]", "[97, 98]"),
+            (r#""a\206\178""#, "\"ab\""),
         )),
         "ci" => Some((
             "CI Text",
@@ -17681,7 +18201,7 @@ fn eq_list_scalar_value_data(slug: &str) -> Option<EqListValueData> {
                 "{\"type\":\"Character\",\"codePoint\":946}".to_owned(),
                 "{\"type\":\"Character\",\"codePoint\":97}".to_owned(),
             ),
-            ("'β'", "'a'"),
+            ("'\\946'", "'a'"),
         )),
         "day" => Some((
             "Day",
@@ -17761,7 +18281,7 @@ fn eq_list_compound_value_data(slug: &str) -> Option<EqListValueData> {
         "text" => Some((
             "Text",
             (eq_list_text("aβ"), eq_list_text("ab")),
-            ("\"aβ\"", "\"ab\""),
+            ("\"a\\946\"", "\"ab\""),
         )),
         "time-of-day" => Some((
             "TimeOfDay",
@@ -20094,16 +20614,16 @@ fn runtime_builtin_boundary_descriptor(
         .into_iter()
         .filter(|cell| cell.dimension == hell_builtins::CompatibilityDimension::PureRuntime)
         .map(|mut cell| {
-            if boundary == "bottom-after-demanded-prefix"
-                || (builtin == "List.cycle" && boundary == "empty-input")
-            {
-                let retained = if builtin == "List.cycle" {
-                    "whnf-boundary"
-                } else {
-                    "lazy-boundary"
-                };
+            if builtin == "List.cycle" && boundary == "empty-input" {
+                cell.obligations.retain(|obligation| {
+                    matches!(
+                        obligation.0.as_ref(),
+                        "adapter-success" | "result-force-failure" | "whnf-boundary"
+                    )
+                });
+            } else if boundary == "bottom-after-demanded-prefix" {
                 cell.obligations
-                    .retain(|obligation| obligation.0.as_ref() == retained);
+                    .retain(|obligation| obligation.0.as_ref() == "lazy-boundary");
             }
             cell
         })
@@ -20369,6 +20889,7 @@ fn runtime_family_bulk_descriptor(families: &[&str], source: &str) -> ClaimEvide
         let ambiguous_demand_target = source_builtin_occurrences(source, &target.builtin) != 1;
         target.obligations.retain(|obligation| {
             obligation.0.as_ref() != "typed-result"
+                && !is_failure_path_obligation(obligation.0.as_ref())
                 && !(ambiguous_demand_target && is_demand_obligation(obligation.0.as_ref()))
         });
     }
@@ -20378,6 +20899,13 @@ fn runtime_family_bulk_descriptor(families: &[&str], source: &str) -> ClaimEvide
         .map(|target| EvidenceTarget::new(Arc::clone(&target.builtin), target.dimension))
         .collect();
     descriptor
+}
+
+fn is_failure_path_obligation(obligation: &str) -> bool {
+    matches!(
+        obligation,
+        "adapter-failure" | "result-force-failure" | "whnf-failure-boundary"
+    )
 }
 
 fn is_demand_obligation(obligation: &str) -> bool {
@@ -20460,28 +20988,29 @@ fn public_builtin_catalog_reachability_case() -> DifferentialCase {
         .collect::<Vec<_>>();
     let mut source = String::new();
     for (index, spec) in public.iter().enumerate() {
-        let annotation =
-            hell_builtins::source_annotation_scheme(spec.name).map(concrete_builtin_annotation);
-        if let Some(annotation) = annotation.filter(|_| {
-            spec.name != "Monad.then"
-                && !spec.name.starts_with("Tuple.(")
-                && !spec.name.starts_with("Record.")
-                && !is_options_builtin(spec.name)
-        }) {
-            if annotation_is_source_spellable(&annotation) {
+        let annotation = (!spec.name.starts_with("Process."))
+            .then(|| hell_builtins::source_annotation_scheme(spec.name))
+            .flatten()
+            .map(concrete_builtin_annotation);
+        if spec.name != "Monad.then"
+            && !spec.name.starts_with("Tuple.(")
+            && !spec.name.starts_with("Record.")
+            && !is_options_builtin(spec.name)
+        {
+            let reference = builtin_source_reference(spec.name);
+            if annotation
+                .as_deref()
+                .is_some_and(annotation_is_source_spellable)
+            {
+                let annotation = annotation.expect("spellable annotations are present");
                 writeln!(
                     source,
-                    "builtinCatalogProbe{index} :: {annotation} = {}",
-                    builtin_source_reference(spec.name)
+                    "builtinCatalogProbe{index} :: {annotation} = {reference}"
                 )
                 .expect("writing to String cannot fail");
             } else {
-                writeln!(
-                    source,
-                    "builtinCatalogProbe{index} = {}",
-                    builtin_source_reference(spec.name)
-                )
-                .expect("writing to String cannot fail");
+                writeln!(source, "builtinCatalogProbe{index} = {reference}")
+                    .expect("writing to String cannot fail");
             }
         }
     }
@@ -20567,11 +21096,42 @@ fn annotation_is_source_spellable(annotation: &str) -> bool {
 }
 
 fn builtin_source_reference(name: &str) -> String {
-    if matches!(name, "$" | "." | "<$>" | "<**>" | "<*>" | "<>") {
-        format!("({name})")
-    } else {
-        name.to_owned()
+    match name {
+        "$" | "." | "<$>" | "<**>" | "<*>" | "<>" => format!("({name})"),
+        "Process.nullStream" | "Process.setStdout" => process_catalog_reference(
+            "Process.setStdout Process.nullStream $ Process.proc \"catalog\" []",
+        ),
+        "Process.proc" => process_catalog_reference("Process.proc \"catalog\" []"),
+        "Process.runProcess" => {
+            process_catalog_reference("Process.runProcess $ Process.proc \"catalog\" []")
+        }
+        "Process.runProcess_" => {
+            process_catalog_reference("Process.runProcess_ $ Process.proc \"catalog\" []")
+        }
+        "Process.setEnv" => {
+            process_catalog_reference("Process.setEnv [] $ Process.proc \"catalog\" []")
+        }
+        "Process.setStderr" => process_catalog_reference(
+            "Process.setStderr Process.nullStream $ Process.proc \"catalog\" []",
+        ),
+        "Process.setStdin" => process_catalog_reference(
+            "Process.setStdin Process.nullStream $ Process.proc \"catalog\" []",
+        ),
+        "Process.setWorkingDir" => {
+            process_catalog_reference("Process.setWorkingDir \".\" $ Process.proc \"catalog\" []")
+        }
+        "Process.useHandleClose" => process_catalog_reference(
+            "Process.setStdout (Process.useHandleClose IO.stdout) $ Process.proc \"catalog\" []",
+        ),
+        "Process.useHandleOpen" => process_catalog_reference(
+            "Process.setStdout (Process.useHandleOpen IO.stdout) $ Process.proc \"catalog\" []",
+        ),
+        _ => name.to_owned(),
     }
+}
+
+fn process_catalog_reference(source: &str) -> String {
+    source.to_owned()
 }
 
 fn runtime_claim_descriptor(
@@ -20966,8 +21526,9 @@ mod tests {
                 ids.insert(format!("runtime-typed-{builtin}-{}", definition.slug));
             }
         }
-        ids.insert("runtime-typed-map-singleton-nonforce".to_owned());
-        ids.insert("runtime-typed-set-singleton-nonforce".to_owned());
+        ids.insert("runtime-typed-map-singleton-key-strict".to_owned());
+        ids.insert("runtime-typed-map-singleton-value-nonforce".to_owned());
+        ids.insert("runtime-typed-set-singleton-element-strict".to_owned());
         ids
     }
 
@@ -20984,7 +21545,16 @@ mod tests {
                 .claim_evidence
                 .as_ref()
                 .ok_or_else(|| format!("{} lacks singleton evidence", case.id))?;
-            let expected: &[CompatibilityDimension] = if case.id.ends_with("-nonforce") {
+            let expected: &[CompatibilityDimension] = if case
+                .id
+                .starts_with("runtime-typed-map-singleton-key-strict")
+                || case
+                    .id
+                    .starts_with("runtime-typed-map-singleton-value-nonforce")
+                || case
+                    .id
+                    .starts_with("runtime-typed-set-singleton-element-strict")
+            {
                 &[CompatibilityDimension::PureRuntime]
             } else {
                 &[
@@ -21338,7 +21908,7 @@ mod tests {
     }
 
     #[test]
-    fn current_directory_effects_require_upstream_success_and_sandboxed_denial() {
+    fn current_directory_differentials_are_upstream_and_success_bound() {
         let cases = runtime_directory_observation_cases();
         let selected = cases
             .iter()
@@ -21346,7 +21916,7 @@ mod tests {
                 matches!(
                     case.id.as_ref(),
                     "runtime-current-directory-roundtrip"
-                        | "runtime-current-directory-sandbox-denied"
+                        | "runtime-current-directory-upstream-available"
                 )
             })
             .collect::<Vec<_>>();
@@ -21357,30 +21927,10 @@ mod tests {
         );
         assert_eq!(
             selected[1].claim_evidence.as_ref().unwrap().profile,
-            ExecutionProfile::Sandboxed
+            ExecutionProfile::Upstream
         );
         crate::validate_evidence_catalog(&cases)
             .expect("current-directory profile descriptors are canonical");
-
-        let committed = crate::committed_differential_cases();
-        for (omitted, missing) in [
-            ("runtime-current-directory-roundtrip", "effect-success"),
-            ("runtime-current-directory-sandbox-denied", "effect-failure"),
-        ] {
-            let reduced = committed
-                .iter()
-                .filter(|case| case.id.as_ref() != omitted)
-                .cloned()
-                .collect::<Vec<_>>();
-            let error = crate::validate_runtime_obligation_coverage(&reduced)
-                .expect_err("runtime coverage remains intentionally incomplete");
-            assert!(
-                error.contains("Directory.getCurrentDirectory")
-                    && error.contains("Effects")
-                    && error.contains(missing),
-                "omitting {omitted} did not reopen current-directory Effects: {error}"
-            );
-        }
     }
 
     const EQ_LIST_EXPECTED_BUILTIN_PATHS: &[(&str, &[&str])] = &[
@@ -21700,7 +22250,7 @@ mod tests {
         let after = crate::validate_runtime_obligation_coverage(&cases)
             .expect_err("the remaining runtime catalog is intentionally incomplete");
         assert!(
-            after.contains("134 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
+            after.contains("138 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
             "{after}"
         );
         let before = cases
@@ -21710,7 +22260,7 @@ mod tests {
         let before = crate::validate_runtime_obligation_coverage(&before)
             .expect_err("removing Ord/List reopens its exact scope");
         assert!(
-            before.contains("137 incomplete cells, 17 boundary gaps, and 0 interaction gaps"),
+            before.contains("141 incomplete cells, 17 boundary gaps, and 0 interaction gaps"),
             "{before}"
         );
     }
@@ -21879,14 +22429,14 @@ mod tests {
         let before = crate::validate_runtime_obligation_coverage(&cases)
             .expect_err("the committed runtime catalog is intentionally incomplete");
         assert!(
-            before.contains("134 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
+            before.contains("138 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
             "{before}"
         );
         cases.extend(runtime_ord_map_cases());
         let after = crate::validate_runtime_obligation_coverage(&cases)
             .expect_err("the remaining runtime catalog is intentionally incomplete");
         assert!(
-            after.contains("127 incomplete cells, 7 boundary gaps, and 0 interaction gaps"),
+            after.contains("131 incomplete cells, 7 boundary gaps, and 0 interaction gaps"),
             "{after}"
         );
     }
@@ -22236,5 +22786,167 @@ mod tests {
         assert!(first.iter().any(|case| case.id.contains("variant")));
         assert!(first.iter().any(|case| case.id.contains("short-circuit")));
         assert!(first.iter().all(|case| case.source.ends_with('\n')));
+    }
+
+    #[test]
+    fn cycle_empty_boundary_binds_failure_status_presentation_and_adapter_path() {
+        let cases = runtime_cycle_boundary_cases();
+        let empty = cases
+            .iter()
+            .find(|case| case.id.as_ref() == "list-cycle-boundary-empty-input")
+            .expect("List.cycle empty boundary");
+        assert!(!empty.expected_runtime_completion);
+        let target = &empty
+            .claim_evidence
+            .as_ref()
+            .expect("List.cycle empty descriptor")
+            .semantic_targets[0];
+        assert_eq!(
+            target
+                .obligations
+                .iter()
+                .map(|obligation| obligation.0.as_ref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "adapter-success",
+                "result-force-failure",
+                "whnf-boundary",
+            ])
+        );
+        assert_eq!(
+            target.expected_process_status_sha256,
+            Some(crate::process_status_sha256(false, Some(1)))
+        );
+        assert_eq!(
+            target.expected_raw_presentation_sha256,
+            Some(crate::raw_presentation_sha256(
+                b"",
+                concat!(
+                    "hell: Prelude.cycle: empty list\n",
+                    "CallStack (from HasCallStack):\n",
+                    "  error, called at libraries/base/GHC/List.hs:2004:3 in base:GHC.List\n",
+                    "  errorEmptyList, called at libraries/base/GHC/List.hs:972:27 in base:GHC.List\n",
+                    "  cycle, called at src/Hell.hs:1953:4 in main:Main\n",
+                )
+                .as_bytes(),
+            ))
+        );
+        crate::validate_semantic_target_obligations(empty, target)
+            .expect("List.cycle result-force descriptor is complete");
+    }
+
+    #[test]
+    fn cycle_empty_boundary_rejects_incomplete_result_force_authority() {
+        let cases = runtime_cycle_boundary_cases();
+        let empty = cases
+            .iter()
+            .find(|case| case.id.as_ref() == "list-cycle-boundary-empty-input")
+            .expect("List.cycle empty boundary");
+        let target = &empty
+            .claim_evidence
+            .as_ref()
+            .expect("List.cycle empty descriptor")
+            .semantic_targets[0];
+        for (name, mutate) in [
+            (
+                "missing obligation",
+                (|target: &mut crate::EvidenceTargetV2| {
+                    target
+                        .obligations
+                        .retain(|item| item.0.as_ref() != "result-force-failure");
+                }) as fn(&mut crate::EvidenceTargetV2),
+            ),
+            ("missing typed result", |target| {
+                target.expected_typed_result_sha256 = None;
+            }),
+            ("missing status", |target| {
+                target.expected_process_status_sha256 = None;
+            }),
+            ("missing raw presentation", |target| {
+                target.expected_raw_presentation_sha256 = None;
+            }),
+            ("failure-path contamination", |target| {
+                target
+                    .obligations
+                    .push(crate::ObligationId(Arc::from("adapter-failure")));
+            }),
+        ] {
+            let mut mutant = target.clone();
+            mutate(&mut mutant);
+            assert!(
+                crate::validate_semantic_target_obligations(empty, &mutant).is_err(),
+                "{name} was accepted"
+            );
+        }
+        let mut completion = empty.clone();
+        completion.expected_runtime_completion = true;
+        assert!(
+            crate::validate_semantic_target_obligations(
+                &completion,
+                &completion.claim_evidence.as_ref().unwrap().semantic_targets[0],
+            )
+            .is_err(),
+            "successful completion contaminated the result-force failure"
+        );
+    }
+
+    #[test]
+    fn cycle_success_boundaries_and_collection_closure_omit_result_force_failure() {
+        let cases = runtime_cycle_boundary_cases();
+        let empty_id = "list-cycle-boundary-empty-input";
+        for success in cases.iter().filter(|case| case.id.as_ref() != empty_id) {
+            assert!(success.expected_runtime_completion);
+            let obligations =
+                &success.claim_evidence.as_ref().unwrap().semantic_targets[0].obligations;
+            assert!(
+                obligations
+                    .iter()
+                    .any(|item| item.0.as_ref() == "adapter-success")
+            );
+            assert!(
+                !obligations
+                    .iter()
+                    .any(|item| item.0.as_ref() == "result-force-failure")
+            );
+            let mut contaminated = success.clone();
+            contaminated
+                .claim_evidence
+                .as_mut()
+                .unwrap()
+                .semantic_targets[0]
+                .obligations
+                .push(crate::ObligationId(Arc::from("result-force-failure")));
+            assert!(
+                crate::validate_semantic_target_obligations(
+                    &contaminated,
+                    &contaminated
+                        .claim_evidence
+                        .as_ref()
+                        .unwrap()
+                        .semantic_targets[0],
+                )
+                .is_err(),
+                "a successful List.cycle boundary claimed result-force failure"
+            );
+        }
+        let closure = runtime_collection_obligations_case();
+        let closure_target = closure
+            .claim_evidence
+            .as_ref()
+            .unwrap()
+            .semantic_targets
+            .iter()
+            .find(|target| {
+                target.builtin.as_ref() == "List.cycle"
+                    && target.dimension == CompatibilityDimension::PureRuntime
+            })
+            .expect("successful collection closure List.cycle target");
+        assert!(
+            closure_target
+                .obligations
+                .iter()
+                .all(|item| item.0.as_ref() != "result-force-failure"),
+            "the successful collection closure claimed result-force failure"
+        );
     }
 }

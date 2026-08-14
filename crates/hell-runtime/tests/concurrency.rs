@@ -169,3 +169,104 @@ fn timeout_cancels_a_delay_and_returns_nothing_promptly() {
     );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
+
+#[test]
+fn timeout_cancels_nonproductive_many_without_losing_lazy_maybe_prefixes() {
+    assert_eq!(
+        run(concat!(
+            "main = IO.print $ Maybe.maybe [] (List.take 3) $ ",
+            "Alternative.many (Maybe.Just 1 :: Maybe Int)\n",
+        )),
+        "[1,1,1]\n"
+    );
+
+    let started = Instant::now();
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  result <- Timeout.timeout 100000 $ ",
+            "Maybe.maybe (IO.pure ()) ",
+            "(\\values -> Monad.forM_ values (\\_ -> IO.pure ())) $ ",
+            "Alternative.many (Maybe.Just 1 :: Maybe Int)\n",
+            "  Maybe.maybe (Text.putStr \"timeout\") ",
+            "(\\_ -> Text.putStr \"completed\") result\n",
+        )),
+        "timeout"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(feature = "compat-tracing")]
+#[test]
+fn shared_nonproductive_many_consumers_are_trace_canonical_and_semantically_equal() {
+    let source = concat!(
+        "values = Maybe.maybe [] (\\items -> items) $ ",
+        "Alternative.many (Maybe.Just 1 :: Maybe Int)\n",
+        "work = Timeout.timeout 100000 $ ",
+        "Monad.forM_ Main.values (\\_ -> IO.pure ())\n",
+        "main = do\n",
+        "  (left, right) <- Async.concurrently Main.work Main.work\n",
+        "  Maybe.maybe (Text.putStr \"timeout\") ",
+        "(\\_ -> Text.putStr \"completed\") left\n",
+        "  Maybe.maybe (Text.putStr \"timeout\") ",
+        "(\\_ -> Text.putStr \"completed\") right\n",
+    );
+    let directory = std::env::temp_dir().join(format!(
+        "hell-shared-nonproductive-traces-{}",
+        std::process::id()
+    ));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).expect("create shared nonproductive trace directory");
+    let mut baseline = None;
+    for iteration in 0..64 {
+        let program = compile_source(
+            &mut CompilerSession::default(),
+            "shared-nonproductive.hell",
+            source,
+        )
+        .expect("shared nonproductive source compiles");
+        let trace = directory.join(format!("semantic-trace-{iteration}.json"));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        hell_runtime::run_main_with_semantic_trace(
+            program,
+            RuntimeContext::new(Vec::new(), SharedWriter(Arc::clone(&output))),
+            &trace,
+        )
+        .expect("shared nonproductive consumers complete under guest timeouts");
+        assert_eq!(
+            *output.lock().expect("shared nonproductive output lock"),
+            b"timeouttimeout",
+            "shared consumers changed their guest-visible result"
+        );
+        let bytes = std::fs::read(&trace).expect("read shared nonproductive trace");
+        let rendered = std::str::from_utf8(&bytes).expect("semantic trace is UTF-8 JSON");
+        let maybe = hell_builtins::lookup("Maybe.maybe")
+            .expect("Maybe.maybe builtin")
+            .id
+            .0;
+        let put_str = hell_builtins::lookup("Text.putStr")
+            .expect("Text.putStr builtin")
+            .id
+            .0;
+        for (maybe_sequence, put_sequence) in [(4, 5), (6, 7)] {
+            assert!(
+                rendered.contains(&format!(
+                    "\"builtinId\": {maybe}, \"ownerTaskId\": null, \"sequence\": {maybe_sequence}, \"parentSequence\": null, \"instanceTarget\": null, \"instancePremises\": [], \"outcome\": \"alias\", \"nestedAdapters\": 1"
+                )),
+                "root Maybe.maybe selection lost its one exact nested adapter"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "\"builtinId\": {put_str}, \"ownerTaskId\": null, \"sequence\": {put_sequence}, \"parentSequence\": {maybe_sequence}"
+                )),
+                "Text.putStr was detached from or cross-linked across Maybe.maybe selections"
+            );
+        }
+        if let Some(expected) = &baseline {
+            assert_eq!(bytes, *expected, "concurrent trace bytes changed");
+        } else {
+            baseline = Some(bytes);
+        }
+    }
+    std::fs::remove_dir_all(directory).expect("remove shared nonproductive trace directory");
+}

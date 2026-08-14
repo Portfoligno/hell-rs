@@ -790,6 +790,40 @@ mod tests {
                     && cell.exemption.is_none()
             })
             .count();
-        assert_eq!(unresolved, 6_258);
+        assert_eq!(unresolved, 6_255);
+
+        // The portable getCurrentDirectory mapping replaces exactly one generic
+        // unmapped cell per release platform. Its absent failure evidence remains
+        // explicit and release-blocking rather than disappearing into this count.
+        let current_directory_effects = plan
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.key.builtin == "Directory.getCurrentDirectory"
+                    && cell.key.dimension == hell_builtins::CompatibilityDimension::Effects
+                    && cell.key.profile == crate::conformance::ProfileId::Upstream
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(current_directory_effects.len(), 3);
+        for platform in crate::conformance::ConformancePlatform::ALL {
+            let cell = current_directory_effects
+                .iter()
+                .find(|cell| cell.key.platform == platform)
+                .unwrap_or_else(|| {
+                    panic!("missing getCurrentDirectory Effects cell for {platform:?}")
+                });
+            let failure = cell
+                .obligations
+                .iter()
+                .find(|obligation| obligation.id == "effect-failure")
+                .expect("getCurrentDirectory must remain semantically fallible");
+            assert!(failure.case_ids.is_empty());
+            assert!(
+                !cell
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.id == "unmapped-release-evidence")
+            );
+        }
     }
 }

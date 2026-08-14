@@ -160,6 +160,7 @@ dependencies = [
  "hell-source",
  "hell-syntax",
  "hell-testkit",
+ "nix",
  "serde",
  "serde_yaml",
  "tar",
@@ -214,6 +215,8 @@ name = "hell-host"
 version = "0.1.0"
 dependencies = [
  "command-group",
+ "nix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -245,6 +248,7 @@ dependencies = [
  "hell-http-host",
  "hell-source",
  "hell-types",
+ "nix",
 ]
 
 [[package]]

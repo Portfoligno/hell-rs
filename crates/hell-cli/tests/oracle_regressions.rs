@@ -105,6 +105,25 @@ fn call_by_need_matches_the_oracle_on_unused_bottoms_and_infinite_lists() {
 }
 
 #[test]
+fn error_error_uses_the_pinned_user_presentation_without_changing_runtime_identity() {
+    let output = run_source(
+        "pinned-user-error",
+        "main = IO.print (Error.error \"pinned failure\" :: Int)\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        concat!(
+            "hell: pinned failure\n",
+            "CallStack (from HasCallStack):\n",
+            "  error, called at src/Hell.hs:1953:4 in main:Main\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn global_expansion_and_reachability_match_the_oracle() {
     assert_success(
         &run_source(

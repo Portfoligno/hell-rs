@@ -21,6 +21,37 @@ const NIGHTLY_ORACLE_ACQUIRE: &str = "./target/ci/hell-ci oracle-acquire acquire
 const NIGHTLY_DIVERGENCE_PROTOTYPES: &str = "./target/ci/hell-ci divergence-prototype verify";
 const NIGHTLY_REGRESSION_PRODUCER: &str = "./target/ci/hell-ci nightly --oracle ci-out/linux-release-oracle --oracle-sha256 5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9 --dependency-attestation ci-out/dependency-policy.json --report ci-out/nightly-linux.json";
 const NIGHTLY_REGRESSION_CONSUMER: &str = "./target/ci/hell-ci regression-import explore-generated --input ci-out --output ci-out/regression-exploration";
+const MUTATION_RUN_COMMAND: &str =
+    "./target/ci/hell-ci mutation run --output ci-out/mutation/mutation-score.json";
+const REGRESSION_TYPED_CORPUS_COMMAND: &str =
+    "cargo test --locked --package hell-testkit --test typed_corpus";
+const REGRESSION_ORACLE_COMMAND: &str =
+    "cargo test --locked --package hell-cli --test oracle_regressions";
+const BUILD_DRIVER_COMMAND: &str =
+    "cargo build --locked --profile ci --package hell-ci --bin hell-ci";
+const BUILD_DRIVER_AND_HELPER_COMMAND: &str = "cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper";
+const BUILD_DEBUG_CANDIDATE_COMMAND: &str =
+    "cargo build --locked --package hell-cli --bin hell --features compat-tracing";
+const BUILD_RELEASE_CANDIDATE_COMMAND: &str =
+    "cargo build --release --locked --package hell-cli --bin hell --features compat-tracing";
+const MACOS_LLVM_COMMAND: &str = "brew link --force llvm@18";
+const NIGHTLY_DEPENDENCY_COMMAND: &str = "./target/ci/hell-ci dependency-attestation --output ci-out/dependency-policy.json --report ci-out/dependency-policy-report.json";
+const NIGHTLY_MACOS_PORTABILITY_COMMAND: &str =
+    "./target/ci/hell-ci portability --report ci-out/nightly-macos.json";
+const NIGHTLY_WINDOWS_PORTABILITY_COMMAND: &str =
+    ".\\target\\ci\\hell-ci.exe portability --report ci-out\\nightly-windows.json";
+const NIGHTLY_MACOS_ORACLE_COMMAND: &str = "./target/ci/hell-ci native-oracle-shard --source oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/macos-oracle.json";
+const NIGHTLY_WINDOWS_DEPENDENCY_COMMAND: &str = ".\\target\\ci\\hell-ci.exe dependency-attestation --output ci-out\\dependency-policy.json --report ci-out\\dependency-policy-report.json";
+const NIGHTLY_WINDOWS_ORACLE_COMMAND: &str = ".\\target\\ci\\hell-ci.exe native-oracle-shard --source oracle-source --platform windows-amd64 --dependency-attestation ci-out\\dependency-policy.json --report ci-out\\windows-oracle.json";
+const FUZZ_PREPARE_COMMAND: &str = "./target/ci/hell-ci fuzz-corpus prepare --input crates/hell-ci/fuzz/corpus --output ci-out/fuzz-corpora --to ci-out/fuzz-artifacts";
+const FUZZ_REQUIREMENT_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz requirement_toml ci-out/fuzz-corpora/requirement_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/requirement_toml/";
+const FUZZ_NORMALIZER_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_toml ci-out/fuzz-corpora/normalizer_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_toml/";
+const FUZZ_DIVERGENCE_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz divergence_toml ci-out/fuzz-corpora/divergence_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/divergence_toml/";
+const FUZZ_REPLAY_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_replay ci-out/fuzz-corpora/normalizer_replay -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_replay/";
+const FUZZ_TRACE_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz semantic_trace ci-out/fuzz-corpora/semantic_trace -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/semantic_trace/";
+const FUZZ_VERIFY_COMMAND: &str =
+    "./target/ci/hell-ci fuzz-corpus verify-clean --input crates/hell-ci/fuzz/corpus";
+const CARGO_DENY_INSTALL_COMMAND: &str = "cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ../ci-tool-cache/cargo-deny-target";
 const RELEASE_RESOLVE_COMMAND: &str =
     "./automation/target/ci/hell-ci release resolve --output release-state/resolution.json";
 const RELEASE_PLAN_COMMAND: &str = "./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json";
@@ -193,6 +224,7 @@ struct Step {
 }
 
 pub(super) fn check(root: &Path, tracked: &[PathBuf], failures: &mut Vec<String>) {
+    check_custom_environment_interfaces(root, tracked, failures);
     let workflow_paths = tracked
         .iter()
         .filter(|path| path.parent() == Some(Path::new(".github/workflows")))
@@ -263,6 +295,241 @@ pub(super) fn check(root: &Path, tracked: &[PathBuf], failures: &mut Vec<String>
         Some(nightly) => check_nightly(nightly, failures),
         None => failures.push("nightly workflow is missing or invalid".to_owned()),
     }
+    for path in [
+        MUTATION_PATH,
+        NIGHTLY_PATH,
+        REGRESSION_CORPUS_PATH,
+        REGRESSION_SUBJECT_PATH,
+    ] {
+        if let Some(workflow) = parsed.get(Path::new(path)) {
+            check_push_gate_inventory(path, workflow, failures);
+            check_push_cache_pairs(path, workflow, failures);
+        }
+    }
+}
+
+fn check_custom_environment_interfaces(
+    root: &Path,
+    tracked: &[PathBuf],
+    failures: &mut Vec<String>,
+) {
+    for relative in tracked.iter().filter(|path| {
+        matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("rs" | "hell" | "hs")
+        )
+    }) {
+        let source = match fs::read_to_string(root.join(relative)) {
+            Ok(source) => source,
+            Err(error) => {
+                failures.push(format!(
+                    "cannot inspect {} for environment interfaces: {error}",
+                    relative.display()
+                ));
+                continue;
+            }
+        };
+        for name in environment_interface_names(&source) {
+            if standard_environment_name(&name) {
+                continue;
+            }
+            failures.push(format!(
+                "{} defines or consumes custom environment interface {name:?}; use typed arguments or files",
+                relative.display(),
+            ));
+        }
+    }
+}
+
+fn environment_interface_names(source: &str) -> BTreeSet<String> {
+    let compact = source
+        .chars()
+        .filter(|value| !value.is_ascii_whitespace())
+        .collect::<String>();
+    let mut names = BTreeSet::new();
+    for marker in [
+        "std::env::var(\"",
+        "std::env::var_os(\"",
+        "env::var(\"",
+        "env::var_os(\"",
+        ".env(\"",
+        ".env_remove(\"",
+        ".environment(\"",
+        "option_env!(\"",
+        "env!(\"",
+        "set_var(\"",
+        "remove_var(\"",
+        "cargo:rustc-env=",
+        "required_env(\"",
+        "required_env_os(\"",
+        "parse_env_u64(\"",
+    ] {
+        let mut remainder = compact.as_str();
+        while let Some(index) = remainder.find(marker) {
+            let value = &remainder[index + marker.len()..];
+            let name = value.split(['"', '=', '\n']).next().unwrap_or_default();
+            if environment_name_shape(name) {
+                names.insert(name.to_owned());
+            }
+            remainder = value;
+        }
+    }
+    let mut remainder = compact.as_str();
+    while let Some(index) = remainder.find("Process.setEnv") {
+        let value = &remainder[index + "Process.setEnv".len()..];
+        if let Some(argument) = first_balanced_argument(value) {
+            process_environment_names(argument, &mut names);
+        }
+        remainder = value;
+    }
+    names
+}
+
+fn first_balanced_argument(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    let first = *bytes.first()?;
+    let expected_close = match first {
+        b'(' => b')',
+        b'[' => b']',
+        _ => return None,
+    };
+    let mut stack = vec![expected_close];
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(1) {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if byte == b'"' && (index == 0 || bytes[index - 1] != b'\\') {
+            quoted = true;
+            continue;
+        }
+        match byte {
+            b'(' => stack.push(b')'),
+            b'[' => stack.push(b']'),
+            b')' | b']' if stack.last() == Some(&byte) => {
+                stack.pop();
+                if stack.is_empty() {
+                    return Some(&value[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn process_environment_names(argument: &str, names: &mut BTreeSet<String>) {
+    let normalized = argument.replace("\\\"", "\"");
+    let mut remainder = normalized.as_str();
+    while let Some(index) = remainder.find("(\"") {
+        let value = &remainder[index + 2..];
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        let name = &value[..end];
+        let after_name = &value[end + 1..];
+        if after_name.starts_with(",\"") && environment_name_shape(name) {
+            names.insert(name.to_owned());
+        }
+        remainder = value;
+    }
+}
+
+fn environment_name_shape(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'(' | b')'))
+}
+
+fn standard_environment_name(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_RUNTIME_TOKEN",
+        "APPDATA",
+        "CARGO",
+        "CARGO_BUILD_TARGET",
+        "CARGO_HOME",
+        "CARGO_INCREMENTAL",
+        "CARGO_MANIFEST_DIR",
+        "CARGO_PKG_VERSION",
+        "CARGO_PROFILE",
+        "CARGO_TARGET_DIR",
+        "CARGO_TERM_COLOR",
+        "CI",
+        "ComSpec",
+        "DEVELOPER_DIR",
+        "GITHUB_ACTIONS",
+        "GITHUB_API_URL",
+        "GITHUB_ENV",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_OUTPUT",
+        "GITHUB_PATH",
+        "GITHUB_REF_NAME",
+        "GITHUB_REPOSITORY",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_TOKEN",
+        "GITHUB_WORKFLOW_REF",
+        "GITHUB_WORKFLOW_SHA",
+        "GITHUB_WORKSPACE",
+        "HOME",
+        "ImageOS",
+        "ImageVersion",
+        "LANG",
+        "LC_ALL",
+        "LIB",
+        "LIBPATH",
+        "LIBRARY_PATH",
+        "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
+        "OUT_DIR",
+        "PATH",
+        "PATHEXT",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "RUNNER_ARCH",
+        "RUNNER_ENVIRONMENT",
+        "RUNNER_OS",
+        "RUNNER_TEMP",
+        "RUSTC_WRAPPER",
+        "RUSTDOCFLAGS",
+        "RUSTFLAGS",
+        "RUSTUP_HOME",
+        "SCCACHE_DIR",
+        "SDKROOT",
+        "SOURCE_DATE_EPOCH",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "UCRTVersion",
+        "USERPROFILE",
+        "UniversalCRTSdkDir",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "VSINSTALLDIR",
+        "VisualStudioVersion",
+        "WindowsSDKVersion",
+        "WindowsSdkDir",
+        "__DOTNET_ADD_64BIT",
+        "__DOTNET_PREFERRED_BITNESS",
+    ];
+    EXACT.contains(&name) || name.starts_with("CARGO_BIN_EXE_")
 }
 
 fn check_triggers(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
@@ -461,6 +728,7 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
             "CI readiness jobs must be exactly {expected_jobs:?}, found {actual_jobs:?}"
         ));
     }
+    check_ci_gate_inventory(workflow, failures);
     check_needs(workflow, "plan", &[], failures);
     for job in ["linux", "macos", "windows"] {
         check_needs(workflow, job, &["plan"], failures);
@@ -712,6 +980,139 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
     }
 }
 
+fn check_ci_gate_inventory(workflow: &Workflow, failures: &mut Vec<String>) {
+    const RUSTUP_SHOW: &str = "rustup show active-toolchain";
+    const DOWNLOAD_ACTION: &str = "actions/download-artifact";
+    const UPLOAD_ACTION: &str = "actions/upload-artifact";
+    const SETUP_HASKELL_ACTION: &str = "haskell-actions/setup";
+
+    for (job_name, expected_commands, expected_actions) in [
+        (
+            "plan",
+            vec![RUSTUP_SHOW, BUILD_DRIVER_COMMAND, READINESS_PLAN_COMMAND],
+            vec![
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                UPLOAD_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+        ),
+        (
+            "linux",
+            vec![
+                RUSTUP_SHOW,
+                CARGO_DENY_INSTALL_COMMAND,
+                BUILD_DRIVER_AND_HELPER_COMMAND,
+                READINESS_LINUX_COMMAND,
+            ],
+            vec![
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                DOWNLOAD_ACTION,
+                SETUP_HASKELL_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                UPLOAD_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+        ),
+        (
+            "macos",
+            vec![
+                RUSTUP_SHOW,
+                MACOS_LLVM_COMMAND,
+                BUILD_DRIVER_AND_HELPER_COMMAND,
+                READINESS_MACOS_COMMAND,
+            ],
+            vec![
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                DOWNLOAD_ACTION,
+                SETUP_HASKELL_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                UPLOAD_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+        ),
+        (
+            "windows",
+            vec![
+                RUSTUP_SHOW,
+                BUILD_DRIVER_AND_HELPER_COMMAND,
+                READINESS_WINDOWS_COMMAND,
+            ],
+            vec![
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                DOWNLOAD_ACTION,
+                SETUP_HASKELL_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                UPLOAD_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+        ),
+        (
+            "verify",
+            vec![BUILD_DRIVER_COMMAND, READINESS_VERIFY_COMMAND],
+            vec![
+                CHECKOUT_ACTION,
+                DOWNLOAD_ACTION,
+                DOWNLOAD_ACTION,
+                DOWNLOAD_ACTION,
+                DOWNLOAD_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                UPLOAD_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+        ),
+    ] {
+        let steps = workflow
+            .jobs
+            .get(job_name)
+            .and_then(|job| job.steps.as_deref())
+            .unwrap_or_default();
+        let actual_commands = steps
+            .iter()
+            .filter_map(|step| step.run.as_deref())
+            .collect::<Vec<_>>();
+        if actual_commands != expected_commands {
+            failures.push(format!(
+                "CI job {job_name:?} must run the exact ordered local-reproducible gate inventory"
+            ));
+        }
+        let actual_actions = steps
+            .iter()
+            .filter_map(|step| step.uses.as_deref().and_then(action_name))
+            .collect::<Vec<_>>();
+        if actual_actions != expected_actions {
+            failures.push(format!(
+                "CI job {job_name:?} must use the exact ordered action inventory"
+            ));
+        }
+    }
+}
+
 fn check_readiness_platform_job(
     workflow: &Workflow,
     job_name: &str,
@@ -739,6 +1140,23 @@ fn check_readiness_platform_job(
             "CI job {job_name:?} must invoke the exact {platform} readiness driver"
         ));
         return;
+    }
+    if job_name == "linux"
+        && workflow
+            .jobs
+            .get(job_name)
+            .and_then(|job| job.steps.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| step.run.as_deref())
+            .filter(|command| *command == CARGO_DENY_INSTALL_COMMAND)
+            .count()
+            != 1
+    {
+        failures.push(
+            "CI Linux readiness must rebuild pinned cargo-deny with its dedicated compilation cache"
+                .to_owned(),
+        );
     }
     let actual_gates = option_value(commands[0], "--required-gates")
         .map(|value| value.split(',').collect::<Vec<_>>())
@@ -797,17 +1215,17 @@ fn check_readiness_caches(workflow: &Workflow, failures: &mut Vec<String>) {
             .iter()
             .filter_map(|step| with_scalar(step, "key"))
             .collect::<Vec<_>>();
-        let expected_pairs = if matches!(job_name.as_str(), "linux" | "macos" | "windows") {
-            3
-        } else {
-            2
+        let expected_pairs = match job_name.as_str() {
+            "linux" => 4,
+            "macos" | "windows" => 3,
+            _ => 2,
         };
         if restores.len() != expected_pairs
             || saves.len() != expected_pairs
             || restore_keys != save_keys
         {
             failures.push(format!(
-                "CI readiness job {job_name:?} must have two exact split cache pairs"
+                "CI readiness job {job_name:?} must have its exact split cache pairs"
             ));
         }
         for restore in restores {
@@ -970,6 +1388,295 @@ fn check_nightly(workflow: &Workflow, failures: &mut Vec<String>) {
     }
 }
 
+fn check_push_gate_inventory(path: &str, workflow: &Workflow, failures: &mut Vec<String>) {
+    const INSTALL_NIGHTLY: &str = "rustup toolchain install nightly-2026-07-31 --profile minimal";
+    const INSTALL_FUZZ: &str = "cargo +nightly-2026-07-31 install cargo-fuzz --version 0.13.2 --locked --force --target-dir ci-tool-cache/cargo-fuzz-target";
+
+    let expected = match path {
+        MUTATION_PATH => vec![("mutation", vec![BUILD_DRIVER_COMMAND, MUTATION_RUN_COMMAND])],
+        REGRESSION_CORPUS_PATH | REGRESSION_SUBJECT_PATH => vec![(
+            "validate",
+            vec![REGRESSION_TYPED_CORPUS_COMMAND, REGRESSION_ORACLE_COMMAND],
+        )],
+        NIGHTLY_PATH => vec![
+            (
+                "linux",
+                vec![
+                    BUILD_DRIVER_AND_HELPER_COMMAND,
+                    BUILD_DEBUG_CANDIDATE_COMMAND,
+                    NIGHTLY_DEPENDENCY_COMMAND,
+                    NIGHTLY_ORACLE_ACQUIRE,
+                    NIGHTLY_REGRESSION_PRODUCER,
+                    NIGHTLY_REGRESSION_CONSUMER,
+                    NIGHTLY_DIVERGENCE_PROTOTYPES,
+                ],
+            ),
+            (
+                "fuzz",
+                vec![
+                    INSTALL_NIGHTLY,
+                    INSTALL_FUZZ,
+                    BUILD_DRIVER_COMMAND,
+                    FUZZ_PREPARE_COMMAND,
+                    FUZZ_REQUIREMENT_COMMAND,
+                    FUZZ_NORMALIZER_COMMAND,
+                    FUZZ_DIVERGENCE_COMMAND,
+                    FUZZ_REPLAY_COMMAND,
+                    FUZZ_TRACE_COMMAND,
+                    FUZZ_VERIFY_COMMAND,
+                ],
+            ),
+            (
+                "macos",
+                vec![
+                    MACOS_LLVM_COMMAND,
+                    BUILD_DRIVER_AND_HELPER_COMMAND,
+                    BUILD_RELEASE_CANDIDATE_COMMAND,
+                    NIGHTLY_MACOS_PORTABILITY_COMMAND,
+                    NIGHTLY_DEPENDENCY_COMMAND,
+                    NIGHTLY_MACOS_ORACLE_COMMAND,
+                ],
+            ),
+            (
+                "windows",
+                vec![
+                    BUILD_DRIVER_AND_HELPER_COMMAND,
+                    BUILD_RELEASE_CANDIDATE_COMMAND,
+                    NIGHTLY_WINDOWS_PORTABILITY_COMMAND,
+                    NIGHTLY_WINDOWS_DEPENDENCY_COMMAND,
+                    NIGHTLY_WINDOWS_ORACLE_COMMAND,
+                ],
+            ),
+        ],
+        _ => return,
+    };
+    let expected_jobs = expected
+        .iter()
+        .map(|(job, _)| *job)
+        .collect::<BTreeSet<_>>();
+    let actual_jobs = workflow
+        .jobs
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_jobs != expected_jobs {
+        failures.push(format!(
+            "{path} push gate jobs must be exactly {expected_jobs:?}, found {actual_jobs:?}"
+        ));
+    }
+    for (job_name, expected_commands) in expected {
+        let expected_actions = match (path, job_name) {
+            (MUTATION_PATH, "mutation") => vec![
+                CHECKOUT_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                "actions/upload-artifact",
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+            (REGRESSION_CORPUS_PATH | REGRESSION_SUBJECT_PATH, "validate") => vec![
+                CHECKOUT_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+            (NIGHTLY_PATH, "linux") => vec![
+                CHECKOUT_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                "actions/upload-artifact",
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+            (NIGHTLY_PATH, "fuzz") => vec![
+                CHECKOUT_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                "actions/upload-artifact",
+                "actions/upload-artifact",
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+            (NIGHTLY_PATH, "macos" | "windows") => vec![
+                CHECKOUT_ACTION,
+                CHECKOUT_ACTION,
+                "haskell-actions/setup",
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                CACHE_RESTORE_ACTION,
+                "actions/upload-artifact",
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+                CACHE_SAVE_ACTION,
+            ],
+            _ => Vec::new(),
+        };
+        let actual_actions = workflow
+            .jobs
+            .get(job_name)
+            .and_then(|job| job.steps.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| step.uses.as_deref().and_then(action_name))
+            .collect::<Vec<_>>();
+        if actual_actions != expected_actions {
+            failures.push(format!(
+                "{path} job {job_name:?} must use the exact ordered action inventory"
+            ));
+        }
+        let actual_commands = workflow
+            .jobs
+            .get(job_name)
+            .and_then(|job| job.steps.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|step| step.run.as_deref())
+            .collect::<Vec<_>>();
+        if actual_commands != expected_commands {
+            failures.push(format!(
+                "{path} job {job_name:?} must run the exact ordered local-reproducible gate inventory"
+            ));
+        }
+        let checkout_set = match (path, job_name) {
+            (NIGHTLY_PATH, "macos" | "windows") => vec![
+                (None, "${{ github.sha }}", ""),
+                (
+                    Some("chrisdone/hell"),
+                    "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff",
+                    "oracle-source",
+                ),
+            ],
+            _ => vec![(None, "${{ github.sha }}", "")],
+        };
+        check_checkout_set(workflow, job_name, &checkout_set, failures);
+    }
+}
+
+fn check_push_cache_pairs(path: &str, workflow: &Workflow, failures: &mut Vec<String>) {
+    for (job_name, job) in &workflow.jobs {
+        let steps = job.steps.as_deref().unwrap_or_default();
+        let restores = cache_steps(steps, CACHE_RESTORE_ACTION);
+        let saves = cache_steps(steps, CACHE_SAVE_ACTION);
+        let restore_pairs = restores
+            .iter()
+            .map(|step| {
+                (
+                    with_scalar(step, "path").unwrap_or_default(),
+                    with_scalar(step, "key").unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let save_pairs = saves
+            .iter()
+            .map(|step| {
+                (
+                    with_scalar(step, "path").unwrap_or_default(),
+                    with_scalar(step, "key").unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if restore_pairs.is_empty() || restore_pairs != save_pairs {
+            failures.push(format!(
+                "{path} job {job_name:?} must have exact split cache restore/save pairs"
+            ));
+        }
+        if restores
+            .iter()
+            .any(|step| with_scalar(step, "restore-keys").is_some())
+        {
+            failures.push(format!(
+                "{path} job {job_name:?} must not use fallback cache keys"
+            ));
+        }
+        if path == NIGHTLY_PATH && job_name == "macos" {
+            let stack_cache = restores
+                .iter()
+                .find(|step| scalar(step.id.as_ref()) == Some("stack-cache"));
+            let stack_path = stack_cache.and_then(|step| with_scalar(step, "path"));
+            let stack_key = stack_cache
+                .and_then(|step| with_scalar(step, "key"))
+                .unwrap_or_default();
+            let required_identity = [
+                "${{ runner.os }}",
+                "${{ runner.arch }}",
+                "stack-3.11.1",
+                "ghc-9.8.2",
+                "llvm-18.1.8",
+                "oracle-8e952cf9de4ab25d7716982a9ca234f9bdcf1bff",
+                "oracle-source/stack.yaml",
+                "oracle-source/stack.yaml.lock",
+                "oracle-source/package.yaml",
+                "oracle-source/hell.cabal",
+                "oracle-source/src/**",
+                "crates/hell-ci/src/command.rs",
+            ];
+            if stack_path != Some("${{ steps.setup-stack.outputs.stack-root }}")
+                || required_identity
+                    .iter()
+                    .any(|identity| !stack_key.contains(identity))
+            {
+                failures.push(
+                    "nightly macOS Stack-root cache must bind the exact native toolchain, overlay, and oracle inputs"
+                        .to_owned(),
+                );
+            }
+        }
+        let mut ids = BTreeSet::new();
+        for (restore, save) in restores.iter().zip(&saves) {
+            let id = scalar(restore.id.as_ref()).unwrap_or_default();
+            let expected_condition = format!(
+                "${{{{ always() && steps.{id}.outcome == 'success' && steps.{id}.outputs.cache-hit != 'true' }}}}"
+            );
+            if id.is_empty()
+                || !ids.insert(id)
+                || restore.condition.is_some()
+                || scalar(save.condition.as_ref()) != Some(&expected_condition)
+            {
+                failures.push(format!(
+                    "{path} job {job_name:?} cache pairs must use unique restore ids and exact always-save predicates"
+                ));
+            }
+        }
+        const BUILD_INPUTS: [&str; 15] = [
+            "rust-toolchain.toml",
+            "Cargo.lock",
+            "Cargo.toml",
+            "crates/**/Cargo.toml",
+            "**/build.rs",
+            ".cargo/**",
+            "crates/**/*.rs",
+            "builtins/**",
+            "compat/**",
+            "fixtures/**",
+            "baseline.toml",
+            "deny.toml",
+            "release-policy.toml",
+            "spec/**",
+            ".github/**",
+        ];
+        for (cache_path, key) in restore_pairs {
+            if matches!(cache_path, "target" | "crates/hell-ci/fuzz/target")
+                && BUILD_INPUTS.iter().any(|input| !key.contains(input))
+            {
+                failures.push(format!(
+                    "{path} job {job_name:?} compilation cache omits a build input"
+                ));
+            }
+            if cache_path == "crates/hell-ci/fuzz/target" && !key.contains("crates/hell-ci/fuzz/**")
+            {
+                failures.push(format!(
+                    "{path} job {job_name:?} fuzz compilation cache omits its crate inputs"
+                ));
+            }
+        }
+    }
+}
+
 fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
     touch_workflow_fields(workflow);
     check_environment_contract(path, workflow, failures);
@@ -981,6 +1688,12 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
     }
     for (job_name, job) in &workflow.jobs {
         touch_job_fields(job);
+        if path != Path::new(RELEASE_PATH) && job.condition.is_some() {
+            failures.push(format!(
+                "{} job {job_name:?} must not conditionally skip a required event",
+                path.display()
+            ));
+        }
         if let Some(action) = job.uses.as_ref().and_then(Value::as_str) {
             check_action_pin(path, job_name, action, failures);
         }
@@ -997,6 +1710,18 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
         }
         for step in job.steps.as_deref().unwrap_or_default() {
             touch_step_fields(step);
+            if step.run.is_some()
+                && step.condition.is_some()
+                && !(path == Path::new(NIGHTLY_PATH)
+                    && job_name == "fuzz"
+                    && step.run.as_deref() == Some(FUZZ_VERIFY_COMMAND)
+                    && scalar(step.condition.as_ref()) == Some("${{ always() }}"))
+            {
+                failures.push(format!(
+                    "{} job {job_name:?} conditionally skips a required run command",
+                    path.display()
+                ));
+            }
             if step.shell.is_some() {
                 failures.push(format!(
                     "{} job {job_name:?} declares an explicit shell",
@@ -1024,6 +1749,22 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
             }
             if let Some(action) = &step.uses {
                 check_action_pin(path, job_name, action, failures);
+                if step.condition.is_some()
+                    && !match action_name(action) {
+                        Some(CACHE_SAVE_ACTION) => {
+                            scalar(step.condition.as_ref()).is_some_and(valid_cache_save_condition)
+                        }
+                        Some("actions/upload-artifact") => {
+                            scalar(step.condition.as_ref()) == Some("${{ always() }}")
+                        }
+                        _ => false,
+                    }
+                {
+                    failures.push(format!(
+                        "{} job {job_name:?} conditionally skips a required action",
+                        path.display()
+                    ));
+                }
                 if action_name(action) == Some("actions/attest")
                     && (path != Path::new(RELEASE_PATH) || job_name != "publish")
                 {
@@ -1040,7 +1781,7 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
                 }
                 if action_name(action) == Some(CACHE_SAVE_ACTION)
                     && scalar(step.condition.as_ref())
-                        .is_none_or(|condition| !condition.contains("always()"))
+                        .is_none_or(|condition| !valid_cache_save_condition(condition))
                 {
                     failures.push(format!(
                         "{} job {job_name:?} cache save is not guarded by always()",
@@ -1050,6 +1791,26 @@ fn check_common(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn valid_cache_save_condition(condition: &str) -> bool {
+    const PREFIX: &str = "${{ always() && steps.";
+    const SUFFIX: &str = ".outcome == 'success' && steps.";
+    const END: &str = ".outputs.cache-hit != 'true' }}";
+    let Some(remainder) = condition.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((first, remainder)) = remainder.split_once(SUFFIX) else {
+        return false;
+    };
+    let Some(second) = remainder.strip_suffix(END) else {
+        return false;
+    };
+    !first.is_empty()
+        && first == second
+        && first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn check_environment_contract(path: &Path, workflow: &Workflow, failures: &mut Vec<String>) {
@@ -1221,6 +1982,21 @@ fn check_release(workflow: &Workflow, failures: &mut Vec<String>) {
                 "release job {job_name:?} runner must be exactly {runner:?}"
             ));
         }
+    }
+    let cargo_deny_installs = workflow
+        .jobs
+        .get("linux")
+        .and_then(|job| job.steps.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|step| step.run.as_deref())
+        .filter(|command| *command == CARGO_DENY_INSTALL_COMMAND)
+        .count();
+    if cargo_deny_installs != 1 {
+        failures.push(
+            "release Linux must rebuild pinned cargo-deny with its dedicated compilation cache"
+                .to_owned(),
+        );
     }
     if release_workflow_has_forbidden_authority(workflow) {
         failures.push(
@@ -1468,6 +2244,34 @@ fn check_platform_job(
     if matching != [expected_command] {
         failures.push(format!(
             "platform job {job_name:?} must invoke the exact trusted {platform} conformance driver"
+        ));
+    }
+    let run_commands = job
+        .steps
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|step| step.run.as_deref())
+        .collect::<Vec<_>>();
+    if run_commands
+        .iter()
+        .filter(|command| **command == BUILD_DRIVER_AND_HELPER_COMMAND)
+        .count()
+        != 1
+    {
+        failures.push(format!(
+            "platform job {job_name:?} must build the trusted driver and process helper together"
+        ));
+    }
+    let expected_llvm_count = usize::from(job_name == "macos");
+    if run_commands
+        .iter()
+        .filter(|command| **command == MACOS_LLVM_COMMAND)
+        .count()
+        != expected_llvm_count
+    {
+        failures.push(format!(
+            "platform job {job_name:?} has an invalid pinned macOS LLVM provisioning inventory"
         ));
     }
     let gate_argument = matching
@@ -2163,7 +2967,7 @@ fn check_release_caches(workflow: &Workflow, failures: &mut Vec<String>) {
         }
         for step in &saves {
             if scalar(step.condition.as_ref())
-                .is_none_or(|condition| !condition.contains("always()"))
+                .is_none_or(|condition| !valid_cache_save_condition(condition))
             {
                 failures.push(format!(
                     "release job {job_name:?} cache save is not guarded by always()"
@@ -2458,6 +3262,15 @@ mod tests {
         failures
     }
 
+    fn push_gate_failures(path: &str, source: &str) -> Vec<String> {
+        let workflow: Workflow = serde_yaml::from_str(source).expect("typed push workflow");
+        let mut failures = Vec::new();
+        check_common(Path::new(path), &workflow, &mut failures);
+        check_push_gate_inventory(path, &workflow, &mut failures);
+        check_push_cache_pairs(path, &workflow, &mut failures);
+        failures
+    }
+
     fn release_source() -> String {
         include_str!("../../../../.github/workflows/release.yml")
             .replace(
@@ -2586,6 +3399,15 @@ mod tests {
                     "verify",
                     "      - name: Retain exact readiness decision\n",
                     "      - name: Forbidden publish\n        run: ./candidate-target/ci/hell-ci release publish\n      - name: Retain exact readiness decision\n",
+                ),
+            ),
+            (
+                "unapproved pinned action",
+                mutate_job(
+                    &source,
+                    "verify",
+                    "      - name: Retain exact readiness decision\n",
+                    "      - name: Unapproved action\n        uses: actions/setup-node@0000000000000000000000000000000000000000\n      - name: Retain exact readiness decision\n",
                 ),
             ),
         ] {
@@ -3370,6 +4192,139 @@ mod tests {
                 .iter()
                 .any(|failure| failure.contains("regression producer"))
         );
+    }
+
+    #[test]
+    fn push_workflows_bind_exact_local_gate_commands_and_caches() {
+        for (path, source) in [
+            (
+                MUTATION_PATH,
+                include_str!("../../../../.github/workflows/mutation.yml"),
+            ),
+            (
+                NIGHTLY_PATH,
+                include_str!("../../../../.github/workflows/nightly.yml"),
+            ),
+            (
+                REGRESSION_CORPUS_PATH,
+                include_str!("../../../../.github/workflows/regression-corpus.yml"),
+            ),
+            (
+                REGRESSION_SUBJECT_PATH,
+                include_str!("../../../../.github/workflows/regression-subject.yml"),
+            ),
+        ] {
+            let actual = push_gate_failures(path, source);
+            assert!(actual.is_empty(), "{path}: {actual:?}");
+        }
+
+        let mutation = include_str!("../../../../.github/workflows/mutation.yml");
+        let skipped = mutation.replacen(
+            "    runs-on: ubuntu-24.04",
+            "    if: false\n    runs-on: ubuntu-24.04",
+            1,
+        );
+        assert!(
+            push_gate_failures(MUTATION_PATH, &skipped)
+                .iter()
+                .any(|failure| failure.contains("conditionally skip"))
+        );
+        let skipped_checkout = mutation.replacen(
+            "        uses: actions/checkout",
+            "        if: false\n        uses: actions/checkout",
+            1,
+        );
+        assert!(
+            push_gate_failures(MUTATION_PATH, &skipped_checkout)
+                .iter()
+                .any(|failure| failure.contains("required action"))
+        );
+        let changed = mutation.replacen(MUTATION_RUN_COMMAND, "cargo test --workspace", 1);
+        assert!(
+            push_gate_failures(MUTATION_PATH, &changed)
+                .iter()
+                .any(|failure| failure.contains("exact ordered"))
+        );
+        let stale_cache = mutation.replacen("'builtins/**', ", "", 1);
+        assert!(
+            push_gate_failures(MUTATION_PATH, &stale_cache)
+                .iter()
+                .any(|failure| failure.contains("omits a build input"))
+        );
+        let weakened_save = mutation.replacen(
+            "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}",
+            "${{ false && always() }}",
+            1,
+        );
+        assert!(
+            push_gate_failures(MUTATION_PATH, &weakened_save)
+                .iter()
+                .any(|failure| failure.contains("exact always-save predicates"))
+        );
+    }
+
+    #[test]
+    fn project_specific_host_environment_interfaces_fail_closed() {
+        let build_script_source = ["println!(\"cargo:rustc-", "env=LOCAL_BUILD=value\")"].concat();
+        let wrapper_sources = [
+            (
+                ["required_", "env(\"WRAPPER_MODE\")"].concat(),
+                "WRAPPER_MODE",
+            ),
+            (
+                ["required_", "env_os(\"WRAPPER_PATH\")"].concat(),
+                "WRAPPER_PATH",
+            ),
+            (
+                ["parse_env_", "u64(\"WRAPPER_LIMIT\")"].concat(),
+                "WRAPPER_LIMIT",
+            ),
+        ];
+        for (source, name) in [
+            (
+                "std::env::var(\"CORVETHAL_TOKEN\")".to_owned(),
+                "CORVETHAL_TOKEN",
+            ),
+            (
+                "option_env!(\"PROJECT_SOURCE\")".to_owned(),
+                "PROJECT_SOURCE",
+            ),
+            (
+                "command.env(\"VISIBLE_NAME\", \"value\")".to_owned(),
+                "VISIBLE_NAME",
+            ),
+            (
+                "command.environment(\"CORVETHAL_MODE\", \"test\")".to_owned(),
+                "CORVETHAL_MODE",
+            ),
+            (build_script_source, "LOCAL_BUILD"),
+        ] {
+            assert_eq!(
+                environment_interface_names(&source),
+                BTreeSet::from([name.to_owned()])
+            );
+            assert!(!standard_environment_name(name));
+        }
+        for (source, name) in wrapper_sources {
+            assert_eq!(
+                environment_interface_names(&source),
+                BTreeSet::from([name.to_owned()])
+            );
+            assert!(!standard_environment_name(name));
+        }
+        let process_marker = ["Process.", "setEnv"].concat();
+        let process_source = [
+            process_marker.as_str(),
+            "\n  (List.cons\n    (\"LC_ALL\", \"C\")\n    (List.cons\n      (\"APPLICATION_MODE\", \"test\")\n      List.nil))",
+        ]
+        .concat();
+        assert_eq!(
+            environment_interface_names(&process_source),
+            BTreeSet::from(["APPLICATION_MODE".to_owned(), "LC_ALL".to_owned()])
+        );
+        assert!(!standard_environment_name("APPLICATION_MODE"));
+        assert!(standard_environment_name("GITHUB_TOKEN"));
+        assert!(standard_environment_name("CARGO_BIN_EXE_hell"));
     }
 
     #[test]

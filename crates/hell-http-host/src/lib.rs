@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+mod peer_disconnect;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -936,10 +938,12 @@ async fn serve_connection(
     let ingress = IngressControl::new();
     let wire = WireControl::new();
     let requests = ActiveRequests::new();
+    let response_started = Arc::new(AtomicBool::new(false));
     let service_requests = requests.clone();
     let service_config = config.clone();
     let service_ingress = ingress.clone();
     let service_wire = wire.clone();
+    let service_response_started = Arc::clone(&response_started);
     let service_first_error = Arc::clone(&first_error);
     let service = service_fn(move |request| {
         let dispatched = dispatch_request(
@@ -951,6 +955,7 @@ async fn serve_connection(
             Arc::clone(&service_first_error),
             service_ingress.clone(),
             service_wire.clone(),
+            Arc::clone(&service_response_started),
         );
         let service_error = Arc::clone(&service_first_error);
         async move {
@@ -989,16 +994,43 @@ async fn serve_connection(
             connection.as_mut().graceful_shutdown();
             break tokio::time::timeout(config.graceful_shutdown, &mut connection)
                 .await
-                .map_err(|_| HostError::new("HTTP connection shutdown deadline elapsed"))?
-                .map_err(|error| HostError::new(format!("serve HTTP connection: {error}")));
+                .map_err(|_| HostError::new("HTTP connection shutdown deadline elapsed"))?;
         }
         if let Ok(result) = tokio::time::timeout(ENGINE_POLL_INTERVAL, &mut connection).await {
-            break result
-                .map_err(|error| HostError::new(format!("serve HTTP connection: {error}")));
+            break result;
         }
     };
+    drop(connection);
     requests.cancel_all();
-    result
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if response_peer_disconnected(&error, response_started.load(Ordering::Acquire)) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(HostError::new(format!("serve HTTP connection: {error}"))),
+    }
+}
+
+fn response_peer_disconnected(error: &hyper::Error, response_started: bool) -> bool {
+    if !response_started || error.is_user() || error.is_body_write_aborted() {
+        return false;
+    }
+    if error.is_incomplete_message() {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| peer_disconnect::io_kind(error.kind()))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 #[derive(Clone)]
@@ -1066,6 +1098,7 @@ async fn dispatch_request(
     first_error: Arc<Mutex<Option<HostError>>>,
     ingress: IngressControl,
     wire: WireControl,
+    response_started: Arc<AtomicBool>,
 ) -> HostResult<Response<EngineBody>> {
     let (parts, body) = request.into_parts();
     let cancellation = Cancellation::new();
@@ -1129,8 +1162,9 @@ async fn dispatch_request(
         Arc::clone(&first_error),
         &wire,
         request_guard,
+        completed_requests,
     )?;
-    completed_requests.fetch_add(1, Ordering::AcqRel);
+    response_started.store(true, Ordering::Release);
     Ok(response)
 }
 
@@ -1285,6 +1319,7 @@ fn build_response(
     first_error: Arc<Mutex<Option<HostError>>>,
     wire: &WireControl,
     request_guard: ActiveRequest,
+    completed_requests: Arc<AtomicUsize>,
 ) -> HostResult<Response<EngineBody>> {
     let status = StatusCode::from_u16(response.status)
         .map_err(|error| HostError::new(format!("invalid HTTP response status: {error}")))?;
@@ -1303,7 +1338,13 @@ fn build_response(
             .map_err(|error| HostError::new(format!("invalid HTTP response header: {error}")))?;
         output = output.header(name, value);
     }
-    let body = EngineBody::new(response.body, cancellation, first_error, request_guard);
+    let body = EngineBody::new(
+        response.body,
+        cancellation,
+        first_error,
+        request_guard,
+        completed_requests,
+    );
     let mut output = output
         .body(body)
         .map_err(|error| HostError::new(format!("build HTTP response: {error}")))?;
@@ -1327,6 +1368,7 @@ struct EngineBody {
     cancellation: Cancellation,
     completed: bool,
     _request_guard: ActiveRequest,
+    completed_requests: Arc<AtomicUsize>,
 }
 
 impl EngineBody {
@@ -1335,6 +1377,7 @@ impl EngineBody {
         cancellation: Cancellation,
         first_error: Arc<Mutex<Option<HostError>>>,
         request_guard: ActiveRequest,
+        completed_requests: Arc<AtomicUsize>,
     ) -> Self {
         let (state, exact_length, completed) = match body {
             ResponseBody::Empty => (EngineBodyState::Empty, Some(0), true),
@@ -1370,6 +1413,7 @@ impl EngineBody {
             cancellation,
             completed,
             _request_guard: request_guard,
+            completed_requests,
         }
     }
 }
@@ -1431,6 +1475,7 @@ impl Drop for EngineBody {
         if !self.completed {
             self.cancellation.cancel();
         }
+        self.completed_requests.fetch_add(1, Ordering::AcqRel);
     }
 }
 

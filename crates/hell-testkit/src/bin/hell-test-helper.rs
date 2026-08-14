@@ -10,8 +10,28 @@ use std::time::Duration;
 
 fn main() -> ExitCode {
     mark_forbidden_invocation();
-    let run_result = run(std::env::args_os().skip(1).collect());
-    let audit_result = write_resource_audit_if_requested();
+    let (audit, arguments) = match parse_evidence_options(std::env::args_os().skip(1).collect()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let omit_audit = arguments
+        .last()
+        .and_then(|argument| fs::read(argument).ok())
+        .is_some_and(|source| {
+            matches!(
+                source.as_slice(),
+                b"fail-before-audit" | b"fail-before-audit-slow"
+            )
+        });
+    let run_result = run(arguments);
+    let audit_result = if omit_audit {
+        Ok(())
+    } else {
+        write_resource_audit_if_requested(audit.as_deref())
+    };
     let result = match run_result {
         Ok(()) => audit_result,
         Err(error) => Err(error),
@@ -25,8 +45,30 @@ fn main() -> ExitCode {
     }
 }
 
-fn write_resource_audit_if_requested() -> Result<(), String> {
-    let Some(path) = std::env::var_os("HELL_EVIDENCE_RESOURCE_AUDIT").map(PathBuf::from) else {
+fn parse_evidence_options(
+    arguments: Vec<OsString>,
+) -> Result<(Option<PathBuf>, Vec<OsString>), String> {
+    let mut arguments = arguments.into_iter();
+    let audit = if arguments
+        .as_slice()
+        .first()
+        .is_some_and(|value| value == "--evidence-resource-audit")
+    {
+        arguments.next();
+        Some(
+            arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--evidence-resource-audit requires a path".to_owned())?,
+        )
+    } else {
+        None
+    };
+    Ok((audit, arguments.collect()))
+}
+
+fn write_resource_audit_if_requested(path: Option<&std::path::Path>) -> Result<(), String> {
+    let Some(path) = path else {
         return Ok(());
     };
     fs::write(
@@ -78,26 +120,14 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     if run_profile_observer(&command, &mut arguments)? {
         return Ok(());
     }
+    if run_unprofiled_oracle_script(&command, &mut arguments)? {
+        return Ok(());
+    }
     if run_output_command(&command, &mut arguments)?.is_some() {
         return Ok(());
     }
     if command == "emit" {
-        let stdout_bytes = parse_named_usize(&mut arguments, "--stdout-bytes")?;
-        let stderr_bytes = parse_named_usize(&mut arguments, "--stderr-bytes")?;
-        ensure_empty(arguments)?;
-        let stdout =
-            std::thread::spawn(move || write_repeated(std::io::stdout(), b'O', stdout_bytes));
-        let stderr =
-            std::thread::spawn(move || write_repeated(std::io::stderr(), b'E', stderr_bytes));
-        stdout
-            .join()
-            .map_err(|_| "stdout fixture thread panicked".to_owned())?
-            .map_err(|error| error.to_string())?;
-        stderr
-            .join()
-            .map_err(|_| "stderr fixture thread panicked".to_owned())?
-            .map_err(|error| error.to_string())?;
-        return Ok(());
+        return run_emit(&mut arguments);
     }
     if command == "sleep-ms" {
         let milliseconds = parse_usize(arguments.next(), "MILLISECONDS")?;
@@ -159,6 +189,35 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
         "unknown helper subcommand {}",
         command.to_string_lossy()
     ))
+}
+
+fn run_emit(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), String> {
+    let stdout_bytes = parse_named_usize(arguments, "--stdout-bytes")?;
+    let stderr_bytes = parse_named_usize(arguments, "--stderr-bytes")?;
+    ensure_empty(arguments)?;
+    let stdout = std::thread::spawn(move || write_repeated(std::io::stdout(), b'O', stdout_bytes));
+    let stderr = std::thread::spawn(move || write_repeated(std::io::stderr(), b'E', stderr_bytes));
+    stdout
+        .join()
+        .map_err(|_| "stdout fixture thread panicked".to_owned())?
+        .map_err(|error| error.to_string())?;
+    stderr
+        .join()
+        .map_err(|_| "stderr fixture thread panicked".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn run_unprofiled_oracle_script(
+    command: &OsString,
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<bool, String> {
+    if fs::read(command).is_err() {
+        return Ok(false);
+    }
+    ensure_empty(arguments)?;
+    println!("upstream");
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -230,9 +289,30 @@ fn run_profile_observer(
         .next()
         .ok_or_else(|| "execution profile fixture requires a script".to_owned())?;
     if mode_or_script == "--check" {
-        arguments
+        let script = arguments
             .next()
             .ok_or_else(|| "execution profile check requires a script".to_owned())?;
+        if let Ok(source) = fs::read(script)
+            && matches!(
+                source.as_slice(),
+                b"fail-before-audit" | b"fail-before-audit-slow"
+            )
+        {
+            if source == b"fail-before-audit-slow" {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Err("fixture failed before retaining audit".to_owned());
+        }
+    } else if let Ok(source) = fs::read(mode_or_script)
+        && matches!(
+            source.as_slice(),
+            b"fail-before-audit" | b"fail-before-audit-slow"
+        )
+    {
+        if source == b"fail-before-audit-slow" {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return Err("fixture failed before retaining audit".to_owned());
     }
     ensure_empty(arguments)?;
     println!("{profile}");

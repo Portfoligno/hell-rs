@@ -50,8 +50,11 @@ fn build_info_records_compiler_and_runtime_policy() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("compiler policy CompilerConfig"));
-    assert!(stdout.contains("source commit "));
-    assert!(stdout.contains("compatibility evidence schema 1"));
+    assert!(stdout.contains("compatibility evidence schema 2"));
+    assert!(stdout.contains(&format!(
+        "compat tracing enabled {}",
+        cfg!(feature = "compat-tracing")
+    )));
     assert!(stdout.contains("profile: Upstream"));
     assert!(stdout.contains("max_expansion_depth: None"));
     assert!(stdout.contains("runtime policy RuntimePolicy"));

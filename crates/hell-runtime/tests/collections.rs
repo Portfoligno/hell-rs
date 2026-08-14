@@ -187,10 +187,11 @@ fn run_map_comparator_test(mutant: Option<&str>) -> ExitStatus {
     let mut command = Command::new(std::env::current_exe().expect("collections test executable"));
     command
         .arg("map_from_list_consumes_ord_comparators_and_preserves_unordered_fallback")
-        .arg("--exact")
-        .env_remove("HELL_ASSURANCE_MUTANT_ID");
+        .arg("--exact");
     if let Some(mutant) = mutant {
-        command.env("HELL_ASSURANCE_MUTANT_ID", mutant);
+        command
+            .args(["--skip", "__hell_mutant", "--skip"])
+            .arg(mutant);
     }
     command.status().expect("nested collections test runs")
 }

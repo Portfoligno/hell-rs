@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/regression-corpus.tsv', 'fixtures/**', '.github/workflows/regression-subject.yml') }}
+          key: regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}
       - name: Run typed corpus tests
         run: cargo test --locked --package hell-testkit --test typed_corpus
       - name: Run CLI oracle regressions
@@ -53,4 +53,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/regression-corpus.tsv', 'fixtures/**', '.github/workflows/regression-subject.yml') }}
+          key: regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}

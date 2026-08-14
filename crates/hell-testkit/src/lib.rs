@@ -8,13 +8,13 @@ mod runtime_obligations;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
@@ -83,8 +83,7 @@ pub const POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT: &str = concat!(
     "CARGO_HOME,CARGO_INCREMENTAL,CARGO_TARGET_DIR,CARGO_TERM_COLOR,CI,DEVELOPER_DIR,",
     "GITHUB_ACTIONS,HOME,ImageOS,ImageVersion,LANG,LC_ALL,LIBRARY_PATH,PATH,RUNNER_ARCH,",
     "RUNNER_OS,RUSTC_WRAPPER,RUSTDOCFLAGS,RUSTUP_HOME,SCCACHE_DIR,SDKROOT,SOURCE_DATE_EPOCH,",
-    "TEMP,TMP,TMPDIR,USERPROFILE,HELL_EVIDENCE_RESOURCE_AUDIT,HELL_EVIDENCE_SEMANTIC_TRACE,",
-    "HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID,HELL_VISIBLE_SENTINEL"
+    "TEMP,TMP,TMPDIR,USERPROFILE"
 );
 
 /// Exact POSIX child environment names accepted by the trusted adapter.
@@ -116,10 +115,6 @@ pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "TMP",
     "TMPDIR",
     "USERPROFILE",
-    "HELL_EVIDENCE_RESOURCE_AUDIT",
-    "HELL_EVIDENCE_SEMANTIC_TRACE",
-    "HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID",
-    "HELL_VISIBLE_SENTINEL",
 ];
 
 /// Clears a child environment and restores only the release build allowlist.
@@ -174,12 +169,14 @@ pub use runtime_obligations::{
     RuntimeBoundaryRequirement, RuntimeInteractionRequirement, RuntimeObligationCell,
     RuntimePlatformShard, RuntimePlatformTarget, applicable_runtime_obligation_cells,
     mandatory_runtime_boundaries, mandatory_runtime_interactions,
+    portable_native_oracle_failure_unavailable, portable_native_oracle_obligation_cells,
     runtime_assurance_authority_sha256, runtime_assurance_spec_sha256,
     runtime_obligation_cells_for_spec, validate_runtime_obligation_trace,
     validate_runtime_platform_set,
 };
 
 static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
+const MAX_DIFFERENTIAL_WORKERS: usize = 4;
 const COMPLETE_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CAPTURE_EDGE_BYTES: usize = 256 * 1024;
 const FILE_INLINE_BYTES: usize = 64 * 1024;
@@ -211,6 +208,11 @@ thread_local! {
 impl CandidateLaunchPolicy {
     /// Creates a POSIX policy after the trusted driver has established the
     /// separate account and filesystem ownership boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a launcher path cannot be canonicalized or the
+    /// supplied principal, group, or writable roots are not canonical.
     #[cfg(unix)]
     pub fn posix(
         launcher: PathBuf,
@@ -295,7 +297,11 @@ impl CandidateLaunchPolicy {
     #[cfg(not(unix))]
     fn wrap(&self, command: &mut Command) -> std::io::Result<()> {
         let program = resolve_parent_program(command.get_program())?;
-        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let arguments = std::iter::once(program.as_os_str())
+            .chain(command.get_args())
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let encoded = encode_windows_argv(&arguments)?;
         let directory = command.get_current_dir().map(Path::to_owned);
         let environment = command
             .get_envs()
@@ -304,8 +310,7 @@ impl CandidateLaunchPolicy {
         let mut wrapped = Command::new(&self.launcher);
         wrapped
             .arg("__release-restricted-child")
-            .arg(program)
-            .args(arguments)
+            .arg(encoded)
             .env_clear();
         for (name, value) in environment {
             if let Some(value) = value {
@@ -347,6 +352,8 @@ impl CandidateLaunchPolicy {
     /// Grants the already-created sandbox to the exact candidate group.
     #[cfg(unix)]
     fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
         if !path.is_absolute()
             || !self
                 .writable_roots
@@ -366,7 +373,6 @@ impl CandidateLaunchPolicy {
         if !status.success() {
             return Err(std::io::Error::other("cannot bind candidate sandbox group"));
         }
-        use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o2770))
     }
 
@@ -374,6 +380,111 @@ impl CandidateLaunchPolicy {
     fn prepare_writable_directory(&self, _path: &Path) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_ARGV_TOKEN_PREFIX: &str = "hell-argv-v1";
+#[cfg(any(windows, test))]
+const WINDOWS_ARGV_HELPER_PREFIX_UTF16_LEN: usize = "hell-ci __release-argv-child ".len();
+#[cfg(any(windows, test))]
+const WINDOWS_CREATE_PROCESS_COMMAND_LINE_LIMIT: usize = 32_767;
+#[cfg(any(windows, test))]
+const WINDOWS_ARGV_TOKEN_LIMIT: usize =
+    WINDOWS_CREATE_PROCESS_COMMAND_LINE_LIMIT - WINDOWS_ARGV_HELPER_PREFIX_UTF16_LEN - 1;
+
+/// Encodes Windows UTF-16 argv as one bounded, delimiter-structured token for
+/// the restricted-process adapter.
+///
+/// # Errors
+///
+/// Returns an error when the encoded token exceeds the fixed adapter bound.
+#[cfg(windows)]
+pub fn encode_windows_argv(arguments: &[OsString]) -> std::io::Result<OsString> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    encode_windows_argv_units(
+        &arguments
+            .iter()
+            .map(|argument| argument.encode_wide().collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    )
+    .map(OsString::from)
+}
+
+/// Decodes the one-token Windows argv representation into native strings.
+///
+/// # Errors
+///
+/// Returns an error for malformed, oversized, or version-mismatched input.
+#[cfg(windows)]
+pub fn decode_windows_argv(token: &std::ffi::OsStr) -> std::io::Result<Vec<OsString>> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let token = token
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("Windows argv token is not ASCII"))?;
+    decode_windows_argv_units(token)
+        .map(|arguments| arguments.into_iter().map(OsString::from_wide).collect())
+}
+
+#[cfg(any(windows, test))]
+fn encode_windows_argv_units(arguments: &[Vec<u16>]) -> std::io::Result<String> {
+    let mut token = WINDOWS_ARGV_TOKEN_PREFIX.to_owned();
+    for argument in arguments {
+        if argument.contains(&0) {
+            return Err(std::io::Error::other(
+                "Windows argv cannot contain an embedded NUL",
+            ));
+        }
+        token.push('|');
+        for (index, unit) in argument.iter().enumerate() {
+            if index != 0 {
+                token.push(',');
+            }
+            std::fmt::Write::write_fmt(&mut token, format_args!("{unit}"))
+                .expect("writing to String cannot fail");
+        }
+    }
+    if token.len() > WINDOWS_ARGV_TOKEN_LIMIT {
+        return Err(std::io::Error::other(
+            "Windows argv token exceeds its bound",
+        ));
+    }
+    Ok(token)
+}
+
+#[cfg(any(windows, test))]
+fn decode_windows_argv_units(token: &str) -> std::io::Result<Vec<Vec<u16>>> {
+    if token.len() > WINDOWS_ARGV_TOKEN_LIMIT {
+        return Err(std::io::Error::other(
+            "Windows argv token exceeds its bound",
+        ));
+    }
+    let mut fields = token.split('|');
+    if fields.next() != Some(WINDOWS_ARGV_TOKEN_PREFIX) {
+        return Err(std::io::Error::other("Windows argv token version differs"));
+    }
+    fields
+        .map(|field| {
+            if field.is_empty() {
+                return Ok(Vec::new());
+            }
+            field
+                .split(',')
+                .map(|unit| {
+                    let unit = unit
+                        .parse::<u16>()
+                        .map_err(|_| std::io::Error::other("Windows argv token is malformed"))?;
+                    if unit == 0 {
+                        return Err(std::io::Error::other(
+                            "Windows argv cannot contain an embedded NUL",
+                        ));
+                    }
+                    Ok(unit)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Installs one launch policy for the duration of a synchronous operation.
@@ -483,6 +594,72 @@ pub fn raw_presentation_sha256(stdout: &[u8], stderr: &[u8]) -> Digest {
     );
     digest.update(stderr);
     digest.finish()
+}
+
+/// Renders reviewed Unicode scalar values with Haskell `Show [Char]` syntax.
+///
+/// This is kept in the testkit rather than shared with the candidate renderer
+/// so exact corpus presentation remains independently pinned.
+///
+/// # Errors
+///
+/// Returns an error if any supplied code point is not a Unicode scalar value.
+pub fn reviewed_haskell_string_literal(code_points: &[u32]) -> Result<String, String> {
+    const CONTROL_NAMES: [&str; 32] = [
+        "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL", "BS", "HT", "LF", "VT", "FF", "CR",
+        "SO", "SI", "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB", "CAN", "EM", "SUB",
+        "ESC", "FS", "GS", "RS", "US",
+    ];
+
+    let characters = code_points
+        .iter()
+        .copied()
+        .map(|code_point| {
+            char::from_u32(code_point)
+                .ok_or_else(|| format!("invalid reviewed Character code point {code_point}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rendered = String::from("\"");
+    for (index, character) in characters.iter().copied().enumerate() {
+        let next = characters.get(index + 1).copied();
+        if character == '"' {
+            rendered.push_str("\\\"");
+        } else if character > '\u{7f}' {
+            rendered.push('\\');
+            rendered.push_str(&u32::from(character).to_string());
+            if next.is_some_and(|value| value.is_ascii_digit()) {
+                rendered.push_str("\\&");
+            }
+        } else if character == '\u{7f}' {
+            rendered.push_str("\\DEL");
+        } else if character == '\\' {
+            rendered.push_str("\\\\");
+        } else if character >= ' ' {
+            rendered.push(character);
+        } else {
+            match character {
+                '\u{7}' => rendered.push_str("\\a"),
+                '\u{8}' => rendered.push_str("\\b"),
+                '\u{c}' => rendered.push_str("\\f"),
+                '\n' => rendered.push_str("\\n"),
+                '\r' => rendered.push_str("\\r"),
+                '\t' => rendered.push_str("\\t"),
+                '\u{b}' => rendered.push_str("\\v"),
+                '\u{e}' => {
+                    rendered.push_str("\\SO");
+                    if next == Some('H') {
+                        rendered.push_str("\\&");
+                    }
+                }
+                value => {
+                    rendered.push('\\');
+                    rendered.push_str(CONTROL_NAMES[u32::from(value) as usize]);
+                }
+            }
+        }
+    }
+    rendered.push('"');
+    Ok(rendered)
 }
 
 /// Versioned, deliberately narrow normalization used only as a retained
@@ -601,6 +778,7 @@ pub enum CausalSignal {
     SpecializedBuiltin,
     RuntimeAdapter,
     RuntimeAdapterAndForceTrace,
+    ForceTrace,
     EffectEvent,
     TaskAndCancellation,
     PresentationField,
@@ -626,6 +804,10 @@ pub struct EvidenceTargetV2 {
     pub expected_presentation_shadow_normalizer: Option<PresentationShadowNormalizerId>,
     pub expected_normalized_presentation_sha256: Option<Digest>,
     pub expected_lazy_argument_exit_sha256: Option<Digest>,
+    /// Exact pre-adapter WHNF demand failure, including argument and error code.
+    pub expected_whnf_argument_failure_sha256: Option<Digest>,
+    /// Exact ordered Alternative.many nonproductive boundary lifecycle.
+    pub expected_nonproductive_trace_sha256: Option<Digest>,
     pub expected_single_task_lifecycle_sha256: Option<Digest>,
     pub expected_task_trace_sha256: Option<Digest>,
     pub expected_process_status_sha256: Option<Digest>,
@@ -713,6 +895,7 @@ pub enum LogicalTraceEvent {
     CompleteThunk {
         label: Arc<str>,
         outcome: Arc<str>,
+        error_code: Option<Arc<str>>,
     },
     ForceBuiltinArgument {
         builtin: BuiltinId,
@@ -845,6 +1028,8 @@ impl EvidenceTargetV2 {
             expected_presentation_shadow_normalizer: None,
             expected_normalized_presentation_sha256: None,
             expected_lazy_argument_exit_sha256: None,
+            expected_whnf_argument_failure_sha256: None,
+            expected_nonproductive_trace_sha256: None,
             expected_single_task_lifecycle_sha256: None,
             expected_task_trace_sha256: None,
             expected_process_status_sha256: None,
@@ -939,6 +1124,35 @@ pub(crate) fn lazy_argument_exit_sha256<'a>(
     let mut canonical = b"hell-runtime-lazy-argument-exit-v1\0".to_vec();
     for (argument, outcome) in states {
         canonical.extend_from_slice(&argument.to_be_bytes());
+        canonical.extend_from_slice(&(outcome.len() as u64).to_be_bytes());
+        canonical.extend_from_slice(outcome.as_bytes());
+    }
+    sha256_bytes(&canonical)
+}
+
+pub(crate) fn whnf_argument_failure_sha256<'a>(
+    failures: impl IntoIterator<Item = (u16, &'a str, &'a str)>,
+) -> Digest {
+    let mut canonical = b"hell-runtime-whnf-argument-failure-v1\0".to_vec();
+    for (argument, outcome, error_code) in failures {
+        canonical.extend_from_slice(&argument.to_be_bytes());
+        for value in [outcome, error_code] {
+            canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            canonical.extend_from_slice(value.as_bytes());
+        }
+    }
+    sha256_bytes(&canonical)
+}
+
+pub(crate) fn nonproductive_trace_sha256<'a>(
+    events: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Digest {
+    let events = events.into_iter().collect::<Vec<_>>();
+    let mut canonical = b"hell-runtime-nonproductive-trace-v1\0".to_vec();
+    canonical.extend_from_slice(&(events.len() as u64).to_be_bytes());
+    for (boundary, outcome) in events {
+        canonical.extend_from_slice(&(boundary.len() as u64).to_be_bytes());
+        canonical.extend_from_slice(boundary.as_bytes());
         canonical.extend_from_slice(&(outcome.len() as u64).to_be_bytes());
         canonical.extend_from_slice(outcome.as_bytes());
     }
@@ -1152,7 +1366,70 @@ pub enum ExecutableRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildInfo {
+    pub schema_version: u64,
+    pub compat_tracing: bool,
     pub lines: Arc<[Arc<str>]>,
+}
+
+const CANDIDATE_BUILD_INFO_SCHEMA_VERSION: u64 = 2;
+const CANDIDATE_COMPILER_POLICY_SHA256: &str =
+    "ab02a39329b32cda76aacf3c2dfb2477199584d4c50254ad70de9733931d6a1b";
+const CANDIDATE_RUNTIME_POLICY_SHA256: &str =
+    "d11a8fe248f038ded84295868136f2b1633173a1cefb768de84050f920f52cf1";
+
+/// Parses the candidate's closed, versioned `--build-info` output.
+///
+/// # Errors
+///
+/// Returns an error when a field is missing, duplicated, reordered, malformed,
+/// or belongs to an unsupported schema version.
+pub fn parse_candidate_build_info<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<BuildInfo> {
+    let lines = lines.into_iter().map(Arc::<str>::from).collect::<Vec<_>>();
+    if lines.len() != 7 {
+        return Err(std::io::Error::other(format!(
+            "candidate build info schema {CANDIDATE_BUILD_INFO_SCHEMA_VERSION} requires exactly 7 lines, observed {}",
+            lines.len()
+        )));
+    }
+    let expected = [
+        format!("hell-rs {}", env!("CARGO_PKG_VERSION")),
+        format!("language baseline {}", hell_builtins::LANGUAGE_VERSION),
+        format!("upstream {}", hell_builtins::UPSTREAM_COMMIT),
+        format!("compatibility evidence schema {CANDIDATE_BUILD_INFO_SCHEMA_VERSION}"),
+    ];
+    for (index, expected) in expected.iter().enumerate() {
+        if lines[index].as_ref() != expected {
+            return Err(std::io::Error::other(format!(
+                "candidate build info line {index} differs from schema {CANDIDATE_BUILD_INFO_SCHEMA_VERSION}"
+            )));
+        }
+    }
+    let compat_tracing = match lines[4].as_ref() {
+        "compat tracing enabled true" => true,
+        "compat tracing enabled false" => false,
+        _ => {
+            return Err(std::io::Error::other(
+                "candidate build info compat tracing field is malformed",
+            ));
+        }
+    };
+    if sha256_bytes(lines[5].as_bytes()).hex() != CANDIDATE_COMPILER_POLICY_SHA256 {
+        return Err(std::io::Error::other(
+            "candidate build info compiler policy field is malformed",
+        ));
+    }
+    if sha256_bytes(lines[6].as_bytes()).hex() != CANDIDATE_RUNTIME_POLICY_SHA256 {
+        return Err(std::io::Error::other(
+            "candidate build info runtime policy field is malformed",
+        ));
+    }
+    Ok(BuildInfo {
+        schema_version: CANDIDATE_BUILD_INFO_SCHEMA_VERSION,
+        compat_tracing,
+        lines: lines.into(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1381,7 +1658,7 @@ pub fn validate_evidence_catalog(cases: &[DifferentialCase]) -> Result<(), Strin
         }
     }
     for ((builtin, dimension), observed) in obligation_coverage {
-        let required = required_obligations_for_target(&builtin, dimension)?;
+        let required = portable_native_oracle_obligations_for_target(&builtin, dimension)?;
         if observed != required {
             return Err(format!(
                 "semantic targets for {builtin:?}/{dimension:?} do not cover its registry-derived obligation family: observed {observed:?}, required {required:?}"
@@ -1389,6 +1666,23 @@ pub fn validate_evidence_catalog(cases: &[DifferentialCase]) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn portable_native_oracle_obligations_for_target(
+    builtin: &str,
+    dimension: CompatibilityDimension,
+) -> Result<BTreeSet<Arc<str>>, String> {
+    let mut required = required_obligations_for_target(builtin, dimension)?;
+    if portable_native_oracle_failure_unavailable(builtin, dimension) {
+        // Both operations remain semantically fallible in the registry. The
+        // native-oracle corpus cannot portably induce those host lookup
+        // failures: the sandbox profile is candidate-only, and platform home
+        // discovery cannot be disabled in a child process. Preserve the
+        // assurance obligation while requiring only portable observations in
+        // this differential catalog.
+        required.remove("effect-failure");
+    }
+    Ok(required)
 }
 
 fn validate_case_descriptor(
@@ -1472,6 +1766,14 @@ fn validate_legacy_targets(
                 case.id, target.dimension
             ));
         }
+        if !descriptor.semantic_targets.iter().any(|semantic| {
+            semantic.builtin == target.builtin && semantic.dimension == target.dimension
+        }) {
+            return Err(format!(
+                "case {:?} compatibility and semantic targets disagree",
+                case.id
+            ));
+        }
     }
     Ok(())
 }
@@ -1494,7 +1796,21 @@ fn validate_semantic_targets(
             ));
         };
         validate_semantic_instance_declaration(case, target, spec)?;
-        let comparator_sensitive = runtime_obligations::collection_comparator_sensitive(spec.name);
+        if target.expected_nonproductive_trace_sha256.is_some()
+            && (spec.name != "Alternative.many"
+                || target.dimension != CompatibilityDimension::PureRuntime
+                || !matches!(
+                    target.expected_instance_target.as_deref(),
+                    Some("Maybe" | "Options.Parser")
+                ))
+        {
+            return Err(format!(
+                "case {:?} nonproductive trace is not scoped to a reviewed Alternative.many instance",
+                case.id
+            ));
+        }
+        let comparator_sensitive = runtime_obligations::collection_comparator_sensitive(spec.name)
+            && target.causal_signal != CausalSignal::ForceTrace;
         if target.expected_comparator_trace_sha256.is_some() != comparator_sensitive
             || (comparator_sensitive && target.expected_instance_target.is_none())
         {
@@ -1554,6 +1870,40 @@ fn validate_semantic_target_obligations(
             case.id, target.builtin, target.dimension
         ));
     }
+    let has_obligation = |name: &str| {
+        target
+            .obligations
+            .iter()
+            .any(|obligation| obligation.0.as_ref() == name)
+    };
+    let force_failure = has_obligation("whnf-failure-boundary");
+    if force_failure != target.expected_whnf_argument_failure_sha256.is_some()
+        || (force_failure
+            && (target.causal_signal != CausalSignal::ForceTrace
+                || target.expected_instance_target.is_some()
+                || !target.expected_instance_premises.is_empty()
+                || target.expected_comparator_trace_sha256.is_some()
+                || target.expected_typed_result_sha256.is_some()
+                || has_obligation("adapter-success")
+                || has_obligation("adapter-failure")
+                || has_obligation("whnf-boundary")))
+    {
+        return Err(format!(
+            "case {:?} semantic target {:?}/{:?} has an incomplete or contaminated WHNF failure proof",
+            case.id, target.builtin, target.dimension
+        ));
+    }
+    validate_result_force_failure_obligation(case, target)?;
+    if (has_obligation("adapter-success") && has_obligation("adapter-failure"))
+        || (has_obligation("effect-success") && has_obligation("effect-failure"))
+        || (has_obligation("effect-cancellation")
+            && (has_obligation("effect-success") || has_obligation("effect-failure")))
+    {
+        return Err(format!(
+            "case {:?} semantic target {:?}/{:?} mixes successful and failed path obligations",
+            case.id, target.builtin, target.dimension
+        ));
+    }
     let normalized_shadow = target
         .obligations
         .iter()
@@ -1601,6 +1951,46 @@ fn validate_semantic_target_obligations(
         return Err(format!(
             "case {:?} semantic target {:?} declares an unknown or duplicate interaction",
             case.id, target.builtin
+        ));
+    }
+    Ok(())
+}
+
+fn validate_result_force_failure_obligation(
+    case: &DifferentialCase,
+    target: &EvidenceTargetV2,
+) -> Result<(), String> {
+    let has_obligation = |name: &str| {
+        target
+            .obligations
+            .iter()
+            .any(|obligation| obligation.0.as_ref() == name)
+    };
+    let result_force_failure = has_obligation("result-force-failure");
+    let list_cycle_force_error = target.builtin.as_ref() == "List.cycle"
+        && target.expected_typed_result_sha256
+            == Some(sha256_bytes(
+                b"{\"type\":\"TypedResult\",\"argument\":0,\"boundary\":\"adapter-result\",\"value\":{\"type\":\"ForceBoundary\",\"outcome\":\"error\",\"code\":\"H0901\"}}",
+            ));
+    let exact_result_force_obligations = target.obligations.len() == 3
+        && has_obligation("adapter-success")
+        && has_obligation("whnf-boundary")
+        && result_force_failure;
+    if result_force_failure != list_cycle_force_error
+        || (result_force_failure
+            && (!exact_result_force_obligations
+                || target.causal_signal != CausalSignal::RuntimeAdapterAndForceTrace
+                || target.boundary_classes.len() != 1
+                || target.boundary_classes[0].as_ref() != "empty-input"
+                || target.expected_process_status_sha256
+                    != Some(process_status_sha256(false, Some(1)))
+                || target.expected_raw_presentation_sha256.is_none()
+                || case.expected_runtime_completion
+                || has_obligation("adapter-failure")))
+    {
+        return Err(format!(
+            "case {:?} semantic target {:?}/{:?} has an incomplete or contaminated result-force failure proof",
+            case.id, target.builtin, target.dimension
         ));
     }
     Ok(())
@@ -2488,7 +2878,9 @@ fn causal_signal_matches_dimension(
                 CompatibilityDimension::StaticSemantics
             )
             | (
-                CausalSignal::RuntimeAdapterAndForceTrace | CausalSignal::RuntimeAdapter,
+                CausalSignal::RuntimeAdapterAndForceTrace
+                    | CausalSignal::RuntimeAdapter
+                    | CausalSignal::ForceTrace,
                 CompatibilityDimension::PureRuntime
             )
             | (CausalSignal::EffectEvent, CompatibilityDimension::Effects)
@@ -2574,12 +2966,121 @@ pub struct DifferentialMismatch {
     pub candidate: Vec<u8>,
 }
 
+/// A reviewed projection that excludes one raw observation field from the
+/// authoritative compatibility comparison while retaining both exact sides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DifferentialComparisonProjection {
+    Exact,
+    ReviewedRuntimeFailureStderr {
+        oracle_sha256: Digest,
+        candidate_sha256: Digest,
+        oracle_bytes: u64,
+        candidate_bytes: u64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DifferentialReport {
     pub oracle: Observation,
     pub candidate: Observation,
+    pub comparison_projection: DifferentialComparisonProjection,
     pub mismatches: Vec<DifferentialMismatch>,
 }
+
+/// Monotonic timing telemetry for one differential case.
+///
+/// Timing never participates in observation comparison or release decisions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DifferentialTiming {
+    pub oracle_process: Duration,
+    pub candidate_process: Duration,
+    pub driver_overhead: Duration,
+}
+
+/// One authoritative differential report plus non-authoritative timing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedDifferentialReport {
+    pub report: DifferentialReport,
+    pub timing: DifferentialTiming,
+}
+
+/// Aggregate non-authoritative timing for one authoritative ordered batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DifferentialBatchTiming {
+    pub case_count: usize,
+    pub completed_count: usize,
+    pub worker_count: usize,
+    pub wall: Duration,
+    /// Sum of per-case oracle subprocess wall time. This can exceed batch wall
+    /// time when workers overlap.
+    pub oracle_process_sum: Duration,
+    /// Sum of per-case candidate subprocess wall time. This can exceed batch
+    /// wall time when workers overlap.
+    pub candidate_process_sum: Duration,
+    /// Sum of per-case harness/normalization time excluding both subprocesses.
+    pub driver_overhead_sum: Duration,
+}
+
+/// Complete ordered results plus telemetry that does not affect conformance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DifferentialBatchReport {
+    pub reports: Vec<DifferentialReport>,
+    pub case_timings: Vec<DifferentialTiming>,
+    pub timing: DifferentialBatchTiming,
+}
+
+/// Lowest authoritative batch failure after every worker has joined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DifferentialBatchFailure {
+    pub case_index: Option<usize>,
+    pub case_id: Option<Arc<str>>,
+    pub detail: String,
+    pub timing: DifferentialBatchTiming,
+}
+
+impl DifferentialBatchFailure {
+    fn configuration(detail: String, wall: Duration) -> Self {
+        Self {
+            case_index: None,
+            case_id: None,
+            detail,
+            timing: DifferentialBatchTiming {
+                wall,
+                ..DifferentialBatchTiming::default()
+            },
+        }
+    }
+
+    fn case(
+        case_index: usize,
+        case_id: Arc<str>,
+        detail: String,
+        timing: DifferentialBatchTiming,
+    ) -> Self {
+        Self {
+            case_index: Some(case_index),
+            case_id: Some(case_id),
+            detail,
+            timing,
+        }
+    }
+}
+
+impl std::fmt::Display for DifferentialBatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (Some(index), Some(case_id)) = (self.case_index, self.case_id.as_deref()) {
+            write!(
+                formatter,
+                "case {case_id} at authoritative index {index} failed: {}",
+                self.detail
+            )
+        } else {
+            formatter.write_str(&self.detail)
+        }
+    }
+}
+
+impl std::error::Error for DifferentialBatchFailure {}
 
 impl DifferentialReport {
     #[must_use]
@@ -2734,6 +3235,7 @@ pub fn run(executable: &Path, script: &Path, case: &DifferentialCase) -> std::io
     let working_directory = script.parent().unwrap_or_else(|| Path::new("."));
     let captured = capture_process(
         executable,
+        ExecutableRole::Candidate,
         script,
         working_directory,
         case,
@@ -2780,14 +3282,608 @@ pub fn differential_with_identities(
     candidate: &ExecutableIdentity,
     case: &DifferentialCase,
 ) -> std::io::Result<DifferentialReport> {
+    differential_with_identities_timed(oracle, candidate, case).map(|timed| timed.report)
+}
+
+/// Runs one isolated differential case while retaining role-separated
+/// monotonic execution timings that never participate in conformance.
+///
+/// # Errors
+///
+/// Returns an I/O error if either sandbox or child process cannot be managed.
+pub fn differential_with_identities_timed(
+    oracle: &ExecutableIdentity,
+    candidate: &ExecutableIdentity,
+    case: &DifferentialCase,
+) -> std::io::Result<TimedDifferentialReport> {
+    differential_with_identities_timed_at(oracle, candidate, case, None)
+}
+
+fn differential_with_identities_timed_at(
+    oracle: &ExecutableIdentity,
+    candidate: &ExecutableIdentity,
+    case: &DifferentialCase,
+    sandbox_sequences: Option<(u64, u64)>,
+) -> std::io::Result<TimedDifferentialReport> {
+    let started = Instant::now();
     let profile = case_execution_profile(case);
-    let oracle_observation = observe_source(oracle, case, "oracle", profile)?;
-    let candidate_observation = observe_source(candidate, case, "candidate", profile)?;
-    let mismatches = compare(&oracle_observation, &candidate_observation);
-    Ok(DifferentialReport {
-        oracle: oracle_observation,
-        candidate: candidate_observation,
-        mismatches,
+    let oracle_observation = observe_source_timed(
+        oracle,
+        case,
+        "oracle",
+        profile,
+        sandbox_sequences.map(|sequences| sequences.0),
+    )?;
+    let candidate_observation = observe_source_timed(
+        candidate,
+        case,
+        "candidate",
+        profile,
+        sandbox_sequences.map(|sequences| sequences.1),
+    )?;
+    let (comparison_projection, mismatches) = compare_case_observations(
+        case,
+        &oracle_observation.observation,
+        &candidate_observation.observation,
+    );
+    let elapsed = started.elapsed();
+    let process_duration = oracle_observation
+        .process_duration
+        .saturating_add(candidate_observation.process_duration);
+    Ok(TimedDifferentialReport {
+        report: DifferentialReport {
+            oracle: oracle_observation.observation,
+            candidate: candidate_observation.observation,
+            comparison_projection,
+            mismatches,
+        },
+        timing: DifferentialTiming {
+            oracle_process: oracle_observation.process_duration,
+            candidate_process: candidate_observation.process_duration,
+            driver_overhead: elapsed.saturating_sub(process_duration),
+        },
+    })
+}
+
+/// Returns the deterministic worker bound for differential batches.
+///
+/// Candidate-principal confinement requires serial execution because its
+/// bounded UID quiescence sweep intentionally covers the whole principal.
+#[must_use]
+pub fn differential_worker_limit() -> usize {
+    if CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().is_some()) {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |parallelism| {
+            parallelism.get().min(MAX_DIFFERENTIAL_WORKERS)
+        })
+    }
+}
+
+/// Retains a non-authoritative sample together with its exact full-inventory
+/// provenance.
+#[derive(Clone, Debug)]
+pub struct RepresentativeDifferentialSample {
+    pub cases: Vec<DifferentialCase>,
+    pub inventory_count: usize,
+    pub inventory_sha256: Digest,
+    pub selected_indices: Vec<usize>,
+}
+
+/// Hashes the exact ordered differential inventory used by authoritative and
+/// diagnostic suites.
+///
+/// # Errors
+///
+/// Returns an error if a case identifier length cannot be represented as a
+/// `u64`.
+pub fn differential_inventory_sha256(cases: &[DifferentialCase]) -> Result<Digest, String> {
+    let mut inventory_bytes = b"hell-differential-inventory-v2\0".to_vec();
+    inventory_bytes.extend_from_slice(
+        &u64::try_from(cases.len())
+            .map_err(|_| "differential inventory length overflow")?
+            .to_be_bytes(),
+    );
+    for case in cases {
+        inventory_bytes.extend_from_slice(&differential_inventory_case_sha256(case)?.0);
+    }
+    Ok(sha256_bytes(&inventory_bytes))
+}
+
+fn differential_inventory_case_sha256(case: &DifferentialCase) -> Result<Digest, String> {
+    let mut canonical = b"hell-differential-inventory-case-v1\0".to_vec();
+    push_inventory_bytes(&mut canonical, case.id.as_bytes())?;
+    push_inventory_bytes(&mut canonical, case.source.as_bytes())?;
+    push_inventory_os_strings(&mut canonical, &case.arguments, "argument")?;
+    canonical.extend_from_slice(
+        &u64::try_from(case.environment.len())
+            .map_err(|_| "differential environment length overflow")?
+            .to_be_bytes(),
+    );
+    for (name, value) in &case.environment {
+        push_inventory_os_string(&mut canonical, name, "environment name")?;
+        push_inventory_os_string(&mut canonical, value, "environment value")?;
+    }
+    push_inventory_bytes(&mut canonical, &case.stdin)?;
+    canonical.extend_from_slice(&case.timeout.as_secs().to_be_bytes());
+    canonical.extend_from_slice(&case.timeout.subsec_nanos().to_be_bytes());
+    canonical.extend_from_slice(
+        &u64::try_from(case.normalization.stderr_replacements.len())
+            .map_err(|_| "differential stderr replacement count overflow")?
+            .to_be_bytes(),
+    );
+    for (from, to) in &case.normalization.stderr_replacements {
+        push_inventory_bytes(&mut canonical, from)?;
+        push_inventory_bytes(&mut canonical, to)?;
+    }
+    canonical.push(u8::from(case.normalization.normalize_path_separators));
+    canonical.push(match case.environment_profile {
+        EnvironmentProfile::Minimal => 0,
+        EnvironmentProfile::ProcessCapable => 1,
+        EnvironmentProfile::NativePlatform => 2,
+        EnvironmentProfile::Explicit => 3,
+    });
+    if case.environment_profile == EnvironmentProfile::ProcessCapable {
+        push_inventory_bytes(&mut canonical, b"hell-test-helper-v1")?;
+    } else {
+        push_inventory_bytes(&mut canonical, b"")?;
+    }
+    canonical.push(match case.mode {
+        DifferentialMode::Check => 0,
+        DifferentialMode::Run => 1,
+    });
+    canonical.push(u8::from(case.expected_runtime_completion));
+    let mut logical_case = case.clone();
+    logical_case.process_helper_directory = None;
+    logical_case.process_helper_sha256 = None;
+    canonical.extend_from_slice(&case_descriptor_sha256(&logical_case).0);
+    Ok(sha256_bytes(&canonical))
+}
+
+fn push_inventory_os_strings(
+    canonical: &mut Vec<u8>,
+    values: &[OsString],
+    label: &str,
+) -> Result<(), String> {
+    canonical.extend_from_slice(
+        &u64::try_from(values.len())
+            .map_err(|_| format!("differential {label} count overflow"))?
+            .to_be_bytes(),
+    );
+    for value in values {
+        push_inventory_os_string(canonical, value, label)?;
+    }
+    Ok(())
+}
+
+fn push_inventory_os_string(
+    canonical: &mut Vec<u8>,
+    value: &OsStr,
+    label: &str,
+) -> Result<(), String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("differential {label} is not canonical UTF-8"))?;
+    push_inventory_bytes(canonical, value.as_bytes())
+}
+
+fn push_inventory_bytes(canonical: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+    canonical.extend_from_slice(
+        &u64::try_from(value.len())
+            .map_err(|_| "differential inventory field length overflow")?
+            .to_be_bytes(),
+    );
+    canonical.extend_from_slice(value);
+    Ok(())
+}
+
+/// Selects a deterministic, evenly distributed diagnostic sample from an
+/// authoritative differential order.
+///
+/// This is a performance-diagnostic inventory only. Release conformance still
+/// executes its complete inventory and never consumes this sample.
+///
+/// # Errors
+///
+/// Returns an error unless the requested sample is between 32 and 256 cases,
+/// is no larger than the authoritative inventory, and index arithmetic fits.
+pub fn representative_differential_sample(
+    cases: &[DifferentialCase],
+    sample_count: usize,
+) -> Result<RepresentativeDifferentialSample, String> {
+    const MIN_SAMPLE_COUNT: usize = 32;
+    const MAX_SAMPLE_COUNT: usize = 256;
+
+    if !(MIN_SAMPLE_COUNT..=MAX_SAMPLE_COUNT).contains(&sample_count) || sample_count > cases.len()
+    {
+        return Err(format!(
+            "representative differential sample count must be 32..=256 and no greater than the {} authoritative cases",
+            cases.len()
+        ));
+    }
+    let inventory_sha256 = differential_inventory_sha256(cases)?;
+    let final_index = cases.len() - 1;
+    let final_sample = sample_count - 1;
+    let selected_indices = (0..sample_count)
+        .map(|sample| {
+            sample
+                .checked_mul(final_index)
+                .map(|product| product / final_sample)
+                .ok_or_else(|| "representative differential index arithmetic overflow".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_cases = selected_indices
+        .iter()
+        .map(|index| cases[*index].clone())
+        .collect();
+    Ok(RepresentativeDifferentialSample {
+        cases: selected_cases,
+        inventory_count: cases.len(),
+        inventory_sha256,
+        selected_indices,
+    })
+}
+
+struct ExecutableIntegrityGuard {
+    original: ExecutableIdentity,
+    #[cfg(unix)]
+    handle: fs::File,
+    #[cfg(unix)]
+    original_identity: UnixExecutableIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnixExecutableIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    user: u32,
+    group: u32,
+    change_seconds: i64,
+    change_nanoseconds: i64,
+}
+
+impl ExecutableIntegrityGuard {
+    fn new(identity: &ExecutableIdentity) -> Result<Self, String> {
+        let canonical = fs::canonicalize(&identity.path)
+            .map_err(|error| format!("cannot canonicalize bound executable: {error}"))?;
+        if canonical != identity.path {
+            return Err("bound executable identity path is not canonical".to_owned());
+        }
+        let observed = sha256_file(&identity.path)
+            .map_err(|error| format!("cannot hash bound executable: {error}"))?;
+        if observed != identity.sha256 {
+            return Err("bound executable digest differs before batch".to_owned());
+        }
+        #[cfg(unix)]
+        {
+            let handle = fs::File::open(&identity.path)
+                .map_err(|error| format!("cannot retain bound executable handle: {error}"))?;
+            let retained_identity =
+                unix_executable_identity(&handle.metadata().map_err(|error| {
+                    format!("cannot inspect retained executable handle: {error}")
+                })?)?;
+            let original_identity = unix_executable_identity(
+                &fs::metadata(&identity.path)
+                    .map_err(|error| format!("cannot inspect bound executable path: {error}"))?,
+            )?;
+            if retained_identity != original_identity {
+                return Err("bound executable path differs from retained handle".to_owned());
+            }
+            Ok(Self {
+                original: identity.clone(),
+                handle,
+                original_identity,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                original: identity.clone(),
+            })
+        }
+    }
+
+    fn execution_identity(&self) -> &ExecutableIdentity {
+        &self.original
+    }
+
+    fn require_unchanged(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let retained =
+                unix_executable_identity(&self.handle.metadata().map_err(|error| {
+                    format!("cannot recheck retained executable handle: {error}")
+                })?)?;
+            let canonical = fs::canonicalize(&self.original.path)
+                .map_err(|error| format!("cannot recanonicalize bound executable: {error}"))?;
+            let current = unix_executable_identity(
+                &fs::metadata(&canonical)
+                    .map_err(|error| format!("cannot recheck bound executable path: {error}"))?,
+            )?;
+            if canonical != self.original.path
+                || current != self.original_identity
+                || retained != self.original_identity
+            {
+                return Err("bound executable identity changed during batch".to_owned());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let original = sha256_file(&self.original.path)
+                .map_err(|error| format!("cannot rehash original executable: {error}"))?;
+            (original == self.original.sha256)
+                .then_some(())
+                .ok_or_else(|| "bound executable digest changed during batch".to_owned())
+        }
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        self.require_unchanged()?;
+        let original = sha256_file(&self.original.path)
+            .map_err(|error| format!("cannot hash original executable after batch: {error}"))?;
+        (original == self.original.sha256)
+            .then_some(())
+            .ok_or_else(|| "bound executable digest changed during batch".to_owned())
+    }
+}
+
+#[cfg(unix)]
+fn unix_executable_identity(metadata: &fs::Metadata) -> Result<UnixExecutableIdentity, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !metadata.is_file() {
+        return Err("bound executable is not a regular file".to_owned());
+    }
+    Ok(UnixExecutableIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mode: metadata.mode(),
+        user: metadata.uid(),
+        group: metadata.gid(),
+        change_seconds: metadata.ctime(),
+        change_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+/// Runs every differential case with a bounded worker pool while retaining
+/// authoritative input order independently from scheduling order.
+///
+/// # Errors
+///
+/// Returns the lowest authoritative failing case after all workers have
+/// joined, or an integrity/configuration failure with aggregate timing.
+pub fn differential_batch_with_identities(
+    oracle: &ExecutableIdentity,
+    candidate: &ExecutableIdentity,
+    cases: &[DifferentialCase],
+    worker_count: usize,
+) -> Result<DifferentialBatchReport, Box<DifferentialBatchFailure>> {
+    let started = Instant::now();
+    let limit = differential_worker_limit();
+    if worker_count == 0 || worker_count > limit {
+        return Err(Box::new(DifferentialBatchFailure::configuration(
+            format!("differential worker count {worker_count} exceeds exact bound {limit}"),
+            started.elapsed(),
+        )));
+    }
+    if cases.is_empty() {
+        return Ok(DifferentialBatchReport {
+            reports: Vec::new(),
+            case_timings: Vec::new(),
+            timing: DifferentialBatchTiming {
+                worker_count,
+                wall: started.elapsed(),
+                ..DifferentialBatchTiming::default()
+            },
+        });
+    }
+    let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
+    let oracle_guard = ExecutableIntegrityGuard::new(oracle).map_err(|error| {
+        Box::new(DifferentialBatchFailure::configuration(
+            error,
+            started.elapsed(),
+        ))
+    })?;
+    let candidate_guard = ExecutableIntegrityGuard::new(candidate).map_err(|error| {
+        Box::new(DifferentialBatchFailure::configuration(
+            error,
+            started.elapsed(),
+        ))
+    })?;
+    let sandbox_count = u64::try_from(cases.len())
+        .ok()
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| {
+            Box::new(DifferentialBatchFailure::configuration(
+                "differential sandbox count overflow".to_owned(),
+                started.elapsed(),
+            ))
+        })?;
+    let sandbox_base = NEXT_SANDBOX.fetch_add(sandbox_count, Ordering::Relaxed);
+    let active_workers = worker_count.min(cases.len());
+    let (slots, first_failure) = run_differential_workers(
+        &oracle_guard,
+        &candidate_guard,
+        cases,
+        active_workers,
+        sandbox_base,
+        launch_policy.as_ref(),
+    );
+    let integrity = oracle_guard
+        .finish()
+        .and_then(|()| candidate_guard.finish());
+    let wall = started.elapsed();
+    if let Err(error) = integrity {
+        return Err(Box::new(DifferentialBatchFailure::configuration(
+            error, wall,
+        )));
+    }
+    collect_differential_batch(cases, slots, first_failure, active_workers, wall)
+}
+
+type DifferentialSlot = Option<Result<TimedDifferentialReport, String>>;
+
+fn run_differential_workers(
+    oracle_guard: &ExecutableIntegrityGuard,
+    candidate_guard: &ExecutableIntegrityGuard,
+    cases: &[DifferentialCase],
+    worker_count: usize,
+    sandbox_base: u64,
+    launch_policy: Option<&CandidateLaunchPolicy>,
+) -> (Vec<DifferentialSlot>, usize) {
+    let next = AtomicUsize::new(0);
+    let first_failure = AtomicUsize::new(cases.len());
+    let slots = Mutex::new(
+        (0..cases.len())
+            .map(|_| None)
+            .collect::<Vec<DifferentialSlot>>(),
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let oracle_guard = &oracle_guard;
+            let candidate_guard = &candidate_guard;
+            let next = &next;
+            let first_failure = &first_failure;
+            let slots = &slots;
+            scope.spawn(move || {
+                let operation = || loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= cases.len() || index > first_failure.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let outcome = run_guarded_differential_case(
+                        oracle_guard,
+                        candidate_guard,
+                        &cases[index],
+                        sandbox_base,
+                        index,
+                    );
+                    if outcome.is_err() {
+                        first_failure.fetch_min(index, Ordering::AcqRel);
+                    }
+                    slots
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = Some(outcome);
+                };
+                if let Some(policy) = launch_policy {
+                    with_candidate_launch_policy(policy, operation);
+                } else {
+                    operation();
+                }
+            });
+        }
+    });
+    let slots = slots
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (slots, first_failure.load(Ordering::Acquire))
+}
+
+fn collect_differential_batch(
+    cases: &[DifferentialCase],
+    mut slots: Vec<DifferentialSlot>,
+    first_failure: usize,
+    worker_count: usize,
+    wall: Duration,
+) -> Result<DifferentialBatchReport, Box<DifferentialBatchFailure>> {
+    let mut reports = Vec::with_capacity(cases.len());
+    let mut case_timings = Vec::with_capacity(cases.len());
+    let mut timing = DifferentialBatchTiming {
+        case_count: cases.len(),
+        worker_count,
+        wall,
+        ..DifferentialBatchTiming::default()
+    };
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let Some(outcome) = slot.take() else {
+            if index <= first_failure {
+                return Err(Box::new(DifferentialBatchFailure::case(
+                    index,
+                    Arc::clone(&cases[index].id),
+                    "differential worker did not retain its indexed result".to_owned(),
+                    timing,
+                )));
+            }
+            break;
+        };
+        match outcome {
+            Ok(timed) => {
+                timing.completed_count = timing.completed_count.saturating_add(1);
+                timing.oracle_process_sum = timing
+                    .oracle_process_sum
+                    .saturating_add(timed.timing.oracle_process);
+                timing.candidate_process_sum = timing
+                    .candidate_process_sum
+                    .saturating_add(timed.timing.candidate_process);
+                timing.driver_overhead_sum = timing
+                    .driver_overhead_sum
+                    .saturating_add(timed.timing.driver_overhead);
+                case_timings.push(timed.timing);
+                reports.push(timed.report);
+            }
+            Err(detail) => {
+                return Err(Box::new(DifferentialBatchFailure::case(
+                    index,
+                    Arc::clone(&cases[index].id),
+                    detail,
+                    timing,
+                )));
+            }
+        }
+    }
+    if reports.len() != cases.len() {
+        return Err(Box::new(DifferentialBatchFailure::configuration(
+            "differential batch stopped without an indexed failure".to_owned(),
+            wall,
+        )));
+    }
+    Ok(DifferentialBatchReport {
+        reports,
+        case_timings,
+        timing,
+    })
+}
+
+fn run_guarded_differential_case(
+    oracle: &ExecutableIntegrityGuard,
+    candidate: &ExecutableIntegrityGuard,
+    case: &DifferentialCase,
+    sandbox_base: u64,
+    index: usize,
+) -> Result<TimedDifferentialReport, String> {
+    oracle.require_unchanged()?;
+    candidate.require_unchanged()?;
+    let offset = u64::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(2))
+        .ok_or_else(|| "differential sandbox index overflow".to_owned())?;
+    let oracle_sequence = sandbox_base
+        .checked_add(offset)
+        .ok_or_else(|| "differential oracle sandbox sequence overflow".to_owned())?;
+    let candidate_sequence = oracle_sequence
+        .checked_add(1)
+        .ok_or_else(|| "differential candidate sandbox sequence overflow".to_owned())?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        differential_with_identities_timed_at(
+            oracle.execution_identity(),
+            candidate.execution_identity(),
+            case,
+            Some((oracle_sequence, candidate_sequence)),
+        )
+    }))
+    .map_err(|_| "differential worker panicked".to_owned())?
+    .map_err(|error| error.to_string());
+    oracle.require_unchanged()?;
+    candidate.require_unchanged()?;
+    outcome.map(|mut timed| {
+        timed.report.oracle.identity = oracle.original.clone();
+        timed.report.candidate.identity = candidate.original.clone();
+        timed
     })
 }
 
@@ -2821,10 +3917,12 @@ pub fn differential_with_nonclaim_trace_target(
     let oracle_observation = observe_source(oracle, case, "oracle", profile)?;
     let candidate_observation =
         observe_source_with_nonclaim_target(candidate, case, "candidate", profile, target)?;
-    let mismatches = compare(&oracle_observation, &candidate_observation);
+    let (comparison_projection, mismatches) =
+        compare_case_observations(case, &oracle_observation, &candidate_observation);
     Ok(DifferentialReport {
         oracle: oracle_observation,
         candidate: candidate_observation,
+        comparison_projection,
         mismatches,
     })
 }
@@ -2888,7 +3986,7 @@ pub fn inspect_executable(
     role: ExecutableRole,
 ) -> std::io::Result<ExecutableIdentity> {
     let (path, sha256) = resolve_and_hash(path)?;
-    probe_identity(path, sha256, role)
+    probe_identity(path, sha256, role, false)
 }
 
 /// Verifies the pinned digest and reported language version before a corpus.
@@ -2914,7 +4012,7 @@ pub fn verify_executable(
             sha256.hex()
         )));
     }
-    let identity = probe_identity(path, sha256, role)?;
+    let identity = probe_identity(path, sha256, role, true)?;
     if identity.reported_version.as_ref() != expected_version {
         return Err(std::io::Error::other(format!(
             "{:?} executable version mismatch: expected {expected_version:?}, observed {:?}",
@@ -2922,6 +4020,52 @@ pub fn verify_executable(
         )));
     }
     Ok(identity)
+}
+
+/// Verifies that a candidate identity is the unchanged, canonical executable
+/// whose parsed build information enables compatibility tracing.
+///
+/// # Errors
+///
+/// Returns an error for a non-candidate identity, missing or disabled build
+/// information, a noncanonical path, or a digest change since identity probing.
+pub fn verify_compat_tracing_candidate_identity(
+    identity: &ExecutableIdentity,
+) -> std::io::Result<()> {
+    if identity.role != ExecutableRole::Candidate {
+        return Err(std::io::Error::other(
+            "compatibility tracing attestation requires a candidate identity",
+        ));
+    }
+    let build_info = identity
+        .build_info
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("candidate build info is missing"))?;
+    if build_info.schema_version != CANDIDATE_BUILD_INFO_SCHEMA_VERSION {
+        return Err(std::io::Error::other(format!(
+            "candidate build info schema must be {CANDIDATE_BUILD_INFO_SCHEMA_VERSION}"
+        )));
+    }
+    if !build_info.compat_tracing {
+        return Err(std::io::Error::other(
+            "candidate build info reports compat tracing disabled",
+        ));
+    }
+    let canonical = fs::canonicalize(&identity.path)?;
+    if canonical != identity.path {
+        return Err(std::io::Error::other(
+            "candidate identity path is not canonical",
+        ));
+    }
+    let observed = sha256_file(&identity.path)?;
+    if observed != identity.sha256 {
+        return Err(std::io::Error::other(format!(
+            "candidate executable changed after build-info probing: expected {}, observed {}",
+            identity.sha256.hex(),
+            observed.hex()
+        )));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -2970,6 +4114,224 @@ pub fn compare(oracle: &Observation, candidate: &Observation) -> Vec<Differentia
     mismatches
 }
 
+/// Compares two observations under the exact reviewed case authority. Any
+/// descriptor-scoped field projection is returned separately from the
+/// authoritative mismatch set.
+#[must_use]
+pub fn compare_case_observations(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> (DifferentialComparisonProjection, Vec<DifferentialMismatch>) {
+    let mut mismatches = compare(oracle, candidate);
+    let projection = reviewed_runtime_failure_stderr_projection(case, oracle, candidate);
+    if projection.is_some() {
+        mismatches.retain(|mismatch| mismatch.kind != MismatchKind::Stderr);
+    }
+    (
+        projection.unwrap_or(DifferentialComparisonProjection::Exact),
+        mismatches,
+    )
+}
+
+pub(crate) fn reviewed_runtime_failure_stderr_builtin(
+    case: &DifferentialCase,
+) -> Option<BuiltinId> {
+    let descriptor = case.claim_evidence.as_ref()?;
+    if case.mode != DifferentialMode::Run
+        || case.expected_runtime_completion
+        || descriptor.profile != case_execution_profile(case)
+        || validate_case_descriptor(case, descriptor).is_err()
+        || validate_legacy_targets(case, descriptor).is_err()
+        || validate_semantic_targets(case, descriptor).is_err()
+        || validate_callback_contracts(case, descriptor).is_err()
+        || descriptor
+            .targets
+            .iter()
+            .any(|target| target.dimension == CompatibilityDimension::Presentation)
+        || descriptor
+            .semantic_targets
+            .iter()
+            .any(|target| target.dimension == CompatibilityDimension::Presentation)
+        || descriptor
+            .semantic_targets
+            .iter()
+            .any(|target| target.expected_raw_presentation_sha256.is_some())
+    {
+        return None;
+    }
+
+    let mut effects = descriptor.semantic_targets.iter().filter(|target| {
+        target.dimension == CompatibilityDimension::Effects
+            && target.causal_signal == CausalSignal::EffectEvent
+            && target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == "effect-failure")
+            && target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == "effect-ordering")
+            && !target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == "effect-success")
+    });
+    let effect = effects.next()?;
+    if effects.next().is_some() {
+        return None;
+    }
+    let mut adapters = descriptor.semantic_targets.iter().filter(|target| {
+        target.builtin == effect.builtin
+            && target.dimension == CompatibilityDimension::PureRuntime
+            && matches!(
+                target.causal_signal,
+                CausalSignal::RuntimeAdapter | CausalSignal::RuntimeAdapterAndForceTrace
+            )
+            && target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == "adapter-failure")
+            && !target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == "adapter-success")
+    });
+    adapters.next()?;
+    if adapters.next().is_some() {
+        return None;
+    }
+    hell_builtins::lookup(&effect.builtin).map(|builtin| builtin.id)
+}
+
+pub(crate) fn reviewed_runtime_failure_expected_task_trace(
+    case: &DifferentialCase,
+    builtin: BuiltinId,
+) -> Result<Option<Digest>, ()> {
+    let builtin_name = hell_builtins::registry()
+        .iter()
+        .find(|spec| spec.id == builtin)
+        .ok_or(())?
+        .name;
+    let descriptor = case.claim_evidence.as_ref().ok_or(())?;
+    let mut expected = descriptor
+        .semantic_targets
+        .iter()
+        .filter(|target| target.builtin.as_ref() == builtin_name)
+        .filter_map(|target| target.expected_task_trace_sha256);
+    let first = expected.next();
+    if expected.any(|candidate| Some(candidate) != first) {
+        return Err(());
+    }
+    Ok(first)
+}
+
+fn semantic_task_trace_sha256(semantic: &SemanticObservation, builtin: BuiltinId) -> Digest {
+    let mut tasks = Vec::<u64>::new();
+    let mut events = Vec::new();
+    for event in &semantic.task_trace {
+        let LogicalTraceEvent::TaskEvent {
+            task,
+            builtin: event_builtin,
+            event,
+        } = event
+        else {
+            continue;
+        };
+        if *event_builtin != builtin {
+            continue;
+        }
+        let index = tasks
+            .iter()
+            .position(|candidate| candidate == task)
+            .unwrap_or_else(|| {
+                tasks.push(*task);
+                tasks.len() - 1
+            });
+        events.push((index, event.as_ref()));
+    }
+    task_trace_sha256(events)
+}
+
+fn reviewed_runtime_failure_stderr_projection(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Option<DifferentialComparisonProjection> {
+    let builtin = reviewed_runtime_failure_stderr_builtin(case)?;
+    if oracle.identity.role != ExecutableRole::Oracle
+        || candidate.identity.role != ExecutableRole::Candidate
+        || oracle.case_id != case.id
+        || candidate.case_id != case.id
+        || oracle.environment_profile != case.environment_profile
+        || candidate.environment_profile != case.environment_profile
+        || oracle.process_helper_sha256 != case.process_helper_sha256
+        || candidate.process_helper_sha256 != case.process_helper_sha256
+        || oracle.harness_normalizers != applied_harness_normalizers()
+        || candidate.harness_normalizers != applied_harness_normalizers()
+        || oracle.claim_normalizers != applied_claim_normalizers(case)
+        || candidate.claim_normalizers != applied_claim_normalizers(case)
+        || oracle.mode != DifferentialMode::Run
+        || candidate.mode != DifferentialMode::Run
+        || oracle.timed_out
+        || candidate.timed_out
+        || oracle.status.success
+        || candidate.status.success
+        || oracle.status != candidate.status
+        || oracle.stdout != candidate.stdout
+        || oracle.filesystem != candidate.filesystem
+        || oracle.stderr.truncated
+        || candidate.stderr.truncated
+        || oracle.stderr == candidate.stderr
+    {
+        return None;
+    }
+    let semantic = candidate.semantic.as_ref()?;
+    if !semantic
+        .coverage
+        .contains(&CoverageEvent::EnteredAdapter(builtin))
+    {
+        return None;
+    }
+    let expected_task_trace = reviewed_runtime_failure_expected_task_trace(case, builtin).ok()?;
+    if expected_task_trace
+        .is_some_and(|expected| semantic_task_trace_sha256(semantic, builtin) != expected)
+    {
+        return None;
+    }
+    let effects = semantic
+        .effect_trace
+        .iter()
+        .filter_map(|event| match event {
+            LogicalTraceEvent::HostEffect {
+                builtin: observed,
+                owner_task,
+                sequence,
+                parent_sequence,
+                effect,
+            } if *observed == builtin => Some((*owner_task, *sequence, *parent_sequence, effect)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if effects.len() != 2
+        || effects[0].0 != effects[1].0
+        || effects[0].1 != effects[1].1
+        || effects[0].2 != effects[1].2
+        || effects[0].3.as_ref() != "started"
+        || effects[1].3.as_ref() != "failed"
+    {
+        return None;
+    }
+    Some(
+        DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+            oracle_sha256: oracle.stderr.sha256,
+            candidate_sha256: candidate.stderr.sha256,
+            oracle_bytes: oracle.stderr.total_bytes,
+            candidate_bytes: candidate.stderr.total_bytes,
+        },
+    )
+}
+
 fn push_mismatch(
     mismatches: &mut Vec<DifferentialMismatch>,
     kind: MismatchKind,
@@ -3006,7 +4368,30 @@ fn observe_source(
     label: &str,
     profile: ExecutionProfile,
 ) -> std::io::Result<Observation> {
-    observe_source_with_optional_target(identity, case, label, profile, None, false)
+    observe_source_timed(identity, case, label, profile, None).map(|timed| timed.observation)
+}
+
+struct TimedObservation {
+    observation: Observation,
+    process_duration: Duration,
+}
+
+fn observe_source_timed(
+    identity: &ExecutableIdentity,
+    case: &DifferentialCase,
+    label: &str,
+    profile: ExecutionProfile,
+    sandbox_sequence: Option<u64>,
+) -> std::io::Result<TimedObservation> {
+    observe_source_with_optional_target(
+        identity,
+        case,
+        label,
+        profile,
+        None,
+        false,
+        sandbox_sequence,
+    )
 }
 
 fn observe_source_with_nonclaim_target(
@@ -3016,7 +4401,8 @@ fn observe_source_with_nonclaim_target(
     profile: ExecutionProfile,
     target: BuiltinId,
 ) -> std::io::Result<Observation> {
-    observe_source_with_optional_target(identity, case, label, profile, Some(target), true)
+    observe_source_with_optional_target(identity, case, label, profile, Some(target), true, None)
+        .map(|timed| timed.observation)
 }
 
 fn observe_source_with_optional_target(
@@ -3026,8 +4412,9 @@ fn observe_source_with_optional_target(
     profile: ExecutionProfile,
     nonclaim_target: Option<BuiltinId>,
     force_semantic_trace: bool,
-) -> std::io::Result<Observation> {
-    let sandbox = Sandbox::new(label)?;
+    sandbox_sequence: Option<u64>,
+) -> std::io::Result<TimedObservation> {
+    let sandbox = Sandbox::new(label, sandbox_sequence)?;
     let script = sandbox.path.join("main.hell");
     fs::write(&script, case.source.as_bytes())?;
     let resource_audit_path = (identity.role == ExecutableRole::Candidate
@@ -3039,6 +4426,7 @@ fn observe_source_with_optional_target(
         .then(|| sandbox.path.join("candidate-semantic-trace.json"));
     let captured = capture_process(
         &identity.path,
+        identity.role,
         &script,
         &sandbox.path,
         case,
@@ -3052,15 +4440,8 @@ fn observe_source_with_optional_target(
     let resource_audit = resource_audit_path
         .as_ref()
         .map(|path| {
-            let bytes = fs::read(path).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "candidate did not retain resource audit {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
+            let bytes = fs::read(path)
+                .map_err(|error| missing_resource_audit_error(path, &error, &captured))?;
             let audit = parse_resource_audit(&bytes)?;
             fs::remove_file(path)?;
             Ok::<ResourceAudit, std::io::Error>(audit)
@@ -3068,7 +4449,7 @@ fn observe_source_with_optional_target(
         .transpose()?;
     let semantic = semantic_trace_path
         .as_ref()
-        .map(|path| read_semantic_trace(path, force_semantic_trace))
+        .map(|path| read_semantic_trace(path, force_semantic_trace, &captured))
         .transpose()?
         .flatten();
     let raw_stderr = captured.stderr.clone();
@@ -3087,32 +4468,54 @@ fn observe_source_with_optional_target(
     let diagnostic = (case.mode == DifferentialMode::Check && !captured.status.success())
         .then(|| parse_diagnostic_observation(&stderr))
         .transpose()?;
-    Ok(Observation {
-        identity: identity.clone(),
-        case_id: Arc::clone(&case.id),
-        environment_profile: case.environment_profile,
-        process_helper_sha256: case.process_helper_sha256,
-        mode: case.mode,
-        status: captured.status.into(),
-        stdout: captured.stdout,
-        raw_stderr,
-        claim_input_stderr,
-        stderr: BoundedCapture::from_bytes(stderr),
-        normalizer_sandbox: sandbox.path.clone(),
-        normalizer_script: script,
-        timed_out: captured.timed_out,
-        diagnostic,
-        filesystem: snapshot_filesystem(&sandbox.path)?,
-        harness_normalizers: applied_harness_normalizers(),
-        claim_normalizers: applied_claim_normalizers(case),
-        resource_audit,
-        semantic,
+    Ok(TimedObservation {
+        observation: Observation {
+            identity: identity.clone(),
+            case_id: Arc::clone(&case.id),
+            environment_profile: case.environment_profile,
+            process_helper_sha256: case.process_helper_sha256,
+            mode: case.mode,
+            status: captured.status.into(),
+            stdout: captured.stdout,
+            raw_stderr,
+            claim_input_stderr,
+            stderr: BoundedCapture::from_bytes(stderr),
+            normalizer_sandbox: sandbox.path.clone(),
+            normalizer_script: script,
+            timed_out: captured.timed_out,
+            diagnostic,
+            filesystem: snapshot_filesystem(&sandbox.path)?,
+            harness_normalizers: applied_harness_normalizers(),
+            claim_normalizers: applied_claim_normalizers(case),
+            resource_audit,
+            semantic,
+        },
+        process_duration: captured.duration,
     })
+}
+
+fn missing_resource_audit_error(
+    path: &Path,
+    error: &std::io::Error,
+    captured: &CapturedProcess,
+) -> std::io::Error {
+    let stderr = captured.stderr.mismatch_bytes();
+    let stderr = String::from_utf8_lossy(&stderr);
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "candidate did not retain resource audit {} after status {:?}, timed out {}: {error}; child stderr: {stderr}",
+            path.display(),
+            captured.status.code(),
+            captured.timed_out,
+        ),
+    )
 }
 
 fn read_semantic_trace(
     path: &Path,
     absent_is_nonclaim: bool,
+    captured: &CapturedProcess,
 ) -> std::io::Result<Option<SemanticObservation>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -3123,8 +4526,11 @@ fn read_semantic_trace(
             return Err(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "candidate did not retain semantic trace {}: {error}",
-                    path.display()
+                    "candidate did not retain semantic trace {} after status {:?}, timed out {}: {error}; child stderr: {}",
+                    path.display(),
+                    captured.status.code(),
+                    captured.timed_out,
+                    String::from_utf8_lossy(&captured.stderr.mismatch_bytes()),
                 ),
             ));
         }
@@ -3153,7 +4559,7 @@ fn semantic_trace_fields(bytes: &[u8]) -> std::io::Result<SemanticTraceFields<'_
     let text = std::str::from_utf8(bytes)
         .map_err(|_| std::io::Error::other("candidate semantic trace was not UTF-8"))?;
     let mut lines = text.lines();
-    if lines.next() != Some("{") || lines.next() != Some("  \"schemaVersion\": 9,") {
+    if lines.next() != Some("{") || lines.next() != Some("  \"schemaVersion\": 10,") {
         return Err(std::io::Error::other(
             "candidate semantic trace has an unsupported schema",
         ));
@@ -3488,6 +4894,7 @@ fn semantic_observation(parsed: ParsedSemanticTrace) -> SemanticObservation {
                     LogicalTraceEvent::CompleteThunk {
                         label: Arc::from(event.boundary),
                         outcome: Arc::from(event.outcome),
+                        error_code: event.error_code.map(Arc::from),
                     },
                 ]
             })
@@ -4425,6 +5832,27 @@ struct ParsedForcedArgument {
     argument: u16,
     boundary: String,
     outcome: String,
+    error_code: Option<String>,
+}
+
+fn forced_argument_canonical_key(
+    event: &ParsedForcedArgument,
+) -> (u16, u16, u8, u8, &str, &str, &str) {
+    let phase = match event.boundary.as_str() {
+        "nonproductive-repeat" | "nonproductive-parser-node" => Some(0),
+        "nonproductive-pending" => Some(1),
+        "nonproductive-cancelled" => Some(2),
+        _ => None,
+    };
+    (
+        event.builtin.0,
+        event.argument,
+        u8::from(phase.is_some()),
+        phase.unwrap_or_default(),
+        &event.boundary,
+        &event.outcome,
+        event.error_code.as_deref().unwrap_or_default(),
+    )
 }
 
 fn parse_forced_arguments(encoded: &str) -> std::io::Result<Vec<ParsedForcedArgument>> {
@@ -4445,12 +5873,24 @@ fn parse_forced_arguments(encoded: &str) -> std::io::Result<Vec<ParsedForcedArgu
         let (argument, fields) = fields
             .split_once(", \"boundaryClass\": \"")
             .ok_or_else(|| std::io::Error::other("forced argument trace is malformed"))?;
-        let (boundary, outcome) = fields
+        let (boundary, outcome_fields) = fields
             .split_once("\", \"outcome\": \"")
-            .and_then(|(boundary, outcome)| {
-                outcome.strip_suffix('"').map(|value| (boundary, value))
-            })
             .ok_or_else(|| std::io::Error::other("forced argument trace is malformed"))?;
+        let (outcome, error_code) = if let Some((outcome, error_code)) =
+            outcome_fields.split_once("\", \"errorCode\": \"")
+        {
+            let error_code = error_code
+                .strip_suffix('"')
+                .ok_or_else(|| std::io::Error::other("forced argument trace is malformed"))?;
+            (outcome, Some(error_code))
+        } else {
+            (
+                outcome_fields
+                    .strip_suffix('"')
+                    .ok_or_else(|| std::io::Error::other("forced argument trace is malformed"))?,
+                None,
+            )
+        };
         let event = event
             .parse::<u64>()
             .map_err(|_| std::io::Error::other("forced event ID is malformed"))?;
@@ -4466,11 +5906,13 @@ fn parse_forced_arguments(encoded: &str) -> std::io::Result<Vec<ParsedForcedArgu
             argument,
             boundary: boundary.to_owned(),
             outcome: outcome.to_owned(),
+            error_code: error_code.map(str::to_owned),
         };
         if usize::from(builtin) >= hell_builtins::registry().len()
-            || observed
-                .last()
-                .is_some_and(|prior: &ParsedForcedArgument| prior.event_id >= event)
+            || observed.last().is_some_and(|prior: &ParsedForcedArgument| {
+                prior.event_id >= event
+                    || forced_argument_canonical_key(prior) > forced_argument_canonical_key(&pair)
+            })
             || !matches!(
                 boundary,
                 "conditional-branch"
@@ -4483,13 +5925,27 @@ fn parse_forced_arguments(encoded: &str) -> std::io::Result<Vec<ParsedForcedArgu
                     | "lazy-adapter-entry"
                     | "lazy-adapter-exit"
                     | "lazy-demand"
+                    | "nonproductive-cancelled"
+                    | "nonproductive-parser-node"
+                    | "nonproductive-pending"
+                    | "nonproductive-repeat"
                     | "whnf-demand"
+                    | "whnf-force-failed"
                     | "whnf-force-complete"
             )
             || !matches!(
                 outcome,
                 "value" | "error" | "not-forced" | "in-progress" | "cycle" | "poisoned"
             )
+            || match (boundary, outcome, error_code) {
+                ("whnf-force-failed", "error", Some(code)) => {
+                    code.len() != 5
+                        || !code.starts_with('H')
+                        || !code[1..].bytes().all(|byte| byte.is_ascii_digit())
+                }
+                (_, _, None) => false,
+                _ => true,
+            }
         {
             return Err(std::io::Error::other(
                 "forced argument trace is unknown, duplicate, or unsorted",
@@ -5309,7 +6765,13 @@ fn diagnostic_path_separator_v1(stderr: &mut [u8]) {
 
 #[cfg(feature = "mutation-testing")]
 fn diagnostic_mutant_active() -> bool {
-    std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref() == Ok("diagnostic-overbroad-normalization")
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    arguments.windows(4).any(|window| {
+        window[0] == "--skip"
+            && window[1] == "__hell_mutant"
+            && window[2] == "--skip"
+            && window[3] == "diagnostic-overbroad-normalization"
+    })
 }
 
 #[cfg(not(feature = "mutation-testing"))]
@@ -5352,12 +6814,27 @@ fn structured_diagnostic_path<'a>(
     script: &[u8],
 ) -> Option<(&'static [u8], &'a [u8])> {
     const HELPER_PREFIX: &[u8] = b"unknown helper subcommand ";
-    if let Some(suffix) = line.strip_prefix(script) {
+    const ORACLE_PARSE_PREFIX: &[u8] = b"hell: Parse error: ";
+    if let Some(suffix) = line
+        .strip_prefix(script)
+        .filter(|suffix| diagnostic_path_suffix(suffix))
+    {
         return Some((b"", suffix));
     }
-    line.strip_prefix(HELPER_PREFIX)
-        .and_then(|line| line.strip_prefix(script))
-        .map(|suffix| (HELPER_PREFIX, suffix))
+    for prefix in [HELPER_PREFIX, ORACLE_PARSE_PREFIX] {
+        if let Some(suffix) = line
+            .strip_prefix(prefix)
+            .and_then(|line| line.strip_prefix(script))
+            .filter(|suffix| diagnostic_path_suffix(suffix))
+        {
+            return Some((prefix, suffix));
+        }
+    }
+    None
+}
+
+fn diagnostic_path_suffix(suffix: &[u8]) -> bool {
+    suffix.is_empty() || suffix.first() == Some(&b':')
 }
 
 fn haskell_show_path(path: &[u8]) -> Vec<u8> {
@@ -5458,6 +6935,7 @@ fn probe_identity(
     path: PathBuf,
     sha256: Digest,
     role: ExecutableRole,
+    require_candidate_build_info: bool,
 ) -> std::io::Result<ExecutableIdentity> {
     let reported_version = probe_lines(&path, "--version")?;
     let reported_version: Arc<str> = reported_version
@@ -5465,14 +6943,26 @@ fn probe_identity(
         .ok_or_else(|| std::io::Error::other("--version produced no output"))?
         .clone();
     let build_info = if role == ExecutableRole::Candidate {
-        probe_lines(&path, "--build-info")
-            .ok()
-            .map(|lines| BuildInfo {
-                lines: lines.into(),
-            })
+        let parsed = probe_lines(&path, "--build-info").and_then(|lines| {
+            parse_candidate_build_info(lines.iter().map(std::convert::AsRef::as_ref))
+        });
+        match parsed {
+            Ok(build_info) => Some(build_info),
+            Err(error) if require_candidate_build_info => return Err(error),
+            Err(_) => None,
+        }
     } else {
         None
     };
+    let observed_sha256 = sha256_file(&path)?;
+    if observed_sha256 != sha256 {
+        return Err(std::io::Error::other(format!(
+            "{:?} executable changed during identity probing: expected {}, observed {}",
+            role,
+            sha256.hex(),
+            observed_sha256.hex()
+        )));
+    }
     Ok(ExecutableIdentity {
         path,
         sha256,
@@ -5524,6 +7014,7 @@ struct CapturedProcess {
     stdout: BoundedCapture,
     stderr: BoundedCapture,
     timed_out: bool,
+    duration: Duration,
 }
 
 /// Result of a structured host command run under process-tree supervision.
@@ -5552,10 +7043,6 @@ pub fn run_supervised_command(
     input: &[u8],
     timeout: Duration,
 ) -> std::io::Result<SupervisedOutput> {
-    let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
-    if let Some(policy) = &launch_policy {
-        policy.wrap(command)?;
-    }
     struct QuiescenceGuard(Option<CandidateLaunchPolicy>);
     impl Drop for QuiescenceGuard {
         fn drop(&mut self) {
@@ -5563,6 +7050,11 @@ pub fn run_supervised_command(
                 let _ = policy.require_quiescence();
             }
         }
+    }
+
+    let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
+    if let Some(policy) = &launch_policy {
+        policy.wrap(command)?;
     }
     let mut quiescence = QuiescenceGuard(launch_policy);
     command
@@ -5636,6 +7128,7 @@ struct CaptureEvidence<'a> {
 
 fn capture_process(
     executable: &Path,
+    role: ExecutableRole,
     script: &Path,
     working_directory: &Path,
     case: &DifferentialCase,
@@ -5643,7 +7136,33 @@ fn capture_process(
     evidence: CaptureEvidence<'_>,
 ) -> std::io::Result<CapturedProcess> {
     let mut command = Command::new(executable);
-    command.arg("--execution-profile").arg(profile.as_str());
+    if let Some(path) = evidence.resource_audit_path {
+        command.arg("--evidence-resource-audit").arg(path);
+    }
+    if let Some(path) = evidence.semantic_trace_path {
+        command.arg("--evidence-semantic-trace").arg(path);
+        if let Some(selection) = evidence
+            .nonclaim_target
+            .map(|builtin| TypedResultTarget {
+                builtin,
+                instance: None,
+            })
+            .or(typed_result_target(case)?)
+        {
+            let target = hell_builtins::registry()
+                .get(usize::from(selection.builtin.0))
+                .ok_or_else(|| std::io::Error::other("typed result target disappeared"))?;
+            command
+                .arg("--evidence-typed-result-builtin")
+                .arg(target.name);
+            if let Some(instance) = selection.instance {
+                command
+                    .arg("--evidence-typed-result-instance")
+                    .arg(instance.as_ref());
+            }
+        }
+    }
+    configure_execution_profile(&mut command, role, profile);
     match case.mode {
         DifferentialMode::Check => {
             command.arg("--check").arg(script);
@@ -5681,26 +7200,27 @@ fn capture_process(
             command.envs(case.environment.iter().cloned());
         }
     }
-    if let Some(path) = evidence.resource_audit_path {
-        command.env("HELL_EVIDENCE_RESOURCE_AUDIT", path);
-    }
-    if let Some(path) = evidence.semantic_trace_path {
-        command.env("HELL_EVIDENCE_SEMANTIC_TRACE", path);
-        if let Some(target) = evidence.nonclaim_target.or(typed_result_target(case)?) {
-            command.env(
-                "HELL_EVIDENCE_TYPED_RESULT_BUILTIN_ID",
-                target.0.to_string(),
-            );
-        }
-    }
     command.current_dir(working_directory);
+    let started = Instant::now();
     let captured = run_supervised_command(&mut command, &case.stdin, case.timeout)?;
+    let duration = started.elapsed();
     Ok(CapturedProcess {
         status: captured.status,
         stdout: captured.stdout,
         stderr: captured.stderr,
         timed_out: captured.timed_out,
+        duration,
     })
+}
+
+fn configure_execution_profile(
+    command: &mut Command,
+    role: ExecutableRole,
+    profile: ExecutionProfile,
+) {
+    if role == ExecutableRole::Candidate {
+        command.arg("--execution-profile").arg(profile.as_str());
+    }
 }
 
 fn scrub_ci_authority_environment(command: &mut Command) {
@@ -5735,7 +7255,13 @@ fn configure_evidence_native_environment(
     Ok(())
 }
 
-fn typed_result_target(case: &DifferentialCase) -> std::io::Result<Option<BuiltinId>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedResultTarget {
+    builtin: BuiltinId,
+    instance: Option<Arc<str>>,
+}
+
+fn typed_result_target(case: &DifferentialCase) -> std::io::Result<Option<TypedResultTarget>> {
     let targets = case
         .claim_evidence
         .iter()
@@ -5749,11 +7275,14 @@ fn typed_result_target(case: &DifferentialCase) -> std::io::Result<Option<Builti
         })
         .map(|target| {
             hell_builtins::lookup(&target.builtin)
-                .map(|spec| spec.id)
+                .map(|spec| TypedResultTarget {
+                    builtin: spec.id,
+                    instance: target.expected_instance_target.clone(),
+                })
                 .ok_or_else(|| std::io::Error::other("typed-result target is not registry-backed"))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    let Some(first) = targets.first().copied() else {
+    let Some(first) = targets.first().cloned() else {
         return Ok(None);
     };
     if targets.iter().all(|target| *target == first) {
@@ -5914,8 +7443,8 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new(label: &str) -> std::io::Result<Self> {
-        let sequence = NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed);
+    fn new(label: &str, sequence: Option<u64>) -> std::io::Result<Self> {
+        let sequence = sequence.unwrap_or_else(|| NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed));
         let sandbox_root = CANDIDATE_LAUNCH_POLICY.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -6035,8 +7564,39 @@ impl Iterator for DeterministicUtf8 {
 #[cfg(test)]
 mod authority_environment_tests {
     use super::{
-        Command, configure_evidence_native_environment, configure_release_child_environment,
+        Command, WINDOWS_ARGV_TOKEN_LIMIT, WINDOWS_ARGV_TOKEN_PREFIX,
+        configure_evidence_native_environment, configure_release_child_environment,
+        decode_windows_argv_units, encode_windows_argv_units,
     };
+
+    #[test]
+    fn windows_adapter_token_round_trips_adversarial_argv() {
+        let arguments = vec![
+            Vec::new(),
+            "space and \"quotes\" and \\slashes\\"
+                .encode_utf16()
+                .collect(),
+            vec![u16::MAX, 0xd800, 0xdfff],
+        ];
+        let token = encode_windows_argv_units(&arguments).unwrap();
+        assert!(!token.chars().any(char::is_whitespace));
+        assert_eq!(decode_windows_argv_units(&token).unwrap(), arguments);
+    }
+
+    #[test]
+    fn windows_adapter_token_rejects_malformed_units() {
+        assert!(decode_windows_argv_units("hell-argv-v1|not-a-unit").is_err());
+        assert!(decode_windows_argv_units("hell-argv-v1|0").is_err());
+        assert!(decode_windows_argv_units("unknown|1").is_err());
+    }
+
+    #[test]
+    fn windows_adapter_token_enforces_create_process_bound() {
+        let launchable_units = (WINDOWS_ARGV_TOKEN_LIMIT - WINDOWS_ARGV_TOKEN_PREFIX.len()) / 2;
+        let launchable = encode_windows_argv_units(&[vec![1; launchable_units]]).unwrap();
+        assert!(launchable.len() <= WINDOWS_ARGV_TOKEN_LIMIT);
+        assert!(encode_windows_argv_units(&[vec![1; launchable_units + 1]]).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -6045,7 +7605,6 @@ mod authority_environment_tests {
         command.env("GITHUB_TOKEN", "secret");
         command.env("ACTIONS_RUNTIME_TOKEN", "secret");
         command.env("GITHUB_OUTPUT", "secret");
-        command.env("HELL_VISIBLE_SENTINEL", "also-secret");
         configure_release_child_environment(&mut command);
         let output = command.output().expect("spawn environment probe");
         assert!(output.status.success());
@@ -6053,7 +7612,6 @@ mod authority_environment_tests {
         assert!(!visible.contains("GITHUB_TOKEN="));
         assert!(!visible.contains("ACTIONS_RUNTIME_TOKEN="));
         assert!(!visible.contains("GITHUB_OUTPUT="));
-        assert!(!visible.contains("HELL_VISIBLE_SENTINEL="));
     }
 
     #[test]
@@ -6092,10 +7650,34 @@ mod authority_environment_tests {
 mod diagnostic_tests {
     use super::{
         DiagnosticCategory, DiagnosticObservation, DiagnosticPhase, NormalizerId,
-        RetainedNormalizerInput, apply_retained_normalizer_twice, diagnostic_path_separator_v1,
-        parse_diagnostic_observation, scrub_diagnostic_path_bytes,
+        RetainedNormalizerInput, apply_retained_normalizer_twice, configure_execution_profile,
+        diagnostic_path_separator_v1, parse_diagnostic_observation, scrub_diagnostic_path_bytes,
     };
+    use crate::{ExecutableRole, ExecutionProfile};
     use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn execution_profile_is_candidate_only() {
+        let mut oracle = Command::new("oracle");
+        configure_execution_profile(
+            &mut oracle,
+            ExecutableRole::Oracle,
+            ExecutionProfile::Upstream,
+        );
+        assert!(oracle.get_args().next().is_none());
+
+        let mut candidate = Command::new("candidate");
+        configure_execution_profile(
+            &mut candidate,
+            ExecutableRole::Candidate,
+            ExecutionProfile::Upstream,
+        );
+        assert_eq!(
+            candidate.get_args().collect::<Vec<_>>(),
+            ["--execution-profile", "upstream"]
+        );
+    }
 
     #[test]
     fn diagnostic_path_scrubbing_handles_exact_windows_show_quoting_only() {
@@ -6251,6 +7833,22 @@ mod diagnostic_tests {
                 script
             ),
             br"unknown helper subcommand <SANDBOX>\main.hell"
+        );
+        assert_eq!(
+            scrub_diagnostic_path_bytes(
+                br"hell: Parse error: C:\work\sandbox\main.hell:2:1: Parse error: ;",
+                sandbox,
+                script
+            ),
+            br"hell: Parse error: <SANDBOX>\main.hell:2:1: Parse error: ;"
+        );
+        assert_eq!(
+            scrub_diagnostic_path_bytes(
+                br"hell: Parse error: C:\work\sandbox\main.hellish:2:1",
+                sandbox,
+                script
+            ),
+            br"hell: Parse error: C:\work\sandbox\main.hellish:2:1"
         );
         assert_eq!(
             scrub_diagnostic_path_bytes(&once, br"<SANDBOX>", br"<SANDBOX>\main.hell"),
@@ -6423,14 +8021,27 @@ mod typed_target_tests {
         assert_eq!(
             typed_result_target(&case(&["Map.fromList"]))
                 .unwrap()
-                .unwrap(),
+                .unwrap()
+                .builtin,
             hell_builtins::lookup("Map.fromList").unwrap().id
         );
         assert_eq!(
             typed_result_target(&case(&["Map.fromList", "Map.fromList"]))
                 .unwrap()
-                .unwrap(),
+                .unwrap()
+                .builtin,
             hell_builtins::lookup("Map.fromList").unwrap().id
+        );
+        let mut overloaded = case(&["Ord.lt"]);
+        overloaded.claim_evidence.as_mut().unwrap().semantic_targets[0].expected_instance_target =
+            Some("Set".into());
+        assert_eq!(
+            typed_result_target(&overloaded)
+                .unwrap()
+                .unwrap()
+                .instance
+                .as_deref(),
+            Some("Set")
         );
         assert!(typed_result_target(&case(&["Map.fromList", "List.cons"])).is_err());
     }
@@ -6545,30 +8156,36 @@ mod evidence_catalog_tests {
         let descriptor = ordinary.claim_evidence.as_ref().unwrap();
         assert!(validate_semantic_targets(&ordinary, descriptor).is_err());
 
-        let mut collection = eligible_case();
-        {
-            let descriptor = collection.claim_evidence.as_mut().unwrap();
-            descriptor.targets[0].builtin = "Map.singleton".into();
-            let target = &mut descriptor.semantic_targets[0];
-            target.builtin = "Map.singleton".into();
-            target.obligations = required_obligations_for_target(
-                "Map.singleton",
-                CompatibilityDimension::PureRuntime,
-            )
-            .unwrap()
+        let mut collection = committed_differential_cases()
             .into_iter()
-            .map(ObligationId)
-            .collect();
-            target.expected_instance_target = Some("Int".into());
-        }
+            .find(|case| case.id.as_ref() == "runtime-typed-map-singleton-int")
+            .expect("committed Map.singleton Int case");
+        let complete = collection
+            .claim_evidence
+            .as_ref()
+            .expect("reviewed Map.singleton descriptor")
+            .clone();
+        validate_semantic_targets(&collection, &complete)
+            .expect("committed Map.singleton binds explicit empty comparator authority");
+
+        let target = collection
+            .claim_evidence
+            .as_mut()
+            .expect("reviewed Map.singleton descriptor")
+            .semantic_targets
+            .iter_mut()
+            .find(|target| {
+                target.builtin.as_ref() == "Map.singleton"
+                    && target.dimension == CompatibilityDimension::PureRuntime
+            })
+            .expect("reviewed Map.singleton PureRuntime target");
+        assert!(
+            target.expected_comparator_trace_sha256.is_some(),
+            "committed descriptor binds the explicit empty trace"
+        );
+        target.expected_comparator_trace_sha256 = None;
         let missing = collection.claim_evidence.as_ref().unwrap().clone();
         assert!(validate_semantic_targets(&collection, &missing).is_err());
-        collection.claim_evidence.as_mut().unwrap().semantic_targets[0]
-            .expected_comparator_trace_sha256 =
-            Some(comparator_trace_sha256("Map.singleton", 1, "Int", &[], &[]));
-        let complete = collection.claim_evidence.as_ref().unwrap().clone();
-        validate_semantic_targets(&collection, &complete)
-            .expect("explicit empty comparator authority is scoped to Map.singleton");
     }
 
     #[test]
@@ -6583,13 +8200,74 @@ mod evidence_catalog_tests {
     }
 
     #[test]
+    fn portable_directory_catalog_does_not_erase_semantic_fallibility() {
+        for builtin in [
+            "Directory.getCurrentDirectory",
+            "Directory.getHomeDirectory",
+        ] {
+            let semantic =
+                required_obligations_for_target(builtin, CompatibilityDimension::Effects).unwrap();
+            assert!(semantic.contains("effect-success"), "{builtin}");
+            assert!(semantic.contains("effect-failure"), "{builtin}");
+
+            let portable = portable_native_oracle_obligations_for_target(
+                builtin,
+                CompatibilityDimension::Effects,
+            )
+            .unwrap();
+            assert!(portable.contains("effect-success"), "{builtin}");
+            assert!(!portable.contains("effect-failure"), "{builtin}");
+        }
+        let set_current = portable_native_oracle_obligations_for_target(
+            "Directory.setCurrentDirectory",
+            CompatibilityDimension::Effects,
+        )
+        .unwrap();
+        assert!(set_current.contains("effect-failure"));
+    }
+
+    #[test]
     fn runtime_catalog_reports_exact_remaining_scope_after_core_data_tranche() {
         let error = validate_runtime_obligation_coverage(&dormant_committed_differential_cases())
             .expect_err("the runtime corpus is intentionally fail-closed until exhaustive");
         assert!(
-            error.contains("134 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
+            error.contains("138 incomplete cells, 14 boundary gaps, and 0 interaction gaps"),
             "{error}"
         );
+        for builtin in ["Map.singleton", "Set.singleton"] {
+            let cell_prefix = format!("{builtin}/PureRuntime:");
+            let cell = error
+                .split("; ")
+                .find(|cell| cell.starts_with(&cell_prefix))
+                .unwrap_or_else(|| panic!("missing exact residual cell {cell_prefix}"));
+            let scopes = required_runtime_instance_scopes(builtin)
+                .into_iter()
+                .map(|scope| {
+                    format!(
+                        "{}:missing=[\"whnf-failure-boundary\"],bool-partition=false",
+                        scope.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(cell, format!("{cell_prefix} instance-scopes=[{scopes}]"));
+        }
+        for builtin in [
+            "Directory.getCurrentDirectory",
+            "Directory.getHomeDirectory",
+        ] {
+            let cell_prefix = format!("{builtin}/Effects:");
+            let cell = error
+                .split("; ")
+                .find(|cell| cell.starts_with(&cell_prefix))
+                .unwrap_or_else(|| panic!("missing exact residual cell {cell_prefix}"));
+            assert_eq!(
+                cell,
+                format!(
+                    "{cell_prefix} instance-scopes=[unconstrained:missing=[\"effect-failure\"],bool-partition=false]"
+                )
+            );
+        }
         assert!(!error.contains("http-stream-disconnect: missing"));
         assert!(!error.contains("timeout-process: missing"));
         assert!(!error.contains("text-decode-process-capture: missing"));

@@ -169,7 +169,7 @@ fn validate_base64_field(value: &JsonValue, label: &str) -> Result<Vec<u8>, Stri
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 4 != 0 || value.len() > MAX_OBSERVATION_BYTES.saturating_mul(2) {
+    if !value.len().is_multiple_of(4) || value.len() > MAX_OBSERVATION_BYTES.saturating_mul(2) {
         return Err("observation base64 is truncated or oversized".to_owned());
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
@@ -359,6 +359,8 @@ pub(crate) struct EvidenceRecord {
     pub(crate) conformance_plan_sha256: String,
     pub(crate) candidate_sha: String,
     pub(crate) candidate_executable_sha256: String,
+    pub(crate) candidate_build_info_schema_version: u64,
+    pub(crate) candidate_compat_tracing: bool,
     pub(crate) source_inventory_sha256: String,
     pub(crate) oracle: OracleBinding,
     pub(crate) platform: ConformancePlatform,
@@ -384,6 +386,8 @@ pub(crate) struct ExploratoryRecord {
     pub(crate) source_inventory_sha256: String,
     pub(crate) candidate_sha: String,
     pub(crate) candidate_executable_sha256: String,
+    pub(crate) candidate_build_info_schema_version: u64,
+    pub(crate) candidate_compat_tracing: bool,
     pub(crate) oracle: OracleBinding,
     pub(crate) candidate_observation_sha256: String,
     pub(crate) oracle_observation_sha256: String,
@@ -419,19 +423,33 @@ pub(crate) struct EvidenceManifest {
     pub(crate) manifest_sha256: String,
 }
 
+pub(crate) struct EvidenceManifestInput {
+    pub(crate) platform: ConformancePlatform,
+    pub(crate) candidate_sha: String,
+    pub(crate) candidate_executable_sha256: String,
+    pub(crate) release_plan_sha256: String,
+    pub(crate) conformance_plan_sha256: String,
+    pub(crate) oracle: OracleBinding,
+    pub(crate) records: Vec<EvidenceMember>,
+    pub(crate) exploratory_records: Vec<EvidenceMember>,
+    pub(crate) observations: Vec<EvidenceMember>,
+    pub(crate) assigned_obligations: u64,
+}
+
 impl EvidenceManifest {
-    pub(crate) fn new(
-        platform: ConformancePlatform,
-        candidate_sha: String,
-        candidate_executable_sha256: String,
-        release_plan_sha256: String,
-        conformance_plan_sha256: String,
-        oracle: OracleBinding,
-        records: Vec<EvidenceMember>,
-        exploratory_records: Vec<EvidenceMember>,
-        observations: Vec<EvidenceMember>,
-        assigned_obligations: u64,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(input: EvidenceManifestInput) -> Result<Self, String> {
+        let EvidenceManifestInput {
+            platform,
+            candidate_sha,
+            candidate_executable_sha256,
+            release_plan_sha256,
+            conformance_plan_sha256,
+            oracle,
+            records,
+            exploratory_records,
+            observations,
+            assigned_obligations,
+        } = input;
         let produced_records = u64::try_from(records.len()).map_err(|_| "record count overflow")?;
         let mut manifest = Self {
             platform,
@@ -617,10 +635,10 @@ impl EvidenceManifest {
             if !paths.insert(member.path.as_str()) {
                 return Err("evidence manifest repeats a path".to_owned());
             }
-            if let Some(id) = &member.id {
-                if !ids.insert(id.as_str()) {
-                    return Err("evidence manifest repeats an ID".to_owned());
-                }
+            if let Some(id) = &member.id
+                && !ids.insert(id.as_str())
+            {
+                return Err("evidence manifest repeats an ID".to_owned());
             }
         }
         if self.records.iter().any(|member| {
@@ -649,6 +667,14 @@ impl ExploratoryRecord {
     fn json_without_id(&self) -> JsonValue {
         object([
             (
+                "candidateBuildInfoSchemaVersion",
+                number(self.candidate_build_info_schema_version),
+            ),
+            (
+                "candidateCompatTracing",
+                JsonValue::Bool(self.candidate_compat_tracing),
+            ),
+            (
                 "candidateExecutableSha256",
                 string(&self.candidate_executable_sha256),
             ),
@@ -671,7 +697,7 @@ impl ExploratoryRecord {
             ),
             ("platform", string(self.platform.as_str())),
             ("releasePlanSha256", string(&self.release_plan_sha256)),
-            ("schemaVersion", number(1)),
+            ("schemaVersion", number(2)),
             ("seed", number(self.seed)),
             (
                 "sourceInventorySha256",
@@ -703,6 +729,8 @@ impl ExploratoryRecord {
         require_exact_json_keys(
             fields,
             &[
+                "candidateBuildInfoSchemaVersion",
+                "candidateCompatTracing",
                 "candidateExecutableSha256",
                 "candidateObservationSha256",
                 "candidateSha",
@@ -721,7 +749,7 @@ impl ExploratoryRecord {
                 "sourceSha256",
             ],
         )?;
-        if json_member(fields, "schemaVersion")?.number()? != 1 {
+        if json_member(fields, "schemaVersion")?.number()? != 2 {
             return Err("unsupported exploratory record schema".to_owned());
         }
         let record = Self {
@@ -743,6 +771,12 @@ impl ExploratoryRecord {
                 .string()?
                 .to_owned(),
             candidate_sha: json_member(fields, "candidateSha")?.string()?.to_owned(),
+            candidate_build_info_schema_version: json_member(
+                fields,
+                "candidateBuildInfoSchemaVersion",
+            )?
+            .number()?,
+            candidate_compat_tracing: json_member(fields, "candidateCompatTracing")?.boolean()?,
             candidate_executable_sha256: json_member(fields, "candidateExecutableSha256")?
                 .string()?
                 .to_owned(),
@@ -754,6 +788,12 @@ impl ExploratoryRecord {
                 .string()?
                 .to_owned(),
         };
+        if record.candidate_build_info_schema_version != 2 || !record.candidate_compat_tracing {
+            return Err(
+                "exploratory record candidate compatibility tracing attestation is invalid"
+                    .to_owned(),
+            );
+        }
         if json_member(fields, "recordId")?.string()? != record.canonical_id()? {
             return Err("exploratory record content-derived ID mismatch".to_owned());
         }
@@ -1261,6 +1301,8 @@ impl EvidenceRecord {
     pub(crate) fn parse(value: &JsonValue) -> Result<Self, String> {
         let fields = value.object()?;
         let mut expected_keys = vec![
+            "candidateBuildInfoSchemaVersion",
+            "candidateCompatTracing",
             "candidateExecutableSha256",
             "candidateObservationSha256",
             "candidateSha",
@@ -1284,7 +1326,7 @@ impl EvidenceRecord {
             expected_keys.push("accepted");
         }
         require_exact_json_keys(fields, &expected_keys)?;
-        if json_member(fields, "schemaVersion")?.number()? != 1 {
+        if json_member(fields, "schemaVersion")?.number()? != 2 {
             return Err("unsupported evidence record schema".to_owned());
         }
         let cell = CellKey::parse(json_member(fields, "cellKey")?)?;
@@ -1299,6 +1341,12 @@ impl EvidenceRecord {
                 .string()?
                 .to_owned(),
             candidate_sha: json_member(fields, "candidateSha")?.string()?.to_owned(),
+            candidate_build_info_schema_version: json_member(
+                fields,
+                "candidateBuildInfoSchemaVersion",
+            )?
+            .number()?,
+            candidate_compat_tracing: json_member(fields, "candidateCompatTracing")?.boolean()?,
             candidate_executable_sha256: json_member(fields, "candidateExecutableSha256")?
                 .string()?
                 .to_owned(),
@@ -1325,6 +1373,11 @@ impl EvidenceRecord {
                 .to_owned(),
             requested_normalizers: parse_strings(json_member(fields, "requestedNormalizers")?)?,
         };
+        if record.candidate_build_info_schema_version != 2 || !record.candidate_compat_tracing {
+            return Err(
+                "evidence record candidate compatibility tracing attestation is invalid".to_owned(),
+            );
+        }
         if record.platform != record.target.cell.platform
             || record.profile != record.target.cell.profile
         {
@@ -1350,6 +1403,14 @@ impl EvidenceRecord {
 
 fn record_json(record: &EvidenceRecord) -> JsonValue {
     object([
+        (
+            "candidateBuildInfoSchemaVersion",
+            number(record.candidate_build_info_schema_version),
+        ),
+        (
+            "candidateCompatTracing",
+            JsonValue::Bool(record.candidate_compat_tracing),
+        ),
         (
             "candidateExecutableSha256",
             string(&record.candidate_executable_sha256),
@@ -1386,7 +1447,7 @@ fn record_json(record: &EvidenceRecord) -> JsonValue {
                     .collect(),
             ),
         ),
-        ("schemaVersion", number(1)),
+        ("schemaVersion", number(2)),
         (
             "sourceInventorySha256",
             string(&record.source_inventory_sha256),
@@ -1851,21 +1912,21 @@ mod tests {
         observations: Vec<EvidenceMember>,
         assigned_adjustment: u64,
     ) -> EvidenceManifest {
-        EvidenceManifest::new(
+        EvidenceManifest::new(EvidenceManifestInput {
             platform,
-            trusted.candidate_sha.clone(),
-            trusted.candidate_executable_sha256[&platform].clone(),
-            trusted.release_plan_sha256.clone(),
-            trusted.conformance_plan_sha256.clone(),
-            trusted.oracle[&platform].clone(),
+            candidate_sha: trusted.candidate_sha.clone(),
+            candidate_executable_sha256: trusted.candidate_executable_sha256[&platform].clone(),
+            release_plan_sha256: trusted.release_plan_sha256.clone(),
+            conformance_plan_sha256: trusted.conformance_plan_sha256.clone(),
+            oracle: trusted.oracle[&platform].clone(),
             records,
-            Vec::new(),
+            exploratory_records: Vec::new(),
             observations,
-            assigned_obligation_count(plan, platform)
+            assigned_obligations: assigned_obligation_count(plan, platform)
                 .unwrap()
                 .checked_add(assigned_adjustment)
                 .unwrap(),
-        )
+        })
         .unwrap()
     }
 
@@ -1943,6 +2004,8 @@ mod tests {
                     candidate_sha: trusted.candidate_sha.clone(),
                     candidate_executable_sha256: trusted.candidate_executable_sha256[&platform]
                         .clone(),
+                    candidate_build_info_schema_version: 2,
+                    candidate_compat_tracing: true,
                     oracle: trusted.oracle[&platform].clone(),
                     candidate_observation_sha256: observation.sha256.clone(),
                     oracle_observation_sha256: observation.sha256.clone(),
@@ -1958,18 +2021,19 @@ mod tests {
             }
             exploratory.sort_by(|left, right| left.path.cmp(&right.path));
             manifests.push(
-                EvidenceManifest::new(
+                EvidenceManifest::new(EvidenceManifestInput {
                     platform,
-                    trusted.candidate_sha.clone(),
-                    trusted.candidate_executable_sha256[&platform].clone(),
-                    trusted.release_plan_sha256.clone(),
-                    trusted.conformance_plan_sha256.clone(),
-                    trusted.oracle[&platform].clone(),
-                    Vec::new(),
-                    exploratory,
-                    vec![observation_member.clone()],
-                    assigned_obligation_count(plan, platform).unwrap(),
-                )
+                    candidate_sha: trusted.candidate_sha.clone(),
+                    candidate_executable_sha256: trusted.candidate_executable_sha256[&platform]
+                        .clone(),
+                    release_plan_sha256: trusted.release_plan_sha256.clone(),
+                    conformance_plan_sha256: trusted.conformance_plan_sha256.clone(),
+                    oracle: trusted.oracle[&platform].clone(),
+                    records: Vec::new(),
+                    exploratory_records: exploratory,
+                    observations: vec![observation_member.clone()],
+                    assigned_obligations: assigned_obligation_count(plan, platform).unwrap(),
+                })
                 .unwrap(),
             );
         }
@@ -2148,6 +2212,8 @@ mod tests {
             candidate_sha: trusted.candidate_sha.clone(),
             candidate_executable_sha256: trusted.candidate_executable_sha256[&cell.key.platform]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&cell.key.platform].clone(),
             platform: cell.key.platform,
@@ -2189,6 +2255,8 @@ mod tests {
             candidate_sha: "f".repeat(40),
             candidate_executable_sha256: trusted.candidate_executable_sha256[&cell.key.platform]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&cell.key.platform].clone(),
             platform: cell.key.platform,
@@ -2306,6 +2374,8 @@ mod tests {
             candidate_sha: trusted.candidate_sha.clone(),
             candidate_executable_sha256: trusted.candidate_executable_sha256[&cell.key.platform]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&cell.key.platform].clone(),
             platform: cell.key.platform,
@@ -2322,9 +2392,35 @@ mod tests {
             requested_normalizers: Vec::new(),
         };
         record.record_id = record.canonical_id().unwrap();
-        let mut fields = record.json().object().unwrap().clone();
+        let baseline = record.json();
+        assert!(EvidenceRecord::parse(&baseline).is_ok());
+
+        let mut fields = baseline.object().unwrap().clone();
         fields.insert("accepted".to_owned(), JsonValue::Bool(true));
         assert!(EvidenceRecord::parse(&JsonValue::Object(fields)).is_err());
+
+        let mut fields = baseline.object().unwrap().clone();
+        fields.remove("candidateCompatTracing");
+        assert!(EvidenceRecord::parse(&JsonValue::Object(fields)).is_err());
+
+        let mut fields = baseline.object().unwrap().clone();
+        fields.insert("candidateCompatTracing".to_owned(), JsonValue::Bool(false));
+        assert!(
+            EvidenceRecord::parse(&JsonValue::Object(fields))
+                .unwrap_err()
+                .contains("compatibility tracing attestation")
+        );
+
+        let mut fields = baseline.object().unwrap().clone();
+        fields.insert(
+            "candidateBuildInfoSchemaVersion".to_owned(),
+            JsonValue::Number(3),
+        );
+        assert!(
+            EvidenceRecord::parse(&JsonValue::Object(fields))
+                .unwrap_err()
+                .contains("compatibility tracing attestation")
+        );
     }
 
     #[test]
@@ -2396,18 +2492,18 @@ mod tests {
         let platform = omitted[0].platform;
         let mut records = omitted[0].exploratory_records.clone();
         records.pop();
-        omitted[0] = EvidenceManifest::new(
+        omitted[0] = EvidenceManifest::new(EvidenceManifestInput {
             platform,
-            trusted.candidate_sha.clone(),
-            trusted.candidate_executable_sha256[&platform].clone(),
-            trusted.release_plan_sha256.clone(),
-            trusted.conformance_plan_sha256.clone(),
-            trusted.oracle[&platform].clone(),
-            Vec::new(),
-            records,
-            omitted[0].observations.clone(),
-            assigned_obligation_count(&plan, platform).unwrap(),
-        )
+            candidate_sha: trusted.candidate_sha.clone(),
+            candidate_executable_sha256: trusted.candidate_executable_sha256[&platform].clone(),
+            release_plan_sha256: trusted.release_plan_sha256.clone(),
+            conformance_plan_sha256: trusted.conformance_plan_sha256.clone(),
+            oracle: trusted.oracle[&platform].clone(),
+            records: Vec::new(),
+            exploratory_records: records,
+            observations: omitted[0].observations.clone(),
+            assigned_obligations: assigned_obligation_count(&plan, platform).unwrap(),
+        })
         .unwrap();
         let mut omitted_members = members;
         omitted_members.insert(
@@ -2470,6 +2566,8 @@ mod tests {
             candidate_executable_sha256: trusted.candidate_executable_sha256
                 [&ConformancePlatform::LinuxX86_64]
                 .clone(),
+            candidate_build_info_schema_version: 2,
+            candidate_compat_tracing: true,
             source_inventory_sha256: trusted.source_inventory_sha256.clone(),
             oracle: trusted.oracle[&ConformancePlatform::LinuxX86_64].clone(),
             platform: ConformancePlatform::LinuxX86_64,

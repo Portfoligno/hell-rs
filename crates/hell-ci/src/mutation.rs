@@ -30,6 +30,39 @@ pub(crate) fn recognizes(arguments: &[OsString]) -> bool {
     arguments.first().and_then(|value| value.to_str()) == Some("mutation")
 }
 
+pub(crate) fn active(id: &str) -> bool {
+    if !cfg!(feature = "mutation-testing") {
+        return false;
+    }
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let selected = selected_mutant(&arguments);
+    selected.as_deref() == Some(id)
+}
+
+fn selected_mutant(arguments: &[OsString]) -> Option<String> {
+    let marker_count = arguments
+        .iter()
+        .filter(|argument| *argument == "__hell_mutant")
+        .count();
+    if marker_count == 0 {
+        return None;
+    }
+    let selections = arguments
+        .windows(4)
+        .filter(|window| {
+            window[0] == "--skip" && window[1] == "__hell_mutant" && window[2] == "--skip"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(marker_count, 1, "mutation argv marker must be unique");
+    assert_eq!(selections.len(), 1, "mutation argv is malformed");
+    Some(
+        selections[0][3]
+            .to_str()
+            .expect("mutation id must be UTF-8")
+            .to_owned(),
+    )
+}
+
 pub(crate) fn run_cli(root: &Path, arguments: &[OsString]) -> ExitCode {
     let result = parse_output(arguments).and_then(|output| {
         let candidate = git_head(root)?;
@@ -186,17 +219,21 @@ fn run_mutant(
     mutant: &Mutant,
 ) -> Result<JsonValue, String> {
     let arguments = cargo_arguments(mutant)?;
-    let cargo = resolve_cargo()?;
-    let baseline = CommandSpec::new(cargo.as_os_str(), Duration::from_mins(10))
+    let cargo = CommandSpec::cargo(Duration::from_mins(10)).current_directory(root);
+    let baseline = cargo
+        .clone()
         .arguments(arguments.iter().map(String::as_str))
-        .environment_remove("HELL_ASSURANCE_MUTANT_ID")
-        .current_directory(root)
         .run()
         .map_err(|error| format!("cannot run mutation baseline {}: {error}", mutant.id))?;
-    let activated = CommandSpec::new(cargo.as_os_str(), Duration::from_mins(10))
-        .arguments(arguments.iter().map(String::as_str))
-        .environment("HELL_ASSURANCE_MUTANT_ID", &mutant.id)
-        .current_directory(root)
+    let mut activated_arguments = arguments.clone();
+    activated_arguments.extend([
+        "--skip".to_owned(),
+        "__hell_mutant".to_owned(),
+        "--skip".to_owned(),
+        mutant.id.clone(),
+    ]);
+    let activated = cargo
+        .arguments(activated_arguments.iter().map(String::as_str))
         .run()
         .map_err(|error| format!("cannot run mutation {}: {error}", mutant.id))?;
     if !exact_result(&baseline.stdout, &mutant.test, true)?
@@ -246,25 +283,6 @@ fn run_mutant(
         ),
         ("test".to_owned(), JsonValue::String(mutant.test.clone())),
     ])))
-}
-
-fn resolve_cargo() -> Result<PathBuf, String> {
-    let mut candidates = std::env::var_os("CARGO")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if let Some(search) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&search).map(|directory| directory.join("cargo")));
-    }
-    for candidate in candidates {
-        if candidate.is_absolute() && candidate.is_file() {
-            // Preserve the Cargo proxy path: resolving a rustup-managed
-            // `cargo` symlink changes argv[0] to `rustup` and therefore changes
-            // the executable's typed dispatch semantics.
-            return Ok(candidate);
-        }
-    }
-    Err("cannot resolve Cargo executable from CARGO or PATH".to_owned())
 }
 
 fn cargo_arguments(mutant: &Mutant) -> Result<Vec<String>, String> {
@@ -379,5 +397,25 @@ mod tests {
             required_mutant_ids_from_values(&values).unwrap(),
             trusted_required_mutant_ids().unwrap()
         );
+    }
+
+    #[test]
+    fn mutation_selection_requires_one_exact_typed_argv_shape() {
+        let selected = [
+            "test-binary",
+            "--skip",
+            "__hell_mutant",
+            "--skip",
+            "exact-id",
+        ]
+        .map(OsString::from);
+        assert_eq!(selected_mutant(&selected).as_deref(), Some("exact-id"));
+        assert_eq!(selected_mutant(&[OsString::from("test-binary")]), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "mutation argv is malformed")]
+    fn malformed_mutation_selection_fails_closed() {
+        let _ = selected_mutant(&["test-binary", "__hell_mutant", "exact-id"].map(OsString::from));
     }
 }

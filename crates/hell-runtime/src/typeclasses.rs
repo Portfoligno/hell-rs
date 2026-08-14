@@ -2,17 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use hell_core::ClassEvidence;
+use hell_core::{ClassEvidence, InstanceEvidencePlanId};
 use hell_types::TypeNode;
 
 #[cfg(feature = "compat-tracing")]
 use crate::AdapterCausalIdentity;
 use crate::{
     Evaluator, ForceOutcome, FunctionValue, HostFunction, IoAction, ListCell, PrimitiveFamily,
-    PrimitiveVariantValue, RuntimeError, RuntimeResult, Suspension, Thunk, ThunkRef, Value,
-    list_from_values,
+    PrimitiveVariantValue, RuntimeError, RuntimeErrorKind, RuntimeResult, Suspension, Thunk,
+    ThunkRef, Value, list_from_values,
 };
 
 #[derive(Clone, Debug)]
@@ -59,7 +60,12 @@ pub enum OptionParser {
         callback_argument: u16,
     },
     Optional(Arc<Self>),
-    Many(Arc<Self>),
+    Many {
+        parser: Arc<Self>,
+        source: ThunkRef,
+        #[cfg(feature = "compat-tracing")]
+        nonproductive_origin: Option<crate::NonproductiveListOrigin>,
+    },
     Switch(OptionModifiers),
     Flag {
         inactive: Option<ThunkRef>,
@@ -82,6 +88,7 @@ pub struct InfoModifiers {
 pub struct ParserInfo {
     pub(crate) parser: Arc<OptionParser>,
     pub(crate) modifiers: InfoModifiers,
+    pub(crate) program_path: Arc<[Arc<str>]>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -217,6 +224,17 @@ pub(crate) fn instance_target(
             "class evidence root does not match its retained plan",
         ));
     }
+    instance_target_from_type(evaluator, plan.head)
+}
+
+pub(crate) fn instance_plan_target(
+    evaluator: &Evaluator,
+    plan: InstanceEvidencePlanId,
+) -> RuntimeResult<Arc<str>> {
+    let plan = evaluator
+        .program
+        .instance_evidence(plan)
+        .ok_or_else(|| RuntimeError::internal("class evidence plan disappeared"))?;
     instance_target_from_type(evaluator, plan.head)
 }
 
@@ -911,23 +929,42 @@ fn many_value(
 ) -> RuntimeResult<ForceOutcome> {
     match target {
         Some("Options.Parser") => {
-            let argument = evaluator.force(argument)?;
-            let Value::OptionsParser(parser) = argument.as_ref() else {
+            #[cfg(feature = "compat-tracing")]
+            let nonproductive_origin = evaluator
+                .nonproductive_list_origin(Arc::clone(argument), "nonproductive-parser-node")?;
+            let source = Arc::clone(argument);
+            let forced_argument = evaluator.force(argument)?;
+            let Value::OptionsParser(parser) = forced_argument.as_ref() else {
                 return Err(RuntimeError::internal(
                     "Alternative Options.Parser value mismatch",
                 ));
             };
             Ok(ForceOutcome::Value(Arc::new(Value::OptionsParser(
-                Arc::new(OptionParser::Many(Arc::clone(parser))),
+                Arc::new(OptionParser::Many {
+                    parser: Arc::clone(parser),
+                    source,
+                    #[cfg(feature = "compat-tracing")]
+                    nonproductive_origin,
+                }),
             ))))
         }
         Some("Maybe") => match evaluator.force(argument)?.as_ref() {
             Value::Maybe(None) => Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(
                 Thunk::evaluated(Value::List(ListCell::Nil)),
             ))))),
-            Value::Maybe(Some(_)) => Err(RuntimeError::internal(
-                "Alternative.many on a successful Maybe is non-productive",
-            )),
+            Value::Maybe(Some(value)) => {
+                #[cfg(feature = "compat-tracing")]
+                let origin = evaluator
+                    .nonproductive_list_origin(Arc::clone(argument), "nonproductive-repeat")?;
+                Ok(ForceOutcome::Value(Arc::new(Value::Maybe(Some(
+                    Evaluator::repeat_list(
+                        Arc::clone(value),
+                        true,
+                        #[cfg(feature = "compat-tracing")]
+                        origin,
+                    ),
+                )))))
+            }
             _ => Err(RuntimeError::internal("Alternative Maybe value mismatch")),
         },
         Some(other) => Err(RuntimeError::internal(format!(
@@ -1173,7 +1210,10 @@ fn traverse_value(
                             callback_argument,
                         );
                         let action = evaluator.force_io(&action)?;
-                        results.push(action.run(evaluator, context)?);
+                        let result = action.run(evaluator, context)?;
+                        if !discard {
+                            results.push(result);
+                        }
                     }
                     if discard {
                         Ok(Thunk::evaluated(Value::Unit))
@@ -1392,7 +1432,7 @@ fn case_insensitive(evaluator: &mut Evaluator, argument: &ThunkRef) -> RuntimeRe
     let folded = match evaluator.force(argument)?.as_ref() {
         Value::Text(text) => Thunk::evaluated(Value::Text(text.to_lowercase().into())),
         Value::ByteString(bytes) => Thunk::evaluated(Value::ByteString(
-            bytes.iter().map(u8::to_ascii_lowercase).collect(),
+            bytes.iter().copied().map(fold_case_char8_byte).collect(),
         )),
         _ => return Err(RuntimeError::internal("FoldCase evidence/value mismatch")),
     };
@@ -1402,6 +1442,16 @@ fn case_insensitive(evaluator: &mut Evaluator, argument: &ThunkRef) -> RuntimeRe
             folded,
         },
     ))))
+}
+
+fn fold_case_char8_byte(byte: u8) -> u8 {
+    let mut lowercase = char::from(byte).to_lowercase();
+    let folded = lowercase.next().expect("Latin-1 lowercase is nonempty");
+    assert!(
+        lowercase.next().is_none(),
+        "Latin-1 lowercase is one code point"
+    );
+    u8::try_from(u32::from(folded)).expect("Latin-1 lowercase remains Latin-1")
 }
 
 fn folded_case(evaluator: &mut Evaluator, value: &ThunkRef) -> RuntimeResult<ForceOutcome> {
@@ -2215,6 +2265,7 @@ fn option_info(
         ParserInfo {
             parser: Arc::clone(parser),
             modifiers: modifiers.clone(),
+            program_path: Arc::from([]),
         },
     ))))
 }
@@ -2265,28 +2316,38 @@ fn option_exec(evaluator: &mut Evaluator, info: &ThunkRef) -> RuntimeResult<Forc
     let info = info.clone();
     Ok(ForceOutcome::Value(Arc::new(Value::Io(IoAction::new(
         move |evaluator, context| {
-            let mut state = match tokenize_options(&info, &context.args)? {
-                TokenizedOptions::State(state) => state,
-                TokenizedOptions::Help {
-                    info: help_info,
-                    inherited_helper,
-                } => {
-                    let help = render_option_help(&help_info, inherited_helper)?;
-                    context.write(help.as_bytes())?;
-                    return Err(RuntimeError::exit(0));
+            let result: RuntimeResult<ThunkRef> = (|| {
+                let mut state = match tokenize_options(&info, &context.args)? {
+                    TokenizedOptions::State(state) => state,
+                    TokenizedOptions::Help {
+                        info: help_info,
+                        inherited_helper_count,
+                    } => {
+                        let help = render_option_help(&help_info, inherited_helper_count)?;
+                        context.write(help.as_bytes())?;
+                        return Err(RuntimeError::exit(0));
+                    }
+                };
+                let value = match evaluate_option(evaluator, &info.parser, &mut state)? {
+                    OptionEvaluation::Success { value, .. } => value,
+                    OptionEvaluation::Missing { expected, .. } => {
+                        return Err(RuntimeError::option_parse(option_usage_error(
+                            &info,
+                            &option_missing_message(&expected),
+                        )));
+                    }
+                };
+                ensure_no_option_leftovers(&info, &state)?;
+                Ok(value)
+            })();
+            match result {
+                Err(error) if error.kind == RuntimeErrorKind::OptionParse => {
+                    context.write_stderr(error.message.as_bytes())?;
+                    context.write_stderr(b"\n")?;
+                    Err(RuntimeError::exit(1))
                 }
-            };
-            let value = match evaluate_option(evaluator, &info.parser, &mut state)? {
-                OptionEvaluation::Success { value, .. } => value,
-                OptionEvaluation::Missing { expected, .. } => {
-                    return Err(RuntimeError::user(option_usage_error(
-                        &info,
-                        &format!("missing {expected}"),
-                    )));
-                }
-            };
-            ensure_no_option_leftovers(&info, &state)?;
-            Ok(value)
+                result => result,
+            }
         },
     )))))
 }
@@ -2302,14 +2363,14 @@ struct ParserPlan {
     options: BTreeMap<Arc<str>, PlannedOptionKind>,
     commands: BTreeMap<Arc<str>, ParserInfo>,
     command_order: Vec<Arc<str>>,
-    helper: bool,
+    helper_count: usize,
 }
 
 enum TokenizedOptions {
     State(OptionParseState),
     Help {
         info: ParserInfo,
-        inherited_helper: bool,
+        inherited_helper_count: usize,
     },
 }
 
@@ -2332,11 +2393,19 @@ enum OptionOccurrenceValue {
 struct SelectedCommand {
     info: ParserInfo,
     state: Box<OptionParseState>,
+    parent_info: ParserInfo,
+    sibling_commands: BTreeSet<Arc<str>>,
 }
 
 enum OptionEvaluation {
-    Success { value: ThunkRef, consumed: usize },
-    Missing { expected: Arc<str>, consumed: usize },
+    Success {
+        value: ThunkRef,
+        consumed: usize,
+    },
+    Missing {
+        expected: Vec<Arc<str>>,
+        consumed: usize,
+    },
 }
 
 fn validate_option_modifiers(
@@ -2418,10 +2487,15 @@ fn validate_command_modifiers(modifiers: &OptionModifiers) -> RuntimeResult<()> 
 fn compile_option_plan(parser: &OptionParser, plan: &mut ParserPlan) -> RuntimeResult<()> {
     match parser {
         OptionParser::Pure(_) | OptionParser::StringArgument(_) => {}
-        OptionParser::Helper => plan.helper = true,
+        OptionParser::Helper => {
+            plan.helper_count = plan
+                .helper_count
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::internal("Options helper count overflowed"))?;
+        }
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
-        | OptionParser::Many(parser) => compile_option_plan(parser, plan)?,
+        | OptionParser::Many { parser, .. } => compile_option_plan(parser, plan)?,
         OptionParser::Apply {
             function,
             argument,
@@ -2488,13 +2562,14 @@ fn plan_option(
 fn tokenize_options(info: &ParserInfo, arguments: &[OsString]) -> RuntimeResult<TokenizedOptions> {
     let mut plan = ParserPlan::default();
     compile_option_plan(&info.parser, &mut plan)?;
-    tokenize_with_plan(info, &plan, arguments)
+    tokenize_with_plan(info, &plan, 0, arguments)
 }
 
 #[allow(clippy::too_many_lines)]
 fn tokenize_with_plan(
     info: &ParserInfo,
     plan: &ParserPlan,
+    inherited_helper_count: usize,
     arguments: &[OsString],
 ) -> RuntimeResult<TokenizedOptions> {
     let mut state = OptionParseState {
@@ -2513,10 +2588,13 @@ fn tokenize_with_plan(
             index += 1;
             continue;
         }
-        if option_mode && plan.helper && matches!(token.to_str(), Some("--help" | "-h")) {
+        if option_mode
+            && (plan.helper_count > 0 || inherited_helper_count > 0)
+            && matches!(token.to_str(), Some("--help" | "-h"))
+        {
             return Ok(TokenizedOptions::Help {
                 info: info.clone(),
-                inherited_helper: plan.helper,
+                inherited_helper_count,
             });
         }
         if option_mode
@@ -2526,18 +2604,18 @@ fn tokenize_with_plan(
                 .split_once('=')
                 .map_or((long_token, None), |(name, value)| (name, Some(value)));
             let Some(kind) = plan.options.get(name) else {
-                return Err(RuntimeError::user(option_usage_error(
+                return Err(RuntimeError::option_parse(option_usage_error(
                     info,
-                    &format!("unknown option `--{name}`"),
+                    &format!("Invalid option `--{name}'"),
                 )));
             };
             let token_position = index;
             let value = match kind {
                 PlannedOptionKind::Flag => {
                     if attached.is_some() {
-                        return Err(RuntimeError::user(option_usage_error(
+                        return Err(RuntimeError::option_parse(option_usage_error(
                             info,
-                            &format!("flag `--{name}` does not take an argument"),
+                            &format!("Invalid option `--{name}'"),
                         )));
                     }
                     OptionOccurrenceValue::Flag
@@ -2548,9 +2626,9 @@ fn tokenize_with_plan(
                     } else {
                         index += 1;
                         let Some(value) = arguments.get(index) else {
-                            return Err(RuntimeError::user(option_usage_error(
+                            return Err(RuntimeError::option_parse(option_usage_error(
                                 info,
-                                &format!("option `--{name}` requires an argument"),
+                                &format!("The option `--{name}` expects an argument."),
                             )));
                         };
                         OptionOccurrenceValue::Value(value.clone())
@@ -2573,42 +2651,55 @@ fn tokenize_with_plan(
                 .to_str()
                 .is_some_and(|token| token.starts_with('-') && token != "-")
         {
-            return Err(RuntimeError::user(option_usage_error(
+            return Err(RuntimeError::option_parse(option_usage_error(
                 info,
-                &format!("unknown option `{}`", token.to_string_lossy()),
+                &format!("Invalid option `{}'", token.to_string_lossy()),
             )));
         }
         if !plan.commands.is_empty() && state.selected_command.is_none() {
             let Some(command_name) = token.to_str() else {
-                return Err(RuntimeError::user(option_usage_error(
+                return Err(RuntimeError::option_parse(option_usage_error(
                     info,
-                    "command name is not valid Unicode",
+                    "Invalid argument",
                 )));
             };
             let Some(command_info) = plan.commands.get(command_name) else {
-                return Err(RuntimeError::user(option_usage_error(
+                return Err(RuntimeError::option_parse(option_usage_error(
                     info,
-                    &format!("invalid command `{command_name}`"),
+                    &format!("Invalid argument `{command_name}'"),
                 )));
             };
+            let mut command_info = command_info.clone();
+            let mut program_path = info.program_path.iter().cloned().collect::<Vec<_>>();
+            program_path.push(Arc::from(command_name));
+            command_info.program_path = program_path.into();
             let mut command_plan = ParserPlan::default();
             compile_option_plan(&command_info.parser, &mut command_plan)?;
-            command_plan.helper |= plan.helper;
-            match tokenize_with_plan(command_info, &command_plan, &arguments[index + 1..])? {
+            let child_inherited_helpers = inherited_helper_count
+                .checked_add(plan.helper_count)
+                .ok_or_else(|| RuntimeError::internal("Options helper count overflowed"))?;
+            match tokenize_with_plan(
+                &command_info,
+                &command_plan,
+                child_inherited_helpers,
+                &arguments[index + 1..],
+            )? {
                 TokenizedOptions::State(command_state) => {
                     state.selected_command = Some(SelectedCommand {
-                        info: command_info.clone(),
+                        info: command_info,
                         state: Box::new(command_state),
+                        parent_info: info.clone(),
+                        sibling_commands: plan.commands.keys().cloned().collect(),
                     });
                     return Ok(TokenizedOptions::State(state));
                 }
                 TokenizedOptions::Help {
                     info: help_info,
-                    inherited_helper,
+                    inherited_helper_count,
                 } => {
                     return Ok(TokenizedOptions::Help {
                         info: help_info,
-                        inherited_helper,
+                        inherited_helper_count,
                     });
                 }
             }
@@ -2693,7 +2784,12 @@ fn evaluate_option(
             }
             missing @ OptionEvaluation::Missing { .. } => Ok(missing),
         },
-        OptionParser::Many(parser) => {
+        OptionParser::Many {
+            parser,
+            source,
+            #[cfg(feature = "compat-tracing")]
+            nonproductive_origin,
+        } => {
             let mut values = Vec::new();
             let mut consumed = 0usize;
             loop {
@@ -2703,9 +2799,11 @@ fn evaluate_option(
                         consumed: item_consumed,
                     } => {
                         if item_consumed == 0 {
-                            return Err(RuntimeError::user(
-                                "Alternative.many parser accepted empty input",
-                            ));
+                            return evaluator.wait_for_nonproductive_many(
+                                source,
+                                #[cfg(feature = "compat-tracing")]
+                                nonproductive_origin.as_ref(),
+                            );
                         }
                         consumed = consumed.saturating_add(item_consumed);
                         values.push(value);
@@ -2743,7 +2841,7 @@ fn evaluate_option(
             } else if let Some(inactive) = inactive {
                 Ok(option_success(Arc::clone(inactive), 0))
             } else {
-                Ok(option_missing(format!("option `--{long}`"), 0))
+                Ok(option_missing(format!("--{long}"), 0))
             }
         }
         OptionParser::StringOption(modifiers) => {
@@ -2758,7 +2856,10 @@ fn evaluate_option(
                 )),
                 None => match modifier_default(modifiers) {
                     Some(default) => Ok(option_success(default, 0)),
-                    None => Ok(option_missing(format!("option `--{long}`"), 0)),
+                    None => Ok(option_missing(
+                        format!("--{long} {}", argument_metavar(modifiers)),
+                        0,
+                    )),
                 },
             }
         }
@@ -2776,16 +2877,16 @@ fn evaluate_option(
         }
         OptionParser::Commands(_) => {
             let Some(mut selected) = state.selected_command.take() else {
-                return Ok(option_missing("command", 0));
+                return Ok(option_missing("COMMAND", 0));
             };
             let result = evaluate_option(evaluator, &selected.info.parser, &mut selected.state)?;
             match result {
                 OptionEvaluation::Success { value, consumed } => {
-                    ensure_no_option_leftovers(&selected.info, &selected.state)?;
+                    ensure_no_selected_command_leftovers(&selected)?;
                     Ok(option_success(value, consumed.saturating_add(1)))
                 }
-                OptionEvaluation::Missing { expected, .. } => Err(RuntimeError::user(
-                    option_usage_error(&selected.info, &format!("missing {expected}")),
+                OptionEvaluation::Missing { expected, .. } => Err(RuntimeError::option_parse(
+                    option_usage_error(&selected.info, &option_missing_message(&expected)),
                 )),
             }
         }
@@ -2801,54 +2902,34 @@ fn evaluate_option_application(
     #[cfg(feature = "compat-tracing")] callback_parent: Option<AdapterCausalIdentity>,
     #[cfg(feature = "compat-tracing")] callback_argument: u16,
 ) -> RuntimeResult<OptionEvaluation> {
-    let (function, function_consumed, argument, argument_consumed) = if flipped {
-        let argument_result = evaluate_option(evaluator, argument_parser, state)?;
-        let OptionEvaluation::Success {
-            value: argument,
-            consumed: argument_consumed,
-        } = argument_result
-        else {
-            return Ok(argument_result);
-        };
-        let function_result = evaluate_option(evaluator, function_parser, state)?;
-        let OptionEvaluation::Success {
-            value: function,
-            consumed: function_consumed,
-        } = function_result
-        else {
-            let OptionEvaluation::Missing { expected, consumed } = function_result else {
-                unreachable!("option evaluation has two variants")
-            };
-            return Ok(OptionEvaluation::Missing {
-                expected,
-                consumed: argument_consumed.saturating_add(consumed),
-            });
-        };
-        (function, function_consumed, argument, argument_consumed)
+    let (first, second) = if flipped {
+        (
+            evaluate_option(evaluator, argument_parser, state)?,
+            evaluate_option(evaluator, function_parser, state)?,
+        )
     } else {
-        let function_result = evaluate_option(evaluator, function_parser, state)?;
-        let OptionEvaluation::Success {
-            value: function,
-            consumed: function_consumed,
-        } = function_result
-        else {
-            return Ok(function_result);
-        };
-        let argument_result = evaluate_option(evaluator, argument_parser, state)?;
-        let OptionEvaluation::Success {
-            value: argument,
-            consumed: argument_consumed,
-        } = argument_result
-        else {
-            let OptionEvaluation::Missing { expected, consumed } = argument_result else {
-                unreachable!("option evaluation has two variants")
-            };
-            return Ok(OptionEvaluation::Missing {
-                expected,
-                consumed: function_consumed.saturating_add(consumed),
-            });
-        };
-        (function, function_consumed, argument, argument_consumed)
+        (
+            evaluate_option(evaluator, function_parser, state)?,
+            evaluate_option(evaluator, argument_parser, state)?,
+        )
+    };
+    let (first, first_consumed, second, second_consumed) = match (first, second) {
+        (
+            OptionEvaluation::Success {
+                value: first,
+                consumed: first_consumed,
+            },
+            OptionEvaluation::Success {
+                value: second,
+                consumed: second_consumed,
+            },
+        ) => (first, first_consumed, second, second_consumed),
+        (first, second) => return Ok(option_missing_application(first, second)),
+    };
+    let (function, function_consumed, argument, argument_consumed) = if flipped {
+        (second, second_consumed, first, first_consumed)
+    } else {
+        (first, first_consumed, second, second_consumed)
     };
     #[cfg(feature = "compat-tracing")]
     let applied = Evaluator::callback_application_for_optional_parent(
@@ -2879,9 +2960,48 @@ fn option_success(value: ThunkRef, consumed: usize) -> OptionEvaluation {
 
 fn option_missing(expected: impl Into<Arc<str>>, consumed: usize) -> OptionEvaluation {
     OptionEvaluation::Missing {
-        expected: expected.into(),
+        expected: vec![expected.into()],
         consumed,
     }
+}
+
+fn option_missing_application(
+    first: OptionEvaluation,
+    second: OptionEvaluation,
+) -> OptionEvaluation {
+    let mut expected = Vec::new();
+    let mut consumed = 0usize;
+    for result in [first, second] {
+        match result {
+            OptionEvaluation::Success {
+                consumed: branch_consumed,
+                ..
+            } => consumed = consumed.saturating_add(branch_consumed),
+            OptionEvaluation::Missing {
+                expected: branch_expected,
+                consumed: branch_consumed,
+            } => {
+                expected.extend(branch_expected);
+                consumed = consumed.saturating_add(branch_consumed);
+            }
+        }
+    }
+    assert!(
+        !expected.is_empty(),
+        "failed option application must retain one missing requirement"
+    );
+    OptionEvaluation::Missing { expected, consumed }
+}
+
+fn option_missing_message(expected: &[Arc<str>]) -> String {
+    format!(
+        "Missing: {}",
+        expected
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(" ")
+    )
 }
 
 fn required_long(modifiers: &OptionModifiers) -> RuntimeResult<&str> {
@@ -2915,7 +3035,7 @@ fn argument_metavar(modifiers: &OptionModifiers) -> Arc<str> {
             OptionModifier::Metavar(value) => Some(Arc::clone(value)),
             _ => None,
         })
-        .unwrap_or_else(|| Arc::from("argument"))
+        .unwrap_or_else(|| Arc::from("ARG"))
 }
 
 fn ensure_no_option_leftovers(info: &ParserInfo, state: &OptionParseState) -> RuntimeResult<()> {
@@ -2924,24 +3044,46 @@ fn ensure_no_option_leftovers(info: &ParserInfo, state: &OptionParseState) -> Ru
         .iter()
         .find(|(_, occurrences)| !occurrences.is_empty())
     {
-        return Err(RuntimeError::user(option_usage_error(
+        return Err(RuntimeError::option_parse(option_usage_error(
             info,
-            &format!("unexpected repeated option `--{long}`"),
+            &format!("Invalid option `--{long}'"),
         )));
     }
     if let Some(unexpected) = state.positionals.front() {
-        return Err(RuntimeError::user(option_usage_error(
+        return Err(RuntimeError::option_parse(option_usage_error(
             info,
-            &format!("unexpected argument `{}`", unexpected.to_string_lossy()),
+            &format!("Invalid argument `{}'", unexpected.to_string_lossy()),
         )));
     }
     if state.selected_command.is_some() {
-        return Err(RuntimeError::user(option_usage_error(
+        return Err(RuntimeError::option_parse(option_usage_error(
             info,
-            "unexpected command",
+            "Invalid argument",
         )));
     }
     Ok(())
+}
+
+fn ensure_no_selected_command_leftovers(selected: &SelectedCommand) -> RuntimeResult<()> {
+    if selected
+        .state
+        .options
+        .values()
+        .any(|occurrences| !occurrences.is_empty())
+    {
+        return ensure_no_option_leftovers(&selected.info, &selected.state);
+    }
+    if let Some(unexpected) = selected.state.positionals.front() {
+        let info = unexpected
+            .to_str()
+            .filter(|name| selected.sibling_commands.contains(*name))
+            .map_or(&selected.info, |_| &selected.parent_info);
+        return Err(RuntimeError::option_parse(option_usage_error(
+            info,
+            &format!("Invalid argument `{}'", unexpected.to_string_lossy()),
+        )));
+    }
+    ensure_no_option_leftovers(&selected.info, &selected.state)
 }
 
 fn modifier_long(modifiers: &OptionModifiers) -> Option<&str> {
@@ -2967,68 +3109,127 @@ fn modifier_default(modifiers: &OptionModifiers) -> Option<ThunkRef> {
 }
 
 fn option_usage_error(info: &ParserInfo, message: &str) -> String {
-    let mut output = message.to_owned();
-    if let Some(header) = &info.modifiers.header {
-        output.push_str("\n\n");
-        output.push_str(header);
-    }
+    let mut output = format!("{message}\n\n{}", option_usage_line(info));
     if let Some(description) = &info.modifiers.program_description {
-        output.push_str("\n\n");
+        output.push_str("\n\n  ");
         output.push_str(description);
-    }
-    if info.modifiers.full_description {
-        output.push_str("\n\nUse --help for usage details.");
-    }
-    if let Some(help) = parser_help(&info.parser) {
-        output.push_str("\n\n");
-        output.push_str(help);
     }
     output
 }
 
-fn render_option_help(info: &ParserInfo, inherited_helper: bool) -> RuntimeResult<String> {
+fn option_usage_line(info: &ParserInfo) -> String {
+    let synopsis = parser_usage(&info.parser);
+    let mut parts = vec!["Usage: hell".to_owned()];
+    parts.extend(info.program_path.iter().map(ToString::to_string));
+    if !synopsis.is_empty() {
+        parts.push(synopsis);
+    }
+    parts.join(" ")
+}
+
+fn parser_usage(parser: &OptionParser) -> String {
+    match parser {
+        OptionParser::Pure(_) | OptionParser::Helper => String::new(),
+        OptionParser::Map { parser, .. } => parser_usage(parser),
+        OptionParser::Apply {
+            function,
+            argument,
+            flipped,
+            ..
+        } => {
+            let (first, second) = if *flipped {
+                (argument, function)
+            } else {
+                (function, argument)
+            };
+            [parser_usage(first), parser_usage(second)]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        OptionParser::Optional(parser) => optional_usage(parser, false),
+        OptionParser::Many { parser, .. } => optional_usage(parser, true),
+        OptionParser::Switch(modifiers) => option_long_syntax(modifiers)
+            .map(|syntax| format!("[{syntax}]"))
+            .unwrap_or_default(),
+        OptionParser::Flag {
+            inactive,
+            modifiers,
+            ..
+        } => option_long_syntax(modifiers).map_or_else(String::new, |syntax| {
+            if inactive.is_some() {
+                format!("[{syntax}]")
+            } else {
+                syntax
+            }
+        }),
+        OptionParser::StringOption(modifiers) => {
+            option_long_syntax(modifiers).map_or_else(String::new, |syntax| {
+                let syntax = format!("{syntax} {}", argument_metavar(modifiers));
+                if modifier_default(modifiers).is_some() {
+                    format!("[{syntax}]")
+                } else {
+                    syntax
+                }
+            })
+        }
+        OptionParser::StringArgument(modifiers) => {
+            let syntax = argument_metavar(modifiers).to_string();
+            if modifier_default(modifiers).is_some() {
+                format!("[{syntax}]")
+            } else {
+                syntax
+            }
+        }
+        OptionParser::Commands(_) => "COMMAND".to_owned(),
+    }
+}
+
+fn optional_usage(parser: &OptionParser, _repeated: bool) -> String {
+    let inner = parser_usage(parser);
+    if inner.is_empty() {
+        return inner;
+    }
+    format!("[{inner}]")
+}
+
+fn render_option_help(info: &ParserInfo, inherited_helper_count: usize) -> RuntimeResult<String> {
     let mut plan = ParserPlan::default();
     compile_option_plan(&info.parser, &mut plan)?;
-    plan.helper |= inherited_helper;
+    let helper_count = plan
+        .helper_count
+        .checked_add(inherited_helper_count)
+        .ok_or_else(|| RuntimeError::internal("Options helper count overflowed"))?;
     let mut output = String::new();
     if let Some(header) = &info.modifiers.header {
         output.push_str(header);
         output.push_str("\n\n");
     }
-    output.push_str("Usage:");
-    if !plan.options.is_empty() || plan.helper {
-        output.push_str(" [OPTIONS]");
-    }
-    if !plan.commands.is_empty() {
-        output.push_str(" COMMAND");
-    }
-    if parser_has_positional(&info.parser) {
-        output.push_str(" ARGUMENTS");
-    }
+    output.push_str(&option_usage_line(info));
     output.push('\n');
     if let Some(description) = &info.modifiers.program_description {
-        output.push('\n');
+        output.push_str("\n  ");
         output.push_str(description);
         output.push('\n');
     }
     let mut entries = Vec::new();
     collect_option_help(&info.parser, &mut entries);
-    if plan.helper {
+    for _ in 0..helper_count {
         entries.push((
-            "-h, --help".to_owned(),
+            "-h,--help".to_owned(),
             Some(Arc::from("Show this help text")),
         ));
     }
     if !entries.is_empty() {
         output.push_str("\nAvailable options:\n");
         for (syntax, help) in entries {
-            output.push_str("  ");
-            output.push_str(&syntax);
             if let Some(help) = help {
                 output.push_str("  ");
+                write!(output, "{syntax:<25}").expect("writing to String cannot fail");
                 output.push_str(&help);
+                output.push('\n');
             }
-            output.push('\n');
         }
     }
     if !plan.commands.is_empty() {
@@ -3039,10 +3240,11 @@ fn render_option_help(info: &ParserInfo, inherited_helper: bool) -> RuntimeResul
                 .get(name)
                 .expect("planned command order references a command");
             output.push_str("  ");
-            output.push_str(name);
             if let Some(description) = &command.modifiers.program_description {
-                output.push_str("  ");
+                write!(output, "{name:<25}").expect("writing to String cannot fail");
                 output.push_str(description);
+            } else {
+                output.push_str(name);
             }
             output.push('\n');
         }
@@ -3050,24 +3252,11 @@ fn render_option_help(info: &ParserInfo, inherited_helper: bool) -> RuntimeResul
     Ok(output)
 }
 
-fn parser_has_positional(parser: &OptionParser) -> bool {
-    match parser {
-        OptionParser::StringArgument(_) => true,
-        OptionParser::Map { parser, .. }
-        | OptionParser::Optional(parser)
-        | OptionParser::Many(parser) => parser_has_positional(parser),
-        OptionParser::Apply {
-            function, argument, ..
-        } => parser_has_positional(function) || parser_has_positional(argument),
-        _ => false,
-    }
-}
-
 fn collect_option_help(parser: &OptionParser, entries: &mut Vec<(String, Option<Arc<str>>)>) {
     match parser {
         OptionParser::Map { parser, .. }
         | OptionParser::Optional(parser)
-        | OptionParser::Many(parser) => collect_option_help(parser, entries),
+        | OptionParser::Many { parser, .. } => collect_option_help(parser, entries),
         OptionParser::Apply {
             function,
             argument,
@@ -3083,32 +3272,36 @@ fn collect_option_help(parser: &OptionParser, entries: &mut Vec<(String, Option<
             }
         }
         OptionParser::Switch(modifiers) | OptionParser::Flag { modifiers, .. } => {
-            if let Some(syntax) = option_long_syntax(modifiers) {
-                entries.push((syntax, modifier_help(modifiers)));
+            if let (Some(syntax), Some(help)) =
+                (option_long_syntax(modifiers), modifier_help(modifiers))
+            {
+                entries.push((syntax, Some(help)));
             }
         }
         OptionParser::StringOption(modifiers) => {
-            if let Some(mut syntax) = option_long_syntax(modifiers) {
+            if let (Some(mut syntax), Some(help)) =
+                (option_long_syntax(modifiers), modifier_help(modifiers))
+            {
                 let metavar = argument_metavar(modifiers);
                 syntax.push(' ');
                 syntax.push_str(&metavar);
-                entries.push((syntax, modifier_help(modifiers)));
+                entries.push((syntax, Some(help)));
             }
         }
         OptionParser::StringArgument(modifiers) => {
-            entries.push((
-                argument_metavar(modifiers).to_string(),
-                modifier_help(modifiers),
-            ));
+            if let Some(help) = modifier_help(modifiers) {
+                entries.push((argument_metavar(modifiers).to_string(), Some(help)));
+            }
         }
         OptionParser::Pure(_) | OptionParser::Helper | OptionParser::Commands(_) => {}
     }
 }
 
 fn option_long_syntax(modifiers: &OptionModifiers) -> Option<String> {
-    let aliases = modifier_longs(modifiers)
+    let mut aliases = modifier_longs(modifiers)
         .map(|long| format!("--{long}"))
         .collect::<Vec<_>>();
+    aliases.sort_unstable();
     (!aliases.is_empty()).then(|| aliases.join("|"))
 }
 
@@ -3121,30 +3314,4 @@ fn modifier_help(modifiers: &OptionModifiers) -> Option<Arc<str>> {
             OptionModifier::Help(help) => Some(Arc::clone(help)),
             _ => None,
         })
-}
-
-fn parser_help(parser: &OptionParser) -> Option<&str> {
-    match parser {
-        OptionParser::Map { parser, .. }
-        | OptionParser::Optional(parser)
-        | OptionParser::Many(parser) => parser_help(parser),
-        OptionParser::Apply {
-            function, argument, ..
-        } => parser_help(function).or_else(|| parser_help(argument)),
-        OptionParser::Switch(modifiers)
-        | OptionParser::Flag { modifiers, .. }
-        | OptionParser::StringOption(modifiers)
-        | OptionParser::StringArgument(modifiers)
-        | OptionParser::Commands(modifiers) => {
-            modifiers
-                .0
-                .iter()
-                .rev()
-                .find_map(|modifier| match modifier {
-                    OptionModifier::Help(help) => Some(help.as_ref()),
-                    _ => None,
-                })
-        }
-        OptionParser::Pure(_) | OptionParser::Helper => None,
-    }
 }

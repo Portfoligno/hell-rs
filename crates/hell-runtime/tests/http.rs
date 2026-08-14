@@ -486,7 +486,7 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
 }
 
 #[test]
-fn streaming_client_disconnect_unwinds_and_releases_resource_permits() {
+fn streaming_client_disconnect_is_connection_local_and_releases_resource_permits() {
     let port = available_port();
     let chunk = "x".repeat(1024);
     let source = format!(
@@ -509,15 +509,121 @@ fn streaming_client_disconnect_unwinds_and_releases_resource_permits() {
     stream.shutdown(Shutdown::Both).unwrap();
     drop(stream);
 
-    let error = receiver
+    receiver
         .recv_timeout(Duration::from_secs(3))
         .expect("client disconnect unwound the response stream")
-        .unwrap_err();
-    assert!(error.starts_with("H0908:"), "unexpected error: {error}");
+        .expect("client disconnect must not fail the HTTP application");
     worker.join().unwrap();
     let resources = observer.budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
+}
+
+#[test]
+fn file_and_chunked_fixed_disconnects_are_connection_local() {
+    let directory = std::env::temp_dir().join(format!(
+        "hell-http-peer-abort-{}-{}",
+        std::process::id(),
+        available_port()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("large.bin");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(64 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let file_port = available_port();
+    let file_source = format!(
+        concat!(
+            "main = Http.run {file_port} \\_request respond ->\n",
+            "  respond $ Http.responseFile (Http.mkStatus 200 \"OK\") []\n",
+            "    \"large.bin\" Maybe.Nothing\n",
+        ),
+        file_port = file_port
+    );
+    let (worker, receiver, observer) = start_server_observed(&file_source, directory.clone());
+    let mut stream = connect(file_port);
+    stream
+        .write_all(b"GET /file HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let head = read_response_head(&mut stream);
+    assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    stream.shutdown(Shutdown::Both).unwrap();
+    drop(stream);
+    receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("file disconnect unwound the response")
+        .expect("file disconnect must not fail the HTTP application");
+    worker.join().unwrap();
+    let resources = observer.budget().snapshot();
+    assert_eq!(resources.live_http_connections, 0);
+    assert_eq!(resources.live_tasks, 0);
+
+    let fixed_port = available_port();
+    let fixed_source = format!(
+        concat!(
+            "main = Http.run {fixed_port} \\_request respond -> do\n",
+            "  body <- ByteString.readFile \"large.bin\"\n",
+            "  respond $ Http.responseBuilder (Http.mkStatus 200 \"OK\")\n",
+            "    [(CI.mk (Text.encodeUtf8 \"Transfer-Encoding\"), Text.encodeUtf8 \"chunked\")]\n",
+            "    (Builder.byteString body)\n",
+        ),
+        fixed_port = fixed_port
+    );
+    let (worker, receiver, observer) = start_server_observed(&fixed_source, directory.clone());
+    let mut stream = connect(fixed_port);
+    stream
+        .write_all(b"GET /fixed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let head = read_response_head(&mut stream);
+    assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    stream.shutdown(Shutdown::Both).unwrap();
+    drop(stream);
+    receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("fixed disconnect unwound the response")
+        .expect("fixed disconnect must not fail the HTTP application");
+    worker.join().unwrap();
+    let resources = observer.budget().snapshot();
+    assert_eq!(resources.live_http_connections, 0);
+    assert_eq!(resources.live_tasks, 0);
+
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn incomplete_request_before_response_remains_server_fatal() {
+    let port = available_port();
+    let source = format!(
+        concat!(
+            "main = Http.run {port} \\request respond -> do\n",
+            "  body <- Http.consumeRequestBodyStrict request\n",
+            "  respond $ Http.responseBuilder (Http.mkStatus 200 \"OK\") []\n",
+            "    (Builder.byteString body)\n",
+        ),
+        port = port
+    );
+    let (worker, receiver) = start_server(&source, std::env::temp_dir());
+    let mut stream = connect(port);
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\npartial")
+        .unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+
+    let error = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("incomplete request reached the server scope")
+        .unwrap_err();
+    let cancelled = error == "H0906: IO action was cancelled";
+    let body_read_failed = error.starts_with("H0908:")
+        && error.contains("read HTTP request body: error reading a body from connection");
+    assert!(
+        cancelled || body_read_failed,
+        "unexpected incomplete-request error: {error}"
+    );
+    drop(stream);
+    worker.join().unwrap();
 }
 
 #[test]
@@ -936,15 +1042,19 @@ fn timed_cancellation_wakes_a_partial_request_body_read() {
     worker.join().unwrap();
 }
 
+#[cfg(feature = "mutation-testing")]
 #[test]
 fn blocked_body_test_detects_removed_process_stream_cancellation() {
     let executable = std::env::current_exe().expect("HTTP integration test executable exists");
     let output = std::process::Command::new(executable)
-        .env("HELL_ASSURANCE_MUTANT_ID", "process-stream-cancellation")
         .args([
             "--exact",
             "timed_cancellation_wakes_a_partial_request_body_read",
             "--nocapture",
+            "--skip",
+            "__hell_mutant",
+            "--skip",
+            "process-stream-cancellation",
         ])
         .output()
         .expect("activated HTTP cancellation test starts");

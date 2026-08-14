@@ -32,7 +32,7 @@ pub(crate) fn run(
     let oracle_source = fs::canonicalize(oracle_source)
         .map_err(|error| format!("cannot canonicalize oracle root: {error}"))?;
     validate_checkout(&root, &plan)?;
-    validate_runner(platform)?;
+    let runner_identity = validate_runner(platform)?;
     validate_oracle(&oracle_source)?;
     let oracle_inventory_before = source_inventory(&oracle_source)?;
     let oracle_inventory_digest =
@@ -74,13 +74,20 @@ pub(crate) fn run(
         return Err("candidate dependency policy differs from trusted automation".to_owned());
     }
     write_atomic(&output.join("source-inventory.json"), &inventory_bytes)?;
-    let (tools, prepared_oracle) =
+    let (tools, prepared_oracle) = {
+        let archive_adapter = crate::command::NativeArchiveAdapter::for_macos(
+            platform == ReleasePlatform::MacosAarch64,
+            &target,
+            &oracle_source,
+        )?;
         hell_testkit::with_candidate_launch_policy(launch_policy, || -> Result<_, String> {
             Ok((
-                tool_identities(platform, &oracle_source, &target)?,
-                prepare_oracle(platform, &oracle_source, &root, &target)?,
+                tool_identities(platform, &oracle_source, &archive_adapter)?,
+                prepare_oracle(platform, &oracle_source, &root, &archive_adapter)?,
             ))
-        })?;
+        })?
+    };
+    require_candidate_target(&root, &target)?;
 
     let mut gates = BTreeMap::from([
         ("runner-identity", true),
@@ -91,8 +98,8 @@ pub(crate) fn run(
     evidence.insert(
         "runner-identity".to_owned(),
         object([
-            ("arch", string(&env::var("RUNNER_ARCH").unwrap_or_default())),
-            ("os", string(&env::var("RUNNER_OS").unwrap_or_default())),
+            ("arch", string(&runner_identity.1)),
+            ("os", string(&runner_identity.0)),
             ("schemaVersion", number(1)),
             ("state", string("passed")),
         ]),
@@ -793,9 +800,7 @@ fn validate_conformance_plan(
 }
 
 fn accept_conformance_plan_binding(matches: bool) -> bool {
-    let substitution = cfg!(feature = "mutation-testing")
-        && std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref()
-            == Ok("candidate-conformance-plan-substitution");
+    let substitution = crate::mutation::active("candidate-conformance-plan-substitution");
     substitution || matches
 }
 
@@ -1155,19 +1160,7 @@ fn run_platform_gates(
         )?;
         command_gate(
             "release-build",
-            cargo(
-                root,
-                Duration::from_mins(30),
-                [
-                    "build",
-                    "--release",
-                    "--locked",
-                    "--package",
-                    "hell-cli",
-                    "--bin",
-                    "hell",
-                ],
-            ),
+            release_candidate_build(root),
             gates,
             evidence,
         )?;
@@ -1284,6 +1277,12 @@ fn collect_conformance_evidence(
         hell_builtins::LANGUAGE_VERSION,
     )
     .map_err(|error| format!("cannot bind conformance candidate executable: {error}"))?;
+    hell_testkit::verify_compat_tracing_candidate_identity(&candidate)
+        .map_err(|error| format!("cannot bind candidate compatibility tracing: {error}"))?;
+    let candidate_build_info = candidate
+        .build_info
+        .as_ref()
+        .ok_or_else(|| "verified candidate build info is missing".to_owned())?;
     let oracle_binding = crate::conformance::OracleBinding {
         repository: "chrisdone/hell".to_owned(),
         commit: "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff".to_owned(),
@@ -1302,14 +1301,28 @@ fn collect_conformance_evidence(
         .collect::<BTreeSet<_>>();
     let mut observations = BTreeMap::<String, Vec<u8>>::new();
     let mut committed_observations = BTreeMap::<String, (String, String)>::new();
-    for case_id in requested_case_ids {
-        let case = committed_cases
-            .get(&case_id)
-            .ok_or_else(|| format!("planned committed case {case_id:?} is unavailable"))?;
-        let report = collect_one_differential(oracle, &candidate, case)?;
+    let requested_cases = requested_case_ids
+        .iter()
+        .map(|case_id| {
+            committed_cases
+                .get(case_id)
+                .cloned()
+                .ok_or_else(|| format!("planned committed case {case_id:?} is unavailable"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let workers = hell_testkit::differential_worker_limit();
+    let committed_batch = hell_testkit::differential_batch_with_identities(
+        oracle,
+        &candidate,
+        &requested_cases,
+        workers,
+    )
+    .map_err(|error| format!("cannot collect committed differential batch: {error}"))?;
+    let mut differential_timing = committed_batch.timing;
+    for (case_id, report) in requested_case_ids.iter().zip(committed_batch.reports) {
         let oracle_digest = retain_observation(&report.oracle, &mut observations)?;
         let candidate_digest = retain_observation(&report.candidate, &mut observations)?;
-        committed_observations.insert(case_id, (candidate_digest, oracle_digest));
+        committed_observations.insert(case_id.clone(), (candidate_digest, oracle_digest));
     }
     let mut record_files = BTreeMap::<String, Vec<u8>>::new();
     let mut record_members = Vec::new();
@@ -1327,6 +1340,8 @@ fn collect_conformance_evidence(
                 conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
                 candidate_sha: plan.resolution.candidate_sha.clone(),
                 candidate_executable_sha256: candidate.sha256.hex(),
+                candidate_build_info_schema_version: candidate_build_info.schema_version,
+                candidate_compat_tracing: candidate_build_info.compat_tracing,
                 source_inventory_sha256: plan.source_inventory_sha256.clone(),
                 oracle: oracle_binding.clone(),
                 platform: conformance_platform,
@@ -1357,16 +1372,27 @@ fn collect_conformance_evidence(
     }
     let mut exploratory_members = Vec::new();
     let mut unclassified_mismatches = 0_u64;
-    for generated in hell_testkit::generated_typed_cases(
+    let generated = hell_testkit::generated_typed_cases(
         crate::conformance::EXPLORATORY_GENERATOR_SEED,
         crate::conformance::EXPLORATORY_GENERATOR_COUNT,
-    ) {
-        let case = hell_testkit::DifferentialCase {
+    );
+    let generated_cases = generated
+        .iter()
+        .map(|generated| hell_testkit::DifferentialCase {
             id: generated.id.clone(),
             source: generated.source.clone(),
             ..hell_testkit::DifferentialCase::default()
-        };
-        let report = collect_one_differential(oracle, &candidate, &case)?;
+        })
+        .collect::<Vec<_>>();
+    let generated_batch = hell_testkit::differential_batch_with_identities(
+        oracle,
+        &candidate,
+        &generated_cases,
+        workers,
+    )
+    .map_err(|error| format!("cannot collect exploratory differential batch: {error}"))?;
+    add_differential_timing(&mut differential_timing, generated_batch.timing);
+    for (generated, report) in generated.iter().zip(generated_batch.reports) {
         let oracle_observation_sha256 = retain_observation(&report.oracle, &mut observations)?;
         let candidate_observation_sha256 =
             retain_observation(&report.candidate, &mut observations)?;
@@ -1386,6 +1412,8 @@ fn collect_conformance_evidence(
             conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
             candidate_sha: plan.resolution.candidate_sha.clone(),
             candidate_executable_sha256: candidate.sha256.hex(),
+            candidate_build_info_schema_version: candidate_build_info.schema_version,
+            candidate_compat_tracing: candidate_build_info.compat_tracing,
             source_inventory_sha256: plan.source_inventory_sha256.clone(),
             oracle: oracle_binding.clone(),
             candidate_observation_sha256,
@@ -1416,18 +1444,19 @@ fn collect_conformance_evidence(
     record_members.sort_by(|left, right| left.path.cmp(&right.path));
     exploratory_members.sort_by(|left, right| left.path.cmp(&right.path));
     observation_members.sort_by(|left, right| left.path.cmp(&right.path));
-    let manifest = crate::conformance::EvidenceManifest::new(
-        conformance_platform,
-        plan.resolution.candidate_sha.clone(),
-        candidate.sha256.hex(),
-        plan.plan_sha256.clone(),
-        conformance_plan.plan_sha256.clone(),
-        oracle_binding,
-        record_members,
-        exploratory_members,
-        observation_members,
-        assigned_obligations,
-    )?;
+    let manifest =
+        crate::conformance::EvidenceManifest::new(crate::conformance::EvidenceManifestInput {
+            platform: conformance_platform,
+            candidate_sha: plan.resolution.candidate_sha.clone(),
+            candidate_executable_sha256: candidate.sha256.hex(),
+            release_plan_sha256: plan.plan_sha256.clone(),
+            conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
+            oracle: oracle_binding,
+            records: record_members,
+            exploratory_records: exploratory_members,
+            observations: observation_members,
+            assigned_obligations,
+        })?;
     for (path, bytes) in record_files {
         write_atomic(&output.join(&path), &bytes)?;
         retained.insert(path, bytes);
@@ -1451,7 +1480,42 @@ fn collect_conformance_evidence(
         "conformance-evidence".to_owned(),
         object([
             ("assignedObligations", number(assigned_obligations)),
+            (
+                "candidateProcessSumMillis",
+                number(duration_millis(
+                    differential_timing.candidate_process_sum,
+                    "candidate process timing",
+                )?),
+            ),
             ("candidateExecutableSha256", string(&candidate.sha256.hex())),
+            (
+                "completedDifferentialCases",
+                number(
+                    u64::try_from(differential_timing.completed_count)
+                        .map_err(|_| "completed differential case count overflow")?,
+                ),
+            ),
+            (
+                "differentialBatchWallMillis",
+                number(duration_millis(
+                    differential_timing.wall,
+                    "differential batch wall timing",
+                )?),
+            ),
+            (
+                "differentialDriverOverheadSumMillis",
+                number(duration_millis(
+                    differential_timing.driver_overhead_sum,
+                    "differential driver timing",
+                )?),
+            ),
+            (
+                "differentialWorkerCount",
+                number(
+                    u64::try_from(differential_timing.worker_count)
+                        .map_err(|_| "differential worker count overflow")?,
+                ),
+            ),
             (
                 "exploratoryRecords",
                 number(
@@ -1464,6 +1528,13 @@ fn collect_conformance_evidence(
                 "oracleCommit",
                 string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"),
             ),
+            (
+                "oracleProcessSumMillis",
+                number(duration_millis(
+                    differential_timing.oracle_process_sum,
+                    "oracle process timing",
+                )?),
+            ),
             ("oracleExecutableSha256", string(&oracle.sha256.hex())),
             ("oracleRepository", string("chrisdone/hell")),
             ("oracleSourceSha256", string(oracle_source_sha256)),
@@ -1474,6 +1545,29 @@ fn collect_conformance_evidence(
         ]),
     );
     Ok(())
+}
+
+fn add_differential_timing(
+    total: &mut hell_testkit::DifferentialBatchTiming,
+    batch: hell_testkit::DifferentialBatchTiming,
+) {
+    total.case_count = total.case_count.saturating_add(batch.case_count);
+    total.completed_count = total.completed_count.saturating_add(batch.completed_count);
+    total.worker_count = total.worker_count.max(batch.worker_count);
+    total.wall = total.wall.saturating_add(batch.wall);
+    total.oracle_process_sum = total
+        .oracle_process_sum
+        .saturating_add(batch.oracle_process_sum);
+    total.candidate_process_sum = total
+        .candidate_process_sum
+        .saturating_add(batch.candidate_process_sum);
+    total.driver_overhead_sum = total
+        .driver_overhead_sum
+        .saturating_add(batch.driver_overhead_sum);
+}
+
+fn duration_millis(duration: Duration, label: &str) -> Result<u64, String> {
+    u64::try_from(duration.as_millis()).map_err(|_| format!("{label} overflow"))
 }
 
 fn obligation_is_assigned(
@@ -1492,19 +1586,6 @@ fn obligation_is_assigned(
         }
         crate::conformance::EvidenceStrategy::CrossPlatformRelation => false,
     }
-}
-
-fn collect_one_differential(
-    oracle: &hell_testkit::ExecutableIdentity,
-    candidate: &hell_testkit::ExecutableIdentity,
-    case: &hell_testkit::DifferentialCase,
-) -> Result<hell_testkit::DifferentialReport, String> {
-    require_executable_digest(&oracle.path, oracle.sha256, "retained oracle")?;
-    require_executable_digest(&candidate.path, candidate.sha256, "candidate executable")?;
-    let result = hell_testkit::differential_with_identities(oracle, candidate, case);
-    require_executable_digest(&oracle.path, oracle.sha256, "retained oracle")?;
-    require_executable_digest(&candidate.path, candidate.sha256, "candidate executable")?;
-    result.map_err(|error| format!("cannot collect differential case {:?}: {error}", case.id))
 }
 
 fn bind_process_helper(cases: &mut [hell_testkit::DifferentialCase]) -> Result<(), String> {
@@ -1598,7 +1679,7 @@ fn prepare_oracle(
     platform: ReleasePlatform,
     oracle_source: &Path,
     candidate_root: &Path,
-    candidate_target: &Path,
+    archive_adapter: &crate::command::NativeArchiveAdapter,
 ) -> Result<hell_testkit::ExecutableIdentity, String> {
     if platform == ReleasePlatform::LinuxX86_64 {
         let oracle = acquire_linux_oracle(&transient_path(candidate_root, "oracle-acquisition"))?;
@@ -1616,32 +1697,14 @@ fn prepare_oracle(
         .map_err(|error| format!("cannot prepare pinned Linux oracle: {error}"))?;
         return retain_oracle_copy(candidate_root, identity);
     }
-    let build = CommandSpec::new("stack", Duration::from_hours(2))
-        .arguments([
-            "build",
-            "--stack-yaml",
-            "stack.yaml",
-            "--locked",
-            "--work-dir",
-        ])
-        .argument(candidate_target.join("oracle-stack-work").as_os_str())
-        .current_directory(oracle_source);
+    let build = archive_adapter.stack_build(oracle_source, Duration::from_hours(2));
     let result = build
         .run()
         .map_err(|error| format!("cannot build native oracle: {error}"))?;
     if !result.status.success() || result.timed_out {
         return Err("native oracle build failed before candidate execution".to_owned());
     }
-    let path = CommandSpec::new("stack", Duration::from_mins(5))
-        .arguments([
-            "path",
-            "--stack-yaml",
-            "stack.yaml",
-            "--local-install-root",
-            "--work-dir",
-        ])
-        .argument(candidate_target.join("oracle-stack-work").as_os_str())
-        .current_directory(oracle_source);
+    let path = archive_adapter.stack_path(oracle_source);
     let result = path
         .run()
         .map_err(|error| format!("cannot resolve native oracle: {error}"))?;
@@ -1744,23 +1807,26 @@ fn linux_rust_commands(root: &Path) -> Vec<(&'static str, CommandSpec)> {
             )
             .environment("RUSTDOCFLAGS", "-D warnings"),
         ),
-        (
-            "release-build",
-            cargo(
-                root,
-                Duration::from_mins(30),
-                [
-                    "build",
-                    "--release",
-                    "--locked",
-                    "--package",
-                    "hell-cli",
-                    "--bin",
-                    "hell",
-                ],
-            ),
-        ),
+        ("release-build", release_candidate_build(root)),
     ]
+}
+
+fn release_candidate_build(root: &Path) -> CommandSpec {
+    cargo(
+        root,
+        Duration::from_mins(30),
+        [
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "hell-cli",
+            "--bin",
+            "hell",
+            "--features",
+            "compat-tracing",
+        ],
+    )
 }
 
 fn suite_examples(
@@ -1820,6 +1886,8 @@ fn command_gate(
     evidence: &mut BTreeMap<String, JsonValue>,
 ) -> Result<(), String> {
     let program = command.display_program();
+    let invocation_name = command.display_invocation_name();
+    let canonical_identity = command.display_canonical_executable_identity();
     let arguments = command.display_arguments();
     let result = command
         .run()
@@ -1827,7 +1895,13 @@ fn command_gate(
     let passed = result.status.success() && !result.timed_out;
     evidence.insert(
         name.to_owned(),
-        command_evidence(&program, &arguments, &result),
+        command_evidence(
+            &program,
+            invocation_name.as_deref(),
+            canonical_identity.as_deref(),
+            &arguments,
+            &result,
+        ),
     );
     gates.insert(name, passed);
     passed
@@ -1835,25 +1909,47 @@ fn command_gate(
         .ok_or_else(|| format!("release gate {name} failed"))
 }
 
-fn command_evidence(program: &str, arguments: &[String], result: &CommandResult) -> JsonValue {
-    object([
+fn command_evidence(
+    program: &str,
+    invocation_name: Option<&str>,
+    canonical_identity: Option<&str>,
+    arguments: &[String],
+    result: &CommandResult,
+) -> JsonValue {
+    let mut evidence = BTreeMap::from([
         (
-            "arguments",
+            "arguments".to_owned(),
             JsonValue::Array(arguments.iter().map(|value| string(value)).collect()),
         ),
-        ("program", string(program)),
-        ("schemaVersion", number(1)),
+        ("program".to_owned(), string(program)),
+        ("schemaVersion".to_owned(), number(1)),
         (
-            "state",
+            "state".to_owned(),
             string(if result.status.success() && !result.timed_out {
                 "passed"
             } else {
                 "failed"
             }),
         ),
-        ("stderrSha256", string(&result.stderr_sha256.hex())),
-        ("stdoutSha256", string(&result.stdout_sha256.hex())),
-    ])
+        (
+            "stderrSha256".to_owned(),
+            string(&result.stderr_sha256.hex()),
+        ),
+        (
+            "stdoutSha256".to_owned(),
+            string(&result.stdout_sha256.hex()),
+        ),
+    ]);
+    if let Some(invocation_name) = invocation_name {
+        evidence.insert("invocationName".to_owned(), string(invocation_name));
+    }
+    if let Some(canonical_identity) = canonical_identity {
+        evidence.insert(
+            "canonicalExecutableIdentity".to_owned(),
+            string(canonical_identity),
+        );
+    }
+    JsonValue::Object(evidence)
 }
 
 fn in_process_gate(
@@ -1876,7 +1972,7 @@ fn in_process_gate(
 }
 
 fn cargo<const N: usize>(root: &Path, timeout: Duration, arguments: [&str; N]) -> CommandSpec {
-    CommandSpec::new("cargo", timeout)
+    CommandSpec::cargo(timeout)
         .arguments(arguments)
         .current_directory(root)
 }
@@ -1884,13 +1980,13 @@ fn cargo<const N: usize>(root: &Path, timeout: Duration, arguments: [&str; N]) -
 fn tool_identities(
     platform: ReleasePlatform,
     oracle_source: &Path,
-    candidate_target: &Path,
+    archive_adapter: &crate::command::NativeArchiveAdapter,
 ) -> Result<BTreeMap<String, JsonValue>, String> {
     let mut identities = BTreeMap::new();
     for (name, command) in [
         (
             "cargo",
-            CommandSpec::new("cargo", Duration::from_secs(30)).argument("--version"),
+            CommandSpec::cargo(Duration::from_secs(30)).argument("--version"),
         ),
         (
             "rustc",
@@ -1913,15 +2009,16 @@ fn tool_identities(
         return Err("Stack version differs from release policy".to_owned());
     }
     if platform != ReleasePlatform::LinuxX86_64 {
+        if let Some(identity) = archive_adapter.identity_command() {
+            identities.insert(
+                "llvm-ar".to_owned(),
+                string(&tool_output(identity, "llvm-ar")?),
+            );
+        }
         identities.insert(
             "ghc".to_owned(),
             string(&tool_output(
-                CommandSpec::new("stack", Duration::from_mins(5))
-                    .argument("--stack-yaml")
-                    .argument(oracle_source.join("stack.yaml").as_os_str())
-                    .argument("--work-dir")
-                    .argument(candidate_target.join("oracle-stack-work").as_os_str())
-                    .arguments(["exec", "--", "ghc", "--numeric-version"]),
+                archive_adapter.stack_ghc_version(oracle_source),
                 "ghc",
             )?),
         );
@@ -1954,21 +2051,45 @@ fn validate_checkout(root: &Path, plan: &ReleasePlan) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_runner(platform: ReleasePlatform) -> Result<(), String> {
+fn validate_runner(platform: ReleasePlatform) -> Result<(String, String), String> {
+    let runner_os = env::var("RUNNER_OS").ok();
+    let runner_arch = env::var("RUNNER_ARCH").ok();
+    validate_runner_identity(
+        platform,
+        runner_os.as_deref(),
+        runner_arch.as_deref(),
+        env::consts::OS,
+        env::consts::ARCH,
+    )
+}
+
+fn validate_runner_identity(
+    platform: ReleasePlatform,
+    runner_os: Option<&str>,
+    runner_arch: Option<&str>,
+    host_os: &str,
+    host_arch: &str,
+) -> Result<(String, String), String> {
     let expected = platform.runner();
-    if env::var("RUNNER_OS").as_deref() != Ok(expected.0)
-        || env::var("RUNNER_ARCH").as_deref() != Ok(expected.1)
-    {
-        return Err(format!("runner identity does not match {}", platform.id()));
+    match (runner_os, runner_arch) {
+        (Some(os), Some(arch)) if (os, arch) == expected => Ok((os.to_owned(), arch.to_owned())),
+        (None, None) if (host_os, host_arch) == platform_host(platform) => {
+            Ok((expected.0.to_owned(), expected.1.to_owned()))
+        }
+        _ => Err(format!("runner identity does not match {}", platform.id())),
     }
-    Ok(())
+}
+
+const fn platform_host(platform: ReleasePlatform) -> (&'static str, &'static str) {
+    match platform {
+        ReleasePlatform::LinuxX86_64 => ("linux", "x86_64"),
+        ReleasePlatform::MacosAarch64 => ("macos", "aarch64"),
+        ReleasePlatform::WindowsX86_64 => ("windows", "x86_64"),
+    }
 }
 
 fn validate_oracle(root: &Path) -> Result<(), String> {
-    if git_head(root)? != "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff" {
-        return Err("oracle source checkout differs from pinned commit".to_owned());
-    }
-    Ok(())
+    crate::command::verify_pinned_oracle_checkout(root)
 }
 
 fn git_head(root: &Path) -> Result<String, String> {
@@ -1988,7 +2109,10 @@ fn git_head(root: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::accept_conformance_plan_binding;
+    use super::{
+        accept_conformance_plan_binding, release_candidate_build, validate_runner_identity,
+    };
+    use crate::release::schema::ReleasePlatform;
 
     #[cfg(unix)]
     use super::normalize_candidate_cache_tree;
@@ -1997,6 +2121,69 @@ mod tests {
     fn candidate_conformance_plan_substitution_is_rejected() {
         assert!(accept_conformance_plan_binding(true));
         assert!(!accept_conformance_plan_binding(false));
+    }
+
+    #[test]
+    fn runner_identity_accepts_exact_hosted_or_local_identity() {
+        assert_eq!(
+            validate_runner_identity(
+                ReleasePlatform::MacosAarch64,
+                Some("macOS"),
+                Some("ARM64"),
+                "untrusted",
+                "untrusted",
+            )
+            .unwrap(),
+            ("macOS".to_owned(), "ARM64".to_owned())
+        );
+        assert_eq!(
+            validate_runner_identity(
+                ReleasePlatform::MacosAarch64,
+                None,
+                None,
+                "macos",
+                "aarch64",
+            )
+            .unwrap(),
+            ("macOS".to_owned(), "ARM64".to_owned())
+        );
+    }
+
+    #[test]
+    fn runner_identity_rejects_partial_or_mismatched_identity() {
+        assert!(
+            validate_runner_identity(
+                ReleasePlatform::MacosAarch64,
+                Some("macOS"),
+                None,
+                "macos",
+                "aarch64",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_runner_identity(ReleasePlatform::MacosAarch64, None, None, "linux", "x86_64",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn release_candidate_build_enables_required_evidence() {
+        let command = release_candidate_build(std::path::Path::new("candidate"));
+        assert_eq!(
+            command.display_arguments(),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "--package",
+                "hell-cli",
+                "--bin",
+                "hell",
+                "--features",
+                "compat-tracing",
+            ]
+        );
     }
 
     #[cfg(unix)]

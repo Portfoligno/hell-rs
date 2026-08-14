@@ -5,5 +5,10 @@ Commit: d4d028609ed46a560c62caea8c70e7e91d1afd29
 Language version: 2026-05-29
 Pinned source SHA-256: 6b59dbbdaaa1e31938e8cbdf93ffb2b981fe8064009693f92fbdd134f7dd25f9
 
-The 44 files under examples/ are copied verbatim from the pinned commit.
+Of the 44 files under examples/, 43 are copied verbatim from the pinned commit.
+examples/11-env-vars.hell is locally adapted to set the standard LC_ALL=C pair
+instead of the upstream custom demonstration variable. This preserves its
+check-only environment-construction coverage without defining a project-specific
+environment interface. Its adapted SHA-256 is
+17b35986cfbf8a198430d16ad7d4e210d1d9c78ee974dee835769130e76d02d1.
 LICENSE is the license file from that same commit.

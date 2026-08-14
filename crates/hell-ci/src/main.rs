@@ -47,6 +47,12 @@ enum Invocation {
         platform: String,
         dependency_attestation: PathBuf,
     },
+    NativeDifferentialBenchmark {
+        report: PathBuf,
+        oracle: PathBuf,
+        candidate: PathBuf,
+        sample_count: usize,
+    },
     DependencyAttestation {
         report: PathBuf,
         output: PathBuf,
@@ -58,7 +64,7 @@ enum Invocation {
 }
 
 fn usage() -> &'static str {
-    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci examples --profile ci|release --report PATH\n       hell-ci conformance audit --candidate-root PATH --output PATH\n       hell-ci readiness plan|platform|verify [options]\n       hell-ci release resolve|plan|platform|assemble|verify-bundle|check-remote-state|stage-attestations|publish [options]"
+    "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci native-differential-benchmark --oracle PATH --candidate PATH --sample-count 32..256 --report PATH\n       hell-ci examples --profile ci|release --report PATH\n       hell-ci conformance audit --candidate-root PATH --output PATH\n       hell-ci readiness plan|platform|verify [options]\n       hell-ci release resolve|plan|platform|assemble|verify-bundle|check-remote-state|stage-attestations|publish [options]"
 }
 
 #[allow(clippy::too_many_lines)]
@@ -74,6 +80,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     let mut format = None;
     let mut oracle = None;
     let mut oracle_sha256 = None;
+    let mut candidate = None;
+    let mut sample_count = None;
     let mut source = None;
     let mut platform = None;
     let mut input = None;
@@ -183,6 +191,33 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                     .map_err(|_| "--oracle-sha256 must be UTF-8".to_owned())?;
                 oracle_sha256 = Some(Digest::from_hex(&digest).map_err(str::to_owned)?);
             }
+            "--candidate" => {
+                if candidate.is_some() {
+                    return Err("--candidate was provided more than once".to_owned());
+                }
+                candidate = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--candidate requires PATH".to_owned())?,
+                ));
+            }
+            "--sample-count" => {
+                if sample_count.is_some() {
+                    return Err("--sample-count was provided more than once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--sample-count requires an integer".to_owned())?
+                    .into_string()
+                    .map_err(|_| "--sample-count must be UTF-8".to_owned())?;
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    "--sample-count must be a canonical positive integer".to_owned()
+                })?;
+                if value != parsed.to_string() {
+                    return Err("--sample-count must be a canonical positive integer".to_owned());
+                }
+                sample_count = Some(parsed);
+            }
             "--source" => {
                 if source.is_some() {
                     return Err("--source was provided more than once".to_owned());
@@ -287,6 +322,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         return Err("retired promotion options are not supported".to_owned());
     }
     let report = report.ok_or_else(|| "--report is required".to_owned())?;
+    let benchmark_options_absent = candidate.is_none() && sample_count.is_none();
     match command.as_str() {
         "policy"
             if profile.is_none()
@@ -302,6 +338,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::Policy { report })
@@ -320,6 +357,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::Verify { report })
@@ -338,6 +376,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::Portability { report })
@@ -355,6 +394,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::DependencyAttestation {
@@ -374,6 +414,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::Nightly {
@@ -396,6 +437,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::NativeOracleShard {
@@ -405,6 +447,34 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                     .ok_or_else(|| "native-oracle-shard requires --platform".to_owned())?,
                 dependency_attestation: dependency_attestation.ok_or_else(|| {
                     "native-oracle-shard requires --dependency-attestation PATH".to_owned()
+                })?,
+            })
+        }
+        "native-differential-benchmark"
+            if profile.is_none()
+                && format.is_none()
+                && oracle_sha256.is_none()
+                && source.is_none()
+                && platform.is_none()
+                && input.is_none()
+                && output.is_none()
+                && dependency_attestation.is_none()
+                && proposal.is_none()
+                && expect_source.is_none()
+                && expect_epoch.is_none()
+                && expect_proposal.is_none()
+                && !explain =>
+        {
+            Ok(Invocation::NativeDifferentialBenchmark {
+                report,
+                oracle: oracle.ok_or_else(|| {
+                    "native-differential-benchmark requires --oracle PATH".to_owned()
+                })?,
+                candidate: candidate.ok_or_else(|| {
+                    "native-differential-benchmark requires --candidate PATH".to_owned()
+                })?,
+                sample_count: sample_count.ok_or_else(|| {
+                    "native-differential-benchmark requires --sample-count".to_owned()
                 })?,
             })
         }
@@ -421,6 +491,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
                 && expect_source.is_none()
                 && expect_epoch.is_none()
                 && expect_proposal.is_none()
+                && benchmark_options_absent
                 && !explain =>
         {
             Ok(Invocation::Examples {
@@ -437,7 +508,18 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
 }
 
 fn main() -> ExitCode {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut process_arguments = std::env::args_os();
+    let invoked = process_arguments.next();
+    let arguments = process_arguments.collect::<Vec<_>>();
+    #[cfg(unix)]
+    if invoked
+        .as_deref()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        == Some("ar")
+    {
+        return command::run_native_archive_adapter(&arguments);
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-posix-child") {
         return command::run_posix_release_child(&arguments[1..]);
@@ -445,6 +527,10 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-restricted-child") {
         return command::run_windows_restricted_child(&arguments[1..]);
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__release-argv-child") {
+        return command::run_windows_argv_child(&arguments[1..]);
     }
     let root = match std::env::current_dir() {
         Ok(root) => root,
@@ -528,10 +614,16 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Portability { report } => ("portability", report),
         Invocation::Nightly { report, .. } => ("nightly", report),
         Invocation::NativeOracleShard { report, .. } => ("native-oracle-shard", report),
+        Invocation::NativeDifferentialBenchmark { report, .. } => {
+            ("native-differential-benchmark", report)
+        }
         Invocation::DependencyAttestation { report, .. } => ("dependency-attestation", report),
         Invocation::Examples { report, .. } => ("examples", report),
     };
     let mut report = Report::new(suite_name);
+    if matches!(invocation, Invocation::NativeDifferentialBenchmark { .. }) {
+        report.mark_non_authoritative();
+    }
     let failures = release_suite::failures_directory(report_path);
     let result = match invocation {
         Invocation::Policy { .. } => release_suite::policy_suite(root, &mut report),
@@ -562,6 +654,18 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
             source,
             platform,
             dependency_attestation,
+        ),
+        Invocation::NativeDifferentialBenchmark {
+            oracle,
+            candidate,
+            sample_count,
+            ..
+        } => release_suite::native_differential_benchmark(
+            root,
+            &mut report,
+            oracle,
+            candidate,
+            *sample_count,
         ),
         Invocation::DependencyAttestation { output, .. } => {
             release_suite::dependency_attestation(root, output, &mut report)
@@ -686,6 +790,51 @@ mod tests {
                 .map(OsString::from)
             ),
             Ok(Invocation::NativeOracleShard { .. })
+        ));
+    }
+
+    #[test]
+    fn native_benchmark_requires_typed_paths_and_canonical_sample_count() {
+        assert!(
+            parse(["native-differential-benchmark", "--report", "out.json"].map(OsString::from))
+                .is_err()
+        );
+        assert!(
+            parse(
+                [
+                    "native-differential-benchmark",
+                    "--oracle",
+                    "oracle",
+                    "--candidate",
+                    "candidate",
+                    "--sample-count",
+                    "0256",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            parse(
+                [
+                    "native-differential-benchmark",
+                    "--oracle",
+                    "oracle",
+                    "--candidate",
+                    "candidate",
+                    "--sample-count",
+                    "256",
+                    "--report",
+                    "out.json",
+                ]
+                .map(OsString::from)
+            ),
+            Ok(Invocation::NativeDifferentialBenchmark {
+                sample_count: 256,
+                ..
+            })
         ));
     }
 

@@ -135,7 +135,7 @@ pub fn validate_runtime_obligation_trace(
 ) -> Result<(), String> {
     let lines = trace.lines().collect::<Vec<_>>();
     if lines.first() != Some(&"{")
-        || lines.get(1) != Some(&"  \"schemaVersion\": 9,")
+        || lines.get(1) != Some(&"  \"schemaVersion\": 10,")
         || lines.last() != Some(&"}")
         || lines.len() != 15
     {
@@ -270,6 +270,28 @@ fn validate_runtime_obligation_target(
     }
     let spec = hell_builtins::lookup(&target.builtin)
         .ok_or_else(|| format!("runtime trace target {:?} disappeared", target.builtin))?;
+    if target.causal_signal == CausalSignal::ForceTrace {
+        if entered.contains(&spec.id.0)
+            || adapter_events
+                .iter()
+                .any(|event| event.builtin == spec.id.0)
+            || target.expected_instance_target.is_some()
+            || !target.expected_instance_premises.is_empty()
+            || target.expected_comparator_trace_sha256.is_some()
+            || target.expected_typed_result_sha256.is_some()
+        {
+            return Err(format!(
+                "pre-adapter force trace is contaminated by adapter evidence for {:?}",
+                target.builtin
+            ));
+        }
+        if spec.demand.contains(&hell_builtins::Demand::Lazy) {
+            validate_lazy_adapter_entry_boundaries(spec, boundaries, 1)?;
+        }
+        validate_target_obligation_boundaries(target, spec, boundaries, &[])?;
+        validate_expected_whnf_argument_failure(target, spec, boundaries)?;
+        return validate_expected_lazy_argument_exit(target, spec, boundaries);
+    }
     if !entered.contains(&spec.id.0) {
         return Err(format!(
             "runtime trace never entered adapter {:?}",
@@ -319,7 +341,9 @@ fn validate_runtime_obligation_target(
         validate_lazy_adapter_entry_boundaries(spec, boundaries, matching_events.len())?;
     }
     validate_target_obligation_boundaries(target, spec, boundaries, &matching_events)?;
-    validate_expected_lazy_argument_exit(target, spec, boundaries)
+    validate_expected_whnf_argument_failure(target, spec, boundaries)?;
+    validate_expected_lazy_argument_exit(target, spec, boundaries)?;
+    validate_expected_nonproductive_trace(target, spec, boundaries)
 }
 
 fn validate_trace_comparator_digest(
@@ -415,6 +439,14 @@ fn validate_target_obligation_boundaries(
                 hell_builtins::Demand::Whnf,
                 "whnf-force-complete",
             )?,
+            "whnf-failure-boundary" => {
+                if target.expected_whnf_argument_failure_sha256.is_none() {
+                    return Err(format!(
+                        "runtime WHNF failure proof is missing for {:?}",
+                        target.builtin
+                    ));
+                }
+            }
             "deep-boundary" => {
                 return Err(format!(
                     "runtime deep-demand proof is fail-closed for {:?}",
@@ -446,6 +478,34 @@ fn validate_target_obligation_boundaries(
     Ok(())
 }
 
+fn validate_expected_whnf_argument_failure(
+    target: &crate::EvidenceTargetV2,
+    spec: &hell_builtins::BuiltinSpec,
+    boundaries: &[TraceBoundary<'_>],
+) -> Result<(), String> {
+    let Some(expected) = target.expected_whnf_argument_failure_sha256 else {
+        return Ok(());
+    };
+    let failures = boundaries
+        .iter()
+        .filter(|boundary| boundary.builtin == spec.id.0 && boundary.class == "whnf-force-failed")
+        .map(|boundary| {
+            (
+                boundary.argument,
+                boundary.outcome,
+                boundary.error_code.unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() || crate::whnf_argument_failure_sha256(failures) != expected {
+        return Err(format!(
+            "runtime trace WHNF argument failure disagrees for {:?}",
+            target.builtin
+        ));
+    }
+    Ok(())
+}
+
 fn validate_expected_lazy_argument_exit(
     target: &crate::EvidenceTargetV2,
     spec: &hell_builtins::BuiltinSpec,
@@ -462,6 +522,36 @@ fn validate_expected_lazy_argument_exit(
     if states.is_empty() || crate::lazy_argument_exit_sha256(states) != expected {
         return Err(format!(
             "runtime trace lazy argument exit states disagree for {:?}",
+            target.builtin
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_nonproductive_trace(
+    target: &crate::EvidenceTargetV2,
+    spec: &hell_builtins::BuiltinSpec,
+    boundaries: &[TraceBoundary<'_>],
+) -> Result<(), String> {
+    let Some(expected) = target.expected_nonproductive_trace_sha256 else {
+        return Ok(());
+    };
+    let events = boundaries
+        .iter()
+        .filter(|boundary| {
+            boundary.builtin == spec.id.0
+                && boundary.argument == 0
+                && boundary.class.starts_with("nonproductive-")
+        })
+        .collect::<Vec<_>>();
+    let actual = crate::nonproductive_trace_sha256(
+        events
+            .iter()
+            .map(|boundary| (boundary.class, boundary.outcome)),
+    );
+    if events.is_empty() || actual != expected {
+        return Err(format!(
+            "runtime trace nonproductive lifecycle disagrees for {:?}",
             target.builtin
         ));
     }
@@ -819,6 +909,7 @@ struct TraceBoundary<'a> {
     argument: u16,
     class: &'a str,
     outcome: &'a str,
+    error_code: Option<&'a str>,
 }
 
 struct TraceAdapterEvent {
@@ -884,7 +975,7 @@ fn trace_builtin_ids(encoded: &str, label: &str) -> Result<Vec<u16>, String> {
 }
 
 fn trace_boundaries(encoded: &str) -> Result<Vec<TraceBoundary<'_>>, String> {
-    trace_objects(encoded)
+    let boundaries = trace_objects(encoded)
         .map(|entry| {
             let (_, entry) = entry
                 .strip_prefix("\"eventId\": ")
@@ -896,10 +987,24 @@ fn trace_boundaries(encoded: &str) -> Result<Vec<TraceBoundary<'_>>, String> {
             let (argument, entry) = entry
                 .split_once(", \"boundaryClass\": \"")
                 .ok_or_else(|| "runtime boundary is malformed".to_owned())?;
-            let (class, outcome) = entry
+            let (class, outcome_fields) = entry
                 .split_once("\", \"outcome\": \"")
-                .and_then(|(class, outcome)| outcome.strip_suffix('"').map(|value| (class, value)))
                 .ok_or_else(|| "runtime boundary is malformed".to_owned())?;
+            let (outcome, error_code) = if let Some((outcome, error_code)) =
+                outcome_fields.split_once("\", \"errorCode\": \"")
+            {
+                let error_code = error_code
+                    .strip_suffix('"')
+                    .ok_or_else(|| "runtime boundary is malformed".to_owned())?;
+                (outcome, Some(error_code))
+            } else {
+                (
+                    outcome_fields
+                        .strip_suffix('"')
+                        .ok_or_else(|| "runtime boundary is malformed".to_owned())?,
+                    None,
+                )
+            };
             if !matches!(
                 class,
                 "conditional-branch"
@@ -912,13 +1017,29 @@ fn trace_boundaries(encoded: &str) -> Result<Vec<TraceBoundary<'_>>, String> {
                     | "lazy-adapter-entry"
                     | "lazy-adapter-exit"
                     | "lazy-demand"
+                    | "nonproductive-cancelled"
+                    | "nonproductive-parser-node"
+                    | "nonproductive-pending"
+                    | "nonproductive-repeat"
                     | "whnf-demand"
+                    | "whnf-force-failed"
                     | "whnf-force-complete"
             ) || !matches!(
                 outcome,
                 "value" | "error" | "not-forced" | "in-progress" | "cycle" | "poisoned"
             ) {
-                return Err("runtime boundary class or outcome is unknown".into());
+                return Err("runtime boundary class or outcome is unknown".to_owned());
+            }
+            if match (class, outcome, error_code) {
+                ("whnf-force-failed", "error", Some(code)) => {
+                    code.len() != 5
+                        || !code.starts_with('H')
+                        || !code[1..].bytes().all(|byte| byte.is_ascii_digit())
+                }
+                (_, _, None) => false,
+                _ => true,
+            } {
+                return Err("runtime boundary error code is inconsistent".to_owned());
             }
             let builtin = builtin
                 .parse::<u16>()
@@ -938,9 +1059,36 @@ fn trace_boundaries(encoded: &str) -> Result<Vec<TraceBoundary<'_>>, String> {
                 argument,
                 class,
                 outcome,
+                error_code,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundaries.windows(2).any(|events| {
+        trace_boundary_canonical_key(&events[0]) > trace_boundary_canonical_key(&events[1])
+    }) {
+        return Err("runtime boundary order is noncanonical".into());
+    }
+    Ok(boundaries)
+}
+
+fn trace_boundary_canonical_key<'a>(
+    boundary: &TraceBoundary<'a>,
+) -> (u16, u16, u8, u8, &'a str, &'a str, &'a str) {
+    let phase = match boundary.class {
+        "nonproductive-repeat" | "nonproductive-parser-node" => Some(0),
+        "nonproductive-pending" => Some(1),
+        "nonproductive-cancelled" => Some(2),
+        _ => None,
+    };
+    (
+        boundary.builtin,
+        boundary.argument,
+        u8::from(phase.is_some()),
+        phase.unwrap_or_default(),
+        boundary.class,
+        boundary.outcome,
+        boundary.error_code.unwrap_or_default(),
+    )
 }
 
 fn trace_adapter_events(encoded: &str) -> Result<Vec<TraceAdapterEvent>, String> {
@@ -1557,6 +1705,41 @@ pub fn applicable_runtime_obligation_cells() -> Vec<RuntimeObligationCell> {
         .collect()
 }
 
+/// Whether one semantically fallible cell lacks a deterministic portable
+/// native-oracle failure trigger.
+///
+/// The full assurance cell remains unchanged. This predicate is used only to
+/// distinguish portable differential completeness from semantic
+/// applicability; its missing failure obligation remains release-blocking.
+#[must_use]
+pub fn portable_native_oracle_failure_unavailable(
+    builtin: &str,
+    dimension: CompatibilityDimension,
+) -> bool {
+    dimension == CompatibilityDimension::Effects
+        && matches!(
+            builtin,
+            "Directory.getCurrentDirectory" | "Directory.getHomeDirectory"
+        )
+}
+
+/// Returns the obligation subset that the portable native-oracle catalog can
+/// deterministically exercise.
+///
+/// Consumers must continue to serialize and evaluate the full cells returned
+/// by [`applicable_runtime_obligation_cells`].
+#[must_use]
+pub fn portable_native_oracle_obligation_cells() -> Vec<RuntimeObligationCell> {
+    let mut cells = applicable_runtime_obligation_cells();
+    for cell in &mut cells {
+        if portable_native_oracle_failure_unavailable(&cell.builtin, cell.dimension) {
+            cell.obligations
+                .retain(|obligation| obligation.0.as_ref() != "effect-failure");
+        }
+    }
+    cells
+}
+
 /// Returns the exact runtime obligation cells for one registry entry.
 #[must_use]
 pub fn runtime_obligation_cells_for_spec(spec: &BuiltinSpec) -> Vec<RuntimeObligationCell> {
@@ -1688,8 +1871,19 @@ fn pure_runtime_obligations(spec: &BuiltinSpec) -> Vec<&'static str> {
     if matches!(family, "Text" | "ByteString" | "Json" | "CI" | "Show") {
         obligations.push("encoding-boundary");
     }
-    if text_can_observe_invalid_encoding(spec.name) {
+    if text_can_observe_invalid_encoding(spec.name)
+        || matches!(
+            spec.name,
+            "Process.runProcess" | "Process.runProcess_" | "Async.race" | "Async.concurrently"
+        )
+    {
         obligations.push("adapter-failure");
+    }
+    if spec.name == "List.cycle" {
+        obligations.push("result-force-failure");
+    }
+    if matches!(spec.name, "Map.singleton" | "Set.singleton") {
+        obligations.push("whnf-failure-boundary");
     }
     if matches!(
         family,
@@ -1858,6 +2052,9 @@ fn effect_obligations(spec: &BuiltinSpec) -> Vec<&'static str> {
     }];
     if host_failure_probe_required(spec) && !failure_only(spec) {
         obligations.push("effect-failure");
+    }
+    if spec.name == "Options.execParser" {
+        obligations.push("effect-cancellation");
     }
     obligations.push("effect-ordering");
     obligations

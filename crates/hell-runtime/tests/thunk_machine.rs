@@ -53,6 +53,7 @@ fn concurrent_waiters_share_one_failed_evaluation() {
         code: "H0901",
         kind: RuntimeErrorKind::UserError,
         message: "shared failure".into(),
+        presentation: None,
         suppressed: Arc::from([]),
     });
     let operation_failure = Arc::clone(&failure);

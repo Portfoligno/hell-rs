@@ -45,6 +45,103 @@ fn int_subtract_preserves_operand_order_and_wrapping_boundary() {
 }
 
 #[test]
+fn int_read_maybe_uses_pinned_twos_complement_modular_conversion() {
+    assert_eq!(
+        run(concat!(
+            "main = do\n",
+            "  IO.print $ Int.readMaybe \" +42 \"\n",
+            "  IO.print $ Int.readMaybe \"-9223372036854775808\"\n",
+            "  IO.print $ Int.readMaybe \"9223372036854775807\"\n",
+            "  IO.print $ Int.readMaybe \"9223372036854775808\"\n",
+            "  IO.print $ Int.readMaybe \"-9223372036854775809\"\n",
+            "  IO.print $ Int.readMaybe \"18446744073709551616\"\n",
+            "  IO.print $ Int.readMaybe \"18446744073709551617\"\n",
+            "  IO.print $ Int.readMaybe \"-18446744073709551616\"\n",
+            "  IO.print $ Int.readMaybe \"-18446744073709551617\"\n",
+            "  IO.print $ Int.readMaybe \"123456789012345678901234567890\"\n",
+            "  IO.print $ Int.readMaybe \"-123456789012345678901234567890\"\n",
+            "  IO.print $ Int.readMaybe \"not-an-int\"\n",
+        )),
+        concat!(
+            "Just 42\n",
+            "Just (-9223372036854775808)\n",
+            "Just 9223372036854775807\n",
+            "Just (-9223372036854775808)\n",
+            "Just 9223372036854775807\n",
+            "Just 0\n",
+            "Just 1\n",
+            "Just 0\n",
+            "Just (-1)\n",
+            "Just (-4362896299872285998)\n",
+            "Just 4362896299872285998\n",
+            "Nothing\n",
+        )
+    );
+}
+
+#[test]
+fn show_f_float_rounds_the_shortest_decimal_like_the_pinned_oracle() {
+    const MAX_FIXED_TWO: &str = concat!(
+        "1797693134862315700000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000.00",
+    );
+    assert_eq!(
+        run(concat!(
+            "f0 = \\value -> Text.putStrLn $ Double.showFFloat (Maybe.Just 0) value \"\"\n",
+            "f2 = \\value -> Text.putStrLn $ Double.showFFloat (Maybe.Just 2) value \"\"\n",
+            "f17 = \\value -> Text.putStrLn $ Double.showFFloat (Maybe.Just 17) value \"\"\n",
+            "read = \\text -> Maybe.maybe (Error.error \"parse\") Function.id $ Double.readMaybe text\n",
+            "main = do\n",
+            "  Main.f2 2.675\n",
+            "  Main.f2 1.005\n",
+            "  Main.f2 9.995\n",
+            "  Main.f2 $ Main.read \"-2.675\"\n",
+            "  Main.f2 $ Main.read \"-1.005\"\n",
+            "  Main.f2 $ Main.read \"-9.995\"\n",
+            "  Main.f2 0.0009995\n",
+            "  Main.f0 2.5\n",
+            "  Main.f0 3.5\n",
+            "  Main.f2 1e20\n",
+            "  Main.f2 1e-20\n",
+            "  Main.f17 5e-324\n",
+            "  Main.f2 $ Main.read \"-0.0\"\n",
+            "  Main.f2 $ Main.read \"Infinity\"\n",
+            "  Main.f2 $ Main.read \"-Infinity\"\n",
+            "  Main.f2 $ Main.read \"NaN\"\n",
+            "  Main.f2 1.7976931348623157e308\n",
+            "  Main.f2 $ Double.mult (Double.fromInt $ Int.subtract 1 0) ",
+            "1.7976931348623157e308\n",
+        )),
+        format!(
+            concat!(
+                "2.68\n",
+                "1.00\n",
+                "10.00\n",
+                "-2.68\n",
+                "-1.00\n",
+                "-10.00\n",
+                "0.00\n",
+                "2\n",
+                "4\n",
+                "100000000000000000000.00\n",
+                "0.00\n",
+                "0.00000000000000000\n",
+                "-0.00\n",
+                "Infinity\n",
+                "-Infinity\n",
+                "NaN\n",
+                "{maximum}\n",
+                "-{maximum}\n",
+            ),
+            maximum = MAX_FIXED_TWO,
+        )
+    );
+}
+
+#[test]
 fn numeric_equality_distinguishes_values_and_nan() {
     assert_eq!(
         run(concat!(
@@ -69,10 +166,11 @@ fn run_equality_partition_test(mutant: Option<&str>) -> ExitStatus {
     let mut command = Command::new(std::env::current_exe().expect("numeric test executable"));
     command
         .arg("numeric_equality_distinguishes_values_and_nan")
-        .arg("--exact")
-        .env_remove("HELL_ASSURANCE_MUTANT_ID");
+        .arg("--exact");
     if let Some(mutant) = mutant {
-        command.env("HELL_ASSURANCE_MUTANT_ID", mutant);
+        command
+            .args(["--skip", "__hell_mutant", "--skip"])
+            .arg(mutant);
     }
     command.status().expect("nested numeric test runs")
 }

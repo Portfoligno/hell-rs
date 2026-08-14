@@ -448,6 +448,7 @@ fn close_pair_scopes(
             code: primary.code,
             kind: primary.kind.clone(),
             message: Arc::clone(&primary.message),
+            presentation: primary.presentation.clone(),
             suppressed: suppressed.into(),
         }));
     }
@@ -461,6 +462,7 @@ fn close_pair_scopes(
         code: primary.code,
         kind: primary.kind.clone(),
         message: Arc::clone(&primary.message),
+        presentation: primary.presentation.clone(),
         suppressed: suppressed.into(),
     }))
 }
@@ -902,6 +904,7 @@ mod tests {
                 code: "H0901",
                 kind: RuntimeErrorKind::UserError,
                 message: "boom".into(),
+                presentation: None,
                 suppressed: Arc::from([]),
             }))
         })));

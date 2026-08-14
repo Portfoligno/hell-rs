@@ -56,6 +56,21 @@ fn known_quirk_has_an_explicit_wiring_adapter() {
 }
 
 #[test]
+fn io_block_buffering_matches_the_pinned_unary_constructor() {
+    let spec = hell_builtins::lookup("IO.BlockBuffering").unwrap();
+    assert_eq!(spec.scheme, Some("Maybe Int -> BufferMode"));
+    assert_eq!(spec.arity, 1);
+}
+
+#[test]
+fn io_traversals_match_the_pinned_unit_callback_contract() {
+    let map = hell_builtins::lookup("IO.mapM_").unwrap();
+    assert_eq!(map.scheme, Some("forall a. (a -> IO ()) -> [a] -> IO ()"));
+    let for_ = hell_builtins::lookup("IO.forM_").unwrap();
+    assert_eq!(for_.scheme, Some("forall a. [a] -> (a -> IO ()) -> IO ()"));
+}
+
+#[test]
 fn internal_row_and_tag_registry_is_fully_executable() {
     let internal = registry()
         .iter()
@@ -172,8 +187,14 @@ fn declarative_requirement_override_is_scoped_without_a_final_status() {
         runtime.scopes[0].strategy,
         RequirementStrategy::NativeOracle
     );
-    assert_eq!(runtime.scopes[0].applicability_rule, "pure-runtime-value");
-    assert_eq!(runtime.scopes[0].review_group, "bool-conditional-v1");
+    assert_eq!(
+        runtime.scopes[0].applicability_rule,
+        "descriptor-v8-reviewed-runtime-target"
+    );
+    assert_eq!(
+        runtime.scopes[0].review_group,
+        "descriptor-v8-runtime-authority"
+    );
     assert_eq!(runtime.scopes[0].profiles, [ExecutionProfile::Upstream]);
     assert_eq!(runtime.scopes[1].profiles, [ExecutionProfile::Sandboxed]);
 }

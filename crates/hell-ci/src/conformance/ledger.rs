@@ -1523,7 +1523,7 @@ mod tests {
         };
         assert!(
             make(exemption.clone())
-                .validate(&[required_key.clone()])
+                .validate(std::slice::from_ref(&required_key))
                 .is_err()
         );
         exemption.expires_on = "2026-08-14".to_owned();
@@ -1566,10 +1566,18 @@ mod tests {
         };
         let mut wildcard = valid.clone();
         wildcard.id = "EX-*".to_owned();
-        assert!(make(wildcard).validate(&[required_key.clone()]).is_err());
+        assert!(
+            make(wildcard)
+                .validate(std::slice::from_ref(&required_key))
+                .is_err()
+        );
         let mut expired = valid.clone();
         expired.expires_on = "2026-08-13".to_owned();
-        assert!(make(expired).validate(&[required_key.clone()]).is_err());
+        assert!(
+            make(expired)
+                .validate(std::slice::from_ref(&required_key))
+                .is_err()
+        );
         let mut wrong_candidate = valid;
         wrong_candidate.candidate_sha = "b".repeat(40);
         assert!(make(wrong_candidate).validate(&[required_key]).is_err());

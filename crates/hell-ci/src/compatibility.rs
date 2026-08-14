@@ -147,7 +147,7 @@ fn dispatch(root: &Path, arguments: &[OsString]) -> Result<String, String> {
 }
 
 fn reject_mutant(id: &str) -> Result<(), String> {
-    if std::env::var("HELL_ASSURANCE_MUTANT_ID").as_deref() == Ok(id) {
+    if crate::mutation::active(id) {
         Err(format!("activated release control mutant: {id}"))
     } else {
         Ok(())

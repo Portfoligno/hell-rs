@@ -502,6 +502,7 @@ fn prepare_host_response(
                 ResponseBody::Stream {
                     producer: Box::new(FixedBodyProducer {
                         bytes,
+                        cancellation,
                         _task_permit: task_permit,
                         _scope: request_scope,
                     }),
@@ -601,6 +602,7 @@ fn prepare_host_response(
                         remaining: count,
                         evaluator,
                         first_error,
+                        cancellation,
                         _task_permit: task_permit,
                         _scope: request_scope,
                     }),
@@ -691,13 +693,19 @@ fn content_length_header(length: usize) -> HostHeader {
 
 struct FixedBodyProducer {
     bytes: Arc<[u8]>,
+    cancellation: HostCancellation,
     _task_permit: BudgetPermit,
     _scope: ScopeGuard,
 }
 
 impl BodyProducer for FixedBodyProducer {
     fn produce(self: Box<Self>, sink: BodySink) -> Result<(), HostError> {
-        sink.send(self.bytes.to_vec())
+        let result = sink.send(self.bytes.to_vec());
+        if result.is_err() && self.cancellation.is_cancelled() {
+            Ok(())
+        } else {
+            result
+        }
     }
 }
 
@@ -706,6 +714,7 @@ struct FileBodyProducer {
     remaining: u64,
     evaluator: Evaluator,
     first_error: Arc<Mutex<Option<Arc<RuntimeError>>>>,
+    cancellation: HostCancellation,
     _task_permit: BudgetPermit,
     _scope: ScopeGuard,
 }
@@ -728,19 +737,17 @@ impl BodyProducer for FileBodyProducer {
                     ));
                 }
                 sink.send(buffer[..read].to_vec())
-                    .map_err(|error| RuntimeError::http(error.message()))?;
+                    .map_err(|error| response_sink_error(&self.cancellation, &error))?;
                 self.remaining -= u64::try_from(read).expect("read size fits u64");
             }
             Ok(())
         })();
-        let result = result.map_err(|error| {
-            if error.kind == crate::RuntimeErrorKind::Cancelled {
-                RuntimeError::http("HTTP response connection closed while sending a file")
-            } else {
-                error
-            }
-        });
-        result.map_err(|error| record_host_runtime_error(&self.first_error, &error))
+        finish_body_production(
+            result,
+            &self.cancellation,
+            &self.first_error,
+            "HTTP response connection closed while sending a file",
+        )
     }
 }
 
@@ -792,15 +799,12 @@ impl BodyProducer for StreamBodyProducer {
                 Ok(())
             })();
         alive.store(false, Ordering::Release);
-        let result = result.map_err(|error| {
-            if error.kind == crate::RuntimeErrorKind::Cancelled && self.cancellation.is_cancelled()
-            {
-                RuntimeError::http("HTTP response connection closed while streaming")
-            } else {
-                error
-            }
-        });
-        result.map_err(|error| record_host_runtime_error(&self.first_error, &error))
+        finish_body_production(
+            result,
+            &self.cancellation,
+            &self.first_error,
+            "HTTP response connection closed while streaming",
+        )
     }
 }
 
@@ -833,11 +837,11 @@ fn host_stream_writer(
                         ));
                     }
                     sink.send(bytes.to_vec())
-                        .map_err(|error| RuntimeError::http(error.message()))?;
+                        .map_err(|error| response_sink_error(&cancellation, &error))?;
                     *remaining -= bytes.len();
                 } else {
                     sink.send(bytes.to_vec())
-                        .map_err(|error| RuntimeError::http(error.message()))?;
+                        .map_err(|error| response_sink_error(&cancellation, &error))?;
                 }
                 Ok(Thunk::evaluated(Value::Unit))
             },
@@ -857,9 +861,41 @@ fn host_stream_flush(
             return Err(RuntimeError::cancelled());
         }
         sink.flush()
-            .map_err(|error| RuntimeError::http(error.message()))?;
+            .map_err(|error| response_sink_error(&cancellation, &error))?;
         Ok(Thunk::evaluated(Value::Unit))
     })
+}
+
+fn response_sink_error(cancellation: &HostCancellation, error: &HostError) -> Arc<RuntimeError> {
+    if cancellation.is_cancelled() {
+        RuntimeError::cancelled()
+    } else {
+        RuntimeError::http(error.message())
+    }
+}
+
+fn finish_body_production(
+    result: RuntimeResult<()>,
+    cancellation: &HostCancellation,
+    first_error: &Mutex<Option<Arc<RuntimeError>>>,
+    cancellation_message: &'static str,
+) -> Result<(), HostError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind == crate::RuntimeErrorKind::Cancelled && cancellation.is_cancelled() =>
+        {
+            Ok(())
+        }
+        Err(error) => {
+            let error = if error.kind == crate::RuntimeErrorKind::Cancelled {
+                RuntimeError::http(cancellation_message)
+            } else {
+                error
+            };
+            Err(record_host_runtime_error(first_error, &error))
+        }
+    }
 }
 
 fn record_host_runtime_error(

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use hell_compiler::{CompilerSession, compile_source};
-use hell_runtime::{RuntimeContext, run_main};
+use hell_runtime::{RuntimeContext, RuntimeError, RuntimeErrorKind, run_main};
 
 #[derive(Clone)]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -19,17 +19,28 @@ impl Write for SharedWriter {
 }
 
 fn run(source: &str, arguments: &[&str]) -> (Result<(), String>, String) {
+    let (result, stdout, _stderr) = run_with_streams(source, arguments);
+    (result.map_err(|error| error.to_string()), stdout)
+}
+
+fn run_with_streams(
+    source: &str,
+    arguments: &[&str],
+) -> (Result<(), Arc<RuntimeError>>, String, String) {
     let program = compile_source(&mut CompilerSession::default(), "applicative.hell", source)
         .map_err(|error| error.to_string())
         .unwrap();
-    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
     let context = RuntimeContext::new(
         arguments.iter().copied().map(Arc::<str>::from).collect(),
-        SharedWriter(Arc::clone(&bytes)),
-    );
-    let result = run_main(program, context).map_err(|error| error.to_string());
-    let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-    (result, output)
+        SharedWriter(Arc::clone(&stdout)),
+    )
+    .with_stderr(SharedWriter(Arc::clone(&stderr)));
+    let result = run_main(program, context);
+    let stdout = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+    let stderr = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+    (result, stdout, stderr)
 }
 
 #[test]
@@ -94,12 +105,21 @@ fn io_and_parser_apply_preserve_operator_specific_order_and_failure() {
     let (result, output) = run(parser, &["--value", "abc", "--function", "xy"]);
     result.unwrap();
     assert_eq!(output, "5\n");
-    let (result, output) = run(parser, &["--function", "xy"]);
-    assert!(result.unwrap_err().contains("--value"));
-    assert!(output.is_empty());
-    let (result, output) = run(parser, &[]);
-    let error = result.unwrap_err();
-    assert!(error.contains("--value"));
-    assert!(!error.contains("missing option `--function`"));
-    assert!(output.is_empty());
+    let (result, stdout, stderr) = run_with_streams(parser, &["--function", "xy"]);
+    assert_eq!(result.unwrap_err().kind, RuntimeErrorKind::Exit(1));
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        "Missing: --value ARG\n\nUsage: hell --value ARG --function ARG\n"
+    );
+    let (result, stdout, stderr) = run_with_streams(parser, &[]);
+    assert_eq!(result.unwrap_err().kind, RuntimeErrorKind::Exit(1));
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        concat!(
+            "Missing: --value ARG --function ARG\n\n",
+            "Usage: hell --value ARG --function ARG\n",
+        )
+    );
 }

@@ -27,7 +27,7 @@ impl FileHandle {
                 file: Some(file),
                 pending: Vec::new(),
             }),
-            buffering: Mutex::new(BufferMode::Block),
+            buffering: Mutex::new(BufferMode::Block(None)),
             permit: Mutex::new(permit),
         })
     }
@@ -68,13 +68,13 @@ impl FileHandle {
         match mode {
             BufferMode::None => flush_pending(&mut state)?,
             BufferMode::Line => {
-                if let Some(last_newline) = state.pending.iter().rposition(|byte| *byte == b'\n') {
-                    let remaining = state.pending.split_off(last_newline.saturating_add(1));
+                if bytes.contains(&b'\n') {
                     flush_pending(&mut state)?;
-                    state.pending = remaining;
                 }
             }
-            BufferMode::Block => flush_complete_blocks(&mut state)?,
+            BufferMode::Block(size) => {
+                flush_complete_blocks(&mut state, size.unwrap_or(BLOCK_BUFFER_BYTES))?;
+            }
         }
         Ok(())
     }
@@ -154,8 +154,8 @@ fn flush_pending(state: &mut FileState) -> std::io::Result<()> {
     Ok(())
 }
 
-fn flush_complete_blocks(state: &mut FileState) -> std::io::Result<()> {
-    let complete_bytes = state.pending.len() / BLOCK_BUFFER_BYTES * BLOCK_BUFFER_BYTES;
+fn flush_complete_blocks(state: &mut FileState, block_bytes: usize) -> std::io::Result<()> {
+    let complete_bytes = state.pending.len() / block_bytes * block_bytes;
     if complete_bytes == 0 {
         return Ok(());
     }
@@ -216,7 +216,7 @@ pub enum BufferMode {
     /// Flush after writes containing a newline.
     Line,
     /// Leave flushing to the underlying buffered writer.
-    Block,
+    Block(Option<usize>),
 }
 
 /// File access mode accepted by `IO.openFile`.
@@ -251,7 +251,7 @@ mod tests {
         handle.write_all(b"tail").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"block");
         handle.write_all(b"\nrest").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"blocktail\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"blocktail\nrest");
 
         handle.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"blocktail\nrest");

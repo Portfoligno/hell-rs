@@ -72,6 +72,41 @@ impl<T: Clone> PersistentTree<T> {
         Self { root: build(items) }
     }
 
+    #[cfg(feature = "compat-tracing")]
+    fn map_preserving_shape<U: Clone, F>(
+        &self,
+        transform: &mut F,
+    ) -> RuntimeResult<PersistentTree<U>>
+    where
+        F: FnMut(&T) -> RuntimeResult<U>,
+    {
+        fn map_node<T, U: Clone, F>(
+            node: Option<&Arc<TreeNode<T>>>,
+            transform: &mut F,
+        ) -> RuntimeResult<Option<Arc<TreeNode<U>>>>
+        where
+            F: FnMut(&T) -> RuntimeResult<U>,
+        {
+            let Some(node) = node else {
+                return Ok(None);
+            };
+            let item = transform(&node.item)?;
+            let left = map_node(node.left.as_ref(), transform)?;
+            let right = map_node(node.right.as_ref(), transform)?;
+            let mapped = TreeNode::new(item, left, right);
+            if mapped.len != node.len {
+                return Err(RuntimeError::internal(
+                    "shape-preserving collection map changed the retained node length",
+                ));
+            }
+            Ok(Some(mapped))
+        }
+
+        Ok(PersistentTree {
+            root: map_node(self.root.as_ref(), transform)?,
+        })
+    }
+
     fn len(&self) -> usize {
         node_len(self.root.as_ref())
     }
@@ -431,6 +466,14 @@ impl OrderedMap {
         Self(PersistentTree::from_sorted(entries))
     }
 
+    #[cfg(feature = "compat-tracing")]
+    pub(crate) fn map_preserving_shape<F>(&self, mut transform: F) -> RuntimeResult<Self>
+    where
+        F: FnMut(&MapEntry) -> RuntimeResult<MapEntry>,
+    {
+        Ok(Self(self.0.map_preserving_shape(&mut transform)?))
+    }
+
     fn singleton(key: ThunkRef, item: ThunkRef) -> Self {
         Self(PersistentTree::singleton((key, item)))
     }
@@ -445,6 +488,19 @@ impl OrderedMap {
 }
 
 impl OrderedSet {
+    #[cfg(test)]
+    pub(crate) fn from_sorted(elements: &[ThunkRef]) -> Self {
+        Self(PersistentTree::from_sorted(elements))
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    pub(crate) fn map_preserving_shape<F>(&self, mut transform: F) -> RuntimeResult<Self>
+    where
+        F: FnMut(&ThunkRef) -> RuntimeResult<ThunkRef>,
+    {
+        Ok(Self(self.0.map_preserving_shape(&mut transform)?))
+    }
+
     fn singleton(element: ThunkRef) -> Self {
         Self(PersistentTree::singleton(element))
     }
@@ -499,11 +555,12 @@ pub(super) fn apply_native(
         }),
         "map_delete" => ord_evidence(evaluator, evidence, "Map.delete")
             .and_then(|evidence| map_delete(evaluator, evidence, &arguments[0], &arguments[1])),
-        "map_singleton" => ord_evidence(evaluator, evidence, "Map.singleton").map(|_| {
-            collection(Value::Map(Arc::new(OrderedMap::singleton(
+        "map_singleton" => ord_evidence(evaluator, evidence, "Map.singleton").and_then(|_| {
+            evaluator.force(&arguments[0])?;
+            Ok(collection(Value::Map(Arc::new(OrderedMap::singleton(
                 Arc::clone(&arguments[0]),
                 Arc::clone(&arguments[1]),
-            ))))
+            )))))
         }),
         "map_size" => map_size(evaluator, &arguments[0]),
         "map_filter" => map_filter(evaluator, &arguments[0], &arguments[1], false),
@@ -560,9 +617,10 @@ pub(super) fn apply_native(
             })
         }
         "set_size" => set_size(evaluator, &arguments[0]),
-        "set_singleton" => ord_evidence(evaluator, evidence, "Set.singleton").map(|_| {
-            collection(Value::Set(Arc::new(OrderedSet::singleton(Arc::clone(
-                &arguments[0],
+        "set_singleton" => ord_evidence(evaluator, evidence, "Set.singleton").and_then(|_| {
+            evaluator.force(&arguments[0])?;
+            Ok(collection(Value::Set(Arc::new(OrderedSet::singleton(
+                Arc::clone(&arguments[0]),
             )))))
         }),
         _ => return None,

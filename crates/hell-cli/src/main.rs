@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use hell_builtins::ExecutionProfile;
 use hell_compiler::{CompilerSession, DiagnosticBundle, compile_file};
@@ -19,7 +20,25 @@ enum Command {
         file: PathBuf,
         arguments: Vec<OsString>,
         profile: ExecutionProfile,
+        evidence: EvidenceOptions,
     },
+}
+
+#[derive(Default)]
+struct EvidenceOptions {
+    resource_audit: Option<PathBuf>,
+    semantic_trace: Option<PathBuf>,
+    typed_result_builtin: Option<hell_builtins::BuiltinId>,
+    typed_result_instance: Option<Arc<str>>,
+}
+
+impl EvidenceOptions {
+    fn is_empty(&self) -> bool {
+        self.resource_audit.is_none()
+            && self.semantic_trace.is_none()
+            && self.typed_result_builtin.is_none()
+            && self.typed_result_instance.is_none()
+    }
 }
 
 enum RunFailure {
@@ -35,10 +54,15 @@ fn usage_summary() -> &'static str {
     "Usage: hell [FILE | --check FILE | --version]\n\n  Runs and typechecks Hell scripts"
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter().peekable();
+    let evidence = parse_evidence_options(&mut arguments)?;
     let profile = parse_execution_profile(&mut arguments)?;
     let Some(first) = arguments.next() else {
+        if !evidence.is_empty() {
+            return Err("evidence options require a script".to_owned());
+        }
         if profile != ExecutionProfile::Upstream {
             return Err("--execution-profile requires a script or --check".into());
         }
@@ -49,6 +73,7 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
             file: first.into(),
             arguments: arguments.collect(),
             profile,
+            evidence,
         });
     }
 
@@ -59,17 +84,24 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
             .iter()
             .any(|option| option == "--help" || option == "-h")
     {
+        if !evidence.is_empty() {
+            return Err("evidence options require a script".to_owned());
+        }
         return Ok(Command::Help);
     }
     if first == "--" {
         let mut remaining = remaining.into_iter();
         let Some(file) = remaining.next() else {
+            if !evidence.is_empty() || profile != ExecutionProfile::Upstream {
+                return Err("evidence and execution profile options require a script".to_owned());
+            }
             return Ok(Command::Version);
         };
         return Ok(Command::Run {
             file: file.into(),
             arguments: remaining.collect(),
             profile,
+            evidence,
         });
     }
 
@@ -117,17 +149,98 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         }
     }
     if let Some(command) = terminal {
-        if check.is_some() || compiler_stats || profile != ExecutionProfile::Upstream {
+        if check.is_some()
+            || compiler_stats
+            || profile != ExecutionProfile::Upstream
+            || !evidence.is_empty()
+        {
             return Err("help, version, and build info do not accept other options".into());
         }
         return Ok(command);
     }
     let file = check.ok_or_else(|| format!("Missing: --check FILE\n\n{}", usage_summary()))?;
+    if !evidence.is_empty() {
+        return Err("evidence options require execution, not --check".to_owned());
+    }
     Ok(Command::Check {
         file,
         compiler_stats,
         profile,
     })
+}
+
+fn parse_evidence_options(
+    arguments: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
+) -> Result<EvidenceOptions, String> {
+    let mut options = EvidenceOptions::default();
+    loop {
+        let flag = match arguments.peek().and_then(|value| value.to_str()) {
+            Some("--evidence-resource-audit") => "--evidence-resource-audit",
+            Some("--evidence-semantic-trace") => "--evidence-semantic-trace",
+            _ => break,
+        };
+        let slot = if flag == "--evidence-resource-audit" {
+            &mut options.resource_audit
+        } else {
+            &mut options.semantic_trace
+        };
+        arguments.next();
+        if slot.is_some() {
+            return Err(format!("{flag} was provided more than once"));
+        }
+        *slot = Some(PathBuf::from(
+            arguments
+                .next()
+                .ok_or_else(|| format!("{flag} requires a path"))?,
+        ));
+    }
+    if arguments.peek().and_then(|value| value.to_str()) == Some("--evidence-typed-result-builtin")
+    {
+        arguments.next();
+        let name = arguments
+            .next()
+            .ok_or_else(|| "--evidence-typed-result-builtin requires a registry name".to_owned())?
+            .into_string()
+            .map_err(|_| "evidence builtin name must be UTF-8".to_owned())?;
+        options.typed_result_builtin = Some(
+            hell_builtins::lookup(&name)
+                .ok_or_else(|| format!("unknown evidence builtin {name:?}"))?
+                .id,
+        );
+        if arguments.peek().and_then(|value| value.to_str())
+            == Some("--evidence-typed-result-builtin")
+        {
+            return Err("--evidence-typed-result-builtin was provided more than once".to_owned());
+        }
+    }
+    if arguments.peek().and_then(|value| value.to_str()) == Some("--evidence-typed-result-instance")
+    {
+        arguments.next();
+        let instance = arguments
+            .next()
+            .ok_or_else(|| "--evidence-typed-result-instance requires a target".to_owned())?
+            .into_string()
+            .map_err(|_| "evidence instance target must be UTF-8".to_owned())?;
+        let builtin = options.typed_result_builtin.ok_or_else(|| {
+            "typed result instance evidence requires a typed result builtin".to_owned()
+        })?;
+        let class = hell_builtins::registry()[usize::from(builtin.0)]
+            .type_class
+            .ok_or_else(|| "unconstrained typed result builtin rejects an instance".to_owned())?;
+        if hell_builtins::instance(class, &instance).is_none() {
+            return Err("typed result instance is not registry-backed".to_owned());
+        }
+        options.typed_result_instance = Some(Arc::from(instance));
+        if arguments.peek().and_then(|value| value.to_str())
+            == Some("--evidence-typed-result-instance")
+        {
+            return Err("--evidence-typed-result-instance was provided more than once".to_owned());
+        }
+    }
+    if options.typed_result_builtin.is_some() && options.semantic_trace.is_none() {
+        return Err("typed result evidence requires a semantic trace path".to_owned());
+    }
+    Ok(options)
 }
 
 fn parse_execution_profile(
@@ -174,11 +287,11 @@ fn run(command: Command) -> Result<(), RunFailure> {
             println!("hell-rs {}", env!("CARGO_PKG_VERSION"));
             println!("language baseline {}", hell_builtins::LANGUAGE_VERSION);
             println!("upstream {}", hell_builtins::UPSTREAM_COMMIT);
+            println!("compatibility evidence schema 2");
             println!(
-                "source commit {}",
-                option_env!("HELL_SOURCE_COMMIT").unwrap_or("unavailable")
+                "compat tracing enabled {}",
+                cfg!(feature = "compat-tracing")
             );
-            println!("compatibility evidence schema 1");
             println!(
                 "compiler policy {:?}",
                 hell_compiler::CompilerConfig::upstream()
@@ -200,6 +313,7 @@ fn run(command: Command) -> Result<(), RunFailure> {
             file,
             arguments,
             profile,
+            evidence,
         } => {
             let program = compile_path(&file, false, profile).map_err(RunFailure::Message)?;
             let mut platform = hell_platform::PlatformContext::process(arguments)
@@ -209,7 +323,32 @@ fn run(command: Command) -> Result<(), RunFailure> {
                     .runtime
                     .with_policy(hell_runtime::policy::RuntimePolicy::sandboxed());
             }
-            hell_runtime::run_main(program, platform.runtime).map_err(|error| match error.kind {
+            #[cfg(feature = "compat-tracing")]
+            let outcome = hell_runtime::run_main_with_evidence(
+                program,
+                platform.runtime,
+                evidence.resource_audit.as_deref(),
+                evidence.semantic_trace.as_deref(),
+                evidence.typed_result_builtin,
+                evidence.typed_result_instance,
+            );
+            #[cfg(not(feature = "compat-tracing"))]
+            let outcome = {
+                if evidence.semantic_trace.is_some()
+                    || evidence.typed_result_builtin.is_some()
+                    || evidence.typed_result_instance.is_some()
+                {
+                    return Err(RunFailure::Message(
+                        "semantic evidence requires the compat-tracing feature".to_owned(),
+                    ));
+                }
+                hell_runtime::run_main_with_resource_audit(
+                    program,
+                    platform.runtime,
+                    evidence.resource_audit.as_deref(),
+                )
+            };
+            outcome.map_err(|error| match error.kind {
                 hell_runtime::RuntimeErrorKind::Exit(status) => RunFailure::Exit(status),
                 _ => RunFailure::Message(error.to_string()),
             })
@@ -282,6 +421,88 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Err(RunFailure::Exit(status)) => ExitCode::from(u8::try_from(status).unwrap_or(1)),
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_options_require_execution() {
+        for arguments in [
+            vec!["--evidence-resource-audit", "audit.json"],
+            vec!["--evidence-resource-audit", "audit.json", "--"],
+            vec!["--evidence-resource-audit", "audit.json", "--version"],
+            vec![
+                "--evidence-resource-audit",
+                "audit.json",
+                "--check",
+                "input.hell",
+            ],
+        ] {
+            assert!(parse(arguments.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn evidence_options_are_prefix_only_and_typed_target_is_unique() {
+        assert!(
+            parse(
+                [
+                    "--evidence-semantic-trace",
+                    "trace.json",
+                    "--evidence-typed-result-builtin",
+                    "Bool.bool",
+                    "--evidence-typed-result-builtin",
+                    "Bool.bool",
+                    "input.hell",
+                ]
+                .map(OsString::from),
+            )
+            .is_err()
+        );
+        assert!(
+            parse(["input.hell", "--evidence-resource-audit", "audit.json"].map(OsString::from),)
+                .is_ok()
+        );
+        let command = parse(
+            [
+                "--evidence-semantic-trace",
+                "trace.json",
+                "--evidence-typed-result-builtin",
+                "Ord.lt",
+                "--evidence-typed-result-instance",
+                "Set",
+                "input.hell",
+            ]
+            .map(OsString::from),
+        )
+        .expect("registry-backed instance evidence");
+        let Command::Run { evidence, .. } = command else {
+            panic!("evidence command was not a run");
+        };
+        assert_eq!(evidence.typed_result_instance.as_deref(), Some("Set"));
+        for arguments in [
+            vec![
+                "--evidence-semantic-trace",
+                "trace.json",
+                "--evidence-typed-result-instance",
+                "Set",
+                "input.hell",
+            ],
+            vec![
+                "--evidence-semantic-trace",
+                "trace.json",
+                "--evidence-typed-result-builtin",
+                "Ord.lt",
+                "--evidence-typed-result-instance",
+                "Unknown",
+                "input.hell",
+            ],
+        ] {
+            assert!(parse(arguments.into_iter().map(OsString::from)).is_err());
+        }
     }
 }
 

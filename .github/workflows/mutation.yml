@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/mutants.toml', '.github/workflows/mutation.yml') }}
+          key: mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}
       - name: Build mutation driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
       - name: Execute release-relevant advisory mutant catalog
@@ -65,4 +65,4 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'compat/mutants.toml', '.github/workflows/mutation.yml') }}
+          key: mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}

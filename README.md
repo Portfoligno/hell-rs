@@ -29,10 +29,10 @@ The Rust executable does not invoke GHC or an upstream `hell` process.
 
 ## Continuous integration
 
-Build the Rust CI driver:
+Build the Rust CI driver and its process-capable conformance helper:
 
 ```text
-cargo build --locked --profile ci --package hell-ci --bin hell-ci
+cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
 ```
 
 Run repository policy and Linux verification:
@@ -47,6 +47,12 @@ Run the portability suite:
 ```text
 target/ci/hell-ci portability --report ci-out/portability-local.json
 ```
+
+The exact branch-push gate inventory, direct local commands, native-platform
+requirements, and hosted-only boundary are documented in
+[`spec/local-ci.md`](spec/local-ci.md). Run every displayed command as its own
+process invocation; local CI uses typed arguments and artifacts rather than
+project-specific environment variables.
 
 CI runs on pushes to every branch except tag pushes and on pull requests.
 Extended, mutation, and regression workflows run directly on the pushed commit.

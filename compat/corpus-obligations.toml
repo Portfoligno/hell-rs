@@ -1,7 +1,7 @@
 schema_version = 2
 state = "review-required"
-pure_runtime = ["adapter-success", "adapter-failure", "lazy-boundary", "whnf-boundary", "deep-boundary", "conditional-selected", "conditional-unselected", "io-execution-boundary", "typed-result", "callback-order", "collection-interaction", "constructor-eliminator", "numeric-boundary", "encoding-boundary", "parser-composition"]
-effects = ["effect-success", "effect-failure", "effect-ordering"]
+pure_runtime = ["adapter-success", "adapter-failure", "result-force-failure", "lazy-boundary", "whnf-boundary", "whnf-failure-boundary", "deep-boundary", "conditional-selected", "conditional-unselected", "io-execution-boundary", "typed-result", "callback-order", "collection-interaction", "constructor-eliminator", "numeric-boundary", "encoding-boundary", "parser-composition"]
+effects = ["effect-success", "effect-failure", "effect-cancellation", "effect-ordering"]
 concurrency = ["task-lifecycle", "race-cancellation", "scope-cleanup"]
 presentation = ["raw-observation", "normalized-shadow-diff"]
 platform = ["three-platform-observation"]

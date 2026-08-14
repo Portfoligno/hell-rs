@@ -141,6 +141,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2
+      - name: Restore cargo-deny compilation cache
+        id: cargo-deny-target-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-tool-cache/cargo-deny-target
+          key: release-linux-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2
       - name: Restore candidate compilation cache
         id: target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -152,10 +158,10 @@ jobs:
         run: rustup show active-toolchain
       - name: Install pinned cargo-deny
         working-directory: automation
-        run: cargo install cargo-deny --locked --version 0.20.2 --force
+        run: cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ../ci-tool-cache/cargo-deny-target
       - name: Build trusted release driver
         working-directory: automation
-        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
       - name: Run Linux release gate, collect conformance evidence, and package
         run: ./automation/target/ci/hell-ci release platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Linux result
@@ -175,6 +181,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2
+      - name: Save cargo-deny compilation cache
+        if: ${{ always() && steps.cargo-deny-target-cache.outcome == 'success' && steps.cargo-deny-target-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-tool-cache/cargo-deny-target
+          key: release-linux-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2
       - name: Save candidate compilation cache
         if: ${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -243,9 +255,11 @@ jobs:
       - name: Resolve pinned Rust toolchain
         working-directory: automation
         run: rustup show active-toolchain
+      - name: Expose pinned LLVM archiver
+        run: brew link --force llvm@18
       - name: Build trusted release driver
         working-directory: automation
-        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
       - name: Run macOS release gate, collect conformance evidence, and package
         run: ./automation/target/ci/hell-ci release platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact macOS result
@@ -335,7 +349,7 @@ jobs:
         run: rustup show active-toolchain
       - name: Build trusted release driver
         working-directory: automation
-        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci
+        run: cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
       - name: Run Windows release gate, collect conformance evidence, and package
         run: .\automation\target\ci\hell-ci.exe release platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input\release-plan.json --conformance-plan release-input\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Windows result

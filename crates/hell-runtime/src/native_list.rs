@@ -252,7 +252,7 @@ fn cycle_from(original: ThunkRef, current: ThunkRef, seen: bool) -> ThunkRef {
             Arc::clone(&original),
             false,
         )),
-        Value::List(ListCell::Nil) => Err(RuntimeError::user("List.cycle: empty list")),
+        Value::List(ListCell::Nil) => Err(RuntimeError::list_cycle_empty()),
         _ => Err(non_list("List.cycle")),
     })
 }
@@ -376,7 +376,7 @@ fn group_by(function: Option<ThunkRef>, input: ThunkRef) -> ThunkRef {
                 "List.group/groupBy",
             );
             #[cfg(feature = "compat-tracing")]
-            evaluator.register_current_adapter_child(&classified)?;
+            let classified = evaluator.register_current_adapter_child(&classified)?;
             let group_tail = take_class(Arc::clone(&classified), true, "List.group/groupBy");
             let suffix = drop_class(classified, true, "List.group/groupBy");
             Ok(Arc::new(Value::List(ListCell::Cons {
@@ -1391,12 +1391,12 @@ fn null(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
 }
 
 fn repeat(item: ThunkRef) -> ThunkRef {
-    Thunk::deferred(move |_| {
-        Ok(Arc::new(Value::List(ListCell::Cons {
-            head: Arc::clone(&item),
-            tail: repeat(Arc::clone(&item)),
-        })))
-    })
+    Evaluator::repeat_list(
+        item,
+        false,
+        #[cfg(feature = "compat-tracing")]
+        None,
+    )
 }
 
 fn take_while(predicate: ThunkRef, input: ThunkRef) -> ThunkRef {
