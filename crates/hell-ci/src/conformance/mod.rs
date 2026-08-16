@@ -1296,7 +1296,7 @@ mod tests {
         let output = std::env::temp_dir().join(format!(
             "hell-conformance-audit-{}-{}.json",
             std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
+            crate::test_thread_name_component(std::thread::current().name())
         ));
         let message = audit(candidate_root.to_owned(), output.clone()).unwrap();
         assert!(message.contains("8520 projected blockers"));
@@ -1420,6 +1420,65 @@ mod tests {
                 assert!(!obligation("effect-success").case_ids.is_empty());
                 assert!(!obligation("effect-ordering").case_ids.is_empty());
                 assert!(obligation("effect-failure").case_ids.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn home_directory_environment_probes_authorize_the_exact_windows_plan_obligations() {
+        let plan = build_release_conformance_plan(
+            &"a".repeat(40),
+            &"b".repeat(40),
+            "2026-08-13T00:00:00Z",
+            &"c".repeat(64),
+            &"d".repeat(64),
+            Vec::new(),
+        )
+        .unwrap();
+        for (dimension, obligations) in [
+            (
+                hell_builtins::CompatibilityDimension::PureRuntime,
+                &["adapter-success"][..],
+            ),
+            (
+                hell_builtins::CompatibilityDimension::Effects,
+                &["effect-success", "effect-ordering"][..],
+            ),
+            (
+                hell_builtins::CompatibilityDimension::Platform,
+                &["three-platform-observation"][..],
+            ),
+            (
+                hell_builtins::CompatibilityDimension::ResourceBehavior,
+                &["resource-audit"][..],
+            ),
+        ] {
+            let cell = plan
+                .cells
+                .iter()
+                .find(|cell| {
+                    cell.key.builtin == "Directory.getHomeDirectory"
+                        && cell.key.dimension == dimension
+                        && cell.key.profile == ProfileId::Upstream
+                        && cell.key.platform == ConformancePlatform::WindowsX86_64
+                })
+                .expect("Windows home-directory plan cell");
+            for obligation in obligations {
+                let case_ids = &cell
+                    .obligations
+                    .iter()
+                    .find(|planned| planned.id == *obligation)
+                    .unwrap_or_else(|| panic!("missing home-directory obligation {obligation}"))
+                    .case_ids;
+                for case_id in [
+                    "runtime-directory-get-home-home-a",
+                    "runtime-directory-get-home-home-b",
+                ] {
+                    assert!(
+                        case_ids.iter().any(|candidate| candidate == case_id),
+                        "{obligation}: {case_id}"
+                    );
+                }
             }
         }
     }

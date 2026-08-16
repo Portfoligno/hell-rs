@@ -63,17 +63,22 @@ impl Observation {
                 "termination",
             ],
         )?;
-        if json_member(fields, "schemaVersion")?.number()? != 3 {
+        if json_member(fields, "schemaVersion")?.number()? != 4 {
             return Err("unsupported observation schema".to_owned());
         }
         let context = json_member(fields, "normalizerContext")?.object()?;
-        require_exact_json_keys(context, &["sandbox", "script"])?;
+        require_exact_json_keys(context, &["executable", "sandbox", "script"])?;
+        let executable = json_member(context, "executable")?.string()?;
         let sandbox = json_member(context, "sandbox")?.string()?;
         let script = json_member(context, "script")?.string()?;
-        if sandbox.is_empty()
+        if executable.is_empty()
+            || std::path::Path::new(executable).file_name().is_none()
+            || sandbox.is_empty()
             || script.is_empty()
+            || executable.contains('\0')
             || sandbox.contains('\0')
             || script.contains('\0')
+            || executable.len() > MAX_OBSERVATION_BYTES
             || sandbox.len() > MAX_OBSERVATION_BYTES
             || script.len() > MAX_OBSERVATION_BYTES
         {
@@ -1632,6 +1637,9 @@ fn replay_normalizers(
     let context = json_member(fields, "normalizerContext")
         .and_then(JsonValue::object)
         .map_err(|_| InvalidEvidenceCode::EvidenceBinding)?;
+    let executable = json_member(context, "executable")
+        .and_then(JsonValue::string)
+        .map_err(|_| InvalidEvidenceCode::EvidenceBinding)?;
     let sandbox = json_member(context, "sandbox")
         .and_then(JsonValue::string)
         .map_err(|_| InvalidEvidenceCode::EvidenceBinding)?;
@@ -1660,6 +1668,7 @@ fn replay_normalizers(
         .collect::<Result<Vec<_>, _>>()?;
     let replayed = hell_testkit::replay_conformance_stderr(
         &raw,
+        std::path::Path::new(executable),
         std::path::Path::new(sandbox),
         std::path::Path::new(script),
         case,
@@ -1850,6 +1859,7 @@ mod tests {
 
     fn normalizer_context() -> JsonValue {
         object([
+            ("executable", string("/bin/hell")),
             ("sandbox", string("/sandbox")),
             ("script", string("/sandbox/main.hell")),
         ])
@@ -1960,7 +1970,7 @@ mod tests {
                 object([("encoding", string("base64")), ("value", string(""))]),
             ),
             ("resourceAudit", string("None")),
-            ("schemaVersion", number(3)),
+            ("schemaVersion", number(4)),
             ("semanticTrace", JsonValue::Array(Vec::new())),
             (
                 "stderr",
@@ -2070,7 +2080,7 @@ mod tests {
                         object([("encoding", string("base64")), ("value", string(""))]),
                     ),
                     ("resourceAudit", string("None")),
-                    ("schemaVersion", number(3)),
+                    ("schemaVersion", number(4)),
                     ("semanticTrace", JsonValue::Array(Vec::new())),
                     (
                         "stderr",
@@ -2132,7 +2142,11 @@ mod tests {
                     ("mode", string("Run")),
                     (
                         "normalizerContext",
-                        object([("sandbox", string(sandbox)), ("script", string(script))]),
+                        object([
+                            ("executable", string("/bin/hell")),
+                            ("sandbox", string(sandbox)),
+                            ("script", string(script)),
+                        ]),
                     ),
                     (
                         "rawStderr",
@@ -2142,7 +2156,7 @@ mod tests {
                         ]),
                     ),
                     ("resourceAudit", string("None")),
-                    ("schemaVersion", number(3)),
+                    ("schemaVersion", number(4)),
                     ("semanticTrace", JsonValue::Array(Vec::new())),
                     (
                         "stderr",
@@ -2305,7 +2319,7 @@ mod tests {
                 object([("encoding", string("base64")), ("value", string(""))]),
             ),
             ("resourceAudit", string("None")),
-            ("schemaVersion", number(3)),
+            ("schemaVersion", number(4)),
             ("semanticTrace", JsonValue::Array(Vec::new())),
             (
                 "stderr",
@@ -2543,7 +2557,7 @@ mod tests {
                 object([("encoding", string("base64")), ("value", string(""))]),
             ),
             ("resourceAudit", string("None")),
-            ("schemaVersion", number(3)),
+            ("schemaVersion", number(4)),
             ("semanticTrace", JsonValue::Array(Vec::new())),
             (
                 "stderr",

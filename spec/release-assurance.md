@@ -18,15 +18,17 @@ and reruns the technical decision before any publication authority is granted.
 ## Automatic push readiness
 
 Every branch push, with tag pushes excluded, runs one unfiltered readiness DAG
-for the exact `github.sha`. The planning job resolves the repository's current
-default branch to an immutable trusted-automation SHA, binds that SHA into the
-plan, and every downstream job checks out that exact automation revision. The
-candidate branch remains arbitrary. The Linux, macOS, and Windows jobs execute
-the same technical gate inventories used by release, and the final trusted
-verifier reconstructs the complete evidence partition without executing
-candidate code. A green aggregate push check suite therefore means that exact
-commit is technically eligible to become a release under that bound control
-plane.
+for the exact `github.sha`. The planning job checks out both the readiness
+driver and repository under test at that immutable candidate SHA. The plan
+requires their Git identities to match, binds that identity into every plan,
+report, and evidence artifact, and every downstream job checks out that exact
+revision. The Linux, macOS, and Windows jobs execute the same technical gate
+inventories used by release, and the final exact-SHA verifier reconstructs the
+complete evidence partition. A stale default-branch driver cannot participate
+in this branch-independent preparation path, and a substituted driver or plan
+fails identity and digest validation. A green aggregate push check suite
+therefore means that exact commit is technically eligible to become a release
+under its candidate-bound control plane.
 
 Automatic readiness includes conformance policy and plan binding,
 applicability and evidence catalogs, native oracle evidence, confinement,
@@ -38,11 +40,13 @@ nor reuses release authority.
 
 ## Trust boundary
 
-The protected default-branch workflow and Rust release driver are the trusted
-control plane. Candidate code executes only in unprivileged GitHub-hosted Linux,
-macOS, and Windows jobs with read-only repository permissions. Those jobs
-receive neither repository write permission nor OIDC attestation permission.
-Candidate and oracle processes run with a
+Automatic readiness is an exact-SHA, candidate-bound preparation path; it has
+no release or attestation authority. The protected default-branch workflow and
+Rust release driver remain the trusted publication control plane and
+independently rerun readiness before publishing. Candidate code executes only
+in unprivileged GitHub-hosted Linux, macOS, and Windows readiness jobs with
+read-only repository permissions. Those jobs receive neither repository write
+permission nor OIDC attestation permission. Candidate and oracle processes run with a
 scrubbed environment, structured argument vectors, bounded output, and bounded
 execution time.
 

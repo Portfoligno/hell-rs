@@ -1107,6 +1107,10 @@ fn scan_callback(
 
 fn sort(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     let items = evaluator.force_list_elements(input)?;
+    if use_base_421_sort_topology() {
+        let sorted = base_421_sort(evaluator, items, reviewed_sort_greater_than)?;
+        return Ok(Value::List(list_cell_from(sorted)));
+    }
     let mut runs = natural_sort_runs(evaluator, items)?;
     while runs.len() > 1 {
         evaluator.ensure_not_cancelled()?;
@@ -1124,10 +1128,77 @@ fn sort(evaluator: &mut Evaluator, input: &ThunkRef) -> RuntimeResult<Value> {
     Ok(Value::List(list_cell_from(runs.pop().unwrap_or_default())))
 }
 
-fn natural_sort_runs(
+pub(crate) fn use_base_421_sort_topology() -> bool {
+    let reviewed = hell_builtins::native_oracle_list_sort()
+        == hell_builtins::NativeOracleListSort::Ghc912Base421FourWay;
+    reviewed != crate::semantic_mutant_active("list-sort-native-oracle-topology")
+}
+
+fn reviewed_sort_greater_than(
     evaluator: &mut Evaluator,
-    items: Vec<ThunkRef>,
-) -> RuntimeResult<Vec<Vec<ThunkRef>>> {
+    left: &ThunkRef,
+    right: &ThunkRef,
+) -> RuntimeResult<bool> {
+    let raw_greater_than = (hell_builtins::native_oracle_list_sort()
+        == hell_builtins::NativeOracleListSort::Ghc912Base421FourWay)
+        != crate::semantic_mutant_active("list-sort-native-oracle-comparator");
+    if raw_greater_than {
+        evaluator.less_values(right, left)
+    } else {
+        compare_greater_than(evaluator, left, right)
+    }
+}
+
+pub(crate) fn base_421_sort<T>(
+    evaluator: &mut Evaluator,
+    items: Vec<T>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<T>> {
+    let mut items = items.into_iter();
+    let Some(first) = items.next() else {
+        return Ok(Vec::new());
+    };
+    let Some(second) = items.next() else {
+        return Ok(vec![first]);
+    };
+    let Some(third) = items.next() else {
+        return merge_base_421(evaluator, vec![first], vec![second], greater_than);
+    };
+    let Some(fourth) = items.next() else {
+        return merge_three_base_421(
+            evaluator,
+            vec![first],
+            vec![second],
+            vec![third],
+            greater_than,
+        );
+    };
+    let Some(fifth) = items.next() else {
+        return merge_four_base_421(
+            evaluator,
+            vec![first],
+            vec![second],
+            vec![third],
+            vec![fourth],
+            greater_than,
+        );
+    };
+
+    let mut all = vec![first, second, third, fourth, fifth];
+    all.extend(items);
+    let mut runs = natural_base_421_runs(evaluator, all, greater_than)?;
+    while runs.len() > 1 {
+        evaluator.ensure_not_cancelled()?;
+        runs = reduce_base_421_once(evaluator, runs, greater_than)?;
+    }
+    Ok(runs.pop().expect("nonempty base-4.21 sort has one run"))
+}
+
+fn natural_base_421_runs<T>(
+    evaluator: &mut Evaluator,
+    items: Vec<T>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<Vec<T>>> {
     let mut remaining = items.into_iter().peekable();
     let mut runs = Vec::new();
     while let Some(first) = remaining.next() {
@@ -1139,7 +1210,167 @@ fn natural_sort_runs(
         let mut run = vec![first];
         let mut current = second;
         while let Some(next) = remaining.peek() {
-            let next_descending = greater_than(evaluator, &current, next)?;
+            if greater_than(evaluator, &current, next)? != descending {
+                break;
+            }
+            run.push(current);
+            current = remaining.next().expect("peeked base-4.21 sort item exists");
+        }
+        run.push(current);
+        if descending {
+            run.reverse();
+        }
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
+fn reduce_base_421_once<T>(
+    evaluator: &mut Evaluator,
+    runs: Vec<Vec<T>>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<Vec<T>>> {
+    let mut runs = runs.into_iter();
+    let mut reduced = Vec::new();
+    loop {
+        match runs.len() {
+            0 => break,
+            1 => reduced.push(runs.next().expect("one base-4.21 run remains")),
+            2 => {
+                let first = runs.next().expect("first base-4.21 run exists");
+                let second = runs.next().expect("second base-4.21 run exists");
+                reduced.push(merge_base_421(evaluator, first, second, greater_than)?);
+            }
+            3 => {
+                let first = runs.next().expect("first base-4.21 run exists");
+                let second = runs.next().expect("second base-4.21 run exists");
+                let third = runs.next().expect("third base-4.21 run exists");
+                reduced.push(merge_three_base_421(
+                    evaluator,
+                    first,
+                    second,
+                    third,
+                    greater_than,
+                )?);
+            }
+            5 => {
+                let first = runs.next().expect("first base-4.21 run exists");
+                let second = runs.next().expect("second base-4.21 run exists");
+                reduced.push(merge_base_421(evaluator, first, second, greater_than)?);
+                let third = runs.next().expect("third base-4.21 run exists");
+                let fourth = runs.next().expect("fourth base-4.21 run exists");
+                let fifth = runs.next().expect("fifth base-4.21 run exists");
+                reduced.push(merge_three_base_421(
+                    evaluator,
+                    third,
+                    fourth,
+                    fifth,
+                    greater_than,
+                )?);
+            }
+            6 => {
+                let first = runs.next().expect("first base-4.21 run exists");
+                let second = runs.next().expect("second base-4.21 run exists");
+                let third = runs.next().expect("third base-4.21 run exists");
+                reduced.push(merge_three_base_421(
+                    evaluator,
+                    first,
+                    second,
+                    third,
+                    greater_than,
+                )?);
+                let fourth = runs.next().expect("fourth base-4.21 run exists");
+                let fifth = runs.next().expect("fifth base-4.21 run exists");
+                let sixth = runs.next().expect("sixth base-4.21 run exists");
+                reduced.push(merge_three_base_421(
+                    evaluator,
+                    fourth,
+                    fifth,
+                    sixth,
+                    greater_than,
+                )?);
+            }
+            _ => {
+                let first = runs.next().expect("first base-4.21 run exists");
+                let second = runs.next().expect("second base-4.21 run exists");
+                let third = runs.next().expect("third base-4.21 run exists");
+                let fourth = runs.next().expect("fourth base-4.21 run exists");
+                reduced.push(merge_four_base_421(
+                    evaluator,
+                    first,
+                    second,
+                    third,
+                    fourth,
+                    greater_than,
+                )?);
+            }
+        }
+    }
+    Ok(reduced)
+}
+
+fn merge_three_base_421<T>(
+    evaluator: &mut Evaluator,
+    first: Vec<T>,
+    second: Vec<T>,
+    third: Vec<T>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<T>> {
+    let first_two = merge_base_421(evaluator, first, second, greater_than)?;
+    merge_base_421(evaluator, first_two, third, greater_than)
+}
+
+fn merge_four_base_421<T>(
+    evaluator: &mut Evaluator,
+    first: Vec<T>,
+    second: Vec<T>,
+    third: Vec<T>,
+    fourth: Vec<T>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<T>> {
+    let first_two = merge_base_421(evaluator, first, second, greater_than)?;
+    let second_two = merge_base_421(evaluator, third, fourth, greater_than)?;
+    merge_base_421(evaluator, first_two, second_two, greater_than)
+}
+
+fn merge_base_421<T>(
+    evaluator: &mut Evaluator,
+    left: Vec<T>,
+    right: Vec<T>,
+    greater_than: fn(&mut Evaluator, &T, &T) -> RuntimeResult<bool>,
+) -> RuntimeResult<Vec<T>> {
+    let mut output = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some(left_item), Some(right_item)) = (left.peek(), right.peek()) {
+        evaluator.ensure_not_cancelled()?;
+        if greater_than(evaluator, left_item, right_item)? {
+            output.push(right.next().expect("peeked right base-4.21 item exists"));
+        } else {
+            output.push(left.next().expect("peeked left base-4.21 item exists"));
+        }
+    }
+    output.extend(left);
+    output.extend(right);
+    Ok(output)
+}
+
+fn natural_sort_runs(
+    evaluator: &mut Evaluator,
+    items: Vec<ThunkRef>,
+) -> RuntimeResult<Vec<Vec<ThunkRef>>> {
+    let mut remaining = items.into_iter().peekable();
+    let mut runs = Vec::new();
+    while let Some(first) = remaining.next() {
+        let Some(second) = remaining.next() else {
+            runs.push(vec![first]);
+            break;
+        };
+        let descending = reviewed_sort_greater_than(evaluator, &first, &second)?;
+        let mut run = vec![first];
+        let mut current = second;
+        while let Some(next) = remaining.peek() {
+            let next_descending = reviewed_sort_greater_than(evaluator, &current, next)?;
             if next_descending != descending {
                 break;
             }
@@ -1155,7 +1386,7 @@ fn natural_sort_runs(
     Ok(runs)
 }
 
-fn greater_than(
+fn compare_greater_than(
     evaluator: &mut Evaluator,
     left: &ThunkRef,
     right: &ThunkRef,
@@ -1173,7 +1404,7 @@ fn merge_sorted(
     let mut right = right.into_iter().peekable();
     while let (Some(left_item), Some(right_item)) = (left.peek(), right.peek()) {
         evaluator.ensure_not_cancelled()?;
-        if greater_than(evaluator, left_item, right_item)? {
+        if reviewed_sort_greater_than(evaluator, left_item, right_item)? {
             output.push(right.next().expect("peeked right item exists"));
         } else {
             output.push(left.next().expect("peeked left item exists"));

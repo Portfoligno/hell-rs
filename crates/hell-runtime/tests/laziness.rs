@@ -1,5 +1,7 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "mutation-testing")]
 use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
@@ -1496,8 +1498,8 @@ fn process_set_env_path_search_never_selects_batch_scripts() {
     let second = directory.join("second");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
-    std::fs::write(first.join("native-helper.bat"), b"@exit /b 97\r\n").unwrap();
-    std::fs::write(first.join("native-helper.cmd"), b"@exit /b 98\r\n").unwrap();
+    std::fs::write(first.join("native-helper.bat"), b"not executed\r\n").unwrap();
+    std::fs::write(first.join("native-helper.cmd"), b"not executed\r\n").unwrap();
     std::fs::copy(
         std::env::current_exe().unwrap(),
         second.join("native-helper.exe"),

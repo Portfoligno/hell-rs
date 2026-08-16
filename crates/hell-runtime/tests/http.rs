@@ -592,6 +592,43 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
     std::fs::remove_dir(directory).unwrap();
 }
 
+fn is_incomplete_request_failure(error: &str) -> bool {
+    // Hyper connection teardown can cancel the request before the independent
+    // body pump publishes its transport error, or the pump can publish first.
+    // Hyper's transport error has one exact connection category and may append
+    // one nonempty single-line cause. Runtime cancellation is the third source.
+    error == "H0906: IO action was cancelled"
+        || error == "H0908: HTTP request was cancelled"
+        || error == "H0908: read HTTP request body: error reading a body from connection"
+        || error
+            .strip_prefix("H0908: read HTTP request body: error reading a body from connection: ")
+            .is_some_and(|detail| {
+                !detail.is_empty() && !detail.contains('\r') && !detail.contains('\n')
+            })
+}
+
+#[test]
+fn incomplete_request_failure_classification_is_closed_world() {
+    for error in [
+        "H0906: IO action was cancelled",
+        "H0908: HTTP request was cancelled",
+        "H0908: read HTTP request body: error reading a body from connection",
+        "H0908: read HTTP request body: error reading a body from connection: incomplete message",
+    ] {
+        assert!(is_incomplete_request_failure(error));
+    }
+    for error in [
+        "H0908: request was cancelled",
+        "H0908: HTTP request was cancelled: response started",
+        "H0908: read HTTP request body: error reading a body from connection: ",
+        "H0908: read HTTP request body: error reading a body from connection: incomplete\nmessage",
+        "H0908: HTTP response stream was cancelled",
+        "H0908: network capability is disabled",
+    ] {
+        assert!(!is_incomplete_request_failure(error));
+    }
+}
+
 #[test]
 fn incomplete_request_before_response_remains_server_fatal() {
     let port = available_port();
@@ -604,7 +641,7 @@ fn incomplete_request_before_response_remains_server_fatal() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&source, std::env::temp_dir());
+    let (worker, receiver, observer) = start_server_observed(&source, std::env::temp_dir());
     let mut stream = connect(port);
     stream
         .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\npartial")
@@ -615,15 +652,21 @@ fn incomplete_request_before_response_remains_server_fatal() {
         .recv_timeout(Duration::from_secs(3))
         .expect("incomplete request reached the server scope")
         .unwrap_err();
-    let cancelled = error == "H0906: IO action was cancelled";
-    let body_read_failed = error.starts_with("H0908:")
-        && error.contains("read HTTP request body: error reading a body from connection");
     assert!(
-        cancelled || body_read_failed,
+        is_incomplete_request_failure(&error),
         "unexpected incomplete-request error: {error}"
     );
-    drop(stream);
     worker.join().unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(
+        response.is_empty(),
+        "incomplete request unexpectedly produced a response: {response:?}"
+    );
+    let resources = observer.budget().snapshot();
+    assert_eq!(resources.live_http_connections, 0);
+    assert_eq!(resources.live_tasks, 0);
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod collection_authority;
 mod corpus;
 mod reviewed_set;
 mod runtime_obligations;
+mod windows_presentation;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -21,6 +22,7 @@ use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
 
 use hell_builtins::CompatibilityDimension;
 pub use hell_builtins::{BuiltinId, ClaimPlatform, ExecutionProfile, NormalizerId};
+pub use windows_presentation::WindowsPresentationField;
 
 /// Environment names that a release-candidate child may inherit from the
 /// trusted driver. Values are selected from the trusted parent's environment;
@@ -73,18 +75,14 @@ pub const RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "__DOTNET_PREFERRED_BITNESS",
 ];
 
-/// Environment names explicitly carried through the POSIX privilege boundary.
-/// The trusted adapter clears sudo's synthesized environment before executing
-/// the requested program, so this is both the preservation and final-child
-/// allowlist.
+/// Versioned request marker for the typed POSIX release-child envelope.
 #[cfg(unix)]
-pub const POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT: &str = concat!(
-    "--preserve-env=",
-    "CARGO_HOME,CARGO_INCREMENTAL,CARGO_TARGET_DIR,CARGO_TERM_COLOR,CI,DEVELOPER_DIR,",
-    "GITHUB_ACTIONS,HOME,ImageOS,ImageVersion,LANG,LC_ALL,LIBRARY_PATH,PATH,RUNNER_ARCH,",
-    "RUNNER_OS,RUSTC_WRAPPER,RUSTDOCFLAGS,RUSTUP_HOME,SCCACHE_DIR,SDKROOT,SOURCE_DATE_EPOCH,",
-    "TEMP,TMP,TMPDIR,USERPROFILE"
-);
+pub const POSIX_RELEASE_CHILD_REQUEST_V1: &str = "__release-posix-child-v1";
+
+/// Maximum exact group inventory retained for a POSIX candidate, including
+/// its primary group.
+#[cfg(unix)]
+pub const POSIX_CANDIDATE_GROUP_LIMIT: usize = 128;
 
 /// Exact POSIX child environment names accepted by the trusted adapter.
 #[cfg(unix)]
@@ -108,6 +106,7 @@ pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "RUSTC_WRAPPER",
     "RUSTDOCFLAGS",
     "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
     "SCCACHE_DIR",
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
@@ -191,6 +190,24 @@ pub struct CandidateLaunchPolicy {
     #[cfg(unix)]
     adapter: PathBuf,
     #[cfg(unix)]
+    adapter_sha256: Digest,
+    #[cfg(unix)]
+    adapter_identity: PosixAdapterIdentity,
+    #[cfg(unix)]
+    cargo_source: PathBuf,
+    #[cfg(unix)]
+    cargo_adapter: PathBuf,
+    #[cfg(unix)]
+    cargo_adapter_sha256: Digest,
+    #[cfg(unix)]
+    cargo_adapter_identity: PosixAdapterIdentity,
+    #[cfg(unix)]
+    cargo_authority: BoundPosixCargoSourceAuthority,
+    #[cfg(unix)]
+    cargo_deny_authority: Option<BoundPosixCargoDenyAuthority>,
+    #[cfg(unix)]
+    stack_authority: Option<BoundPosixStackAuthority>,
+    #[cfg(unix)]
     principal: Arc<str>,
     #[cfg(unix)]
     uid: u32,
@@ -198,7 +215,1498 @@ pub struct CandidateLaunchPolicy {
     group: Arc<str>,
     #[cfg(windows)]
     launcher: PathBuf,
+    #[cfg(windows)]
+    launcher_sha256: Digest,
+    #[cfg(windows)]
+    restricted_adapter: PathBuf,
+    #[cfg(windows)]
+    restricted_adapter_sha256: Digest,
+    #[cfg(windows)]
+    toolchain: WindowsToolchainAuthority,
     writable_roots: Arc<[PathBuf]>,
+}
+
+/// Exact executable authorities for the Windows restricted-child boundary.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsLaunchAuthorities {
+    launcher: PathBuf,
+    launcher_sha256: Digest,
+    restricted_adapter: PathBuf,
+    restricted_adapter_sha256: Digest,
+    toolchain: WindowsToolchainAuthority,
+}
+
+/// Exact source-to-stage executable mapping for the selected Windows Rustup toolchain.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsToolchainAuthority {
+    cargo_source: BoundProgramInvocation,
+    rustc_source: BoundProgramInvocation,
+    selected_cargo: BoundProgramInvocation,
+    staged_cargo: BoundProgramInvocation,
+    selected_rustc: BoundProgramInvocation,
+    staged_rustc: BoundProgramInvocation,
+    inventory_root: PathBuf,
+    inventory_files: Arc<[BoundProgramInvocation]>,
+    inventory_directories: Arc<[PathBuf]>,
+    trusted_parent_path: OsString,
+    trusted_path_entries: Arc<[WindowsTrustedPathEntry]>,
+    system_root: WindowsSystemRootAuthority,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsSystemRootAuthority {
+    value: OsString,
+    root: WindowsPresentTrustedPathEntry,
+    system32: WindowsPresentTrustedPathEntry,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+enum WindowsTrustedPathEntry {
+    Present(WindowsPresentTrustedPathEntry),
+    Absent(WindowsAbsentTrustedPathEntry),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsPresentTrustedPathEntry {
+    invocation_path: PathBuf,
+    canonical_identity: PathBuf,
+    identity: Arc<same_file::Handle>,
+}
+
+#[cfg(windows)]
+impl WindowsTrustedPathEntry {
+    fn bind(path: PathBuf) -> std::io::Result<Self> {
+        validate_windows_trusted_path_spelling(&path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => WindowsPresentTrustedPathEntry::bind(path).map(Self::Present),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                WindowsAbsentTrustedPathEntry::bind(path).map(Self::Absent)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        match self {
+            Self::Present(entry) => entry.revalidate(),
+            Self::Absent(entry) => entry.revalidate(),
+        }
+    }
+
+    fn canonical_identity(&self) -> Option<&Path> {
+        match self {
+            Self::Present(entry) => Some(&entry.canonical_identity),
+            Self::Absent(_) => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPresentTrustedPathEntry {
+    fn bind(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        validate_windows_trusted_path_spelling(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows PATH entry is not a direct directory",
+            ));
+        }
+        let canonical_identity = fs::canonicalize(&path)?;
+        let canonical_metadata = fs::symlink_metadata(&canonical_identity)?;
+        if !canonical_metadata.is_dir()
+            || canonical_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows PATH identity is not a direct directory",
+            ));
+        }
+        Ok(Self {
+            invocation_path: path,
+            identity: Arc::new(same_file::Handle::from_path(&canonical_identity)?),
+            canonical_identity,
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let metadata = fs::symlink_metadata(&self.invocation_path)?;
+        if !metadata.is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || fs::canonicalize(&self.invocation_path)? != self.canonical_identity
+            || same_file::Handle::from_path(&self.canonical_identity)? != *self.identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows PATH directory identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl WindowsSystemRootAuthority {
+    fn bind(value: OsString, trusted_path: &[WindowsTrustedPathEntry]) -> std::io::Result<Self> {
+        let root = WindowsPresentTrustedPathEntry::bind(PathBuf::from(&value))?;
+        let system32 = WindowsPresentTrustedPathEntry::bind(root.invocation_path.join("System32"))?;
+        let system32_parent = system32.canonical_identity.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows System32 has no parent",
+            )
+        })?;
+        if same_file::Handle::from_path(system32_parent)? != *root.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows System32 is not a direct child of SystemRoot",
+            ));
+        }
+        let path_contains = |required: &WindowsPresentTrustedPathEntry| {
+            trusted_path.iter().any(|entry| {
+                matches!(
+                    entry,
+                    WindowsTrustedPathEntry::Present(present)
+                        if *present.identity == *required.identity
+                )
+            })
+        };
+        if !path_contains(&root) || !path_contains(&system32) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows PATH does not contain its exact SystemRoot and System32",
+            ));
+        }
+        let authority = Self {
+            value,
+            root,
+            system32,
+        };
+        authority.revalidate()?;
+        Ok(authority)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        self.root.revalidate()?;
+        self.system32.revalidate()?;
+        let system32_parent = self.system32.canonical_identity.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows System32 has no parent",
+            )
+        })?;
+        if same_file::Handle::from_path(system32_parent)? != *self.root.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows SystemRoot relation changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsAbsentTrustedPathEntry {
+    invocation_path: PathBuf,
+    first_absent_path: PathBuf,
+    existing_ancestor: WindowsPresentTrustedPathEntry,
+}
+
+#[cfg(windows)]
+impl WindowsAbsentTrustedPathEntry {
+    fn bind(invocation_path: PathBuf) -> std::io::Result<Self> {
+        validate_windows_trusted_path_spelling(&invocation_path)?;
+        let mut first_absent_path = invocation_path.clone();
+        let mut ancestor = invocation_path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "absent trusted Windows PATH entry has no parent",
+                )
+            })?
+            .to_path_buf();
+        loop {
+            match fs::symlink_metadata(&ancestor) {
+                Ok(_) => {
+                    return Ok(Self {
+                        invocation_path,
+                        first_absent_path,
+                        existing_ancestor: WindowsPresentTrustedPathEntry::bind(ancestor)?,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    first_absent_path.clone_from(&ancestor);
+                    ancestor = ancestor
+                        .parent()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "absent trusted Windows PATH entry has no existing ancestor",
+                            )
+                        })?
+                        .to_path_buf();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        self.existing_ancestor.revalidate()?;
+        match fs::symlink_metadata(&self.first_absent_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "absent trusted Windows PATH entry appeared: {}",
+                    self.invocation_path.display()
+                ),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_trusted_path_spelling(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let has_raw_dot_component = path
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>()
+        .split(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+        .any(|component| {
+            component == [u16::from(b'.')] || component == [u16::from(b'.'), u16::from(b'.')]
+        });
+    if !path.is_absolute() || path_has_lexical_dot_component(path) || has_raw_dot_component {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trusted Windows PATH entry is not absolute and lexical",
+        ));
+    }
+    Ok(())
+}
+
+/// One exact Rustup proxy/selected source/staged executable mapping.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsToolchainExecutableAuthority {
+    source_invocation: PathBuf,
+    source_identity: PathBuf,
+    selected: PathBuf,
+    staged: PathBuf,
+}
+
+/// Closed operation labels for failures while binding a staged Windows Rust
+/// toolchain. These labels keep hosted diagnostics actionable without changing
+/// which paths or identities the authority accepts.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsToolchainBindOperation {
+    CanonicalizeInventoryRoot,
+    BindTrustedPathEntry,
+    BindSystemRoot,
+    BindCargoSource,
+    BindRustcSource,
+    BindSelectedCargo,
+    BindStagedCargo,
+    BindSelectedRustc,
+    BindStagedRustc,
+    BindInventoryFile,
+    HashSelectedCargo,
+    HashStagedCargo,
+    HashSelectedRustc,
+    HashStagedRustc,
+    RevalidateInventory,
+}
+
+impl std::fmt::Display for WindowsToolchainBindOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::CanonicalizeInventoryRoot => "canonicalize-inventory-root",
+            Self::BindTrustedPathEntry => "bind-trusted-path-entry",
+            Self::BindSystemRoot => "bind-system-root",
+            Self::BindCargoSource => "bind-cargo-source",
+            Self::BindRustcSource => "bind-rustc-source",
+            Self::BindSelectedCargo => "bind-selected-cargo",
+            Self::BindStagedCargo => "bind-staged-cargo",
+            Self::BindSelectedRustc => "bind-selected-rustc",
+            Self::BindStagedRustc => "bind-staged-rustc",
+            Self::BindInventoryFile => "bind-inventory-file",
+            Self::HashSelectedCargo => "hash-selected-cargo",
+            Self::HashStagedCargo => "hash-staged-cargo",
+            Self::HashSelectedRustc => "hash-selected-rustc",
+            Self::HashStagedRustc => "hash-staged-rustc",
+            Self::RevalidateInventory => "revalidate-inventory",
+        };
+        formatter.write_str(label)
+    }
+}
+
+/// Retains the original I/O error kind while attaching a closed operation and
+/// the exact path on which the trusted binding failed.
+#[doc(hidden)]
+#[must_use]
+pub fn windows_toolchain_bind_failure(
+    operation: WindowsToolchainBindOperation,
+    path: &Path,
+    error: &std::io::Error,
+) -> std::io::Error {
+    let raw_os_error = error
+        .raw_os_error()
+        .map_or_else(|| "none".to_owned(), |code| code.to_string());
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "operation={operation} path={} kind={:?} osError={raw_os_error} source={error}",
+            path.display(),
+            error.kind()
+        ),
+    )
+}
+
+#[cfg(windows)]
+impl WindowsToolchainExecutableAuthority {
+    /// Describes a standard Rustup proxy mapped to one selected staged tool.
+    #[must_use]
+    pub fn rustup_proxy(
+        proxy: PathBuf,
+        proxy_identity: PathBuf,
+        selected: PathBuf,
+        staged: PathBuf,
+    ) -> Self {
+        Self {
+            source_invocation: proxy,
+            source_identity: proxy_identity,
+            selected,
+            staged,
+        }
+    }
+
+    /// Describes the exact selected toolchain executable mapped to its staged copy.
+    #[must_use]
+    pub fn selected_toolchain(
+        invocation: PathBuf,
+        identity: PathBuf,
+        selected: PathBuf,
+        staged: PathBuf,
+    ) -> Self {
+        Self {
+            source_invocation: invocation,
+            source_identity: identity,
+            selected,
+            staged,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsToolchainAuthority {
+    /// Binds the two typed Rust tool sources and exact selected/staged executables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any path is redirected or substituted, or if a staged
+    /// executable does not have the exact bytes of its selected source.
+    pub fn new(
+        cargo: WindowsToolchainExecutableAuthority,
+        rustc: WindowsToolchainExecutableAuthority,
+        inventory_root: PathBuf,
+        inventory_files: Vec<PathBuf>,
+        inventory_directories: Vec<PathBuf>,
+        trusted_parent_path: OsString,
+        trusted_parent_system_root: OsString,
+    ) -> std::io::Result<Self> {
+        let inventory_root = fs::canonicalize(&inventory_root).map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::CanonicalizeInventoryRoot,
+                &inventory_root,
+                &error,
+            )
+        })?;
+        let mut trusted_path_entries = Vec::new();
+        for path in std::env::split_paths(&trusted_parent_path) {
+            let entry = WindowsTrustedPathEntry::bind(path.clone()).map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::BindTrustedPathEntry,
+                    &path,
+                    &error,
+                )
+            })?;
+            trusted_path_entries.push(entry);
+        }
+        if trusted_path_entries.is_empty()
+            || trusted_path_entries.len() > 128
+            || !trusted_path_entries
+                .iter()
+                .any(|entry| entry.canonical_identity().is_some())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trusted Windows PATH has an invalid entry count",
+            ));
+        }
+        let system_root_path = PathBuf::from(&trusted_parent_system_root);
+        let system_root =
+            WindowsSystemRootAuthority::bind(trusted_parent_system_root, &trusted_path_entries)
+                .map_err(|error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindSystemRoot,
+                        &system_root_path,
+                        &error,
+                    )
+                })?;
+        let cargo_source_path = cargo.source_identity.clone();
+        let rustc_source_path = rustc.source_identity.clone();
+        let selected_cargo_path = cargo.selected.clone();
+        let staged_cargo_path = cargo.staged.clone();
+        let selected_rustc_path = rustc.selected.clone();
+        let staged_rustc_path = rustc.staged.clone();
+        let cargo_source =
+            BoundProgramInvocation::new(cargo.source_invocation, cargo.source_identity).map_err(
+                |error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindCargoSource,
+                        &cargo_source_path,
+                        &error,
+                    )
+                },
+            )?;
+        let rustc_source =
+            BoundProgramInvocation::new(rustc.source_invocation, rustc.source_identity).map_err(
+                |error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindRustcSource,
+                        &rustc_source_path,
+                        &error,
+                    )
+                },
+            )?;
+        let selected_cargo =
+            BoundProgramInvocation::new(selected_cargo_path.clone(), selected_cargo_path.clone())
+                .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::BindSelectedCargo,
+                    &selected_cargo_path,
+                    &error,
+                )
+            })?;
+        let staged_cargo =
+            BoundProgramInvocation::new(staged_cargo_path.clone(), staged_cargo_path.clone())
+                .map_err(|error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindStagedCargo,
+                        &staged_cargo_path,
+                        &error,
+                    )
+                })?;
+        let selected_rustc =
+            BoundProgramInvocation::new(selected_rustc_path.clone(), selected_rustc_path.clone())
+                .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::BindSelectedRustc,
+                    &selected_rustc_path,
+                    &error,
+                )
+            })?;
+        let staged_rustc =
+            BoundProgramInvocation::new(staged_rustc_path.clone(), staged_rustc_path.clone())
+                .map_err(|error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindStagedRustc,
+                        &staged_rustc_path,
+                        &error,
+                    )
+                })?;
+        let inventory_files = inventory_files
+            .into_iter()
+            .map(|path| {
+                BoundProgramInvocation::new(path.clone(), path.clone()).map_err(|error| {
+                    windows_toolchain_bind_failure(
+                        WindowsToolchainBindOperation::BindInventoryFile,
+                        &path,
+                        &error,
+                    )
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let authority = Self {
+            cargo_source,
+            rustc_source,
+            selected_cargo,
+            staged_cargo,
+            selected_rustc,
+            staged_rustc,
+            inventory_root,
+            inventory_files: inventory_files.into(),
+            inventory_directories: inventory_directories.into(),
+            trusted_parent_path,
+            trusted_path_entries: trusted_path_entries.into(),
+            system_root,
+        };
+        let selected_cargo_sha = sha256_file(&authority.selected_cargo.canonical_identity)
+            .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::HashSelectedCargo,
+                    &authority.selected_cargo.canonical_identity,
+                    &error,
+                )
+            })?;
+        let staged_cargo_sha =
+            sha256_file(&authority.staged_cargo.canonical_identity).map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::HashStagedCargo,
+                    &authority.staged_cargo.canonical_identity,
+                    &error,
+                )
+            })?;
+        let selected_rustc_sha = sha256_file(&authority.selected_rustc.canonical_identity)
+            .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::HashSelectedRustc,
+                    &authority.selected_rustc.canonical_identity,
+                    &error,
+                )
+            })?;
+        let staged_rustc_sha =
+            sha256_file(&authority.staged_rustc.canonical_identity).map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::HashStagedRustc,
+                    &authority.staged_rustc.canonical_identity,
+                    &error,
+                )
+            })?;
+        if selected_cargo_sha != staged_cargo_sha || selected_rustc_sha != staged_rustc_sha {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows Rust executable differs from selected source",
+            ));
+        }
+        authority.revalidate_inventory().map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::RevalidateInventory,
+                &authority.inventory_root,
+                &error,
+            )
+        })?;
+        Ok(authority)
+    }
+
+    /// Revalidates the closed staged inventory and every held file authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an entry was added, removed, redirected, or changed.
+    pub fn revalidate(&self) -> std::io::Result<()> {
+        self.revalidate_inventory()?;
+        for entry in self.trusted_path_entries.iter() {
+            entry.revalidate()?;
+        }
+        self.system_root.revalidate()?;
+        Ok(())
+    }
+
+    /// Resolves an exact trusted Rust proxy/source request to its staged executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the closed inventory changed or a Rust tool request
+    /// is outside the bound proxy/source authority.
+    pub fn mapped_program(
+        &self,
+        requested: &OsStr,
+        resolved: &Path,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let request_matches = |logical: &str, authority: &BoundProgramInvocation| {
+            (requested == authority.invocation_path.as_os_str()
+                && resolved == authority.invocation_path)
+                || (requested == OsStr::new(logical) && resolved == authority.canonical_identity)
+        };
+        let mapping = if request_matches("cargo", &self.cargo_source) {
+            Some((&self.cargo_source, &self.selected_cargo, &self.staged_cargo))
+        } else if request_matches("rustc", &self.rustc_source) {
+            Some((&self.rustc_source, &self.selected_rustc, &self.staged_rustc))
+        } else {
+            None
+        };
+        let Some((source, selected, staged)) = mapping else {
+            if windows_executable_has_logical_name(requested, "cargo")
+                || windows_executable_has_logical_name(requested, "rustc")
+                || windows_executable_has_logical_name(resolved.as_os_str(), "cargo")
+                || windows_executable_has_logical_name(resolved.as_os_str(), "rustc")
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows Rust tool request is outside the selected toolchain authority",
+                ));
+            }
+            return Ok(None);
+        };
+        self.revalidate_inventory()?;
+        source.revalidate(source.invocation_path.as_os_str())?;
+        selected.revalidate(selected.invocation_path.as_os_str())?;
+        staged
+            .revalidate(staged.invocation_path.as_os_str())
+            .map(Some)
+    }
+
+    /// Produces the exact child PATH after proving it still equals the trusted
+    /// parent capture and revalidating every staged and suffix directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child changed PATH or any bound directory was
+    /// redirected or substituted.
+    pub fn restricted_child_path(&self, supplied: &OsStr) -> std::io::Result<OsString> {
+        if supplied != self.trusted_parent_path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Windows release child PATH differs from its trusted parent capture",
+            ));
+        }
+        self.revalidate()?;
+        let staged_rustc = self
+            .staged_rustc
+            .revalidate(self.staged_rustc.invocation_path.as_os_str())?;
+        let staged_bin = staged_rustc.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows rustc has no bin directory",
+            )
+        })?;
+        if self.staged_cargo.canonical_identity.parent() != Some(staged_bin)
+            || !self
+                .inventory_directories
+                .iter()
+                .any(|directory| directory == staged_bin)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows Cargo and rustc do not share the inventoried bin directory",
+            ));
+        }
+        std::env::join_paths(
+            std::iter::once(staged_bin.to_path_buf()).chain(
+                self.trusted_path_entries
+                    .iter()
+                    .filter_map(|entry| entry.canonical_identity().map(Path::to_path_buf)),
+            ),
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }
+
+    fn revalidate_inventory(&self) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let mut expected = BTreeSet::new();
+        for directory in self.inventory_directories.iter() {
+            expected.insert((directory.clone(), true));
+        }
+        for file in self.inventory_files.iter() {
+            expected.insert((file.invocation_path.clone(), false));
+            file.revalidate(file.invocation_path.as_os_str())?;
+        }
+        let mut observed = BTreeSet::new();
+        let mut pending = vec![self.inventory_root.clone()];
+        while let Some(directory) = pending.pop() {
+            let metadata = fs::symlink_metadata(&directory)?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "staged Windows toolchain directory identity changed",
+                ));
+            }
+            observed.insert((directory.clone(), true));
+            for entry in fs::read_dir(&directory)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged Windows toolchain gained a reparse point",
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    observed.insert((path, false));
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged Windows toolchain gained a special entry",
+                    ));
+                }
+            }
+        }
+        if observed != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows toolchain closed inventory changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Selects the one standard Windows SystemRoot value from the parent process.
+///
+/// # Errors
+///
+/// Returns an error unless exactly one nonempty case-insensitive SystemRoot
+/// entry is present.
+#[cfg(windows)]
+pub fn capture_windows_standard_system_root() -> std::io::Result<OsString> {
+    let mut values = std::env::vars_os().filter(|(name, _)| {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SystemRoot"))
+    });
+    let (_, value) = values.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "trusted Windows parent has no SystemRoot",
+        )
+    })?;
+    if value.is_empty() || values.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trusted Windows parent SystemRoot is empty or duplicated",
+        ));
+    }
+    Ok(value)
+}
+
+/// Applies one exact captured SystemRoot value to a raw Windows child
+/// environment vector.
+///
+/// This is public only so host-portable tests can exercise case-insensitive
+/// duplicate, removal, disagreement, and injection behavior without mutating
+/// the process environment.
+///
+/// # Errors
+///
+/// Returns an error if SystemRoot is duplicated, explicitly removed, or
+/// differs from the captured standard value.
+#[doc(hidden)]
+pub fn configure_windows_standard_system_root_value(
+    environment: &mut Vec<(OsString, Option<OsString>)>,
+    captured: &OsStr,
+    required: bool,
+) -> std::io::Result<()> {
+    let indices = environment
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| {
+            name.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SystemRoot"))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if indices.len() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows release child has duplicate SystemRoot entries",
+        ));
+    }
+    match indices.first().copied() {
+        Some(index) => {
+            let supplied = environment[index].1.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows release child removed its trusted SystemRoot",
+                )
+            })?;
+            if supplied != captured {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows release child SystemRoot differs from its trusted parent capture",
+                ));
+            }
+            environment[index] = (OsString::from("SystemRoot"), Some(captured.to_owned()));
+        }
+        None if required => {
+            environment.push((OsString::from("SystemRoot"), Some(captured.to_owned())));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Rewrites the exact Windows child PATH at the restricted launch boundary.
+///
+/// This is public only so the Windows portability suite can exercise the raw
+/// environment-vector boundary, including duplicate case spellings that
+/// `std::process::Command` may coalesce.
+///
+/// # Errors
+///
+/// Returns an error if an explicit PATH is removed, duplicated, or differs
+/// from the trusted parent capture, or if a bound directory changed.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn configure_windows_restricted_child_path(
+    toolchain: &WindowsToolchainAuthority,
+    environment: &mut Vec<(OsString, Option<OsString>)>,
+    requires_trusted_path: bool,
+) -> std::io::Result<()> {
+    let path_indices = environment
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| {
+            name.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("PATH"))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if path_indices.len() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows release child has duplicate PATH entries",
+        ));
+    }
+    let restricted_path = match path_indices.first().copied() {
+        Some(index) => {
+            let supplied_path = environment[index].1.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows release child removed its trusted PATH",
+                )
+            })?;
+            Some(toolchain.restricted_child_path(supplied_path)?)
+        }
+        None if requires_trusted_path => {
+            Some(toolchain.restricted_child_path(&toolchain.trusted_parent_path)?)
+        }
+        None => None,
+    };
+    if let Some(restricted_path) = restricted_path {
+        if let Some(index) = path_indices.first().copied() {
+            environment[index] = (OsString::from("PATH"), Some(restricted_path));
+        } else {
+            environment.push((OsString::from("PATH"), Some(restricted_path)));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites the exact trusted loader environment for a Windows restricted child.
+///
+/// This is public only so the Windows portability suite can exercise the
+/// mapped-tool boundary.
+///
+/// # Errors
+///
+/// Returns an error if PATH or SystemRoot differs from its bound parent value,
+/// is removed or duplicated, or if any bound directory identity changed.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn configure_windows_restricted_child_environment(
+    toolchain: &WindowsToolchainAuthority,
+    environment: &mut Vec<(OsString, Option<OsString>)>,
+    requires_trusted_loader_environment: bool,
+) -> std::io::Result<()> {
+    configure_windows_restricted_child_path(
+        toolchain,
+        environment,
+        requires_trusted_loader_environment,
+    )?;
+    toolchain.system_root.revalidate()?;
+    configure_windows_standard_system_root_value(
+        environment,
+        &toolchain.system_root.value,
+        requires_trusted_loader_environment,
+    )
+}
+
+#[cfg(windows)]
+fn windows_executable_has_logical_name(path: &OsStr, expected: &str) -> bool {
+    let path = Path::new(path);
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+        && path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+            })
+}
+
+#[cfg(windows)]
+impl WindowsLaunchAuthorities {
+    /// Binds the unrestricted token launcher and the minimal executable that
+    /// enters under the restricted token.
+    #[must_use]
+    pub fn new(
+        launcher: PathBuf,
+        launcher_sha256: Digest,
+        restricted_adapter: PathBuf,
+        restricted_adapter_sha256: Digest,
+        toolchain: WindowsToolchainAuthority,
+    ) -> Self {
+        Self {
+            launcher,
+            launcher_sha256,
+            restricted_adapter,
+            restricted_adapter_sha256,
+            toolchain,
+        }
+    }
+}
+
+/// Exact staged executable authorities for a POSIX release child.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixLaunchAuthorities {
+    adapter: PathBuf,
+    adapter_sha256: Digest,
+    cargo_source: PathBuf,
+    cargo_adapter: PathBuf,
+    cargo_adapter_sha256: Digest,
+    cargo_authority: PosixCargoSourceAuthority,
+    cargo_deny_authority: Option<PosixCargoDenyAuthority>,
+    stack_authority: Option<PosixStackAuthority>,
+}
+
+/// Exact source-to-stage authority for the pinned POSIX `cargo-deny` binary.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixCargoDenyAuthority {
+    source: PosixStandardExecutableIdentity,
+    source_sha256: Digest,
+    staged: PathBuf,
+    staged_sha256: Digest,
+    cargo_home: PathBuf,
+    metadata: PosixCargoDenyMetadataAuthority,
+    trusted_owner: u32,
+    trusted_group_id: u32,
+}
+
+/// Trusted ownership assigned to the read-only portion of a staged POSIX
+/// `cargo-deny` Cargo home.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct PosixCargoDenyCacheOwnership {
+    trusted_owner: u32,
+    trusted_group_id: u32,
+}
+
+/// Exact read-only Cargo metadata document supplied to pinned `cargo-deny`.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixCargoDenyMetadataAuthority {
+    directory: PathBuf,
+    path: PathBuf,
+    size: u64,
+    sha256: Digest,
+    trusted_owner: u32,
+}
+
+/// Exact source-to-stage authority for the required POSIX `stack` binary.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixStackAuthority {
+    source: PosixStandardExecutableIdentity,
+    source_sha256: Digest,
+    staged: PathBuf,
+    staged_sha256: Digest,
+    stack_root: PathBuf,
+    trusted_group_id: u32,
+}
+
+/// Closed classification of the trusted Cargo source executable.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub enum PosixCargoSourceAuthority {
+    /// Cargo is distinct from the independently resolved standard Rustup.
+    Native {
+        cargo: PosixCanonicalExecutableIdentity,
+        standard_rustup: PosixStandardExecutableIdentity,
+    },
+    /// Cargo is the independently resolved standard Rustup multicall binary.
+    Rustup(Box<PosixRustupAuthority>),
+}
+
+/// Exact canonical identity of a trusted executable source.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixCanonicalExecutableIdentity {
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+/// Exact invocation and file identity of an independently resolved standard tool.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixStandardExecutableIdentity {
+    invocation: PathBuf,
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+/// Canonical standard Rustup state required by a staged POSIX Cargo proxy.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixRustupAuthority {
+    proxy_identity: PosixRustupProxyIdentity,
+    rustc_authority: PosixRustcAuthority,
+    source_home: PathBuf,
+    home: PathBuf,
+    toolchain: OsString,
+    compiler_mapping: PosixRustupCompilerMapping,
+}
+
+/// Closed identity of the independently resolved standard `rustc` command.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub enum PosixRustcAuthority {
+    /// The standard `rustc` command is another logical name for Rustup.
+    RustupProxy(PosixStandardExecutableIdentity),
+    /// The standard `rustc` command is the exact selected toolchain compiler.
+    SelectedToolchain(PosixStandardExecutableIdentity),
+}
+
+/// Exact source-to-staged compiler mapping for a selected Rustup toolchain.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixRustupCompilerMapping {
+    source: PathBuf,
+    source_sha256: Digest,
+    staged: PathBuf,
+    staged_sha256: Digest,
+}
+
+/// Exact same-file correspondence between Cargo's multicall entry point and
+/// the independently resolved standard Rustup executable.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixRustupProxyIdentity {
+    cargo_invocation: PathBuf,
+    cargo: PathBuf,
+    rustup_invocation: PathBuf,
+    rustup: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+/// Exact account identity used to evaluate POSIX filesystem access.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct PosixCandidateIdentity {
+    principal: String,
+    uid: u32,
+    group_ids: Vec<u32>,
+    group: String,
+}
+
+#[cfg(unix)]
+impl PosixCandidateIdentity {
+    /// Binds the canonical account names and complete numeric group inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either account name is empty/non-alphanumeric or
+    /// the group inventory is empty, duplicated, oversized, or omits the
+    /// primary GID.
+    pub fn new(
+        principal: String,
+        uid: u32,
+        primary_gid: u32,
+        group_ids: Vec<u32>,
+        group: String,
+    ) -> std::io::Result<Self> {
+        if principal.is_empty()
+            || group.is_empty()
+            || !principal.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !group.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !posix_candidate_group_inventory_is_valid(primary_gid, &group_ids)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate POSIX identity is not canonical",
+            ));
+        }
+        Ok(Self {
+            principal,
+            uid,
+            group_ids,
+            group,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl PosixRustupAuthority {
+    /// Binds the standard Rustup home and exact active toolchain name captured
+    /// by the trusted parent.
+    #[must_use]
+    pub fn new(
+        proxy_identity: PosixRustupProxyIdentity,
+        rustc_authority: PosixRustcAuthority,
+        source_home: PathBuf,
+        home: PathBuf,
+        toolchain: OsString,
+        compiler_mapping: PosixRustupCompilerMapping,
+    ) -> Self {
+        Self {
+            proxy_identity,
+            rustc_authority,
+            source_home,
+            home,
+            toolchain,
+            compiler_mapping,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixRustupCompilerMapping {
+    /// Binds the selected source compiler to its exact staged counterpart.
+    #[must_use]
+    pub fn new(
+        source: PathBuf,
+        source_sha256: Digest,
+        staged: PathBuf,
+        staged_sha256: Digest,
+    ) -> Self {
+        Self {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixStandardExecutableIdentity {
+    /// Carries a parent-bound standard executable identity into launch policy.
+    #[must_use]
+    pub fn new(invocation: PathBuf, canonical: PathBuf, device: u64, inode: u64) -> Self {
+        Self {
+            invocation,
+            canonical,
+            device,
+            inode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixCanonicalExecutableIdentity {
+    /// Carries a parent-bound canonical executable identity into launch policy.
+    #[must_use]
+    pub fn new(canonical: PathBuf, device: u64, inode: u64) -> Self {
+        Self {
+            canonical,
+            device,
+            inode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixRustupProxyIdentity {
+    /// Carries the parent-bound Unix file identity into staged launch policy.
+    #[must_use]
+    pub fn new(
+        cargo_invocation: PathBuf,
+        cargo: PathBuf,
+        rustup_invocation: PathBuf,
+        rustup: PathBuf,
+        device: u64,
+        inode: u64,
+    ) -> Self {
+        Self {
+            cargo_invocation,
+            cargo,
+            rustup_invocation,
+            rustup,
+            device,
+            inode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixLaunchAuthorities {
+    /// Binds the trusted adapter and the source/staged identities of Cargo.
+    #[must_use]
+    pub fn new(
+        adapter: PathBuf,
+        adapter_sha256: Digest,
+        cargo_source: PathBuf,
+        cargo_adapter: PathBuf,
+        cargo_adapter_sha256: Digest,
+        cargo_authority: PosixCargoSourceAuthority,
+    ) -> Self {
+        Self {
+            adapter,
+            adapter_sha256,
+            cargo_source,
+            cargo_adapter,
+            cargo_adapter_sha256,
+            cargo_authority,
+            cargo_deny_authority: None,
+            stack_authority: None,
+        }
+    }
+
+    /// Adds the exact pinned `cargo-deny` source and its protected staged copy.
+    #[must_use]
+    pub fn cargo_deny(mut self, authority: PosixCargoDenyAuthority) -> Self {
+        self.cargo_deny_authority = Some(authority);
+        self
+    }
+
+    /// Adds the exact standard `stack` source and its protected staged copy.
+    #[must_use]
+    pub fn stack(mut self, authority: PosixStackAuthority) -> Self {
+        self.stack_authority = Some(authority);
+        self
+    }
+}
+
+#[cfg(unix)]
+impl PosixCargoDenyAuthority {
+    /// Binds the independently resolved source and exact protected staged copy.
+    #[must_use]
+    pub fn new(
+        source: PosixStandardExecutableIdentity,
+        source_sha256: Digest,
+        staged: PathBuf,
+        staged_sha256: Digest,
+        cargo_home: PathBuf,
+        metadata: PosixCargoDenyMetadataAuthority,
+        cache_ownership: PosixCargoDenyCacheOwnership,
+    ) -> Self {
+        Self {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            cargo_home,
+            metadata,
+            trusted_owner: cache_ownership.trusted_owner,
+            trusted_group_id: cache_ownership.trusted_group_id,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixCargoDenyCacheOwnership {
+    /// Binds the trusted owner and reader group of the staged cache.
+    #[must_use]
+    pub const fn new(trusted_owner: u32, trusted_group_id: u32) -> Self {
+        Self {
+            trusted_owner,
+            trusted_group_id,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixCargoDenyMetadataAuthority {
+    /// Binds the exact trusted metadata directory, document, size, and digest.
+    #[must_use]
+    pub fn new(
+        directory: PathBuf,
+        path: PathBuf,
+        size: u64,
+        sha256: Digest,
+        trusted_owner: u32,
+    ) -> Self {
+        Self {
+            directory,
+            path,
+            size,
+            sha256,
+            trusted_owner,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixStackAuthority {
+    /// Binds the independently resolved source and exact protected staged copy.
+    #[must_use]
+    pub fn new(
+        source: PosixStandardExecutableIdentity,
+        source_sha256: Digest,
+        staged: PathBuf,
+        staged_sha256: Digest,
+        stack_root: PathBuf,
+        trusted_group_id: u32,
+    ) -> Self {
+        Self {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            stack_root,
+            trusted_group_id,
+        }
+    }
+}
+
+/// A logical executable invocation whose canonical file identity was bound by
+/// the trusted parent. This preserves multicall aliases such as `cargo` while
+/// failing closed if the alias is substituted before the supervised spawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundProgramInvocation {
+    invocation_path: PathBuf,
+    canonical_identity: PathBuf,
+    file_identity: BoundProgramFileIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundProgramFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct BoundProgramFileIdentity {
+    _guard: Arc<fs::File>,
+    sha256: Digest,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for BoundProgramFileIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundProgramFileIdentity")
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for BoundProgramFileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256
+    }
+}
+
+#[cfg(windows)]
+impl Eq for BoundProgramFileIdentity {}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundProgramFileIdentity;
+
+impl BoundProgramFileIdentity {
+    #[cfg(unix)]
+    fn bind(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound program identity is not a file",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn bind(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        // Keep one read-only handle whose sharing contract permits only other
+        // readers. Windows therefore refuses writes, deletes, and same-path
+        // replacement for the complete cloned authority lifetime.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)?;
+        if !guard.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound program identity is not a file",
+            ));
+        }
+        Ok(Self {
+            _guard: Arc::new(guard),
+            sha256: sha256_file(path)?,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn bind(_path: &Path) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bound program file identity is unsupported on this platform",
+        ))
+    }
+}
+
+impl BoundProgramInvocation {
+    /// Binds an absolute logical invocation path to its canonical executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either path is noncanonical, the invocation does
+    /// not resolve to the expected file, the resolved target is not a file, or
+    /// an exact platform file identity cannot be established.
+    pub fn new(invocation_path: PathBuf, canonical_identity: PathBuf) -> std::io::Result<Self> {
+        let identity = Self {
+            invocation_path,
+            file_identity: BoundProgramFileIdentity::bind(&canonical_identity)?,
+            canonical_identity,
+        };
+        identity.revalidate(identity.invocation_path.as_os_str())?;
+        Ok(identity)
+    }
+
+    fn revalidate(&self, requested_program: &OsStr) -> std::io::Result<PathBuf> {
+        let invocation_parent = self
+            .invocation_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("bound program has no parent"))?;
+        if Path::new(requested_program) != self.invocation_path
+            || !self.invocation_path.is_absolute()
+            || fs::canonicalize(invocation_parent)? != invocation_parent
+            || fs::canonicalize(&self.canonical_identity)? != self.canonical_identity
+            || fs::canonicalize(&self.invocation_path)? != self.canonical_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bound program invocation identity changed",
+            ));
+        }
+        if BoundProgramFileIdentity::bind(&self.canonical_identity)? != self.file_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bound program file identity changed",
+            ));
+        }
+        Ok(self.invocation_path.clone())
+    }
 }
 
 thread_local! {
@@ -216,29 +1724,79 @@ impl CandidateLaunchPolicy {
     #[cfg(unix)]
     pub fn posix(
         launcher: PathBuf,
-        adapter: PathBuf,
-        principal: String,
-        uid: u32,
-        group: String,
+        authorities: PosixLaunchAuthorities,
+        identity: PosixCandidateIdentity,
         writable_roots: Vec<PathBuf>,
     ) -> std::io::Result<Self> {
+        let PosixLaunchAuthorities {
+            adapter,
+            adapter_sha256,
+            cargo_source,
+            cargo_adapter,
+            cargo_adapter_sha256,
+            cargo_authority,
+            cargo_deny_authority,
+            stack_authority,
+        } = authorities;
         let launcher = fs::canonicalize(launcher)?;
         let adapter = fs::canonicalize(adapter)?;
-        if principal.is_empty()
-            || group.is_empty()
-            || !principal.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            || !group.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            || writable_roots.is_empty()
-            || writable_roots.iter().any(|path| !path.is_absolute())
-        {
+        let adapter_identity = posix_adapter_identity(&adapter)?;
+        verify_posix_adapter_identity(&adapter, &adapter, adapter_sha256, &adapter_identity)?;
+        let cargo_source = fs::canonicalize(cargo_source)?;
+        let cargo_adapter = fs::canonicalize(cargo_adapter)?;
+        let cargo_adapter_identity = posix_adapter_identity(&cargo_adapter)?;
+        verify_posix_adapter_identity(
+            &cargo_adapter,
+            &cargo_adapter,
+            cargo_adapter_sha256,
+            &cargo_adapter_identity,
+        )?;
+        let PosixCandidateIdentity {
+            principal,
+            uid,
+            group_ids: candidate_group_ids,
+            group,
+        } = identity;
+        let candidate_group_ids: Arc<[u32]> = candidate_group_ids.into();
+        let cargo_authority = BoundPosixCargoSourceAuthority::new(
+            cargo_authority,
+            &cargo_source,
+            uid,
+            Arc::clone(&candidate_group_ids),
+        )?;
+        if writable_roots.is_empty() || writable_roots.iter().any(|path| !path.is_absolute()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "candidate launch policy is not canonical",
             ));
         }
+        let cargo_deny_authority = cargo_deny_authority
+            .map(|authority| {
+                BoundPosixCargoDenyAuthority::new(
+                    authority,
+                    uid,
+                    &candidate_group_ids,
+                    &writable_roots,
+                )
+            })
+            .transpose()?;
+        let stack_authority = stack_authority
+            .map(|authority| {
+                BoundPosixStackAuthority::new(authority, uid, &candidate_group_ids, &writable_roots)
+            })
+            .transpose()?;
         Ok(Self {
             launcher,
             adapter,
+            adapter_sha256,
+            adapter_identity,
+            cargo_source,
+            cargo_adapter,
+            cargo_adapter_sha256,
+            cargo_adapter_identity,
+            cargo_authority,
+            cargo_deny_authority,
+            stack_authority,
             principal: principal.into(),
             uid,
             group: group.into(),
@@ -246,9 +1804,50 @@ impl CandidateLaunchPolicy {
         })
     }
 
-    #[cfg(not(unix))]
-    pub fn windows(launcher: PathBuf, writable_roots: Vec<PathBuf>) -> std::io::Result<Self> {
+    /// Binds the exact local Stack work directory after the native adapter is sealed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the work directory is a candidate-writable child
+    /// of the same canonical authority that directly contains the Stack source.
+    #[cfg(unix)]
+    pub fn with_posix_stack_work_authority(
+        mut self,
+        source: &Path,
+        work: &Path,
+    ) -> std::io::Result<Self> {
+        self.stack_authority
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("POSIX Stack authority is absent"))?
+            .bind_work(source, work)?;
+        Ok(self)
+    }
+
+    #[cfg(windows)]
+    /// Creates a Windows candidate policy from already-bound executable authorities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an authority has changed or a writable root is not absolute.
+    pub fn windows(
+        authorities: WindowsLaunchAuthorities,
+        writable_roots: Vec<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let WindowsLaunchAuthorities {
+            launcher,
+            launcher_sha256,
+            restricted_adapter,
+            restricted_adapter_sha256,
+            toolchain,
+        } = authorities;
         let launcher = fs::canonicalize(launcher)?;
+        verify_windows_launcher_identity(&launcher, &launcher, launcher_sha256)?;
+        let restricted_adapter = fs::canonicalize(restricted_adapter)?;
+        verify_windows_restricted_adapter_identity(
+            &restricted_adapter,
+            &restricted_adapter,
+            restricted_adapter_sha256,
+        )?;
         if writable_roots.is_empty() || writable_roots.iter().any(|path| !path.is_absolute()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -257,36 +1856,136 @@ impl CandidateLaunchPolicy {
         }
         Ok(Self {
             launcher,
+            launcher_sha256,
+            restricted_adapter,
+            restricted_adapter_sha256,
+            toolchain,
             writable_roots: writable_roots.into(),
         })
     }
 
     #[cfg(unix)]
-    fn wrap(&self, command: &mut Command) -> std::io::Result<()> {
-        let program = resolve_parent_program(command.get_program())?;
-        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+    fn mapped_posix_cargo_deny_request(
+        &self,
+        requested: &OsStr,
+        resolved: &Path,
+    ) -> std::io::Result<Option<(PathBuf, PathBuf, PathBuf)>> {
+        self.cargo_deny_authority
+            .as_ref()
+            .map(|authority| {
+                authority
+                    .request_is_bound(requested, resolved)
+                    .map(|matches| {
+                        matches.then(|| {
+                            (
+                                authority.staged.clone(),
+                                authority.cargo_home.clone(),
+                                authority.metadata.path.clone(),
+                            )
+                        })
+                    })
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[cfg(unix)]
+    fn wrap(
+        &self,
+        command: &mut Command,
+        bound_program: Option<&BoundProgramInvocation>,
+    ) -> std::io::Result<()> {
+        verify_posix_adapter_identity(
+            &self.adapter,
+            &self.adapter,
+            self.adapter_sha256,
+            &self.adapter_identity,
+        )?;
+        let resolved_program =
+            resolve_parent_program_for_launch(command.get_program(), bound_program)?;
+        let staged_cargo = bound_program.is_some_and(|identity| {
+            identity.canonical_identity == self.cargo_source
+                && identity.invocation_path.file_name() == Some(OsStr::new("cargo"))
+        });
+        let staged_cargo_deny =
+            self.mapped_posix_cargo_deny_request(command.get_program(), &resolved_program)?;
+        let staged_stack = self
+            .stack_authority
+            .as_ref()
+            .map(|authority| authority.mapped_request(command.get_program(), &resolved_program))
+            .transpose()?
+            .flatten();
+        let uses_staged_cargo_tools = staged_cargo || staged_cargo_deny.is_some();
+        if uses_staged_cargo_tools {
+            verify_posix_adapter_identity(
+                &self.cargo_adapter,
+                &self.cargo_adapter,
+                self.cargo_adapter_sha256,
+                &self.cargo_adapter_identity,
+            )?;
+            self.cargo_authority.revalidate(&self.cargo_source)?;
+        }
+        let program = if staged_cargo {
+            self.cargo_adapter.clone()
+        } else if let Some((staged, _, _)) = &staged_cargo_deny {
+            staged.clone()
+        } else if let Some((staged, _, _)) = &staged_stack {
+            staged.clone()
+        } else if let Some(authority) = self.cargo_authority.rustup() {
+            if authority.request_is_bound_rustc(command.get_program(), &resolved_program)? {
+                authority.revalidate()?;
+                authority.compiler_mapping.staged.path.clone()
+            } else {
+                resolved_program
+            }
+        } else {
+            resolved_program
+        };
+        let arguments = posix_stack_arguments(
+            command.get_args().map(OsString::from).collect(),
+            staged_stack.as_ref().map(|(_, root, _)| root.as_path()),
+            staged_stack
+                .as_ref()
+                .and_then(|(_, _, work)| work.as_deref()),
+        )?;
+        let arguments = posix_cargo_deny_arguments(
+            arguments,
+            staged_cargo_deny
+                .as_ref()
+                .map(|(_, _, metadata)| metadata.as_path()),
+        )?;
         let directory = command.get_current_dir().map(Path::to_owned);
         let environment = command
             .get_envs()
             .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
             .collect::<Vec<_>>();
+        let environment = posix_release_child_environment(
+            environment,
+            uses_staged_cargo_tools
+                .then_some(self.cargo_authority.rustup())
+                .flatten(),
+            uses_staged_cargo_tools
+                .then(|| self.cargo_authority.child_tool_path(&self.cargo_adapter))
+                .transpose()?
+                .as_deref(),
+            staged_cargo_deny
+                .as_ref()
+                .map(|(_, cargo_home, _)| cargo_home.as_path()),
+        )?;
         let mut wrapped = Command::new(&self.launcher);
         wrapped
             .arg("-n")
-            .arg(POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT)
             .arg("-u")
             .arg(self.principal.as_ref())
             .arg("--")
             .arg(&self.adapter)
-            .arg("__release-posix-child")
-            .arg(program)
-            .args(arguments)
+            .arg(POSIX_RELEASE_CHILD_REQUEST_V1)
+            .arg(environment.len().to_string())
             .env_clear();
-        for (name, value) in &environment {
-            if let Some(value) = value {
-                wrapped.env(name, value);
-            }
+        for (name, value) in environment {
+            wrapped.arg(name).arg(value);
         }
+        wrapped.arg(program).args(arguments);
         if let Some(directory) = directory {
             wrapped.current_dir(directory);
         }
@@ -294,19 +1993,44 @@ impl CandidateLaunchPolicy {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    fn wrap(&self, command: &mut Command) -> std::io::Result<()> {
-        let program = resolve_parent_program(command.get_program())?;
-        let arguments = std::iter::once(program.as_os_str())
+    #[cfg(windows)]
+    fn wrap(
+        &self,
+        command: &mut Command,
+        bound_program: Option<&BoundProgramInvocation>,
+    ) -> std::io::Result<()> {
+        verify_windows_launcher_identity(&self.launcher, &self.launcher, self.launcher_sha256)?;
+        verify_windows_restricted_adapter_identity(
+            &self.restricted_adapter,
+            &self.restricted_adapter,
+            self.restricted_adapter_sha256,
+        )?;
+        let program = resolve_parent_program_for_launch(command.get_program(), bound_program)?;
+        let mapped_program = self
+            .toolchain
+            .mapped_program(command.get_program(), &program)?;
+        let requires_trusted_path = mapped_program.is_some();
+        let program = mapped_program.unwrap_or(program);
+        let target_arguments = std::iter::once(program.as_os_str())
             .chain(command.get_args())
             .map(OsString::from)
             .collect::<Vec<_>>();
-        let encoded = encode_windows_argv(&arguments)?;
+        let request = windows_restricted_launch_request(
+            &self.restricted_adapter,
+            self.restricted_adapter_sha256,
+            &target_arguments,
+        );
+        let encoded = encode_windows_argv(&request)?;
         let directory = command.get_current_dir().map(Path::to_owned);
-        let environment = command
+        let mut environment = command
             .get_envs()
             .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
             .collect::<Vec<_>>();
+        configure_windows_restricted_child_environment(
+            &self.toolchain,
+            &mut environment,
+            requires_trusted_path,
+        )?;
         let mut wrapped = Command::new(&self.launcher);
         wrapped
             .arg("__release-restricted-child")
@@ -333,9 +2057,13 @@ impl CandidateLaunchPolicy {
                 .arg(&uid)
                 .status()?;
             let output = Command::new("/bin/ps")
-                .args(["-U", uid.as_str(), "-o", "pid="])
+                .args(["-U", uid.as_str(), "-o", "pid=,stat="])
                 .output()?;
-            if output.status.success() && output.stdout.iter().all(u8::is_ascii_whitespace) {
+            if uid_process_snapshot_is_quiescent(
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            ) {
                 return Ok(());
             }
         }
@@ -382,10 +2110,2073 @@ impl CandidateLaunchPolicy {
     }
 }
 
+#[cfg(unix)]
+fn posix_stack_arguments(
+    mut arguments: Vec<OsString>,
+    stack_root: Option<&Path>,
+    stack_work: Option<&Path>,
+) -> std::io::Result<Vec<OsString>> {
+    let Some(stack_root) = stack_root else {
+        return Ok(arguments);
+    };
+    if arguments.iter().any(|argument| {
+        argument == OsStr::new("--stack-root")
+            || argument == OsStr::new("--work-dir")
+            || argument.to_str().is_some_and(|argument| {
+                argument.starts_with("--stack-root=") || argument.starts_with("--work-dir=")
+            })
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Stack request attempts to replace its bound root or work authority",
+        ));
+    }
+    let mut bound = vec![
+        OsString::from("--stack-root"),
+        stack_root.as_os_str().into(),
+    ];
+    if let Some(work) = stack_work {
+        if work.is_absolute()
+            || work.components().count() != 1
+            || work.file_name() != Some(OsStr::new(".stack-work"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack work authority is not the exact relative source child",
+            ));
+        }
+        bound.extend([OsString::from("--work-dir"), work.as_os_str().into()]);
+    }
+    arguments.splice(0..0, bound);
+    Ok(arguments)
+}
+
+#[cfg(unix)]
+fn posix_cargo_deny_arguments(
+    mut arguments: Vec<OsString>,
+    metadata: Option<&Path>,
+) -> std::io::Result<Vec<OsString>> {
+    let Some(metadata) = metadata else {
+        return Ok(arguments);
+    };
+    if arguments.iter().any(|argument| {
+        argument == OsStr::new("--metadata-path")
+            || argument
+                .to_str()
+                .is_some_and(|argument| argument.starts_with("--metadata-path="))
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cargo-deny request attempts to replace its bound metadata authority",
+        ));
+    }
+    arguments.splice(
+        0..0,
+        [
+            OsString::from("--metadata-path"),
+            metadata.as_os_str().to_owned(),
+        ],
+    );
+    Ok(arguments)
+}
+
+#[cfg(unix)]
+fn posix_release_child_environment(
+    environment: impl IntoIterator<Item = (OsString, Option<OsString>)>,
+    rustup_authority: Option<&BoundPosixRustupAuthority>,
+    child_tool_path: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> std::io::Result<BTreeMap<OsString, OsString>> {
+    let mut encoded = BTreeMap::new();
+    for (name, value) in environment {
+        let Some(value) = value else {
+            continue;
+        };
+        if !POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .any(|allowed| name == *allowed)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX release child environment name is not allowed",
+            ));
+        }
+        if encoded.insert(name, value).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX release child environment name is duplicated",
+            ));
+        }
+    }
+    if let Some(authority) = rustup_authority {
+        encoded.insert(OsString::from("RUSTUP_HOME"), authority.home.clone().into());
+        encoded.insert(
+            OsString::from("RUSTUP_TOOLCHAIN"),
+            authority.toolchain.clone(),
+        );
+    }
+    if let Some(cargo_home) = cargo_home {
+        encoded.insert(
+            OsString::from("CARGO_HOME"),
+            cargo_home.as_os_str().to_owned(),
+        );
+    }
+    if let Some(prefix) = child_tool_path {
+        let inherited = encoded.get(OsStr::new("PATH"));
+        let paths = std::iter::once(prefix.to_path_buf()).chain(
+            inherited
+                .into_iter()
+                .flat_map(|value| std::env::split_paths(value))
+                .filter(|entry| entry != prefix),
+        );
+        let path = std::env::join_paths(paths).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot encode POSIX staged tool PATH: {error}"),
+            )
+        })?;
+        encoded.insert(OsString::from("PATH"), path);
+    }
+    if encoded.len() > POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX release child environment exceeds its entry bound",
+        ));
+    }
+    Ok(encoded)
+}
+
+#[cfg(any(windows, test))]
+fn windows_restricted_launch_request(
+    restricted_adapter: &Path,
+    restricted_adapter_sha256: Digest,
+    target_arguments: &[OsString],
+) -> Vec<OsString> {
+    std::iter::once(restricted_adapter.as_os_str().to_owned())
+        .chain(std::iter::once(OsString::from(
+            restricted_adapter_sha256.hex(),
+        )))
+        .chain(target_arguments.iter().cloned())
+        .collect()
+}
+
+#[cfg(unix)]
+const POSIX_RUSTUP_ENTRY_LIMIT: usize = 100_000;
+
+#[cfg(unix)]
+const POSIX_CARGO_CACHE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PosixRustupAccessRequirement {
+    AncestorDirectory,
+    AuthorityDirectory,
+    ReadableFile,
+    ExecutableFile,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixRustupEntryIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    requirement: PosixRustupAccessRequirement,
+}
+
+#[cfg(unix)]
+fn validate_posix_rustup_proxy_identity(
+    identity: &PosixRustupProxyIdentity,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let cargo_parent = identity.cargo_invocation.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "logical Cargo invocation has no parent",
+        )
+    })?;
+    let rustup_parent = identity.rustup_invocation.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "standard Rustup invocation has no parent",
+        )
+    })?;
+    if !identity.cargo_invocation.is_absolute()
+        || !identity.cargo.is_absolute()
+        || !identity.rustup_invocation.is_absolute()
+        || !identity.rustup.is_absolute()
+        || fs::canonicalize(&identity.cargo_invocation)? != identity.cargo
+        || fs::canonicalize(&identity.cargo)? != identity.cargo
+        || fs::canonicalize(&identity.rustup_invocation)? != identity.rustup
+        || fs::canonicalize(&identity.rustup)? != identity.rustup
+        || fs::canonicalize(cargo_parent)? != cargo_parent
+        || fs::canonicalize(rustup_parent)? != rustup_parent
+        || identity.cargo_invocation.file_name() != Some(OsStr::new("cargo"))
+        || identity.rustup_invocation.file_name() != Some(OsStr::new("rustup"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX Cargo/Rustup proxy authority is not canonical",
+        ));
+    }
+    let cargo_invocation = fs::metadata(&identity.cargo_invocation)?;
+    let cargo = fs::symlink_metadata(&identity.cargo)?;
+    let rustup = fs::symlink_metadata(&identity.rustup)?;
+    if !cargo_invocation.is_file()
+        || !cargo.is_file()
+        || !rustup.is_file()
+        || cargo.file_type().is_symlink()
+        || rustup.file_type().is_symlink()
+        || cargo_invocation.dev() != identity.device
+        || cargo_invocation.ino() != identity.inode
+        || cargo.dev() != identity.device
+        || cargo.ino() != identity.inode
+        || rustup.dev() != identity.device
+        || rustup.ino() != identity.inode
+        || cargo.permissions().mode() & 0o111 == 0
+        || rustup.permissions().mode() & 0o111 == 0
+        || !posix_rustup_owner_is_trusted(cargo.uid(), candidate_uid)
+        || !posix_rustup_owner_is_trusted(rustup.uid(), candidate_uid)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "POSIX Cargo/Rustup proxy file identity is not trusted",
+        ));
+    }
+    let (_, cargo_access) =
+        posix_rustup_effective_access(cargo.permissions().mode(), cargo.gid(), candidate_group_ids);
+    let (_, rustup_access) = posix_rustup_effective_access(
+        rustup.permissions().mode(),
+        rustup.gid(),
+        candidate_group_ids,
+    );
+    if cargo_access & 0o2 != 0 || rustup_access & 0o2 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "candidate principal can modify the POSIX Cargo/Rustup proxy authority",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixCargoDenyAuthority {
+    source: BoundPosixStandardExecutableIdentity,
+    source_sha256: Digest,
+    staged: PathBuf,
+    staged_sha256: Digest,
+    staged_identity: PosixAdapterIdentity,
+    cargo_home: PathBuf,
+    metadata: BoundPosixCargoDenyMetadataAuthority,
+    candidate_uid: u32,
+    trusted_owner: u32,
+    trusted_group_id: u32,
+    cargo_home_inventory: Vec<PosixCargoCacheEntryIdentity>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixCargoDenyMetadataAuthority {
+    directory: PathBuf,
+    directory_identity: PosixCargoDenyMetadataFileIdentity,
+    path: PathBuf,
+    file_identity: PosixCargoDenyMetadataFileIdentity,
+    size: u64,
+    sha256: Digest,
+    trusted_owner: u32,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixCargoDenyMetadataFileIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixCargoCacheEntryIdentity {
+    relative: PathBuf,
+    directory: bool,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    size: u64,
+    sha256: Option<Digest>,
+}
+
+#[cfg(unix)]
+impl BoundPosixCargoDenyAuthority {
+    fn new(
+        authority: PosixCargoDenyAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+        writable_roots: &[PathBuf],
+    ) -> std::io::Result<Self> {
+        let metadata = BoundPosixCargoDenyMetadataAuthority::new(
+            authority.metadata.clone(),
+            candidate_uid,
+            candidate_group_ids,
+        )?;
+        Self::new_with_metadata(
+            authority,
+            candidate_uid,
+            candidate_group_ids,
+            writable_roots,
+            metadata,
+            true,
+        )
+    }
+
+    fn new_with_metadata(
+        authority: PosixCargoDenyAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+        writable_roots: &[PathBuf],
+        metadata: BoundPosixCargoDenyMetadataAuthority,
+        require_distinct_trusted_owner: bool,
+    ) -> std::io::Result<Self> {
+        let PosixCargoDenyAuthority {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            cargo_home,
+            metadata: _,
+            trusted_owner,
+            trusted_group_id,
+        } = authority;
+        let source = BoundPosixStandardExecutableIdentity::new_named(source, "cargo-deny")?;
+        let staged = fs::canonicalize(staged)?;
+        if staged.file_name() != Some(OsStr::new("cargo-deny")) || source_sha256 != staged_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX cargo-deny source and staged authority differ",
+            ));
+        }
+        let staged_identity = posix_adapter_identity(&staged)?;
+        let cargo_home = fs::canonicalize(cargo_home)?;
+        let within_writable_root = writable_roots.iter().any(|root| {
+            fs::canonicalize(root)
+                .is_ok_and(|canonical_root| cargo_home.starts_with(canonical_root))
+        });
+        if !within_writable_root {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX cargo-deny home is outside the candidate writable authority",
+            ));
+        }
+        if candidate_group_ids.contains(&trusted_group_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "candidate principal belongs to the trusted cargo-deny cache reader group",
+            ));
+        }
+        if require_distinct_trusted_owner && trusted_owner == candidate_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "candidate principal owns the trusted cargo-deny cache",
+            ));
+        }
+        let cargo_home_inventory = posix_candidate_cargo_cache_inventory(
+            &cargo_home,
+            candidate_uid,
+            trusted_owner,
+            trusted_group_id,
+        )?;
+        let bound = Self {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            staged_identity,
+            cargo_home,
+            metadata,
+            candidate_uid,
+            trusted_owner,
+            trusted_group_id,
+            cargo_home_inventory,
+        };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    #[cfg(test)]
+    fn new_for_fixture(
+        authority: PosixCargoDenyAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+        writable_roots: &[PathBuf],
+        metadata_candidate_uid: u32,
+    ) -> std::io::Result<Self> {
+        let metadata = BoundPosixCargoDenyMetadataAuthority::new(
+            authority.metadata.clone(),
+            metadata_candidate_uid,
+            candidate_group_ids,
+        )?;
+        Self::new_with_metadata(
+            authority,
+            candidate_uid,
+            candidate_group_ids,
+            writable_roots,
+            metadata,
+            false,
+        )
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        self.source.revalidate()?;
+        if sha256_file(&self.source.identity.canonical)? != self.source_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny source digest changed before spawn",
+            ));
+        }
+        verify_posix_adapter_identity(
+            &self.staged,
+            &self.staged,
+            self.staged_sha256,
+            &self.staged_identity,
+        )?;
+        self.cargo_home_inventory.first().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny cache inventory is empty",
+            )
+        })?;
+        let observed = posix_candidate_cargo_cache_inventory(
+            &self.cargo_home,
+            self.candidate_uid,
+            self.trusted_owner,
+            self.trusted_group_id,
+        )?;
+        if observed != self.cargo_home_inventory {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny cache changed before spawn",
+            ));
+        }
+        self.metadata.revalidate()?;
+        Ok(())
+    }
+
+    fn request_is_bound(&self, requested: &OsStr, resolved: &Path) -> std::io::Result<bool> {
+        let requested = Path::new(requested);
+        if requested.file_name() != Some(OsStr::new("cargo-deny")) {
+            return Ok(false);
+        }
+        if requested.components().count() != 1 && requested != self.source.identity.invocation {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cargo-deny request is outside the exact staged authority",
+            ));
+        }
+        self.revalidate()?;
+        if resolved != self.source.identity.invocation
+            || fs::canonicalize(resolved)? != self.source.identity.canonical
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "standard cargo-deny authority changed before spawn",
+            ));
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+impl BoundPosixCargoDenyMetadataAuthority {
+    fn new(
+        authority: PosixCargoDenyMetadataAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+    ) -> std::io::Result<Self> {
+        let PosixCargoDenyMetadataAuthority {
+            directory,
+            path,
+            size,
+            sha256,
+            trusted_owner,
+        } = authority;
+        let directory = fs::canonicalize(directory)?;
+        let path = fs::canonicalize(path)?;
+        if trusted_owner == candidate_uid
+            || !candidate_group_ids.contains(&candidate_uid)
+            || !posix_cargo_deny_metadata_path_is_exact(&directory, &path)
+            || !posix_cargo_deny_metadata_parent_is_trusted(&directory)?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX cargo-deny metadata path or ownership differs from policy",
+            ));
+        }
+        let directory_identity = posix_cargo_deny_metadata_identity(&directory, true)?;
+        let file_identity = posix_cargo_deny_metadata_identity(&path, false)?;
+        if directory_identity.uid != trusted_owner
+            || directory_identity.mode != 0o555
+            || file_identity.uid != trusted_owner
+            || file_identity.mode != 0o444
+            || fs::metadata(&path)?.len() != size
+            || sha256_file(&path)? != sha256
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX cargo-deny metadata identity differs from policy",
+            ));
+        }
+        let bound = Self {
+            directory,
+            directory_identity,
+            path,
+            file_identity,
+            size,
+            sha256,
+            trusted_owner,
+        };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        if !posix_cargo_deny_metadata_path_is_exact(&self.directory, &self.path)
+            || !posix_cargo_deny_metadata_parent_is_trusted(&self.directory)?
+            || !posix_cargo_deny_metadata_directory_is_closed(&self.directory)?
+            || posix_cargo_deny_metadata_identity(&self.directory, true)? != self.directory_identity
+            || posix_cargo_deny_metadata_identity(&self.path, false)? != self.file_identity
+            || self.directory_identity.uid != self.trusted_owner
+            || self.directory_identity.mode != 0o555
+            || self.file_identity.uid != self.trusted_owner
+            || self.file_identity.mode != 0o444
+            || fs::metadata(&self.path)?.len() != self.size
+            || sha256_file(&self.path)? != self.sha256
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny metadata changed before spawn",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn posix_cargo_deny_metadata_directory_is_closed(directory: &Path) -> std::io::Result<bool> {
+    let mut members = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    members.sort();
+    Ok(members == [OsString::from("metadata.json")])
+}
+
+#[cfg(unix)]
+fn posix_cargo_deny_metadata_parent_is_trusted(directory: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let Some(parent) = directory.parent() else {
+        return Ok(false);
+    };
+    let metadata = fs::symlink_metadata(parent)?;
+    Ok(!metadata.file_type().is_symlink()
+        && metadata.is_dir()
+        && metadata.uid() == 0
+        && metadata.gid() == 0
+        && metadata.permissions().mode() & 0o7777 == 0o1777
+        && fs::canonicalize(parent)? == parent)
+}
+
+#[cfg(unix)]
+fn posix_cargo_deny_metadata_path_is_exact(directory: &Path, path: &Path) -> bool {
+    let Some(name) = directory.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let Some((process, sequence)) = name
+        .strip_prefix("hell-cargo-deny-metadata-")
+        .and_then(|suffix| suffix.split_once('-'))
+    else {
+        return false;
+    };
+    let canonical_number = |value: &str| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|number| value == number.to_string())
+    };
+    matches!(directory.parent(), Some(parent) if parent == Path::new("/var/tmp") || parent == Path::new("/private/var/tmp"))
+        && canonical_number(process)
+        && canonical_number(sequence)
+        && path == directory.join("metadata.json")
+}
+
+#[cfg(unix)]
+fn posix_cargo_deny_metadata_identity(
+    path: &Path,
+    directory: bool,
+) -> std::io::Result<PosixCargoDenyMetadataFileIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || directory != metadata.is_dir()
+        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
+        || fs::canonicalize(path)? != path
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX cargo-deny metadata is redirected or special",
+        ));
+    }
+    Ok(PosixCargoDenyMetadataFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    })
+}
+
+#[cfg(unix)]
+fn posix_candidate_cargo_cache_inventory(
+    cargo_home: &Path,
+    candidate_uid: u32,
+    trusted_owner: u32,
+    trusted_group_id: u32,
+) -> std::io::Result<Vec<PosixCargoCacheEntryIdentity>> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut pending = vec![cargo_home.to_path_buf()];
+    let mut inventory = Vec::new();
+    let mut bytes = 0_u64;
+    let lock = Path::new("advisory-dbs").join("db.lock");
+    let mut found_lock = false;
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        let directory = metadata.is_dir();
+        let relative = path
+            .strip_prefix(cargo_home)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "POSIX cargo-deny cache entry escapes its home",
+                )
+            })?
+            .to_path_buf();
+        let is_lock = relative == lock;
+        let expected_owner = if is_lock {
+            candidate_uid
+        } else {
+            trusted_owner
+        };
+        if metadata.file_type().is_symlink()
+            || (!directory && !metadata.is_file())
+            || (!directory && metadata.nlink() != 1)
+            || fs::canonicalize(&path)? != path
+            || metadata.uid() != expected_owner
+            || metadata.gid() != trusted_group_id
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX cargo-deny cache identity differs from its candidate-owned policy",
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o7777;
+        let expected_mode = if is_lock {
+            0o600
+        } else if directory {
+            0o555
+        } else {
+            0o444
+        };
+        if mode != expected_mode || (is_lock && (directory || metadata.len() != 0)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX cargo-deny cache permissions differ from policy",
+            ));
+        }
+        found_lock |= is_lock;
+        let size = if directory { 0 } else { metadata.len() };
+        bytes = bytes.checked_add(size).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny cache byte count overflowed",
+            )
+        })?;
+        if inventory.len() >= POSIX_RUSTUP_ENTRY_LIMIT || bytes > POSIX_CARGO_CACHE_BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX cargo-deny cache exceeds its closed resource bound",
+            ));
+        }
+        let sha256 = (!directory && !is_lock)
+            .then(|| sha256_file(&path))
+            .transpose()?;
+        inventory.push(PosixCargoCacheEntryIdentity {
+            relative,
+            directory,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode,
+            size,
+            sha256,
+        });
+        if directory {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    if !found_lock {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX cargo-deny advisory lock authority is absent",
+        ));
+    }
+    inventory.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(inventory)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixStackAuthority {
+    source: BoundPosixStandardExecutableIdentity,
+    source_sha256: Digest,
+    staged: PathBuf,
+    staged_sha256: Digest,
+    staged_identity: PosixAdapterIdentity,
+    stack_root: PathBuf,
+    stack_root_identity: PosixStackRootIdentity,
+    candidate_uid: u32,
+    candidate_group_ids: Arc<[u32]>,
+    work: Option<BoundPosixStackWorkAuthority>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixStackDirectoryIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl PosixStackDirectoryIdentity {
+    fn bind(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(path)?;
+        if !path.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || fs::canonicalize(path)? != path
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX Stack work authority is not one canonical directory",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.permissions().mode() & 0o7777,
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        if Self::bind(&self.path)? != *self {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack work directory identity changed before spawn",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixStackWorkAuthority {
+    source: PosixStackDirectoryIdentity,
+    work: PosixStackDirectoryIdentity,
+    relative: PathBuf,
+    candidate_uid: u32,
+    candidate_group_ids: Arc<[u32]>,
+}
+
+#[cfg(unix)]
+impl BoundPosixStackWorkAuthority {
+    fn new(
+        source: &Path,
+        work: &Path,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+    ) -> std::io::Result<Self> {
+        let source = PosixStackDirectoryIdentity::bind(source)?;
+        let work = PosixStackDirectoryIdentity::bind(work)?;
+        let relative = PathBuf::from(".stack-work");
+        if work.path != source.path.join(&relative)
+            || work.path.parent() != Some(source.path.as_path())
+            || fs::canonicalize(source.path.join(&relative))? != work.path
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX Stack work directory is not the exact reserved source child",
+            ));
+        }
+        if work.uid != candidate_uid
+            || candidate_group_ids.contains(&work.gid)
+            || work.mode != 0o750
+            || source.mode != 0o555
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "POSIX Stack work directory access differs from its bound authority",
+            ));
+        }
+        let bound = Self {
+            source,
+            work,
+            relative,
+            candidate_uid,
+            candidate_group_ids: candidate_group_ids.into(),
+        };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        if self.relative != Path::new(".stack-work")
+            || self.work.path != self.source.path.join(&self.relative)
+            || self.work.path.parent() != Some(self.source.path.as_path())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack work authority relation changed before spawn",
+            ));
+        }
+        for identity in [&self.source, &self.work] {
+            identity.revalidate()?;
+        }
+        if self.work.uid != self.candidate_uid
+            || self.candidate_group_ids.contains(&self.work.gid)
+            || self.work.mode != 0o750
+            || self.source.mode != 0o555
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack work directory access changed before spawn",
+            ));
+        }
+        if fs::canonicalize(self.source.path.join(&self.relative))? != self.work.path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack relative work path changed before spawn",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixStackRootIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl BoundPosixStackAuthority {
+    fn new(
+        authority: PosixStackAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+        writable_roots: &[PathBuf],
+    ) -> std::io::Result<Self> {
+        let PosixStackAuthority {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            stack_root,
+            trusted_group_id,
+        } = authority;
+        let source = BoundPosixStandardExecutableIdentity::new_named(source, "stack")?;
+        let staged = fs::canonicalize(staged)?;
+        if staged.file_name() != Some(OsStr::new("stack")) || source_sha256 != staged_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX Stack source and staged authority differ",
+            ));
+        }
+        let staged_identity = posix_adapter_identity(&staged)?;
+        if candidate_group_ids.contains(&trusted_group_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "candidate principal belongs to the trusted Stack-root reader group",
+            ));
+        }
+        let stack_root = fs::canonicalize(stack_root)?;
+        if !writable_roots.iter().any(|root| {
+            fs::canonicalize(root)
+                .is_ok_and(|canonical_root| stack_root.starts_with(canonical_root))
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX Stack root is outside the candidate writable authority",
+            ));
+        }
+        let stack_root_identity =
+            posix_stack_root_identity(&stack_root, candidate_uid, trusted_group_id)?;
+        if fs::read_dir(&stack_root)?.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "initial POSIX Stack root is not empty",
+            ));
+        }
+        let bound = Self {
+            source,
+            source_sha256,
+            staged,
+            staged_sha256,
+            staged_identity,
+            stack_root,
+            stack_root_identity,
+            candidate_uid,
+            candidate_group_ids: candidate_group_ids.into(),
+            work: None,
+        };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        self.source.revalidate()?;
+        if sha256_file(&self.source.identity.canonical)? != self.source_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack source digest changed before spawn",
+            ));
+        }
+        verify_posix_adapter_identity(
+            &self.staged,
+            &self.staged,
+            self.staged_sha256,
+            &self.staged_identity,
+        )?;
+        if posix_stack_root_identity(
+            &self.stack_root,
+            self.stack_root_identity.uid,
+            self.stack_root_identity.gid,
+        )? != self.stack_root_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Stack root identity changed before spawn",
+            ));
+        }
+        if let Some(work) = &self.work {
+            work.revalidate()?;
+        }
+        Ok(())
+    }
+
+    fn bind_work(&mut self, source: &Path, work: &Path) -> std::io::Result<()> {
+        if self.work.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "POSIX Stack work authority is already bound",
+            ));
+        }
+        self.work = Some(BoundPosixStackWorkAuthority::new(
+            source,
+            work,
+            self.candidate_uid,
+            &self.candidate_group_ids,
+        )?);
+        self.revalidate()
+    }
+
+    fn request_is_bound(&self, requested: &OsStr, resolved: &Path) -> std::io::Result<bool> {
+        let requested = Path::new(requested);
+        if requested.file_name() != Some(OsStr::new("stack")) {
+            return Ok(false);
+        }
+        if requested.components().count() != 1 && requested != self.source.identity.invocation {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Stack request is outside the exact staged authority",
+            ));
+        }
+        self.revalidate()?;
+        if resolved != self.source.identity.invocation
+            || fs::canonicalize(resolved)? != self.source.identity.canonical
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "standard Stack authority changed before spawn",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn mapped_request(
+        &self,
+        requested: &OsStr,
+        resolved: &Path,
+    ) -> std::io::Result<Option<(PathBuf, PathBuf, Option<PathBuf>)>> {
+        self.request_is_bound(requested, resolved).map(|matches| {
+            matches.then(|| {
+                (
+                    self.staged.clone(),
+                    self.stack_root.clone(),
+                    self.work.as_ref().map(|work| work.relative.clone()),
+                )
+            })
+        })
+    }
+}
+
+#[cfg(unix)]
+fn posix_stack_root_identity(
+    stack_root: &Path,
+    candidate_uid: u32,
+    trusted_group_id: u32,
+) -> std::io::Result<PosixStackRootIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(stack_root)?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if !stack_root.is_absolute()
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(stack_root)? != stack_root
+        || metadata.uid() != candidate_uid
+        || metadata.gid() != trusted_group_id
+        || mode != 0o750
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "POSIX Stack root identity or permissions differ from policy",
+        ));
+    }
+    Ok(PosixStackRootIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode,
+    })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+enum BoundPosixCargoSourceAuthority {
+    Native {
+        cargo: BoundPosixCanonicalExecutableIdentity,
+        standard_rustup: BoundPosixStandardExecutableIdentity,
+    },
+    Rustup(Box<BoundPosixRustupAuthority>),
+}
+
+#[cfg(unix)]
+impl BoundPosixCargoSourceAuthority {
+    fn new(
+        authority: PosixCargoSourceAuthority,
+        cargo_source: &Path,
+        candidate_uid: u32,
+        candidate_group_ids: Arc<[u32]>,
+    ) -> std::io::Result<Self> {
+        match authority {
+            PosixCargoSourceAuthority::Native {
+                cargo,
+                standard_rustup,
+            } => {
+                if cargo_source.file_name() == Some(OsStr::new("rustup")) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a Cargo executable named rustup requires exact Rustup authority",
+                    ));
+                }
+                let cargo = BoundPosixCanonicalExecutableIdentity::new(cargo)?;
+                if cargo.0.canonical != cargo_source {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "native Cargo authority does not match the Cargo source",
+                    ));
+                }
+                let standard_rustup = BoundPosixStandardExecutableIdentity::new(standard_rustup)?;
+                if standard_rustup.same_file(cargo_source)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a Rustup-backed Cargo executable cannot be classified as native",
+                    ));
+                }
+                Ok(Self::Native {
+                    cargo,
+                    standard_rustup,
+                })
+            }
+            PosixCargoSourceAuthority::Rustup(authority) => {
+                if authority.proxy_identity.cargo != cargo_source {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Rustup authority does not correspond to the Cargo source identity",
+                    ));
+                }
+                Ok(Self::Rustup(Box::new(BoundPosixRustupAuthority::new(
+                    *authority,
+                    candidate_uid,
+                    candidate_group_ids,
+                )?)))
+            }
+        }
+    }
+
+    fn revalidate(&self, cargo_source: &Path) -> std::io::Result<()> {
+        match self {
+            Self::Native {
+                cargo,
+                standard_rustup,
+            } => {
+                cargo.revalidate()?;
+                standard_rustup.revalidate()?;
+                if cargo.0.canonical != cargo_source || standard_rustup.same_file(cargo_source)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "native Cargo classification changed before spawn",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Rustup(authority) => authority.revalidate(),
+        }
+    }
+
+    fn rustup(&self) -> Option<&BoundPosixRustupAuthority> {
+        match self {
+            Self::Native { .. } => None,
+            Self::Rustup(authority) => Some(authority),
+        }
+    }
+
+    fn child_tool_path(&self, cargo_adapter: &Path) -> std::io::Result<PathBuf> {
+        match self {
+            Self::Native { .. } => cargo_adapter
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| std::io::Error::other("staged Cargo has no parent")),
+            Self::Rustup(authority) => authority.selected_tool_bin(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixStandardExecutableIdentity {
+    identity: PosixStandardExecutableIdentity,
+    logical_name: &'static str,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixCanonicalExecutableIdentity(PosixCanonicalExecutableIdentity);
+
+#[cfg(unix)]
+impl BoundPosixCanonicalExecutableIdentity {
+    fn new(identity: PosixCanonicalExecutableIdentity) -> std::io::Result<Self> {
+        let bound = Self(identity);
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(&self.0.canonical)?;
+        if fs::canonicalize(&self.0.canonical)? != self.0.canonical
+            || !metadata.is_file()
+            || metadata.dev() != self.0.device
+            || metadata.ino() != self.0.inode
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical executable identity changed",
+            ));
+        }
+        require_posix_effective_executable(&self.0.canonical)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl BoundPosixStandardExecutableIdentity {
+    fn new(identity: PosixStandardExecutableIdentity) -> std::io::Result<Self> {
+        Self::new_named(identity, "rustup")
+    }
+
+    fn new_named(
+        identity: PosixStandardExecutableIdentity,
+        logical_name: &'static str,
+    ) -> std::io::Result<Self> {
+        let bound = Self {
+            identity,
+            logical_name,
+        };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let identity = &self.identity;
+        let parent = identity.invocation.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "standard executable invocation has no parent",
+            )
+        })?;
+        let metadata = fs::metadata(&identity.canonical)?;
+        if identity.invocation.file_name() != Some(OsStr::new(self.logical_name))
+            || !identity.invocation.is_absolute()
+            || fs::canonicalize(parent)? != parent
+            || fs::canonicalize(&identity.invocation)? != identity.canonical
+            || fs::canonicalize(&identity.canonical)? != identity.canonical
+            || !metadata.is_file()
+            || metadata.dev() != identity.device
+            || metadata.ino() != identity.inode
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "standard executable identity changed",
+            ));
+        }
+        require_posix_effective_executable(&identity.invocation)?;
+        Ok(())
+    }
+
+    fn same_file(&self, path: &Path) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(path)?;
+        Ok(metadata.dev() == self.identity.device && metadata.ino() == self.identity.inode)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+enum BoundPosixRustcAuthority {
+    RustupProxy(BoundPosixStandardExecutableIdentity),
+    SelectedToolchain(BoundPosixStandardExecutableIdentity),
+}
+
+#[cfg(unix)]
+impl BoundPosixRustcAuthority {
+    fn new(
+        authority: PosixRustcAuthority,
+        proxy: &PosixRustupProxyIdentity,
+        compiler_mapping: &BoundPosixRustupCompilerMapping,
+    ) -> std::io::Result<Self> {
+        let authority = match authority {
+            PosixRustcAuthority::RustupProxy(identity) => Self::RustupProxy(
+                BoundPosixStandardExecutableIdentity::new_named(identity, "rustc")?,
+            ),
+            PosixRustcAuthority::SelectedToolchain(identity) => Self::SelectedToolchain(
+                BoundPosixStandardExecutableIdentity::new_named(identity, "rustc")?,
+            ),
+        };
+        authority.revalidate(proxy, compiler_mapping)?;
+        Ok(authority)
+    }
+
+    fn standard(&self) -> &BoundPosixStandardExecutableIdentity {
+        match self {
+            Self::RustupProxy(identity) | Self::SelectedToolchain(identity) => identity,
+        }
+    }
+
+    fn revalidate(
+        &self,
+        proxy: &PosixRustupProxyIdentity,
+        compiler_mapping: &BoundPosixRustupCompilerMapping,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let standard = self.standard();
+        standard.revalidate()?;
+        match self {
+            Self::RustupProxy(_) => {
+                if standard.identity.device != proxy.device
+                    || standard.identity.inode != proxy.inode
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "standard rustc does not match the Rustup proxy identity",
+                    ));
+                }
+            }
+            Self::SelectedToolchain(_) => {
+                let source = &compiler_mapping.source;
+                let metadata = fs::metadata(&standard.identity.canonical)?;
+                if standard.identity.canonical != source.path
+                    || metadata.dev() != source.device
+                    || metadata.ino() != source.inode
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "standard rustc does not match the inventoried selected compiler",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn invocation(&self) -> &Path {
+        &self.standard().identity.invocation
+    }
+
+    fn canonical(&self) -> &Path {
+        &self.standard().identity.canonical
+    }
+}
+
+#[cfg(unix)]
+fn require_posix_effective_executable(path: &Path) -> std::io::Result<()> {
+    use nix::fcntl::AtFlags;
+    use nix::unistd::{AccessFlags, faccessat};
+
+    faccessat(None, path, AccessFlags::X_OK, AtFlags::AT_EACCESS).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("executable is unavailable to the effective user: {error}"),
+        )
+    })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixRustupAuthority {
+    proxy_identity: PosixRustupProxyIdentity,
+    rustc_authority: BoundPosixRustcAuthority,
+    home: PathBuf,
+    toolchain: OsString,
+    compiler_mapping: BoundPosixRustupCompilerMapping,
+    candidate_uid: u32,
+    candidate_group_ids: Arc<[u32]>,
+    critical_entries: Arc<[PosixRustupEntryIdentity]>,
+    tree_entries: Arc<[PosixRustupEntryIdentity]>,
+}
+
+#[cfg(unix)]
+impl BoundPosixRustupAuthority {
+    fn new(
+        authority: PosixRustupAuthority,
+        candidate_uid: u32,
+        candidate_group_ids: Arc<[u32]>,
+    ) -> std::io::Result<Self> {
+        let PosixRustupAuthority {
+            proxy_identity,
+            rustc_authority,
+            source_home,
+            home,
+            toolchain,
+            compiler_mapping,
+        } = authority;
+        validate_posix_rustup_proxy_identity(&proxy_identity, candidate_uid, &candidate_group_ids)?;
+        validate_posix_rustup_compiler_mapping_paths(
+            &source_home,
+            &home,
+            &toolchain,
+            &compiler_mapping,
+        )?;
+        let critical_entries =
+            posix_rustup_critical_entries(&home, &toolchain, candidate_uid, &candidate_group_ids)?;
+        let tree_entries = posix_rustup_tree_entries(&home, candidate_uid, &candidate_group_ids)?;
+        let compiler_mapping = BoundPosixRustupCompilerMapping::new(
+            &compiler_mapping,
+            candidate_uid,
+            &candidate_group_ids,
+        )?;
+        let rustc_authority =
+            BoundPosixRustcAuthority::new(rustc_authority, &proxy_identity, &compiler_mapping)?;
+        Ok(Self {
+            proxy_identity,
+            rustc_authority,
+            home,
+            toolchain,
+            compiler_mapping,
+            candidate_uid,
+            candidate_group_ids,
+            critical_entries: critical_entries.into(),
+            tree_entries: tree_entries.into(),
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        validate_posix_rustup_proxy_identity(
+            &self.proxy_identity,
+            self.candidate_uid,
+            &self.candidate_group_ids,
+        )?;
+        for expected in &*self.critical_entries {
+            let observed = posix_rustup_entry_identity(
+                &expected.path,
+                self.candidate_uid,
+                &self.candidate_group_ids,
+                expected.requirement,
+            )?;
+            if observed != *expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "POSIX Rustup authority identity changed before spawn",
+                ));
+            }
+        }
+        if posix_rustup_tree_entries(&self.home, self.candidate_uid, &self.candidate_group_ids)?
+            != *self.tree_entries
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Rustup authority inventory changed before spawn",
+            ));
+        }
+        self.compiler_mapping
+            .revalidate(self.candidate_uid, &self.candidate_group_ids)?;
+        self.rustc_authority
+            .revalidate(&self.proxy_identity, &self.compiler_mapping)?;
+        Ok(())
+    }
+
+    fn request_is_bound_rustc(&self, requested: &OsStr, resolved: &Path) -> std::io::Result<bool> {
+        let requested = Path::new(requested);
+        if requested.file_name() != Some(OsStr::new("rustc")) {
+            return Ok(false);
+        }
+        if requested.components().count() != 1 && requested != self.rustc_authority.invocation() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rustc request is outside the exact standard compiler authority",
+            ));
+        }
+        self.revalidate()?;
+        if resolved != self.rustc_authority.invocation()
+            || fs::canonicalize(resolved)? != self.rustc_authority.canonical()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "standard Rust compiler authority changed before spawn",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn selected_tool_bin(&self) -> std::io::Result<PathBuf> {
+        let bin = self
+            .home
+            .join("toolchains")
+            .join(&self.toolchain)
+            .join("bin");
+        if fs::canonicalize(&bin)? != bin {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "selected staged Rust tool bin changed before spawn",
+            ));
+        }
+        Ok(bin)
+    }
+}
+
+#[cfg(unix)]
+fn validate_posix_rustup_compiler_mapping_paths(
+    source_home: &Path,
+    staged_home: &Path,
+    toolchain: &OsStr,
+    mapping: &PosixRustupCompilerMapping,
+) -> std::io::Result<()> {
+    let source_rustc = source_home
+        .join("toolchains")
+        .join(toolchain)
+        .join("bin/rustc");
+    let staged_rustc = staged_home
+        .join("toolchains")
+        .join(toolchain)
+        .join("bin/rustc");
+    if fs::canonicalize(source_home)? != source_home
+        || fs::canonicalize(&source_rustc)? != source_rustc
+        || mapping.source != source_rustc
+        || mapping.staged != staged_rustc
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Rust compiler mapping is outside the selected source or staged toolchain",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn posix_rustup_critical_entries(
+    home: &Path,
+    toolchain: &OsStr,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> std::io::Result<Vec<PosixRustupEntryIdentity>> {
+    if !home.is_absolute()
+        || fs::canonicalize(home)? != home
+        || Path::new(toolchain).components().count() != 1
+        || toolchain.is_empty()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX Rustup authority is not canonical",
+        ));
+    }
+    let toolchains = home.join("toolchains");
+    let toolchain_root = toolchains.join(toolchain);
+    if fs::canonicalize(&toolchain_root)? != toolchain_root {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "selected Rust toolchain path is redirected",
+        ));
+    }
+    let bin = toolchain_root.join("bin");
+    let settings = home.join("settings.toml");
+    let update_hashes = home.join("update-hashes");
+    let update_hash = update_hashes.join(toolchain);
+    let cargo = bin.join("cargo");
+    let rustc = bin.join("rustc");
+    let mut entries = home
+        .ancestors()
+        .map(|ancestor| {
+            posix_rustup_entry_identity(
+                ancestor,
+                candidate_uid,
+                candidate_group_ids,
+                PosixRustupAccessRequirement::AncestorDirectory,
+            )
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for (path, requirement) in [
+        (home, PosixRustupAccessRequirement::AuthorityDirectory),
+        (&settings, PosixRustupAccessRequirement::ReadableFile),
+        (
+            &update_hashes,
+            PosixRustupAccessRequirement::AuthorityDirectory,
+        ),
+        (&update_hash, PosixRustupAccessRequirement::ReadableFile),
+        (
+            &toolchains,
+            PosixRustupAccessRequirement::AuthorityDirectory,
+        ),
+        (
+            &toolchain_root,
+            PosixRustupAccessRequirement::AuthorityDirectory,
+        ),
+        (&bin, PosixRustupAccessRequirement::AuthorityDirectory),
+        (&cargo, PosixRustupAccessRequirement::ExecutableFile),
+        (&rustc, PosixRustupAccessRequirement::ExecutableFile),
+    ] {
+        entries.push(posix_rustup_entry_identity(
+            path,
+            candidate_uid,
+            candidate_group_ids,
+            requirement,
+        )?);
+    }
+    Ok(entries)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixRustupCompilerMapping {
+    source: PosixRustupMappedExecutableIdentity,
+    staged: PosixRustupMappedExecutableIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixRustupMappedExecutableIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    size: u64,
+    sha256: Digest,
+}
+
+#[cfg(unix)]
+impl BoundPosixRustupCompilerMapping {
+    fn new(
+        mapping: &PosixRustupCompilerMapping,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+    ) -> std::io::Result<Self> {
+        let source = PosixRustupMappedExecutableIdentity::read(
+            &mapping.source,
+            mapping.source_sha256,
+            candidate_uid,
+            candidate_group_ids,
+        )?;
+        let staged = PosixRustupMappedExecutableIdentity::read(
+            &mapping.staged,
+            mapping.staged_sha256,
+            candidate_uid,
+            candidate_group_ids,
+        )?;
+        if source.size != staged.size || source.sha256 != staged.sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source and staged Rust compiler identities differ",
+            ));
+        }
+        Ok(Self { source, staged })
+    }
+
+    fn revalidate(&self, candidate_uid: u32, candidate_group_ids: &[u32]) -> std::io::Result<()> {
+        for expected in [&self.source, &self.staged] {
+            let observed = PosixRustupMappedExecutableIdentity::read(
+                &expected.path,
+                expected.sha256,
+                candidate_uid,
+                candidate_group_ids,
+            )?;
+            if observed != *expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "source or staged Rust compiler identity changed before spawn",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl PosixRustupMappedExecutableIdentity {
+    fn read(
+        path: &Path,
+        expected_sha256: Digest,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let entry = posix_rustup_entry_identity(
+            path,
+            candidate_uid,
+            candidate_group_ids,
+            PosixRustupAccessRequirement::ExecutableFile,
+        )?;
+        let metadata = fs::symlink_metadata(path)?;
+        let sha256 = sha256_file(path)?;
+        if sha256 != expected_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mapped Rust compiler digest changed",
+            ));
+        }
+        Ok(Self {
+            path: entry.path,
+            device: entry.device,
+            inode: entry.inode,
+            links: entry.links,
+            uid: entry.uid,
+            gid: entry.gid,
+            mode: metadata.permissions().mode() & 0o7777,
+            size: metadata.len(),
+            sha256,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn posix_rustup_entry_identity(
+    path: &Path,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+    requirement: PosixRustupAccessRequirement,
+) -> std::io::Result<PosixRustupEntryIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || fs::canonicalize(path)? != path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX Rustup authority path is redirected",
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if !posix_rustup_owner_is_trusted(metadata.uid(), candidate_uid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "candidate principal owns POSIX Rustup authority",
+        ));
+    }
+    let identity = PosixRustupEntryIdentity {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode,
+        requirement,
+    };
+    if metadata.is_file() && metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "POSIX Rustup authority file has multiple hard links",
+        ));
+    }
+    match requirement {
+        PosixRustupAccessRequirement::AncestorDirectory => {
+            if !metadata.is_dir()
+                || !posix_rustup_ancestor_access_is_safe(mode, metadata.gid(), candidate_group_ids)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    posix_rustup_ancestor_rejection(
+                        &identity,
+                        metadata.is_dir(),
+                        candidate_uid,
+                        candidate_group_ids,
+                    ),
+                ));
+            }
+        }
+        PosixRustupAccessRequirement::AuthorityDirectory => {
+            if !metadata.is_dir() || mode & 0o005 != 0o005 || mode & 0o022 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "POSIX Rustup directory is writable or not candidate-readable",
+                ));
+            }
+        }
+        PosixRustupAccessRequirement::ReadableFile => {
+            if !metadata.is_file() || mode & 0o004 == 0 || mode & 0o022 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "POSIX Rustup file is writable or not candidate-readable",
+                ));
+            }
+        }
+        PosixRustupAccessRequirement::ExecutableFile => {
+            if !metadata.is_file() || mode & 0o005 != 0o005 || mode & 0o022 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "POSIX Rustup executable is writable or not candidate-executable",
+                ));
+            }
+        }
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn posix_candidate_group_inventory_is_valid(primary_gid: u32, group_ids: &[u32]) -> bool {
+    !group_ids.is_empty()
+        && group_ids.len() <= POSIX_CANDIDATE_GROUP_LIMIT
+        && group_ids.contains(&primary_gid)
+        && group_ids.iter().copied().collect::<BTreeSet<_>>().len() == group_ids.len()
+}
+
+#[cfg(unix)]
+fn posix_rustup_ancestor_access_is_safe(
+    mode: u32,
+    owner_gid: u32,
+    candidate_group_ids: &[u32],
+) -> bool {
+    let (_, effective) = posix_rustup_effective_access(mode, owner_gid, candidate_group_ids);
+    effective & 0o5 == 0o5 && (effective & 0o2 == 0 || mode & 0o1000 != 0)
+}
+
+#[cfg(unix)]
+fn posix_rustup_effective_access(
+    mode: u32,
+    owner_gid: u32,
+    candidate_group_ids: &[u32],
+) -> (&'static str, u32) {
+    if candidate_group_ids.contains(&owner_gid) {
+        ("group", (mode >> 3) & 0o7)
+    } else {
+        ("other", mode & 0o7)
+    }
+}
+
+#[cfg(unix)]
+fn posix_rustup_ancestor_rejection(
+    identity: &PosixRustupEntryIdentity,
+    is_directory: bool,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> String {
+    let (access_class, effective) =
+        posix_rustup_effective_access(identity.mode, identity.gid, candidate_group_ids);
+    let path = identity.path.display();
+    let mode = identity.mode;
+    let file_owner = identity.uid;
+    let owning_group = identity.gid;
+    format!(
+        "POSIX Rustup ancestor rejected: path={path},isDirectory={is_directory},mode=0o{mode:04o},ownerUid={file_owner},ownerGid={owning_group},candidateUid={candidate_uid},candidateGroups={candidate_group_ids:?},accessClass={access_class},effectiveBits=0o{effective:o}"
+    )
+}
+
+#[cfg(unix)]
+fn posix_rustup_owner_is_trusted(owner_uid: u32, candidate_uid: u32) -> bool {
+    owner_uid != candidate_uid
+}
+
+#[cfg(unix)]
+fn posix_rustup_tree_entries(
+    root: &Path,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> std::io::Result<Vec<PosixRustupEntryIdentity>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut identities = Vec::new();
+    let mut entries = 0_usize;
+    while let Some(path) = pending.pop() {
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("POSIX Rustup inventory overflowed"))?;
+        if entries > POSIX_RUSTUP_ENTRY_LIMIT {
+            return Err(std::io::Error::other(
+                "POSIX Rustup inventory exceeds its entry bound",
+            ));
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            identities.push(posix_rustup_entry_identity(
+                &path,
+                candidate_uid,
+                candidate_group_ids,
+                PosixRustupAccessRequirement::AuthorityDirectory,
+            )?);
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        } else if metadata.is_file() {
+            identities.push(posix_rustup_entry_identity(
+                &path,
+                candidate_uid,
+                candidate_group_ids,
+                PosixRustupAccessRequirement::ReadableFile,
+            )?);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POSIX Rustup inventory contains a redirected or special entry",
+            ));
+        }
+    }
+    identities.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(identities)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixAdapterIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    parent_device: u64,
+    parent_inode: u64,
+    parent_uid: u32,
+    parent_gid: u32,
+    parent_mode: u32,
+}
+
+#[cfg(unix)]
+fn posix_adapter_identity(path: &Path) -> std::io::Result<PosixAdapterIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("POSIX adapter has no parent"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    Ok(PosixAdapterIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+        parent_device: parent_metadata.dev(),
+        parent_inode: parent_metadata.ino(),
+        parent_uid: parent_metadata.uid(),
+        parent_gid: parent_metadata.gid(),
+        parent_mode: parent_metadata.permissions().mode() & 0o7777,
+    })
+}
+
+#[cfg(unix)]
+fn verify_posix_adapter_identity(
+    path: &Path,
+    expected_canonical_path: &Path,
+    expected_sha256: Digest,
+    expected_identity: &PosixAdapterIdentity,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)?;
+    let canonical = fs::canonicalize(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("POSIX adapter has no parent"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || canonical != expected_canonical_path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX adapter canonical path changed",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX adapter is not a regular file",
+        ));
+    }
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX adapter parent identity changed",
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 || mode & 0o005 != 0o005 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "POSIX adapter is writable or not read-executable by the candidate principal",
+        ));
+    }
+    let parent_mode = parent_metadata.permissions().mode();
+    if parent_mode & 0o022 != 0 || parent_mode & 0o005 != 0o005 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "POSIX adapter parent is writable or not traversable by the candidate principal",
+        ));
+    }
+    if posix_adapter_identity(path)? != *expected_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX adapter file identity changed",
+        ));
+    }
+    if sha256_file(&canonical)? != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX adapter digest changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn verify_windows_launcher_identity(
+    path: &Path,
+    expected_canonical_path: &Path,
+    expected_sha256: Digest,
+) -> std::io::Result<()> {
+    let canonical = fs::canonicalize(path)?;
+    if canonical != expected_canonical_path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restricted launcher canonical path changed",
+        ));
+    }
+    if !fs::metadata(&canonical)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "restricted launcher is not a regular file",
+        ));
+    }
+    if sha256_file(&canonical)? != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restricted launcher digest changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn verify_windows_restricted_adapter_identity(
+    path: &Path,
+    expected_canonical_path: &Path,
+    expected_sha256: Digest,
+) -> std::io::Result<()> {
+    verify_windows_launcher_identity(path, expected_canonical_path, expected_sha256)?;
+    if expected_canonical_path.file_name() != Some(OsStr::new("hell-test-helper.exe")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "restricted argv adapter has the wrong executable name",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn uid_process_snapshot_is_quiescent(status: Option<i32>, snapshot: &[u8], stderr: &[u8]) -> bool {
+    if status == Some(1) {
+        return snapshot.is_empty() && stderr.is_empty();
+    }
+    if status != Some(0) || !stderr.is_empty() {
+        return false;
+    }
+    snapshot.split(|byte| *byte == b'\n').all(|line| {
+        let mut fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty());
+        let Some(pid) = fields.next() else {
+            return true;
+        };
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        fields.next().is_none()
+            && pid.iter().all(u8::is_ascii_digit)
+            && pid.iter().any(|byte| *byte != b'0')
+            && state.first() == Some(&b'Z')
+            && state[1..]
+                .iter()
+                .all(|byte| matches!(byte, b'<' | b'N' | b'L' | b's' | b'l' | b'+'))
+    })
+}
+
 #[cfg(any(windows, test))]
 const WINDOWS_ARGV_TOKEN_PREFIX: &str = "hell-argv-v1";
 #[cfg(any(windows, test))]
-const WINDOWS_ARGV_HELPER_PREFIX_UTF16_LEN: usize = "hell-ci __release-argv-child ".len();
+const WINDOWS_ARGV_HELPER_PREFIX_UTF16_LEN: usize = "hell-test-helper __release-argv-child ".len();
 #[cfg(any(windows, test))]
 const WINDOWS_CREATE_PROCESS_COMMAND_LINE_LIMIT: usize = 32_767;
 #[cfg(any(windows, test))]
@@ -423,8 +4214,132 @@ pub fn decode_windows_argv(token: &std::ffi::OsStr) -> std::io::Result<Vec<OsStr
     let token = token
         .to_str()
         .ok_or_else(|| std::io::Error::other("Windows argv token is not ASCII"))?;
-    decode_windows_argv_units(token)
-        .map(|arguments| arguments.into_iter().map(OsString::from_wide).collect())
+    decode_windows_argv_units(token).map(|arguments| {
+        arguments
+            .into_iter()
+            .map(|argument| OsString::from_wide(&argument))
+            .collect()
+    })
+}
+
+/// Returns the exact diagnostic required when a Windows child status cannot
+/// be represented by [`std::process::ExitCode`].
+///
+/// A loader exception is delivered through `ExitStatus::code` as a signed
+/// `i32`; retaining both spellings prevents the restricted argv adapter from
+/// collapsing that evidence into an unexplained exit code `1`.
+#[doc(hidden)]
+#[must_use]
+pub fn windows_argv_child_status_diagnostic(code: Option<i32>) -> Option<String> {
+    match code {
+        Some(code) if u8::try_from(code).is_ok() => None,
+        Some(code) => Some(format!(
+            "Windows argv target exited with raw status {code} (0x{:08x})",
+            code.cast_unsigned()
+        )),
+        None => Some("Windows argv target terminated without an exit code".to_owned()),
+    }
+}
+
+fn bounded_windows_path_debug(path: &Path) -> String {
+    const LIMIT: usize = 1_024;
+
+    let rendered = format!("\"{}\"", path.as_os_str().to_string_lossy().escape_debug());
+    if rendered.len() <= LIMIT {
+        rendered
+    } else {
+        let split = (0..=LIMIT)
+            .rev()
+            .find(|index| rendered.is_char_boundary(*index))
+            .expect("zero is a UTF-8 boundary");
+        format!("{}<truncated:{}>", &rendered[..split], rendered.len())
+    }
+}
+
+/// Captures bounded prelaunch evidence for the exact Windows argv target.
+///
+/// This report is diagnostic-only: failures are encoded in the returned text
+/// and never widen or replace the executable authority used for the launch.
+#[doc(hidden)]
+#[must_use]
+pub fn windows_argv_target_prelaunch_diagnostic(program: &Path) -> String {
+    const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+    const MAX_DLL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const MAX_DLLS: usize = 128;
+
+    let program_text = bounded_windows_path_debug(program);
+    let result = (|| -> std::io::Result<String> {
+        let metadata = fs::symlink_metadata(program)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_FILE_BYTES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "target is not one bounded direct file",
+            ));
+        }
+        let parent = program
+            .parent()
+            .ok_or_else(|| std::io::Error::other("target has no staged-bin parent"))?;
+        let mut dlls = fs::read_dir(parent)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        dlls.retain(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("dll"))
+        });
+        dlls.sort_by_key(|path| path.file_name().map(OsStr::to_os_string));
+        if dlls.len() > MAX_DLLS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged-bin DLL inventory exceeds its entry bound",
+            ));
+        }
+        let mut total_bytes = 0_u64;
+        let mut dll_evidence = Vec::with_capacity(dlls.len());
+        for dll in dlls {
+            let metadata = fs::symlink_metadata(&dll)?;
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "staged-bin DLL inventory size overflowed",
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_FILE_BYTES
+                || total_bytes > MAX_DLL_BYTES
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "staged-bin DLL inventory is not bounded direct files",
+                ));
+            }
+            dll_evidence.push(format!(
+                "{{name={},bytes={},sha256={}}}",
+                bounded_windows_path_debug(Path::new(
+                    dll.file_name().unwrap_or_else(|| OsStr::new("<missing>"))
+                )),
+                metadata.len(),
+                sha256_file(&dll)?.hex(),
+            ));
+        }
+        Ok(format!(
+            "program={program_text},programBytes={},programSha256={},stagedBin={},dllCount={},dllBytes={total_bytes},dlls=[{}]",
+            metadata.len(),
+            sha256_file(program)?.hex(),
+            bounded_windows_path_debug(parent),
+            dll_evidence.len(),
+            dll_evidence.join(","),
+        ))
+    })();
+    match result {
+        Ok(report) => format!("Windows argv target prelaunch evidence: {report}"),
+        Err(error) => format!(
+            "Windows argv target prelaunch evidence: program={program_text},unavailable={error}"
+        ),
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -519,52 +4434,1831 @@ fn resolve_parent_program(program: &std::ffi::OsStr) -> std::io::Result<PathBuf>
     }
     let search = std::env::var_os("PATH")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is unavailable"))?;
-    for directory in std::env::split_paths(&search) {
-        let candidate = directory.join(path);
-        if candidate.is_file() {
-            return Ok(candidate);
+    #[cfg(windows)]
+    {
+        let extensions = std::env::var_os("PATHEXT")
+            .map(|value| windows_native_executable_extensions(&value))
+            .unwrap_or_else(|| vec![OsString::from(".COM"), OsString::from(".EXE")]);
+        return resolve_windows_parent_program_from(
+            program,
+            &std::env::split_paths(&search).collect::<Vec<_>>(),
+            &extensions,
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        for directory in std::env::split_paths(&search) {
+            let candidate = directory.join(path);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "trusted parent could not resolve child program",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_native_executable_extensions(value: &OsStr) -> Vec<OsString> {
+    value
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| {
+            extension.eq_ignore_ascii_case(".com") || extension.eq_ignore_ascii_case(".exe")
+        })
+        .map(OsString::from)
+        .collect()
+}
+
+/// Resolves a bare Windows program using only ordered native COM/EXE extensions.
+///
+/// # Errors
+///
+/// Returns an error for noncanonical names, nonnative extensions, or when no
+/// regular executable exists beneath an absolute search directory.
+#[doc(hidden)]
+pub fn resolve_windows_parent_program_from(
+    program: &OsStr,
+    search: &[PathBuf],
+    extensions: &[OsString],
+) -> std::io::Result<PathBuf> {
+    let path = Path::new(program);
+    if program.is_empty() || path.is_absolute() || path.components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows program name must be one relative component",
+        ));
+    }
+    if path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_none_or(|stem| !windows_tool_stem_is_canonical(stem))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows program stem is not canonical",
+        ));
+    }
+    let names = if path.extension().is_some() {
+        let native = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("com") || extension.eq_ignore_ascii_case("exe")
+            });
+        if !native {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows program extension is not native",
+            ));
+        }
+        vec![program.to_owned()]
+    } else {
+        extensions
+            .iter()
+            .filter(|extension| {
+                extension.to_str().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case(".com") || extension.eq_ignore_ascii_case(".exe")
+                })
+            })
+            .map(|extension| {
+                let mut name = program.to_owned();
+                name.push(extension);
+                name
+            })
+            .collect::<Vec<_>>()
+    };
+    for directory in search.iter().filter(|directory| directory.is_absolute()) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return fs::canonicalize(candidate);
+            }
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "trusted parent could not resolve child program",
+        "trusted parent could not resolve native Windows child program",
     ))
+}
+
+fn windows_tool_stem_is_canonical(stem: &str) -> bool {
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return false;
+    }
+    let upper = stem.to_ascii_uppercase();
+    let numbered_device = upper.len() == 4
+        && matches!(&upper[..3], "COM" | "LPT")
+        && matches!(upper.as_bytes()[3], b'1'..=b'9');
+    !matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") && !numbered_device
+}
+
+fn resolve_parent_program_for_launch(
+    program: &std::ffi::OsStr,
+    bound_program: Option<&BoundProgramInvocation>,
+) -> std::io::Result<PathBuf> {
+    bound_program.map_or_else(
+        || resolve_parent_program(program),
+        |identity| identity.revalidate(program),
+    )
 }
 
 #[cfg(all(test, unix))]
 mod candidate_launch_policy_tests {
     use super::*;
 
+    fn candidate_identity(name: &str, uid: u32) -> PosixCandidateIdentity {
+        PosixCandidateIdentity::new(name.to_owned(), uid, uid, vec![uid], name.to_owned()).unwrap()
+    }
+
+    fn native_cargo_authority(
+        cargo: &Path,
+        standard_rustup_invocation: &Path,
+    ) -> PosixCargoSourceAuthority {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let cargo = fs::canonicalize(cargo).unwrap();
+        let cargo_metadata = fs::metadata(&cargo).unwrap();
+        let rustup = fs::canonicalize(standard_rustup_invocation).unwrap();
+        let rustup_metadata = fs::metadata(&rustup).unwrap();
+        let rustup_invocation = fs::canonicalize(standard_rustup_invocation.parent().unwrap())
+            .unwrap()
+            .join("rustup");
+        PosixCargoSourceAuthority::Native {
+            cargo: PosixCanonicalExecutableIdentity::new(
+                cargo,
+                cargo_metadata.dev(),
+                cargo_metadata.ino(),
+            ),
+            standard_rustup: PosixStandardExecutableIdentity::new(
+                rustup_invocation,
+                rustup,
+                rustup_metadata.dev(),
+                rustup_metadata.ino(),
+            ),
+        }
+    }
+
+    fn oversized_candidate_groups(primary_gid: u32) -> Vec<u32> {
+        let limit = u32::try_from(POSIX_CANDIDATE_GROUP_LIMIT).unwrap();
+        (0..limit).chain(std::iter::once(primary_gid)).collect()
+    }
+
+    #[test]
+    fn rustup_ancestor_access_uses_only_the_candidate_effective_permission_class() {
+        let candidate_groups = [61_001, 20];
+        assert!(posix_rustup_ancestor_access_is_safe(
+            0o775,
+            501,
+            &candidate_groups
+        ));
+        assert!(!posix_rustup_ancestor_access_is_safe(
+            0o775,
+            20,
+            &candidate_groups
+        ));
+        assert!(posix_rustup_ancestor_access_is_safe(
+            0o750,
+            20,
+            &candidate_groups
+        ));
+        assert!(!posix_rustup_ancestor_access_is_safe(
+            0o750,
+            501,
+            &candidate_groups
+        ));
+        assert!(!posix_rustup_ancestor_access_is_safe(
+            0o777,
+            501,
+            &candidate_groups
+        ));
+        assert!(posix_rustup_ancestor_access_is_safe(
+            0o1777,
+            501,
+            &candidate_groups
+        ));
+        assert!(posix_candidate_group_inventory_is_valid(
+            61_001,
+            &candidate_groups
+        ));
+        assert!(!posix_candidate_group_inventory_is_valid(61_001, &[]));
+        assert!(!posix_candidate_group_inventory_is_valid(
+            61_001,
+            &[20, 701]
+        ));
+        assert!(!posix_candidate_group_inventory_is_valid(
+            61_001,
+            &[61_001, 20, 61_001]
+        ));
+        assert!(!posix_candidate_group_inventory_is_valid(
+            61_001,
+            &oversized_candidate_groups(61_001)
+        ));
+        assert!(!posix_rustup_owner_is_trusted(61_001, 61_001));
+        assert!(posix_rustup_owner_is_trusted(501, 61_001));
+    }
+
+    #[test]
+    fn posix_candidate_identity_rejects_incomplete_or_oversized_groups() {
+        assert!(
+            PosixCandidateIdentity::new(
+                "hellreltest".to_owned(),
+                61_001,
+                61_001,
+                vec![20, 61_001, 701],
+                "hellreltest".to_owned(),
+            )
+            .is_ok()
+        );
+        for groups in [
+            Vec::new(),
+            vec![20, 701],
+            vec![61_001, 20, 61_001],
+            oversized_candidate_groups(61_001),
+        ] {
+            assert!(
+                PosixCandidateIdentity::new(
+                    "hellreltest".to_owned(),
+                    61_001,
+                    61_001,
+                    groups,
+                    "hellreltest".to_owned(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rustup_ancestor_rejection_binds_exact_authority_state() {
+        let identity = PosixRustupEntryIdentity {
+            path: PathBuf::from("/trusted/rustup"),
+            device: 17,
+            inode: 29,
+            links: 1,
+            uid: 501,
+            gid: 20,
+            mode: 0o775,
+            requirement: PosixRustupAccessRequirement::AncestorDirectory,
+        };
+        assert_eq!(
+            posix_rustup_ancestor_rejection(&identity, true, 61_001, &[61_001, 20]),
+            "POSIX Rustup ancestor rejected: path=/trusted/rustup,isDirectory=true,mode=0o0775,ownerUid=501,ownerGid=20,candidateUid=61001,candidateGroups=[61001, 20],accessClass=group,effectiveBits=0o7"
+        );
+    }
+
+    #[test]
+    fn standard_executable_identity_requires_effective_user_execute_access() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-standard-executable-x-ok-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let rustup = root.join("rustup");
+        fs::write(&rustup, b"not executed\n").unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o001)).unwrap();
+        let metadata = fs::metadata(&rustup).unwrap();
+        assert!(
+            BoundPosixStandardExecutableIdentity::new(PosixStandardExecutableIdentity::new(
+                rustup.clone(),
+                rustup,
+                metadata.dev(),
+                metadata.ino(),
+            ))
+            .is_err(),
+            "execute permission for another identity must not replace effective-user X_OK"
+        );
+    }
+
+    struct CargoDenyAuthorityFixture {
+        root: PathBuf,
+        source: PathBuf,
+        staged: PathBuf,
+        cargo_home: PathBuf,
+        cache_entry: PathBuf,
+        advisory_lock: PathBuf,
+        metadata_directory: PathBuf,
+        metadata_path: PathBuf,
+        bound: BoundPosixCargoDenyAuthority,
+    }
+
+    fn cargo_deny_authority_fixture() -> CargoDenyAuthorityFixture {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-cargo-deny-authority-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_root = root.join("source");
+        let staged_root = root.join("staged");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir(&staged_root).unwrap();
+        let source_root = fs::canonicalize(source_root).unwrap();
+        let staged_root = fs::canonicalize(staged_root).unwrap();
+        let source = source_root.join("cargo-deny");
+        let staged = staged_root.join("cargo-deny");
+        let cargo_home = root.join("cargo-deny-cargo-home");
+        fs::create_dir(&cargo_home).unwrap();
+        let cache_entry = cargo_home.join("registry-cache");
+        fs::write(&cache_entry, b"bound cargo cache\n").unwrap();
+        fs::set_permissions(&cache_entry, fs::Permissions::from_mode(0o444)).unwrap();
+        let advisory_root = cargo_home.join("advisory-dbs");
+        fs::create_dir(&advisory_root).unwrap();
+        let advisory_lock = advisory_root.join("db.lock");
+        fs::write(&advisory_lock, b"").unwrap();
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555)).unwrap();
+        for path in [&source, &staged] {
+            fs::write(path, b"pinned cargo-deny\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let metadata_parent = if cfg!(target_os = "macos") {
+            Path::new("/private/var/tmp")
+        } else {
+            Path::new("/var/tmp")
+        };
+        let metadata_directory = metadata_parent.join(format!(
+            "hell-cargo-deny-metadata-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&metadata_directory).unwrap();
+        let metadata_path = metadata_directory.join("metadata.json");
+        fs::write(&metadata_path, b"{\"version\":1}\n").unwrap();
+        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o555)).unwrap();
+        let metadata_file = fs::metadata(&metadata_path).unwrap();
+        let metadata = PosixCargoDenyMetadataAuthority::new(
+            metadata_directory.clone(),
+            metadata_path.clone(),
+            metadata_file.len(),
+            sha256_file(&metadata_path).unwrap(),
+            metadata_file.uid(),
+        );
+        let source_metadata = fs::metadata(&source).unwrap();
+        let cargo_home_metadata = fs::metadata(&cargo_home).unwrap();
+        let digest = sha256_file(&source).unwrap();
+        let authority = PosixCargoDenyAuthority::new(
+            PosixStandardExecutableIdentity::new(
+                source.clone(),
+                source.clone(),
+                source_metadata.dev(),
+                source_metadata.ino(),
+            ),
+            digest,
+            staged.clone(),
+            digest,
+            cargo_home.clone(),
+            metadata,
+            PosixCargoDenyCacheOwnership::new(cargo_home_metadata.uid(), cargo_home_metadata.gid()),
+        );
+        let candidate_group_id = cargo_home_metadata.gid().checked_add(1).unwrap();
+        let bound = BoundPosixCargoDenyAuthority::new_for_fixture(
+            authority.clone(),
+            cargo_home_metadata.uid(),
+            &[candidate_group_id],
+            std::slice::from_ref(&root),
+            candidate_group_id,
+        )
+        .unwrap();
+        assert!(
+            BoundPosixCargoDenyAuthority::new(
+                authority,
+                cargo_home_metadata.uid(),
+                &[cargo_home_metadata.gid()],
+                std::slice::from_ref(&root),
+            )
+            .is_err()
+        );
+
+        CargoDenyAuthorityFixture {
+            root,
+            source,
+            staged,
+            cargo_home,
+            cache_entry,
+            advisory_lock,
+            metadata_directory,
+            metadata_path,
+            bound,
+        }
+    }
+
+    fn cargo_deny_policy(
+        root: &Path,
+        bound: &BoundPosixCargoDenyAuthority,
+    ) -> (CandidateLaunchPolicy, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let standard_rustup = root.join("rustup");
+        symlink("/usr/bin/false", &standard_rustup).unwrap();
+        let native_cargo = fs::canonicalize("/usr/bin/true").unwrap();
+        let mut policy = CandidateLaunchPolicy::posix(
+            native_cargo.clone(),
+            PosixLaunchAuthorities::new(
+                native_cargo.clone(),
+                sha256_file(&native_cargo).unwrap(),
+                native_cargo.clone(),
+                native_cargo.clone(),
+                sha256_file(&native_cargo).unwrap(),
+                native_cargo_authority(&native_cargo, &standard_rustup),
+            ),
+            candidate_identity("hellreldeny", 61_007),
+            vec![root.to_path_buf()],
+        )
+        .unwrap();
+        policy.cargo_deny_authority = Some(bound.clone());
+        (policy, native_cargo)
+    }
+
+    #[test]
+    fn cargo_deny_authority_maps_only_the_exact_bound_source_to_its_staged_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let CargoDenyAuthorityFixture {
+            root,
+            source,
+            staged,
+            cargo_home,
+            cache_entry,
+            advisory_lock,
+            metadata_directory,
+            metadata_path: _,
+            bound,
+        } = cargo_deny_authority_fixture();
+        let advisory_identity = bound
+            .cargo_home_inventory
+            .iter()
+            .find(|entry| entry.relative == Path::new("advisory-dbs/db.lock"))
+            .unwrap();
+        assert!(advisory_identity.sha256.is_none());
+        let immutable_identity = bound
+            .cargo_home_inventory
+            .iter()
+            .find(|entry| entry.relative == Path::new("registry-cache"))
+            .unwrap();
+        assert!(immutable_identity.sha256.is_some());
+        assert!(
+            bound
+                .request_is_bound(OsStr::new("cargo-deny"), &source)
+                .unwrap()
+        );
+        assert!(
+            !bound
+                .request_is_bound(OsStr::new("cargo"), &source)
+                .unwrap()
+        );
+        let forgery_root = root.join("forgery");
+        fs::create_dir(&forgery_root).unwrap();
+        let forgery = forgery_root.join("cargo-deny");
+        fs::write(&forgery, b"pinned cargo-deny\n").unwrap();
+        fs::set_permissions(&forgery, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            bound
+                .request_is_bound(forgery.as_os_str(), &forgery)
+                .is_err()
+        );
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&source, b"source substitution\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&source, b"pinned cargo-deny\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        bound.revalidate().unwrap();
+
+        fs::set_permissions(&cache_entry, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&cache_entry, b"cache substitution\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&cache_entry, b"bound cargo cache\n").unwrap();
+        fs::set_permissions(&cache_entry, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::write(&advisory_lock, b"forged lock contents\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&advisory_lock, b"").unwrap();
+        bound.revalidate().unwrap();
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
+        bound.revalidate().unwrap();
+        let advisory_root = advisory_lock.parent().unwrap();
+        let original_lock = advisory_root.join("original-db.lock");
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&advisory_lock, &original_lock).unwrap();
+        fs::write(&advisory_lock, b"").unwrap();
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&advisory_lock).unwrap();
+        fs::rename(&original_lock, &advisory_lock).unwrap();
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o555)).unwrap();
+        bound.revalidate().unwrap();
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555)).unwrap();
+
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&staged, b"staged substitution\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            advisory_lock.parent().unwrap(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(metadata_directory).unwrap();
+    }
+
+    #[test]
+    fn cargo_deny_metadata_is_injected_and_revalidated_without_overrides() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let CargoDenyAuthorityFixture {
+            root,
+            source,
+            staged,
+            cargo_home,
+            cache_entry: _,
+            advisory_lock,
+            metadata_directory,
+            metadata_path,
+            bound,
+        } = cargo_deny_authority_fixture();
+        let (policy, native_cargo) = cargo_deny_policy(&root, &bound);
+        let mut command = Command::new(&source);
+        command.args(["--frozen", "--all-features", "check", "all"]);
+        command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        policy.wrap(&mut command, None).unwrap();
+        let (environment, program, arguments) = posix_release_child_request(&command);
+        assert_eq!(program, staged);
+        assert_eq!(arguments[0], OsStr::new("--metadata-path"));
+        assert_eq!(arguments[1], metadata_path.as_os_str());
+        assert_eq!(
+            &arguments[2..],
+            ["--frozen", "--all-features", "check", "all"].map(OsString::from)
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("CARGO_HOME"))
+                .map(OsString::as_os_str),
+            Some(bound.cargo_home.as_os_str())
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("PATH"))
+                .and_then(|value| std::env::split_paths(value).next()),
+            native_cargo.parent().map(Path::to_path_buf)
+        );
+        for argument in [
+            OsString::from("--metadata-path"),
+            OsString::from("--metadata-path=forged"),
+        ] {
+            let mut forged = Command::new(&source);
+            forged.arg(argument);
+            forged.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+            assert!(policy.wrap(&mut forged, None).is_err());
+        }
+
+        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&metadata_path, b"{\"version\":2}\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&metadata_path, b"{\"version\":1}\n").unwrap();
+        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o444)).unwrap();
+        bound.revalidate().unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(metadata_directory.join("extra.json"), b"{}\n").unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(metadata_directory.join("extra.json")).unwrap();
+        fs::remove_file(&metadata_path).unwrap();
+        fs::write(&metadata_path, b"{\"version\":1}\n").unwrap();
+        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(bound.revalidate().is_err());
+
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            advisory_lock.parent().unwrap(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(metadata_directory).unwrap();
+    }
+
+    struct StackAuthorityFixture {
+        root: PathBuf,
+        source: PathBuf,
+        staged: PathBuf,
+        stack_root: PathBuf,
+        stack_root_uid: u32,
+        candidate_group_id: u32,
+        authority: PosixStackAuthority,
+        bound: BoundPosixStackAuthority,
+    }
+
+    fn stack_authority_fixture() -> StackAuthorityFixture {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-stack-authority-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_root = root.join("source");
+        let staged_root = root.join("staged");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir(&staged_root).unwrap();
+        let source_root = fs::canonicalize(source_root).unwrap();
+        let staged_root = fs::canonicalize(staged_root).unwrap();
+        let source = source_root.join("stack");
+        let staged = staged_root.join("stack");
+        let stack_root = root.join("stack-root");
+        fs::create_dir(&stack_root).unwrap();
+        fs::set_permissions(&stack_root, fs::Permissions::from_mode(0o750)).unwrap();
+        let stack_root = fs::canonicalize(stack_root).unwrap();
+        for path in [&source, &staged] {
+            fs::write(path, b"pinned stack\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let source_metadata = fs::metadata(&source).unwrap();
+        let stack_root_metadata = fs::metadata(&stack_root).unwrap();
+        let candidate_group_id = stack_root_metadata.gid().checked_add(1).unwrap();
+        let digest = sha256_file(&source).unwrap();
+        let authority = PosixStackAuthority::new(
+            PosixStandardExecutableIdentity::new(
+                source.clone(),
+                source.clone(),
+                source_metadata.dev(),
+                source_metadata.ino(),
+            ),
+            digest,
+            staged.clone(),
+            digest,
+            stack_root.clone(),
+            stack_root_metadata.gid(),
+        );
+        let bound = BoundPosixStackAuthority::new(
+            authority.clone(),
+            stack_root_metadata.uid(),
+            &[candidate_group_id],
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert!(
+            BoundPosixStackAuthority::new(
+                authority.clone(),
+                stack_root_metadata.uid(),
+                &[stack_root_metadata.gid()],
+                std::slice::from_ref(&root),
+            )
+            .is_err()
+        );
+        let initial_forgery = stack_root.join("preexisting-state");
+        fs::write(&initial_forgery, b"unexpected\n").unwrap();
+        assert!(
+            BoundPosixStackAuthority::new(
+                authority.clone(),
+                stack_root_metadata.uid(),
+                &[candidate_group_id],
+                std::slice::from_ref(&root),
+            )
+            .is_err()
+        );
+        fs::remove_file(initial_forgery).unwrap();
+        StackAuthorityFixture {
+            root,
+            source,
+            staged,
+            stack_root,
+            stack_root_uid: stack_root_metadata.uid(),
+            candidate_group_id,
+            authority,
+            bound,
+        }
+    }
+
+    fn assert_stack_argument_forgeries_rejected(
+        policy: &CandidateLaunchPolicy,
+        source: &Path,
+        root: &Path,
+    ) {
+        for arguments in [
+            vec![OsString::from("--stack-root"), root.as_os_str().into()],
+            vec![OsString::from("--stack-root=/unbound")],
+            vec![OsString::from("--work-dir"), root.as_os_str().into()],
+            vec![OsString::from("--work-dir=/unbound")],
+        ] {
+            let mut forged = Command::new(source);
+            forged
+                .args(arguments)
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+            assert!(policy.wrap(&mut forged, None).is_err());
+        }
+    }
+
+    #[test]
+    fn stack_work_authority_binds_relative_path_and_revalidates_every_directory() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-stack-work-authority-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let source = root.join("oracle");
+        fs::create_dir(&source).unwrap();
+        let work = source.join(".stack-work");
+        fs::create_dir(&work).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o750)).unwrap();
+        let work_metadata = fs::metadata(&work).unwrap();
+        let candidate_uid = work_metadata.uid();
+        let bound = BoundPosixStackWorkAuthority::new(
+            &source,
+            &work,
+            candidate_uid,
+            &[work_metadata.gid().checked_add(1).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(bound.relative, PathBuf::from(".stack-work"));
+        assert_eq!(
+            posix_stack_arguments(
+                vec![OsString::from("build")],
+                Some(Path::new("/bound/stack-root")),
+                Some(&bound.relative),
+            )
+            .unwrap(),
+            [
+                OsString::from("--stack-root"),
+                OsString::from("/bound/stack-root"),
+                OsString::from("--work-dir"),
+                OsString::from(".stack-work"),
+                OsString::from("build"),
+            ]
+        );
+        for arguments in [
+            vec![
+                OsString::from("--work-dir"),
+                bound.relative.clone().into_os_string(),
+            ],
+            vec![OsString::from("--work-dir=.stack-work")],
+        ] {
+            assert!(
+                posix_stack_arguments(
+                    arguments,
+                    Some(Path::new("/bound/stack-root")),
+                    Some(&bound.relative),
+                )
+                .is_err()
+            );
+        }
+        let escaped_source = root.parent().unwrap().join(format!(
+            "hell-stack-work-escaped-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&escaped_source).unwrap();
+        let escaped_source = fs::canonicalize(escaped_source).unwrap();
+        assert!(
+            BoundPosixStackWorkAuthority::new(
+                &escaped_source,
+                &work,
+                candidate_uid,
+                &[work_metadata.gid().checked_add(1).unwrap()],
+            )
+            .is_err()
+        );
+        let replacement = source.join("replacement-stack-work");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::remove_dir(&work).unwrap();
+        fs::rename(replacement, &work).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir(escaped_source).unwrap();
+    }
+
+    #[test]
+    fn stack_authority_maps_only_the_exact_bound_source_to_its_staged_copy() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let StackAuthorityFixture {
+            root,
+            source,
+            staged,
+            stack_root,
+            stack_root_uid,
+            candidate_group_id,
+            authority,
+            bound,
+        } = stack_authority_fixture();
+        assert!(
+            bound
+                .request_is_bound(OsStr::new("stack"), &source)
+                .unwrap()
+        );
+        assert!(
+            !bound
+                .request_is_bound(OsStr::new("cargo"), &source)
+                .unwrap()
+        );
+
+        let forgery = root.join("stack");
+        fs::write(&forgery, b"pinned stack\n").unwrap();
+        fs::set_permissions(&forgery, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            bound
+                .request_is_bound(forgery.as_os_str(), &forgery)
+                .is_err()
+        );
+
+        let standard_rustup = root.join("rustup");
+        symlink("/usr/bin/false", &standard_rustup).unwrap();
+        let native_cargo = fs::canonicalize("/usr/bin/true").unwrap();
+        let policy = CandidateLaunchPolicy::posix(
+            native_cargo.clone(),
+            PosixLaunchAuthorities::new(
+                native_cargo.clone(),
+                sha256_file(&native_cargo).unwrap(),
+                native_cargo.clone(),
+                native_cargo.clone(),
+                sha256_file(&native_cargo).unwrap(),
+                native_cargo_authority(&native_cargo, &standard_rustup),
+            )
+            .stack(authority),
+            PosixCandidateIdentity::new(
+                "hellrelstack".to_owned(),
+                stack_root_uid,
+                candidate_group_id,
+                vec![candidate_group_id],
+                "hellrelstack".to_owned(),
+            )
+            .unwrap(),
+            vec![root.clone()],
+        )
+        .unwrap();
+        assert_stack_argument_forgeries_rejected(&policy, &source, &root);
+        let mut command = Command::new(&source);
+        command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        policy.wrap(&mut command, None).unwrap();
+        let (_, program, arguments) = posix_release_child_request(&command);
+        assert_eq!(program, staged);
+        assert_eq!(
+            arguments,
+            [
+                OsString::from("--stack-root"),
+                stack_root.clone().into_os_string(),
+            ]
+        );
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&source, b"source substitution\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&source, b"pinned stack\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        bound.revalidate().unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&staged, b"staged substitution\n").unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::write(&staged, b"pinned stack\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o555)).unwrap();
+        bound.revalidate().unwrap();
+        fs::set_permissions(&bound.stack_root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::set_permissions(&bound.stack_root, fs::Permissions::from_mode(0o750)).unwrap();
+        let replacement_root = root.join("replacement-stack-root");
+        fs::create_dir(&replacement_root).unwrap();
+        fs::set_permissions(&replacement_root, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::remove_dir(&bound.stack_root).unwrap();
+        fs::rename(replacement_root, &bound.stack_root).unwrap();
+        assert!(bound.revalidate().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rustup_proxy_identity_separates_logical_aliases_from_the_multicall_target() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-rustup-proxy-aliases-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("cargo-path")).unwrap();
+        fs::create_dir(root.join("standard-path")).unwrap();
+        let target = root.join("multicall-engine");
+        let replacement = root.join("replacement-engine");
+        let cargo_invocation = root.join("cargo-path/cargo");
+        let rustup_invocation = root.join("standard-path/rustup");
+        for executable in [&target, &replacement] {
+            fs::write(executable, b"multicall executable\n").unwrap();
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        symlink(&target, &cargo_invocation).unwrap();
+        symlink(&target, &rustup_invocation).unwrap();
+        let canonical_target = fs::canonicalize(&target).unwrap();
+        let metadata = fs::metadata(&canonical_target).unwrap();
+        let identity = PosixRustupProxyIdentity::new(
+            fs::canonicalize(root.join("cargo-path"))
+                .unwrap()
+                .join("cargo"),
+            canonical_target.clone(),
+            fs::canonicalize(root.join("standard-path"))
+                .unwrap()
+                .join("rustup"),
+            canonical_target,
+            metadata.dev(),
+            metadata.ino(),
+        );
+        validate_posix_rustup_proxy_identity(&identity, 61_001, &[61_001]).unwrap();
+
+        let mut forged_name = identity.clone();
+        forged_name.cargo_invocation = root.join("cargo-path/not-cargo");
+        symlink(&target, &forged_name.cargo_invocation).unwrap();
+        assert!(validate_posix_rustup_proxy_identity(&forged_name, 61_001, &[61_001]).is_err());
+
+        fs::remove_file(&cargo_invocation).unwrap();
+        symlink(&replacement, &cargo_invocation).unwrap();
+        assert!(
+            validate_posix_rustup_proxy_identity(&identity, 61_001, &[61_001]).is_err(),
+            "a same-byte replacement behind the logical Cargo alias must fail"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn rustup_authority_fixture(root: &Path) -> (PosixRustupAuthority, PathBuf) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let source_home = root.join("source-rustup-home");
+        let home = root.join("rustup-home");
+        let toolchain = OsString::from("1.97.1-test-x86_64-unknown-linux-gnu");
+        for rustup_home in [&source_home, &home] {
+            let toolchains = rustup_home.join("toolchains");
+            let update_hashes = rustup_home.join("update-hashes");
+            let toolchain_root = toolchains.join(&toolchain);
+            let bin = toolchain_root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let settings = rustup_home.join("settings.toml");
+            fs::write(&settings, b"default_toolchain = none\n").unwrap();
+            fs::create_dir_all(&update_hashes).unwrap();
+            fs::write(update_hashes.join(&toolchain), b"test update hash\n").unwrap();
+            for executable in [bin.join("cargo"), bin.join("rustc")] {
+                fs::write(&executable, b"trusted toolchain executable\n").unwrap();
+                fs::set_permissions(executable, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            for directory in [
+                rustup_home.as_path(),
+                toolchains.as_path(),
+                update_hashes.as_path(),
+                toolchain_root.as_path(),
+                bin.as_path(),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::set_permissions(
+                update_hashes.join(&toolchain),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let source_home = fs::canonicalize(source_home).unwrap();
+        let canonical_root = fs::canonicalize(root).unwrap();
+        let cargo_proxy = fs::canonicalize(root.join("cargo")).unwrap();
+        let rustup = fs::canonicalize(root.join("rustup")).unwrap();
+        let rustc_invocation = canonical_root.join("rustc");
+        if !rustc_invocation.exists() {
+            fs::hard_link(&rustup, &rustc_invocation).unwrap();
+        }
+        let rustc = fs::canonicalize(&rustc_invocation).unwrap();
+        let metadata = fs::metadata(&cargo_proxy).unwrap();
+        let rustc_metadata = fs::metadata(&rustc).unwrap();
+        let source_rustc = source_home
+            .join("toolchains")
+            .join(&toolchain)
+            .join("bin/rustc");
+        let staged_rustc = home.join("toolchains").join(&toolchain).join("bin/rustc");
+        (
+            PosixRustupAuthority::new(
+                PosixRustupProxyIdentity::new(
+                    canonical_root.join("cargo"),
+                    cargo_proxy,
+                    canonical_root.join("rustup"),
+                    rustup,
+                    metadata.dev(),
+                    metadata.ino(),
+                ),
+                PosixRustcAuthority::RustupProxy(PosixStandardExecutableIdentity::new(
+                    rustc_invocation,
+                    rustc,
+                    rustc_metadata.dev(),
+                    rustc_metadata.ino(),
+                )),
+                source_home,
+                home,
+                toolchain,
+                PosixRustupCompilerMapping::new(
+                    source_rustc.clone(),
+                    sha256_file(&source_rustc).unwrap(),
+                    staged_rustc.clone(),
+                    sha256_file(&staged_rustc).unwrap(),
+                ),
+            ),
+            fs::canonicalize(root.join("rustup-home/settings.toml")).unwrap(),
+        )
+    }
+
+    fn assert_same_bytes_native_cargo_is_not_a_rustup_proxy(
+        root: &Path,
+        staged: &Path,
+        rustup_authority: &PosixRustupAuthority,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let native_directory = root.join("native");
+        fs::create_dir(&native_directory).unwrap();
+        let native_cargo = native_directory.join("cargo");
+        let native_rustup = native_directory.join("rustup");
+        for path in [&native_cargo, &native_rustup] {
+            fs::write(path, b"same native bytes\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert!(!same_executable_file(&native_cargo, &native_rustup).unwrap());
+        let launcher = fs::canonicalize("/usr/bin/true").unwrap();
+        CandidateLaunchPolicy::posix(
+            launcher.clone(),
+            PosixLaunchAuthorities::new(
+                launcher.clone(),
+                sha256_file(&launcher).unwrap(),
+                fs::canonicalize(&native_cargo).unwrap(),
+                staged.to_path_buf(),
+                sha256_file(staged).unwrap(),
+                native_cargo_authority(&native_cargo, &native_rustup),
+            ),
+            candidate_identity("hellrelnative", 61_003),
+            vec![std::env::temp_dir()],
+        )
+        .unwrap();
+        let policy = CandidateLaunchPolicy::posix(
+            launcher.clone(),
+            PosixLaunchAuthorities::new(
+                launcher.clone(),
+                sha256_file(&launcher).unwrap(),
+                fs::canonicalize(&native_cargo).unwrap(),
+                staged.to_path_buf(),
+                sha256_file(staged).unwrap(),
+                PosixCargoSourceAuthority::Rustup(Box::new(rustup_authority.clone())),
+            ),
+            candidate_identity("hellrelnative", 61_003),
+            vec![std::env::temp_dir()],
+        );
+        assert!(
+            policy.is_err(),
+            "same-byte native Cargo must reject an unrelated Rustup proxy authority"
+        );
+    }
+
+    fn assert_rustup_proxy_requires_authority(cargo: &Path, rustup: &Path, staged: &Path) {
+        let launcher = fs::canonicalize("/usr/bin/true").unwrap();
+        let policy = CandidateLaunchPolicy::posix(
+            launcher.clone(),
+            PosixLaunchAuthorities::new(
+                launcher.clone(),
+                sha256_file(&launcher).unwrap(),
+                cargo.to_path_buf(),
+                staged.to_path_buf(),
+                sha256_file(staged).unwrap(),
+                native_cargo_authority(cargo, rustup),
+            ),
+            candidate_identity("hellrelalias", 61_002),
+            vec![std::env::temp_dir()],
+        );
+        assert!(policy.is_err());
+    }
+
+    fn assert_proxy_replacement_is_rejected(
+        policy: &CandidateLaunchPolicy,
+        invocation: &Path,
+        identity: &BoundProgramInvocation,
+        cargo: &Path,
+        rustup: &Path,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::remove_file(rustup).unwrap();
+        fs::write(rustup, b"multicall executable\n").unwrap();
+        fs::set_permissions(rustup, fs::Permissions::from_mode(0o555)).unwrap();
+        let mut replaced_proxy = Command::new(invocation);
+        assert!(
+            policy.wrap(&mut replaced_proxy, Some(identity)).is_err(),
+            "same-byte Rustup replacement must fail the bound same-file identity"
+        );
+        fs::remove_file(rustup).unwrap();
+        fs::hard_link(cargo, rustup).unwrap();
+    }
+
+    fn posix_release_child_request(
+        command: &Command,
+    ) -> (BTreeMap<OsString, OsString>, OsString, Vec<OsString>) {
+        assert!(command.get_envs().next().is_none());
+        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(arguments[0], "-n");
+        assert_eq!(arguments[1], "-u");
+        assert_eq!(arguments[3], "--");
+        assert_eq!(arguments[5], POSIX_RELEASE_CHILD_REQUEST_V1);
+        let count = arguments[6].to_str().unwrap().parse::<usize>().unwrap();
+        let pairs_end = 7 + count * 2;
+        let mut environment = BTreeMap::new();
+        for pair in arguments[7..pairs_end].chunks_exact(2) {
+            assert!(
+                environment
+                    .insert(pair[0].clone(), pair[1].clone())
+                    .is_none()
+            );
+        }
+        (
+            environment,
+            arguments[pairs_end].clone(),
+            arguments[pairs_end + 1..].to_vec(),
+        )
+    }
+
+    fn assert_rustup_authority_environment(command: &Command, expected_home: &Path) {
+        let (environment, _, _) = posix_release_child_request(command);
+        assert_eq!(
+            environment.get(OsStr::new("RUSTUP_HOME")),
+            Some(&expected_home.as_os_str().to_os_string())
+        );
+        assert_eq!(
+            environment.get(OsStr::new("RUSTUP_TOOLCHAIN")),
+            Some(&OsString::from("1.97.1-test-x86_64-unknown-linux-gnu"))
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("PATH"))
+                .and_then(|value| std::env::split_paths(value).next()),
+            Some(expected_home.join("toolchains/1.97.1-test-x86_64-unknown-linux-gnu/bin"))
+        );
+    }
+
     #[test]
     fn posix_wrapper_uses_fixed_preservation_contract_and_trusted_adapter() {
         let launcher = fs::canonicalize("/usr/bin/true").unwrap();
-        let adapter = std::env::current_exe().unwrap();
+        let adapter = launcher.clone();
+        let authority_root = std::env::temp_dir().join(format!(
+            "hell-native-cargo-authority-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&authority_root).unwrap();
+        let standard_rustup = authority_root.join("rustup");
+        std::os::unix::fs::symlink("/usr/bin/false", &standard_rustup).unwrap();
         let policy = CandidateLaunchPolicy::posix(
             launcher.clone(),
-            adapter.clone(),
-            "hellreltest".to_owned(),
-            61_001,
-            "hellreltest".to_owned(),
+            PosixLaunchAuthorities::new(
+                adapter.clone(),
+                sha256_file(&adapter).unwrap(),
+                adapter.clone(),
+                adapter.clone(),
+                sha256_file(&adapter).unwrap(),
+                native_cargo_authority(&adapter, &standard_rustup),
+            ),
+            candidate_identity("hellreltest", 61_001),
             vec![std::env::temp_dir()],
         )
         .unwrap();
         let mut command = Command::new("/usr/bin/true");
         command.env_clear().env("HOME", "/isolated/home");
-        policy.wrap(&mut command).unwrap();
+        policy.wrap(&mut command, None).unwrap();
         assert_eq!(command.get_program(), launcher);
         let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(arguments[0], "-n");
-        assert_eq!(arguments[1], POSIX_RELEASE_CHILD_PRESERVE_ENVIRONMENT);
-        assert_eq!(arguments[2], "-u");
-        assert_eq!(arguments[3], "hellreltest");
-        assert_eq!(arguments[4], "--");
-        assert_eq!(arguments[5], adapter);
-        assert_eq!(arguments[6], "__release-posix-child");
-        assert_eq!(arguments[7], "/usr/bin/true");
-        assert!(
-            command.get_envs().any(|(name, value)| name == "HOME"
-                && value == Some(std::ffi::OsStr::new("/isolated/home")))
+        assert_eq!(arguments[2], "hellreltest");
+        assert_eq!(arguments[4], adapter);
+        let (environment, program, child_arguments) = posix_release_child_request(&command);
+        assert_eq!(
+            environment.get(OsStr::new("HOME")),
+            Some(&OsString::from("/isolated/home"))
         );
+        assert_eq!(program, "/usr/bin/true");
+        assert!(child_arguments.is_empty());
+    }
+
+    #[test]
+    fn posix_adapter_identity_rejects_permissions_path_and_digest_substitution() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-posix-adapter-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let adapter = root.join("hell-ci");
+        let alias = root.join("alias");
+        let substitution = root.join("other");
+        fs::write(&adapter, b"trusted-adapter\n").unwrap();
+        fs::write(&substitution, b"other-adapter\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&substitution, fs::Permissions::from_mode(0o555)).unwrap();
+        symlink(&adapter, &alias).unwrap();
+        let canonical = fs::canonicalize(&adapter).unwrap();
+        let other = fs::canonicalize(&substitution).unwrap();
+        let digest = sha256_file(&canonical).unwrap();
+        let mut identity = posix_adapter_identity(&canonical).unwrap();
+        verify_posix_adapter_identity(&canonical, &canonical, digest, &identity).unwrap();
+        assert!(verify_posix_adapter_identity(&alias, &canonical, digest, &identity).is_err());
+        assert!(verify_posix_adapter_identity(&canonical, &other, digest, &identity).is_err());
+        assert!(
+            verify_posix_adapter_identity(&canonical, &canonical, Digest::default(), &identity)
+                .is_err()
+        );
+        let same_bytes = root.join("same-bytes");
+        fs::write(&same_bytes, b"trusted-adapter\n").unwrap();
+        fs::set_permissions(&same_bytes, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::rename(&same_bytes, &adapter).unwrap();
+        assert!(verify_posix_adapter_identity(&canonical, &canonical, digest, &identity).is_err());
+        identity = posix_adapter_identity(&canonical).unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(verify_posix_adapter_identity(&canonical, &canonical, digest, &identity).is_err());
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o550)).unwrap();
+        assert!(verify_posix_adapter_identity(&canonical, &canonical, digest, &identity).is_err());
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&adapter, b"mutated-adapter\n").unwrap();
+        assert!(verify_posix_adapter_identity(&canonical, &canonical, digest, &identity).is_err());
+        fs::write(&adapter, b"trusted-adapter\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o555)).unwrap();
+        let parent_identity = posix_adapter_identity(&canonical).unwrap();
+        let replaced_parent = root.with_extension("replaced-parent");
+        let _ = fs::remove_dir_all(&replaced_parent);
+        fs::rename(&root, &replaced_parent).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(&adapter, b"trusted-adapter\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            verify_posix_adapter_identity(&canonical, &canonical, digest, &parent_identity)
+                .is_err(),
+            "same-path same-byte replacement of the adapter parent must fail closed"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(fs::remove_file(&adapter).is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(replaced_parent).unwrap();
+    }
+
+    #[test]
+    fn uid_sweep_accepts_only_exact_empty_selection_or_zombie_rows() {
+        for quiescent in [
+            b"".as_slice(),
+            b"   \n".as_slice(),
+            b" 123 Z\n".as_slice(),
+            b" 123 Z+\n 456 Zs\n".as_slice(),
+        ] {
+            assert!(uid_process_snapshot_is_quiescent(Some(0), quiescent, b""));
+        }
+        assert!(uid_process_snapshot_is_quiescent(Some(1), b"", b""));
+        for retained in [
+            b" 123 R\n".as_slice(),
+            b" 123 S+\n".as_slice(),
+            b" 123 D\n".as_slice(),
+            b" 123 T\n".as_slice(),
+            b" 123\n".as_slice(),
+            b" Z\n".as_slice(),
+            b" 0 Z\n".as_slice(),
+            b" 123 Z?\n".as_slice(),
+            b" 123 Z unexpected\n".as_slice(),
+        ] {
+            assert!(!uid_process_snapshot_is_quiescent(Some(0), retained, b""));
+        }
+        for (status, stdout, stderr) in [
+            (Some(1), b" \n".as_slice(), b"".as_slice()),
+            (Some(1), b"".as_slice(), b"ps error\n".as_slice()),
+            (Some(2), b"".as_slice(), b"".as_slice()),
+            (None, b"".as_slice(), b"".as_slice()),
+            (Some(0), b"".as_slice(), b"ps warning\n".as_slice()),
+        ] {
+            assert!(!uid_process_snapshot_is_quiescent(status, stdout, stderr));
+        }
+    }
+
+    #[test]
+    fn windows_launcher_identity_rejects_omission_path_and_digest_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "hell-windows-launcher-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let launcher = root.join("hell-ci.exe");
+        let adapter = root.join("hell-test-helper.exe");
+        let substitution = root.join("other.exe");
+        fs::write(&launcher, b"trusted-launcher\n").unwrap();
+        fs::write(&adapter, b"trusted-adapter\n").unwrap();
+        fs::write(&substitution, b"other-launcher\n").unwrap();
+        let canonical = fs::canonicalize(&launcher).unwrap();
+        let canonical_adapter = fs::canonicalize(&adapter).unwrap();
+        let other = fs::canonicalize(&substitution).unwrap();
+        let digest = sha256_file(&canonical).unwrap();
+        let adapter_digest = sha256_file(&canonical_adapter).unwrap();
+        verify_windows_launcher_identity(&launcher, &canonical, digest).unwrap();
+        assert!(verify_windows_launcher_identity(&launcher, &other, digest).is_err());
+        assert!(
+            verify_windows_launcher_identity(&launcher, &canonical, Digest::default()).is_err()
+        );
+        fs::write(&launcher, b"mutated-launcher\n").unwrap();
+        assert!(verify_windows_launcher_identity(&launcher, &canonical, digest).is_err());
+        verify_windows_restricted_adapter_identity(&adapter, &canonical_adapter, adapter_digest)
+            .unwrap();
+        assert!(
+            verify_windows_restricted_adapter_identity(&adapter, &other, adapter_digest).is_err()
+        );
+        assert!(
+            verify_windows_restricted_adapter_identity(
+                &adapter,
+                &canonical_adapter,
+                Digest::default()
+            )
+            .is_err()
+        );
+        assert!(
+            verify_windows_restricted_adapter_identity(&substitution, &other, adapter_digest)
+                .is_err()
+        );
+        fs::write(&adapter, b"mutated-adapter\n").unwrap();
+        assert!(
+            verify_windows_restricted_adapter_identity(
+                &adapter,
+                &canonical_adapter,
+                adapter_digest
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_restricted_request_binds_exact_adapter_path_digest_and_target_argv() {
+        let adapter = Path::new("/trusted/hell-test-helper.exe");
+        let digest = Digest([0x5a; 32]);
+        let target = vec![
+            OsString::from("C:\\trusted\\cargo.exe"),
+            OsString::from("test"),
+        ];
+        assert_eq!(
+            windows_restricted_launch_request(adapter, digest, &target),
+            vec![
+                adapter.as_os_str().to_owned(),
+                OsString::from(digest.hex()),
+                target[0].clone(),
+                target[1].clone(),
+            ]
+        );
+    }
+
+    fn assert_rustup_tree_substitution_rejected(
+        policy: &CandidateLaunchPolicy,
+        invocation: &Path,
+        identity: &BoundProgramInvocation,
+        rustup_home: &Path,
+    ) {
+        let rustup_bin = rustup_home
+            .join("toolchains")
+            .join("1.97.1-test-x86_64-unknown-linux-gnu")
+            .join("bin");
+        let added_entry = rustup_bin.join("added-after-bind");
+        fs::write(&added_entry, b"inventory substitution\n").unwrap();
+        let mut expanded_rustup = Command::new(invocation);
+        assert!(
+            policy.wrap(&mut expanded_rustup, Some(identity)).is_err(),
+            "an added Rustup entry must fail the closed inventory before spawn"
+        );
+        fs::remove_file(&added_entry).unwrap();
+        let hard_link = rustup_bin.join("hard-linked-rustc");
+        fs::hard_link(rustup_bin.join("rustc"), &hard_link).unwrap();
+        let mut hard_linked_rustup = Command::new(invocation);
+        assert!(
+            policy
+                .wrap(&mut hard_linked_rustup, Some(identity))
+                .is_err(),
+            "a multiply-linked Rustup file must fail before spawn"
+        );
+        fs::remove_file(&hard_link).unwrap();
+    }
+
+    fn assert_cargo_source_classification(
+        root: &Path,
+        cargo: &Path,
+        staged_cargo: &Path,
+        rustup_authority: &PosixRustupAuthority,
+        unrelated_rustc: &Path,
+    ) {
+        assert_rustup_proxy_requires_authority(
+            cargo,
+            &fs::canonicalize(root).unwrap().join("rustup"),
+            staged_cargo,
+        );
+        assert_same_bytes_native_cargo_is_not_a_rustup_proxy(root, staged_cargo, rustup_authority);
+        let mut wrong_mapping = rustup_authority.clone();
+        wrong_mapping.compiler_mapping.staged = fs::canonicalize(unrelated_rustc).unwrap();
+        wrong_mapping.compiler_mapping.staged_sha256 = sha256_file(unrelated_rustc).unwrap();
+        let launcher = fs::canonicalize("/usr/bin/true").unwrap();
+        assert!(
+            CandidateLaunchPolicy::posix(
+                launcher.clone(),
+                PosixLaunchAuthorities::new(
+                    launcher.clone(),
+                    sha256_file(&launcher).unwrap(),
+                    cargo.to_path_buf(),
+                    staged_cargo.to_path_buf(),
+                    sha256_file(staged_cargo).unwrap(),
+                    PosixCargoSourceAuthority::Rustup(Box::new(wrong_mapping)),
+                ),
+                candidate_identity("hellrelwrongmap", 61_004),
+                vec![std::env::temp_dir()],
+            )
+            .is_err(),
+            "a same-byte compiler outside the selected staged toolchain must be rejected"
+        );
+    }
+
+    fn assert_bound_rustc_mapping_and_substitutions(
+        policy: &CandidateLaunchPolicy,
+        rustc_invocation: &Path,
+        rustc_identity: &BoundProgramInvocation,
+        unrelated_rustc: &Path,
+        source_rustc: &Path,
+        staged_rustc: &Path,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut rustc_command = Command::new(rustc_invocation);
+        rustc_command.args(["--version", "--verbose"]);
+        policy
+            .wrap(&mut rustc_command, Some(rustc_identity))
+            .unwrap();
+        let (environment, program, arguments) = posix_release_child_request(&rustc_command);
+        assert_eq!(program, staged_rustc);
+        assert_eq!(arguments, ["--version", "--verbose"]);
+        assert!(!environment.contains_key(OsStr::new("RUSTUP_HOME")));
+        assert!(
+            policy
+                .cargo_authority
+                .rustup()
+                .unwrap()
+                .request_is_bound_rustc(OsStr::new("rustc"), unrelated_rustc)
+                .is_err(),
+            "a changed standard PATH rustc identity must fail instead of falling back"
+        );
+        let unrelated_canonical = fs::canonicalize(unrelated_rustc).unwrap();
+        let unrelated_identity =
+            BoundProgramInvocation::new(unrelated_canonical.clone(), unrelated_canonical.clone())
+                .unwrap();
+        let mut unrelated_command = Command::new(&unrelated_canonical);
+        assert!(
+            policy
+                .wrap(&mut unrelated_command, Some(&unrelated_identity))
+                .is_err(),
+            "an absolute rustc path outside the exact standard authority must fail"
+        );
+
+        for (path, replacement, message) in [
+            (
+                staged_rustc,
+                b"substituted staged compiler\n".as_slice(),
+                "a substituted staged compiler must fail before spawn",
+            ),
+            (
+                source_rustc,
+                b"substituted source compiler\n".as_slice(),
+                "a substituted source compiler must fail before spawn",
+            ),
+        ] {
+            let original = fs::read(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(path, replacement).unwrap();
+            let mut substituted = Command::new(rustc_invocation);
+            assert!(
+                policy.wrap(&mut substituted, Some(rustc_identity)).is_err(),
+                "{message}"
+            );
+            fs::write(path, original).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_selected_toolchain_rustc_authority(
+        cargo: &Path,
+        staged_cargo: &Path,
+        rustup_authority: &PosixRustupAuthority,
+        unrelated_rustc: &Path,
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let source_rustc = rustup_authority.compiler_mapping.source.clone();
+        let staged_rustc = rustup_authority.compiler_mapping.staged.clone();
+        let source_metadata = fs::metadata(&source_rustc).unwrap();
+        let source_identity = PosixStandardExecutableIdentity::new(
+            source_rustc.clone(),
+            source_rustc.clone(),
+            source_metadata.dev(),
+            source_metadata.ino(),
+        );
+        let launcher = fs::canonicalize("/usr/bin/true").unwrap();
+        let build_policy = |authority: PosixRustupAuthority, account: &str, uid| {
+            CandidateLaunchPolicy::posix(
+                launcher.clone(),
+                PosixLaunchAuthorities::new(
+                    launcher.clone(),
+                    sha256_file(&launcher).unwrap(),
+                    cargo.to_path_buf(),
+                    staged_cargo.to_path_buf(),
+                    sha256_file(staged_cargo).unwrap(),
+                    PosixCargoSourceAuthority::Rustup(Box::new(authority)),
+                ),
+                candidate_identity(account, uid),
+                vec![std::env::temp_dir()],
+            )
+        };
+
+        let mut selected = rustup_authority.clone();
+        selected.rustc_authority = PosixRustcAuthority::SelectedToolchain(source_identity.clone());
+        let selected_policy = build_policy(selected, "hellrelselected", 61_005).unwrap();
+        let selected_invocation = BoundProgramInvocation::new(
+            source_rustc.clone(),
+            fs::canonicalize(&source_rustc).unwrap(),
+        )
+        .unwrap();
+        let mut command = Command::new(&source_rustc);
+        command.args(["--version", "--verbose"]);
+        selected_policy
+            .wrap(&mut command, Some(&selected_invocation))
+            .unwrap();
+        let (environment, program, arguments) = posix_release_child_request(&command);
+        assert_eq!(program, staged_rustc);
+        assert_eq!(arguments, ["--version", "--verbose"]);
+        assert!(!environment.contains_key(OsStr::new("RUSTUP_HOME")));
+
+        let unrelated_metadata = fs::metadata(unrelated_rustc).unwrap();
+        let unrelated_identity = PosixStandardExecutableIdentity::new(
+            unrelated_rustc.to_path_buf(),
+            fs::canonicalize(unrelated_rustc).unwrap(),
+            unrelated_metadata.dev(),
+            unrelated_metadata.ino(),
+        );
+        let mut forged_selected = rustup_authority.clone();
+        forged_selected.rustc_authority =
+            PosixRustcAuthority::SelectedToolchain(unrelated_identity);
+        assert!(
+            build_policy(forged_selected, "hellrelforgedselected", 61_006).is_err(),
+            "a same-byte compiler outside the selected toolchain must not mint authority"
+        );
+
+        let mut forged_proxy = rustup_authority.clone();
+        forged_proxy.rustc_authority = PosixRustcAuthority::RustupProxy(source_identity);
+        assert!(
+            build_policy(forged_proxy, "hellrelforgedproxy", 61_007).is_err(),
+            "the selected compiler must not be mislabeled as the Rustup proxy"
+        );
+    }
+
+    fn assert_bound_cargo_substitutions(
+        policy: &CandidateLaunchPolicy,
+        invocation: &Path,
+        identity: &BoundProgramInvocation,
+        alias: &Path,
+        target: &Path,
+        staged: &Path,
+        rustup_settings: &Path,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert!(
+            resolve_parent_program_for_launch(target.as_os_str(), Some(identity)).is_err(),
+            "a bound canonical target must not replace its logical alias"
+        );
+        assert_rustup_tree_substitution_rejected(
+            policy,
+            invocation,
+            identity,
+            rustup_settings.parent().unwrap(),
+        );
+        fs::set_permissions(rustup_settings, fs::Permissions::from_mode(0o666)).unwrap();
+        let mut substituted_rustup = Command::new(invocation);
+        assert!(
+            policy
+                .wrap(&mut substituted_rustup, Some(identity))
+                .is_err(),
+            "a writable or substituted Rustup authority must fail closed before spawn"
+        );
+        fs::set_permissions(rustup_settings, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_proxy_replacement_is_rejected(policy, invocation, identity, alias, target);
+        fs::set_permissions(staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(staged, b"staged substitution\n").unwrap();
+        let mut substituted_staging = Command::new(invocation);
+        assert!(
+            policy
+                .wrap(&mut substituted_staging, Some(identity))
+                .is_err(),
+            "a staged Cargo file identity or digest substitution must fail closed"
+        );
+        fs::remove_file(alias).unwrap();
+        fs::write(alias, b"multicall executable\n").unwrap();
+        fs::set_permissions(alias, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            resolve_parent_program_for_launch(invocation.as_os_str(), Some(identity)).is_err(),
+            "a same-byte replacement at the bound alias path must fail by file identity"
+        );
+    }
+
+    #[test]
+    fn bound_multicall_program_uses_only_its_verified_staged_alias() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = PathBuf::from("/tmp").join(format!(
+            "hell-bound-multicall-program-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let target = root.join("rustup");
+        let alias = root.join("cargo");
+        let staged = root.join("staged-cargo");
+        fs::write(&target, b"multicall executable\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        fs::write(&staged, b"staged multicall executable\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o555)).unwrap();
+        let invocation = fs::canonicalize(&root).unwrap().join("cargo");
+        let canonical_target = fs::canonicalize(&alias).unwrap();
+        let canonical_staged = fs::canonicalize(&staged).unwrap();
+        let (rustup_authority, rustup_settings) = rustup_authority_fixture(&root);
+        let expected_rustup_home = fs::canonicalize(root.join("rustup-home")).unwrap();
+        let source_rustc = rustup_authority.compiler_mapping.source.clone();
+        let staged_rustc = rustup_authority.compiler_mapping.staged.clone();
+        let rustc_invocation = fs::canonicalize(&root).unwrap().join("rustc");
+        let rustc_identity = BoundProgramInvocation::new(
+            rustc_invocation.clone(),
+            fs::canonicalize(&rustc_invocation).unwrap(),
+        )
+        .unwrap();
+        let identity =
+            BoundProgramInvocation::new(invocation.clone(), canonical_target.clone()).unwrap();
+        let unrelated_rustc = root.join("unrelated").join("rustc");
+        fs::create_dir(unrelated_rustc.parent().unwrap()).unwrap();
+        fs::write(&unrelated_rustc, fs::read(&staged_rustc).unwrap()).unwrap();
+        fs::set_permissions(&unrelated_rustc, fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(
+            resolve_parent_program_for_launch(invocation.as_os_str(), Some(&identity)).unwrap(),
+            invocation
+        );
+        assert_eq!(
+            resolve_parent_program_for_launch(alias.as_os_str(), None).unwrap(),
+            canonical_target
+        );
+        assert_cargo_source_classification(
+            &root,
+            &canonical_target,
+            &canonical_staged,
+            &rustup_authority,
+            &unrelated_rustc,
+        );
+        assert_selected_toolchain_rustc_authority(
+            &canonical_target,
+            &canonical_staged,
+            &rustup_authority,
+            &unrelated_rustc,
+        );
+        let policy = CandidateLaunchPolicy::posix(
+            fs::canonicalize("/usr/bin/true").unwrap(),
+            PosixLaunchAuthorities::new(
+                fs::canonicalize("/usr/bin/true").unwrap(),
+                sha256_file(&fs::canonicalize("/usr/bin/true").unwrap()).unwrap(),
+                canonical_target.clone(),
+                canonical_staged.clone(),
+                sha256_file(&canonical_staged).unwrap(),
+                PosixCargoSourceAuthority::Rustup(Box::new(rustup_authority)),
+            ),
+            candidate_identity("hellrelalias", 61_002),
+            vec![std::env::temp_dir()],
+        )
+        .unwrap();
+        let mut command = Command::new(&invocation);
+        command
+            .arg("--version")
+            .env("RUSTUP_HOME", "/candidate-controlled")
+            .env("RUSTUP_TOOLCHAIN", "candidate-controlled");
+        policy.wrap(&mut command, Some(&identity)).unwrap();
+        let (_, program, child_arguments) = posix_release_child_request(&command);
+        assert_eq!(program, canonical_staged);
+        assert_eq!(child_arguments, [OsString::from("--version")]);
+        assert_rustup_authority_environment(&command, &expected_rustup_home);
+        assert_bound_rustc_mapping_and_substitutions(
+            &policy,
+            &rustc_invocation,
+            &rustc_identity,
+            &unrelated_rustc,
+            &source_rustc,
+            &staged_rustc,
+        );
+        assert_bound_cargo_substitutions(
+            &policy,
+            &invocation,
+            &identity,
+            &alias,
+            &target,
+            &staged,
+            &rustup_settings,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_invocation_tests {
+    use super::*;
+
+    fn identity(path: PathBuf) -> ExecutableIdentity {
+        ExecutableIdentity {
+            sha256: sha256_file(&path).unwrap(),
+            path,
+            reported_version: "fixture-version".into(),
+            build_info: None,
+            role: ExecutableRole::Oracle,
+            assurance_epoch_sha256: Some(sha256_bytes(b"fixture-epoch")),
+            acquisition_receipt_id: Some("fixture-receipt".into()),
+            acquisition_receipt_sha256: Some(sha256_bytes(b"fixture-receipt")),
+            acquisition_attestation_sha256: Some(sha256_bytes(b"fixture-attestation")),
+        }
+    }
+
+    #[test]
+    fn exact_execution_alias_binds_name_file_identity_and_source_provenance() {
+        let root =
+            std::env::temp_dir().join(format!("hell-executable-invocation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let current = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let source_path = root.join("linux-release-oracle");
+        let execution_path = root.join(format!("hell{}", std::env::consts::EXE_SUFFIX));
+        fs::hard_link(&current, &source_path).unwrap();
+        fs::hard_link(&source_path, &execution_path).unwrap();
+        let source = identity(source_path.canonicalize().unwrap());
+        let mut execution = source.clone();
+        execution.path = execution_path.canonicalize().unwrap();
+        let authority = ExecutableInvocationAuthority::exact_hell(&source, &execution).unwrap();
+        assert_eq!(authority.source(), &source);
+        assert_eq!(authority.execution(), &execution);
+        let guard = ExecutableIntegrityGuard::new(&authority).unwrap();
+        assert_eq!(guard.execution_identity(), &execution);
+        guard.require_unchanged().unwrap();
+
+        let wrong_name_path = root.join("other-oracle");
+        fs::hard_link(&source.path, &wrong_name_path).unwrap();
+        let mut wrong_name = source.clone();
+        wrong_name.path = wrong_name_path.canonicalize().unwrap();
+        assert!(ExecutableInvocationAuthority::exact_hell(&source, &wrong_name).is_err());
+
+        let copied_root = root.join("copied");
+        fs::create_dir(&copied_root).unwrap();
+        let copied_path = copied_root.join(format!("hell{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(&source.path, &copied_path).unwrap();
+        let mut copied = source.clone();
+        copied.path = copied_path.canonicalize().unwrap();
+        assert!(ExecutableInvocationAuthority::exact_hell(&source, &copied).is_err());
+
+        let mut forged_provenance = execution.clone();
+        forged_provenance.acquisition_receipt_sha256 = Some(sha256_bytes(b"forged"));
+        assert!(ExecutableInvocationAuthority::exact_hell(&source, &forged_provenance).is_err());
+
+        fs::remove_file(&execution.path).unwrap();
+        fs::hard_link(&copied.path, &execution.path).unwrap();
+        assert!(guard.require_unchanged().is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -983,6 +6677,7 @@ pub struct NormalizerAuditRecord {
 pub struct RetainedNormalizerInput<'a> {
     pub normalizer: NormalizerId,
     pub observation: &'a [u8],
+    pub executable: &'a Path,
     pub sandbox: &'a Path,
     pub script: &'a Path,
 }
@@ -1342,6 +7037,340 @@ pub fn bind_process_helper_directory(
     Ok(digest)
 }
 
+#[cfg(unix)]
+const CARGO_PROBE_RECORD_MAGIC: &[u8] = b"hell-cargo-probe-v1\0";
+#[cfg(unix)]
+const CARGO_PROBE_ARGUMENT_LIMIT: usize = 128;
+#[cfg(unix)]
+const CARGO_PROBE_ARGUMENT_BYTE_LIMIT: usize = 8 * 1024;
+#[cfg(unix)]
+const CARGO_PROBE_INVOCATION_BYTE_LIMIT: usize = 64 * 1024;
+#[cfg(unix)]
+const CARGO_PROBE_RECORD_LIMIT: usize = 64;
+#[cfg(unix)]
+const CARGO_PROBE_LOG_BYTE_LIMIT: u64 = 64 * 1024 * 64;
+
+/// Returns the bounded sibling log used by the compiled Cargo probe fixture.
+#[cfg(unix)]
+#[doc(hidden)]
+#[must_use]
+pub fn cargo_probe_log_path(helper: &Path) -> PathBuf {
+    helper.with_extension("cargo-probe-v1.log")
+}
+
+#[cfg(unix)]
+fn encode_cargo_probe_invocation(arguments: &[std::ffi::OsString]) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if arguments.len() > CARGO_PROBE_ARGUMENT_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Cargo probe argv exceeds its argument bound",
+        ));
+    }
+    let mut record = Vec::with_capacity(CARGO_PROBE_RECORD_MAGIC.len() + 4);
+    record.extend_from_slice(CARGO_PROBE_RECORD_MAGIC);
+    record.extend_from_slice(
+        &u32::try_from(arguments.len())
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cargo probe argv count is unrepresentable",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    for argument in arguments {
+        let bytes = argument.as_os_str().as_bytes();
+        if bytes.len() > CARGO_PROBE_ARGUMENT_BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cargo probe argument exceeds its byte bound",
+            ));
+        }
+        record.extend_from_slice(
+            &u32::try_from(bytes.len())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Cargo probe argument length is unrepresentable",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        record.extend_from_slice(bytes);
+        if record.len() > CARGO_PROBE_INVOCATION_BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cargo probe argv exceeds its invocation byte bound",
+            ));
+        }
+    }
+    Ok(record)
+}
+
+#[cfg(unix)]
+fn require_cargo_probe_log_handle(
+    log: &Path,
+    file: &fs::File,
+    expected_length: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path_metadata = fs::symlink_metadata(log)?;
+    let opened_metadata = file.metadata()?;
+    if !path_metadata.is_file()
+        || path_metadata.file_type().is_symlink()
+        || path_metadata.nlink() != 1
+        || opened_metadata.nlink() != 1
+        || opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+        || opened_metadata.len() != expected_length
+        || path_metadata.len() != expected_length
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log path and opened identity differ",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_cargo_probe_log_for_append(log: &Path, record_length: usize) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let record_length = u64::try_from(record_length).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Cargo probe record length is unrepresentable",
+        )
+    })?;
+    match fs::symlink_metadata(log) {
+        Ok(path_metadata) => {
+            if !path_metadata.is_file()
+                || path_metadata.file_type().is_symlink()
+                || path_metadata.nlink() != 1
+                || path_metadata
+                    .len()
+                    .checked_add(record_length)
+                    .is_none_or(|length| length > CARGO_PROBE_LOG_BYTE_LIMIT)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Cargo probe log identity or size differs from policy",
+                ));
+            }
+            let file = fs::OpenOptions::new().append(true).open(log)?;
+            require_cargo_probe_log_handle(log, &file, path_metadata.len())?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(log)?;
+            require_cargo_probe_log_handle(log, &file, 0)?;
+            Ok(file)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Appends one exact argv record for the compiled Cargo probe fixture.
+///
+/// # Errors
+///
+/// Returns an error when the argv or existing log exceeds its closed bounds,
+/// contains an unrepresentable field length, or cannot be appended.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn append_cargo_probe_invocation(
+    helper: &Path,
+    arguments: &[std::ffi::OsString],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let record = encode_cargo_probe_invocation(arguments)?;
+    let log = cargo_probe_log_path(helper);
+    let mut file = open_cargo_probe_log_for_append(&log, record.len())?;
+    file.write_all(&record)?;
+    let final_length = file.metadata()?.len();
+    if final_length > CARGO_PROBE_LOG_BYTE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log exceeds its byte bound after append",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn take_cargo_probe_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> std::io::Result<&'a [u8]> {
+    let end = cursor.checked_add(length).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe record offset overflowed",
+        )
+    })?;
+    let value = bytes.get(*cursor..end).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe record is truncated",
+        )
+    })?;
+    *cursor = end;
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn take_cargo_probe_u32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u32> {
+    let field = take_cargo_probe_bytes(bytes, cursor, std::mem::size_of::<u32>())?;
+    Ok(u32::from_le_bytes(
+        field.try_into().expect("exact u32 byte count"),
+    ))
+}
+
+#[cfg(unix)]
+fn read_cargo_probe_log(helper: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let log = cargo_probe_log_path(helper);
+    let path_metadata = fs::symlink_metadata(&log)?;
+    if !path_metadata.is_file()
+        || path_metadata.file_type().is_symlink()
+        || path_metadata.nlink() != 1
+        || path_metadata.len() > CARGO_PROBE_LOG_BYTE_LIMIT
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log identity or size differs from policy",
+        ));
+    }
+    let file = fs::File::open(&log)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.nlink() != 1
+        || opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+        || opened_metadata.len() != path_metadata.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log changed while it was opened",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(CARGO_PROBE_LOG_BYTE_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    let bytes_len = u64::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log length is unrepresentable",
+        )
+    })?;
+    if bytes_len > CARGO_PROBE_LOG_BYTE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log grew beyond its byte bound",
+        ));
+    }
+    let final_metadata = fs::symlink_metadata(&log)?;
+    if final_metadata.file_type().is_symlink()
+        || final_metadata.dev() != opened_metadata.dev()
+        || final_metadata.ino() != opened_metadata.ino()
+        || final_metadata.len() != bytes_len
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo probe log changed while it was read",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn decode_cargo_probe_invocations(bytes: &[u8]) -> std::io::Result<Vec<Vec<std::ffi::OsString>>> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut cursor = 0_usize;
+    let mut records = Vec::new();
+    while cursor < bytes.len() {
+        let record_start = cursor;
+        if records.len() >= CARGO_PROBE_RECORD_LIMIT
+            || take_cargo_probe_bytes(bytes, &mut cursor, CARGO_PROBE_RECORD_MAGIC.len())?
+                != CARGO_PROBE_RECORD_MAGIC
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo probe log has an unknown or excessive record",
+            ));
+        }
+        let argument_count =
+            usize::try_from(take_cargo_probe_u32(bytes, &mut cursor)?).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Cargo probe argv count is unrepresentable",
+                )
+            })?;
+        if argument_count > CARGO_PROBE_ARGUMENT_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo probe argv exceeds its argument bound",
+            ));
+        }
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            let length =
+                usize::try_from(take_cargo_probe_u32(bytes, &mut cursor)?).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Cargo probe argument length is unrepresentable",
+                    )
+                })?;
+            if length > CARGO_PROBE_ARGUMENT_BYTE_LIMIT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Cargo probe argument exceeds its byte bound",
+                ));
+            }
+            arguments.push(std::ffi::OsString::from_vec(
+                take_cargo_probe_bytes(bytes, &mut cursor, length)?.to_vec(),
+            ));
+        }
+        if cursor
+            .checked_sub(record_start)
+            .is_none_or(|length| length > CARGO_PROBE_INVOCATION_BYTE_LIMIT)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo probe record exceeds its invocation byte bound",
+            ));
+        }
+        records.push(arguments);
+    }
+    Ok(records)
+}
+
+/// Reads the exact bounded argv records emitted by the compiled Cargo probe.
+///
+/// # Errors
+///
+/// Returns an error when the log is redirected, oversized, truncated, has an
+/// unknown schema, or contains a field outside the closed bounds.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn read_cargo_probe_invocations(
+    helper: &Path,
+) -> std::io::Result<Vec<Vec<std::ffi::OsString>>> {
+    decode_cargo_probe_invocations(&read_cargo_probe_log(helper)?)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DifferentialMode {
     Check,
@@ -1443,6 +7472,98 @@ pub struct ExecutableIdentity {
     pub acquisition_receipt_id: Option<Arc<str>>,
     pub acquisition_receipt_sha256: Option<Digest>,
     pub acquisition_attestation_sha256: Option<Digest>,
+}
+
+/// Separately binds an executable's source provenance and the exact path used
+/// as its process invocation identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutableInvocationAuthority {
+    source: ExecutableIdentity,
+    execution: ExecutableIdentity,
+}
+
+impl ExecutableInvocationAuthority {
+    /// Binds a direct invocation whose source and execution paths are equal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the identity is canonical and unchanged.
+    pub fn direct(identity: &ExecutableIdentity) -> std::io::Result<Self> {
+        Self::new(identity, identity, None)
+    }
+
+    /// Binds an invocation named exactly `hell` (`hell.exe` on Windows) to a
+    /// separately retained source identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both identities are canonical, claim the same
+    /// executable bytes and provenance, and name the same underlying file.
+    pub fn exact_hell(
+        source: &ExecutableIdentity,
+        execution: &ExecutableIdentity,
+    ) -> std::io::Result<Self> {
+        let expected = OsString::from(format!("hell{}", std::env::consts::EXE_SUFFIX));
+        Self::new(source, execution, Some(&expected))
+    }
+
+    fn new(
+        source: &ExecutableIdentity,
+        execution: &ExecutableIdentity,
+        exact_name: Option<&OsStr>,
+    ) -> std::io::Result<Self> {
+        if fs::canonicalize(&source.path)? != source.path
+            || fs::canonicalize(&execution.path)? != execution.path
+            || exact_name.is_some_and(|name| execution.path.file_name() != Some(name))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "executable invocation path is not canonical or exactly named",
+            ));
+        }
+        let mut expected_execution = source.clone();
+        expected_execution.path.clone_from(&execution.path);
+        if *execution != expected_execution
+            || sha256_file(&source.path)? != source.sha256
+            || sha256_file(&execution.path)? != execution.sha256
+            || !same_executable_file(&source.path, &execution.path)?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "executable invocation differs from its source authority",
+            ));
+        }
+        Ok(Self {
+            source: source.clone(),
+            execution: execution.clone(),
+        })
+    }
+
+    /// Returns the separately retained source identity.
+    #[must_use]
+    pub fn source(&self) -> &ExecutableIdentity {
+        &self.source
+    }
+
+    /// Returns the exact identity and basename used at process spawn.
+    #[must_use]
+    pub fn execution(&self) -> &ExecutableIdentity {
+        &self.execution
+    }
+}
+
+#[cfg(unix)]
+fn same_executable_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left = fs::metadata(left)?;
+    let right = fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_executable_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    Ok(left == right)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2933,7 +9054,7 @@ fn applied_claim_normalizers(case: &DifferentialCase) -> Vec<NormalizerId> {
 pub fn apply_retained_normalizer_twice(input: RetainedNormalizerInput<'_>) -> NormalizerPasses {
     let apply = |observation: &[u8]| match input.normalizer {
         NormalizerId::DiagnosticSandboxPathV1 => {
-            diagnostic_sandbox_path_v1(observation, input.sandbox, input.script)
+            diagnostic_sandbox_path_v1(observation, input.executable, input.sandbox, input.script)
         }
         NormalizerId::DiagnosticPathSeparatorV1 => {
             let mut normalized = observation.to_vec();
@@ -2977,6 +9098,152 @@ pub enum DifferentialComparisonProjection {
         oracle_bytes: u64,
         candidate_bytes: u64,
     },
+    ReviewedRuntimeFailureExceptionStderr {
+        exception_family: RuntimeFailureExceptionFamily,
+        payload_sha256: Digest,
+        oracle_sha256: Digest,
+        candidate_sha256: Digest,
+        oracle_bytes: u64,
+        candidate_bytes: u64,
+    },
+    ReviewedWindowsPresentation {
+        platform: ClaimPlatform,
+        field: WindowsPresentationField,
+        oracle_sha256: Digest,
+        candidate_sha256: Digest,
+        oracle_bytes: u64,
+        candidate_bytes: u64,
+    },
+}
+
+/// The exact upstream exception wrapper admitted by one reviewed failure case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFailureExceptionFamily {
+    UnicodeException,
+    IOException,
+    ErrorCall,
+}
+
+impl RuntimeFailureExceptionFamily {
+    #[must_use]
+    pub const fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::UnicodeException => "unicode-exception",
+            Self::IOException => "io-exception",
+            Self::ErrorCall => "error-call",
+        }
+    }
+}
+
+/// Exact stage at which a reviewed runtime-failure stderr projection was
+/// rejected. This is diagnostic evidence only; it does not authorize a
+/// projection or alter the comparison result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFailureProjectionRejectionReason {
+    DescriptorTable,
+    ObservationAuthority,
+    MissingOracleStderr,
+    MissingCandidateStderr,
+    MissingCandidateSemantic,
+    OracleParserStage,
+    OracleExceptionFamily,
+    OraclePayloadHandlingMissing,
+    OraclePayloadHandlingMismatch,
+    OraclePayloadUnexpectedHandling,
+    OraclePayloadEmpty,
+    OraclePayloadMultiline,
+    OraclePayloadControl,
+    OracleFrameGrammar,
+    OracleFrameTerminalNewline,
+    OracleFrameCount,
+    OracleFrameFunction,
+    OracleFrameOrigin,
+    CandidateLegacyParser,
+    CandidatePayload,
+    CandidateFrame,
+    PayloadMismatch,
+    SemanticTarget,
+    SemanticCausality,
+}
+
+impl RuntimeFailureProjectionRejectionReason {
+    #[must_use]
+    pub const fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::DescriptorTable => "descriptor-table",
+            Self::ObservationAuthority => "observation-authority",
+            Self::MissingOracleStderr => "missing-oracle-stderr",
+            Self::MissingCandidateStderr => "missing-candidate-stderr",
+            Self::MissingCandidateSemantic => "missing-candidate-semantic",
+            Self::OracleParserStage => "oracle-parser-stage",
+            Self::OracleExceptionFamily => "oracle-exception-family",
+            Self::OraclePayloadHandlingMissing => "oracle-payload-handling-missing",
+            Self::OraclePayloadHandlingMismatch => "oracle-payload-handling-mismatch",
+            Self::OraclePayloadUnexpectedHandling => "oracle-payload-unexpected-handling",
+            Self::OraclePayloadEmpty => "oracle-payload-empty",
+            Self::OraclePayloadMultiline => "oracle-payload-multiline",
+            Self::OraclePayloadControl => "oracle-payload-control",
+            Self::OracleFrameGrammar => "oracle-frame-grammar",
+            Self::OracleFrameTerminalNewline => "oracle-frame-terminal-newline",
+            Self::OracleFrameCount => "oracle-frame-count",
+            Self::OracleFrameFunction => "oracle-frame-function",
+            Self::OracleFrameOrigin => "oracle-frame-origin",
+            Self::CandidateLegacyParser => "candidate-legacy-parser",
+            Self::CandidatePayload => "candidate-payload",
+            Self::CandidateFrame => "candidate-frame",
+            Self::PayloadMismatch => "payload-mismatch",
+            Self::SemanticTarget => "semantic-target",
+            Self::SemanticCausality => "semantic-causality",
+        }
+    }
+}
+
+/// Bounded, non-secret diagnostic evidence for one rejected exact-table
+/// runtime-failure projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFailureProjectionRejection {
+    pub reason: RuntimeFailureProjectionRejectionReason,
+    pub exception_family: RuntimeFailureExceptionFamily,
+    pub descriptor_builtin: &'static str,
+    pub descriptor_dimension: CompatibilityDimension,
+    pub descriptor_obligation: &'static str,
+    pub oracle_stderr_sha256: Digest,
+    pub oracle_stderr_bytes: u64,
+    pub candidate_stderr_sha256: Digest,
+    pub candidate_stderr_bytes: u64,
+    pub semantic_present: bool,
+    pub typed_result_sha256_present: bool,
+    pub typed_result_builtin_present: bool,
+    pub semantic_coverage_count: usize,
+    pub obligation_event_count: usize,
+    pub causal_order_count: usize,
+    pub force_event_count: usize,
+    pub effect_event_count: usize,
+    pub task_event_count: usize,
+    pub resource_event_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeFailurePresentationAuthority {
+    pub family: RuntimeFailureExceptionFamily,
+    pub builtin: BuiltinId,
+    pub builtin_name: &'static str,
+    pub dimension: CompatibilityDimension,
+    pub obligation: &'static str,
+    pub allow_while_handling: bool,
+    oracle_frame_functions: &'static [&'static str],
+    candidate_frame_functions: &'static [&'static str],
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeFailurePresentationSpec {
+    family: RuntimeFailureExceptionFamily,
+    builtin: &'static str,
+    dimension: CompatibilityDimension,
+    obligation: &'static str,
+    allow_while_handling: bool,
+    oracle_frame_functions: &'static [&'static str],
+    candidate_frame_functions: &'static [&'static str],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3525,11 +9792,15 @@ pub fn representative_differential_sample(
 }
 
 struct ExecutableIntegrityGuard {
-    original: ExecutableIdentity,
+    authority: ExecutableInvocationAuthority,
     #[cfg(unix)]
-    handle: fs::File,
+    source_handle: fs::File,
     #[cfg(unix)]
-    original_identity: UnixExecutableIdentity,
+    execution_handle: fs::File,
+    #[cfg(unix)]
+    source_identity: UnixExecutableIdentity,
+    #[cfg(unix)]
+    execution_identity: UnixExecutableIdentity,
 }
 
 #[cfg(unix)]
@@ -3546,89 +9817,118 @@ struct UnixExecutableIdentity {
 }
 
 impl ExecutableIntegrityGuard {
-    fn new(identity: &ExecutableIdentity) -> Result<Self, String> {
-        let canonical = fs::canonicalize(&identity.path)
-            .map_err(|error| format!("cannot canonicalize bound executable: {error}"))?;
-        if canonical != identity.path {
-            return Err("bound executable identity path is not canonical".to_owned());
-        }
-        let observed = sha256_file(&identity.path)
-            .map_err(|error| format!("cannot hash bound executable: {error}"))?;
-        if observed != identity.sha256 {
-            return Err("bound executable digest differs before batch".to_owned());
-        }
+    fn new(authority: &ExecutableInvocationAuthority) -> Result<Self, String> {
+        let authority = authority.clone();
+        require_executable_invocation_paths(&authority)?;
         #[cfg(unix)]
         {
-            let handle = fs::File::open(&identity.path)
-                .map_err(|error| format!("cannot retain bound executable handle: {error}"))?;
-            let retained_identity =
-                unix_executable_identity(&handle.metadata().map_err(|error| {
-                    format!("cannot inspect retained executable handle: {error}")
+            let source_handle = fs::File::open(&authority.source.path)
+                .map_err(|error| format!("cannot retain source executable handle: {error}"))?;
+            let execution_handle = fs::File::open(&authority.execution.path)
+                .map_err(|error| format!("cannot retain execution alias handle: {error}"))?;
+            let source_identity =
+                unix_executable_identity(&source_handle.metadata().map_err(|error| {
+                    format!("cannot inspect source executable handle: {error}")
                 })?)?;
-            let original_identity = unix_executable_identity(
-                &fs::metadata(&identity.path)
-                    .map_err(|error| format!("cannot inspect bound executable path: {error}"))?,
+            let execution_identity = unix_executable_identity(
+                &execution_handle
+                    .metadata()
+                    .map_err(|error| format!("cannot inspect execution alias handle: {error}"))?,
             )?;
-            if retained_identity != original_identity {
-                return Err("bound executable path differs from retained handle".to_owned());
+            if source_identity != execution_identity {
+                return Err("execution alias does not name the source executable".to_owned());
             }
             Ok(Self {
-                original: identity.clone(),
-                handle,
-                original_identity,
+                authority,
+                source_handle,
+                execution_handle,
+                source_identity,
+                execution_identity,
             })
         }
         #[cfg(not(unix))]
         {
-            Ok(Self {
-                original: identity.clone(),
-            })
+            Ok(Self { authority })
         }
     }
 
     fn execution_identity(&self) -> &ExecutableIdentity {
-        &self.original
+        if diagnostic_program_mutant_active()
+            && self.authority.source.role == ExecutableRole::Oracle
+            && self.authority.source.path != self.authority.execution.path
+        {
+            &self.authority.source
+        } else {
+            &self.authority.execution
+        }
     }
 
     fn require_unchanged(&self) -> Result<(), String> {
+        require_executable_invocation_paths(&self.authority)?;
         #[cfg(unix)]
         {
-            let retained =
-                unix_executable_identity(&self.handle.metadata().map_err(|error| {
-                    format!("cannot recheck retained executable handle: {error}")
-                })?)?;
-            let canonical = fs::canonicalize(&self.original.path)
-                .map_err(|error| format!("cannot recanonicalize bound executable: {error}"))?;
-            let current = unix_executable_identity(
-                &fs::metadata(&canonical)
-                    .map_err(|error| format!("cannot recheck bound executable path: {error}"))?,
+            let retained_source = unix_executable_identity(
+                &self
+                    .source_handle
+                    .metadata()
+                    .map_err(|error| format!("cannot recheck source handle: {error}"))?,
             )?;
-            if canonical != self.original.path
-                || current != self.original_identity
-                || retained != self.original_identity
+            let retained_execution = unix_executable_identity(
+                &self
+                    .execution_handle
+                    .metadata()
+                    .map_err(|error| format!("cannot recheck execution handle: {error}"))?,
+            )?;
+            let current_source = unix_executable_identity(
+                &fs::metadata(&self.authority.source.path)
+                    .map_err(|error| format!("cannot recheck source executable: {error}"))?,
+            )?;
+            let current_execution = unix_executable_identity(
+                &fs::metadata(&self.authority.execution.path)
+                    .map_err(|error| format!("cannot recheck execution alias: {error}"))?,
+            )?;
+            if current_source != self.source_identity
+                || current_execution != self.execution_identity
+                || retained_source != self.source_identity
+                || retained_execution != self.execution_identity
             {
-                return Err("bound executable identity changed during batch".to_owned());
+                return Err("bound source or execution identity changed during batch".to_owned());
             }
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            let original = sha256_file(&self.original.path)
-                .map_err(|error| format!("cannot rehash original executable: {error}"))?;
-            (original == self.original.sha256)
-                .then_some(())
-                .ok_or_else(|| "bound executable digest changed during batch".to_owned())
+            Ok(())
         }
     }
 
     fn finish(&self) -> Result<(), String> {
         self.require_unchanged()?;
-        let original = sha256_file(&self.original.path)
-            .map_err(|error| format!("cannot hash original executable after batch: {error}"))?;
-        (original == self.original.sha256)
+        let source = sha256_file(&self.authority.source.path)
+            .map_err(|error| format!("cannot hash source executable after batch: {error}"))?;
+        let execution = sha256_file(&self.authority.execution.path)
+            .map_err(|error| format!("cannot hash execution alias after batch: {error}"))?;
+        (source == self.authority.source.sha256 && execution == self.authority.execution.sha256)
             .then_some(())
-            .ok_or_else(|| "bound executable digest changed during batch".to_owned())
+            .ok_or_else(|| "bound source or execution digest changed during batch".to_owned())
     }
+}
+
+fn require_executable_invocation_paths(
+    authority: &ExecutableInvocationAuthority,
+) -> Result<(), String> {
+    let source = fs::canonicalize(&authority.source.path)
+        .map_err(|error| format!("cannot canonicalize source executable: {error}"))?;
+    let execution = fs::canonicalize(&authority.execution.path)
+        .map_err(|error| format!("cannot canonicalize execution alias: {error}"))?;
+    if source != authority.source.path
+        || execution != authority.execution.path
+        || !same_executable_file(&source, &execution)
+            .map_err(|error| format!("cannot compare source and execution identity: {error}"))?
+    {
+        return Err("bound source or execution path identity changed".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3660,6 +9960,35 @@ fn unix_executable_identity(metadata: &fs::Metadata) -> Result<UnixExecutableIde
 pub fn differential_batch_with_identities(
     oracle: &ExecutableIdentity,
     candidate: &ExecutableIdentity,
+    cases: &[DifferentialCase],
+    worker_count: usize,
+) -> Result<DifferentialBatchReport, Box<DifferentialBatchFailure>> {
+    let started = Instant::now();
+    let oracle = ExecutableInvocationAuthority::direct(oracle).map_err(|error| {
+        Box::new(DifferentialBatchFailure::configuration(
+            format!("cannot bind direct oracle invocation: {error}"),
+            started.elapsed(),
+        ))
+    })?;
+    let candidate = ExecutableInvocationAuthority::direct(candidate).map_err(|error| {
+        Box::new(DifferentialBatchFailure::configuration(
+            format!("cannot bind direct candidate invocation: {error}"),
+            started.elapsed(),
+        ))
+    })?;
+    differential_batch_with_invocations(&oracle, &candidate, cases, worker_count)
+}
+
+/// Runs every differential case with separately bound source and process
+/// invocation identities.
+///
+/// # Errors
+///
+/// Returns an identity/configuration failure or the lowest authoritative case
+/// failure after all workers have joined.
+pub fn differential_batch_with_invocations(
+    oracle: &ExecutableInvocationAuthority,
+    candidate: &ExecutableInvocationAuthority,
     cases: &[DifferentialCase],
     worker_count: usize,
 ) -> Result<DifferentialBatchReport, Box<DifferentialBatchFailure>> {
@@ -3881,8 +10210,8 @@ fn run_guarded_differential_case(
     oracle.require_unchanged()?;
     candidate.require_unchanged()?;
     outcome.map(|mut timed| {
-        timed.report.oracle.identity = oracle.original.clone();
-        timed.report.candidate.identity = candidate.original.clone();
+        timed.report.oracle.identity = oracle.authority.execution.clone();
+        timed.report.candidate.identity = candidate.authority.execution.clone();
         timed
     })
 }
@@ -4051,8 +10380,13 @@ pub fn verify_compat_tracing_candidate_identity(
             "candidate build info reports compat tracing disabled",
         ));
     }
+    if path_has_lexical_dot_component(&identity.path) {
+        return Err(std::io::Error::other(
+            "candidate identity path is not lexically canonical",
+        ));
+    }
     let canonical = fs::canonicalize(&identity.path)?;
-    if canonical != identity.path {
+    if canonical.as_os_str() != identity.path.as_os_str() {
         return Err(std::io::Error::other(
             "candidate identity path is not canonical",
         ));
@@ -4066,6 +10400,14 @@ pub fn verify_compat_tracing_candidate_identity(
         )));
     }
     Ok(())
+}
+
+fn path_has_lexical_dot_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::CurDir | std::path::Component::ParentDir => true,
+        std::path::Component::Normal(name) => name == OsStr::new(".") || name == OsStr::new(".."),
+        std::path::Component::Prefix(_) | std::path::Component::RootDir => false,
+    })
 }
 
 #[must_use]
@@ -4125,8 +10467,29 @@ pub fn compare_case_observations(
 ) -> (DifferentialComparisonProjection, Vec<DifferentialMismatch>) {
     let mut mismatches = compare(oracle, candidate);
     let projection = reviewed_runtime_failure_stderr_projection(case, oracle, candidate);
-    if projection.is_some() {
-        mismatches.retain(|mismatch| mismatch.kind != MismatchKind::Stderr);
+    #[cfg(windows)]
+    let projection = windows_presentation::reviewed_windows_presentation_projection(
+        ClaimPlatform::Windows,
+        case,
+        oracle,
+        candidate,
+        &mismatches,
+    )
+    .or(projection);
+    if let Some(projected) = &projection {
+        let field = match projected {
+            DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+            | DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. } => {
+                Some(MismatchKind::Stderr)
+            }
+            DifferentialComparisonProjection::ReviewedWindowsPresentation { field, .. } => {
+                Some(field.mismatch_kind())
+            }
+            DifferentialComparisonProjection::Exact => None,
+        };
+        if let Some(field) = field {
+            mismatches.retain(|mismatch| mismatch.kind != field);
+        }
     }
     (
         projection.unwrap_or(DifferentialComparisonProjection::Exact),
@@ -4134,11 +10497,202 @@ pub fn compare_case_observations(
     )
 }
 
-pub(crate) fn reviewed_runtime_failure_stderr_builtin(
+fn runtime_failure_presentation_spec(id: &str) -> Option<RuntimeFailurePresentationSpec> {
+    use CompatibilityDimension::Effects;
+    use RuntimeFailureExceptionFamily::{ErrorCall, IOException, UnicodeException};
+    let (family, builtin, dimension, obligation, allow_while_handling) =
+        if let Some((builtin, dimension, obligation)) = unicode_failure_target(id) {
+            (UnicodeException, builtin, dimension, obligation, false)
+        } else if let Some(builtin) = io_exception_failure_builtin(id) {
+            (IOException, builtin, Effects, "effect-failure", false)
+        } else {
+            let (builtin, dimension, obligation, handling) = error_call_failure_target(id)?;
+            (ErrorCall, builtin, dimension, obligation, handling)
+        };
+    let (oracle_frame_functions, candidate_frame_functions): (
+        &'static [&'static str],
+        &'static [&'static str],
+    ) = match (family, id) {
+        (UnicodeException | IOException, _) => (&["throwIO"], &[]),
+        (
+            ErrorCall,
+            "runtime-typed-map-singleton-key-strict"
+            | "runtime-typed-set-singleton-element-strict"
+            | "list-take-boundary-bottom-after-demanded-prefix"
+            | "runtime-interaction-list-laziness-error",
+        ) => (&["throwIO", "error"], &["error"]),
+        (ErrorCall, "list-cycle-boundary-empty-input") => {
+            (&["throwIO", "error"], &["error", "errorEmptyList", "cycle"])
+        }
+        (ErrorCall, _) => (&["error"], &["error"]),
+    };
+    Some(RuntimeFailurePresentationSpec {
+        family,
+        builtin,
+        dimension,
+        obligation,
+        allow_while_handling,
+        oracle_frame_functions,
+        candidate_frame_functions,
+    })
+}
+
+fn unicode_failure_target(
+    id: &str,
+) -> Option<(&'static str, CompatibilityDimension, &'static str)> {
+    use CompatibilityDimension::{Effects, PureRuntime};
+    match id {
+        "text-decodeutf8-boundary-invalid-encoding" => {
+            Some(("Text.decodeUtf8", PureRuntime, "adapter-failure"))
+        }
+        "text-getcontents-boundary-invalid-encoding" => {
+            Some(("Text.getContents", Effects, "effect-failure"))
+        }
+        "text-getline-boundary-invalid-encoding" => {
+            Some(("Text.getLine", Effects, "effect-failure"))
+        }
+        _ => None,
+    }
+}
+
+fn io_exception_failure_builtin(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "text-getline-boundary-empty-input" => "Text.getLine",
+        "runtime-typed-io-text-writefile-failure" => "Text.writeFile",
+        "runtime-typed-io-text-appendfile-failure" => "Text.appendFile",
+        "runtime-typed-io-bytestring-writefile-failure" => "ByteString.writeFile",
+        "runtime-typed-io-bytestring-readfile-failure" => "ByteString.readFile",
+        "runtime-typed-io-bytestring-readprocess-failure" => "ByteString.readProcess",
+        "runtime-typed-io-bytestring-readprocess-checked-failure" => "ByteString.readProcess_",
+        "runtime-typed-io-bytestring-readprocess-stdout-checked-failure" => {
+            "ByteString.readProcessStdout_"
+        }
+        "runtime-environment-get-env-missing" => "Environment.getEnv",
+        "runtime-io-open-file-failure" => "IO.openFile",
+        "runtime-directory-copy-file-failure" => "Directory.copyFile",
+        "runtime-directory-create-directory-failure" => "Directory.createDirectory",
+        "runtime-directory-create-directory-if-missing-failure" => {
+            "Directory.createDirectoryIfMissing"
+        }
+        "runtime-directory-get-file-size-failure" => "Directory.getFileSize",
+        "runtime-directory-remove-file-failure" => "Directory.removeFile",
+        "runtime-directory-rename-file-failure" => "Directory.renameFile",
+        "runtime-directory-list-directory-failure" => "Directory.listDirectory",
+        "runtime-directory-remove-directory-failure" => "Directory.removeDirectory",
+        "runtime-directory-set-current-directory-failure" => "Directory.setCurrentDirectory",
+        _ => return None,
+    })
+}
+
+fn error_call_failure_target(
+    id: &str,
+) -> Option<(&'static str, CompatibilityDimension, &'static str, bool)> {
+    use CompatibilityDimension::{Effects, PureRuntime};
+    Some(match id {
+        "runtime-typed-map-singleton-key-strict" => {
+            ("Map.singleton", PureRuntime, "whnf-failure-boundary", false)
+        }
+        "runtime-typed-set-singleton-element-strict" => {
+            ("Set.singleton", PureRuntime, "whnf-failure-boundary", false)
+        }
+        "runtime-io-mapm-failure" => ("IO.mapM_", Effects, "effect-ordering", false),
+        "runtime-io-form-failure" => ("IO.forM_", Effects, "effect-ordering", false),
+        "runtime-typed-thread-delay-forced-argument-failure" => {
+            ("Concurrent.threadDelay", Effects, "effect-failure", false)
+        }
+        "runtime-typed-timeout-positive-action-failure" => {
+            ("Timeout.timeout", Effects, "effect-failure", false)
+        }
+        "runtime-temp-directory-failure" => (
+            "Temp.withSystemTempDirectory",
+            Effects,
+            "effect-failure",
+            true,
+        ),
+        "runtime-temp-file-failure" => ("Temp.withSystemTempFile", Effects, "effect-failure", true),
+        "list-cycle-boundary-empty-input" => {
+            ("List.cycle", PureRuntime, "result-force-failure", false)
+        }
+        "list-take-boundary-bottom-after-demanded-prefix"
+        | "runtime-interaction-list-laziness-error" => {
+            ("List.take", PureRuntime, "lazy-boundary", false)
+        }
+        _ => return None,
+    })
+}
+
+pub(crate) fn has_runtime_failure_presentation_authority(id: &str) -> bool {
+    runtime_failure_presentation_spec(id).is_some()
+}
+
+pub(crate) fn reviewed_runtime_failure_presentation_authority(
     case: &DifferentialCase,
-) -> Option<BuiltinId> {
+) -> Option<RuntimeFailurePresentationAuthority> {
+    let spec = runtime_failure_presentation_spec(&case.id)?;
     let descriptor = case.claim_evidence.as_ref()?;
     if case.mode != DifferentialMode::Run
+        || case.expected_runtime_completion
+        || descriptor.profile != case_execution_profile(case)
+        || validate_case_descriptor(case, descriptor).is_err()
+        || validate_legacy_targets(case, descriptor).is_err()
+        || validate_semantic_targets(case, descriptor).is_err()
+        || validate_callback_contracts(case, descriptor).is_err()
+        || descriptor
+            .targets
+            .iter()
+            .any(|target| target.dimension == CompatibilityDimension::Presentation)
+        || descriptor
+            .semantic_targets
+            .iter()
+            .any(|target| target.dimension == CompatibilityDimension::Presentation)
+    {
+        return None;
+    }
+    let mut matching = descriptor.semantic_targets.iter().filter(|target| {
+        target.builtin.as_ref() == spec.builtin
+            && target.dimension == spec.dimension
+            && target
+                .obligations
+                .iter()
+                .any(|obligation| obligation.0.as_ref() == spec.obligation)
+    });
+    let target = matching.next()?;
+    if matching.next().is_some()
+        || (spec.dimension == CompatibilityDimension::Effects
+            && (target.causal_signal != CausalSignal::EffectEvent
+                || !target
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.0.as_ref() == "effect-ordering")
+                || target
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.0.as_ref() == "effect-success")))
+        || (spec.obligation == "whnf-failure-boundary"
+            && target.causal_signal != CausalSignal::ForceTrace)
+        || (matches!(spec.obligation, "result-force-failure" | "lazy-boundary")
+            && target.causal_signal != CausalSignal::RuntimeAdapterAndForceTrace)
+        || (spec.allow_while_handling && spec.family != RuntimeFailureExceptionFamily::ErrorCall)
+    {
+        return None;
+    }
+    let builtin = hell_builtins::lookup(spec.builtin)?.id;
+    Some(RuntimeFailurePresentationAuthority {
+        family: spec.family,
+        builtin,
+        builtin_name: spec.builtin,
+        dimension: spec.dimension,
+        obligation: spec.obligation,
+        allow_while_handling: spec.allow_while_handling,
+        oracle_frame_functions: spec.oracle_frame_functions,
+        candidate_frame_functions: spec.candidate_frame_functions,
+    })
+}
+
+fn reviewed_legacy_runtime_failure_stderr_builtin(case: &DifferentialCase) -> Option<BuiltinId> {
+    let descriptor = case.claim_evidence.as_ref()?;
+    if has_runtime_failure_presentation_authority(&case.id)
+        || case.mode != DifferentialMode::Run
         || case.expected_runtime_completion
         || descriptor.profile != case_execution_profile(case)
         || validate_case_descriptor(case, descriptor).is_err()
@@ -4253,12 +10807,889 @@ fn semantic_task_trace_sha256(semantic: &SemanticObservation, builtin: BuiltinId
     task_trace_sha256(events)
 }
 
+fn runtime_failure_target(
+    case: &DifferentialCase,
+    authority: RuntimeFailurePresentationAuthority,
+) -> Option<&EvidenceTargetV2> {
+    let mut matching = case
+        .claim_evidence
+        .as_ref()?
+        .semantic_targets
+        .iter()
+        .filter(|target| {
+            target.builtin.as_ref() == authority.builtin_name
+                && target.dimension == authority.dimension
+                && target
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.0.as_ref() == authority.obligation)
+        });
+    let target = matching.next()?;
+    matching.next().is_none().then_some(target)
+}
+
+#[cfg(feature = "mutation-testing")]
+fn runtime_failure_mutant_active(id: &str) -> bool {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    arguments.windows(4).any(|window| {
+        window[0] == "--skip"
+            && window[1] == "__hell_mutant"
+            && window[2] == "--skip"
+            && window[3] == id
+    })
+}
+
+#[cfg(not(feature = "mutation-testing"))]
+const fn runtime_failure_mutant_active(_id: &str) -> bool {
+    false
+}
+
+fn reviewed_runtime_failure_causality(
+    case: &DifferentialCase,
+    authority: RuntimeFailurePresentationAuthority,
+    semantic: &SemanticObservation,
+) -> bool {
+    if runtime_failure_mutant_active("runtime-failure-causal-authority") {
+        return true;
+    }
+    let Some(target) = runtime_failure_target(case, authority) else {
+        return false;
+    };
+    let Ok(expected_task_trace) =
+        reviewed_runtime_failure_expected_task_trace(case, authority.builtin)
+    else {
+        return false;
+    };
+    if expected_task_trace
+        .is_some_and(|expected| semantic_task_trace_sha256(semantic, authority.builtin) != expected)
+    {
+        return false;
+    }
+    if authority.dimension == CompatibilityDimension::Effects {
+        return reviewed_runtime_failure_effect_causality(authority, semantic);
+    }
+
+    reviewed_runtime_failure_pure_causality(authority, target, semantic)
+}
+
+fn reviewed_runtime_failure_effect_causality(
+    authority: RuntimeFailurePresentationAuthority,
+    semantic: &SemanticObservation,
+) -> bool {
+    if !semantic
+        .coverage
+        .contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+    {
+        return false;
+    }
+    let effects = semantic
+        .effect_trace
+        .iter()
+        .filter_map(|event| match event {
+            LogicalTraceEvent::HostEffect {
+                builtin,
+                owner_task,
+                sequence,
+                parent_sequence,
+                effect,
+            } if *builtin == authority.builtin => {
+                Some((*owner_task, *sequence, *parent_sequence, effect))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    effects.len() == 2
+        && effects[0].0 == effects[1].0
+        && effects[0].1 == effects[1].1
+        && effects[0].2 == effects[1].2
+        && effects[0].3.as_ref() == "started"
+        && effects[1].3.as_ref() == "failed"
+}
+
+fn reviewed_runtime_failure_pure_causality(
+    authority: RuntimeFailurePresentationAuthority,
+    target: &EvidenceTargetV2,
+    semantic: &SemanticObservation,
+) -> bool {
+    let force_boundaries = semantic
+        .force_trace
+        .chunks_exact(2)
+        .filter_map(|events| match events {
+            [
+                LogicalTraceEvent::ForceBuiltinArgument { builtin, argument },
+                LogicalTraceEvent::CompleteThunk {
+                    outcome,
+                    error_code,
+                    ..
+                },
+            ] if *builtin == authority.builtin => {
+                Some((*argument, outcome.as_ref(), error_code.as_deref()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match authority.obligation {
+        "adapter-failure" => {
+            let matching = semantic
+                .obligation_trace
+                .iter()
+                .filter(|event| event.builtin == authority.builtin)
+                .collect::<Vec<_>>();
+            semantic
+                .coverage
+                .contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+                && matching.len() == 1
+                && matching[0].outcome.as_ref() == "error"
+        }
+        "whnf-failure-boundary" => {
+            let Some(expected) = target.expected_whnf_argument_failure_sha256 else {
+                return false;
+            };
+            force_boundaries
+                .iter()
+                .all(|(_, outcome, error)| *outcome == "error" && error.is_some())
+                && !force_boundaries.is_empty()
+                && whnf_argument_failure_sha256(force_boundaries.iter().filter_map(
+                    |(argument, outcome, error)| error.map(|error| (*argument, *outcome, error)),
+                )) == expected
+        }
+        "lazy-boundary" => {
+            let Some(expected) = target.expected_lazy_argument_exit_sha256 else {
+                return false;
+            };
+            !force_boundaries.is_empty()
+                && force_boundaries
+                    .iter()
+                    .any(|(_, outcome, _)| *outcome == "error")
+                && lazy_argument_exit_sha256(
+                    force_boundaries
+                        .iter()
+                        .map(|(argument, outcome, _)| (*argument, *outcome)),
+                ) == expected
+        }
+        "result-force-failure" => {
+            semantic
+                .coverage
+                .contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+                && semantic.typed_result_builtin == Some(authority.builtin)
+                && semantic.typed_result_sha256 == target.expected_typed_result_sha256
+                && target.expected_typed_result_sha256.is_some()
+                && force_boundaries
+                    .iter()
+                    .any(|(_, outcome, _)| *outcome == "error")
+        }
+        _ => false,
+    }
+}
+
+struct GhcBacktraceFrame<'a> {
+    function: &'a str,
+    location: &'a str,
+    module: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GhcBacktraceRejection {
+    Grammar,
+    TerminalNewline,
+    Count,
+    Function,
+    Origin,
+}
+
+fn ghc_backtrace_frames(frames: &str) -> Result<Vec<GhcBacktraceFrame<'_>>, GhcBacktraceRejection> {
+    if frames.is_empty() {
+        return Err(GhcBacktraceRejection::Grammar);
+    }
+    if !frames.ends_with('\n') {
+        return Err(GhcBacktraceRejection::TerminalNewline);
+    }
+    frames
+        .lines()
+        .map(|line| {
+            let frame = line
+                .strip_prefix("  ")
+                .ok_or(GhcBacktraceRejection::Grammar)?;
+            let (function, location) = frame
+                .split_once(", called at ")
+                .ok_or(GhcBacktraceRejection::Grammar)?;
+            let (location, module) = location
+                .split_once(" in ")
+                .ok_or(GhcBacktraceRejection::Grammar)?;
+            [function, location, module]
+                .iter()
+                .all(|field| {
+                    !field.is_empty()
+                        && *field == field.trim()
+                        && !field.chars().any(char::is_control)
+                })
+                .then_some(GhcBacktraceFrame {
+                    function,
+                    location,
+                    module,
+                })
+                .ok_or(GhcBacktraceRejection::Grammar)
+        })
+        .collect()
+}
+
+fn ghc_backtrace_frame_has_exact_origin(
+    authority: RuntimeFailurePresentationAuthority,
+    frame: &GhcBacktraceFrame<'_>,
+) -> bool {
+    match frame.function {
+        "throwIO" => {
+            frame
+                .location
+                .starts_with("libraries/ghc-internal/src/GHC/Internal/")
+                && frame.module.starts_with("ghc-internal:GHC.Internal.")
+        }
+        "error"
+            if authority
+                .candidate_frame_functions
+                .contains(&"errorEmptyList") =>
+        {
+            (frame
+                .location
+                .starts_with("libraries/base/GHC/List.hs:2004:3")
+                && frame.module.ends_with(":GHC.List"))
+                || (frame
+                    .location
+                    .starts_with("libraries/ghc-internal/src/GHC/Internal/")
+                    && frame.module.starts_with("ghc-internal:GHC.Internal."))
+        }
+        "error" | "cycle" => {
+            frame.location == "src/Hell.hs:1953:4" && frame.module.ends_with(":Main")
+        }
+        "errorEmptyList" => {
+            frame.location == "libraries/base/GHC/List.hs:972:27"
+                && frame.module.ends_with(":GHC.List")
+        }
+        _ => false,
+    }
+}
+
+fn exact_ghc_backtrace(
+    authority: RuntimeFailurePresentationAuthority,
+    frames: &str,
+    expected_functions: &[&str],
+) -> bool {
+    exact_ghc_backtrace_result(authority, frames, expected_functions).is_ok()
+}
+
+fn exact_ghc_backtrace_result(
+    authority: RuntimeFailurePresentationAuthority,
+    frames: &str,
+    expected_functions: &[&str],
+) -> Result<(), GhcBacktraceRejection> {
+    let frames = ghc_backtrace_frames(frames)?;
+    if frames.len() != expected_functions.len() {
+        return Err(GhcBacktraceRejection::Count);
+    }
+    for (frame, function) in frames.iter().zip(expected_functions) {
+        if frame.function != *function {
+            return Err(GhcBacktraceRejection::Function);
+        }
+        if !ghc_backtrace_frame_has_exact_origin(authority, frame) {
+            return Err(GhcBacktraceRejection::Origin);
+        }
+    }
+    Ok(())
+}
+
+const fn oracle_frame_rejection(
+    rejection: GhcBacktraceRejection,
+) -> RuntimeFailureProjectionRejectionReason {
+    use RuntimeFailureProjectionRejectionReason::{
+        OracleFrameCount, OracleFrameFunction, OracleFrameGrammar, OracleFrameOrigin,
+        OracleFrameTerminalNewline,
+    };
+    match rejection {
+        GhcBacktraceRejection::Grammar => OracleFrameGrammar,
+        GhcBacktraceRejection::TerminalNewline => OracleFrameTerminalNewline,
+        GhcBacktraceRejection::Count => OracleFrameCount,
+        GhcBacktraceRejection::Function => OracleFrameFunction,
+        GhcBacktraceRejection::Origin => OracleFrameOrigin,
+    }
+}
+
+fn oracle_exception_payload_result(
+    authority: RuntimeFailurePresentationAuthority,
+    stderr: &[u8],
+) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
+    use RuntimeFailureProjectionRejectionReason::{
+        OracleExceptionFamily, OracleFrameGrammar, OracleParserStage, OraclePayloadControl,
+        OraclePayloadEmpty, OraclePayloadHandlingMismatch, OraclePayloadHandlingMissing,
+        OraclePayloadMultiline, OraclePayloadUnexpectedHandling,
+    };
+
+    let stderr = std::str::from_utf8(stderr).map_err(|_| OracleParserStage)?;
+    let body = stderr
+        .strip_prefix("hell: Uncaught exception ")
+        .ok_or(OracleParserStage)?;
+    let body = match authority.family {
+        RuntimeFailureExceptionFamily::UnicodeException => {
+            let (unit, body) = body
+                .split_once(":Data.Text.Encoding.Error.UnicodeException:\n\n")
+                .ok_or(OracleExceptionFamily)?;
+            if !unit.starts_with("text-")
+                || unit.len() <= "text-".len()
+                || !unit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            {
+                return Err(OracleExceptionFamily);
+            }
+            body
+        }
+        RuntimeFailureExceptionFamily::IOException => body
+            .strip_prefix("ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n")
+            .ok_or(OracleExceptionFamily)?,
+        RuntimeFailureExceptionFamily::ErrorCall => body
+            .strip_prefix("ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n")
+            .ok_or(OracleExceptionFamily)?,
+    };
+    let (framed_payload, frames) = body
+        .split_once("\n\nHasCallStack backtrace:\n")
+        .ok_or(OracleFrameGrammar)?;
+    let payload = if authority.allow_while_handling {
+        let (payload, handling) = framed_payload
+            .split_once("\n\nWhile handling ")
+            .ok_or(OraclePayloadHandlingMissing)?;
+        if handling != payload {
+            return Err(OraclePayloadHandlingMismatch);
+        }
+        payload
+    } else {
+        if framed_payload.contains("\n\nWhile handling ") {
+            return Err(OraclePayloadUnexpectedHandling);
+        }
+        framed_payload
+    };
+    if payload.is_empty() {
+        return Err(OraclePayloadEmpty);
+    }
+    if payload.contains('\n') {
+        return Err(OraclePayloadMultiline);
+    }
+    if payload.chars().any(char::is_control) {
+        return Err(OraclePayloadControl);
+    }
+    exact_ghc_backtrace_result(authority, frames, authority.oracle_frame_functions)
+        .map_err(oracle_frame_rejection)?;
+    Ok(payload)
+}
+
+fn candidate_exception_payload_result(
+    authority: RuntimeFailurePresentationAuthority,
+    stderr: &[u8],
+) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
+    use RuntimeFailureProjectionRejectionReason::{
+        CandidateFrame, CandidateLegacyParser, CandidatePayload,
+    };
+
+    let candidate = std::str::from_utf8(stderr).map_err(|_| CandidateLegacyParser)?;
+    let payload = candidate
+        .strip_prefix("hell: ")
+        .ok_or(CandidateLegacyParser)?;
+    let payload = match authority.family {
+        RuntimeFailureExceptionFamily::UnicodeException
+        | RuntimeFailureExceptionFamily::IOException => {
+            if !authority.candidate_frame_functions.is_empty() {
+                return Err(CandidateFrame);
+            }
+            payload.strip_suffix('\n').ok_or(CandidateLegacyParser)?
+        }
+        RuntimeFailureExceptionFamily::ErrorCall => {
+            let (payload, frames) = payload
+                .split_once("\nCallStack (from HasCallStack):\n")
+                .ok_or(CandidateLegacyParser)?;
+            if !exact_ghc_backtrace(authority, frames, authority.candidate_frame_functions) {
+                return Err(CandidateFrame);
+            }
+            payload
+        }
+    };
+    if payload.is_empty() || payload.contains('\n') || payload.chars().any(char::is_control) {
+        return Err(CandidatePayload);
+    }
+    Ok(payload)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReviewedRuntimeFailurePayloadEvidence {
+    oracle_payload_sha256: Digest,
+    candidate_payload_sha256: Digest,
+}
+
+fn reviewed_runtime_failure_payload_evidence_result(
+    authority: RuntimeFailurePresentationAuthority,
+    oracle_stderr: &[u8],
+    candidate_stderr: &[u8],
+) -> Result<ReviewedRuntimeFailurePayloadEvidence, RuntimeFailureProjectionRejectionReason> {
+    let oracle_payload = oracle_exception_payload_result(authority, oracle_stderr)?;
+    let candidate_payload = candidate_exception_payload_result(authority, candidate_stderr)?;
+    Ok(ReviewedRuntimeFailurePayloadEvidence {
+        oracle_payload_sha256: sha256_bytes(oracle_payload.as_bytes()),
+        candidate_payload_sha256: sha256_bytes(candidate_payload.as_bytes()),
+    })
+}
+
+pub(crate) fn reviewed_runtime_failure_payload_sha256(
+    authority: RuntimeFailurePresentationAuthority,
+    oracle_stderr: &[u8],
+    candidate_stderr: &[u8],
+) -> Option<Digest> {
+    reviewed_runtime_failure_payload_sha256_result(authority, oracle_stderr, candidate_stderr).ok()
+}
+
+fn reviewed_runtime_failure_payload_sha256_result(
+    authority: RuntimeFailurePresentationAuthority,
+    oracle_stderr: &[u8],
+    candidate_stderr: &[u8],
+) -> Result<Digest, RuntimeFailureProjectionRejectionReason> {
+    if runtime_failure_mutant_active("runtime-failure-frame-payload-authority") {
+        return Ok(sha256_bytes(candidate_stderr));
+    }
+    let evidence = reviewed_runtime_failure_payload_evidence_result(
+        authority,
+        oracle_stderr,
+        candidate_stderr,
+    )?;
+    (evidence.oracle_payload_sha256 == evidence.candidate_payload_sha256)
+        .then_some(evidence.oracle_payload_sha256)
+        .ok_or(RuntimeFailureProjectionRejectionReason::PayloadMismatch)
+}
+
+#[cfg(test)]
+mod runtime_failure_presentation_tests {
+    use super::{
+        RuntimeFailureProjectionRejectionReason, candidate_exception_payload_result,
+        oracle_exception_payload_result, reviewed_runtime_failure_payload_sha256,
+        reviewed_runtime_failure_presentation_authority,
+    };
+
+    fn authority(id: &str) -> super::RuntimeFailurePresentationAuthority {
+        let cases = crate::committed_differential_cases();
+        let case = cases
+            .iter()
+            .find(|case| case.id.as_ref() == id)
+            .expect("reviewed runtime-failure case");
+        reviewed_runtime_failure_presentation_authority(case)
+            .expect("reviewed runtime-failure presentation authority")
+    }
+
+    fn io_oracle(payload: &str, frames: &str) -> String {
+        format!(
+            concat!(
+                "hell: Uncaught exception ",
+                "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
+                "{}\n\nHasCallStack backtrace:\n{}",
+            ),
+            payload, frames,
+        )
+    }
+
+    fn temp_oracle(framed_payload: &str) -> String {
+        format!(
+            concat!(
+                "hell: Uncaught exception ",
+                "ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n",
+                "{}\n\nHasCallStack backtrace:\n",
+                "  error, called at src/Hell.hs:1953:4 in oracle-unit:Main\n",
+            ),
+            framed_payload,
+        )
+    }
+
+    fn assert_oracle_rejection(
+        authority: super::RuntimeFailurePresentationAuthority,
+        stderr: &str,
+        expected: RuntimeFailureProjectionRejectionReason,
+    ) {
+        assert_eq!(
+            oracle_exception_payload_result(authority, stderr.as_bytes()).map(|_| ()),
+            Err(expected),
+        );
+    }
+
+    #[test]
+    fn oracle_frame_rejection_subreasons_are_exact() {
+        use RuntimeFailureProjectionRejectionReason::{
+            OracleFrameCount, OracleFrameFunction, OracleFrameGrammar, OracleFrameOrigin,
+            OracleFrameTerminalNewline,
+        };
+
+        let authority = authority("runtime-typed-io-text-writefile-failure");
+        let frame = concat!(
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
+            "in ghc-internal:GHC.Internal.IO\n",
+        );
+        let oracle = io_oracle("reviewed", frame);
+        assert!(oracle_exception_payload_result(authority, oracle.as_bytes()).is_ok());
+        assert_oracle_rejection(
+            authority,
+            &oracle.replace(", called at ", ", invoked at "),
+            OracleFrameGrammar,
+        );
+        assert_oracle_rejection(
+            authority,
+            oracle.strip_suffix('\n').expect("terminal newline"),
+            OracleFrameTerminalNewline,
+        );
+        assert_oracle_rejection(authority, &format!("{oracle}{frame}"), OracleFrameCount);
+        assert_oracle_rejection(
+            authority,
+            &oracle.replace("  throwIO, called at", "  injected, called at"),
+            OracleFrameFunction,
+        );
+        assert_oracle_rejection(
+            authority,
+            &oracle.replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs"),
+            OracleFrameOrigin,
+        );
+    }
+
+    #[test]
+    fn oracle_payload_line_rejection_subreasons_are_exact() {
+        use RuntimeFailureProjectionRejectionReason::{
+            OraclePayloadControl, OraclePayloadEmpty, OraclePayloadMultiline,
+            OraclePayloadUnexpectedHandling,
+        };
+
+        let authority = authority("runtime-typed-io-text-writefile-failure");
+        let frame = concat!(
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
+            "in ghc-internal:GHC.Internal.IO\n",
+        );
+        for (payload, reason) in [
+            ("", OraclePayloadEmpty),
+            ("reviewed\ncontinued", OraclePayloadMultiline),
+            ("reviewed\tcontrol", OraclePayloadControl),
+            (
+                "reviewed\n\nWhile handling reviewed",
+                OraclePayloadUnexpectedHandling,
+            ),
+        ] {
+            assert_oracle_rejection(authority, &io_oracle(payload, frame), reason);
+        }
+    }
+
+    #[test]
+    fn oracle_payload_handling_rejection_subreasons_are_exact() {
+        use RuntimeFailureProjectionRejectionReason::{
+            OraclePayloadHandlingMismatch, OraclePayloadHandlingMissing,
+        };
+
+        let authority = authority("runtime-temp-directory-failure");
+        assert_oracle_rejection(
+            authority,
+            &temp_oracle("reviewed"),
+            OraclePayloadHandlingMissing,
+        );
+        assert_oracle_rejection(
+            authority,
+            &temp_oracle("reviewed\n\nWhile handling substituted"),
+            OraclePayloadHandlingMismatch,
+        );
+    }
+
+    #[test]
+    fn exception_projection_rejects_family_payload_program_frame_and_tail_forgery() {
+        let authority = authority("runtime-typed-io-text-writefile-failure");
+        let oracle = concat!(
+            "hell: Uncaught exception ",
+            "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
+            "missing-parent/file.txt: withBinaryFile: does not exist\n\n",
+            "HasCallStack backtrace:\n",
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
+            "in ghc-internal:GHC.Internal.IO\n",
+        );
+        let candidate = "hell: missing-parent/file.txt: withBinaryFile: does not exist\n";
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                authority,
+                oracle.as_bytes(),
+                candidate.as_bytes(),
+            )
+            .is_some()
+        );
+        assert_eq!(
+            oracle_exception_payload_result(
+                authority,
+                oracle
+                    .replace(
+                        "GHC.Internal.IO.Exception.IOException",
+                        "GHC.Internal.Exception.ErrorCall",
+                    )
+                    .as_bytes(),
+            ),
+            Err(RuntimeFailureProjectionRejectionReason::OracleExceptionFamily),
+        );
+        assert_eq!(
+            oracle_exception_payload_result(
+                authority,
+                oracle
+                    .replace("  throwIO, called at", "  injected, called at")
+                    .as_bytes(),
+            ),
+            Err(RuntimeFailureProjectionRejectionReason::OracleFrameFunction),
+        );
+        assert_eq!(
+            candidate_exception_payload_result(authority, b"other: reviewed\n"),
+            Err(RuntimeFailureProjectionRejectionReason::CandidateLegacyParser),
+        );
+        assert_eq!(
+            candidate_exception_payload_result(authority, b"hell: \n"),
+            Err(RuntimeFailureProjectionRejectionReason::CandidatePayload),
+        );
+        for forged in [
+            oracle.replace(
+                "GHC.Internal.IO.Exception.IOException",
+                "GHC.Internal.Exception.ErrorCall",
+            ),
+            oracle.replacen("hell:", "other:", 1),
+            oracle.replacen("IOException:\n\n", "IOException:\n", 1),
+            oracle.replace(
+                "  throwIO, called at",
+                concat!(
+                    "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
+                    "in ghc-internal:GHC.Internal.IO\n",
+                    "  throwIO, called at",
+                ),
+            ),
+            oracle.replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs"),
+            format!("{oracle}contamination\n"),
+        ] {
+            assert!(
+                reviewed_runtime_failure_payload_sha256(
+                    authority,
+                    forged.as_bytes(),
+                    candidate.as_bytes(),
+                )
+                .is_none(),
+                "forged oracle frame was admitted: {forged:?}",
+            );
+        }
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                authority,
+                oracle.as_bytes(),
+                b"hell: substituted payload\n",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn error_call_and_while_handling_frames_are_exactly_case_scoped() {
+        let strict = authority("runtime-typed-map-singleton-key-strict");
+        let strict_oracle = concat!(
+            "hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n",
+            "singleton key forced\n\nHasCallStack backtrace:\n",
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/Exception.hs:1:1 ",
+            "in ghc-internal:GHC.Internal.Exception\n",
+            "  error, called at src/Hell.hs:1953:4 in oracle-unit:Main\n",
+        );
+        let strict_candidate = concat!(
+            "hell: singleton key forced\nCallStack (from HasCallStack):\n",
+            "  error, called at src/Hell.hs:1953:4 in main:Main\n",
+        );
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                strict,
+                strict_oracle.as_bytes(),
+                strict_candidate.as_bytes(),
+            )
+            .is_some()
+        );
+
+        let temp = authority("runtime-temp-directory-failure");
+        let temp_oracle = concat!(
+            "hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n",
+            "reviewed\n\nWhile handling reviewed\n\nHasCallStack backtrace:\n",
+            "  error, called at src/Hell.hs:1953:4 in oracle-unit:Main\n",
+        );
+        let temp_candidate = concat!(
+            "hell: reviewed\nCallStack (from HasCallStack):\n",
+            "  error, called at src/Hell.hs:1953:4 in main:Main\n",
+        );
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                temp,
+                temp_oracle.as_bytes(),
+                temp_candidate.as_bytes(),
+            )
+            .is_some()
+        );
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                temp,
+                temp_oracle
+                    .replace("While handling reviewed", "While handling substituted")
+                    .as_bytes(),
+                temp_candidate.as_bytes(),
+            )
+            .is_none()
+        );
+        assert!(
+            reviewed_runtime_failure_payload_sha256(
+                strict,
+                temp_oracle.as_bytes(),
+                temp_candidate.as_bytes(),
+            )
+            .is_none()
+        );
+    }
+}
+
 fn reviewed_runtime_failure_stderr_projection(
     case: &DifferentialCase,
     oracle: &Observation,
     candidate: &Observation,
 ) -> Option<DifferentialComparisonProjection> {
-    let builtin = reviewed_runtime_failure_stderr_builtin(case)?;
+    if runtime_failure_presentation_spec(&case.id).is_some() {
+        return reviewed_runtime_failure_exception_stderr_projection(case, oracle, candidate);
+    }
+    reviewed_legacy_runtime_failure_stderr_projection(case, oracle, candidate)
+}
+
+fn reviewed_runtime_failure_exception_stderr_projection(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Option<DifferentialComparisonProjection> {
+    reviewed_runtime_failure_exception_stderr_projection_result(case, oracle, candidate).ok()
+}
+
+fn runtime_failure_observations_are_bound(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> bool {
+    if oracle.identity.role != ExecutableRole::Oracle
+        || candidate.identity.role != ExecutableRole::Candidate
+        || oracle.case_id != case.id
+        || candidate.case_id != case.id
+        || oracle.environment_profile != case.environment_profile
+        || candidate.environment_profile != case.environment_profile
+        || oracle.process_helper_sha256 != case.process_helper_sha256
+        || candidate.process_helper_sha256 != case.process_helper_sha256
+        || oracle.harness_normalizers != applied_harness_normalizers()
+        || candidate.harness_normalizers != applied_harness_normalizers()
+        || oracle.claim_normalizers != applied_claim_normalizers(case)
+        || candidate.claim_normalizers != applied_claim_normalizers(case)
+        || oracle.mode != DifferentialMode::Run
+        || candidate.mode != DifferentialMode::Run
+        || oracle.timed_out
+        || candidate.timed_out
+        || oracle.status.success
+        || candidate.status.success
+        || oracle.status != candidate.status
+        || oracle.stdout != candidate.stdout
+        || oracle.filesystem != candidate.filesystem
+        || oracle.stderr.truncated
+        || candidate.stderr.truncated
+        || oracle.stderr == candidate.stderr
+    {
+        return false;
+    }
+    true
+}
+
+fn reviewed_runtime_failure_exception_stderr_projection_result(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Result<DifferentialComparisonProjection, RuntimeFailureProjectionRejectionReason> {
+    use RuntimeFailureProjectionRejectionReason::{
+        DescriptorTable, MissingCandidateSemantic, MissingCandidateStderr, MissingOracleStderr,
+        ObservationAuthority, SemanticCausality, SemanticTarget,
+    };
+
+    let authority = reviewed_runtime_failure_presentation_authority(case).ok_or(DescriptorTable)?;
+    let semantic = candidate
+        .semantic
+        .as_ref()
+        .ok_or(MissingCandidateSemantic)?;
+    let oracle_stderr = oracle
+        .stderr
+        .complete
+        .as_deref()
+        .ok_or(MissingOracleStderr)?;
+    let candidate_stderr = candidate
+        .stderr
+        .complete
+        .as_deref()
+        .ok_or(MissingCandidateStderr)?;
+    if !runtime_failure_observations_are_bound(case, oracle, candidate) {
+        return Err(ObservationAuthority);
+    }
+    let payload_sha256 =
+        reviewed_runtime_failure_payload_sha256_result(authority, oracle_stderr, candidate_stderr)?;
+    if runtime_failure_target(case, authority).is_none() {
+        return Err(SemanticTarget);
+    }
+    if !reviewed_runtime_failure_causality(case, authority, semantic) {
+        return Err(SemanticCausality);
+    }
+    Ok(
+        DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family: authority.family,
+            payload_sha256,
+            oracle_sha256: oracle.stderr.sha256,
+            candidate_sha256: candidate.stderr.sha256,
+            oracle_bytes: oracle.stderr.total_bytes,
+            candidate_bytes: candidate.stderr.total_bytes,
+        },
+    )
+}
+
+/// Returns bounded diagnostic evidence when one exact-table runtime-failure
+/// projection is rejected. A successful projection and every non-table case
+/// return `None`; this function never changes comparison authority.
+#[must_use]
+pub fn runtime_failure_projection_rejection(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Option<RuntimeFailureProjectionRejection> {
+    let spec = runtime_failure_presentation_spec(&case.id)?;
+    let reason =
+        reviewed_runtime_failure_exception_stderr_projection_result(case, oracle, candidate)
+            .err()?;
+    let semantic = candidate.semantic.as_ref();
+    Some(RuntimeFailureProjectionRejection {
+        reason,
+        exception_family: spec.family,
+        descriptor_builtin: spec.builtin,
+        descriptor_dimension: spec.dimension,
+        descriptor_obligation: spec.obligation,
+        oracle_stderr_sha256: oracle.stderr.sha256,
+        oracle_stderr_bytes: oracle.stderr.total_bytes,
+        candidate_stderr_sha256: candidate.stderr.sha256,
+        candidate_stderr_bytes: candidate.stderr.total_bytes,
+        semantic_present: semantic.is_some(),
+        typed_result_sha256_present: semantic
+            .is_some_and(|value| value.typed_result_sha256.is_some()),
+        typed_result_builtin_present: semantic
+            .is_some_and(|value| value.typed_result_builtin.is_some()),
+        semantic_coverage_count: semantic.map_or(0, |value| value.coverage.len()),
+        obligation_event_count: semantic.map_or(0, |value| value.obligation_trace.len()),
+        causal_order_count: semantic.map_or(0, |value| value.causal_event_order.len()),
+        force_event_count: semantic.map_or(0, |value| value.force_trace.len()),
+        effect_event_count: semantic.map_or(0, |value| value.effect_trace.len()),
+        task_event_count: semantic.map_or(0, |value| value.task_trace.len()),
+        resource_event_count: semantic.map_or(0, |value| value.resource_trace.len()),
+    })
+}
+
+fn reviewed_legacy_runtime_failure_stderr_projection(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Option<DifferentialComparisonProjection> {
+    let builtin = reviewed_legacy_runtime_failure_stderr_builtin(case)?;
     if oracle.identity.role != ExecutableRole::Oracle
         || candidate.identity.role != ExecutableRole::Candidate
         || oracle.case_id != case.id
@@ -4457,7 +11888,7 @@ fn observe_source_with_optional_target(
         .stderr
         .complete
         .ok_or_else(|| std::io::Error::other("stderr exceeded the normalization capture bound"))?;
-    let mut stderr = diagnostic_sandbox_path_v1(&stderr, &sandbox.path, &script);
+    let mut stderr = diagnostic_sandbox_path_v1(&stderr, &identity.path, &sandbox.path, &script);
     for (from, to) in &case.normalization.stderr_replacements {
         stderr = replace_all(&stderr, from, to);
     }
@@ -6743,10 +14174,24 @@ fn json_usize_line(document: &str, field: &str) -> Option<usize> {
     values.next().is_none().then_some(value)
 }
 
-fn diagnostic_sandbox_path_v1(stderr: &[u8], sandbox: &Path, script: &Path) -> Vec<u8> {
+fn diagnostic_sandbox_path_v1(
+    stderr: &[u8],
+    executable: &Path,
+    sandbox: &Path,
+    script: &Path,
+) -> Vec<u8> {
+    let program = executable
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
     let sandbox = sandbox.to_string_lossy();
     let script = script.to_string_lossy();
-    scrub_diagnostic_path_bytes(stderr, sandbox.as_bytes(), script.as_bytes())
+    scrub_diagnostic_path_bytes(
+        stderr,
+        sandbox.as_bytes(),
+        script.as_bytes(),
+        program.as_bytes(),
+    )
 }
 
 fn diagnostic_path_separator_v1(stderr: &mut [u8]) {
@@ -6779,7 +14224,28 @@ const fn diagnostic_mutant_active() -> bool {
     false
 }
 
-fn scrub_diagnostic_path_bytes(stderr: &[u8], _sandbox: &[u8], script: &[u8]) -> Vec<u8> {
+#[cfg(feature = "mutation-testing")]
+fn diagnostic_program_mutant_active() -> bool {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    arguments.windows(4).any(|window| {
+        window[0] == "--skip"
+            && window[1] == "__hell_mutant"
+            && window[2] == "--skip"
+            && window[3] == "diagnostic-hardcoded-oracle-program"
+    })
+}
+
+#[cfg(not(feature = "mutation-testing"))]
+const fn diagnostic_program_mutant_active() -> bool {
+    false
+}
+
+fn scrub_diagnostic_path_bytes(
+    stderr: &[u8],
+    _sandbox: &[u8],
+    script: &[u8],
+    program: &[u8],
+) -> Vec<u8> {
     if diagnostic_mutant_active() {
         return replace_all(stderr, script, b"<SANDBOX>/main.hell");
     }
@@ -6797,38 +14263,81 @@ fn scrub_diagnostic_path_bytes(stderr: &[u8], _sandbox: &[u8], script: &[u8]) ->
     quoted_marker.push(b'"');
     scrubbed = replace_all(&scrubbed, &quoted_script, &quoted_marker);
     let mut output = Vec::with_capacity(scrubbed.len());
+    let mut separate_parse_frame = 0_u8;
     for line in scrubbed.split_inclusive(|byte| *byte == b'\n') {
-        if let Some((prefix, suffix)) = structured_diagnostic_path(line, script) {
+        if let Some((prefix, suffix)) = structured_diagnostic_path(line, script, program) {
             output.extend_from_slice(prefix);
             output.extend_from_slice(marker);
             output.extend_from_slice(suffix);
+            separate_parse_frame = 0;
+        } else if separate_parse_frame == 2
+            && let Some((prefix, suffix)) = separate_oracle_parse_path(line, script)
+        {
+            output.extend_from_slice(prefix);
+            output.extend_from_slice(marker);
+            output.extend_from_slice(suffix);
+            separate_parse_frame = 0;
         } else {
             output.extend_from_slice(line);
+            separate_parse_frame = if exact_oracle_exception_frame(line, program) {
+                1
+            } else if separate_parse_frame == 1 && diagnostic_blank_line(line) {
+                2
+            } else {
+                0
+            };
         }
     }
     output
 }
 
+fn exact_oracle_exception_frame(line: &[u8], program: &[u8]) -> bool {
+    const SUFFIX: &[u8] = b": Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:";
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    !program.is_empty() && line.strip_prefix(program) == Some(SUFFIX)
+}
+
+fn diagnostic_blank_line(line: &[u8]) -> bool {
+    line == b"\n" || line == b"\r\n"
+}
+
+fn separate_oracle_parse_path<'a>(line: &'a [u8], script: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    const PREFIX: &[u8] = b"Parse error: ";
+    line.strip_prefix(PREFIX)
+        .and_then(|line| line.strip_prefix(script))
+        .filter(|suffix| diagnostic_path_suffix(suffix))
+        .map(|suffix| (&line[..PREFIX.len()], suffix))
+}
+
 fn structured_diagnostic_path<'a>(
     line: &'a [u8],
     script: &[u8],
-) -> Option<(&'static [u8], &'a [u8])> {
+    program: &[u8],
+) -> Option<(&'a [u8], &'a [u8])> {
     const HELPER_PREFIX: &[u8] = b"unknown helper subcommand ";
-    const ORACLE_PARSE_PREFIX: &[u8] = b"hell: Parse error: ";
+    const ORACLE_PARSE_MARKER: &[u8] = b": Parse error: ";
     if let Some(suffix) = line
         .strip_prefix(script)
         .filter(|suffix| diagnostic_path_suffix(suffix))
     {
-        return Some((b"", suffix));
+        return Some((&line[..0], suffix));
     }
-    for prefix in [HELPER_PREFIX, ORACLE_PARSE_PREFIX] {
-        if let Some(suffix) = line
-            .strip_prefix(prefix)
+    if let Some(suffix) = line
+        .strip_prefix(HELPER_PREFIX)
+        .and_then(|line| line.strip_prefix(script))
+        .filter(|suffix| diagnostic_path_suffix(suffix))
+    {
+        return Some((&line[..HELPER_PREFIX.len()], suffix));
+    }
+    if !program.is_empty()
+        && let Some(suffix) = line
+            .strip_prefix(program)
+            .and_then(|line| line.strip_prefix(ORACLE_PARSE_MARKER))
             .and_then(|line| line.strip_prefix(script))
             .filter(|suffix| diagnostic_path_suffix(suffix))
-        {
-            return Some((prefix, suffix));
-        }
+    {
+        return Some((&line[..program.len() + ORACLE_PARSE_MARKER.len()], suffix));
     }
     None
 }
@@ -7043,6 +14552,31 @@ pub fn run_supervised_command(
     input: &[u8],
     timeout: Duration,
 ) -> std::io::Result<SupervisedOutput> {
+    run_supervised_command_inner(command, input, timeout, None)
+}
+
+/// Runs a structured command while preserving one separately bound logical
+/// executable alias and revalidating its canonical file identity.
+///
+/// # Errors
+///
+/// Returns an error when the bound invocation changes or when supervised
+/// execution, capture, or cleanup fails.
+pub fn run_supervised_command_with_bound_program(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    bound_program: &BoundProgramInvocation,
+) -> std::io::Result<SupervisedOutput> {
+    run_supervised_command_inner(command, input, timeout, Some(bound_program))
+}
+
+fn run_supervised_command_inner(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    bound_program: Option<&BoundProgramInvocation>,
+) -> std::io::Result<SupervisedOutput> {
     struct QuiescenceGuard(Option<CandidateLaunchPolicy>);
     impl Drop for QuiescenceGuard {
         fn drop(&mut self) {
@@ -7052,9 +14586,12 @@ pub fn run_supervised_command(
         }
     }
 
+    if let Some(identity) = bound_program {
+        identity.revalidate(command.get_program())?;
+    }
     let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
     if let Some(policy) = &launch_policy {
-        policy.wrap(command)?;
+        policy.wrap(command, bound_program)?;
     }
     let mut quiescence = QuiescenceGuard(launch_policy);
     command
@@ -7563,10 +15100,12 @@ impl Iterator for DeterministicUtf8 {
 
 #[cfg(test)]
 mod authority_environment_tests {
+    #[cfg(unix)]
+    use super::configure_release_child_environment;
     use super::{
         Command, WINDOWS_ARGV_TOKEN_LIMIT, WINDOWS_ARGV_TOKEN_PREFIX,
-        configure_evidence_native_environment, configure_release_child_environment,
-        decode_windows_argv_units, encode_windows_argv_units,
+        configure_evidence_native_environment, decode_windows_argv_units,
+        encode_windows_argv_units,
     };
 
     #[test]
@@ -7651,9 +15190,10 @@ mod diagnostic_tests {
     use super::{
         DiagnosticCategory, DiagnosticObservation, DiagnosticPhase, NormalizerId,
         RetainedNormalizerInput, apply_retained_normalizer_twice, configure_execution_profile,
-        diagnostic_path_separator_v1, parse_diagnostic_observation, scrub_diagnostic_path_bytes,
+        diagnostic_path_separator_v1, parse_diagnostic_observation, replay_conformance_stderr,
+        scrub_diagnostic_path_bytes,
     };
-    use crate::{ExecutableRole, ExecutionProfile};
+    use crate::{DifferentialCase, ExecutableRole, ExecutionProfile};
     use std::path::Path;
     use std::process::Command;
 
@@ -7685,7 +15225,7 @@ mod diagnostic_tests {
         let script = br"C:\work\sandbox\main.hell";
         let escaped =
             br#"hell: Invalid variable: Qual (SrcSpan "C:\\work\\sandbox\\main.hell" 1 17 1 33)"#;
-        let scrubbed = scrub_diagnostic_path_bytes(escaped, sandbox, script);
+        let scrubbed = scrub_diagnostic_path_bytes(escaped, sandbox, script, b"hell");
         assert_eq!(
             scrubbed,
             br#"hell: Invalid variable: Qual (SrcSpan "<SANDBOX>\main.hell" 1 17 1 33)"#
@@ -7706,6 +15246,7 @@ mod diagnostic_tests {
                 br"C:\work\sandbox\main.hell:1:17: error[H0402]",
                 sandbox,
                 script,
+                b"hell",
             ),
             br"<SANDBOX>\main.hell:1:17: error[H0402]"
         );
@@ -7714,6 +15255,7 @@ mod diagnostic_tests {
                 br#"SrcSpan "/tmp/sandbox/main.hell" 1 17 1 33"#,
                 br"/tmp/sandbox",
                 br"/tmp/sandbox/main.hell",
+                b"hell",
             ),
             br#"SrcSpan "<SANDBOX>/main.hell" 1 17 1 33"#
         );
@@ -7724,7 +15266,7 @@ mod diagnostic_tests {
             br"unquoted C:\\work\\sandbox\\main.hell 1 17".as_slice(),
         ] {
             assert_eq!(
-                scrub_diagnostic_path_bytes(near_match, sandbox, script),
+                scrub_diagnostic_path_bytes(near_match, sandbox, script, b"hell"),
                 near_match
             );
         }
@@ -7769,6 +15311,118 @@ mod diagnostic_tests {
                     line: 1,
                     column: 17,
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn acquired_oracle_parse_diagnostic_is_bound_to_its_execution_alias() {
+        let sandbox = br"/tmp/differential-oracle";
+        let script = br"/tmp/differential-oracle/main.hell";
+        let raw = b"hell: Parse error: /tmp/differential-oracle/main.hell:2:1: Parse error: ;\n";
+        let scrubbed = scrub_diagnostic_path_bytes(raw, sandbox, script, b"hell");
+        assert_eq!(
+            scrubbed,
+            b"hell: Parse error: <SANDBOX>/main.hell:2:1: Parse error: ;\n"
+        );
+        assert_eq!(
+            parse_diagnostic_observation(&scrubbed).expect("acquired oracle parse diagnostic"),
+            DiagnosticObservation {
+                phase: DiagnosticPhase::Parse,
+                code: "H0200".into(),
+                category: DiagnosticCategory::Syntax,
+                protected_message: "syntax-error".into(),
+                line: 2,
+                column: 1,
+            }
+        );
+        let case = DifferentialCase::default();
+        assert_eq!(
+            replay_conformance_stderr(
+                raw,
+                Path::new("/ci/oracle-execution/hell"),
+                Path::new("/tmp/differential-oracle"),
+                Path::new("/tmp/differential-oracle/main.hell"),
+                &case,
+                &[],
+            )
+            .expect("exact acquired-oracle replay"),
+            scrubbed
+        );
+        assert_ne!(
+            replay_conformance_stderr(
+                raw,
+                Path::new("/ci/oracle-execution/other"),
+                Path::new("/tmp/differential-oracle"),
+                Path::new("/tmp/differential-oracle/main.hell"),
+                &case,
+                &[],
+            )
+            .expect("forged executable path remains outside the normalizer authority"),
+            scrubbed
+        );
+
+        for forged in [
+            b"linux-release-oracle: Parse error: /tmp/differential-oracle/main.hell:2:1\n"
+                .as_slice(),
+            b"other: Parse error: /tmp/differential-oracle/main.hell:2:1\n".as_slice(),
+            b"hell: Parse error: /tmp/differential-oracle/main.hellish:2:1\n".as_slice(),
+        ] {
+            assert_eq!(
+                scrub_diagnostic_path_bytes(forged, sandbox, script, b"hell"),
+                forged
+            );
+        }
+    }
+
+    #[test]
+    fn acquired_oracle_separate_parse_frame_is_exactly_bound() {
+        let case = DifferentialCase::default();
+        let raw = b"hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\nParse error: /tmp/differential-oracle/main.hell:2:1: Parse error: ;\n\nHasCallStack backtrace:\n";
+        let scrubbed = replay_conformance_stderr(
+            raw,
+            Path::new("/ci/oracle-execution/hell"),
+            Path::new("/tmp/differential-oracle"),
+            Path::new("/tmp/differential-oracle/main.hell"),
+            &case,
+            &[],
+        )
+        .expect("exact separate-frame acquired-oracle replay");
+        assert_eq!(
+            scrubbed,
+            b"hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\nParse error: <SANDBOX>/main.hell:2:1: Parse error: ;\n\nHasCallStack backtrace:\n"
+        );
+        assert_eq!(
+            parse_diagnostic_observation(&scrubbed)
+                .expect("separate-frame acquired oracle parse diagnostic"),
+            DiagnosticObservation {
+                phase: DiagnosticPhase::Parse,
+                code: "H0200".into(),
+                category: DiagnosticCategory::Syntax,
+                protected_message: "syntax-error".into(),
+                line: 2,
+                column: 1,
+            }
+        );
+
+        for forged in [
+            b"linux-release-oracle: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\nParse error: /tmp/differential-oracle/main.hell:2:1\n".as_slice(),
+            b"hell: Uncaught exception Other.Error:\n\nParse error: /tmp/differential-oracle/main.hell:2:1\n".as_slice(),
+            b"hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\nParse error: /tmp/differential-oracle/main.hell:2:1\n".as_slice(),
+            b"hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\nuser output\nParse error: /tmp/differential-oracle/main.hell:2:1\n".as_slice(),
+            b"hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\nParse error: /tmp/differential-oracle/main.hellish:2:1\n".as_slice(),
+        ] {
+            assert_eq!(
+                replay_conformance_stderr(
+                    forged,
+                    Path::new("/ci/oracle-execution/hell"),
+                    Path::new("/tmp/differential-oracle"),
+                    Path::new("/tmp/differential-oracle/main.hell"),
+                    &case,
+                    &[],
+                )
+                .expect("forged separate frame remains outside the normalizer authority"),
+                forged
             );
         }
     }
@@ -7820,17 +15474,18 @@ mod diagnostic_tests {
         let script = br"C:\work\sandbox\main.hell";
         let message = br"user message C:\work\sandbox\main.hell is data";
         assert_eq!(
-            scrub_diagnostic_path_bytes(message, sandbox, script),
+            scrub_diagnostic_path_bytes(message, sandbox, script, b"hell"),
             message
         );
         let diagnostic = br"C:\work\sandbox\main.hell:4:2: error[H0200]";
-        let once = scrub_diagnostic_path_bytes(diagnostic, sandbox, script);
+        let once = scrub_diagnostic_path_bytes(diagnostic, sandbox, script, b"hell");
         assert_eq!(once, br"<SANDBOX>\main.hell:4:2: error[H0200]");
         assert_eq!(
             scrub_diagnostic_path_bytes(
                 br"unknown helper subcommand C:\work\sandbox\main.hell",
                 sandbox,
-                script
+                script,
+                b"hell",
             ),
             br"unknown helper subcommand <SANDBOX>\main.hell"
         );
@@ -7838,7 +15493,8 @@ mod diagnostic_tests {
             scrub_diagnostic_path_bytes(
                 br"hell: Parse error: C:\work\sandbox\main.hell:2:1: Parse error: ;",
                 sandbox,
-                script
+                script,
+                b"hell",
             ),
             br"hell: Parse error: <SANDBOX>\main.hell:2:1: Parse error: ;"
         );
@@ -7846,12 +15502,13 @@ mod diagnostic_tests {
             scrub_diagnostic_path_bytes(
                 br"hell: Parse error: C:\work\sandbox\main.hellish:2:1",
                 sandbox,
-                script
+                script,
+                b"hell",
             ),
             br"hell: Parse error: C:\work\sandbox\main.hellish:2:1"
         );
         assert_eq!(
-            scrub_diagnostic_path_bytes(&once, br"<SANDBOX>", br"<SANDBOX>\main.hell"),
+            scrub_diagnostic_path_bytes(&once, br"<SANDBOX>", br"<SANDBOX>\main.hell", b"hell",),
             once
         );
     }
@@ -7864,6 +15521,7 @@ mod diagnostic_tests {
         let sandbox_passes = apply_retained_normalizer_twice(RetainedNormalizerInput {
             normalizer: NormalizerId::DiagnosticSandboxPathV1,
             observation: input,
+            executable: Path::new("hell"),
             sandbox,
             script,
         });
@@ -7876,6 +15534,7 @@ mod diagnostic_tests {
         let separator_passes = apply_retained_normalizer_twice(RetainedNormalizerInput {
             normalizer: NormalizerId::DiagnosticPathSeparatorV1,
             observation: &sandbox_passes.first_pass,
+            executable: Path::new("hell"),
             sandbox,
             script,
         });

@@ -38,6 +38,31 @@ fn candidate_identity(build_info: Option<hell_testkit::BuildInfo>) -> Executable
     identity
 }
 
+fn lexical_parent_path(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let mut units = path
+            .parent()
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        units.extend(std::ffi::OsStr::new("\\missing-component\\..\\").encode_wide());
+        units.extend(path.file_name().unwrap().encode_wide());
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units))
+    }
+    #[cfg(not(windows))]
+    {
+        path.parent()
+            .unwrap()
+            .join("missing-component")
+            .join("..")
+            .join(path.file_name().unwrap())
+    }
+}
+
 #[test]
 fn candidate_build_info_schema_is_closed_and_versioned() {
     let enabled = build_info_lines(true);
@@ -95,17 +120,31 @@ fn evidence_candidate_attestation_binds_canonical_path_and_digest() {
     identity.build_info = Some(parse(&build_info_lines(true)).unwrap());
     verify_compat_tracing_candidate_identity(&identity).unwrap();
 
-    let file_name = identity.path.file_name().unwrap().to_owned();
-    let noncanonical = identity
-        .path
-        .parent()
-        .unwrap()
-        .join("missing-component")
-        .join("..")
-        .join(file_name);
+    let noncanonical = lexical_parent_path(&identity.path);
     let mut wrong_path = identity.clone();
     wrong_path.path = noncanonical;
     assert!(verify_compat_tracing_candidate_identity(&wrong_path).is_err());
+
+    let near_match_root = identity
+        .path
+        .parent()
+        .unwrap()
+        .join(format!("hell-build-info-near-match-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&near_match_root);
+    fs::create_dir(&near_match_root).unwrap();
+    for component in ["...", ".name", "name.."] {
+        let directory = near_match_root.join(component);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join(identity.path.file_name().unwrap());
+        fs::copy(&identity.path, &path).unwrap();
+        let mut near_match = inspect_executable(&path, ExecutableRole::Oracle).unwrap();
+        near_match.role = ExecutableRole::Candidate;
+        near_match.build_info = Some(parse(&build_info_lines(true)).unwrap());
+        verify_compat_tracing_candidate_identity(&near_match).unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+    fs::remove_dir(near_match_root).unwrap();
 
     fs::OpenOptions::new()
         .append(true)

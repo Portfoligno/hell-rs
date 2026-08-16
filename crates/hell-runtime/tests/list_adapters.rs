@@ -207,6 +207,34 @@ fn structural_combinators_match_the_oracle_order_and_accumulator_quirks() {
 }
 
 #[test]
+fn nan_sorting_matches_the_reviewed_native_oracle_merge_algorithm() {
+    let source = concat!(
+        "nan = Maybe.maybe (Error.error \"nan\") Function.id $ Double.readMaybe \"NaN\"\n",
+        "main = do\n",
+        "  IO.print $ List.sort [Main.nan,1.25]\n",
+        "  IO.print $ List.sort [1.25,Main.nan]\n",
+        "  IO.print $ List.sort [Main.nan,1.25,Main.nan,1.75]\n",
+        "  IO.print $ List.sortOn (\\(key, payload) -> key) ",
+        "[(Main.nan,\"item-0\"),(1.25,\"item-1\"),(Main.nan,\"item-2\"),(1.75,\"item-3\")]\n",
+    );
+    let expected = match hell_builtins::native_oracle_list_sort() {
+        hell_builtins::NativeOracleListSort::Ghc98Base419TwoWay => concat!(
+            "[1.25,NaN]\n",
+            "[NaN,1.25]\n",
+            "[1.75,NaN,1.25,NaN]\n",
+            "[(1.75,\"item-3\"),(NaN,\"item-2\"),(1.25,\"item-1\"),(NaN,\"item-0\")]\n",
+        ),
+        hell_builtins::NativeOracleListSort::Ghc912Base421FourWay => concat!(
+            "[NaN,1.25]\n",
+            "[1.25,NaN]\n",
+            "[NaN,1.25,NaN,1.75]\n",
+            "[(1.25,\"item-1\"),(1.75,\"item-3\"),(NaN,\"item-2\"),(NaN,\"item-0\")]\n",
+        ),
+    };
+    assert_eq!(run(source), expected);
+}
+
+#[test]
 fn shared_splits_and_combinatorial_producers_are_productive() {
     let source = concat!(
         "main = do\n",

@@ -469,7 +469,28 @@ fn has_one_canonical_plan_marker(body: &str) -> bool {
 }
 
 pub(crate) fn source_inventory(root: &Path) -> Result<JsonValue, String> {
+    source_inventory_with_authority(root, InventoryAuthority::Candidate)
+}
+
+pub(crate) fn pinned_oracle_source_inventory(root: &Path) -> Result<JsonValue, String> {
+    crate::command::verify_pinned_oracle_checkout(root)?;
+    let inventory = source_inventory_with_authority(root, InventoryAuthority::PinnedOracle)?;
+    crate::command::verify_pinned_oracle_checkout(root)?;
+    Ok(inventory)
+}
+
+#[derive(Clone, Copy)]
+enum InventoryAuthority {
+    Candidate,
+    PinnedOracle,
+}
+
+fn source_inventory_with_authority(
+    root: &Path,
+    authority: InventoryAuthority,
+) -> Result<JsonValue, String> {
     let result = CommandSpec::new("git", Duration::from_secs(60))
+        .git_safe_directory(root)
         .arguments(["ls-files", "--stage", "-z"])
         .current_directory(root)
         .run()
@@ -507,11 +528,7 @@ pub(crate) fn source_inventory(root: &Path) -> Result<JsonValue, String> {
         }
         let path = root.join(relative);
         let bytes = read_regular(&path)?;
-        if std::str::from_utf8(&bytes).is_ok() && !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(format!(
-                "tracked text file {relative:?} has no trailing newline"
-            ));
-        }
+        validate_inventory_bytes(authority, relative, &bytes)?;
         entries.push(object([
             ("mode", string(fields[0])),
             ("path", string(relative)),
@@ -526,6 +543,23 @@ pub(crate) fn source_inventory(root: &Path) -> Result<JsonValue, String> {
         ("files", JsonValue::Array(entries)),
         ("schemaVersion", number(1)),
     ]))
+}
+
+fn validate_inventory_bytes(
+    authority: InventoryAuthority,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if matches!(authority, InventoryAuthority::Candidate)
+        && std::str::from_utf8(bytes).is_ok()
+        && !bytes.is_empty()
+        && !bytes.ends_with(b"\n")
+    {
+        return Err(format!(
+            "tracked text file {relative:?} has no trailing newline"
+        ));
+    }
+    Ok(())
 }
 
 fn ignored_ownership_path(relative: &str) -> bool {
@@ -654,6 +688,27 @@ mod tests {
             assert!(ignored_ownership_path(path));
         }
         assert!(!ignored_ownership_path("docs/release.md"));
+    }
+
+    #[test]
+    fn pinned_oracle_inventory_preserves_historical_text_bytes() {
+        let historical = b"<html>historical oracle output</html>";
+        assert!(
+            validate_inventory_bytes(
+                InventoryAuthority::Candidate,
+                "docs/api/index.html",
+                historical,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_inventory_bytes(
+                InventoryAuthority::PinnedOracle,
+                "docs/api/index.html",
+                historical,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

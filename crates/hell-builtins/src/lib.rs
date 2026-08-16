@@ -36,6 +36,35 @@ pub const PUBLIC_NAME_COUNT: usize = 345;
 pub const INTERNAL_NAME_COUNT: usize = 10;
 pub const UNIQUE_NAME_COUNT: usize = PUBLIC_NAME_COUNT + INTERNAL_NAME_COUNT;
 
+/// The list-sort implementation exposed by the reviewed native oracle for the
+/// current release target. GHC 9.12/base-4.21 changed `Data.List.sort` from the
+/// two-way natural merge used by GHC 9.8/base-4.19 to `actualSort`, whose raw
+/// `(>)` comparator and specialized two-, three-, and four-way merges are
+/// observable for non-total `Ord` instances such as `Double` containing NaN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOracleListSort {
+    Ghc98Base419TwoWay,
+    Ghc912Base421FourWay,
+}
+
+/// Binds guest-visible list sorting to the release workflow's reviewed native
+/// oracle/toolchain matrix. Linux x86-64 uses the pinned GHC 9.12/base-4.21
+/// oracle binary; the macOS arm64 and Windows x86-64 source oracles use the
+/// pinned GHC 9.8.2/base-4.19 toolchain. Unreviewed development targets retain
+/// the established base-4.19 behavior instead of claiming release evidence.
+#[must_use]
+pub const fn native_oracle_list_sort() -> NativeOracleListSort {
+    if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        NativeOracleListSort::Ghc912Base421FourWay
+    } else {
+        NativeOracleListSort::Ghc98Base419TwoWay
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BuiltinId(pub u16);
 

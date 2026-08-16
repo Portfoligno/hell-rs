@@ -402,6 +402,21 @@ fn committed_differential_cases_with_collection(include_collection: bool) -> Vec
     cases.push(runtime_numeric_time_obligations_case());
     cases.extend(list_take_boundary_cases());
     cases.extend(runtime_interaction_cases());
+    let reviewed_failure_presentations = cases
+        .iter()
+        .filter(|case| crate::has_runtime_failure_presentation_authority(&case.id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reviewed_failure_presentations.len(),
+        33,
+        "reviewed exception-presentation authority must bind exactly 33 committed cases",
+    );
+    assert!(
+        reviewed_failure_presentations
+            .iter()
+            .all(|case| !case.expected_runtime_completion),
+        "reviewed exception-presentation cases must declare failing runtime completion",
+    );
     let reviewed_regressions = committed_reviewed_regressions(&cases);
     cases.extend(reviewed_regressions);
     cases
@@ -2051,6 +2066,7 @@ fn runtime_text_decode_utf8_boundary_cases() -> Vec<DifferentialCase> {
             id: Arc::from(format!("text-decodeutf8-boundary-{boundary}")),
             source: Arc::from(source),
             stdin,
+            expected_runtime_completion: boundary != "invalid-encoding",
             claim_evidence: Some(descriptor),
             ..DifferentialCase::default()
         }
@@ -2151,6 +2167,7 @@ fn runtime_text_stdio_input_case(
         )),
         source: Arc::from(source),
         stdin,
+        expected_runtime_completion: success,
         claim_evidence: Some(descriptor),
         ..DifferentialCase::default()
     }
@@ -2840,6 +2857,7 @@ fn runtime_environment_observation_cases() -> Vec<DifferentialCase> {
     cases.push(DifferentialCase {
         id: Arc::from("runtime-environment-get-env-missing"),
         source: Arc::from(failure_source),
+        expected_runtime_completion: false,
         claim_evidence: Some(failure),
         ..DifferentialCase::default()
     });
@@ -5853,6 +5871,13 @@ fn runtime_ord_list_double_case(
 ) -> DifferentialCase {
     let sorted_indices: Vec<usize> = match path {
         "signed-zero-stability" => vec![0, 1],
+        "nan-finite"
+            if builtin == "List.sort"
+                && hell_builtins::native_oracle_list_sort()
+                    == hell_builtins::NativeOracleListSort::Ghc912Base421FourWay =>
+        {
+            vec![0, 1, 2]
+        }
         "nan-finite" => vec![2, 1, 0],
         "infinities" => vec![1, 2, 0],
         _ => unreachable!("reviewed Double Ord list path"),
@@ -5947,7 +5972,14 @@ fn runtime_ord_list_double_two_value_cases(
         ("finite-before-nan", [finite, nan]),
     ] {
         for builtin in ["List.sort", "List.sortOn"] {
-            let values = vec![source_values[1].clone(), source_values[0].clone()];
+            let values = if builtin == "List.sort"
+                && hell_builtins::native_oracle_list_sort()
+                    == hell_builtins::NativeOracleListSort::Ghc912Base421FourWay
+            {
+                source_values.iter().map(|value| (*value).clone()).collect()
+            } else {
+                vec![source_values[1].clone(), source_values[0].clone()]
+            };
             let (source, values, invocations) = if builtin == "List.sortOn" {
                 let first = ord_list_keyed_value(source_values[0], "first");
                 let second = ord_list_keyed_value(source_values[1], "second");
@@ -6010,7 +6042,7 @@ fn runtime_ord_list_double_shape_cases(
     let source_values = [nan.clone(), finite_one, nan.clone(), finite_two];
     let mut cases = Vec::new();
     for builtin in ["List.sort", "List.sortOn"] {
-        let output_indices = [3, 2, 1, 0];
+        let output_indices = ord_list_double_shape_output_indices(builtin);
         let (source, values, invocations) = if builtin == "List.sortOn" {
             let keyed = source_values
                 .iter()
@@ -6102,6 +6134,14 @@ fn runtime_ord_list_double_shape_cases(
         },
     ));
     cases
+}
+
+fn ord_list_double_shape_output_indices(builtin: &str) -> [usize; 4] {
+    match (hell_builtins::native_oracle_list_sort(), builtin) {
+        (hell_builtins::NativeOracleListSort::Ghc912Base421FourWay, "List.sort") => [0, 1, 2, 3],
+        (hell_builtins::NativeOracleListSort::Ghc912Base421FourWay, "List.sortOn") => [1, 3, 2, 0],
+        _ => [3, 2, 1, 0],
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -11826,7 +11866,9 @@ fn runtime_directory_observation_cases() -> Vec<DifferentialCase> {
                 "  Directory.createDirectory \"current\"\n",
                 "  Directory.setCurrentDirectory \"current\"\n",
                 "  current <- Directory.getCurrentDirectory\n",
-                "  Text.writeFile (Text.concat [current, \"/sentinel\"]) \"bound\"\n",
+                "  Directory.setCurrentDirectory \"..\"\n",
+                "  Directory.setCurrentDirectory current\n",
+                "  Text.writeFile \"sentinel\" \"bound\"\n",
                 "  output <- Text.readFile \"sentinel\"\n",
                 "  Directory.removeFile \"sentinel\"\n",
                 "  Directory.setCurrentDirectory \"..\"\n",
@@ -11914,25 +11956,30 @@ fn runtime_home_directory_cases() -> Vec<DifferentialCase> {
             let source = format!(
                 concat!(
                     "main = do\n",
-                    "  Directory.createDirectory {home:?}\n",
                     "  actual <- Directory.getHomeDirectory\n",
-                    "  Text.writeFile (Text.concat [actual, \"/sentinel\"]) {output:?}\n",
-                    "  retained <- Text.readFile (Text.concat [{home:?}, \"/sentinel\"])\n",
-                    "  Text.putStr retained\n",
+                    "  IO.print $ Text.eq actual {home:?}\n",
                 ),
                 home = home,
-                output = output,
             );
             let mut case = runtime_io_success_case(
                 "Directory.getHomeDirectory",
                 &format!("runtime-directory-get-home-{output}"),
                 &source,
-                output.as_bytes(),
+                b"",
             );
             case.environment = vec![
                 ("HOME".into(), home.into()),
                 ("USERPROFILE".into(), home.into()),
             ];
+            let descriptor = case
+                .claim_evidence
+                .as_mut()
+                .expect("home-directory descriptor");
+            descriptor.review_statement =
+                Arc::from("runtime-home-directory-platform-native-oracle-review-v1");
+            for target in &mut descriptor.semantic_targets {
+                target.expected_raw_presentation_sha256 = None;
+            }
             case
         })
         .collect::<Vec<_>>();
@@ -12174,6 +12221,7 @@ fn runtime_directory_failure_case(builtin: &str, id: &str, source: &str) -> Diff
     DifferentialCase {
         id: Arc::from(id),
         source: Arc::from(source),
+        expected_runtime_completion: false,
         claim_evidence: Some(descriptor),
         ..DifferentialCase::default()
     }
@@ -14633,6 +14681,7 @@ fn runtime_interaction_cases() -> Vec<DifferentialCase> {
                 source: Arc::from(source),
                 arguments,
                 environment_profile,
+                expected_runtime_completion: interaction != "list-laziness-error",
                 claim_evidence: Some(runtime_interaction_descriptor(
                     interaction,
                     builtins,
@@ -14697,12 +14746,9 @@ fn runtime_interaction_definitions() -> Vec<RuntimeInteractionDefinition> {
             "race-temporary-resource",
             &["Async.race", "Temp.withSystemTempFile"][..],
             concat!(
-                "temporary = Temp.withSystemTempFile \"hell-runtime-interaction\" \\_path handle -> do\n",
+                "main = Temp.withSystemTempFile \"hell-runtime-interaction\" \\_path handle -> do\n",
                 "  Text.hPutStr handle \"retained-before-cancel\"\n",
-                "  Concurrent.threadDelay 1000000\n",
-                "winner = Concurrent.threadDelay 100000\n",
-                "main = do\n",
-                "  _result <- Async.race Main.temporary Main.winner\n",
+                "  _result <- Async.race (Concurrent.threadDelay 1000000) (IO.pure ())\n",
                 "  IO.pure ()\n",
             ),
             Vec::new(),
@@ -14947,6 +14993,7 @@ fn list_take_boundary_cases() -> Vec<DifferentialCase> {
     .map(|(boundary, source)| DifferentialCase {
         id: Arc::from(format!("list-take-boundary-{boundary}")),
         source: Arc::from(source),
+        expected_runtime_completion: boundary != "bottom-after-demanded-prefix",
         claim_evidence: Some(runtime_builtin_boundary_descriptor(
             "List.take",
             boundary,
@@ -21287,6 +21334,96 @@ fn split_mix(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn race_temporary_interaction_acquires_its_resource_before_starting_the_race() {
+        let (_, participants, source, _, _) = runtime_interaction_definitions()
+            .into_iter()
+            .find(|(interaction, _, _, _, _)| *interaction == "race-temporary-resource")
+            .expect("race/temporary interaction definition");
+        assert_eq!(participants, ["Async.race", "Temp.withSystemTempFile"]);
+        let temporary = source
+            .find("main = Temp.withSystemTempFile")
+            .expect("outer temporary resource acquisition");
+        let write = source
+            .find("Text.hPutStr handle")
+            .expect("temporary resource use");
+        let race = source.find("Async.race").expect("nested race execution");
+        assert!(temporary < write && write < race);
+
+        let case = runtime_interaction_cases()
+            .into_iter()
+            .find(|case| case.id.as_ref() == "runtime-interaction-race-temporary-resource")
+            .expect("committed race/temporary interaction");
+        let targets = &case.claim_evidence.as_ref().unwrap().semantic_targets;
+        assert!(targets.iter().any(|target| {
+            target.builtin.as_ref() == "Temp.withSystemTempFile"
+                && target.dimension == CompatibilityDimension::PureRuntime
+                && target
+                    .obligations
+                    .iter()
+                    .any(|obligation| obligation.0.as_ref() == "io-execution-boundary")
+        }));
+    }
+
+    #[test]
+    fn reviewed_runtime_failure_presentations_bind_exact_closed_inventory() {
+        let cases = committed_differential_cases();
+        let authorities = cases
+            .iter()
+            .filter_map(|case| {
+                crate::reviewed_runtime_failure_presentation_authority(case)
+                    .map(|authority| (case, authority))
+            })
+            .collect::<Vec<_>>();
+        let rejected = cases
+            .iter()
+            .filter(|case| crate::has_runtime_failure_presentation_authority(&case.id))
+            .filter(|case| crate::reviewed_runtime_failure_presentation_authority(case).is_none())
+            .map(|case| case.id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(authorities.len(), 33, "rejected authorities: {rejected:?}");
+        assert!(
+            authorities
+                .iter()
+                .all(|(case, _)| !case.expected_runtime_completion)
+        );
+        assert_eq!(
+            authorities
+                .iter()
+                .filter(|(_, authority)| {
+                    authority.family == crate::RuntimeFailureExceptionFamily::UnicodeException
+                })
+                .count(),
+            3,
+        );
+        assert_eq!(
+            authorities
+                .iter()
+                .filter(|(_, authority)| {
+                    authority.family == crate::RuntimeFailureExceptionFamily::IOException
+                })
+                .count(),
+            19,
+        );
+        assert_eq!(
+            authorities
+                .iter()
+                .filter(|(_, authority)| {
+                    authority.family == crate::RuntimeFailureExceptionFamily::ErrorCall
+                })
+                .count(),
+            11,
+        );
+        assert!(authorities.iter().all(|(case, _)| {
+            crate::artifact::case_descriptor(case).starts_with("schema_version = 9\n")
+        }));
+        let ordinary = cases
+            .iter()
+            .find(|case| case.id.as_ref() == "bool-ordinary-success")
+            .expect("ordinary committed case");
+        assert!(crate::artifact::case_descriptor(ordinary).starts_with("schema_version = 8\n"));
+    }
 
     fn assert_io_print_presentation_is_applicable() {
         let print = hell_builtins::lookup("IO.print").expect("IO.print remains registry-backed");

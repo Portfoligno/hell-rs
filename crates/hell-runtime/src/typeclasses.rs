@@ -1960,6 +1960,13 @@ fn sort_list_on(
         });
         decorated.push((key, value));
     }
+    if crate::native_list::use_base_421_sort_topology() {
+        let sorted =
+            crate::native_list::base_421_sort(evaluator, decorated, keyed_pair_greater_than)?;
+        return Ok(ForceOutcome::Alias(list_from_values(
+            sorted.into_iter().map(|(_, value)| value).collect(),
+        )));
+    }
     let mut runs = natural_keyed_runs(evaluator, decorated)?;
     while runs.len() > 1 {
         evaluator.ensure_not_cancelled()?;
@@ -1981,6 +1988,14 @@ fn sort_list_on(
             .map(|(_, value)| value)
             .collect(),
     )))
+}
+
+fn keyed_pair_greater_than(
+    evaluator: &mut Evaluator,
+    left: &(ThunkRef, ThunkRef),
+    right: &(ThunkRef, ThunkRef),
+) -> RuntimeResult<bool> {
+    keyed_greater_than(evaluator, &left.0, &right.0)
 }
 
 fn natural_keyed_runs(

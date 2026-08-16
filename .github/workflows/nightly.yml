@@ -39,6 +39,8 @@ jobs:
         with:
           path: target
           key: nightly-linux-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ci-tool-cache/cargo-deny-target
       - name: Build CI driver
         run: cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
       - name: Build debug candidate

@@ -52,6 +52,7 @@ const FUZZ_TRACE_COMMAND: &str = "cargo +nightly-2026-07-31 fuzz run --fuzz-dir 
 const FUZZ_VERIFY_COMMAND: &str =
     "./target/ci/hell-ci fuzz-corpus verify-clean --input crates/hell-ci/fuzz/corpus";
 const CARGO_DENY_INSTALL_COMMAND: &str = "cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ../ci-tool-cache/cargo-deny-target";
+const NIGHTLY_CARGO_DENY_INSTALL_COMMAND: &str = "cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ci-tool-cache/cargo-deny-target";
 const RELEASE_RESOLVE_COMMAND: &str =
     "./automation/target/ci/hell-ci release resolve --output release-state/resolution.json";
 const RELEASE_PLAN_COMMAND: &str = "./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json";
@@ -484,6 +485,9 @@ fn standard_environment_name(name: &str) -> bool {
         "GITHUB_WORKFLOW_REF",
         "GITHUB_WORKFLOW_SHA",
         "GITHUB_WORKSPACE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
         "HOME",
         "ImageOS",
         "ImageVersion",
@@ -509,6 +513,7 @@ fn standard_environment_name(name: &str) -> bool {
         "RUSTDOCFLAGS",
         "RUSTFLAGS",
         "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
         "SCCACHE_DIR",
         "SDKROOT",
         "SOURCE_DATE_EPOCH",
@@ -770,7 +775,6 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
         "plan",
         &[
             ("artifact_id", "${{ steps.upload.outputs.artifact-id }}"),
-            ("trusted_sha", "${{ steps.plan.outputs.trusted_sha }}"),
             (
                 "readiness_plan_digest",
                 "${{ steps.plan.outputs.readiness_plan_digest }}",
@@ -799,11 +803,7 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
         workflow,
         "plan",
         &[
-            (
-                None,
-                "${{ github.event.repository.default_branch }}",
-                "automation",
-            ),
+            (None, "${{ github.sha }}", "automation"),
             (None, "${{ github.sha }}", "candidate"),
         ],
         failures,
@@ -813,7 +813,7 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
             workflow,
             job,
             &[
-                (None, "${{ needs.plan.outputs.trusted_sha }}", "automation"),
+                (None, "${{ github.sha }}", "automation"),
                 (None, "${{ github.sha }}", "candidate"),
                 (
                     Some("chrisdone/hell"),
@@ -827,11 +827,7 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
     check_checkout_set(
         workflow,
         "verify",
-        &[(
-            (None),
-            "${{ needs.plan.outputs.trusted_sha }}",
-            "automation",
-        )],
+        &[((None), "${{ github.sha }}", "automation")],
         failures,
     );
     for job in ["plan", "linux", "macos", "windows", "verify"] {
@@ -847,7 +843,7 @@ fn check_ci(workflow: &Workflow, failures: &mut Vec<String>) {
         workflow,
         "plan",
         READINESS_PLAN_COMMAND,
-        "the exact trusted-control candidate-bound readiness plan",
+        "the exact candidate-bound readiness plan",
         failures,
     );
     let plan_steps = workflow
@@ -1241,8 +1237,8 @@ fn check_readiness_caches(workflow: &Workflow, failures: &mut Vec<String>) {
                 "automation/target" => &AUTOMATION_TARGET_INPUTS[..],
                 _ => continue,
             };
-            let exact_trusted_sha = key.contains("${{ needs.plan.outputs.trusted_sha }}");
-            if (path == "automation/target" && exact_trusted_sha)
+            let exact_candidate_sha = key.contains("${{ github.sha }}");
+            if (path == "automation/target" && exact_candidate_sha)
                 || required.iter().all(|input| key.contains(input))
             {
                 continue;
@@ -1336,6 +1332,20 @@ fn string_sequence(value: Option<&Value>) -> Option<Vec<&str>> {
 }
 
 fn check_nightly(workflow: &Workflow, failures: &mut Vec<String>) {
+    let pinned_cargo_deny_installs = workflow
+        .jobs
+        .get("linux")
+        .and_then(|job| job.steps.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|step| step.run.as_deref())
+        .filter(|command| *command == NIGHTLY_CARGO_DENY_INSTALL_COMMAND)
+        .count();
+    if pinned_cargo_deny_installs != 1 {
+        failures.push(format!(
+            "nightly Linux must install exact pinned cargo-deny once, found {pinned_cargo_deny_installs}"
+        ));
+    }
     let acquisitions = workflow
         .jobs
         .values()
@@ -1402,6 +1412,7 @@ fn check_push_gate_inventory(path: &str, workflow: &Workflow, failures: &mut Vec
             (
                 "linux",
                 vec![
+                    NIGHTLY_CARGO_DENY_INSTALL_COMMAND,
                     BUILD_DRIVER_AND_HELPER_COMMAND,
                     BUILD_DEBUG_CANDIDATE_COMMAND,
                     NIGHTLY_DEPENDENCY_COMMAND,
@@ -2400,6 +2411,23 @@ fn check_publish(workflow: &Workflow, failures: &mut Vec<String>) {
     if job.condition.is_some() {
         failures.push("publish job must not have an additional condition".to_owned());
     }
+    let staging_jobs = workflow
+        .jobs
+        .iter()
+        .flat_map(|(job_name, job)| {
+            job.steps
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|step| step.run.as_deref() == Some(STAGE_ATTESTATIONS_COMMAND))
+                .map(move |_| job_name.as_str())
+        })
+        .collect::<Vec<_>>();
+    if staging_jobs != ["publish"] {
+        failures.push(format!(
+            "attestation staging must run exactly once in the Ubuntu publisher, found {staging_jobs:?}"
+        ));
+    }
     let steps = job.steps.as_deref().unwrap_or_default();
     let attestation_steps = steps
         .iter()
@@ -3352,8 +3380,16 @@ mod tests {
                 ),
             ),
             (
-                "moving branch checkout",
+                "candidate substitution",
                 source.replacen("ref: ${{ github.sha }}", "ref: main", 1),
+            ),
+            (
+                "stale default-branch automation",
+                source.replacen(
+                    "ref: ${{ github.sha }}",
+                    "ref: ${{ github.event.repository.default_branch }}",
+                    1,
+                ),
             ),
             (
                 "path-filtered push",
@@ -3848,6 +3884,17 @@ mod tests {
                     &format!("{provenance}      - name: Build trusted release driver\n"),
                 ),
             ),
+            (
+                "attestation staging in Windows release gate",
+                mutate_job(
+                    &source,
+                    "windows",
+                    "      - name: Run Windows release gate, collect conformance evidence, and package\n",
+                    &format!(
+                        "      - name: Invalid Windows attestation staging\n        run: {STAGE_ATTESTATIONS_COMMAND}\n      - name: Run Windows release gate, collect conformance evidence, and package\n"
+                    ),
+                ),
+            ),
         ] {
             assert_ne!(mutant, source, "mutant replaced nothing: {label}");
             assert!(!failures(&mutant).is_empty(), "accepted {label}");
@@ -4151,6 +4198,16 @@ mod tests {
         check_nightly(&workflow, &mut actual);
         assert!(actual.is_empty(), "{actual:?}");
 
+        let mutant = source.replacen("--version 0.20.2", "--version 0.20.1", 1);
+        let workflow: Workflow = serde_yaml::from_str(&mutant).expect("typed nightly mutant");
+        let mut actual = Vec::new();
+        check_nightly(&workflow, &mut actual);
+        assert!(
+            actual
+                .iter()
+                .any(|failure| failure.contains("exact pinned cargo-deny"))
+        );
+
         let mutant = source.replacen("oracle-acquire acquire", "release-oracle acquire", 1);
         let workflow: Workflow = serde_yaml::from_str(&mutant).expect("typed nightly mutant");
         let mut actual = Vec::new();
@@ -4325,6 +4382,9 @@ mod tests {
         assert!(!standard_environment_name("APPLICATION_MODE"));
         assert!(standard_environment_name("GITHUB_TOKEN"));
         assert!(standard_environment_name("CARGO_BIN_EXE_hell"));
+        for name in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
+            assert!(standard_environment_name(name));
+        }
     }
 
     #[test]

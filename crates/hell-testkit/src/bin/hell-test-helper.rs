@@ -1,4 +1,4 @@
-//! Portable hostile-child fixture used by process supervision tests.
+//! Portable hostile-child fixture and minimal Windows restricted argv adapter.
 
 use std::ffi::OsString;
 use std::fs;
@@ -9,8 +9,17 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 fn main() -> ExitCode {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(unix)]
+    if let Some(status) = run_cargo_probe(&arguments) {
+        return status;
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__release-argv-child") {
+        return run_windows_release_argv_child(&arguments[1..]);
+    }
     mark_forbidden_invocation();
-    let (audit, arguments) = match parse_evidence_options(std::env::args_os().skip(1).collect()) {
+    let (audit, arguments) = match parse_evidence_options(arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
@@ -41,6 +50,73 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_cargo_probe(arguments: &[OsString]) -> Option<ExitCode> {
+    let configured = std::env::var_os("CARGO")?;
+    let configured = fs::canonicalize(configured).ok()?;
+    let executable = std::env::current_exe().ok()?;
+    if configured != executable {
+        return None;
+    }
+    if matches!(arguments, [argument] if ["--version", "-V"].iter().any(|value| argument == value))
+    {
+        println!("cargo 1.97.0 (hell-test-helper cargo probe)");
+        return Some(ExitCode::SUCCESS);
+    }
+    if matches!(arguments, [argument] if argument == "-vV") {
+        println!("cargo 1.97.0 (hell-test-helper cargo probe)");
+        println!("release: 1.97.0");
+        println!("commit-hash: 0000000000000000000000000000000000000000");
+        println!("commit-date: 2026-08-16");
+        println!("host: x86_64-unknown-linux-gnu");
+        return Some(ExitCode::SUCCESS);
+    }
+    match hell_testkit::append_cargo_probe_invocation(&executable, arguments) {
+        Ok(()) => Some(ExitCode::from(42)),
+        Err(error) => {
+            eprintln!("Cargo probe could not record its bounded argv: {error}");
+            Some(ExitCode::FAILURE)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_release_argv_child(arguments: &[OsString]) -> ExitCode {
+    let result = (|| {
+        let [encoded] = arguments else {
+            return Err(std::io::Error::other(
+                "Windows argv adapter requires one token",
+            ));
+        };
+        let decoded = hell_testkit::decode_windows_argv(encoded)?;
+        let (program, child_arguments) = decoded
+            .split_first()
+            .ok_or_else(|| std::io::Error::other("decoded Windows argv is empty"))?;
+        let evidence =
+            hell_testkit::windows_argv_target_prelaunch_diagnostic(std::path::Path::new(program));
+        Command::new(program)
+            .args(child_arguments)
+            .status()
+            .map(|status| (status, evidence))
+    })();
+    match result {
+        Ok((status, evidence)) => {
+            let code = status.code();
+            if let Some(diagnostic) = hell_testkit::windows_argv_child_status_diagnostic(code) {
+                eprintln!("{diagnostic}");
+                eprintln!("{evidence}");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::from(u8::try_from(code.expect("representable status")).expect("bounded"))
+            }
+        }
+        Err(error) => {
+            eprintln!("Windows argv adapter failed: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -232,7 +308,7 @@ fn escape_session_double_fork(mut arguments: impl Iterator<Item = OsString>) -> 
     // escaping the original process group. Release supervision must sweep the
     // unique candidate UID before joining its capture readers.
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    Command::new("/usr/bin/setsid")
+    let status = Command::new("/usr/bin/setsid")
         .arg(executable)
         .arg("spawn-grandchild-and-exit")
         .arg(milliseconds.to_string())
@@ -240,9 +316,13 @@ fn escape_session_double_fork(mut arguments: impl Iterator<Item = OsString>) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()
+        .status()
         .map_err(|error| error.to_string())?;
-    Ok(())
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("setsid fixture exited with status {status}"))
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]

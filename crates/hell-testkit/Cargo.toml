@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 compat-tracing = ["hell-compiler/compat-tracing"]
-mutation-testing = []
+mutation-testing = ["compat-tracing"]
 
 [dependencies]
 flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
@@ -15,7 +15,11 @@ hell-digest = { version = "0.1.0", path = "../hell-digest" }
 hell-platform = { version = "0.1.0", path = "../hell-platform" }
 tar = "0.4.44"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27.1", default-features = false, features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
+same-file = "=1.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Threading"] }
 
 [dev-dependencies]

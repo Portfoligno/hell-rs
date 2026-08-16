@@ -510,6 +510,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
 fn main() -> ExitCode {
     let mut process_arguments = std::env::args_os();
     let invoked = process_arguments.next();
+    #[cfg(not(unix))]
+    let _ = invoked;
     let arguments = process_arguments.collect::<Vec<_>>();
     #[cfg(unix)]
     if invoked
@@ -521,16 +523,60 @@ fn main() -> ExitCode {
         return command::run_native_archive_adapter(&arguments);
     }
     #[cfg(unix)]
-    if arguments.first().and_then(|value| value.to_str()) == Some("__release-posix-child") {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some(hell_testkit::POSIX_RELEASE_CHILD_REQUEST_V1)
+    {
         return command::run_posix_release_child(&arguments[1..]);
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__release-normalize-candidate-cache")
+    {
+        return match release::platform::run_posix_candidate_cache_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__release-normalize-cargo-deny-home")
+    {
+        return match release::platform::run_posix_cargo_deny_home_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__release-normalize-stack-root")
+    {
+        return match release::platform::run_posix_stack_root_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__release-normalize-stack-work")
+    {
+        return match release::platform::run_posix_stack_work_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     #[cfg(windows)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-restricted-child") {
         return command::run_windows_restricted_child(&arguments[1..]);
-    }
-    #[cfg(windows)]
-    if arguments.first().and_then(|value| value.to_str()) == Some("__release-argv-child") {
-        return command::run_windows_argv_child(&arguments[1..]);
     }
     let root = match std::env::current_dir() {
         Ok(root) => root,
@@ -720,6 +766,11 @@ fn report_failure_lines(report: &Report) -> impl Iterator<Item = String> + '_ {
 }
 
 #[cfg(test)]
+fn test_thread_name_component(name: Option<&str>) -> String {
+    hell_testkit::sha256_bytes(name.unwrap_or("unnamed").as_bytes()).hex()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -731,6 +782,17 @@ mod tests {
             parse(["examples", "--report", "out.json", "--profile", "release"].map(OsString::from));
         assert!(matches!(first, Ok(Invocation::Examples { .. })));
         assert!(matches!(second, Ok(Invocation::Examples { .. })));
+    }
+
+    #[test]
+    fn test_thread_name_component_is_exact_bounded_and_windows_safe() {
+        let adversarial = "conformance::CON:<>\":/\\|?* trailing. β";
+        let component = test_thread_name_component(Some(adversarial));
+        assert_eq!(component.len(), 64);
+        assert!(component.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(component, test_thread_name_component(Some(adversarial)));
+        assert_ne!(component, test_thread_name_component(Some("other::test")));
+        assert_ne!(component, test_thread_name_component(None));
     }
 
     #[test]

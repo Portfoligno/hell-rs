@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use hell_testkit::{
     DifferentialBatchTiming, DifferentialCase, DifferentialMismatch, DifferentialReport,
-    DifferentialTiming, Digest, ExecutableIdentity, ExecutableRole, GeneratedCase, MismatchKind,
-    bind_process_helper_directory, committed_differential_cases,
-    differential_batch_with_identities, differential_inventory_sha256, differential_worker_limit,
-    generated_typed_cases, representative_differential_sample, sha256_bytes, sha256_file,
-    verify_executable,
+    DifferentialTiming, Digest, ExecutableIdentity, ExecutableInvocationAuthority, ExecutableRole,
+    GeneratedCase, MismatchKind, bind_process_helper_directory, committed_differential_cases,
+    differential_batch_with_identities, differential_batch_with_invocations,
+    differential_inventory_sha256, differential_worker_limit, generated_typed_cases,
+    representative_differential_sample, sha256_bytes, sha256_file, verify_executable,
 };
 
 use crate::command::{CommandSpec, release_candidate_target};
@@ -122,6 +122,7 @@ pub(crate) fn dependency_attestation(
 
 fn git_commit(root: &Path) -> Result<String, String> {
     let result = CommandSpec::new("git", Duration::from_secs(30))
+        .git_safe_directory(root)
         .arguments(["rev-parse", "HEAD"])
         .current_directory(root)
         .run()
@@ -443,6 +444,101 @@ fn report_executable_identity(
     Ok(())
 }
 
+fn report_executable_invocation(
+    report: &mut Report,
+    name: &str,
+    authority: &ExecutableInvocationAuthority,
+) -> Result<(), String> {
+    let role = match authority.execution().role {
+        ExecutableRole::Oracle => "oracle",
+        ExecutableRole::Candidate => "candidate",
+    };
+    if role != name {
+        return Err(format!(
+            "differential {name} invocation has unexpected {role} role"
+        ));
+    }
+    let source = authority
+        .source()
+        .path
+        .to_str()
+        .ok_or_else(|| format!("differential {name} source path is not UTF-8"))?;
+    let execution = authority
+        .execution()
+        .path
+        .to_str()
+        .ok_or_else(|| format!("differential {name} execution path is not UTF-8"))?;
+    let invocation_name = authority
+        .execution()
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("differential {name} invocation name is not UTF-8"))?;
+    report.evidence(
+        format!("conformance-{name}-invocation"),
+        JsonValue::Object(BTreeMap::from([
+            (
+                "executionPath".to_owned(),
+                JsonValue::String(execution.to_owned()),
+            ),
+            (
+                "invocationName".to_owned(),
+                JsonValue::String(invocation_name.to_owned()),
+            ),
+            ("role".to_owned(), JsonValue::String(role.to_owned())),
+            ("schemaVersion".to_owned(), JsonValue::Number(1)),
+            (
+                "sha256".to_owned(),
+                JsonValue::String(authority.execution().sha256.hex()),
+            ),
+            (
+                "sourcePath".to_owned(),
+                JsonValue::String(source.to_owned()),
+            ),
+        ])),
+    );
+    Ok(())
+}
+
+fn exact_oracle_invocation(
+    output_root: &Path,
+    source: &ExecutableIdentity,
+) -> Result<ExecutableInvocationAuthority, String> {
+    let exact_name = format!("hell{}", std::env::consts::EXE_SUFFIX);
+    if source
+        .path
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&exact_name))
+    {
+        return ExecutableInvocationAuthority::exact_hell(source, source)
+            .map_err(|error| format!("cannot bind direct oracle invocation: {error}"));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = output_root;
+        return Err("a non-Unix oracle must already have the exact hell.exe name".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        let directory = output_root.join("oracle-execution");
+        if directory.exists() {
+            return Err("oracle execution directory already exists".to_owned());
+        }
+        fs::create_dir(&directory)
+            .map_err(|error| format!("cannot create oracle execution directory: {error}"))?;
+        let directory = fs::canonicalize(&directory)
+            .map_err(|error| format!("cannot bind oracle execution directory: {error}"))?;
+        let alias = directory.join(exact_name);
+        fs::hard_link(&source.path, &alias)
+            .map_err(|error| format!("cannot create exact oracle execution alias: {error}"))?;
+        let mut execution = source.clone();
+        execution.path = fs::canonicalize(&alias)
+            .map_err(|error| format!("cannot canonicalize oracle execution alias: {error}"))?;
+        ExecutableInvocationAuthority::exact_hell(source, &execution)
+            .map_err(|error| format!("cannot bind exact oracle execution alias: {error}"))
+    }
+}
+
 fn executable_identity_json(identity: &ExecutableIdentity, size: u64) -> Result<JsonValue, String> {
     let role = match identity.role {
         ExecutableRole::Oracle => "oracle",
@@ -653,7 +749,7 @@ fn differential_mismatch_summary(
             ])))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(JsonValue::Object(BTreeMap::from([
+    let mut summary = BTreeMap::from([
         (
             "authoritativeIndex".to_owned(),
             JsonValue::Number(
@@ -669,7 +765,151 @@ fn differential_mismatch_summary(
         ("caseId".to_owned(), JsonValue::String(case.id.to_string())),
         ("mismatches".to_owned(), JsonValue::Array(mismatch)),
         ("oracle".to_owned(), observation_status_json(&report.oracle)),
+    ]);
+    if let Some(rejection) =
+        hell_testkit::runtime_failure_projection_rejection(case, &report.oracle, &report.candidate)
+    {
+        summary.insert(
+            "strictProjectionRejection".to_owned(),
+            runtime_failure_projection_rejection_json(&rejection)?,
+        );
+    }
+    Ok(JsonValue::Object(summary))
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_SUBSTANTIVE_SERIAL_PROBES: &[(usize, &str)] = &[
+    (865, "runtime-typed-thread-delay-forced-argument-failure"),
+    (1081, "runtime-directory-copy-file-failure"),
+    (2658, "runtime-interaction-timeout-process"),
+];
+
+#[cfg(any(windows, test))]
+fn windows_substantive_serial_probe_cases(
+    cases: &[DifferentialCase],
+) -> Result<Vec<(usize, DifferentialCase)>, String> {
+    WINDOWS_SUBSTANTIVE_SERIAL_PROBES
+        .iter()
+        .map(|&(index, expected_id)| {
+            let case = cases.get(index).ok_or_else(|| {
+                format!("Windows substantive serial probe index {index} is absent")
+            })?;
+            if case.id.as_ref() != expected_id {
+                return Err(format!(
+                    "Windows substantive serial probe index {index} resolved to {:?}, expected {expected_id:?}",
+                    case.id,
+                ));
+            }
+            Ok((index, case.clone()))
+        })
+        .collect()
+}
+
+fn runtime_failure_projection_rejection_json(
+    rejection: &hell_testkit::RuntimeFailureProjectionRejection,
+) -> Result<JsonValue, String> {
+    let count = |value: usize| {
+        value
+            .try_into()
+            .map(JsonValue::Number)
+            .map_err(|_| "runtime failure projection diagnostic count overflow".to_owned())
+    };
+    Ok(JsonValue::Object(BTreeMap::from([
+        (
+            "candidateStderrBytes".to_owned(),
+            JsonValue::Number(rejection.candidate_stderr_bytes),
+        ),
+        (
+            "candidateStderrSha256".to_owned(),
+            JsonValue::String(rejection.candidate_stderr_sha256.hex()),
+        ),
+        (
+            "causalOrderCount".to_owned(),
+            count(rejection.causal_order_count)?,
+        ),
+        (
+            "descriptorBuiltin".to_owned(),
+            JsonValue::String(rejection.descriptor_builtin.to_owned()),
+        ),
+        (
+            "descriptorDimension".to_owned(),
+            JsonValue::String(
+                compatibility_dimension_name(rejection.descriptor_dimension).to_owned(),
+            ),
+        ),
+        (
+            "descriptorObligation".to_owned(),
+            JsonValue::String(rejection.descriptor_obligation.to_owned()),
+        ),
+        (
+            "effectEventCount".to_owned(),
+            count(rejection.effect_event_count)?,
+        ),
+        (
+            "exceptionFamily".to_owned(),
+            JsonValue::String(rejection.exception_family.descriptor_name().to_owned()),
+        ),
+        (
+            "forceEventCount".to_owned(),
+            count(rejection.force_event_count)?,
+        ),
+        (
+            "obligationEventCount".to_owned(),
+            count(rejection.obligation_event_count)?,
+        ),
+        (
+            "oracleStderrBytes".to_owned(),
+            JsonValue::Number(rejection.oracle_stderr_bytes),
+        ),
+        (
+            "oracleStderrSha256".to_owned(),
+            JsonValue::String(rejection.oracle_stderr_sha256.hex()),
+        ),
+        (
+            "reason".to_owned(),
+            JsonValue::String(rejection.reason.descriptor_name().to_owned()),
+        ),
+        (
+            "resourceEventCount".to_owned(),
+            count(rejection.resource_event_count)?,
+        ),
+        (
+            "semanticCoverageCount".to_owned(),
+            count(rejection.semantic_coverage_count)?,
+        ),
+        (
+            "semanticPresent".to_owned(),
+            JsonValue::Bool(rejection.semantic_present),
+        ),
+        (
+            "taskEventCount".to_owned(),
+            count(rejection.task_event_count)?,
+        ),
+        (
+            "typedResultBuiltinPresent".to_owned(),
+            JsonValue::Bool(rejection.typed_result_builtin_present),
+        ),
+        (
+            "typedResultSha256Present".to_owned(),
+            JsonValue::Bool(rejection.typed_result_sha256_present),
+        ),
     ])))
+}
+
+const fn compatibility_dimension_name(
+    dimension: hell_builtins::CompatibilityDimension,
+) -> &'static str {
+    use hell_builtins::CompatibilityDimension;
+    match dimension {
+        CompatibilityDimension::Parse => "parse",
+        CompatibilityDimension::StaticSemantics => "static-semantics",
+        CompatibilityDimension::PureRuntime => "pure-runtime",
+        CompatibilityDimension::Effects => "effects",
+        CompatibilityDimension::Concurrency => "concurrency",
+        CompatibilityDimension::Presentation => "presentation",
+        CompatibilityDimension::Platform => "platform",
+        CompatibilityDimension::ResourceBehavior => "resource-behavior",
+    }
 }
 
 fn observation_status_json(observation: &hell_testkit::Observation) -> JsonValue {
@@ -984,6 +1224,7 @@ pub(crate) fn release_native_oracle_shard(
         platform == "macos-arm64",
         &root.join("target"),
         source,
+        None,
     );
     let archive_adapter = match archive_adapter {
         Ok(adapter) => adapter,
@@ -1274,26 +1515,38 @@ fn run_differential(
         execution.dependency,
         execution.candidate_sha,
     )?;
-    let oracle = verify_executable(
+    let oracle_source = verify_executable(
         execution.oracle,
         ExecutableRole::Oracle,
         execution.oracle_digest,
         hell_builtins::LANGUAGE_VERSION,
     )
     .map_err(|error| format!("cannot verify oracle: {error}"))?;
-    let candidate = verify_executable(
+    let candidate_identity = verify_executable(
         execution.candidate,
         ExecutableRole::Candidate,
         None,
         hell_builtins::LANGUAGE_VERSION,
     )
     .map_err(|error| format!("cannot verify candidate: {error}"))?;
-    report_executable_identity(report, "oracle", &oracle)?;
-    report_executable_identity(report, "candidate", &candidate)?;
+    let output_root = execution
+        .failures
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_root)
+        .map_err(|error| format!("cannot create differential output: {error}"))?;
+    let oracle = exact_oracle_invocation(output_root, &oracle_source)?;
+    let candidate =
+        ExecutableInvocationAuthority::exact_hell(&candidate_identity, &candidate_identity)
+            .map_err(|error| format!("cannot bind exact candidate invocation: {error}"))?;
+    report_executable_identity(report, "oracle", &oracle_source)?;
+    report_executable_identity(report, "candidate", &candidate_identity)?;
+    report_executable_invocation(report, "oracle", &oracle)?;
+    report_executable_invocation(report, "candidate", &candidate)?;
     report_candidate_compat_tracing_preflight(
         report,
         "conformance-candidate-compat-tracing",
-        &candidate,
+        &candidate_identity,
     )?;
     let driver = benchmark_current_driver()?;
     report_artifact_identity(report, "driver", &driver)?;
@@ -1310,8 +1563,8 @@ fn run_differential_identities(
     root: &Path,
     report: &mut Report,
     failures: &Path,
-    oracle: hell_testkit::ExecutableIdentity,
-    candidate: hell_testkit::ExecutableIdentity,
+    oracle: ExecutableInvocationAuthority,
+    candidate: ExecutableInvocationAuthority,
 ) -> Result<DifferentialOutcome, String> {
     const GENERATED_SEED: u64 = 0x4845_4c4c;
     let mut cases = committed_differential_cases();
@@ -1328,13 +1581,11 @@ fn run_differential_identities(
     let helper = bind_helper(&mut cases)?;
     report_artifact_identity(report, "helper", &helper)?;
     let output_root = failures.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_root)
-        .map_err(|error| format!("cannot create differential output: {error}"))?;
     let mut cells = reviewed_compatibility_cells()?;
     let reviewed_cells = cells.len();
     let mut committed_mismatches = Vec::new();
     let workers = differential_worker_limit();
-    let committed = differential_batch_with_identities(&oracle, &candidate, &cases, workers)
+    let committed = differential_batch_with_invocations(&oracle, &candidate, &cases, workers)
         .map_err(batch_failure)?;
     let mut metrics = DifferentialMetrics::default();
     metrics.add(committed.timing);
@@ -1369,6 +1620,32 @@ fn run_differential_identities(
             mismatches: committed_mismatches,
         })?,
     );
+    #[cfg(windows)]
+    {
+        let probes = windows_substantive_serial_probe_cases(&cases)?;
+        let probe_cases = probes
+            .iter()
+            .map(|(_, case)| case.clone())
+            .collect::<Vec<_>>();
+        let batch = differential_batch_with_invocations(&oracle, &candidate, &probe_cases, 1)
+            .map_err(batch_failure)?;
+        metrics.add(batch.timing);
+        let observations = probes
+            .iter()
+            .zip(batch.reports)
+            .map(|((index, case), observation)| {
+                differential_mismatch_summary(*index, case, &observation)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        report.evidence(
+            "conformance-substantive-serial-probes",
+            JsonValue::Object(BTreeMap::from([
+                ("cases".to_owned(), JsonValue::Array(observations)),
+                ("schemaVersion".to_owned(), JsonValue::Number(1)),
+                ("workerCount".to_owned(), JsonValue::Number(1)),
+            ])),
+        );
+    }
     let mut generated_mismatches = Vec::new();
     let generated_cases = generated
         .iter()
@@ -1379,7 +1656,7 @@ fn run_differential_identities(
         })
         .collect::<Vec<_>>();
     let generated_batch =
-        differential_batch_with_identities(&oracle, &candidate, &generated_cases, workers)
+        differential_batch_with_invocations(&oracle, &candidate, &generated_cases, workers)
             .map_err(batch_failure)?;
     metrics.add(generated_batch.timing);
     for (case, result) in generated.iter().zip(generated_batch.reports) {
@@ -1660,6 +1937,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_substantive_serial_probes_bind_exact_inventory_positions() {
+        let cases = committed_differential_cases();
+        let probes = windows_substantive_serial_probe_cases(&cases).unwrap();
+        assert_eq!(
+            probes
+                .iter()
+                .map(|(index, case)| (*index, case.id.as_ref()))
+                .collect::<Vec<_>>(),
+            WINDOWS_SUBSTANTIVE_SERIAL_PROBES,
+        );
+
+        let mut substituted = cases;
+        substituted[WINDOWS_SUBSTANTIVE_SERIAL_PROBES[0].0].id =
+            std::sync::Arc::from("substituted");
+        assert!(windows_substantive_serial_probe_cases(&substituted).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oracle_execution_alias_is_exactly_named_and_reported_separately_from_source() {
+        let root = std::env::temp_dir().join(format!(
+            "hell-oracle-execution-report-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let source_path = root.join("linux-release-oracle");
+        fs::hard_link(std::env::current_exe().unwrap(), &source_path).unwrap();
+        let source_path = source_path.canonicalize().unwrap();
+        let source = ExecutableIdentity {
+            sha256: sha256_file(&source_path).unwrap(),
+            path: source_path.clone(),
+            reported_version: hell_builtins::LANGUAGE_VERSION.into(),
+            build_info: None,
+            role: ExecutableRole::Oracle,
+            assurance_epoch_sha256: None,
+            acquisition_receipt_id: Some("pinned-release".into()),
+            acquisition_receipt_sha256: Some(sha256_bytes(b"receipt")),
+            acquisition_attestation_sha256: Some(sha256_bytes(b"attestation")),
+        };
+        let authority = exact_oracle_invocation(&root, &source).unwrap();
+        assert_eq!(authority.source(), &source);
+        let expected_name = format!("hell{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            authority.execution().path.file_name().unwrap(),
+            std::ffi::OsStr::new(&expected_name)
+        );
+        assert_ne!(authority.source().path, authority.execution().path);
+        let mut report = Report::new("oracle-execution-report");
+        report_executable_identity(&mut report, "oracle", authority.source()).unwrap();
+        report_executable_invocation(&mut report, "oracle", &authority).unwrap();
+        let json = report.to_json();
+        assert!(json.contains("\"name\": \"conformance-oracle-identity\""));
+        assert!(json.contains("\"name\": \"conformance-oracle-invocation\""));
+        assert!(json.contains(source_path.to_str().unwrap()));
+        assert!(json.contains(authority.execution().path.to_str().unwrap()));
+        assert!(json.contains("\"invocationName\":\"hell\""));
+        assert!(exact_oracle_invocation(&root, &source).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn benchmark_inventory_is_the_exact_committed_then_generated_authority() {
         let committed = committed_differential_cases();
         let generated = generated_typed_cases(0x4845_4c4c, 32);
@@ -1711,6 +2050,64 @@ mod tests {
             String::from_utf8(encoded).unwrap(),
             "{\"exitCode\":\"-1073741510\",\"success\":false,\"timedOut\":false}\n"
         );
+    }
+
+    #[test]
+    fn strict_projection_rejection_diagnostic_is_bounded_and_reason_typed() {
+        use hell_testkit::RuntimeFailureProjectionRejectionReason as Reason;
+
+        let mut rejection = hell_testkit::RuntimeFailureProjectionRejection {
+            reason: Reason::OracleFrameOrigin,
+            exception_family: hell_testkit::RuntimeFailureExceptionFamily::IOException,
+            descriptor_builtin: "Text.writeFile",
+            descriptor_dimension: hell_builtins::CompatibilityDimension::Effects,
+            descriptor_obligation: "effect-failure",
+            oracle_stderr_sha256: sha256_bytes(b"secret oracle stderr"),
+            oracle_stderr_bytes: 20,
+            candidate_stderr_sha256: sha256_bytes(b"secret candidate stderr"),
+            candidate_stderr_bytes: 23,
+            semantic_present: true,
+            typed_result_sha256_present: false,
+            typed_result_builtin_present: false,
+            semantic_coverage_count: 1,
+            obligation_event_count: 2,
+            causal_order_count: 3,
+            force_event_count: 4,
+            effect_event_count: 5,
+            task_event_count: 6,
+            resource_event_count: 7,
+        };
+        for reason in [
+            Reason::OracleFrameGrammar,
+            Reason::OracleFrameTerminalNewline,
+            Reason::OracleFrameCount,
+            Reason::OracleFrameFunction,
+            Reason::OracleFrameOrigin,
+            Reason::OraclePayloadHandlingMissing,
+            Reason::OraclePayloadHandlingMismatch,
+            Reason::OraclePayloadUnexpectedHandling,
+            Reason::OraclePayloadEmpty,
+            Reason::OraclePayloadMultiline,
+            Reason::OraclePayloadControl,
+        ] {
+            rejection.reason = reason;
+            let encoded = canonical_json_bytes(
+                &runtime_failure_projection_rejection_json(&rejection).unwrap(),
+            )
+            .unwrap();
+            let encoded = String::from_utf8(encoded).unwrap();
+            assert!(encoded.contains(&format!("\"reason\":\"{}\"", reason.descriptor_name())));
+            assert!(!encoded.contains("secret"));
+        }
+        rejection.reason = Reason::OracleFrameOrigin;
+        let encoded =
+            canonical_json_bytes(&runtime_failure_projection_rejection_json(&rejection).unwrap())
+                .unwrap();
+        let encoded = String::from_utf8(encoded).unwrap();
+        assert!(encoded.contains("\"reason\":\"oracle-frame-origin\""));
+        assert!(encoded.contains("\"descriptorBuiltin\":\"Text.writeFile\""));
+        assert!(encoded.contains("\"semanticCoverageCount\":1"));
+        assert!(encoded.contains("\"resourceEventCount\":7"));
     }
 
     #[test]

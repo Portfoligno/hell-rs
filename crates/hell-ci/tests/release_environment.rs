@@ -44,6 +44,7 @@ fn stage(input: &Path, runner_temp: &Path) -> Output {
         .expect("stage-attestations must execute")
 }
 
+#[cfg(unix)]
 #[test]
 fn attestation_registry_stages_two_distinct_exact_json_files() {
     let fixture = Fixture::new("attestation-registry");
@@ -83,6 +84,7 @@ fn attestation_registry_stages_two_distinct_exact_json_files() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn attestation_registry_rejects_ambiguous_or_external_sources() {
     for scenario in [
@@ -239,6 +241,7 @@ fn attestation_registry_rejects_registry_source_and_destination_symlinks() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn attestation_registry_accepts_crlf_line_endings() {
     let fixture = Fixture::new("attestation-crlf");
@@ -256,6 +259,23 @@ fn attestation_registry_accepts_crlf_line_endings() {
     )
     .unwrap();
     assert!(stage(&input, &runner_temp).status.success());
+}
+
+#[cfg(not(unix))]
+#[test]
+fn attestation_staging_rejects_platforms_without_unix_file_identity() {
+    let fixture = Fixture::new("attestation-unsupported-platform");
+    let runner_temp = fixture.path("runner-temp");
+    let input = fixture.path("release-bundle");
+    fs::create_dir(&runner_temp).unwrap();
+    fs::create_dir(&input).unwrap();
+
+    let output = stage(&input, &runner_temp);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "attestation staging requires Unix file identity\n"
+    );
 }
 
 fn release_plan(candidate_sha: &str) -> Vec<u8> {
@@ -320,4 +340,33 @@ fn remote_state_requires_the_standard_token_name() {
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("GITHUB_TOKEN is required"));
+}
+
+#[test]
+fn stack_work_cleanup_precedes_exact_oracle_snapshot_validation() {
+    let source = include_str!("../src/release/platform.rs");
+    let restore = source
+        .split_once("fn restore_inner(&self)")
+        .unwrap()
+        .1
+        .split_once("impl Drop for PosixArchiveAdapterSeal")
+        .unwrap()
+        .0;
+    let normalize = restore.find("self.normalize_stack_work()").unwrap();
+    let remove = restore.find("&self.tools.remove_file").unwrap();
+    let prove_absent = restore
+        .find("candidate Stack work cleanup was not exact")
+        .unwrap();
+    let exact_clean = restore.find("require_clean_checkout(").unwrap();
+    assert!(normalize < remove && remove < prove_absent && prove_absent < exact_clean);
+
+    let validation = source
+        .split_once("fn validate_posix_sources(")
+        .unwrap()
+        .1
+        .split_once("fn validate_posix_retained_oracle(")
+        .unwrap()
+        .0;
+    assert!(validation.contains("if stack_work_present {"));
+    assert!(validation.contains("} else {\n        require_clean_checkout("));
 }

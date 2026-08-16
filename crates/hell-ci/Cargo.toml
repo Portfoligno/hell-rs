@@ -30,7 +30,11 @@ ureq = { version = "3.1.2", default-features = false, features = ["rustls"] }
 nix = { version = "0.27.1", default-features = false, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Threading"] }
+abistr = "=0.2.0-rc3"
+firehazard = "=0.0.0-2022-09-10"
+getrandom = "=0.2.17"
+widestring = "=1.2.1"
+same-file = "=1.0.6"
 
 [lints]
 workspace = true

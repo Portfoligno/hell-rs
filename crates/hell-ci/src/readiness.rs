@@ -93,18 +93,21 @@ fn create_plan(root: PathBuf, output: PathBuf) -> Result<String, String> {
         .map_err(|_| "readiness candidate timestamp is invalid".to_owned())?;
     let evaluation_instant = current_evaluation_instant()?;
 
-    let trusted_root = trusted_automation_root()?;
-    require_clean_checkout(&trusted_root)?;
-    let workflow_sha = git_output(&trusted_root, ["rev-parse", "HEAD"])?;
+    let automation_root = readiness_automation_root()?;
+    require_clean_checkout(&automation_root)?;
+    let workflow_sha = git_output(&automation_root, ["rev-parse", "HEAD"])?;
     require_sha(&workflow_sha, "readiness workflow SHA")?;
+    if workflow_sha != candidate_sha {
+        return Err("readiness automation SHA differs from candidate SHA".to_owned());
+    }
 
     let source_inventory = crate::release::plan::source_inventory(&root)?;
     let source_inventory_bytes = canonical_json_bytes(&source_inventory)?;
     let source_inventory_sha256 = hell_testkit::sha256_bytes(&source_inventory_bytes).hex();
     let trusted_inputs =
-        crate::conformance::build_trusted_inputs(&trusted_root, &root, &workflow_sha)?;
+        crate::conformance::build_trusted_inputs(&automation_root, &root, &workflow_sha)?;
     let exemptions = crate::conformance::parse_release_exemptions(&read_regular(
-        &trusted_root.join(".github/release/conformance-exemptions.toml"),
+        &automation_root.join(".github/release/conformance-exemptions.toml"),
     )?)?;
     let conformance_plan = crate::conformance::build_release_conformance_plan(
         &candidate_sha,
@@ -433,6 +436,9 @@ impl ReadinessPlan {
     fn validate(&self) -> Result<(), String> {
         require_sha(&self.candidate_sha, "readiness candidate SHA")?;
         require_sha(&self.workflow_sha, "readiness workflow SHA")?;
+        if self.workflow_sha != self.candidate_sha {
+            return Err("readiness automation SHA differs from candidate SHA".to_owned());
+        }
         crate::conformance::validate_utc_instant(&self.evaluation_instant)?;
         for (value, label) in [
             (&self.source_inventory_sha256, "source inventory digest"),
@@ -548,8 +554,7 @@ fn append_outputs(plan: &ReadinessPlan) -> Result<(), String> {
         .map_err(|error| format!("cannot open GITHUB_OUTPUT: {error}"))?;
     writeln!(
         output,
-        "trusted_sha={}\nreadiness_plan_digest={}\nconformance_plan_digest={}\ntrusted_conformance_inputs_digest={}",
-        plan.workflow_sha,
+        "readiness_plan_digest={}\nconformance_plan_digest={}\ntrusted_conformance_inputs_digest={}",
         plan.readiness_plan_sha256,
         plan.conformance_plan_sha256,
         plan.trusted_conformance_inputs_sha256,
@@ -557,13 +562,13 @@ fn append_outputs(plan: &ReadinessPlan) -> Result<(), String> {
     .map_err(|error| format!("cannot append readiness outputs: {error}"))
 }
 
-fn trusted_automation_root() -> Result<PathBuf, String> {
+fn readiness_automation_root() -> Result<PathBuf, String> {
     let root = std::env::var_os("GITHUB_WORKSPACE")
         .map(PathBuf::from)
         .map(|workspace| workspace.join("automation"))
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
     fs::canonicalize(root)
-        .map_err(|error| format!("cannot canonicalize trusted readiness automation: {error}"))
+        .map_err(|error| format!("cannot canonicalize candidate readiness automation: {error}"))
 }
 
 fn require_clean_checkout(root: &Path) -> Result<(), String> {
@@ -696,7 +701,7 @@ mod tests {
         let digest = "a".repeat(64);
         let mut plan = ReadinessPlan {
             candidate_sha: "b".repeat(40),
-            workflow_sha: "c".repeat(40),
+            workflow_sha: "b".repeat(40),
             source_date_epoch: 1,
             evaluation_instant: "2026-08-13T00:00:00Z".to_owned(),
             source_inventory_sha256: digest.clone(),
@@ -742,6 +747,13 @@ mod tests {
         let mut misbound = plan.json().object().unwrap().clone();
         misbound.insert("candidateSha".to_owned(), string(&"c".repeat(40)));
         assert!(ReadinessPlan::parse(&JsonValue::Object(misbound)).is_err());
+
+        let mut substituted = sample_plan();
+        substituted.workflow_sha = "c".repeat(40);
+        assert_eq!(
+            substituted.validate(),
+            Err("readiness automation SHA differs from candidate SHA".to_owned())
+        );
     }
 
     #[test]

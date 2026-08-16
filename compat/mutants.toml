@@ -57,13 +57,19 @@ ids = [
   "publisher-trusts-acceptance-json",
   "release-gate-conformance-digest-omitted",
   "legacy-bounded-policy-accepted",
+  "diagnostic-hardcoded-oracle-program",
+  "list-sort-native-oracle-topology",
+  "list-sort-native-oracle-comparator",
+  "runtime-failure-frame-payload-authority",
+  "runtime-failure-causal-authority",
 ]
 release_required = [
   false, false, false, false, false, true, true, true, true, true,
   true, true, false, false, false, false, false, false, false, false,
   true, true, true, true, true, true, true, true, true, true,
   true,
-  true, true, true, true, true, true, true, true, true, true, true, true,
+  true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+  true, true, true,
   true, true, true, true, true, true, true, true, true, true, true, true,
 ]
 families = [
@@ -103,6 +109,9 @@ families = [
   "exemption", "exemption", "report-integrity", "producer-authority", "exploratory",
   "exploratory", "normalizer", "normalizer", "asset-inventory", "plan-binding",
   "publisher-independence", "gate-binding", "legacy-authority",
+  "diagnostic-normalization",
+  "collection-ordering", "collection-ordering",
+  "runtime-failure-presentation", "runtime-failure-presentation",
 ]
 tests = [
   "assurance::tests::retained_artifact_byte_substitution_is_rejected",
@@ -160,6 +169,11 @@ tests = [
   "release::verify::tests::publisher_reconstructs_instead_of_trusting_acceptance",
   "release::verify::tests::release_gate_binds_conformance_digests",
   "release::verify::tests::legacy_bounded_bundle_is_rejected",
+  "executable_invocation_tests::exact_execution_alias_binds_name_file_identity_and_source_provenance",
+  "nan_sorting_matches_the_reviewed_native_oracle_merge_algorithm",
+  "nan_sorting_matches_the_reviewed_native_oracle_merge_algorithm",
+  "runtime_failure_presentation_tests::exception_projection_rejects_family_payload_program_frame_and_tail_forgery",
+  "retained_runtime_failure_projection_is_manifest_bound_and_recomputed",
 ]
 packages = [
   "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci",
@@ -172,6 +186,8 @@ packages = [
   "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci",
   "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci",
   "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci", "hell-ci",
+  "hell-testkit",
+  "hell-runtime", "hell-runtime", "hell-testkit", "hell-testkit",
 ]
 targets = [
   "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci",
@@ -186,6 +202,8 @@ targets = [
   "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci",
   "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci",
   "bin:hell-ci", "bin:hell-ci", "bin:hell-ci", "bin:hell-ci",
+  "lib",
+  "test:list_adapters", "test:list_adapters", "lib", "test:typed_corpus",
 ]
 mutation_sites = [
   "hell-ci::assurance::artifact_review_packet",
@@ -243,6 +261,11 @@ mutation_sites = [
   "hell-ci::release::verify::verify_conformance_bundle",
   "hell-ci::release::verify::verify_release_gate",
   "hell-ci::release::verify::verify_release_manifest",
+  "hell-testkit::ExecutableIntegrityGuard::execution_identity",
+  "hell-runtime::native_list::use_base_421_sort_topology",
+  "hell-runtime::native_list::reviewed_sort_greater_than",
+  "hell-testkit::reviewed_runtime_failure_payload_sha256",
+  "hell-testkit::reviewed_runtime_failure_causality",
 ]
 obligation_ids = [
   "artifact-authenticity", "artifact-run-attempt-binding", "artifact-repository-binding",
@@ -266,6 +289,9 @@ obligation_ids = [
   "normalizer-trusted-replay", "conformance-evidence-retention",
   "conformance-plan-cross-binding", "publisher-independent-reconstruction",
   "release-gate-conformance-binding", "legacy-policy-rejection",
+  "diagnostic-user-text-preservation",
+  "native-oracle-list-sort-topology", "native-oracle-list-sort-comparator",
+  "runtime-failure-frame-payload-authority", "runtime-failure-causal-authority",
 ]
 claim_group_ids = [
   "control/acquisition/artifact-bytes", "control/acquisition/run-attempt",
@@ -289,6 +315,9 @@ claim_group_ids = [
   "control/exploratory/mismatch", "control/exploratory/agreement", "control/normalizer/scope",
   "control/normalizer/replay", "control/assets/evidence", "control/plan/digest",
   "control/publisher/independence", "control/gate/conformance", "control/legacy/policy",
+  "semantic/presentation/diagnostics",
+  "semantic/platform/list-sort", "semantic/platform/list-sort",
+  "semantic/presentation/runtime-failure", "semantic/effects/runtime-failure",
 ]
 classes = [
   "control", "control", "control", "control", "control", "control", "control", "control",
@@ -298,6 +327,8 @@ classes = [
   "control", "control", "control", "control", "control", "control", "control", "control",
   "control", "control", "control", "control", "control", "control", "control", "control",
   "control", "control", "control", "control", "control", "control", "control", "control",
+  "semantic",
+  "semantic", "semantic", "semantic", "semantic",
 ]
 criticalities = [
   "critical", "critical", "critical", "critical", "critical", "critical", "critical", "critical",
@@ -307,4 +338,6 @@ criticalities = [
   "critical", "critical", "critical", "critical", "critical", "critical", "critical", "critical",
   "critical", "critical", "critical", "critical", "critical", "critical", "critical", "critical",
   "critical", "critical", "critical", "critical", "critical", "critical", "critical", "critical",
+  "critical",
+  "critical", "critical", "critical", "critical",
 ]

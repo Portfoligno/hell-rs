@@ -919,7 +919,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "hell-assembly-matrix-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            crate::test_thread_name_component(std::thread::current().name())
         ));
         std::fs::create_dir(&root).unwrap();
         for platform in PLATFORMS {

@@ -1,26 +1,38 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::env;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::command::CommandSpec;
 use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
 
 use super::github::GitHubClient;
-use super::manifest::{read_json, read_regular, write_atomic_new, write_json};
+#[cfg(unix)]
+use super::manifest::write_atomic_new;
+use super::manifest::{read_json, read_regular, write_json};
 use super::schema::{ReleasePlan, number, object, string};
 use super::verify;
 
+#[cfg(unix)]
 const ATTESTATION_REGISTRY: &str = "created_attestation_paths.txt";
+#[cfg(unix)]
 const MAX_ATTESTATION_REGISTRY_BYTES: u64 = 64 * 1024;
+#[cfg(unix)]
 const MAX_ATTESTATION_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(unix)]
 const ATTESTATION_DESTINATIONS: [&str; 2] = [
     "github-provenance.sigstore.json",
     "github-release-gate.sigstore.json",
 ];
 
+#[cfg(unix)]
 pub(crate) fn stage_attestations(input: PathBuf) -> Result<String, String> {
     let runner_temp = PathBuf::from(
         env::var_os("RUNNER_TEMP").ok_or_else(|| "RUNNER_TEMP is required".to_owned())?,
@@ -29,6 +41,12 @@ pub(crate) fn stage_attestations(input: PathBuf) -> Result<String, String> {
     stage_attestations_from_registry(&input, &runner_temp, &registry)
 }
 
+#[cfg(not(unix))]
+pub(crate) fn stage_attestations(_input: PathBuf) -> Result<String, String> {
+    Err("attestation staging requires Unix file identity".to_owned())
+}
+
+#[cfg(unix)]
 fn stage_attestations_from_registry(
     input: &Path,
     runner_temp: &Path,
@@ -84,6 +102,7 @@ fn stage_attestations_from_registry(
     Ok("staged exact GitHub attestation bundles".to_owned())
 }
 
+#[cfg(unix)]
 fn parse_attestation_registry(text: &str) -> Result<[PathBuf; 2], String> {
     let mut lines = text.split('\n').collect::<Vec<_>>();
     if lines.last() == Some(&"") {
@@ -122,6 +141,7 @@ fn parse_attestation_registry(text: &str) -> Result<[PathBuf; 2], String> {
     Ok(entries)
 }
 
+#[cfg(unix)]
 fn read_attestation_bundle(
     index: usize,
     source: &Path,
@@ -149,6 +169,7 @@ fn read_attestation_bundle(
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn read_bounded_real_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
     let before = fs::symlink_metadata(path).map_err(|_| format!("{label} is missing"))?;
     if !before.is_file() || before.file_type().is_symlink() {
@@ -185,6 +206,7 @@ fn read_bounded_real_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn same_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     same_file_identity(left, right)
         && left.len() == right.len()
@@ -197,14 +219,7 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(not(unix))]
-fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    // Stable Rust does not expose a portable file identity on these targets.
-    // Staging is currently Linux-only, so fail closed rather than substitute
-    // timestamps or permissions for identity.
-    false
-}
-
+#[cfg(unix)]
 fn require_real_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|_| format!("{label} is missing"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -213,6 +228,7 @@ fn require_real_directory(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn require_absent_destination(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err("attestation destination already exists".to_owned()),
@@ -221,6 +237,7 @@ fn require_absent_destination(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn require_same_destination_directory(
     path: &Path,
     expected_metadata: &fs::Metadata,
@@ -883,6 +900,8 @@ enum ExistingReleaseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::io::Read as _;
     use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};

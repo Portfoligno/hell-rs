@@ -21,15 +21,14 @@ jobs:
     timeout-minutes: 30
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      trusted_sha: ${{ steps.plan.outputs.trusted_sha }}
       readiness_plan_digest: ${{ steps.plan.outputs.readiness_plan_digest }}
       conformance_plan_digest: ${{ steps.plan.outputs.conformance_plan_digest }}
       trusted_conformance_inputs_digest: ${{ steps.plan.outputs.trusted_conformance_inputs_digest }}
     steps:
-      - name: Check out trusted readiness automation
+      - name: Check out exact candidate readiness driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           path: automation
           fetch-depth: 1
           persist-credentials: false
@@ -96,10 +95,10 @@ jobs:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - name: Check out trusted readiness automation
+      - name: Check out exact candidate readiness driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.plan.outputs.trusted_sha }}
+          ref: ${{ github.sha }}
           path: automation
           fetch-depth: 1
           persist-credentials: false
@@ -151,12 +150,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Restore trusted automation compilation cache
+      - name: Restore candidate readiness-driver compilation cache
         id: automation-target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
       - name: Resolve pinned Rust toolchain
         working-directory: automation
         run: rustup show active-toolchain
@@ -197,12 +196,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Save trusted automation compilation cache
+      - name: Save candidate readiness-driver compilation cache
         if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
 
   macos:
     name: Technical readiness / macOS aarch64
@@ -212,10 +211,10 @@ jobs:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - name: Check out trusted readiness automation
+      - name: Check out exact candidate readiness driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.plan.outputs.trusted_sha }}
+          ref: ${{ github.sha }}
           path: automation
           fetch-depth: 1
           persist-credentials: false
@@ -261,12 +260,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Restore trusted automation compilation cache
+      - name: Restore candidate readiness-driver compilation cache
         id: automation-target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
       - name: Resolve pinned Rust toolchain
         working-directory: automation
         run: rustup show active-toolchain
@@ -300,12 +299,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Save trusted automation compilation cache
+      - name: Save candidate readiness-driver compilation cache
         if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
 
   windows:
     name: Technical readiness / Windows x86_64
@@ -315,10 +314,10 @@ jobs:
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - name: Check out trusted readiness automation
+      - name: Check out exact candidate readiness driver
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.plan.outputs.trusted_sha }}
+          ref: ${{ github.sha }}
           path: automation
           fetch-depth: 1
           persist-credentials: false
@@ -364,12 +363,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Restore trusted automation compilation cache
+      - name: Restore candidate readiness-driver compilation cache
         id: automation-target-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
       - name: Resolve pinned Rust toolchain
         working-directory: automation
         run: rustup show active-toolchain
@@ -401,12 +400,12 @@ jobs:
         with:
           path: candidate-target
           key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}
-      - name: Save trusted automation compilation cache
+      - name: Save candidate readiness-driver compilation cache
         if: ${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: automation/target
-          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ needs.plan.outputs.trusted_sha }}
+          key: readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}
 
   verify:
     name: Blocker-zero technical release eligibility
@@ -414,10 +413,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Check out trusted readiness verifier
+      - name: Check out exact candidate readiness verifier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.plan.outputs.trusted_sha }}
+          ref: ${{ github.sha }}
           path: automation
           fetch-depth: 1
           persist-credentials: false

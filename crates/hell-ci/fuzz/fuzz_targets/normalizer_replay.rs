@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
     let passes = apply_retained_normalizer_twice(RetainedNormalizerInput {
         normalizer,
         observation: data,
+        executable: Path::new("hell"),
         sandbox: Path::new(r"C:\fuzz\sandbox"),
         script: Path::new(r"C:\fuzz\sandbox\main.hell"),
     });

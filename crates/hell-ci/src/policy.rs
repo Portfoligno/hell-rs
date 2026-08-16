@@ -43,6 +43,7 @@ pub(crate) fn normalized_relative_path(value: &str) -> Result<PathBuf, String> {
 
 fn tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let result = CommandSpec::new("git", Duration::from_secs(30))
+        .git_safe_directory(root)
         .arguments(["ls-files", "-z"])
         .current_directory(root)
         .run()

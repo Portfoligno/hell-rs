@@ -354,6 +354,7 @@ fn booleans(values: &BTreeMap<String, String>, key: &str) -> Result<Vec<bool>, S
 
 fn git_head(root: &Path) -> Result<String, String> {
     let result = CommandSpec::new("git", Duration::from_secs(30))
+        .git_safe_directory(root)
         .arguments(["rev-parse", "HEAD"])
         .current_directory(root)
         .run()

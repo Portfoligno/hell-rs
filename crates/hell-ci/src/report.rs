@@ -493,7 +493,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_cargo_report_binds_the_canonical_program_and_exact_argv() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!(
             "hell-ci-resolved-cargo-report-{}",
@@ -501,13 +501,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
-        let executable = root.join("rustup");
-        std::fs::write(
-            &executable,
-            b"#!/bin/sh\ncase \"$0\" in */cargo) exit 0 ;; *) exit 91 ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let executable = std::env::current_exe().unwrap();
         let invocation = root.join("cargo");
         symlink(&executable, &invocation).unwrap();
         let canonical = std::fs::canonicalize(&executable).unwrap();
@@ -516,7 +511,12 @@ mod tests {
             invocation.clone(),
             canonical.clone(),
         )
-        .arguments(["test", "--workspace", "--locked"]);
+        .arguments([
+            "command::tests::cargo_multicall_argv_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ]);
         let mut report = Report::new("diagnostic");
         let result = report
             .run_command("workspace-tests", &spec)
@@ -532,7 +532,15 @@ mod tests {
             step.canonical_executable_identity.as_deref(),
             Some(&*canonical.to_string_lossy())
         );
-        assert_eq!(step.arguments, ["test", "--workspace", "--locked"]);
+        assert_eq!(
+            step.arguments,
+            [
+                "command::tests::cargo_multicall_argv_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ]
+        );
         assert!(step.command_error.is_none());
         assert!(report.passed());
         let json = report.to_json();

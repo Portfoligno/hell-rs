@@ -88,6 +88,11 @@ pub fn canonical_conformance_observation_json(
             "conformance filesystem observation is truncated",
         ));
     }
+    let executable = observation
+        .identity
+        .path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("normalizer executable path is not UTF-8"))?;
     let mut output = String::from("{\"diagnostic\":");
     push_json_string(&mut output, &format!("{:?}", observation.diagnostic));
     output.push_str(",\"exit\":{");
@@ -108,7 +113,9 @@ pub fn canonical_conformance_observation_json(
     push_json_string(&mut output, &format!("{:?}", observation.filesystem));
     output.push_str(",\"mode\":");
     push_json_string(&mut output, &format!("{:?}", observation.mode));
-    output.push_str(",\"normalizerContext\":{\"sandbox\":");
+    output.push_str(",\"normalizerContext\":{\"executable\":");
+    push_json_string(&mut output, executable);
+    output.push_str(",\"sandbox\":");
     push_json_string(
         &mut output,
         observation.normalizer_sandbox.to_string_lossy().as_ref(),
@@ -122,7 +129,7 @@ pub fn canonical_conformance_observation_json(
     push_conformance_capture(&mut output, "rawStderr", raw_stderr);
     output.push_str(",\"resourceAudit\":");
     push_json_string(&mut output, &format!("{:?}", observation.resource_audit));
-    output.push_str(",\"schemaVersion\":3,\"semanticTrace\":[");
+    output.push_str(",\"schemaVersion\":4,\"semanticTrace\":[");
     if observation.semantic.is_some() {
         push_json_string(&mut output, &conformance_semantic_document(observation)?);
     }
@@ -159,6 +166,7 @@ pub fn canonical_conformance_observation_json(
 /// production normalizer pass.
 pub fn replay_conformance_stderr(
     raw_stderr: &[u8],
+    executable: &Path,
     sandbox: &Path,
     script: &Path,
     case: &DifferentialCase,
@@ -169,7 +177,7 @@ pub fn replay_conformance_stderr(
             "conformance normalizer closure differs from the reviewed case",
         ));
     }
-    let mut output = crate::diagnostic_sandbox_path_v1(raw_stderr, sandbox, script);
+    let mut output = crate::diagnostic_sandbox_path_v1(raw_stderr, executable, sandbox, script);
     for (from, to) in &case.normalization.stderr_replacements {
         output = crate::replace_all(&output, from, to);
     }
@@ -177,6 +185,7 @@ pub fn replay_conformance_stderr(
         let passes = crate::apply_retained_normalizer_twice(crate::RetainedNormalizerInput {
             normalizer: *normalizer,
             observation: &output,
+            executable,
             sandbox,
             script,
         });
@@ -1673,13 +1682,30 @@ fn verify_case_comparison_projection(
         ));
     }
     if matches!(
-        retained,
+        &retained,
         crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+            | crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. }
     ) {
         let raw = raw_mismatch_facts(directory)?;
         if raw.len() != 1 || raw[0].category != crate::MismatchKind::Stderr {
             return Err(std::io::Error::other(
                 "reviewed failure projection does not retain exactly one raw stderr difference",
+            ));
+        }
+    }
+    if let crate::DifferentialComparisonProjection::ReviewedWindowsPresentation {
+        platform,
+        field,
+        ..
+    } = retained
+    {
+        let raw = raw_mismatch_facts(directory)?;
+        if platform != hell_builtins::ClaimPlatform::Windows
+            || raw.len() != 1
+            || raw[0].category != field.mismatch_kind()
+        {
+            return Err(std::io::Error::other(
+                "reviewed Windows projection does not retain its exact target and raw field",
             ));
         }
     }
@@ -2431,6 +2457,9 @@ pub enum ObservationEquivalence {
     /// A reviewed failing runtime case differs only in host error prose that
     /// is outside every declared Presentation target.
     ReviewedRuntimeFailureStderr(Vec<RetainedMismatchFact>),
+    /// One exact Windows upstream presentation dialect differs while every
+    /// non-stream observation and target-scoped semantic cause agrees.
+    ReviewedWindowsPresentation(crate::WindowsPresentationField, Vec<RetainedMismatchFact>),
 }
 
 /// One canonical retained mismatch category and its bounded side digests.
@@ -2446,6 +2475,10 @@ pub struct RetainedMismatchFact {
 pub enum RetainedObservationClassification {
     Exact,
     ProjectedRuntimeFailureStderr {
+        raw_mismatches: Vec<RetainedMismatchFact>,
+    },
+    ProjectedWindowsPresentation {
+        field: crate::WindowsPresentationField,
         raw_mismatches: Vec<RetainedMismatchFact>,
     },
     Normalized {
@@ -2498,8 +2531,9 @@ pub fn classify_retained_observation_bundle(
     );
     if normalized_mismatches.is_empty()
         && matches!(
-            projection,
+            &projection,
             crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+                | crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. }
         )
     {
         if raw_mismatches.len() != 1 || raw_mismatches[0].category != crate::MismatchKind::Stderr {
@@ -2508,6 +2542,34 @@ pub fn classify_retained_observation_bundle(
             ));
         }
         Ok(RetainedObservationClassification::ProjectedRuntimeFailureStderr { raw_mismatches })
+    } else if normalized_mismatches.is_empty()
+        && matches!(
+            &projection,
+            crate::DifferentialComparisonProjection::ReviewedWindowsPresentation { .. }
+        )
+    {
+        let crate::DifferentialComparisonProjection::ReviewedWindowsPresentation {
+            platform,
+            field,
+            ..
+        } = projection
+        else {
+            unreachable!("projection variant was matched above")
+        };
+        if platform != hell_builtins::ClaimPlatform::Windows
+            || raw_mismatches.len() != 1
+            || raw_mismatches[0].category != field.mismatch_kind()
+        {
+            return Err(std::io::Error::other(
+                "reviewed Windows projection lacks its exact target and raw field",
+            ));
+        }
+        Ok(
+            RetainedObservationClassification::ProjectedWindowsPresentation {
+                field,
+                raw_mismatches,
+            },
+        )
     } else if normalized_mismatches.is_empty() {
         if raw_mismatches.is_empty() {
             Ok(RetainedObservationClassification::Exact)
@@ -2557,9 +2619,40 @@ fn recompute_projected_mismatch_sides(
     Vec<RetainedMismatchSide>,
 )> {
     let mut mismatches = recompute_mismatch_sides(directory)?;
-    let projection = retained_runtime_failure_stderr_projection(directory, case)?;
-    if !matches!(projection, crate::DifferentialComparisonProjection::Exact) {
-        mismatches.retain(|mismatch| mismatch.fact.category != crate::MismatchKind::Stderr);
+    let authority = mismatches
+        .iter()
+        .map(|mismatch| {
+            Ok((
+                mismatch.fact.category,
+                mismatch.fact.oracle_sha256,
+                mismatch.fact.candidate_sha256,
+                u64::try_from(mismatch.oracle.len()).map_err(|_| {
+                    std::io::Error::other("retained oracle presentation is too large")
+                })?,
+                u64::try_from(mismatch.candidate.len()).map_err(|_| {
+                    std::io::Error::other("retained candidate presentation is too large")
+                })?,
+            ))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let projection = match crate::windows_presentation::retained_windows_presentation_projection(
+        case, &authority,
+    ) {
+        Some(reviewed) => reviewed,
+        None => retained_runtime_failure_stderr_projection(directory, case)?,
+    };
+    let projected_field = match &projection {
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+        | crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            ..
+        } => Some(crate::MismatchKind::Stderr),
+        crate::DifferentialComparisonProjection::ReviewedWindowsPresentation { field, .. } => {
+            Some(field.mismatch_kind())
+        }
+        crate::DifferentialComparisonProjection::Exact => None,
+    };
+    if let Some(field) = projected_field {
+        mismatches.retain(|mismatch| mismatch.fact.category != field);
     }
     Ok((projection, mismatches))
 }
@@ -2568,7 +2661,17 @@ fn retained_runtime_failure_stderr_projection(
     directory: &Path,
     case: &DifferentialCase,
 ) -> std::io::Result<crate::DifferentialComparisonProjection> {
-    let Some(builtin) = crate::reviewed_runtime_failure_stderr_builtin(case) else {
+    if crate::has_runtime_failure_presentation_authority(&case.id) {
+        return retained_runtime_failure_exception_stderr_projection(directory, case);
+    }
+    retained_legacy_runtime_failure_stderr_projection(directory, case)
+}
+
+fn retained_runtime_failure_exception_stderr_projection(
+    directory: &Path,
+    case: &DifferentialCase,
+) -> std::io::Result<crate::DifferentialComparisonProjection> {
+    let Some(authority) = crate::reviewed_runtime_failure_presentation_authority(case) else {
         return Ok(crate::DifferentialComparisonProjection::Exact);
     };
     let oracle_directory = directory.join("oracle");
@@ -2611,8 +2714,80 @@ fn retained_runtime_failure_stderr_projection(
     if oracle_stderr == candidate_stderr {
         return Ok(crate::DifferentialComparisonProjection::Exact);
     }
-    if !parse_semantic_coverage(&candidate_document)?
-        .contains(&CoverageEvent::EnteredAdapter(builtin))
+    if !retained_runtime_failure_causality(
+        &candidate_directory,
+        case,
+        authority,
+        &candidate_document,
+    )? {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    let Some(payload_sha256) = crate::reviewed_runtime_failure_payload_sha256(
+        authority,
+        &oracle_stderr,
+        &candidate_stderr,
+    ) else {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    };
+    Ok(
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family: authority.family,
+            payload_sha256,
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        },
+    )
+}
+
+fn retained_legacy_runtime_failure_stderr_projection(
+    directory: &Path,
+    case: &DifferentialCase,
+) -> std::io::Result<crate::DifferentialComparisonProjection> {
+    let Some(builtin) = crate::reviewed_legacy_runtime_failure_stderr_builtin(case) else {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    };
+    let oracle_directory = directory.join("oracle");
+    let candidate_directory = directory.join("candidate");
+    let oracle_document = fs::read_to_string(oracle_directory.join("observation.json"))?;
+    let candidate_document = fs::read_to_string(candidate_directory.join("observation.json"))?;
+    let oracle = observation_comparison_fields(&oracle_document)?;
+    let candidate = observation_comparison_fields(&candidate_document)?;
+    if oracle.mode != "Run"
+        || candidate.mode != "Run"
+        || oracle.timed_out
+        || candidate.timed_out
+        || observation_status_success(oracle.status)?
+        || observation_status_success(candidate.status)?
+        || oracle.status != candidate.status
+        || oracle.filesystem != candidate.filesystem
+        || fs::read(oracle_directory.join("stdout.bin"))?
+            != fs::read(candidate_directory.join("stdout.bin"))?
+    {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    let oracle_stderr = fs::read(oracle_directory.join("stderr.bin"))?;
+    let candidate_stderr = fs::read(candidate_directory.join("stderr.bin"))?;
+    let (oracle_bytes, oracle_sha256, oracle_truncated) =
+        observation_capture_summary(&oracle_document, "stderr")?;
+    let (candidate_bytes, candidate_sha256, candidate_truncated) =
+        observation_capture_summary(&candidate_document, "stderr")?;
+    if oracle_truncated || candidate_truncated {
+        return Ok(crate::DifferentialComparisonProjection::Exact);
+    }
+    if u64::try_from(oracle_stderr.len()).unwrap_or(u64::MAX) != oracle_bytes
+        || u64::try_from(candidate_stderr.len()).unwrap_or(u64::MAX) != candidate_bytes
+        || sha256_bytes(&oracle_stderr) != oracle_sha256
+        || sha256_bytes(&candidate_stderr) != candidate_sha256
+    {
+        return Err(std::io::Error::other(
+            "retained stderr bytes disagree with their observation identity",
+        ));
+    }
+    if oracle_stderr == candidate_stderr
+        || !parse_semantic_coverage(&candidate_document)?
+            .contains(&CoverageEvent::EnteredAdapter(builtin))
     {
         return Ok(crate::DifferentialComparisonProjection::Exact);
     }
@@ -2661,6 +2836,68 @@ fn retained_runtime_failure_stderr_projection(
             candidate_bytes,
         },
     )
+}
+
+fn retained_runtime_failure_causality(
+    observation_directory: &Path,
+    case: &DifferentialCase,
+    authority: crate::RuntimeFailurePresentationAuthority,
+    document: &str,
+) -> std::io::Result<bool> {
+    if crate::runtime_failure_mutant_active("runtime-failure-causal-authority") {
+        return Ok(true);
+    }
+    let Some(target) = crate::runtime_failure_target(case, authority) else {
+        return Ok(false);
+    };
+    let coverage = parse_semantic_coverage(document)?;
+    let task_trace = parse_semantic_task_trace(document)?;
+    if validate_expected_task_trace(target, authority.builtin, &task_trace).is_err() {
+        return Ok(false);
+    }
+    let effect_trace = parse_semantic_effect_trace(document)?;
+    if authority.dimension == hell_builtins::CompatibilityDimension::Effects {
+        let effects = effect_trace
+            .iter()
+            .filter(|event| event.builtin == authority.builtin)
+            .collect::<Vec<_>>();
+        return Ok(
+            coverage.contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+                && effects.len() == 2
+                && effects[0].owner_task == effects[1].owner_task
+                && effects[0].sequence == effects[1].sequence
+                && effects[0].parent_sequence == effects[1].parent_sequence
+                && effects[0].lifecycle == "started"
+                && effects[1].lifecycle == "failed",
+        );
+    }
+
+    let typed_result = parse_optional_digest_field(document, "semanticTypedResultSha256")?;
+    let typed_result_builtin = parse_optional_u16_field(document, "semanticTypedResultBuiltinId")?;
+    let boundaries = parse_semantic_boundaries(document)?;
+    let resource_trace = parse_semantic_resource_trace(document)?;
+    let obligation_trace = parse_semantic_obligation_trace(document)?;
+    Ok(validate_obligation_semantics(
+        authority.obligation,
+        authority.dimension,
+        authority.builtin,
+        document,
+        observation_directory,
+        &coverage,
+        &effect_trace,
+        &task_trace,
+        &resource_trace,
+        &obligation_trace,
+        typed_result,
+        typed_result_builtin,
+        &boundaries,
+        &target.platforms,
+        target.expected_raw_presentation_sha256,
+        target.expected_presentation_shadow_normalizer,
+        target.expected_normalized_presentation_sha256,
+        None,
+    )
+    .is_ok())
 }
 
 fn observation_status_success(status: &str) -> std::io::Result<bool> {
@@ -3104,7 +3341,123 @@ fn comparison_projection_json(projection: &crate::DifferentialComparisonProjecti
             oracle_bytes,
             candidate_bytes,
         ),
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family,
+            payload_sha256,
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        } => format!(
+            concat!(
+                "{{\n",
+                "  \"schemaVersion\": 2,\n",
+                "  \"kind\": \"reviewed-runtime-failure-exception-stderr-out-of-scope\",\n",
+                "  \"field\": \"stderr\",\n",
+                "  \"exceptionFamily\": \"{}\",\n",
+                "  \"payloadSha256\": \"{}\",\n",
+                "  \"oracleSha256\": \"{}\",\n",
+                "  \"candidateSha256\": \"{}\",\n",
+                "  \"oracleBytes\": {},\n",
+                "  \"candidateBytes\": {}\n",
+                "}}\n"
+            ),
+            exception_family.descriptor_name(),
+            payload_sha256.hex(),
+            oracle_sha256.hex(),
+            candidate_sha256.hex(),
+            oracle_bytes,
+            candidate_bytes,
+        ),
+        crate::DifferentialComparisonProjection::ReviewedWindowsPresentation {
+            platform,
+            field,
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        } => format!(
+            concat!(
+                "{{\n",
+                "  \"schemaVersion\": 3,\n",
+                "  \"kind\": \"reviewed-windows-presentation-out-of-scope\",\n",
+                "  \"platform\": \"{}\",\n",
+                "  \"field\": \"{}\",\n",
+                "  \"oracleSha256\": \"{}\",\n",
+                "  \"candidateSha256\": \"{}\",\n",
+                "  \"oracleBytes\": {},\n",
+                "  \"candidateBytes\": {}\n",
+                "}}\n"
+            ),
+            match platform {
+                hell_builtins::ClaimPlatform::Windows => "Windows",
+                hell_builtins::ClaimPlatform::All => "All",
+                hell_builtins::ClaimPlatform::Linux => "Linux",
+                hell_builtins::ClaimPlatform::MacOs => "MacOs",
+            },
+            field.descriptor_name(),
+            oracle_sha256.hex(),
+            candidate_sha256.hex(),
+            oracle_bytes,
+            candidate_bytes,
+        ),
     }
+}
+
+fn parse_windows_comparison_projection_json(
+    document: &str,
+) -> Option<std::io::Result<crate::DifferentialComparisonProjection>> {
+    if !document.starts_with(concat!(
+        "{\n",
+        "  \"schemaVersion\": 3,\n",
+        "  \"kind\": \"reviewed-windows-presentation-out-of-scope\",\n"
+    )) {
+        return None;
+    }
+    Some((|| {
+        let mut lines = document.lines();
+        if lines.next() != Some("{")
+            || lines.next() != Some("  \"schemaVersion\": 3,")
+            || lines.next() != Some("  \"kind\": \"reviewed-windows-presentation-out-of-scope\",")
+            || lines.next() != Some("  \"platform\": \"Windows\",")
+        {
+            return Err(std::io::Error::other(
+                "Windows comparison projection target is malformed",
+            ));
+        }
+        let field = match lines.next() {
+            Some("  \"field\": \"stdout\",") => crate::WindowsPresentationField::Stdout,
+            Some("  \"field\": \"stderr\",") => crate::WindowsPresentationField::Stderr,
+            _ => {
+                return Err(std::io::Error::other(
+                    "Windows comparison projection field is malformed",
+                ));
+            }
+        };
+        let oracle_sha256 = projection_digest_line(lines.next(), "oracleSha256")?;
+        let candidate_sha256 = projection_digest_line(lines.next(), "candidateSha256")?;
+        let oracle_bytes = projection_u64_line(lines.next(), "oracleBytes")?;
+        let candidate_bytes = projection_u64_line(lines.next(), "candidateBytes")?;
+        if lines.next() != Some("}") || lines.next().is_some() {
+            return Err(std::io::Error::other(
+                "Windows comparison projection has unknown fields",
+            ));
+        }
+        let projection = crate::DifferentialComparisonProjection::ReviewedWindowsPresentation {
+            platform: hell_builtins::ClaimPlatform::Windows,
+            field,
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        };
+        if comparison_projection_json(&projection) != document {
+            return Err(std::io::Error::other(
+                "Windows comparison projection is noncanonical",
+            ));
+        }
+        Ok(projection)
+    })())
 }
 
 fn parse_comparison_projection_json(
@@ -3114,16 +3467,66 @@ fn parse_comparison_projection_json(
     if document == comparison_projection_json(&exact) {
         return Ok(exact);
     }
+    if let Some(windows) = parse_windows_comparison_projection_json(document) {
+        return windows;
+    }
+    let mut legacy_lines = document.lines();
+    if legacy_lines.next() == Some("{")
+        && legacy_lines.next() == Some("  \"schemaVersion\": 1,")
+        && legacy_lines.next()
+            == Some("  \"kind\": \"reviewed-runtime-failure-stderr-out-of-scope\",")
+        && legacy_lines.next() == Some("  \"field\": \"stderr\",")
+    {
+        let oracle_sha256 = projection_digest_line(legacy_lines.next(), "oracleSha256")?;
+        let candidate_sha256 = projection_digest_line(legacy_lines.next(), "candidateSha256")?;
+        let oracle_bytes = projection_u64_line(legacy_lines.next(), "oracleBytes")?;
+        let candidate_bytes = projection_u64_line(legacy_lines.next(), "candidateBytes")?;
+        if legacy_lines.next() != Some("}") || legacy_lines.next().is_some() {
+            return Err(std::io::Error::other(
+                "comparison projection has unknown fields",
+            ));
+        }
+        let projection = crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        };
+        if comparison_projection_json(&projection) != document {
+            return Err(std::io::Error::other(
+                "comparison projection is noncanonical",
+            ));
+        }
+        return Ok(projection);
+    }
     let mut lines = document.lines();
     if lines.next() != Some("{")
-        || lines.next() != Some("  \"schemaVersion\": 1,")
-        || lines.next() != Some("  \"kind\": \"reviewed-runtime-failure-stderr-out-of-scope\",")
+        || lines.next() != Some("  \"schemaVersion\": 2,")
+        || lines.next()
+            != Some("  \"kind\": \"reviewed-runtime-failure-exception-stderr-out-of-scope\",")
         || lines.next() != Some("  \"field\": \"stderr\",")
     {
         return Err(std::io::Error::other(
             "comparison projection schema is malformed",
         ));
     }
+    let exception_family = match lines.next() {
+        Some("  \"exceptionFamily\": \"unicode-exception\",") => {
+            crate::RuntimeFailureExceptionFamily::UnicodeException
+        }
+        Some("  \"exceptionFamily\": \"io-exception\",") => {
+            crate::RuntimeFailureExceptionFamily::IOException
+        }
+        Some("  \"exceptionFamily\": \"error-call\",") => {
+            crate::RuntimeFailureExceptionFamily::ErrorCall
+        }
+        _ => {
+            return Err(std::io::Error::other(
+                "comparison projection exception family is malformed",
+            ));
+        }
+    };
+    let payload_sha256 = projection_digest_line(lines.next(), "payloadSha256")?;
     let oracle_sha256 = projection_digest_line(lines.next(), "oracleSha256")?;
     let candidate_sha256 = projection_digest_line(lines.next(), "candidateSha256")?;
     let oracle_bytes = projection_u64_line(lines.next(), "oracleBytes")?;
@@ -3133,12 +3536,15 @@ fn parse_comparison_projection_json(
             "comparison projection has unknown fields",
         ));
     }
-    let projection = crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
-        oracle_sha256,
-        candidate_sha256,
-        oracle_bytes,
-        candidate_bytes,
-    };
+    let projection =
+        crate::DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family,
+            payload_sha256,
+            oracle_sha256,
+            candidate_sha256,
+            oracle_bytes,
+            candidate_bytes,
+        };
     if comparison_projection_json(&projection) != document {
         return Err(std::io::Error::other(
             "comparison projection is noncanonical",
@@ -3301,6 +3707,13 @@ pub fn classify_observation_bundle_for_case(
         RetainedObservationClassification::ProjectedRuntimeFailureStderr { raw_mismatches } => Ok(
             ObservationEquivalence::ReviewedRuntimeFailureStderr(raw_mismatches),
         ),
+        RetainedObservationClassification::ProjectedWindowsPresentation {
+            field,
+            raw_mismatches,
+        } => Ok(ObservationEquivalence::ReviewedWindowsPresentation(
+            field,
+            raw_mismatches,
+        )),
         RetainedObservationClassification::Normalized { normalizers, .. } => {
             Ok(ObservationEquivalence::Normalized(normalizers))
         }
@@ -7009,7 +7422,12 @@ fn validate_case_id(id: &str) -> std::io::Result<()> {
 }
 
 pub(crate) fn case_descriptor(case: &DifferentialCase) -> String {
-    let mut output = String::from("schema_version = 8\nid = ");
+    let runtime_failure_authority = crate::reviewed_runtime_failure_presentation_authority(case);
+    let mut output = if runtime_failure_authority.is_some() {
+        String::from("schema_version = 9\nid = ")
+    } else {
+        String::from("schema_version = 8\nid = ")
+    };
     push_toml_string(&mut output, &case.id);
     output.push_str("\nmode = ");
     push_toml_string(&mut output, &format!("{:?}", case.mode));
@@ -7027,6 +7445,22 @@ pub(crate) fn case_descriptor(case: &DifferentialCase) -> String {
     } else {
         "false\n"
     });
+    if let Some(authority) = runtime_failure_authority {
+        output.push_str("runtime_failure_exception_family = ");
+        push_toml_string(&mut output, authority.family.descriptor_name());
+        output.push_str("\nruntime_failure_builtin = ");
+        push_toml_string(&mut output, authority.builtin_name);
+        output.push_str("\nruntime_failure_dimension = ");
+        push_toml_string(&mut output, authority.dimension.as_str());
+        output.push_str("\nruntime_failure_obligation = ");
+        push_toml_string(&mut output, authority.obligation);
+        output.push_str("\nruntime_failure_while_handling = ");
+        output.push_str(if authority.allow_while_handling {
+            "true\n"
+        } else {
+            "false\n"
+        });
+    }
     output.push_str("stdin_sha256 = ");
     push_toml_string(&mut output, &sha256_bytes(&case.stdin).hex());
     output.push_str("\nexecution_input_sha256 = ");
@@ -7570,6 +8004,11 @@ fn write_observation(root: &Path, name: &str, observation: &Observation) -> std:
 }
 
 fn normalizer_context_json(observation: &Observation) -> std::io::Result<String> {
+    let executable = observation
+        .identity
+        .path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("normalizer executable path is not UTF-8"))?;
     let sandbox = observation
         .normalizer_sandbox
         .to_str()
@@ -7578,7 +8017,9 @@ fn normalizer_context_json(observation: &Observation) -> std::io::Result<String>
         .normalizer_script
         .to_str()
         .ok_or_else(|| std::io::Error::other("normalizer script path is not UTF-8"))?;
-    let mut output = String::from("{\n  \"schemaVersion\": 1,\n  \"sandboxPath\": ");
+    let mut output = String::from("{\n  \"schemaVersion\": 2,\n  \"executablePath\": ");
+    push_json_string(&mut output, executable);
+    output.push_str(",\n  \"sandboxPath\": ");
     push_json_string(&mut output, sandbox);
     output.push_str(",\n  \"scriptPath\": ");
     push_json_string(&mut output, script);
@@ -8301,16 +8742,88 @@ fn push_toml_string(output: &mut String, value: &str) {
 mod tests {
     use super::*;
 
+    fn portable_temp_component(label: &str) -> String {
+        const STEM_BYTES: usize = 32;
+
+        let mut stem = label
+            .bytes()
+            .take(STEM_BYTES)
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                    char::from(byte)
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if stem.is_empty() {
+            stem.push_str("label");
+        }
+        format!("{stem}-{}", sha256_bytes(label.as_bytes()).hex())
+    }
+
     fn root(name: &str) -> PathBuf {
         static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let component = portable_temp_component(name);
         let root = std::env::temp_dir().join(format!(
-            "hell-testkit-promotion-{name}-{}-{nonce}",
+            "hell-testkit-promotion-{component}-{}-{nonce}",
             std::process::id(),
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn portable_temp_components_bind_adversarial_windows_labels_without_aliasing() {
+        let labels = [
+            "",
+            ".",
+            "..",
+            "<$>",
+            "<*>",
+            "<**>",
+            "<>",
+            "a:b",
+            "a/b",
+            "a\\b",
+            "a?b",
+            "a*b",
+            "a\"b",
+            "a|b",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con",
+            "NUL.txt",
+            "COM1",
+            "LPT9.log",
+            "\0control",
+            "日本語",
+        ];
+        let components = labels
+            .iter()
+            .map(|label| portable_temp_component(label))
+            .collect::<Vec<_>>();
+        for (label, component) in labels.iter().zip(&components) {
+            assert_eq!(*component, portable_temp_component(label));
+            assert!(component.len() <= 32 + 1 + 64);
+            assert!(
+                component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            );
+            assert!(!component.ends_with(['.', ' ']));
+        }
+        assert_eq!(
+            components
+                .iter()
+                .map(|component| component.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            labels.len()
+        );
     }
 
     fn observation(role: crate::ExecutableRole) -> Observation {
@@ -10341,8 +10854,6 @@ mod tests {
                 "runtime-directory-file-exists-invalid-path-false",
                 b"True\n".as_slice(),
             ),
-            ("runtime-directory-get-home-home-a", b"forged-a".as_slice()),
-            ("runtime-directory-get-home-home-b", b"forged-b".as_slice()),
             (
                 "runtime-directory-get-home-platform-fallback",
                 b"True\n".as_slice(),
@@ -10383,6 +10894,57 @@ mod tests {
             (true, 0),
             (false, 1),
         );
+    }
+
+    #[cfg(feature = "compat-tracing")]
+    #[test]
+    fn retained_platform_native_home_directory_rejects_role_substitution() {
+        let cases = crate::committed_differential_cases();
+        for (case_id, forged) in [
+            ("runtime-directory-get-home-home-a", b"forged-a".as_slice()),
+            ("runtime-directory-get-home-home-b", b"forged-b".as_slice()),
+        ] {
+            let case = cases
+                .iter()
+                .find(|case| case.id.as_ref() == case_id)
+                .unwrap_or_else(|| panic!("missing platform-native home case {case_id}"));
+            let descriptor = case
+                .claim_evidence
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing platform-native home authority for {case_id}"));
+            assert_eq!(
+                descriptor.review_statement.as_ref(),
+                "runtime-home-directory-platform-native-oracle-review-v1",
+                "wrong platform-native home authority for {case_id}"
+            );
+            assert!(
+                descriptor
+                    .semantic_targets
+                    .iter()
+                    .all(|target| target.expected_raw_presentation_sha256.is_none()),
+                "platform-native home case unexpectedly fixed raw bytes for {case_id}"
+            );
+
+            let (root, directory) = retain_executed_runtime_case(case, case_id);
+            let candidate_stdout = fs::read(directory.join("candidate/stdout.bin")).unwrap();
+            let oracle_stdout = fs::read(directory.join("oracle/stdout.bin")).unwrap();
+            assert_eq!(
+                candidate_stdout, oracle_stdout,
+                "platform-native home baseline differs for {case_id}"
+            );
+            assert_ne!(
+                candidate_stdout.as_slice(),
+                forged,
+                "platform-native home substitution is ineffective for {case_id}"
+            );
+            fs::write(directory.join("candidate/stdout.bin"), forged).unwrap();
+            rewrite_bundle_file_digest(&directory, "candidate/stdout.bin");
+            assert!(
+                verify_observation_bundle_for_case(&directory, case).is_err(),
+                "platform-native home role substitution was accepted for {case_id}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[cfg(feature = "compat-tracing")]

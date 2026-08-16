@@ -76,7 +76,10 @@ fn setsid_double_fork_fixture_escapes_a_process_group_and_retains_pipes() {
         WaitOutcome::Exited(_)
     ));
     let _ = child.terminate().expect("close original process group");
-    std::thread::sleep(Duration::from_millis(250));
+    let marker_deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < marker_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         marker.exists(),
         "fixture did not escape via setsid/double-fork"

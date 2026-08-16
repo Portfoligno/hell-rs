@@ -1893,10 +1893,22 @@ fn projected_failure_report(
         resource_audit: (role == ExecutableRole::Candidate).then(ResourceAudit::default),
         semantic,
     };
-    let oracle = observation(ExecutableRole::Oracle, b"oracle failure\n", None);
+    let oracle = observation(
+        ExecutableRole::Oracle,
+        concat!(
+            "hell: Uncaught exception ",
+            "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
+            "missing-parent/file.txt: withBinaryFile: does not exist (No such file or directory)\n\n",
+            "HasCallStack backtrace:\n",
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:123:4 ",
+            "in ghc-internal:GHC.Internal.IO\n",
+        )
+        .as_bytes(),
+        None,
+    );
     let candidate = observation(
         ExecutableRole::Candidate,
-        b"candidate failure\n",
+        b"hell: missing-parent/file.txt: withBinaryFile: does not exist (No such file or directory)\n",
         Some(semantic),
     );
     let (comparison_projection, mismatches) = compare_case_observations(case, &oracle, &candidate);
@@ -1909,6 +1921,234 @@ fn projected_failure_report(
 }
 
 #[cfg(feature = "compat-tracing")]
+fn assert_runtime_failure_comparison_rejected(
+    label: &str,
+    case: &hell_testkit::DifferentialCase,
+    oracle: &hell_testkit::Observation,
+    candidate: &hell_testkit::Observation,
+    expected_reason: Option<hell_testkit::RuntimeFailureProjectionRejectionReason>,
+) {
+    use hell_testkit::{DifferentialComparisonProjection, MismatchKind, compare_case_observations};
+
+    let (projection, mismatches) = compare_case_observations(case, oracle, candidate);
+    assert_eq!(
+        projection,
+        DifferentialComparisonProjection::Exact,
+        "{label} retained a strict projection",
+    );
+    assert_eq!(mismatches.len(), 1, "{label} mismatch inventory");
+    assert_eq!(mismatches[0].kind, MismatchKind::Stderr, "{label}");
+    assert_eq!(
+        hell_testkit::runtime_failure_projection_rejection(case, oracle, candidate)
+            .map(|rejection| rejection.reason),
+        expected_reason,
+        "{label} diagnostic reason",
+    );
+}
+
+#[cfg(feature = "compat-tracing")]
+fn assert_oracle_frame_rejection_reasons(
+    case: &hell_testkit::DifferentialCase,
+    report: &hell_testkit::DifferentialReport,
+) {
+    use hell_testkit::{BoundedCapture, RuntimeFailureProjectionRejectionReason as Reason};
+
+    let oracle_text = || String::from_utf8(report.oracle.stderr.complete.clone().unwrap()).unwrap();
+    let mut changed = report.oracle.clone();
+    changed.stderr = BoundedCapture::from_bytes(
+        oracle_text()
+            .replace("  throwIO, called at", "  injected, called at")
+            .into_bytes(),
+    );
+    assert_runtime_failure_comparison_rejected(
+        "oracle frame function",
+        case,
+        &changed,
+        &report.candidate,
+        Some(Reason::OracleFrameFunction),
+    );
+
+    let mut changed = report.oracle.clone();
+    let mut stderr = report.oracle.stderr.complete.clone().unwrap();
+    assert_eq!(stderr.pop(), Some(b'\n'));
+    changed.stderr = BoundedCapture::from_bytes(stderr);
+    assert_runtime_failure_comparison_rejected(
+        "oracle frame terminal newline",
+        case,
+        &changed,
+        &report.candidate,
+        Some(Reason::OracleFrameTerminalNewline),
+    );
+
+    let mut changed = report.oracle.clone();
+    changed.stderr = BoundedCapture::from_bytes(
+        oracle_text()
+            .replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs")
+            .into_bytes(),
+    );
+    assert_runtime_failure_comparison_rejected(
+        "oracle frame origin",
+        case,
+        &changed,
+        &report.candidate,
+        Some(Reason::OracleFrameOrigin),
+    );
+}
+
+#[cfg(feature = "compat-tracing")]
+fn assert_direct_runtime_failure_exception_comparison_is_fail_closed(
+    case: &hell_testkit::DifferentialCase,
+    report: &hell_testkit::DifferentialReport,
+) {
+    use std::sync::Arc;
+
+    use hell_testkit::{
+        BoundedCapture, DifferentialComparisonProjection, LogicalTraceEvent,
+        compare_case_observations,
+    };
+
+    let (projection, mismatches) =
+        compare_case_observations(case, &report.oracle, &report.candidate);
+    assert!(matches!(
+        projection,
+        DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. }
+    ));
+    assert!(mismatches.is_empty());
+
+    let mut changed = report.oracle.clone();
+    changed.stderr = BoundedCapture::from_bytes(
+        String::from_utf8(report.oracle.stderr.complete.clone().unwrap())
+            .unwrap()
+            .replace(
+                "GHC.Internal.IO.Exception.IOException",
+                "GHC.Internal.Exception.ErrorCall",
+            )
+            .into_bytes(),
+    );
+    assert_runtime_failure_comparison_rejected(
+        "oracle family",
+        case,
+        &changed,
+        &report.candidate,
+        Some(hell_testkit::RuntimeFailureProjectionRejectionReason::OracleExceptionFamily),
+    );
+
+    assert_oracle_frame_rejection_reasons(case, report);
+
+    let mut changed = report.candidate.clone();
+    changed.stderr = BoundedCapture::from_bytes(
+        String::from_utf8(report.candidate.stderr.complete.clone().unwrap())
+            .unwrap()
+            .replace("missing-parent/file.txt", "substituted/file.txt")
+            .into_bytes(),
+    );
+    assert_runtime_failure_comparison_rejected(
+        "candidate payload",
+        case,
+        &report.oracle,
+        &changed,
+        Some(hell_testkit::RuntimeFailureProjectionRejectionReason::PayloadMismatch),
+    );
+
+    let mut changed = report.candidate.clone();
+    for event in &mut changed
+        .semantic
+        .as_mut()
+        .expect("candidate semantic evidence")
+        .effect_trace
+    {
+        if let LogicalTraceEvent::HostEffect { effect, .. } = event
+            && effect.as_ref() == "failed"
+        {
+            *effect = Arc::from("completed");
+        }
+    }
+    assert_runtime_failure_comparison_rejected(
+        "candidate causality",
+        case,
+        &report.oracle,
+        &changed,
+        Some(hell_testkit::RuntimeFailureProjectionRejectionReason::SemanticCausality),
+    );
+
+    let mut changed = report.candidate.clone();
+    changed.semantic = None;
+    assert_runtime_failure_comparison_rejected(
+        "missing candidate semantic evidence",
+        case,
+        &report.oracle,
+        &changed,
+        Some(hell_testkit::RuntimeFailureProjectionRejectionReason::MissingCandidateSemantic),
+    );
+
+    assert_runtime_failure_descriptor_rejections(case, report);
+}
+
+#[cfg(feature = "compat-tracing")]
+fn assert_runtime_failure_descriptor_rejections(
+    case: &hell_testkit::DifferentialCase,
+    report: &hell_testkit::DifferentialReport,
+) {
+    use std::sync::Arc;
+
+    use hell_builtins::CompatibilityDimension;
+    use hell_testkit::EvidenceTarget;
+
+    let mut contaminated = case.clone();
+    contaminated
+        .claim_evidence
+        .as_mut()
+        .unwrap()
+        .targets
+        .push(EvidenceTarget {
+            builtin: Arc::from("Text.writeFile"),
+            dimension: CompatibilityDimension::Presentation,
+        });
+    assert_runtime_failure_comparison_rejected(
+        "strict descriptor contamination",
+        &contaminated,
+        &report.oracle,
+        &report.candidate,
+        Some(hell_testkit::RuntimeFailureProjectionRejectionReason::DescriptorTable),
+    );
+
+    assert_runtime_failure_comparison_rejected(
+        "non-reviewed case",
+        &hell_testkit::DifferentialCase::default(),
+        &report.oracle,
+        &report.candidate,
+        None,
+    );
+}
+
+#[cfg(feature = "compat-tracing")]
+fn assert_strict_projection_rejects_legacy_substitution(
+    root: &std::path::Path,
+    case: &hell_testkit::DifferentialCase,
+    report: &hell_testkit::DifferentialReport,
+) {
+    use hell_testkit::{DifferentialComparisonProjection, retain_observation_bundle};
+
+    let mut forged = report.clone();
+    forged.comparison_projection = DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
+        oracle_sha256: forged.oracle.stderr.sha256,
+        candidate_sha256: forged.candidate.stderr.sha256,
+        oracle_bytes: forged.oracle.stderr.total_bytes,
+        candidate_bytes: forged.candidate.stderr.total_bytes,
+    };
+    let error = retain_observation_bundle(&root.join("legacy-forged"), case, &forged).unwrap_err();
+    assert!(error.to_string().contains("projection disagrees"));
+}
+
+#[cfg(feature = "compat-tracing")]
+fn assert_strict_projection_manifest(bundle: &std::path::Path) {
+    let projection = std::fs::read_to_string(bundle.join("comparison-projection.json")).unwrap();
+    assert!(projection.contains("reviewed-runtime-failure-exception-stderr-out-of-scope"));
+    let manifest = std::fs::read_to_string(bundle.join("bundle-manifest.json")).unwrap();
+    assert!(manifest.contains("comparison-projection.json"));
+}
+
+#[cfg(feature = "compat-tracing")]
 #[test]
 fn retained_runtime_failure_projection_is_manifest_bound_and_recomputed() {
     use hell_testkit::{
@@ -1918,8 +2158,8 @@ fn retained_runtime_failure_projection_is_manifest_bound_and_recomputed() {
 
     let case = committed_differential_cases()
         .into_iter()
-        .find(|case| case.id.as_ref() == "runtime-typed-io-text-readfile-failure")
-        .expect("reviewed Text.readFile failure case");
+        .find(|case| case.id.as_ref() == "runtime-typed-io-text-writefile-failure")
+        .expect("reviewed Text.writeFile failure case");
     let root = std::env::temp_dir().join(format!(
         "hell-reviewed-failure-projection-{}",
         std::process::id()
@@ -1951,9 +2191,30 @@ fn retained_runtime_failure_projection_is_manifest_bound_and_recomputed() {
     let report = projected_failure_report(&case, &root, semantic);
     assert!(matches!(
         report.comparison_projection,
-        DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+        DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. }
     ));
     assert!(report.mismatches.is_empty());
+    assert_direct_runtime_failure_exception_comparison_is_fail_closed(&case, &report);
+    let mut causal_forged = report.clone();
+    for event in &mut causal_forged
+        .candidate
+        .semantic
+        .as_mut()
+        .expect("candidate semantic evidence")
+        .effect_trace
+    {
+        if let hell_testkit::LogicalTraceEvent::HostEffect { effect, .. } = event
+            && effect.as_ref() == "failed"
+        {
+            *effect = "completed".into();
+        }
+    }
+    let (forged_projection, _) = hell_testkit::compare_case_observations(
+        &case,
+        &causal_forged.oracle,
+        &causal_forged.candidate,
+    );
+    assert_eq!(forged_projection, DifferentialComparisonProjection::Exact);
     let bundle = retain_observation_bundle(&root.join("evidence"), &case, &report).unwrap();
     verify_observation_bundle_for_case(&bundle, &case).unwrap();
     let classification =
@@ -1963,19 +2224,33 @@ fn retained_runtime_failure_projection_is_manifest_bound_and_recomputed() {
         RetainedObservationClassification::ProjectedRuntimeFailureStderr { ref raw_mismatches }
             if raw_mismatches.len() == 1
     ));
-    let projection = std::fs::read_to_string(bundle.join("comparison-projection.json")).unwrap();
-    assert!(projection.contains("reviewed-runtime-failure-stderr-out-of-scope"));
-    let manifest = std::fs::read_to_string(bundle.join("bundle-manifest.json")).unwrap();
-    assert!(manifest.contains("comparison-projection.json"));
+    assert_strict_projection_manifest(&bundle);
+
+    assert_strict_projection_rejects_legacy_substitution(&root, &case, &report);
 
     let mut forged = report;
     forged.candidate.semantic = None;
-    forged.comparison_projection = DifferentialComparisonProjection::ReviewedRuntimeFailureStderr {
-        oracle_sha256: forged.oracle.stderr.sha256,
-        candidate_sha256: forged.candidate.stderr.sha256,
-        oracle_bytes: forged.oracle.stderr.total_bytes,
-        candidate_bytes: forged.candidate.stderr.total_bytes,
+    let (exception_family, payload_sha256) = match &forged.comparison_projection {
+        DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family,
+            payload_sha256,
+            ..
+        } => (*exception_family, *payload_sha256),
+        DifferentialComparisonProjection::Exact
+        | DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
+        | DifferentialComparisonProjection::ReviewedWindowsPresentation { .. } => {
+            panic!("strict reviewed projection disappeared")
+        }
     };
+    forged.comparison_projection =
+        DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
+            exception_family,
+            payload_sha256,
+            oracle_sha256: forged.oracle.stderr.sha256,
+            candidate_sha256: forged.candidate.stderr.sha256,
+            oracle_bytes: forged.oracle.stderr.total_bytes,
+            candidate_bytes: forged.candidate.stderr.total_bytes,
+        };
     let forged_root = root.join("forged");
     let error = retain_observation_bundle(&forged_root, &case, &forged).unwrap_err();
     assert!(error.to_string().contains("projection disagrees"));
