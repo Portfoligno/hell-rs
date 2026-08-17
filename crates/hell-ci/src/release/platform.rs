@@ -1301,6 +1301,7 @@ fn stage_posix_cargo_deny_home(
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
         copy_posix_cargo_cache_tree(seed.root(), &home, &mut entries, &mut bytes)?;
+        remove_staged_cargo_package_fallback(&home)?;
         let metadata = seed.prove_staged_home_offline(cargo, candidate_root, &home)?;
         let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
@@ -1628,7 +1629,7 @@ impl TrustedCargoCacheSeed {
     }
 
     fn vendor_root(&self) -> PathBuf {
-        self.root.join("vendor")
+        staged_cargo_vendor_root(&self.root)
     }
 
     fn root(&self) -> &Path {
@@ -1884,7 +1885,7 @@ impl TrustedCargoCacheSeed {
             &program_identity,
             "staged frozen fetch proof",
         )?;
-        validate_trusted_cargo_cache_tree(&staged_home.join("vendor"))
+        validate_trusted_cargo_cache_tree(&staged_cargo_vendor_root(staged_home))
     }
 
     fn revalidate_inputs(
@@ -2024,6 +2025,35 @@ fn trusted_cargo_cache_fetch_arguments(
 }
 
 #[cfg(unix)]
+fn staged_cargo_vendor_root(home: &Path) -> PathBuf {
+    home.join("vendor").join("index.crates.io-6f17d22bba15001f")
+}
+
+#[cfg(unix)]
+fn remove_staged_cargo_package_fallback(home: &Path) -> Result<(), String> {
+    for name in ["cache", "src"] {
+        let path = home.join("registry").join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!("cannot inspect staged Cargo package fallback {name}: {error}")
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || fs::canonicalize(&path).map_err(|error| {
+                format!("cannot canonicalize staged Cargo package fallback {name}: {error}")
+            })? != path
+        {
+            return Err(format!(
+                "staged Cargo package fallback {name} is redirected or not a directory"
+            ));
+        }
+        fs::remove_dir_all(&path).map_err(|error| {
+            format!("cannot remove staged Cargo package fallback {name}: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 const TRUSTED_CARGO_LOCK_PACKAGE_LIMIT: usize = 10_000;
 
 #[cfg(unix)]
@@ -2155,6 +2185,23 @@ fn trusted_cargo_deny_advisory_arguments(
 }
 
 #[cfg(unix)]
+fn candidate_cargo_deny_arguments() -> Vec<OsString> {
+    // cargo-deny 0.20.2 has no separate `--disable-fetch` flag. Explicit
+    // `--offline` is its no-fetch mode. Advisory coverage was already fetched
+    // and checked by the trusted seed, so the confined child checks the
+    // remaining policies without opening the candidate advisory database lock.
+    vec![
+        OsString::from("--offline"),
+        OsString::from("--locked"),
+        OsString::from("--all-features"),
+        OsString::from("check"),
+        OsString::from("bans"),
+        OsString::from("licenses"),
+        OsString::from("sources"),
+    ]
+}
+
+#[cfg(unix)]
 fn validate_staged_cargo_metadata(
     document: &[u8],
     candidate_root: &Path,
@@ -2178,7 +2225,7 @@ fn validate_staged_cargo_metadata(
     let packages = validate_staged_cargo_metadata_packages(
         json_member(root, "packages")?.array()?,
         candidate_root,
-        &staged_home.join("vendor"),
+        &staged_cargo_vendor_root(staged_home),
     )?;
     validate_staged_cargo_metadata_members(
         json_member(root, "workspace_members")?.array()?,
@@ -2271,7 +2318,7 @@ fn trusted_cargo_vendor_arguments(
             )
         })
         || manifest != candidate_root.join("Cargo.toml")
-        || vendor != seed_root.join("vendor")
+        || vendor != staged_cargo_vendor_root(seed_root)
     {
         return Err("trusted Cargo vendor authority is not exact".to_owned());
     }
@@ -2289,12 +2336,12 @@ fn trusted_cargo_vendor_arguments(
 fn configure_staged_cargo_home_directory_source(home: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let source = home.join("vendor");
+    let source = staged_cargo_vendor_root(home);
     let metadata = fs::symlink_metadata(&source)
         .map_err(|error| format!("cannot inspect staged Cargo vendor root: {error}"))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || source.parent() != Some(home)
+        || source.parent() != Some(home.join("vendor").as_path())
         || fs::canonicalize(&source)
             .map_err(|error| format!("cannot canonicalize staged Cargo vendor root: {error}"))?
             != source
@@ -2632,6 +2679,10 @@ fn validate_posix_cargo_deny_home_post_state(
         let relative = path
             .strip_prefix(home)
             .map_err(|_| "final cargo-deny cache entry escapes its home".to_owned())?;
+
+        if relative == Path::new("registry/cache") || relative == Path::new("registry/src") {
+            return Err("final cargo-deny cache recreates a removed package fallback".to_owned());
+        }
 
         if relative == advisory_root {
             if metadata.file_type().is_symlink()
@@ -6007,7 +6058,7 @@ fn run_platform_gates(
         command_gate(
             "dependency-policy",
             CommandSpec::cargo_deny(Duration::from_mins(10))
-                .arguments(["--frozen", "--all-features", "check", "all"])
+                .arguments(candidate_cargo_deny_arguments())
                 .current_directory(root),
             gates,
             evidence,
@@ -7359,25 +7410,26 @@ mod tests {
     #[cfg(unix)]
     use super::{
         LINUX_ORACLE_NAME, LinuxOracleAcquisition, PosixAdapterToolPaths,
-        configure_staged_cargo_home_directory_source, copy_posix_cargo_cache_tree,
-        normalize_candidate_cache_tree, normalize_candidate_owned_cache_tree,
-        normalize_cargo_deny_cache_tree, posix_acl_removal_arguments,
-        posix_adapter_authority_chain, posix_adapter_cleanup_is_exact,
+        candidate_cargo_deny_arguments, configure_staged_cargo_home_directory_source,
+        copy_posix_cargo_cache_tree, normalize_candidate_cache_tree,
+        normalize_candidate_owned_cache_tree, normalize_cargo_deny_cache_tree,
+        posix_acl_removal_arguments, posix_adapter_authority_chain, posix_adapter_cleanup_is_exact,
         posix_adapter_installation_root, posix_adapter_tool_paths, posix_candidate_group_inventory,
         posix_candidate_identity_output_is_exact, posix_cargo_deny_home_is_exact,
         posix_cargo_deny_metadata_is_exact, posix_chmod_arguments, posix_object_identity,
         posix_rustup_cleanup_is_exact, posix_rustup_inventory_cost,
         posix_rustup_selected_inventory, posix_source_cleanup_is_exact, posix_stack_root_is_exact,
-        posix_stack_work_is_exact, require_exact_directory_members, require_inventory_snapshot,
+        posix_stack_work_is_exact, remove_staged_cargo_package_fallback,
+        require_exact_directory_members, require_inventory_snapshot,
         require_posix_archive_adapter_transition_state, reserve_posix_cargo_deny_advisory_lock,
-        run_posix_stack_work_normalizer, trusted_cargo_cache_fetch_arguments,
-        trusted_cargo_cache_metadata_arguments, trusted_cargo_cache_offline_metadata_arguments,
-        trusted_cargo_cache_seed_arguments, trusted_cargo_deny_advisory_arguments,
-        trusted_cargo_vendor_arguments, validate_candidate_cache_normalizer_root,
-        validate_posix_adapter_installation_root, validate_posix_cargo_deny_home_post_state,
-        validate_posix_cargo_deny_home_root, validate_posix_stack_root,
-        validate_posix_stack_root_post_state, validate_staged_cargo_metadata,
-        validate_staged_vendor_covers_frozen_lock,
+        run_posix_stack_work_normalizer, staged_cargo_vendor_root,
+        trusted_cargo_cache_fetch_arguments, trusted_cargo_cache_metadata_arguments,
+        trusted_cargo_cache_offline_metadata_arguments, trusted_cargo_cache_seed_arguments,
+        trusted_cargo_deny_advisory_arguments, trusted_cargo_vendor_arguments,
+        validate_candidate_cache_normalizer_root, validate_posix_adapter_installation_root,
+        validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
+        validate_posix_stack_root, validate_posix_stack_root_post_state,
+        validate_staged_cargo_metadata, validate_staged_vendor_covers_frozen_lock,
     };
     #[cfg(unix)]
     use std::path::Path;
@@ -7446,6 +7498,24 @@ mod tests {
             ]
         );
         assert!(
+            !trusted_cargo_deny_advisory_arguments(cargo_home, &advisory_metadata)
+                .unwrap()
+                .iter()
+                .any(|argument| argument == "--offline")
+        );
+        assert_eq!(
+            candidate_cargo_deny_arguments(),
+            [
+                std::ffi::OsString::from("--offline"),
+                std::ffi::OsString::from("--locked"),
+                std::ffi::OsString::from("--all-features"),
+                std::ffi::OsString::from("check"),
+                std::ffi::OsString::from("bans"),
+                std::ffi::OsString::from("licenses"),
+                std::ffi::OsString::from("sources"),
+            ]
+        );
+        assert!(
             trusted_cargo_deny_advisory_arguments(
                 cargo_home,
                 &cargo_home.join("unbound-metadata.json")
@@ -7457,7 +7527,7 @@ mod tests {
                 Path::new("/bound/candidate"),
                 manifest,
                 Path::new("/private/var/tmp/hell-cargo-seed-1-2"),
-                Path::new("/private/var/tmp/hell-cargo-seed-1-2/vendor"),
+                &staged_cargo_vendor_root(Path::new("/private/var/tmp/hell-cargo-seed-1-2")),
             )
             .unwrap(),
             [
@@ -7466,7 +7536,8 @@ mod tests {
                 "--versioned-dirs".into(),
                 "--manifest-path".into(),
                 manifest.as_os_str().to_owned(),
-                "/private/var/tmp/hell-cargo-seed-1-2/vendor".into(),
+                "/private/var/tmp/hell-cargo-seed-1-2/vendor/index.crates.io-6f17d22bba15001f"
+                    .into(),
             ]
         );
         assert!(
@@ -7515,7 +7586,7 @@ mod tests {
                 "hell-cargo-directory-source-{}",
                 std::process::id()
             ));
-        let source = home.join("vendor");
+        let source = staged_cargo_vendor_root(&home);
         let package = source.join("known-folders-1.4.2");
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join(".cargo-checksum.json"), b"{}\n").unwrap();
@@ -7606,7 +7677,7 @@ mod tests {
         let candidate = root.join("candidate");
         let home = root.join("home");
         let workspace_manifest = candidate.join("member/Cargo.toml");
-        let registry_manifest = home.join("vendor/reviewed-1.0.0/Cargo.toml");
+        let registry_manifest = staged_cargo_vendor_root(&home).join("reviewed-1.0.0/Cargo.toml");
         std::fs::create_dir_all(workspace_manifest.parent().unwrap()).unwrap();
         std::fs::create_dir_all(registry_manifest.parent().unwrap()).unwrap();
         std::fs::write(
@@ -7658,7 +7729,7 @@ mod tests {
         let root = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("hell-frozen-vendor-closure-{}", std::process::id()));
-        let vendor = root.join("vendor");
+        let vendor = staged_cargo_vendor_root(&root);
         for package in ["flate2-1.1.9", "nix-0.27.1", "winapi-0.3.9"] {
             let package = vendor.join(package);
             std::fs::create_dir_all(&package).unwrap();
@@ -7718,6 +7789,75 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
 
     #[cfg(unix)]
     #[test]
+    fn staged_sparse_directory_source_has_no_package_fallback() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "hell-sparse-cargo-source-{}-{}",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("test")
+            ));
+        let home = root.join("home");
+        let registry_index = home.join("registry/index/index.crates.io-test");
+        let registry_cache = home.join("registry/cache/index.crates.io-test");
+        let registry_source = home.join("registry/src/index.crates.io-test");
+        let vendor = staged_cargo_vendor_root(&home);
+        std::fs::create_dir_all(&registry_index).unwrap();
+        std::fs::create_dir_all(&registry_cache).unwrap();
+        std::fs::create_dir_all(&registry_source).unwrap();
+        std::fs::write(registry_index.join("config.json"), b"index\n").unwrap();
+        std::fs::write(
+            registry_cache.join("flate2-1.1.9.crate"),
+            b"fallback package\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(registry_source.join("flate2-1.1.9")).unwrap();
+        std::fs::write(
+            registry_source.join("flate2-1.1.9/.cargo-checksum.json"),
+            b"{}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(vendor.join("nix-0.27.1")).unwrap();
+        std::fs::write(vendor.join("nix-0.27.1/.cargo-checksum.json"), b"{}\n").unwrap();
+
+        remove_staged_cargo_package_fallback(&home).unwrap();
+        assert!(registry_index.join("config.json").is_file());
+        assert!(!registry_cache.exists());
+        assert!(!registry_source.exists());
+
+        let lock = "\
+version = 4\n\
+\n\
+[[package]]\n\
+name = \"hell-ci\"\n\
+version = \"0.1.0\"\n\
+\n\
+[[package]]\n\
+name = \"flate2\"\n\
+version = \"1.1.9\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+";
+        let error = validate_staged_vendor_covers_frozen_lock(lock.as_bytes(), &vendor)
+            .expect_err("removed package fallback must not satisfy offline resolution");
+        assert!(error.contains("flate2-1.1.9"), "{error}");
+
+        let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
+        std::fs::create_dir_all(&registry_cache).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(&home, 61_001, 1_001, 1_000, &advisory_lock,)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&registry_cache).unwrap();
+        std::fs::create_dir_all(&registry_source).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(&home, 61_001, 1_001, 1_000, &advisory_lock,)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn staged_cargo_directory_source_rejects_incomplete_or_redirected_vendors() {
         use std::os::unix::fs::symlink;
 
@@ -7731,22 +7871,30 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         assert!(configure_staged_cargo_home_directory_source(&empty).is_err());
 
         let empty_vendor = root.join("empty-vendor");
-        std::fs::create_dir_all(empty_vendor.join("vendor")).unwrap();
+        std::fs::create_dir_all(staged_cargo_vendor_root(&empty_vendor)).unwrap();
         assert!(configure_staged_cargo_home_directory_source(&empty_vendor).is_err());
 
         let missing_checksum = root.join("missing-checksum");
-        std::fs::create_dir_all(missing_checksum.join("vendor/package-1.0.0")).unwrap();
+        std::fs::create_dir_all(staged_cargo_vendor_root(&missing_checksum).join("package-1.0.0"))
+            .unwrap();
         assert!(configure_staged_cargo_home_directory_source(&missing_checksum).is_err());
 
         let redirected = root.join("redirected");
         let outside = root.join("outside");
         std::fs::create_dir_all(&redirected).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        symlink(&outside, redirected.join("vendor")).unwrap();
+        std::fs::create_dir(redirected.join("vendor")).unwrap();
+        symlink(
+            &outside,
+            redirected
+                .join("vendor")
+                .join("index.crates.io-6f17d22bba15001f"),
+        )
+        .unwrap();
         assert!(configure_staged_cargo_home_directory_source(&redirected).is_err());
 
         let unsafe_path = root.join("unsafe'path");
-        let unsafe_package = unsafe_path.join("vendor/package-1.0.0");
+        let unsafe_package = staged_cargo_vendor_root(&unsafe_path).join("package-1.0.0");
         std::fs::create_dir_all(&unsafe_package).unwrap();
         std::fs::write(unsafe_package.join(".cargo-checksum.json"), b"{}\n").unwrap();
         assert!(configure_staged_cargo_home_directory_source(&unsafe_path).is_err());
@@ -8354,6 +8502,14 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
                 & 0o777,
             0o660
         );
+        for path in [&home, &advisory_root, &advisory_lock] {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(metadata.uid(), identity.uid());
+            assert_eq!(metadata.gid(), identity.gid());
+        }
+        let candidate_groups =
+            posix_candidate_group_inventory(b"61001 20 701 100\n", 61_001).unwrap();
+        assert!(!candidate_groups.contains(&12_345));
         std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o444)).unwrap();
         assert!(
             validate_posix_cargo_deny_home_post_state(
@@ -8862,7 +9018,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         let registry_index = source.join("registry/index/index.crates.io-test");
         let registry_cache = source.join("registry/cache/index.crates.io-test");
         let registry_source = source.join("registry/src/index.crates.io-test/crate-1.0.0");
-        let vendor = source.join("vendor/crate-1.0.0");
+        let vendor = staged_cargo_vendor_root(&source).join("crate-1.0.0");
         for directory in [&registry_index, &registry_cache, &registry_source, &vendor] {
             std::fs::create_dir_all(directory).unwrap();
         }
@@ -8896,10 +9052,13 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         );
         assert!(
             destination
-                .join("vendor/crate-1.0.0/.cargo-checksum.json")
+                .join("vendor/index.crates.io-6f17d22bba15001f/crate-1.0.0/.cargo-checksum.json")
                 .is_file()
         );
-        assert_eq!(entries, 16, "one entry remains reserved for config.toml");
+        assert_eq!(
+            entries, 17,
+            "one entry remains reserved for the staged config"
+        );
         let mut bounded_entries = super::POSIX_RUSTUP_STAGE_ENTRY_LIMIT;
         let mut bounded_bytes = 0;
         assert!(
