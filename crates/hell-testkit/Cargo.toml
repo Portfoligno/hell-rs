@@ -16,7 +16,7 @@ hell-platform = { version = "0.1.0", path = "../hell-platform" }
 tar = "0.4.44"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27.1", default-features = false, features = ["fs"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 same-file = "=1.0.6"
