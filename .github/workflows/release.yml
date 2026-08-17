@@ -509,11 +509,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/pre-attestation-remote-state.json
       - name: Attest release subjects with build provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: release-bundle/SUBJECTS.sha256
       - name: Attest release subjects with the release-gate predicate
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: release-bundle/SUBJECTS.sha256
           predicate-type: https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2
