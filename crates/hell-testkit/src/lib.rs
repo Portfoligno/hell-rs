@@ -2760,6 +2760,7 @@ fn posix_candidate_cargo_cache_inventory(
     let mut inventory = Vec::new();
     let mut bytes = 0_u64;
     let lock = Path::new("advisory-dbs").join("db.lock");
+    let advisory_root = Path::new("advisory-dbs");
     let mut found_lock = false;
     while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path)?;
@@ -2774,7 +2775,8 @@ fn posix_candidate_cargo_cache_inventory(
             })?
             .to_path_buf();
         let is_lock = relative == lock;
-        let expected_owner = if is_lock {
+        let is_advisory_root = relative == advisory_root;
+        let expected_owner = if is_lock || is_advisory_root {
             candidate_uid
         } else {
             trusted_owner
@@ -2792,12 +2794,11 @@ fn posix_candidate_cargo_cache_inventory(
             ));
         }
         let mode = metadata.permissions().mode() & 0o7777;
-        let expected_mode = if is_lock {
-            0o600
-        } else if directory {
-            0o555
-        } else {
-            0o444
+        let expected_mode = match (is_lock, is_advisory_root) {
+            (true, _) => 0o600,
+            (_, true) => 0o700,
+            (_, _) if directory => 0o555,
+            (_, _) => 0o444,
         };
         if mode != expected_mode || (is_lock && (directory || metadata.len() != 0)) {
             return Err(std::io::Error::new(
@@ -4779,7 +4780,10 @@ mod candidate_launch_policy_tests {
         let advisory_lock = advisory_root.join("db.lock");
         fs::write(&advisory_lock, b"").unwrap();
         fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o555)).unwrap();
+        // cargo-deny opens db.lock with read+write+create semantics, so the
+        // advisory root itself must stay candidate-writable for lock creation
+        // while every advisory database below it remains read-only.
+        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555)).unwrap();
         for path in [&source, &staged] {
             fs::write(path, b"pinned cargo-deny\n").unwrap();
@@ -4963,7 +4967,7 @@ mod candidate_launch_policy_tests {
         fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_file(&advisory_lock).unwrap();
         fs::rename(&original_lock, &advisory_lock).unwrap();
-        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o700)).unwrap();
         bound.revalidate().unwrap();
         fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(bound.revalidate().is_err());
@@ -5046,9 +5050,14 @@ mod candidate_launch_policy_tests {
         assert!(bound.revalidate().is_err());
         fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_file(metadata_directory.join("extra.json")).unwrap();
-        fs::remove_file(&metadata_path).unwrap();
-        fs::write(&metadata_path, b"{\"version\":1}\n").unwrap();
-        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o444)).unwrap();
+        // Removing and recreating the document can reuse the freed inode on
+        // Linux, which would leave the bound identity valid. Bind a genuinely
+        // distinct inode by renaming a separately created replacement over
+        // the exact authority path instead.
+        let replacement = metadata_directory.join("metadata.replacement.json");
+        fs::write(&replacement, b"{\"version\":1}\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::rename(&replacement, &metadata_path).unwrap();
         fs::set_permissions(&metadata_directory, fs::Permissions::from_mode(0o555)).unwrap();
         assert!(bound.revalidate().is_err());
 

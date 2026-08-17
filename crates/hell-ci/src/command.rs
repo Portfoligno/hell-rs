@@ -734,6 +734,51 @@ fn accepted_llvm_ar_version(output: &str) -> bool {
     })
 }
 
+#[cfg(unix)]
+fn bind_and_freeze_native_archive_authority(
+    authority: &Path,
+    llvm_ar: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let bound = authority.join("llvm-ar");
+    let source_canonical = fs::canonicalize(llvm_ar)
+        .map_err(|error| format!("cannot canonicalize LLVM archiver: {error}"))?;
+    let source_metadata =
+        fs::metadata(llvm_ar).map_err(|error| format!("cannot inspect LLVM archiver: {error}"))?;
+    let source_mode = source_metadata.permissions().mode() & 0o7777;
+    let source_digest =
+        sha256_file(llvm_ar).map_err(|error| format!("cannot hash LLVM archiver: {error}"))?;
+    if !source_metadata.is_file() || source_mode & 0o111 == 0 {
+        return Err("LLVM archiver authority source is not executable".to_owned());
+    }
+
+    symlink(llvm_ar, &bound).map_err(|error| format!("cannot bind LLVM archiver: {error}"))?;
+    let validate = || {
+        if fs::read_link(&bound).ok().as_deref() != Some(llvm_ar) {
+            return Err("bound LLVM archiver target differs from policy".to_owned());
+        }
+        let observed_canonical = fs::canonicalize(&bound)
+            .map_err(|error| format!("cannot canonicalize bound LLVM archiver: {error}"))?;
+        let observed_metadata = fs::metadata(&bound)
+            .map_err(|error| format!("cannot inspect bound LLVM archiver: {error}"))?;
+        let observed_digest = sha256_file(&bound)
+            .map_err(|error| format!("cannot hash bound LLVM archiver: {error}"))?;
+        if observed_canonical != source_canonical
+            || !observed_metadata.is_file()
+            || observed_metadata.permissions().mode() & 0o7777 != source_mode
+            || observed_digest != source_digest
+        {
+            return Err("bound LLVM archiver identity differs from policy".to_owned());
+        }
+        Ok(())
+    };
+    validate()?;
+    fs::set_permissions(authority, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot confine macOS archive authority: {error}"))?;
+    validate()
+}
+
 impl NativeArchiveAdapter {
     pub(crate) fn for_macos(
         enabled: bool,
@@ -757,7 +802,7 @@ impl NativeArchiveAdapter {
         }
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::{PermissionsExt as _, symlink};
+            use std::os::unix::fs::symlink;
 
             let llvm_ar = resolve_path_executable(OsStr::new("llvm-ar"))?;
             let version = CommandSpec::new(llvm_ar.as_os_str(), Duration::from_secs(30))
@@ -790,12 +835,9 @@ impl NativeArchiveAdapter {
             let authority = adapter_root.join(".authority");
             fs::create_dir(&authority)
                 .map_err(|error| format!("cannot create macOS archive authority: {error}"))?;
-            fs::set_permissions(&authority, fs::Permissions::from_mode(0o555))
-                .map_err(|error| format!("cannot confine macOS archive authority: {error}"))?;
             symlink(&executable, adapter_root.join("ar"))
                 .map_err(|error| format!("cannot install macOS archive adapter: {error}"))?;
-            symlink(&llvm_ar, authority.join("llvm-ar"))
-                .map_err(|error| format!("cannot bind LLVM archiver: {error}"))?;
+            bind_and_freeze_native_archive_authority(&authority, &llvm_ar)?;
             let work = adapter_root.join(".stack-work");
             fs::write(work.join("member.o"), b"native-archive-adapter\n")
                 .map_err(|error| format!("cannot write archiver probe member: {error}"))?;
@@ -3165,6 +3207,21 @@ fn windows_private_graphical_acl(
     Ok(acl)
 }
 
+#[cfg(any(windows, test))]
+fn windows_private_graphical_authority_contract(
+    authorities: &[WindowsPrivateGraphicalAuthority],
+) -> std::io::Result<()> {
+    if authorities.contains(&WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll)
+        && authorities.contains(&WindowsPrivateGraphicalAuthority::LogonSessionGenericAll)
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "private graphical objects must grant both restricting SIDs GENERIC_ALL",
+        ))
+    }
+}
+
 #[cfg(windows)]
 fn create_windows_private_graphical_session(
     logon_sid: firehazard::sid::Ptr<'_>,
@@ -3179,14 +3236,8 @@ fn create_windows_private_graphical_session(
         std::io::Error::other(format!("cannot name private window station: {error}"))
     })?;
     let spec = windows_private_graphical_session_spec(nonce);
-    let [
-        WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-        WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
-    ] = spec.window_station_authorities;
-    let [
-        WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-        WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
-    ] = spec.desktop_authorities;
+    windows_private_graphical_authority_contract(&spec.window_station_authorities)?;
+    windows_private_graphical_authority_contract(&spec.desktop_authorities)?;
 
     let station_acl =
         windows_private_graphical_acl(logon_sid, restricted_sid, spec.window_station_authorities)?;
@@ -4699,6 +4750,34 @@ mod tests {
     }
 
     #[test]
+    fn windows_private_graphical_authorities_are_order_insensitive_but_exact() {
+        for authorities in [
+            [
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+            ],
+            [
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+            ],
+        ] {
+            assert!(windows_private_graphical_authority_contract(&authorities).is_ok());
+        }
+        for authorities in [
+            [
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+            ],
+            [
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+            ],
+        ] {
+            assert!(windows_private_graphical_authority_contract(&authorities).is_err());
+        }
+    }
+
+    #[test]
     fn environment_reporting_never_contains_values() {
         let spec = CommandSpec::new("program", Duration::from_secs(1))
             .environment("RUSTDOCFLAGS", "secret-value");
@@ -5233,8 +5312,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_adapter_starts_private_until_its_platform_authority_is_bound() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    fn native_archive_authority_binds_before_freezing() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let base = std::env::temp_dir().join(format!(
             "hell-native-adapter-permissions-{}-{}",
@@ -5253,14 +5332,25 @@ mod tests {
         assert_eq!(root.uid(), work.uid());
         let authority = path.join(".authority");
         fs::create_dir(&authority).unwrap();
-        symlink("/bound/llvm-ar", authority.join("llvm-ar")).unwrap();
-        fs::set_permissions(&authority, fs::Permissions::from_mode(0o555)).unwrap();
+        let llvm_ar = base.join("llvm-ar");
+        fs::write(&llvm_ar, b"bound archiver\n").unwrap();
+        fs::set_permissions(&llvm_ar, fs::Permissions::from_mode(0o755)).unwrap();
+        bind_and_freeze_native_archive_authority(&authority, &llvm_ar).unwrap();
+        assert_eq!(
+            fs::metadata(&authority).unwrap().permissions().mode() & 0o7777,
+            0o555
+        );
+        assert_eq!(
+            fs::canonicalize(authority.join("llvm-ar")).unwrap(),
+            fs::canonicalize(&llvm_ar).unwrap()
+        );
         drop(directory);
         assert!(!path.exists());
         assert_eq!(
             fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
             0o2770
         );
+        fs::remove_file(&llvm_ar).unwrap();
         fs::remove_dir(base).unwrap();
     }
 

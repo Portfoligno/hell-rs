@@ -1303,7 +1303,6 @@ fn stage_posix_cargo_deny_home(
         reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
             stage_posix_cargo_deny_metadata(platform, sudo, &tools, &metadata, trusted_owner)?;
-        seed.cleanup()?;
         normalize_posix_cargo_deny_home_with_adapter(
             sudo,
             adapter,
@@ -1312,6 +1311,14 @@ fn stage_posix_cargo_deny_home(
             trusted_owner,
             trusted_group_id,
         )?;
+        seed.prove_staged_home_frozen_fetch(cargo, candidate_root, &home)?;
+        validate_posix_cargo_deny_home_post_state(
+            &home,
+            candidate_uid,
+            trusted_owner,
+            trusted_group_id,
+        )?;
+        seed.cleanup()?;
         Ok(metadata)
     })();
     let metadata = match copy_result {
@@ -1720,7 +1727,15 @@ impl TrustedCargoCacheSeed {
             &program_identity,
             "vendor materialization",
         )?;
-        validate_trusted_cargo_cache_tree(&vendor)
+        validate_trusted_cargo_cache_tree(&vendor)?;
+        let lock_document = fs::read(candidate_root.join("Cargo.lock"))
+            .map_err(|error| format!("cannot read trusted Cargo lock: {error}"))?;
+        if u64::try_from(lock_document.len()).ok() != Some(lock_identity.size)
+            || TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.lock")? != lock_identity
+        {
+            return Err("trusted Cargo lock changed during vendor materialization".to_owned());
+        }
+        validate_staged_vendor_covers_frozen_lock(&lock_document, &vendor)
     }
 
     fn run_cargo_deny_advisories(
@@ -1827,6 +1842,42 @@ impl TrustedCargoCacheSeed {
         Ok(result.stdout)
     }
 
+    fn prove_staged_home_frozen_fetch(
+        &self,
+        cargo: &crate::command::ResolvedCargoExecutable,
+        candidate_root: &Path,
+        staged_home: &Path,
+    ) -> Result<(), String> {
+        let manifest = candidate_root.join("Cargo.toml");
+        let manifest_identity = TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.toml")?;
+        let lock_identity = TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.lock")?;
+        let program_identity = hell_testkit::BoundProgramInvocation::new(
+            cargo.invocation_path().to_path_buf(),
+            cargo.canonical_identity().to_path_buf(),
+        )
+        .map_err(|error| format!("cannot bind staged frozen fetch executable: {error}"))?;
+        let staged_identity = posix_object_identity(staged_home)?;
+        self.run_cargo_with_home(
+            cargo,
+            candidate_root,
+            trusted_cargo_cache_fetch_arguments(candidate_root, &manifest)?,
+            "staged frozen fetch proof",
+            staged_home,
+        )?;
+        if posix_object_identity(staged_home)? != staged_identity {
+            return Err("staged Cargo home identity changed during frozen fetch proof".to_owned());
+        }
+        self.revalidate_inputs(
+            cargo,
+            candidate_root,
+            &manifest_identity,
+            &lock_identity,
+            &program_identity,
+            "staged frozen fetch proof",
+        )?;
+        validate_trusted_cargo_cache_tree(staged_home)
+    }
+
     fn revalidate_inputs(
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
@@ -1930,6 +1981,138 @@ fn trusted_cargo_cache_offline_metadata_arguments(
     let mut arguments = trusted_cargo_cache_metadata_arguments(candidate_root, manifest)?;
     arguments.insert(2, OsString::from("--offline"));
     Ok(arguments)
+}
+
+#[cfg(unix)]
+fn trusted_cargo_cache_fetch_arguments(
+    candidate_root: &Path,
+    manifest: &Path,
+) -> Result<Vec<OsString>, String> {
+    if !candidate_root.is_absolute()
+        || candidate_root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || manifest != candidate_root.join("Cargo.toml")
+    {
+        return Err("trusted Cargo cache fetch manifest is not exact".to_owned());
+    }
+    // cargo-deny 0.20.2 always shells out to exactly this frozen fetch shape
+    // while checking, even when `--metadata-path` supplies a pre-captured
+    // document, so the staged home must satisfy it for the hosted target.
+    Ok(vec![
+        OsString::from("fetch"),
+        OsString::from("--frozen"),
+        OsString::from("--manifest-path"),
+        manifest.as_os_str().to_owned(),
+    ])
+}
+
+#[cfg(unix)]
+const TRUSTED_CARGO_LOCK_PACKAGE_LIMIT: usize = 10_000;
+
+#[cfg(unix)]
+fn frozen_lock_registry_package(
+    name: Option<String>,
+    version: Option<String>,
+    registry: bool,
+) -> Result<Option<String>, String> {
+    if !registry {
+        return Ok(None);
+    }
+    let Some(name) = name else {
+        return Err("frozen Cargo lock registry package has no name".to_owned());
+    };
+    let Some(version) = version else {
+        return Err("frozen Cargo lock registry package has no version".to_owned());
+    };
+    if name.is_empty()
+        || version.is_empty()
+        || !name
+            .bytes()
+            .chain(version.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_+.".contains(&byte))
+    {
+        return Err("frozen Cargo lock package identity is not exact".to_owned());
+    }
+    Ok(Some(format!("{name}-{version}")))
+}
+
+#[cfg(unix)]
+fn validate_staged_vendor_covers_frozen_lock(
+    document: &[u8],
+    vendor_root: &Path,
+) -> Result<(), String> {
+    const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
+
+    if document.is_empty() || document.len() > MAX_LOCK_BYTES {
+        return Err("frozen Cargo lock exceeds its byte authority".to_owned());
+    }
+    let text =
+        std::str::from_utf8(document).map_err(|_| "frozen Cargo lock is not UTF-8".to_owned())?;
+    let mut registry_packages = BTreeSet::new();
+    let mut packages = 0_usize;
+    let mut name = None;
+    let mut version = None;
+    let mut registry = false;
+    let mut in_package = false;
+    for line in text.lines() {
+        if line.starts_with("[[package]]") {
+            in_package = true;
+            packages += 1;
+            if packages > TRUSTED_CARGO_LOCK_PACKAGE_LIMIT {
+                return Err("frozen Cargo lock exceeds its package bound".to_owned());
+            }
+            if let Some(identity) = frozen_lock_registry_package(
+                name.take(),
+                version.take(),
+                std::mem::take(&mut registry),
+            )? {
+                registry_packages.insert(identity);
+            }
+            continue;
+        }
+        if line.starts_with('[') {
+            in_package = false;
+            if let Some(identity) = frozen_lock_registry_package(
+                name.take(),
+                version.take(),
+                std::mem::take(&mut registry),
+            )? {
+                registry_packages.insert(identity);
+            }
+            continue;
+        }
+        if !in_package || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("name = \"") {
+            name = Some(value.trim_end_matches('"').to_owned());
+        } else if let Some(value) = line.strip_prefix("version = \"") {
+            version = Some(value.trim_end_matches('"').to_owned());
+        } else if let Some(value) = line.strip_prefix("source = \"") {
+            registry = value.trim_end_matches('"').starts_with("registry+");
+        }
+    }
+    if let Some(identity) =
+        frozen_lock_registry_package(name.take(), version.take(), std::mem::take(&mut registry))?
+    {
+        registry_packages.insert(identity);
+    }
+    if packages == 0 || registry_packages.is_empty() {
+        return Err("frozen Cargo lock registry inventory is empty".to_owned());
+    }
+    for identity in &registry_packages {
+        let package = vendor_root.join(identity);
+        if !package.is_dir() || !package.join(".cargo-checksum.json").is_file() {
+            return Err(format!(
+                "staged Cargo vendor closure omits frozen registry package {identity}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2428,6 +2611,7 @@ fn validate_posix_cargo_deny_home_post_state(
     let mut entries = 0_usize;
     let mut bytes = 0_u64;
     let lock = Path::new("advisory-dbs").join("db.lock");
+    let advisory_root = Path::new("advisory-dbs");
     let mut found_lock = false;
     while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path)
@@ -2436,17 +2620,17 @@ fn validate_posix_cargo_deny_home_post_state(
             .strip_prefix(home)
             .map_err(|_| "final cargo-deny cache entry escapes its home".to_owned())?;
         let is_lock = relative == lock;
-        let expected_owner = if is_lock {
+        let is_advisory_root = relative == advisory_root;
+        let expected_owner = if is_lock || is_advisory_root {
             candidate_uid
         } else {
             trusted_owner
         };
-        let expected_mode = if is_lock {
-            0o600
-        } else if metadata.is_dir() {
-            0o555
-        } else {
-            0o444
+        let expected_mode = match (is_lock, is_advisory_root) {
+            (true, _) => 0o600,
+            (_, true) => 0o700,
+            (_, _) if metadata.is_dir() => 0o555,
+            (_, _) => 0o444,
         };
         if metadata.file_type().is_symlink()
             || (!metadata.is_dir() && !metadata.is_file())
@@ -5418,6 +5602,7 @@ fn normalize_cargo_deny_cache_tree(
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
     let lock = Path::new("advisory-dbs").join("db.lock");
+    let advisory_root = Path::new("advisory-dbs");
     let mut pending = vec![root.to_path_buf()];
     let mut entries = 0_usize;
     let mut bytes = 0_u64;
@@ -5453,12 +5638,13 @@ fn normalize_cargo_deny_cache_tree(
             .strip_prefix(root)
             .map_err(|_| "cargo-deny cache authority escaped its root".to_owned())?;
         let is_lock = relative == lock;
+        let is_advisory_root = relative == advisory_root;
         if is_lock && (!file_type.is_file() || metadata.len() != 0) {
             return Err(
                 "cargo-deny advisory lock authority is not an empty regular file".to_owned(),
             );
         }
-        let owner = if is_lock {
+        let owner = if is_lock || is_advisory_root {
             candidate_owner
         } else {
             trusted_owner
@@ -5467,12 +5653,11 @@ fn normalize_cargo_deny_cache_tree(
             .map_err(|error| format!("cannot bind cargo-deny cache ownership: {error}"))?;
         fs::set_permissions(
             &path,
-            fs::Permissions::from_mode(if is_lock {
-                0o600
-            } else if file_type.is_dir() {
-                0o555
-            } else {
-                0o444
+            fs::Permissions::from_mode(match (is_lock, is_advisory_root) {
+                (true, _) => 0o600,
+                (_, true) => 0o700,
+                (_, _) if file_type.is_dir() => 0o555,
+                (_, _) => 0o444,
             }),
         )
         .map_err(|error| format!("cannot bind cargo-deny cache permissions: {error}"))?;
@@ -7133,13 +7318,14 @@ mod tests {
         posix_rustup_selected_inventory, posix_source_cleanup_is_exact, posix_stack_root_is_exact,
         posix_stack_work_is_exact, require_exact_directory_members, require_inventory_snapshot,
         require_posix_archive_adapter_transition_state, reserve_posix_cargo_deny_advisory_lock,
-        run_posix_stack_work_normalizer, trusted_cargo_cache_metadata_arguments,
-        trusted_cargo_cache_offline_metadata_arguments, trusted_cargo_cache_seed_arguments,
-        trusted_cargo_deny_advisory_arguments, trusted_cargo_vendor_arguments,
-        validate_candidate_cache_normalizer_root, validate_posix_adapter_installation_root,
-        validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
-        validate_posix_stack_root, validate_posix_stack_root_post_state,
-        validate_staged_cargo_metadata,
+        run_posix_stack_work_normalizer, trusted_cargo_cache_fetch_arguments,
+        trusted_cargo_cache_metadata_arguments, trusted_cargo_cache_offline_metadata_arguments,
+        trusted_cargo_cache_seed_arguments, trusted_cargo_deny_advisory_arguments,
+        trusted_cargo_vendor_arguments, validate_candidate_cache_normalizer_root,
+        validate_posix_adapter_installation_root, validate_posix_cargo_deny_home_post_state,
+        validate_posix_cargo_deny_home_root, validate_posix_stack_root,
+        validate_posix_stack_root_post_state, validate_staged_cargo_metadata,
+        validate_staged_vendor_covers_frozen_lock,
     };
     #[cfg(unix)]
     use std::path::Path;
@@ -7180,6 +7366,15 @@ mod tests {
                 "--all-features".into(),
                 "--format-version".into(),
                 "1".into(),
+                "--manifest-path".into(),
+                manifest.as_os_str().to_owned(),
+            ]
+        );
+        assert_eq!(
+            trusted_cargo_cache_fetch_arguments(Path::new("/bound/candidate"), manifest).unwrap(),
+            [
+                "fetch".into(),
+                "--frozen".into(),
                 "--manifest-path".into(),
                 manifest.as_os_str().to_owned(),
             ]
@@ -7225,6 +7420,16 @@ mod tests {
         );
         assert!(
             trusted_cargo_cache_metadata_arguments(Path::new("bound/candidate"), manifest).is_err()
+        );
+        assert!(
+            trusted_cargo_cache_fetch_arguments(Path::new("bound/candidate"), manifest).is_err()
+        );
+        assert!(
+            trusted_cargo_cache_fetch_arguments(
+                Path::new("/bound/candidate"),
+                Path::new("/bound/Cargo.lock")
+            )
+            .is_err()
         );
         assert!(
             trusted_cargo_cache_seed_arguments(
@@ -7391,6 +7596,70 @@ mod tests {
         );
         assert!(validate_staged_cargo_metadata(b"not-json\n", &candidate, &home).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_vendor_closure_covers_every_frozen_registry_package() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("hell-frozen-vendor-closure-{}", std::process::id()));
+        let vendor = root.join("vendor");
+        for package in ["flate2-1.1.9", "nix-0.27.1", "winapi-0.3.9"] {
+            let package = vendor.join(package);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join(".cargo-checksum.json"), b"{}\n").unwrap();
+        }
+        let lock = "\
+version = 4\n\
+\n\
+[[package]]\n\
+name = \"hell-ci\"\n\
+version = \"0.1.0\"\n\
+dependencies = [\n\
+ \"flate2\",\n\
+]\n\
+\n\
+[[package]]\n\
+name = \"flate2\"\n\
+version = \"1.1.9\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+checksum = \"bound\"\n\
+\n\
+[[package]]\n\
+name = \"nix\"\n\
+version = \"0.27.1\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+\n\
+[[package]]\n\
+name = \"winapi\"\n\
+version = \"0.3.9\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+";
+        validate_staged_vendor_covers_frozen_lock(lock.as_bytes(), &vendor).unwrap();
+
+        std::fs::remove_dir_all(vendor.join("flate2-1.1.9")).unwrap();
+        let error = validate_staged_vendor_covers_frozen_lock(lock.as_bytes(), &vendor)
+            .expect_err("missing frozen package must fail closed");
+        assert!(error.contains("flate2-1.1.9"), "{error}");
+
+        assert!(validate_staged_vendor_covers_frozen_lock(b"", &vendor).is_err());
+        assert!(
+            validate_staged_vendor_covers_frozen_lock(
+                b"[[package]]\nname = \"workspace-only\"\nversion = \"0.1.0\"\n",
+                &vendor
+            )
+            .is_err()
+        );
+        assert!(
+            validate_staged_vendor_covers_frozen_lock(
+                b"[[package]]\nname = \"traversal/attempt\"\nversion = \"1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+                &vendor
+            )
+            .is_err()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
@@ -8016,6 +8285,14 @@ mod tests {
             0o444
         );
         assert_eq!(
+            std::fs::metadata(&advisory_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
             std::fs::metadata(&advisory_lock)
                 .unwrap()
                 .permissions()
@@ -8023,6 +8300,23 @@ mod tests {
                 & 0o777,
             0o600
         );
+        // cargo-deny 0.20.2 opens db.lock through tame-index with
+        // read+write+create semantics, so both reopening the reserved lock and
+        // creating a replacement lock in the advisory root must succeed for
+        // the lock owner after the read-only transition.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&advisory_lock)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(advisory_root.join("regenerated.lock"))
+            .unwrap();
+        std::fs::remove_file(advisory_root.join("regenerated.lock")).unwrap();
         validate_posix_cargo_deny_home_post_state(
             &home,
             identity.uid(),
@@ -8030,6 +8324,18 @@ mod tests {
             identity.gid(),
         )
         .unwrap();
+
+        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                &home,
+                identity.uid(),
+                identity.uid(),
+                identity.gid(),
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let wrong = environment.join("cargo-home");
         std::fs::create_dir(&wrong).unwrap();
