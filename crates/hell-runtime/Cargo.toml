@@ -16,7 +16,7 @@ hell-http-host = { version = "0.1.0", path = "../hell-http-host" }
 hell-types = { version = "0.1.0", path = "../hell-types" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27.1", default-features = false, features = ["fs"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
