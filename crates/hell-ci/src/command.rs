@@ -1069,7 +1069,7 @@ fn write_native_stack_overlay(directory: &Path, source: &Path) -> Result<PathBuf
     }
     let configure_ar = yaml_single_quoted(&format!("--with-ar={ar_value}"));
     let overlay = format!(
-        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\nallow-different-user: true\nextra-prog-path:\n  - {adapter}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
+        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\nallow-different-user: true\nextra-path:\n  - {adapter}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
     );
     let overlay_path = directory.join("stack.yaml");
     fs::write(&overlay_path, overlay)
@@ -5061,8 +5061,9 @@ mod tests {
         assert!(content.contains("oracle''s source'\n"));
         assert!(content.contains("system-ghc: true\nallow-different-user: true\n"));
         assert!(content.contains(&format!(
-            "extra-prog-path:\n  - {adapter_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
+            "extra-path:\n  - {adapter_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
         )));
+        assert!(!content.contains("extra-prog-path"));
         assert!(content.contains("  \"$everything\": \"-split-sections -j\"\n"));
         assert!(content.contains("  unix-time: \"-optl-all_load\"\n"));
         assert!(content.contains("  network-control: \"-fforce-recomp\"\n"));
@@ -5640,7 +5641,8 @@ mod tests {
             fs::canonicalize(&llvm_ar).unwrap()
         );
         let overlay_content = fs::read_to_string(&overlay).unwrap();
-        assert!(overlay_content.contains("extra-prog-path:\n"));
+        assert!(overlay_content.contains("extra-path:\n"));
+        assert!(!overlay_content.contains("extra-prog-path"));
         assert!(overlay_content.contains("configure-options:\n"));
         assert!(overlay_content.contains("--with-ar="));
 

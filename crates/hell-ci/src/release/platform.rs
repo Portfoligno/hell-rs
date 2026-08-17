@@ -2192,13 +2192,14 @@ fn trusted_cargo_deny_authority_arguments(
 
 #[cfg(unix)]
 fn candidate_cargo_deny_arguments() -> Vec<OsString> {
-    // cargo-deny 0.20.2 has no separate `--disable-fetch` flag. Explicit
-    // `--offline` is its no-fetch mode. Advisory databases and license package
-    // contents are checked by the trusted seed; the confined child checks only
-    // graph-driven policies that consume the injected, trusted metadata.
+    // cargo-deny 0.20.2 has no separate `--disable-fetch` flag and still runs
+    // its fixed Cargo fetch probe even when the launcher supplies bound
+    // metadata. Its tested `--frozen` mode treats that expected offline probe
+    // error as nonfatal and then consumes the bound metadata. Advisory
+    // databases and license package contents remain in the trusted seed; the
+    // confined child checks only graph-driven policies.
     vec![
-        OsString::from("--offline"),
-        OsString::from("--locked"),
+        OsString::from("--frozen"),
         OsString::from("--all-features"),
         OsString::from("check"),
         OsString::from("bans"),
@@ -7521,8 +7522,7 @@ mod tests {
         assert_eq!(
             candidate_arguments,
             [
-                OsString::from("--offline"),
-                OsString::from("--locked"),
+                OsString::from("--frozen"),
                 OsString::from("--all-features"),
                 OsString::from("check"),
                 OsString::from("bans"),
@@ -7533,6 +7533,18 @@ mod tests {
         assert!(candidate_arguments.contains(&OsString::from("sources")));
         assert!(!candidate_arguments.contains(&OsString::from("advisories")));
         assert!(!candidate_arguments.contains(&OsString::from("licenses")));
+        assert!(candidate_arguments.contains(&OsString::from("--frozen")));
+        assert!(!candidate_arguments.contains(&OsString::from("--offline")));
+        assert!(!candidate_arguments.contains(&OsString::from("--locked")));
+        assert!(
+            !candidate_arguments.iter().any(|argument| {
+                argument == "--metadata-path"
+                    || argument
+                        .to_str()
+                        .is_some_and(|argument| argument.starts_with("--metadata-path="))
+            }),
+            "candidate argv must preserve the launcher's trusted metadata binding"
+        );
         assert!(
             trusted_cargo_deny_authority_arguments(
                 cargo_home,
