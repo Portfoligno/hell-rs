@@ -3502,7 +3502,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     for spec in WINDOWS_RESTRICTED_CANARIES {
         let canary = select_windows_restricted_canary(&system_root, &spec)?;
         let mut command_line =
-            windows_restricted_canary_command_line(&canary.program, canary.arguments);
+            windows_restricted_canary_command_line(&canary.program, &canary.arguments);
         let status =
             windows_create_restricted_process(&token, &job, &canary.program, &mut command_line)?;
         eprintln!("{}", windows_restricted_canary_diagnostic(&canary, status));
