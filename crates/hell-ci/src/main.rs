@@ -17,7 +17,7 @@ mod release_suite;
 mod report;
 mod strict_toml;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -514,12 +514,7 @@ fn main() -> ExitCode {
     let _ = invoked;
     let arguments = process_arguments.collect::<Vec<_>>();
     #[cfg(unix)]
-    if invoked
-        .as_deref()
-        .and_then(|value| Path::new(value).file_name())
-        .and_then(|value| value.to_str())
-        == Some("ar")
-    {
+    if native_archive_adapter_dispatch(invoked.as_deref()) {
         return command::run_native_archive_adapter(&arguments);
     }
     #[cfg(unix)]
@@ -652,6 +647,15 @@ fn main() -> ExitCode {
     run(&invocation, &root)
 }
 
+#[cfg(unix)]
+fn native_archive_adapter_dispatch(invoked: Option<&OsStr>) -> bool {
+    invoked
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| matches!(name, "ar" | "llvm-ar"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn run(invocation: &Invocation, root: &Path) -> ExitCode {
     let (suite_name, report_path) = match invocation {
@@ -773,6 +777,24 @@ fn test_thread_name_component(name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_archive_adapter_dispatch_accepts_only_ar_and_llvm_ar() {
+        assert!(native_archive_adapter_dispatch(Some(OsStr::new("ar"))));
+        assert!(native_archive_adapter_dispatch(Some(OsStr::new(
+            "/fixed/adapter/ar"
+        ))));
+        assert!(native_archive_adapter_dispatch(Some(OsStr::new("llvm-ar"))));
+        assert!(native_archive_adapter_dispatch(Some(OsStr::new(
+            "/fixed/adapter/llvm-ar"
+        ))));
+        assert!(!native_archive_adapter_dispatch(Some(OsStr::new("ld"))));
+        assert!(!native_archive_adapter_dispatch(Some(OsStr::new(
+            "/fixed/adapter/ld"
+        ))));
+        assert!(!native_archive_adapter_dispatch(None));
+    }
 
     #[test]
     fn parses_examples_options_in_either_order() {

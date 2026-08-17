@@ -1710,7 +1710,7 @@ impl TrustedCargoCacheSeed {
         }
         fs::write(&metadata_path, &metadata.stdout)
             .map_err(|error| format!("cannot write trusted cargo-deny metadata seed: {error}"))?;
-        self.run_cargo_deny_advisories(cargo, candidate_root, &metadata_path)?;
+        self.run_cargo_deny_authority_checks(cargo, candidate_root, &metadata_path)?;
         self.revalidate_inputs(
             cargo,
             candidate_root,
@@ -1748,7 +1748,7 @@ impl TrustedCargoCacheSeed {
         validate_staged_vendor_covers_frozen_lock(&lock_document, &vendor)
     }
 
-    fn run_cargo_deny_advisories(
+    fn run_cargo_deny_authority_checks(
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
         candidate_root: &Path,
@@ -1756,16 +1756,18 @@ impl TrustedCargoCacheSeed {
     ) -> Result<(), String> {
         self.validate()?;
         let result = crate::command::CommandSpec::cargo_deny(Duration::from_mins(10))
-            .arguments(trusted_cargo_deny_advisory_arguments(&self.root, metadata)?)
+            .arguments(trusted_cargo_deny_authority_arguments(
+                &self.root, metadata,
+            )?)
             .current_directory(candidate_root)
             .environment("CARGO", cargo.invocation_path().as_os_str().to_owned())
             .environment("CARGO_HOME", self.root.as_os_str())
             .environment("CARGO_TARGET_DIR", self.root.join("target"))
             .run()
-            .map_err(|error| format!("cannot run trusted cargo-deny advisory seed: {error}"))?;
+            .map_err(|error| format!("cannot run trusted cargo-deny authority checks: {error}"))?;
         if result.timed_out || !result.status.success() {
             return Err(format!(
-                "trusted cargo-deny advisory seed failed with status {}",
+                "trusted cargo-deny authority checks failed with status {}",
                 result.status.code().unwrap_or(1)
             ));
         }
@@ -2159,7 +2161,7 @@ fn validate_staged_vendor_covers_frozen_lock(
 }
 
 #[cfg(unix)]
-fn trusted_cargo_deny_advisory_arguments(
+fn trusted_cargo_deny_authority_arguments(
     cargo_home: &Path,
     metadata: &Path,
 ) -> Result<Vec<OsString>, String> {
@@ -2173,30 +2175,33 @@ fn trusted_cargo_deny_advisory_arguments(
         })
         || metadata != expected
     {
-        return Err("trusted cargo-deny advisory metadata seed is not exact".to_owned());
+        return Err("trusted cargo-deny authority metadata seed is not exact".to_owned());
     }
+    // License checking reads package source files that are not present in the
+    // captured Cargo metadata graph. Keep that package-content authority in
+    // the trusted seed, together with advisory-database access.
     Ok(vec![
         OsString::from("--metadata-path"),
         metadata.as_os_str().to_owned(),
         OsString::from("--all-features"),
         OsString::from("check"),
         OsString::from("advisories"),
+        OsString::from("licenses"),
     ])
 }
 
 #[cfg(unix)]
 fn candidate_cargo_deny_arguments() -> Vec<OsString> {
     // cargo-deny 0.20.2 has no separate `--disable-fetch` flag. Explicit
-    // `--offline` is its no-fetch mode. Advisory coverage was already fetched
-    // and checked by the trusted seed, so the confined child checks the
-    // remaining policies without opening the candidate advisory database lock.
+    // `--offline` is its no-fetch mode. Advisory databases and license package
+    // contents are checked by the trusted seed; the confined child checks only
+    // graph-driven policies that consume the injected, trusted metadata.
     vec![
         OsString::from("--offline"),
         OsString::from("--locked"),
         OsString::from("--all-features"),
         OsString::from("check"),
         OsString::from("bans"),
-        OsString::from("licenses"),
         OsString::from("sources"),
     ]
 }
@@ -7425,7 +7430,7 @@ mod tests {
         run_posix_stack_work_normalizer, staged_cargo_vendor_root,
         trusted_cargo_cache_fetch_arguments, trusted_cargo_cache_metadata_arguments,
         trusted_cargo_cache_offline_metadata_arguments, trusted_cargo_cache_seed_arguments,
-        trusted_cargo_deny_advisory_arguments, trusted_cargo_vendor_arguments,
+        trusted_cargo_deny_authority_arguments, trusted_cargo_vendor_arguments,
         validate_candidate_cache_normalizer_root, validate_posix_adapter_installation_root,
         validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
         validate_posix_stack_root, validate_posix_stack_root_post_state,
@@ -7437,6 +7442,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trusted_cargo_cache_seed_is_locked_and_manifest_scoped() {
+        use std::ffi::OsString;
+
         let manifest = Path::new("/bound/candidate/Cargo.toml");
         assert_eq!(
             trusted_cargo_cache_seed_arguments(Path::new("/bound/candidate"), manifest).unwrap(),
@@ -7486,37 +7493,48 @@ mod tests {
             ]
         );
         let cargo_home = Path::new("/private/var/tmp/hell-cargo-seed-1-2");
-        let advisory_metadata = cargo_home.join("hell-cargo-deny-metadata.json");
+        let authority_metadata = cargo_home.join("hell-cargo-deny-metadata.json");
         assert_eq!(
-            trusted_cargo_deny_advisory_arguments(cargo_home, &advisory_metadata).unwrap(),
+            trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata).unwrap(),
             [
                 "--metadata-path".into(),
-                advisory_metadata.as_os_str().to_owned(),
+                authority_metadata.as_os_str().to_owned(),
                 "--all-features".into(),
                 "check".into(),
                 "advisories".into(),
+                "licenses".into(),
             ]
         );
+        let trusted_arguments =
+            trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata).unwrap();
+        assert!(trusted_arguments.contains(&OsString::from("advisories")));
+        assert!(trusted_arguments.contains(&OsString::from("licenses")));
+        assert!(!trusted_arguments.contains(&OsString::from("bans")));
+        assert!(!trusted_arguments.contains(&OsString::from("sources")));
         assert!(
-            !trusted_cargo_deny_advisory_arguments(cargo_home, &advisory_metadata)
+            !trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata)
                 .unwrap()
                 .iter()
                 .any(|argument| argument == "--offline")
         );
+        let candidate_arguments = candidate_cargo_deny_arguments();
         assert_eq!(
-            candidate_cargo_deny_arguments(),
+            candidate_arguments,
             [
-                std::ffi::OsString::from("--offline"),
-                std::ffi::OsString::from("--locked"),
-                std::ffi::OsString::from("--all-features"),
-                std::ffi::OsString::from("check"),
-                std::ffi::OsString::from("bans"),
-                std::ffi::OsString::from("licenses"),
-                std::ffi::OsString::from("sources"),
+                OsString::from("--offline"),
+                OsString::from("--locked"),
+                OsString::from("--all-features"),
+                OsString::from("check"),
+                OsString::from("bans"),
+                OsString::from("sources"),
             ]
         );
+        assert!(candidate_arguments.contains(&OsString::from("bans")));
+        assert!(candidate_arguments.contains(&OsString::from("sources")));
+        assert!(!candidate_arguments.contains(&OsString::from("advisories")));
+        assert!(!candidate_arguments.contains(&OsString::from("licenses")));
         assert!(
-            trusted_cargo_deny_advisory_arguments(
+            trusted_cargo_deny_authority_arguments(
                 cargo_home,
                 &cargo_home.join("unbound-metadata.json")
             )

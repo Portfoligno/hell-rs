@@ -658,6 +658,7 @@ pub enum ProcessScope {
 
 pub(crate) struct NativeArchiveAdapter {
     _directory: Option<AdapterDirectory>,
+    ar_path: Option<PathBuf>,
     llvm_ar: Option<PathBuf>,
     llvm_ar_version: Option<String>,
     path: Option<OsString>,
@@ -789,6 +790,7 @@ impl NativeArchiveAdapter {
         if !enabled {
             return Ok(Self {
                 _directory: None,
+                ar_path: None,
                 llvm_ar: None,
                 llvm_ar_version: None,
                 path: None,
@@ -837,6 +839,8 @@ impl NativeArchiveAdapter {
                 .map_err(|error| format!("cannot create macOS archive authority: {error}"))?;
             symlink(&executable, adapter_root.join("ar"))
                 .map_err(|error| format!("cannot install macOS archive adapter: {error}"))?;
+            symlink(&executable, adapter_root.join("llvm-ar"))
+                .map_err(|error| format!("cannot install macOS LLVM archive adapter: {error}"))?;
             bind_and_freeze_native_archive_authority(&authority, &llvm_ar)?;
             let work = adapter_root.join(".stack-work");
             fs::write(work.join("member.o"), b"native-archive-adapter\n")
@@ -874,8 +878,10 @@ impl NativeArchiveAdapter {
             clean_native_archive_probe(&work)?;
             let path = native_archive_path(&inherited, adapter_root, &llvm_ar, &current_directory)?;
             let stack_yaml = write_native_stack_overlay(adapter_root, source)?;
+            let ar_path = adapter_root.join("ar");
             Ok(Self {
                 _directory: Some(directory),
+                ar_path: Some(ar_path),
                 llvm_ar: Some(llvm_ar),
                 llvm_ar_version: Some(llvm_ar_version),
                 path: Some(path),
@@ -890,9 +896,12 @@ impl NativeArchiveAdapter {
     }
 
     pub(crate) fn apply(&self, command: CommandSpec) -> CommandSpec {
-        match &self.path {
-            Some(path) => command.environment("PATH", path),
-            None => command,
+        match (&self.path, &self.ar_path) {
+            (Some(path), Some(ar_path)) => {
+                command.environment("PATH", path).environment("AR", ar_path)
+            }
+            (None, None) => command,
+            _ => panic!("macOS archive adapter PATH and AR bindings are incomplete"),
         }
     }
 
@@ -1074,11 +1083,7 @@ fn native_archive_path(
         } else {
             current_directory.join(entry)
         };
-        let is_provision_directory =
-            fs::canonicalize(&resolved).is_ok_and(|resolved| resolved == provision_directory);
-        let exposes_selected_archiver =
-            fs::canonicalize(resolved.join("llvm-ar")).is_ok_and(|candidate| candidate == llvm_ar);
-        !is_provision_directory && !exposes_selected_archiver
+        fs::canonicalize(&resolved).is_ok_and(|resolved| resolved != provision_directory)
     }));
     std::env::join_paths(paths)
         .map_err(|error| format!("cannot construct archive adapter PATH: {error}"))
@@ -3099,31 +3104,26 @@ fn parse_windows_restricted_launch_request(
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsRestrictedTokenConstraint {
-    DisableMaximumPrivileges,
-    LuaToken,
-    WriteRestricted,
+enum WindowsLaunchTokenConstraint {
+    DuplicatedCurrentPrimary,
 }
 
 #[cfg(any(windows, test))]
-const WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS: [WindowsRestrictedTokenConstraint; 3] = [
-    WindowsRestrictedTokenConstraint::DisableMaximumPrivileges,
-    WindowsRestrictedTokenConstraint::LuaToken,
-    WindowsRestrictedTokenConstraint::WriteRestricted,
-];
+const WINDOWS_LAUNCH_TOKEN_CONSTRAINTS: [WindowsLaunchTokenConstraint; 1] =
+    [WindowsLaunchTokenConstraint::DuplicatedCurrentPrimary];
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsRestrictingSidConstraint {
-    RestrictedCode,
-    LogonSession,
+fn windows_launch_token_contract(
+    constraints: &[WindowsLaunchTokenConstraint],
+) -> std::io::Result<()> {
+    if constraints != WINDOWS_LAUNCH_TOKEN_CONSTRAINTS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows child launcher must duplicate the current normal primary token",
+        ));
+    }
+    Ok(())
 }
-
-#[cfg(any(windows, test))]
-const WINDOWS_RESTRICTING_SID_CONSTRAINTS: [WindowsRestrictingSidConstraint; 2] = [
-    WindowsRestrictingSidConstraint::RestrictedCode,
-    WindowsRestrictingSidConstraint::LogonSession,
-];
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3136,76 +3136,13 @@ const WINDOWS_RESTRICTED_GRAPHICAL_BINDING: WindowsRestrictedGraphicalBinding =
     WindowsRestrictedGraphicalBinding::InheritedDefault;
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowsRestrictedCanaryCommand {
-    executable: &'static str,
-    arguments: &'static [&'static str],
-}
+const WINDOWS_SUPPORTED_LAUNCH_CANARY: [(&str, [&str; 4]); 1] =
+    [("cmd.exe", ["/d", "/c", "exit", "0"])];
 
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowsRestrictedCanarySpec {
-    subsystem: &'static str,
-    imports: &'static [&'static str],
-    candidates: &'static [WindowsRestrictedCanaryCommand],
-}
-
-#[cfg(any(windows, test))]
-const WINDOWS_RESTRICTED_CANARIES: [WindowsRestrictedCanarySpec; 6] = [
-    WindowsRestrictedCanarySpec {
-        subsystem: "baseline",
-        imports: &["kernel32.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "cmd.exe",
-            arguments: &["/d", "/c", "exit", "0"],
-        }],
-    },
-    WindowsRestrictedCanarySpec {
-        subsystem: "user32",
-        imports: &["user32.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "tasklist.exe",
-            arguments: &["/?"],
-        }],
-    },
-    WindowsRestrictedCanarySpec {
-        subsystem: "ole32-combase",
-        imports: &["ole32.dll", "combase.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "powershell.exe",
-            arguments: &["-NoProfile", "-Command", "exit", "0"],
-        }],
-    },
-    WindowsRestrictedCanarySpec {
-        subsystem: "secur32",
-        imports: &["secur32.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "net.exe",
-            arguments: &["helpmsg", "0"],
-        }],
-    },
-    WindowsRestrictedCanarySpec {
-        subsystem: "userenv",
-        imports: &["userenv.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "whoami.exe",
-            arguments: &["/user"],
-        }],
-    },
-    WindowsRestrictedCanarySpec {
-        subsystem: "rpcrt4",
-        imports: &["rpcrt4.dll"],
-        candidates: &[WindowsRestrictedCanaryCommand {
-            executable: "wevtutil.exe",
-            arguments: &["/?"],
-        }],
-    },
-];
-
-// These are diagnostic-only, read-only/help/exit requests. Each executable is
-// selected only after its direct PE imports prove the suspected subsystem, and
-// it then uses the exact restricted token, inherited station, stdio contract,
-// and kill-on-close job as the real argv adapter.
+// The canary validates actual process initialization under the supported
+// normal-user token. It intentionally does not gate on a literal PE import
+// name: Windows API-set forwarding makes direct `kernel32.dll` spelling an
+// invalid launchability predicate.
 
 #[cfg(any(windows, test))]
 fn windows_restricted_graphical_binding_contract(
@@ -3261,22 +3198,17 @@ fn relay_windows_restricted_diagnostic(
 }
 
 #[cfg(windows)]
-fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
-    WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS.into_iter().fold(
-        Default::default(),
-        |flags, constraint| {
-            flags
-                | match constraint {
-                    WindowsRestrictedTokenConstraint::DisableMaximumPrivileges => {
-                        firehazard::token::DISABLE_MAX_PRIVILEGE
-                    }
-                    WindowsRestrictedTokenConstraint::LuaToken => firehazard::token::LUA_TOKEN,
-                    WindowsRestrictedTokenConstraint::WriteRestricted => {
-                        firehazard::token::WRITE_RESTRICTED
-                    }
-                }
-        },
-    )
+fn windows_duplicate_current_primary_token(
+    process_token: &firehazard::token::OwnedHandle,
+) -> std::io::Result<firehazard::token::OwnedHandle> {
+    windows_launch_token_contract(&WINDOWS_LAUNCH_TOKEN_CONSTRAINTS)?;
+    Ok(firehazard::duplicate_token_ex(
+        process_token,
+        firehazard::token::ASSIGN_PRIMARY | firehazard::token::QUERY,
+        None,
+        firehazard::security::Identification,
+        firehazard::token::Primary,
+    )?)
 }
 
 #[cfg(any(windows, test))]
@@ -3289,54 +3221,33 @@ struct ResolvedWindowsRestrictedCanary {
 }
 
 #[cfg(any(windows, test))]
-fn windows_pe_import_contains(imports: &[String], expected: &str) -> bool {
-    imports
-        .iter()
-        .any(|import| import.eq_ignore_ascii_case(expected))
-}
-
-#[cfg(any(windows, test))]
-fn select_windows_restricted_canary(
+fn resolve_windows_supported_launch_canary(
     system_root: &Path,
-    spec: &WindowsRestrictedCanarySpec,
 ) -> std::io::Result<ResolvedWindowsRestrictedCanary> {
-    for candidate in spec.candidates {
-        let program = system_root.join(candidate.executable);
-        let metadata = match fs::symlink_metadata(&program) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let canonical = fs::canonicalize(&program)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || canonical != program {
-            continue;
-        }
-        let imports = windows_pe_imports(&program).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("cannot inspect restricted-token canary: {error}"),
-            )
-        })?;
-        if spec
-            .imports
-            .iter()
-            .any(|expected| windows_pe_import_contains(&imports, expected))
-        {
-            return Ok(ResolvedWindowsRestrictedCanary {
-                subsystem: spec.subsystem,
-                program,
-                arguments: candidate.arguments.to_vec(),
-                imports,
-            });
-        }
+    let (executable, arguments) = WINDOWS_SUPPORTED_LAUNCH_CANARY
+        .first()
+        .ok_or_else(|| std::io::Error::other("supported launch canary is absent"))?;
+    let program = system_root.join(executable);
+    let metadata = fs::symlink_metadata(&program)?;
+    let canonical = fs::canonicalize(&program)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || canonical != program {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "supported launch canary is not one canonical System32 file",
+        ));
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!(
-            "no restricted-token canary directly imports {}",
-            spec.imports.join(" or ")
-        ),
-    ))
+    let imports = windows_pe_imports(&program).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot inspect supported launch canary: {error}"),
+        )
+    })?;
+    Ok(ResolvedWindowsRestrictedCanary {
+        subsystem: "supported-launch",
+        program,
+        arguments: arguments.to_vec(),
+        imports,
+    })
 }
 
 #[cfg(any(windows, test))]
@@ -3375,6 +3286,19 @@ fn windows_restricted_canary_diagnostic(
         bounded_windows_prelaunch_value(canary.program.as_os_str()),
         canary.imports,
     )
+}
+
+#[cfg(any(windows, test))]
+fn windows_restricted_canary_failure(
+    canary: &ResolvedWindowsRestrictedCanary,
+    status: u32,
+) -> Option<String> {
+    (status != 0).then(|| {
+        format!(
+            "{}; supported Windows launch canary must exit successfully",
+            windows_restricted_canary_diagnostic(canary, status)
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -3426,35 +3350,11 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         firehazard::get_current_process(),
         firehazard::token::ALL_ACCESS,
     )?;
-    let restricted_sid = firehazard::convert_string_sid_to_sid_w(widestring::u16cstr!("S-1-5-12"))?;
-    let logon_groups = process_token.logon_sid()?;
-    let [logon_group] = logon_groups.groups() else {
-        return Err(std::io::Error::other(
-            "current Windows token must contain exactly one logon SID",
-        ));
-    };
-    // WRITE_RESTRICTED applies this second SID set only to writes. Restricted
-    // Code binds the explicitly prepared filesystem DACLs while the exact logon
-    // SID retains session-scoped access to the runner's inherited station.
-    // Creating a private station also created an unvalidated CSRSS dependency:
-    // repeatedly widening its object DACL never allowed cargo's USER32/COM
-    // imports to initialize on hosted runners. Filesystem confinement does not
-    // require a private desktop, so preserve the runner's initialized station.
-    let restricted = WINDOWS_RESTRICTING_SID_CONSTRAINTS.map(|constraint| match constraint {
-        WindowsRestrictingSidConstraint::RestrictedCode => {
-            firehazard::sid::AndAttributes::new(&restricted_sid, ())
-        }
-        WindowsRestrictingSidConstraint::LogonSession => {
-            firehazard::sid::AndAttributes::new(logon_group.sid, ())
-        }
-    });
-    let token = firehazard::create_restricted_token(
-        &process_token,
-        windows_restricted_token_flags(),
-        None,
-        None,
-        Some(&restricted),
-    )?;
+    // Duplicate the runner's complete normal primary token. The explicit staged
+    // filesystem DACLs remain authoritative; a write-restricted primary token is
+    // not a complete logon environment and cannot reliably initialize modern
+    // Windows system binaries.
+    let token = windows_duplicate_current_primary_token(&process_token)?;
 
     let job = firehazard::create_job_object_w(None, ())?;
     let limits = firehazard::job::object::ExtendedLimitInformation {
@@ -3497,15 +3397,20 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
             "{}",
             windows_restricted_canary_diagnostic(&target_canary, target_canary_status)
         );
+        if let Some(error) = windows_restricted_canary_failure(&target_canary, target_canary_status)
+        {
+            return Err(std::io::Error::other(error));
+        }
     }
 
-    for spec in WINDOWS_RESTRICTED_CANARIES {
-        let canary = select_windows_restricted_canary(&system_root, &spec)?;
-        let mut command_line =
-            windows_restricted_canary_command_line(&canary.program, &canary.arguments);
-        let status =
-            windows_create_restricted_process(&token, &job, &canary.program, &mut command_line)?;
-        eprintln!("{}", windows_restricted_canary_diagnostic(&canary, status));
+    let canary = resolve_windows_supported_launch_canary(&system_root)?;
+    let mut command_line =
+        windows_restricted_canary_command_line(&canary.program, &canary.arguments);
+    let status =
+        windows_create_restricted_process(&token, &job, &canary.program, &mut command_line)?;
+    eprintln!("{}", windows_restricted_canary_diagnostic(&canary, status));
+    if let Some(error) = windows_restricted_canary_failure(&canary, status) {
+        return Err(std::io::Error::other(error));
     }
 
     let status = windows_create_restricted_process(&token, &job, &launcher, &mut command_line)?;
@@ -4797,22 +4702,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_restricted_token_is_write_scoped_and_privilege_reduced() {
+    fn windows_launch_token_duplicates_the_current_normal_primary_token() {
         assert_eq!(
-            WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS,
-            [
-                WindowsRestrictedTokenConstraint::DisableMaximumPrivileges,
-                WindowsRestrictedTokenConstraint::LuaToken,
-                WindowsRestrictedTokenConstraint::WriteRestricted,
-            ]
+            WINDOWS_LAUNCH_TOKEN_CONSTRAINTS,
+            [WindowsLaunchTokenConstraint::DuplicatedCurrentPrimary]
         );
-        assert_eq!(
-            WINDOWS_RESTRICTING_SID_CONSTRAINTS,
-            [
-                WindowsRestrictingSidConstraint::RestrictedCode,
-                WindowsRestrictingSidConstraint::LogonSession,
-            ]
-        );
+        assert!(windows_launch_token_contract(&WINDOWS_LAUNCH_TOKEN_CONSTRAINTS).is_ok());
+        assert!(windows_launch_token_contract(&[]).is_err());
         assert_eq!(
             WINDOWS_RESTRICTED_GRAPHICAL_BINDING,
             WindowsRestrictedGraphicalBinding::InheritedDefault
@@ -4832,41 +4728,32 @@ mod tests {
     }
 
     #[test]
-    fn windows_restricted_canaries_bind_isolated_imports_and_report_status() {
-        let root = ResolverDirectory::new("windows-restricted-canary");
-        let program = root.path().join("tasklist.exe");
-        fs::write(&program, minimal_windows_pe_with_import(23, b"USER32.dll")).unwrap();
-        let spec = WINDOWS_RESTRICTED_CANARIES
-            .iter()
-            .find(|spec| spec.subsystem == "user32")
-            .unwrap();
+    fn windows_supported_launch_canary_is_pe_bound_and_must_succeed() {
+        let root = ResolverDirectory::new("windows-supported-launch-canary");
+        let program = root.path().join("cmd.exe");
+        fs::write(
+            &program,
+            minimal_windows_pe_with_import(23, b"api-ms-win-core-console-l1-1-0.dll"),
+        )
+        .unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
-        let resolved = select_windows_restricted_canary(&canonical_root, spec).unwrap();
-        assert_eq!(resolved.program, canonical_root.join("tasklist.exe"));
-        assert_eq!(resolved.imports, ["USER32.dll"]);
+        let resolved = resolve_windows_supported_launch_canary(&canonical_root).unwrap();
+        assert_eq!(resolved.program, canonical_root.join("cmd.exe"));
+        assert_eq!(resolved.arguments, ["/d", "/c", "exit", "0"]);
+        assert_eq!(resolved.imports, ["api-ms-win-core-console-l1-1-0.dll"]);
         let diagnostic = windows_restricted_canary_diagnostic(&resolved, 0xc000_0142);
-        assert!(diagnostic.contains("subsystem=user32"));
-        assert!(diagnostic.contains("imports=[\"USER32.dll\"]"));
+        assert!(diagnostic.contains("subsystem=supported-launch"));
+        assert!(diagnostic.contains("imports=[\"api-ms-win-core-console-l1-1-0.dll\"]"));
         assert!(diagnostic.contains("status=3221225794 (0xc0000142)"));
+        assert_eq!(windows_restricted_canary_failure(&resolved, 0), None);
+        let failure = windows_restricted_canary_failure(&resolved, 0xc000_0142).unwrap();
+        assert!(failure.starts_with(&diagnostic));
+        assert!(failure.ends_with("; supported Windows launch canary must exit successfully"));
         let target = root.path().join("cargo.exe");
         fs::write(&target, minimal_windows_pe_with_import(24, b"KERNEL32.dll")).unwrap();
         let target = resolve_windows_restricted_target_canary(&target).unwrap();
         assert_eq!(target.subsystem, "staged-target");
         assert_eq!(target.arguments, ["--version"]);
-        assert_eq!(
-            WINDOWS_RESTRICTED_CANARIES
-                .iter()
-                .map(|spec| spec.subsystem)
-                .collect::<Vec<_>>(),
-            [
-                "baseline",
-                "user32",
-                "ole32-combase",
-                "secur32",
-                "userenv",
-                "rpcrt4"
-            ]
-        );
     }
 
     #[test]
@@ -4960,6 +4847,7 @@ mod tests {
         let adapter_root = Path::new("/fixed/adapter");
         let adapter = NativeArchiveAdapter {
             _directory: None,
+            ar_path: None,
             llvm_ar: None,
             llvm_ar_version: None,
             path: None,
@@ -4985,6 +4873,60 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_archive_adapter_binds_ar_and_exact_clqs_without_ld() {
+        let adapter_root = Path::new("/fixed/macOS-archive-adapter");
+        let adapter = NativeArchiveAdapter {
+            _directory: None,
+            ar_path: Some(adapter_root.join("ar")),
+            llvm_ar: None,
+            llvm_ar_version: None,
+            path: Some(OsString::from("/confined/path")),
+            stack_yaml: None,
+        };
+        let spec = adapter.apply(CommandSpec::new("program", Duration::from_secs(1)));
+        assert_eq!(
+            spec.environment,
+            [
+                (OsString::from("PATH"), OsString::from("/confined/path")),
+                (
+                    OsString::from("AR"),
+                    adapter_root.join("ar").into_os_string()
+                ),
+            ]
+        );
+        assert!(!spec.environment_names().iter().any(|name| name == "LD"));
+
+        let root = std::env::temp_dir().join(format!(
+            "hell-native-archive-ar-binding-{}-{}",
+            std::process::id(),
+            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join(".stack-work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("objects.rsp"), b"member.o\n").unwrap();
+        let normalized = normalize_native_archive_arguments(
+            &[
+                OsString::from("clqs"),
+                OsString::from("archive.a"),
+                OsString::from("@objects.rsp"),
+            ],
+            &root,
+            &work,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized,
+            [
+                OsString::from("qclsL"),
+                OsString::from("archive.a"),
+                OsString::from("@objects.rsp"),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_stack_provenance_resolves_relative_configuration_from_source() {
         let base = std::env::temp_dir().join(format!(
@@ -5006,6 +4948,7 @@ mod tests {
         .unwrap();
         let adapter = NativeArchiveAdapter {
             _directory: None,
+            ar_path: None,
             llvm_ar: None,
             llvm_ar_version: None,
             path: None,
@@ -5113,11 +5056,18 @@ mod tests {
         }
         symlink(&provision, &provision_alias).unwrap();
         let llvm_ar = provision.join("llvm-ar");
-        for executable in [llvm_ar.clone(), broad.join("clang"), first.join("clang")] {
+        let launcher = base.join("hell-ci");
+        for executable in [
+            llvm_ar.clone(),
+            launcher.clone(),
+            broad.join("clang"),
+            first.join("clang"),
+        ] {
             fs::write(&executable, b"not executed\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         }
         symlink(&llvm_ar, broad.join("llvm-ar")).unwrap();
+        symlink(&launcher, adapter.join("llvm-ar")).unwrap();
         let inherited = std::env::join_paths([
             provision.as_path(),
             first.as_path(),
@@ -5134,12 +5084,18 @@ mod tests {
             [
                 adapter.clone(),
                 first.clone(),
+                Path::new("broad").to_path_buf(),
                 second.clone(),
                 first.clone()
             ]
         );
         assert!(paths.iter().skip(1).all(|entry| {
-            fs::canonicalize(entry).unwrap() != fs::canonicalize(&provision).unwrap()
+            let resolved = if entry.is_absolute() {
+                entry.clone()
+            } else {
+                base.join(entry)
+            };
+            fs::canonicalize(resolved).unwrap() != fs::canonicalize(&provision).unwrap()
         }));
         let clang = paths
             .iter()
@@ -5147,6 +5103,18 @@ mod tests {
             .find(|candidate| candidate.is_file())
             .unwrap();
         assert_eq!(clang, first.join("clang"));
+        assert_eq!(
+            fs::canonicalize(base.join("broad")).unwrap(),
+            fs::canonicalize(&broad).unwrap()
+        );
+        assert_eq!(
+            fs::canonicalize(broad.join("llvm-ar")).unwrap(),
+            fs::canonicalize(&llvm_ar).unwrap()
+        );
+        assert_ne!(
+            fs::canonicalize(adapter.join("llvm-ar")).unwrap(),
+            fs::canonicalize(broad.join("llvm-ar")).unwrap()
+        );
         fs::remove_dir_all(base).unwrap();
     }
 
