@@ -3371,7 +3371,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         ));
     }
     let target_token = hell_testkit::encode_windows_argv(&request.target_arguments)?;
-    let launcher_plan = windows_restricted_child_launch_plan(&launcher, &target_token);
+    let mut launcher_plan = windows_restricted_child_launch_plan(&launcher, &target_token);
     let process_token = firehazard::open_process_token(
         firehazard::get_current_process(),
         firehazard::token::ALL_ACCESS,
