@@ -12061,7 +12061,9 @@ fn runtime_directory_operation_definitions() -> Vec<RuntimeDirectoryDefinition> 
                 "  Text.putStr output\n",
             ),
             b"abc",
-            "main = Directory.copyFile \"missing.txt\" \"target.txt\"\n",
+            // A missing parent remains a failure on every platform; the
+            // directly missing source is the reviewed Windows empty-pair bug.
+            "main = Directory.copyFile \"missing/source.txt\" \"target.txt\"\n",
         ),
         (
             "Directory.createDirectory",

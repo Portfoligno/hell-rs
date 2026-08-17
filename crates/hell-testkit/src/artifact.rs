@@ -7612,11 +7612,13 @@ pub(crate) fn case_descriptor(case: &DifferentialCase) -> String {
         output.push_str("\nruntime_failure_obligation = ");
         push_toml_string(&mut output, authority.obligation);
         output.push_str("\nruntime_failure_while_handling = ");
-        output.push_str(if authority.allow_while_handling {
-            "true\n"
-        } else {
-            "false\n"
-        });
+        output.push_str(
+            if authority.while_handling == crate::RuntimeFailureHandlingProjection::None {
+                "false\n"
+            } else {
+                "true\n"
+            },
+        );
     }
     output.push_str("stdin_sha256 = ");
     push_toml_string(&mut output, &sha256_bytes(&case.stdin).hex());

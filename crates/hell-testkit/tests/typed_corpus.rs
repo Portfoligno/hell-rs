@@ -1900,8 +1900,8 @@ fn projected_failure_report(
             "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
             "missing-parent/file.txt: withBinaryFile: does not exist (No such file or directory)\n\n",
             "HasCallStack backtrace:\n",
-            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:123:4 ",
-            "in ghc-internal:GHC.Internal.IO\n",
+            "  ioError, called at libraries/ghc-internal/src/GHC/Internal/Foreign/C/Error.hs:291:5 ",
+            "in ghc-internal:GHC.Internal.Foreign.C.Error\n\n",
         )
         .as_bytes(),
         None,
@@ -1957,7 +1957,7 @@ fn assert_oracle_frame_rejection_reasons(
     let mut changed = report.oracle.clone();
     changed.stderr = BoundedCapture::from_bytes(
         oracle_text()
-            .replace("  throwIO, called at", "  injected, called at")
+            .replace("  ioError, called at", "  injected, called at")
             .into_bytes(),
     );
     assert_runtime_failure_comparison_rejected(
@@ -1983,7 +1983,7 @@ fn assert_oracle_frame_rejection_reasons(
     let mut changed = report.oracle.clone();
     changed.stderr = BoundedCapture::from_bytes(
         oracle_text()
-            .replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs")
+            .replace("GHC/Internal/Foreign/C/Error.hs", "Unrelated/Injected.hs")
             .into_bytes(),
     );
     assert_runtime_failure_comparison_rejected(

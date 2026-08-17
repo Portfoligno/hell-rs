@@ -1086,6 +1086,7 @@ struct PosixCargoDenyHomeProtection {
     candidate_uid: u32,
     trusted_owner: u32,
     trusted_group_id: u32,
+    advisory_lock: fs::File,
     metadata: PosixCargoDenyMetadataProtection,
     active: bool,
 }
@@ -1185,6 +1186,7 @@ impl PosixCargoDenyHomeProtection {
                 self.candidate_uid,
                 self.trusted_owner,
                 self.trusted_group_id,
+                &self.advisory_lock,
             );
             trusted_tool_status(
                 &self.sudo,
@@ -1300,7 +1302,7 @@ fn stage_posix_cargo_deny_home(
         let mut bytes = 0_u64;
         copy_posix_cargo_cache_tree(seed.root(), &home, &mut entries, &mut bytes)?;
         let metadata = seed.prove_staged_home_offline(cargo, candidate_root, &home)?;
-        reserve_posix_cargo_deny_advisory_lock(&home)?;
+        let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
             stage_posix_cargo_deny_metadata(platform, sudo, &tools, &metadata, trusted_owner)?;
         normalize_posix_cargo_deny_home_with_adapter(
@@ -1317,12 +1319,13 @@ fn stage_posix_cargo_deny_home(
             candidate_uid,
             trusted_owner,
             trusted_group_id,
+            &advisory_lock,
         )?;
         seed.cleanup()?;
-        Ok(metadata)
+        Ok((metadata, advisory_lock))
     })();
-    let metadata = match copy_result {
-        Ok(metadata) => metadata,
+    let (metadata, advisory_lock) = match copy_result {
+        Ok(authority) => authority,
         Err(error) => {
             if let Ok(home_text) = path_text(&home, "partial candidate cargo-deny home cleanup") {
                 let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", home_text]);
@@ -1339,13 +1342,14 @@ fn stage_posix_cargo_deny_home(
         candidate_uid,
         trusted_owner,
         trusted_group_id,
+        advisory_lock,
         metadata,
         active: true,
     })
 }
 
 #[cfg(unix)]
-fn reserve_posix_cargo_deny_advisory_lock(home: &Path) -> Result<(), String> {
+fn reserve_posix_cargo_deny_advisory_lock(home: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let advisory_root = home.join("advisory-dbs");
@@ -1356,17 +1360,22 @@ fn reserve_posix_cargo_deny_advisory_lock(home: &Path) -> Result<(), String> {
         fs::remove_file(&lock)
             .map_err(|error| format!("cannot replace staged cargo-deny advisory lock: {error}"))?;
     }
-    fs::OpenOptions::new()
+    let reserved_lock = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock)
         .map_err(|error| format!("cannot reserve cargo-deny advisory lock: {error}"))?;
+    drop(reserved_lock);
+    let lock_authority = fs::OpenOptions::new()
+        .read(true)
+        .open(&lock)
+        .map_err(|error| format!("cannot bind cargo-deny advisory lock metadata: {error}"))?;
     let metadata = fs::symlink_metadata(&lock)
         .map_err(|error| format!("cannot inspect cargo-deny advisory lock: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
         return Err("cargo-deny advisory lock is not an exact regular file".to_owned());
     }
-    Ok(())
+    Ok(lock_authority)
 }
 
 #[cfg(unix)]
@@ -1875,7 +1884,7 @@ impl TrustedCargoCacheSeed {
             &program_identity,
             "staged frozen fetch proof",
         )?;
-        validate_trusted_cargo_cache_tree(staged_home)
+        validate_trusted_cargo_cache_tree(&staged_home.join("vendor"))
     }
 
     fn revalidate_inputs(
@@ -2604,47 +2613,59 @@ fn validate_posix_cargo_deny_home_post_state(
     candidate_uid: u32,
     trusted_owner: u32,
     trusted_group_id: u32,
+    advisory_lock: &fs::File,
 ) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let mut pending = vec![home.to_path_buf()];
     let mut entries = 0_usize;
     let mut bytes = 0_u64;
-    let lock = Path::new("advisory-dbs").join("db.lock");
     let advisory_root = Path::new("advisory-dbs");
-    let mut found_lock = false;
+    let mut found_advisory_root = false;
     while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("cannot inspect final cargo-deny cache state: {error}"))?;
         let relative = path
             .strip_prefix(home)
             .map_err(|_| "final cargo-deny cache entry escapes its home".to_owned())?;
-        let is_lock = relative == lock;
-        let is_advisory_root = relative == advisory_root;
-        let expected_owner = if is_lock || is_advisory_root {
-            candidate_uid
-        } else {
-            trusted_owner
-        };
-        let expected_mode = match (is_lock, is_advisory_root) {
-            (true, _) => 0o600,
-            (_, true) => 0o700,
-            (_, _) if metadata.is_dir() => 0o555,
-            (_, _) => 0o444,
-        };
+
+        if relative == advisory_root {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != candidate_uid
+                || metadata.gid() != trusted_group_id
+                || metadata.permissions().mode() & 0o7777 != 0o700
+            {
+                return Err(
+                    "final cargo-deny cache identity or permissions differ from policy".to_owned(),
+                );
+            }
+            found_advisory_root = true;
+            entries = entries
+                .checked_add(1)
+                .ok_or_else(|| "final cargo-deny cache entry count overflowed".to_owned())?;
+            if entries > POSIX_RUSTUP_STAGE_ENTRY_LIMIT {
+                return Err("final cargo-deny cache exceeds its resource bound".to_owned());
+            }
+            // The advisory root is deliberately candidate-private. Inventory
+            // its trusted contents before the ownership transition, and retain
+            // the lock descriptor so its final metadata can be checked without
+            // granting the trusted enumerator access to candidate storage.
+            continue;
+        }
+
         if metadata.file_type().is_symlink()
             || (!metadata.is_dir() && !metadata.is_file())
             || (metadata.is_file() && metadata.nlink() != 1)
-            || metadata.uid() != expected_owner
+            || metadata.uid() != trusted_owner
             || metadata.gid() != trusted_group_id
-            || metadata.permissions().mode() & 0o7777 != expected_mode
-            || (is_lock && (!metadata.is_file() || metadata.len() != 0))
+            || metadata.permissions().mode() & 0o7777
+                != if metadata.is_dir() { 0o555 } else { 0o444 }
         {
             return Err(
                 "final cargo-deny cache identity or permissions differ from policy".to_owned(),
             );
         }
-        found_lock |= is_lock;
         entries = entries
             .checked_add(1)
             .ok_or_else(|| "final cargo-deny cache entry count overflowed".to_owned())?;
@@ -2664,14 +2685,36 @@ fn validate_posix_cargo_deny_home_post_state(
             {
                 pending.push(
                     entry
-                        .map_err(|error| format!("cannot read final cargo-deny cache: {error}"))?
+                        .map_err(|error| {
+                            format!("cannot read final cargo-deny cache entry: {error}")
+                        })?
                         .path(),
                 );
             }
         }
     }
-    if !found_lock {
-        return Err("final cargo-deny advisory lock authority is absent".to_owned());
+
+    let lock_metadata = advisory_lock
+        .metadata()
+        .map_err(|error| format!("cannot inspect final cargo-deny advisory lock: {error}"))?;
+    if lock_metadata.file_type().is_symlink()
+        || !lock_metadata.is_file()
+        || lock_metadata.nlink() != 1
+        || lock_metadata.len() != 0
+        || lock_metadata.uid() != candidate_uid
+        || lock_metadata.gid() != trusted_group_id
+        || lock_metadata.permissions().mode() & 0o7777 != 0o600
+    {
+        return Err("final cargo-deny cache identity or permissions differ from policy".to_owned());
+    }
+    entries = entries
+        .checked_add(1)
+        .ok_or_else(|| "final cargo-deny cache entry count overflowed".to_owned())?;
+    if entries > POSIX_RUSTUP_STAGE_ENTRY_LIMIT {
+        return Err("final cargo-deny cache exceeds its resource bound".to_owned());
+    }
+    if !found_advisory_root {
+        return Err("final cargo-deny advisory root authority is absent".to_owned());
     }
     Ok(())
 }
@@ -8263,7 +8306,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         std::fs::create_dir_all(&home).unwrap();
         let cached = home.join("registry-cache");
         std::fs::write(&cached, b"cache\n").unwrap();
-        reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
+        let advisory_lock_authority = reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
         let advisory_root = home.join("advisory-dbs");
         let advisory_lock = advisory_root.join("db.lock");
         validate_posix_cargo_deny_home_root(&home).unwrap();
@@ -8322,6 +8365,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             identity.uid(),
             identity.uid(),
             identity.gid(),
+            &advisory_lock_authority,
         )
         .unwrap();
 
@@ -8332,10 +8376,25 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
                 identity.uid(),
                 identity.uid(),
                 identity.gid(),
+                &advisory_lock_authority,
             )
             .is_err()
         );
         std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        std::fs::remove_file(&advisory_lock).unwrap();
+        std::fs::write(&advisory_lock, b"replacement\n").unwrap();
+        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                &home,
+                identity.uid(),
+                identity.uid(),
+                identity.gid(),
+                &advisory_lock_authority,
+            )
+            .is_err()
+        );
 
         let wrong = environment.join("cargo-home");
         std::fs::create_dir(&wrong).unwrap();
@@ -8350,7 +8409,8 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
                 &home,
                 identity.uid(),
                 identity.uid(),
-                identity.gid()
+                identity.gid(),
+                &advisory_lock_authority,
             )
             .is_err()
         );
@@ -8544,7 +8604,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         let advisory_lock = advisory_root.join("db.lock");
         std::fs::create_dir(&advisory_root).unwrap();
         std::fs::write(&advisory_lock, b"staged advisory authority\n").unwrap();
-        reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
+        let advisory_lock_authority = reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
         assert_eq!(std::fs::metadata(&advisory_lock).unwrap().len(), 0);
         let metadata = std::fs::metadata(&home).unwrap();
         normalize_cargo_deny_cache_tree(&home, metadata.uid(), metadata.uid(), metadata.gid())
@@ -8554,6 +8614,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             metadata.uid(),
             metadata.uid(),
             metadata.gid(),
+            &advisory_lock_authority,
         )
         .unwrap();
         assert_eq!(

@@ -854,25 +854,20 @@ impl NativeArchiveAdapter {
             }
             fs::write(work.join("response.rsp"), b"inner.a\n")
                 .map_err(|error| format!("cannot write archiver response probe: {error}"))?;
-            let probe =
-                CommandSpec::new(adapter_root.join("ar").as_os_str(), Duration::from_secs(30))
-                    .arguments(["qcls", "outer.a", "@response.rsp"])
-                    .current_directory(adapter_root)
-                    .run()
-                    .map_err(|error| format!("cannot probe LLVM archiver: {error}"))?;
+            let bound_llvm_ar = authority.join("llvm-ar");
+            let probe = native_archive_feature_probe(&bound_llvm_ar, &work)
+                .run()
+                .map_err(|error| format!("cannot probe LLVM archiver: {error}"))?;
             if !probe.status.success() || probe.timed_out {
                 return Err(
                     "LLVM archiver lacks required response-file/flattening support".to_owned(),
                 );
             }
-            let table = CommandSpec::new(
-                authority.join("llvm-ar").as_os_str(),
-                Duration::from_secs(30),
-            )
-            .arguments(["t", "outer.a"])
-            .current_directory(&work)
-            .run()
-            .map_err(|error| format!("cannot inspect archiver flattening probe: {error}"))?;
+            let table = CommandSpec::new(bound_llvm_ar.as_os_str(), Duration::from_secs(30))
+                .arguments(["t", "outer.a"])
+                .current_directory(&work)
+                .run()
+                .map_err(|error| format!("cannot inspect archiver flattening probe: {error}"))?;
             if !table.status.success() || table.timed_out || table.stdout != b"member.o\n" {
                 return Err("LLVM archiver did not flatten the nested archive exactly".to_owned());
             }
@@ -975,6 +970,13 @@ impl NativeArchiveAdapter {
 }
 
 pub(crate) const PINNED_ORACLE_SOURCE_COMMIT: &str = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff";
+
+#[cfg(unix)]
+fn native_archive_feature_probe(bound_llvm_ar: &Path, work_directory: &Path) -> CommandSpec {
+    CommandSpec::new(bound_llvm_ar.as_os_str(), Duration::from_secs(30))
+        .arguments(["qL", "outer.a", "@response.rsp"])
+        .current_directory(work_directory)
+}
 
 #[cfg(unix)]
 fn prepare_adapter_work_directory(adapter_root: &Path) -> Result<(), String> {
@@ -3067,20 +3069,23 @@ const WINDOWS_RESTRICTING_SID_CONSTRAINTS: [WindowsRestrictingSidConstraint; 2] 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsPrivateGraphicalAuthority {
-    LogonSessionGenericAll,
-    RestrictedCodeGenericAll,
+    LocalSystem,
+    LogonSession,
+    RestrictedCode,
 }
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 2] = [
-    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+const WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 3] = [
+    WindowsPrivateGraphicalAuthority::LocalSystem,
+    WindowsPrivateGraphicalAuthority::RestrictedCode,
+    WindowsPrivateGraphicalAuthority::LogonSession,
 ];
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_DESKTOP_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 2] = [
-    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+const WINDOWS_PRIVATE_DESKTOP_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 3] = [
+    WindowsPrivateGraphicalAuthority::LocalSystem,
+    WindowsPrivateGraphicalAuthority::RestrictedCode,
+    WindowsPrivateGraphicalAuthority::LogonSession,
 ];
 
 #[cfg(any(windows, test))]
@@ -3141,8 +3146,8 @@ struct WindowsPrivateGraphicalSessionSpec {
     desktop_name: String,
     startup_binding: String,
     inherit_handle: bool,
-    window_station_authorities: [WindowsPrivateGraphicalAuthority; 2],
-    desktop_authorities: [WindowsPrivateGraphicalAuthority; 2],
+    window_station_authorities: [WindowsPrivateGraphicalAuthority; 3],
+    desktop_authorities: [WindowsPrivateGraphicalAuthority; 3],
 }
 
 #[cfg(any(windows, test))]
@@ -3189,13 +3194,15 @@ fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
 fn windows_private_graphical_acl(
     logon_sid: firehazard::sid::Ptr<'_>,
     restricted_sid: firehazard::sid::Ptr<'_>,
-    authorities: [WindowsPrivateGraphicalAuthority; 2],
+    local_system_sid: firehazard::sid::Ptr<'_>,
+    authorities: [WindowsPrivateGraphicalAuthority; 3],
 ) -> std::io::Result<firehazard::acl::Builder> {
     let mut acl = firehazard::acl::Builder::new(firehazard::acl::REVISION);
     for authority in authorities {
         let sid = match authority {
-            WindowsPrivateGraphicalAuthority::LogonSessionGenericAll => logon_sid,
-            WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll => restricted_sid,
+            WindowsPrivateGraphicalAuthority::LogonSession => logon_sid,
+            WindowsPrivateGraphicalAuthority::RestrictedCode => restricted_sid,
+            WindowsPrivateGraphicalAuthority::LocalSystem => local_system_sid,
         };
         acl.add_access_allowed_ace(
             firehazard::acl::REVISION,
@@ -3211,13 +3218,20 @@ fn windows_private_graphical_acl(
 fn windows_private_graphical_authority_contract(
     authorities: &[WindowsPrivateGraphicalAuthority],
 ) -> std::io::Result<()> {
-    if authorities.contains(&WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll)
-        && authorities.contains(&WindowsPrivateGraphicalAuthority::LogonSessionGenericAll)
+    let expected = [
+        WindowsPrivateGraphicalAuthority::LocalSystem,
+        WindowsPrivateGraphicalAuthority::RestrictedCode,
+        WindowsPrivateGraphicalAuthority::LogonSession,
+    ];
+    if authorities.len() == expected.len()
+        && expected
+            .iter()
+            .all(|authority| authorities.contains(authority))
     {
         Ok(())
     } else {
         Err(std::io::Error::other(
-            "private graphical objects must grant both restricting SIDs GENERIC_ALL",
+            "private graphical objects must grant LocalSystem and both restricting SIDs GENERIC_ALL",
         ))
     }
 }
@@ -3226,6 +3240,7 @@ fn windows_private_graphical_authority_contract(
 fn create_windows_private_graphical_session(
     logon_sid: firehazard::sid::Ptr<'_>,
     restricted_sid: firehazard::sid::Ptr<'_>,
+    local_system_sid: firehazard::sid::Ptr<'_>,
 ) -> std::io::Result<(
     firehazard::winsta::OwnedHandle,
     firehazard::desktop::OwnedHandle,
@@ -3239,8 +3254,12 @@ fn create_windows_private_graphical_session(
     windows_private_graphical_authority_contract(&spec.window_station_authorities)?;
     windows_private_graphical_authority_contract(&spec.desktop_authorities)?;
 
-    let station_acl =
-        windows_private_graphical_acl(logon_sid, restricted_sid, spec.window_station_authorities)?;
+    let station_acl = windows_private_graphical_acl(
+        logon_sid,
+        restricted_sid,
+        local_system_sid,
+        spec.window_station_authorities,
+    )?;
     let station_descriptor = firehazard::security::DescriptorBuilder::new()
         .dacl(true, Some(station_acl.as_acl_ptr()), false)?
         .finish();
@@ -3265,8 +3284,12 @@ fn create_windows_private_graphical_session(
 
     let original_station = firehazard::open_process_window_station()?;
     firehazard::set_process_window_station(&station)?;
-    let desktop_acl =
-        windows_private_graphical_acl(logon_sid, restricted_sid, spec.desktop_authorities)?;
+    let desktop_acl = windows_private_graphical_acl(
+        logon_sid,
+        restricted_sid,
+        local_system_sid,
+        spec.desktop_authorities,
+    )?;
     let desktop_descriptor = firehazard::security::DescriptorBuilder::new()
         .dacl(true, Some(desktop_acl.as_acl_ptr()), false)?
         .finish();
@@ -3351,6 +3374,8 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         firehazard::token::ALL_ACCESS,
     )?;
     let restricted_sid = firehazard::convert_string_sid_to_sid_w(widestring::u16cstr!("S-1-5-12"))?;
+    let local_system_sid =
+        firehazard::convert_string_sid_to_sid_w(widestring::u16cstr!("S-1-5-18"))?;
     let logon_groups = process_token.logon_sid()?;
     let [logon_group] = logon_groups.groups() else {
         return Err(std::io::Error::other(
@@ -3359,10 +3384,11 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     };
     // WRITE_RESTRICTED applies this second SID set only to writes. Restricted
     // Code binds the explicitly prepared filesystem DACLs, while both restricting
-    // SIDs bind only the ephemeral private station and desktop. Cargo imports
-    // USER32 and COM DLLs whose initialization can write those graphical objects
-    // before Rust entry, and a write check grants access only when every
-    // restricting SID is admitted.
+    // SIDs bind the ephemeral private station and desktop. Cargo imports USER32
+    // and COM DLLs whose initialization writes those graphical objects before
+    // Rust entry, and a write check grants access only when every restricting
+    // SID is admitted. CSRSS owns graphical-object setup in the LocalSystem
+    // account, so it must retain authority on the same private objects.
     let restricted = WINDOWS_RESTRICTING_SID_CONSTRAINTS.map(|constraint| match constraint {
         WindowsRestrictingSidConstraint::RestrictedCode => {
             firehazard::sid::AndAttributes::new(&restricted_sid, ())
@@ -3390,7 +3416,11 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     firehazard::set_information_job_object(&job, limits)?;
 
     let (private_window_station, private_desktop, private_desktop_name) =
-        create_windows_private_graphical_session(logon_group.sid, restricted_sid.as_sid_ptr())?;
+        create_windows_private_graphical_session(
+            logon_group.sid,
+            restricted_sid.as_sid_ptr(),
+            local_system_sid.as_sid_ptr(),
+        )?;
     let desktop_name =
         abistr::CStrNonNull::<u16>::from_units_with_nul(private_desktop_name.as_slice_with_nul())
             .map_err(|error| {
@@ -4691,15 +4721,17 @@ mod tests {
         assert_eq!(
             WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES,
             [
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::LogonSession,
             ]
         );
         assert_eq!(
             WINDOWS_PRIVATE_DESKTOP_AUTHORITIES,
             [
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::LogonSession,
             ]
         );
     }
@@ -4725,15 +4757,17 @@ mod tests {
             assert_eq!(
                 spec.window_station_authorities,
                 [
-                    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                    WindowsPrivateGraphicalAuthority::LocalSystem,
+                    WindowsPrivateGraphicalAuthority::RestrictedCode,
+                    WindowsPrivateGraphicalAuthority::LogonSession,
                 ]
             );
             assert_eq!(
                 spec.desktop_authorities,
                 [
-                    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                    WindowsPrivateGraphicalAuthority::LocalSystem,
+                    WindowsPrivateGraphicalAuthority::RestrictedCode,
+                    WindowsPrivateGraphicalAuthority::LogonSession,
                 ]
             );
             assert!(
@@ -4753,24 +4787,33 @@ mod tests {
     fn windows_private_graphical_authorities_are_order_insensitive_but_exact() {
         for authorities in [
             [
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::LogonSession,
             ],
             [
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSession,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+            ],
+            [
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::LogonSession,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
             ],
         ] {
             assert!(windows_private_graphical_authority_contract(&authorities).is_ok());
         }
         for authorities in [
             [
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
-                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::RestrictedCode,
+                WindowsPrivateGraphicalAuthority::LogonSession,
             ],
             [
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
-                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSession,
+                WindowsPrivateGraphicalAuthority::LocalSystem,
+                WindowsPrivateGraphicalAuthority::LogonSession,
             ],
         ] {
             assert!(windows_private_graphical_authority_contract(&authorities).is_err());
@@ -5352,6 +5395,32 @@ mod tests {
         );
         fs::remove_file(&llvm_ar).unwrap();
         fs::remove_dir(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_archive_preflight_uses_bound_authority_and_combined_feature_argv() {
+        let adapter_root = Path::new("/adapter");
+        let authority = adapter_root.join(".authority");
+        let work = adapter_root.join(".stack-work");
+        let probe = native_archive_feature_probe(&authority.join("llvm-ar"), &work);
+
+        assert_eq!(
+            probe.program,
+            authority.join("llvm-ar").into_os_string(),
+            "preflight must execute the frozen authority binding"
+        );
+        assert_eq!(
+            probe.arguments,
+            [
+                OsString::from("qL"),
+                OsString::from("outer.a"),
+                OsString::from("@response.rsp")
+            ],
+            "preflight must exercise flattening and response files in one bound invocation"
+        );
+        assert_eq!(probe.current_directory.as_deref(), Some(work.as_path()));
+        assert_eq!(probe.timeout, Duration::from_secs(30));
     }
 
     #[test]

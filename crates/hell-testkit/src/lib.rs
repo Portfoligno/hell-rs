@@ -9247,9 +9247,24 @@ pub(crate) struct RuntimeFailurePresentationAuthority {
     pub builtin_name: &'static str,
     pub dimension: CompatibilityDimension,
     pub obligation: &'static str,
-    pub allow_while_handling: bool,
+    pub while_handling: RuntimeFailureHandlingProjection,
     oracle_frame_functions: &'static [&'static str],
+    oracle_frame_layout: RuntimeFailureOracleFrameLayout,
     candidate_frame_functions: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeFailureHandlingProjection {
+    None,
+    Payload,
+    Prefix(&'static str),
+    AfterPathPrefix(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeFailureOracleFrameLayout {
+    Ghc,
+    Frameless,
 }
 
 #[derive(Clone, Copy)]
@@ -9258,8 +9273,9 @@ struct RuntimeFailurePresentationSpec {
     builtin: &'static str,
     dimension: CompatibilityDimension,
     obligation: &'static str,
-    allow_while_handling: bool,
+    while_handling: RuntimeFailureHandlingProjection,
     oracle_frame_functions: &'static [&'static str],
+    oracle_frame_layout: RuntimeFailureOracleFrameLayout,
     candidate_frame_functions: &'static [&'static str],
 }
 
@@ -10529,41 +10545,100 @@ pub fn compare_case_observations(
 fn runtime_failure_presentation_spec(id: &str) -> Option<RuntimeFailurePresentationSpec> {
     use CompatibilityDimension::Effects;
     use RuntimeFailureExceptionFamily::{ErrorCall, IOException, UnicodeException};
-    let (family, builtin, dimension, obligation, allow_while_handling) =
+    let (family, builtin, dimension, obligation, while_handling) =
         if let Some((builtin, dimension, obligation)) = unicode_failure_target(id) {
-            (UnicodeException, builtin, dimension, obligation, false)
+            (
+                UnicodeException,
+                builtin,
+                dimension,
+                obligation,
+                RuntimeFailureHandlingProjection::None,
+            )
         } else if let Some(builtin) = io_exception_failure_builtin(id) {
-            (IOException, builtin, Effects, "effect-failure", false)
+            (
+                IOException,
+                builtin,
+                Effects,
+                "effect-failure",
+                io_exception_handling_projection(id),
+            )
         } else {
             let (builtin, dimension, obligation, handling) = error_call_failure_target(id)?;
-            (ErrorCall, builtin, dimension, obligation, handling)
+            let while_handling = if handling {
+                RuntimeFailureHandlingProjection::Payload
+            } else {
+                RuntimeFailureHandlingProjection::None
+            };
+            (ErrorCall, builtin, dimension, obligation, while_handling)
         };
     let (oracle_frame_functions, candidate_frame_functions): (
         &'static [&'static str],
         &'static [&'static str],
     ) = match (family, id) {
-        (UnicodeException | IOException, _) => (&["throwIO"], &[]),
+        (UnicodeException, _) => (&["throwIO"], &[]),
+        (
+            IOException,
+            "text-getline-boundary-empty-input" | "runtime-environment-get-env-missing",
+        ) => (&["ioException"], &[]),
+        (IOException, _) => (&["ioError"], &[]),
         (
             ErrorCall,
             "runtime-typed-map-singleton-key-strict"
             | "runtime-typed-set-singleton-element-strict"
             | "list-take-boundary-bottom-after-demanded-prefix"
             | "runtime-interaction-list-laziness-error",
-        ) => (&["throwIO", "error"], &["error"]),
+        ) => (&["throwIO"], &["error"]),
         (ErrorCall, "list-cycle-boundary-empty-input") => {
-            (&["throwIO", "error"], &["error", "errorEmptyList", "cycle"])
+            (&["throwIO"], &["error", "errorEmptyList", "cycle"])
+        }
+        (ErrorCall, "runtime-temp-directory-failure" | "runtime-temp-file-failure") => {
+            (&["bracket"], &["error"])
         }
         (ErrorCall, _) => (&["error"], &["error"]),
+    };
+    let oracle_frame_layout = if family == IOException
+        && matches!(
+            id,
+            "runtime-directory-copy-file-failure"
+                | "runtime-directory-get-file-size-failure"
+                | "runtime-directory-rename-file-failure"
+                | "runtime-directory-list-directory-failure"
+        ) {
+        RuntimeFailureOracleFrameLayout::Frameless
+    } else {
+        RuntimeFailureOracleFrameLayout::Ghc
     };
     Some(RuntimeFailurePresentationSpec {
         family,
         builtin,
         dimension,
         obligation,
-        allow_while_handling,
+        while_handling,
         oracle_frame_functions,
+        oracle_frame_layout,
         candidate_frame_functions,
     })
+}
+
+fn io_exception_handling_projection(id: &str) -> RuntimeFailureHandlingProjection {
+    if id.starts_with("runtime-typed-io-bytestring-readprocess") {
+        return RuntimeFailureHandlingProjection::Prefix("missing-hell-test-helper: ");
+    }
+    match id {
+        "runtime-directory-copy-file-failure" => {
+            RuntimeFailureHandlingProjection::AfterPathPrefix("copyFile:")
+        }
+        "runtime-directory-get-file-size-failure" => {
+            RuntimeFailureHandlingProjection::AfterPathPrefix("getFileSize:")
+        }
+        "runtime-directory-rename-file-failure" => {
+            RuntimeFailureHandlingProjection::Prefix("renameFile:")
+        }
+        "runtime-directory-list-directory-failure" => {
+            RuntimeFailureHandlingProjection::AfterPathPrefix("getDirectoryContents:")
+        }
+        _ => RuntimeFailureHandlingProjection::None,
+    }
 }
 
 fn unicode_failure_target(
@@ -10701,7 +10776,6 @@ pub(crate) fn reviewed_runtime_failure_presentation_authority(
             && target.causal_signal != CausalSignal::ForceTrace)
         || (matches!(spec.obligation, "result-force-failure" | "lazy-boundary")
             && target.causal_signal != CausalSignal::RuntimeAdapterAndForceTrace)
-        || (spec.allow_while_handling && spec.family != RuntimeFailureExceptionFamily::ErrorCall)
     {
         return None;
     }
@@ -10712,8 +10786,9 @@ pub(crate) fn reviewed_runtime_failure_presentation_authority(
         builtin_name: spec.builtin,
         dimension: spec.dimension,
         obligation: spec.obligation,
-        allow_while_handling: spec.allow_while_handling,
+        while_handling: spec.while_handling,
         oracle_frame_functions: spec.oracle_frame_functions,
+        oracle_frame_layout: spec.oracle_frame_layout,
         candidate_frame_functions: spec.candidate_frame_functions,
     })
 }
@@ -11073,6 +11148,29 @@ fn ghc_backtrace_frame_has_exact_origin(
                 .starts_with("libraries/ghc-internal/src/GHC/Internal/")
                 && frame.module.starts_with("ghc-internal:GHC.Internal.")
         }
+        "ioError" => {
+            (frame.location == "libraries/ghc-internal/src/GHC/Internal/Foreign/C/Error.hs:291:5"
+                && frame.module.starts_with("ghc-internal:GHC.Internal."))
+                || (frame.location == "libraries/process/System/Process/Common.hs:240:16"
+                    && frame.module.starts_with("process-"))
+                || (frame.location == "libraries/unix/System/Posix/PosixPath/FilePath.hsc:102:5"
+                    && frame.module.starts_with("unix-"))
+                || (frame.location == "libraries/directory/System/Directory/OsPath.hs:320:43"
+                    && frame.module.starts_with("directory-"))
+        }
+        "ioException" => {
+            matches!(
+                frame.location,
+                "libraries/ghc-internal/src/GHC/Internal/IO/Handle/Internals.hs:353:11"
+                    | "libraries/ghc-internal/src/GHC/Internal/System/Environment.hs:192:26"
+            ) && frame.module.starts_with("ghc-internal:GHC.Internal.")
+        }
+        "bracket" => {
+            matches!(
+                frame.location,
+                "./System/IO/Temp.hs:100:3" | "./System/IO/Temp.hs:114:3"
+            ) && frame.module.ends_with(":System.IO.Temp")
+        }
         "error"
             if authority
                 .candidate_frame_functions
@@ -11142,15 +11240,80 @@ const fn oracle_frame_rejection(
     }
 }
 
+fn after_path_handling_matches(payload: &str, handling: &str, prefix: &str) -> bool {
+    let Some((path, operation)) = payload.split_once(": ") else {
+        return false;
+    };
+    let Some(operation_without_prefix) = operation.strip_prefix(prefix) else {
+        return false;
+    };
+    handling.len() == path.len() + 2 + operation_without_prefix.len()
+        && handling.starts_with(path)
+        && handling.as_bytes().get(path.len()) == Some(&b':')
+        && handling.as_bytes().get(path.len() + 1) == Some(&b' ')
+        && handling.ends_with(operation_without_prefix)
+}
+
+fn oracle_framed_payload_result(
+    authority: RuntimeFailurePresentationAuthority,
+    framed_payload: &str,
+) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
+    use RuntimeFailureProjectionRejectionReason::{
+        OracleFrameGrammar, OraclePayloadHandlingMismatch, OraclePayloadHandlingMissing,
+        OraclePayloadUnexpectedHandling,
+    };
+    const HANDLING_MARKER: &str = "\n\nWhile handling ";
+
+    match authority.while_handling {
+        RuntimeFailureHandlingProjection::None => {
+            if framed_payload.contains(HANDLING_MARKER) {
+                return Err(OraclePayloadUnexpectedHandling);
+            }
+            if authority.oracle_frame_layout == RuntimeFailureOracleFrameLayout::Frameless {
+                framed_payload.strip_suffix('\n').ok_or(OracleFrameGrammar)
+            } else {
+                Ok(framed_payload)
+            }
+        }
+        projection => {
+            let (payload, handling) = framed_payload
+                .split_once(HANDLING_MARKER)
+                .ok_or(OraclePayloadHandlingMissing)?;
+            let handling =
+                if authority.oracle_frame_layout == RuntimeFailureOracleFrameLayout::Frameless {
+                    handling.strip_suffix('\n').ok_or(OracleFrameGrammar)?
+                } else {
+                    handling
+                };
+            let handling_matches = match projection {
+                RuntimeFailureHandlingProjection::Payload => handling == payload,
+                RuntimeFailureHandlingProjection::Prefix(prefix) => payload
+                    .strip_prefix(prefix)
+                    .is_some_and(|expected_handling| expected_handling == handling),
+                RuntimeFailureHandlingProjection::AfterPathPrefix(prefix) => {
+                    after_path_handling_matches(payload, handling, prefix)
+                }
+                RuntimeFailureHandlingProjection::None => {
+                    unreachable!("the outer match established that oracle handling is projected")
+                }
+            };
+            if !handling_matches {
+                return Err(OraclePayloadHandlingMismatch);
+            }
+            Ok(payload)
+        }
+    }
+}
+
 fn oracle_exception_payload_result(
     authority: RuntimeFailurePresentationAuthority,
     stderr: &[u8],
 ) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
     use RuntimeFailureProjectionRejectionReason::{
         OracleExceptionFamily, OracleFrameGrammar, OracleParserStage, OraclePayloadControl,
-        OraclePayloadEmpty, OraclePayloadHandlingMismatch, OraclePayloadHandlingMissing,
-        OraclePayloadMultiline, OraclePayloadUnexpectedHandling,
+        OraclePayloadEmpty, OraclePayloadMultiline,
     };
+    const BACKTRACE_MARKER: &str = "\n\nHasCallStack backtrace:\n";
 
     let stderr = std::str::from_utf8(stderr).map_err(|_| OracleParserStage)?;
     let body = stderr
@@ -11178,23 +11341,25 @@ fn oracle_exception_payload_result(
             .strip_prefix("ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n")
             .ok_or(OracleExceptionFamily)?,
     };
-    let (framed_payload, frames) = body
-        .split_once("\n\nHasCallStack backtrace:\n")
-        .ok_or(OracleFrameGrammar)?;
-    let payload = if authority.allow_while_handling {
-        let (payload, handling) = framed_payload
-            .split_once("\n\nWhile handling ")
-            .ok_or(OraclePayloadHandlingMissing)?;
-        if handling != payload {
-            return Err(OraclePayloadHandlingMismatch);
+    // The upstream uncaught-exception renderer emits a blank line after its
+    // final frame (or handling clause). Remove exactly that renderer newline;
+    // frame and handling parsers below retain and enforce the payload newline.
+    let body = body.strip_suffix('\n').ok_or(OracleFrameGrammar)?;
+    let (framed_payload, frames) = match authority.oracle_frame_layout {
+        RuntimeFailureOracleFrameLayout::Ghc => {
+            let (framed_payload, frames) = body
+                .split_once(BACKTRACE_MARKER)
+                .ok_or(OracleFrameGrammar)?;
+            (framed_payload, Some(frames))
         }
-        payload
-    } else {
-        if framed_payload.contains("\n\nWhile handling ") {
-            return Err(OraclePayloadUnexpectedHandling);
+        RuntimeFailureOracleFrameLayout::Frameless => {
+            if body.contains(BACKTRACE_MARKER) {
+                return Err(OracleFrameGrammar);
+            }
+            (body, None)
         }
-        framed_payload
     };
+    let payload = oracle_framed_payload_result(authority, framed_payload)?;
     if payload.is_empty() {
         return Err(OraclePayloadEmpty);
     }
@@ -11204,8 +11369,10 @@ fn oracle_exception_payload_result(
     if payload.chars().any(char::is_control) {
         return Err(OraclePayloadControl);
     }
-    exact_ghc_backtrace_result(authority, frames, authority.oracle_frame_functions)
-        .map_err(oracle_frame_rejection)?;
+    if let Some(frames) = frames {
+        exact_ghc_backtrace_result(authority, frames, authority.oracle_frame_functions)
+            .map_err(oracle_frame_rejection)?;
+    }
     Ok(payload)
 }
 
@@ -11313,7 +11480,7 @@ mod runtime_failure_presentation_tests {
             concat!(
                 "hell: Uncaught exception ",
                 "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
-                "{}\n\nHasCallStack backtrace:\n{}",
+                "{}\n\nHasCallStack backtrace:\n{}\n",
             ),
             payload, frames,
         )
@@ -11351,8 +11518,8 @@ mod runtime_failure_presentation_tests {
 
         let authority = authority("runtime-typed-io-text-writefile-failure");
         let frame = concat!(
-            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
-            "in ghc-internal:GHC.Internal.IO\n",
+            "  ioError, called at libraries/ghc-internal/src/GHC/Internal/Foreign/C/Error.hs:291:5 ",
+            "in ghc-internal:GHC.Internal.Foreign.C.Error\n",
         );
         let oracle = io_oracle("reviewed", frame);
         assert!(oracle_exception_payload_result(authority, oracle.as_bytes()).is_ok());
@@ -11366,15 +11533,23 @@ mod runtime_failure_presentation_tests {
             oracle.strip_suffix('\n').expect("terminal newline"),
             OracleFrameTerminalNewline,
         );
-        assert_oracle_rejection(authority, &format!("{oracle}{frame}"), OracleFrameCount);
         assert_oracle_rejection(
             authority,
-            &oracle.replace("  throwIO, called at", "  injected, called at"),
+            &format!(
+                "{}{}\n",
+                oracle.strip_suffix('\n').expect("renderer newline"),
+                frame
+            ),
+            OracleFrameCount,
+        );
+        assert_oracle_rejection(
+            authority,
+            &oracle.replace("  ioError, called at", "  injected, called at"),
             OracleFrameFunction,
         );
         assert_oracle_rejection(
             authority,
-            &oracle.replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs"),
+            &oracle.replace("GHC/Internal/Foreign/C/Error.hs", "Unrelated/Injected.hs"),
             OracleFrameOrigin,
         );
     }
@@ -11431,8 +11606,8 @@ mod runtime_failure_presentation_tests {
             "ghc-internal:GHC.Internal.IO.Exception.IOException:\n\n",
             "missing-parent/file.txt: withBinaryFile: does not exist\n\n",
             "HasCallStack backtrace:\n",
-            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
-            "in ghc-internal:GHC.Internal.IO\n",
+            "  ioError, called at libraries/ghc-internal/src/GHC/Internal/Foreign/C/Error.hs:291:5 ",
+            "in ghc-internal:GHC.Internal.Foreign.C.Error\n\n",
         );
         let candidate = "hell: missing-parent/file.txt: withBinaryFile: does not exist\n";
         assert!(
@@ -11459,7 +11634,7 @@ mod runtime_failure_presentation_tests {
             oracle_exception_payload_result(
                 authority,
                 oracle
-                    .replace("  throwIO, called at", "  injected, called at")
+                    .replace("  ioError, called at", "  injected, called at")
                     .as_bytes(),
             ),
             Err(RuntimeFailureProjectionRejectionReason::OracleFrameFunction),
@@ -11480,14 +11655,14 @@ mod runtime_failure_presentation_tests {
             oracle.replacen("hell:", "other:", 1),
             oracle.replacen("IOException:\n\n", "IOException:\n", 1),
             oracle.replace(
-                "  throwIO, called at",
+                "  ioError, called at",
                 concat!(
-                    "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO.hs:1:1 ",
-                    "in ghc-internal:GHC.Internal.IO\n",
-                    "  throwIO, called at",
+                    "  ioError, called at libraries/ghc-internal/src/GHC/Internal/Foreign/C/Error.hs:291:5 ",
+                    "in ghc-internal:GHC.Internal.Foreign.C.Error\n",
+                    "  ioError, called at",
                 ),
             ),
-            oracle.replace("GHC/Internal/IO.hs", "Unrelated/Injected.hs"),
+            oracle.replace("GHC/Internal/Foreign/C/Error.hs", "Unrelated/Injected.hs"),
             format!("{oracle}contamination\n"),
         ] {
             assert!(
@@ -11516,9 +11691,8 @@ mod runtime_failure_presentation_tests {
         let strict_oracle = concat!(
             "hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n",
             "singleton key forced\n\nHasCallStack backtrace:\n",
-            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/Exception.hs:1:1 ",
-            "in ghc-internal:GHC.Internal.Exception\n",
-            "  error, called at src/Hell.hs:1953:4 in oracle-unit:Main\n",
+            "  throwIO, called at libraries/ghc-internal/src/GHC/Internal/IO/Handle/Internals.hs:195:13 ",
+            "in ghc-internal:GHC.Internal.IO.Handle.Internals\n\n",
         );
         let strict_candidate = concat!(
             "hell: singleton key forced\nCallStack (from HasCallStack):\n",
@@ -11537,7 +11711,8 @@ mod runtime_failure_presentation_tests {
         let temp_oracle = concat!(
             "hell: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:\n\n",
             "reviewed\n\nWhile handling reviewed\n\nHasCallStack backtrace:\n",
-            "  error, called at src/Hell.hs:1953:4 in oracle-unit:Main\n",
+            "  bracket, called at ./System/IO/Temp.hs:114:3 ",
+            "in temporary-1.3-J41jdMVG6l2EtxMrdNnhIO:System.IO.Temp\n\n",
         );
         let temp_candidate = concat!(
             "hell: reviewed\nCallStack (from HasCallStack):\n",
