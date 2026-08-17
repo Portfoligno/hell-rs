@@ -111,7 +111,7 @@ fn compiled_cargo_probe_handles_versions_and_records_exact_bounded_argv() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
@@ -245,12 +245,15 @@ mod linux {
         let invocations =
             hell_testkit::read_cargo_probe_invocations(&helper).expect("bounded Cargo probe log");
         assert!(!invocations.is_empty());
-        assert!(invocations.iter().all(|invocation| {
-            invocation
-                .first()
-                .is_some_and(|argument| argument == "fetch")
-                && invocation.iter().any(|argument| argument == "--frozen")
-        }));
+        let exact_fetch = vec![
+            OsString::from("fetch"),
+            OsString::from("--manifest-path"),
+            root.join("Cargo.toml").into_os_string(),
+            OsString::from("--frozen"),
+            OsString::from("--locked"),
+            OsString::from("--offline"),
+        ];
+        assert!(invocations.contains(&exact_fetch), "{invocations:?}");
         assert!(
             invocations
                 .iter()

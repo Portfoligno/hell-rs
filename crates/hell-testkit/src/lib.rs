@@ -88,6 +88,7 @@ pub const POSIX_CANDIDATE_GROUP_LIMIT: usize = 128;
 /// Exact POSIX child environment names accepted by the trusted adapter.
 #[cfg(unix)]
 pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "CARGO",
     "CARGO_HOME",
     "CARGO_INCREMENTAL",
     "CARGO_TARGET_DIR",
@@ -1969,6 +1970,7 @@ impl CandidateLaunchPolicy {
                 .then(|| self.cargo_authority.child_tool_path(&self.cargo_adapter))
                 .transpose()?
                 .as_deref(),
+            uses_staged_cargo_tools.then_some(self.cargo_adapter.as_path()),
             staged_cargo_deny
                 .as_ref()
                 .map(|(_, cargo_home, _)| cargo_home.as_path()),
@@ -2186,6 +2188,7 @@ fn posix_release_child_environment(
     environment: impl IntoIterator<Item = (OsString, Option<OsString>)>,
     rustup_authority: Option<&BoundPosixRustupAuthority>,
     child_tool_path: Option<&Path>,
+    bound_cargo: Option<&Path>,
     cargo_home: Option<&Path>,
 ) -> std::io::Result<BTreeMap<OsString, OsString>> {
     let mut encoded = BTreeMap::new();
@@ -2215,6 +2218,9 @@ fn posix_release_child_environment(
             OsString::from("RUSTUP_TOOLCHAIN"),
             authority.toolchain.clone(),
         );
+    }
+    if let Some(bound_cargo) = bound_cargo {
+        encoded.insert(OsString::from("CARGO"), bound_cargo.as_os_str().to_owned());
     }
     if let Some(cargo_home) = cargo_home {
         encoded.insert(
@@ -2795,7 +2801,10 @@ fn posix_candidate_cargo_cache_inventory(
         }
         let mode = metadata.permissions().mode() & 0o7777;
         let expected_mode = match (is_lock, is_advisory_root) {
-            (true, _) => 0o600,
+            // The empty lock is synchronization state shared across the
+            // candidate/trusted-group boundary; its database payloads stay
+            // immutable beneath the advisory root.
+            (true, _) => 0o660,
             (_, true) => 0o750,
             (_, _) if directory => 0o555,
             (_, _) => 0o444,
@@ -4779,7 +4788,7 @@ mod candidate_launch_policy_tests {
         fs::create_dir(&advisory_root).unwrap();
         let advisory_lock = advisory_root.join("db.lock");
         fs::write(&advisory_lock, b"").unwrap();
-        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o660)).unwrap();
         // cargo-deny opens db.lock with read+write+create semantics, so the
         // advisory root itself must stay candidate-writable for lock creation
         // while every advisory database below it remains read-only.
@@ -4954,7 +4963,7 @@ mod candidate_launch_policy_tests {
         bound.revalidate().unwrap();
         fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(bound.revalidate().is_err());
-        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&advisory_lock, fs::Permissions::from_mode(0o660)).unwrap();
         bound.revalidate().unwrap();
         let advisory_root = advisory_lock.parent().unwrap();
         let original_lock = advisory_root.join("original-db.lock");
@@ -5021,6 +5030,12 @@ mod candidate_launch_policy_tests {
                 .get(OsStr::new("CARGO_HOME"))
                 .map(OsString::as_os_str),
             Some(bound.cargo_home.as_os_str())
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("CARGO"))
+                .map(OsString::as_os_str),
+            Some(native_cargo.as_os_str())
         );
         assert_eq!(
             environment

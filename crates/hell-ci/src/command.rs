@@ -2117,7 +2117,7 @@ fn windows_parent_prelaunch_diagnostic(target_arguments: &[OsString]) -> String 
         .map(|value| bounded_windows_prelaunch_value(value.as_os_str()))
         .unwrap_or_else(|error| format!("<unavailable:{error}>"));
     format!(
-        "restricted Windows target prelaunch evidence: program={},imports={imports},SystemRoot={system_root},PATH={path},cwd={cwd},graphicalBinding=inherited-default",
+        "restricted Windows target prelaunch evidence: program={},graphicalBinding=inherited-default,imports={imports},SystemRoot={system_root},PATH={path},cwd={cwd}",
         bounded_windows_prelaunch_value(program),
     )
 }
@@ -2663,6 +2663,52 @@ fn validate_native_archive_response(
 }
 
 #[cfg(unix)]
+fn native_archive_configure_probe(
+    arguments: &[OsString],
+    current_directory: &Path,
+) -> Option<std::io::Result<Vec<OsString>>> {
+    if arguments
+        != [
+            OsStr::new("clqs"),
+            OsStr::new("conftest.a"),
+            OsStr::new("conftest.o"),
+        ]
+    {
+        return None;
+    }
+    let configure = current_directory.join("configure");
+    let member = current_directory.join("conftest.o");
+    let archive = current_directory.join("conftest.a");
+    let regular_real_file = |path: &Path| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+    };
+    if !regular_real_file(&configure) || !regular_real_file(&member) {
+        return Some(Err(std::io::Error::other(
+            "GHC configure archive probe fixture is not a regular real file",
+        )));
+    }
+    match fs::symlink_metadata(&archive) {
+        Ok(_) => {
+            return Some(Err(std::io::Error::other(
+                "GHC configure archive probe target already exists",
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Some(Err(std::io::Error::other(format!(
+                "cannot inspect GHC configure archive probe target: {error}"
+            ))));
+        }
+    }
+    Some(Ok(vec![
+        OsString::from("qclsL"),
+        archive.into_os_string(),
+        member.into_os_string(),
+    ]))
+}
+
+#[cfg(unix)]
 fn archive_adapter_directory(invoked: &OsStr) -> std::io::Result<PathBuf> {
     let invoked = Path::new(invoked);
     let invoked_parent = invoked
@@ -2749,6 +2795,9 @@ fn normalize_native_archive_arguments(
     let bound_work_directory = fs::canonicalize(&work_directory).map_err(|error| {
         std::io::Error::other(format!("cannot bind archive work directory: {error}"))
     })?;
+    if let Some(probe) = native_archive_configure_probe(arguments, current_directory) {
+        return probe;
+    }
     let mut target_index = 1;
     let (mut saw_symbol_table, mut saw_create_quietly) = (false, false);
     while let Some(argument) = arguments.get(target_index) {
@@ -2836,6 +2885,8 @@ fn normalize_native_archive_arguments(
         Some("-qc") => Some("-qLc"),
         Some("qcls") => Some("qclsL"),
         Some("-qcls") => Some("-qclsL"),
+        Some("clqs") => Some("qclsL"),
+        Some("-clqs") => Some("-qclsL"),
         Some("qL" | "-qL" | "qLc" | "-qLc" | "qcL" | "-qcL" | "qclsL" | "-qclsL") => None,
         Some("t") | Some("-t") => None,
         Some(value) => {
@@ -3085,6 +3136,78 @@ const WINDOWS_RESTRICTED_GRAPHICAL_BINDING: WindowsRestrictedGraphicalBinding =
     WindowsRestrictedGraphicalBinding::InheritedDefault;
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsRestrictedCanaryCommand {
+    executable: &'static str,
+    arguments: &'static [&'static str],
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsRestrictedCanarySpec {
+    subsystem: &'static str,
+    imports: &'static [&'static str],
+    candidates: &'static [WindowsRestrictedCanaryCommand],
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_RESTRICTED_CANARIES: [WindowsRestrictedCanarySpec; 6] = [
+    WindowsRestrictedCanarySpec {
+        subsystem: "baseline",
+        imports: &["kernel32.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "cmd.exe",
+            arguments: &["/d", "/c", "exit", "0"],
+        }],
+    },
+    WindowsRestrictedCanarySpec {
+        subsystem: "user32",
+        imports: &["user32.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "tasklist.exe",
+            arguments: &["/?"],
+        }],
+    },
+    WindowsRestrictedCanarySpec {
+        subsystem: "ole32-combase",
+        imports: &["ole32.dll", "combase.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "powershell.exe",
+            arguments: &["-NoProfile", "-Command", "exit", "0"],
+        }],
+    },
+    WindowsRestrictedCanarySpec {
+        subsystem: "secur32",
+        imports: &["secur32.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "net.exe",
+            arguments: &["helpmsg", "0"],
+        }],
+    },
+    WindowsRestrictedCanarySpec {
+        subsystem: "userenv",
+        imports: &["userenv.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "whoami.exe",
+            arguments: &["/user"],
+        }],
+    },
+    WindowsRestrictedCanarySpec {
+        subsystem: "rpcrt4",
+        imports: &["rpcrt4.dll"],
+        candidates: &[WindowsRestrictedCanaryCommand {
+            executable: "wevtutil.exe",
+            arguments: &["/?"],
+        }],
+    },
+];
+
+// These are diagnostic-only, read-only/help/exit requests. Each executable is
+// selected only after its direct PE imports prove the suspected subsystem, and
+// it then uses the exact restricted token, inherited station, stdio contract,
+// and kill-on-close job as the real argv adapter.
+
+#[cfg(any(windows, test))]
 fn windows_restricted_graphical_binding_contract(
     binding: WindowsRestrictedGraphicalBinding,
 ) -> std::io::Result<()> {
@@ -3156,6 +3279,119 @@ fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
     )
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedWindowsRestrictedCanary {
+    subsystem: &'static str,
+    program: PathBuf,
+    arguments: Vec<&'static str>,
+    imports: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+fn windows_pe_import_contains(imports: &[String], expected: &str) -> bool {
+    imports
+        .iter()
+        .any(|import| import.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(any(windows, test))]
+fn select_windows_restricted_canary(
+    system_root: &Path,
+    spec: &WindowsRestrictedCanarySpec,
+) -> std::io::Result<ResolvedWindowsRestrictedCanary> {
+    for candidate in spec.candidates {
+        let program = system_root.join(candidate.executable);
+        let metadata = match fs::symlink_metadata(&program) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let canonical = fs::canonicalize(&program)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || canonical != program {
+            continue;
+        }
+        let imports = windows_pe_imports(&program).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cannot inspect restricted-token canary: {error}"),
+            )
+        })?;
+        if spec
+            .imports
+            .iter()
+            .any(|expected| windows_pe_import_contains(&imports, expected))
+        {
+            return Ok(ResolvedWindowsRestrictedCanary {
+                subsystem: spec.subsystem,
+                program,
+                arguments: candidate.arguments.to_vec(),
+                imports,
+            });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "no restricted-token canary directly imports {}",
+            spec.imports.join(" or ")
+        ),
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_restricted_target_canary(
+    program: &Path,
+) -> std::io::Result<ResolvedWindowsRestrictedCanary> {
+    let metadata = fs::symlink_metadata(program)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restricted-token target canary is not one direct file",
+        ));
+    }
+    let imports = windows_pe_imports(program).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot inspect restricted-token target canary: {error}"),
+        )
+    })?;
+    Ok(ResolvedWindowsRestrictedCanary {
+        subsystem: "staged-target",
+        program: program.to_path_buf(),
+        arguments: vec!["--version"],
+        imports,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_restricted_canary_diagnostic(
+    canary: &ResolvedWindowsRestrictedCanary,
+    status: u32,
+) -> String {
+    format!(
+        "restricted Windows token canary evidence: subsystem={},program={},imports={:?},status={status} (0x{status:08x})",
+        canary.subsystem,
+        bounded_windows_prelaunch_value(canary.program.as_os_str()),
+        canary.imports,
+    )
+}
+
+#[cfg(windows)]
+fn windows_restricted_canary_command_line(program: &Path, arguments: &[&str]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut command_line = vec![u16::from(b'"')];
+    command_line.extend(program.as_os_str().encode_wide());
+    command_line.push(u16::from(b'"'));
+    for argument in arguments {
+        command_line.push(u16::from(b' '));
+        command_line.extend(argument.encode_utf16());
+    }
+    command_line.push(0);
+    command_line
+}
+
 #[cfg(windows)]
 fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, String)> {
     use std::os::windows::ffi::OsStrExt as _;
@@ -3186,13 +3422,6 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         .chain(target_token.encode_wide())
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let application =
-        widestring::U16CString::from_os_str(launcher.as_os_str()).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("restricted child launcher path contains NUL: {error}"),
-            )
-        })?;
     let process_token = firehazard::open_process_token(
         firehazard::get_current_process(),
         firehazard::token::ALL_ACCESS,
@@ -3239,6 +3468,65 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
 
     windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING)?;
     windows_restricted_stdio_contract(&WINDOWS_RESTRICTED_STDIO_HANDLES)?;
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("SystemRoot is absent"))?
+        .join("System32");
+    let system_root = fs::canonicalize(&system_root)?;
+    let target_program = request
+        .target_arguments
+        .first()
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("restricted target program is absent"))?;
+    if target_program
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(OsStr::new("cargo.exe")))
+    {
+        let target_canary = resolve_windows_restricted_target_canary(&target_program)?;
+        let mut target_canary_command_line = windows_restricted_canary_command_line(
+            &target_canary.program,
+            &target_canary.arguments,
+        );
+        let target_canary_status = windows_create_restricted_process(
+            &token,
+            &job,
+            &target_canary.program,
+            &mut target_canary_command_line,
+        )?;
+        eprintln!(
+            "{}",
+            windows_restricted_canary_diagnostic(&target_canary, target_canary_status)
+        );
+    }
+
+    for spec in WINDOWS_RESTRICTED_CANARIES {
+        let canary = select_windows_restricted_canary(&system_root, &spec)?;
+        let mut command_line =
+            windows_restricted_canary_command_line(&canary.program, canary.arguments);
+        let status =
+            windows_create_restricted_process(&token, &job, &canary.program, &mut command_line)?;
+        eprintln!("{}", windows_restricted_canary_diagnostic(&canary, status));
+    }
+
+    let status = windows_create_restricted_process(&token, &job, &launcher, &mut command_line)?;
+    drop(job);
+    Ok((status, prelaunch_evidence))
+}
+
+#[cfg(windows)]
+fn windows_create_restricted_process(
+    token: &firehazard::token::OwnedHandle,
+    job: &firehazard::job::OwnedHandle,
+    application: &Path,
+    command_line: &mut [u16],
+) -> std::io::Result<u32> {
+    let application =
+        widestring::U16CString::from_os_str(application.as_os_str()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("restricted child path contains NUL: {error}"),
+            )
+        })?;
     let inheritable = firehazard::security::Attributes::new(None, true);
     let (stdin_read, stdin_write) = firehazard::io::create_pipe(Some(&inheritable), 0)?;
     let (stdout_read, stdout_write) = firehazard::io::create_pipe(Some(&inheritable), 0)?;
@@ -3264,9 +3552,9 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         attributes.as_slice(),
     )?);
     let process = firehazard::create_process_as_user_w(
-        &token,
+        token,
         application,
-        Some(&mut command_line),
+        Some(command_line),
         None,
         None,
         true,
@@ -3275,7 +3563,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         (),
         &startup,
     )?;
-    firehazard::assign_process_to_job_object(&job, &process.process)?;
+    firehazard::assign_process_to_job_object(job, &process.process)?;
     drop(startup);
     drop(stdin_read);
     drop(stdin_write);
@@ -3291,14 +3579,13 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     });
     firehazard::thread::resume_thread(&process.thread)?;
     let status = firehazard::process::wait_for_process(&process.process)?;
-    drop(job);
     stdout_relay
         .join()
         .map_err(|_| std::io::Error::other("restricted stdout relay panicked"))??;
     stderr_relay
         .join()
         .map_err(|_| std::io::Error::other("restricted stderr relay panicked"))??;
-    Ok((status, prelaunch_evidence))
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -4545,6 +4832,44 @@ mod tests {
     }
 
     #[test]
+    fn windows_restricted_canaries_bind_isolated_imports_and_report_status() {
+        let root = ResolverDirectory::new("windows-restricted-canary");
+        let program = root.path().join("tasklist.exe");
+        fs::write(&program, minimal_windows_pe_with_import(23, b"USER32.dll")).unwrap();
+        let spec = WINDOWS_RESTRICTED_CANARIES
+            .iter()
+            .find(|spec| spec.subsystem == "user32")
+            .unwrap();
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let resolved = select_windows_restricted_canary(&canonical_root, spec).unwrap();
+        assert_eq!(resolved.program, canonical_root.join("tasklist.exe"));
+        assert_eq!(resolved.imports, ["USER32.dll"]);
+        let diagnostic = windows_restricted_canary_diagnostic(&resolved, 0xc000_0142);
+        assert!(diagnostic.contains("subsystem=user32"));
+        assert!(diagnostic.contains("imports=[\"USER32.dll\"]"));
+        assert!(diagnostic.contains("status=3221225794 (0xc0000142)"));
+        let target = root.path().join("cargo.exe");
+        fs::write(&target, minimal_windows_pe_with_import(24, b"KERNEL32.dll")).unwrap();
+        let target = resolve_windows_restricted_target_canary(&target).unwrap();
+        assert_eq!(target.subsystem, "staged-target");
+        assert_eq!(target.arguments, ["--version"]);
+        assert_eq!(
+            WINDOWS_RESTRICTED_CANARIES
+                .iter()
+                .map(|spec| spec.subsystem)
+                .collect::<Vec<_>>(),
+            [
+                "baseline",
+                "user32",
+                "ole32-combase",
+                "secur32",
+                "userenv",
+                "rpcrt4"
+            ]
+        );
+    }
+
+    #[test]
     fn environment_reporting_never_contains_values() {
         let spec = CommandSpec::new("program", Duration::from_secs(1))
             .environment("RUSTDOCFLAGS", "secret-value");
@@ -4910,6 +5235,103 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn native_archive_adapter_accepts_exact_ghc_configure_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "hell-archive-adapter-ghc-probe-{}-{}",
+            std::process::id(),
+            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join(".stack-work");
+        let configure_root = root.join("ghc-configure");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&configure_root).unwrap();
+        fs::write(configure_root.join("configure"), b"#!/bin/sh\n").unwrap();
+        fs::write(configure_root.join("conftest.o"), b"object\n").unwrap();
+
+        let normalized = normalize_native_archive_arguments(
+            &[
+                OsString::from("clqs"),
+                OsString::from("conftest.a"),
+                OsString::from("conftest.o"),
+            ],
+            &root,
+            &configure_root,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized,
+            [
+                OsString::from("qclsL"),
+                configure_root.join("conftest.a").into_os_string(),
+                configure_root.join("conftest.o").into_os_string(),
+            ]
+        );
+
+        assert_eq!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("q"),
+                    OsString::from("conftest.a"),
+                    OsString::from("conftest.o"),
+                ],
+                &root,
+                &configure_root,
+            )
+            .unwrap_err()
+            .to_string(),
+            "archive adapter target escapes its bound work directory"
+        );
+        assert_eq!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("clqs"),
+                    OsString::from("conftest.a"),
+                    OsString::from("member.o"),
+                ],
+                &root,
+                &configure_root,
+            )
+            .unwrap_err()
+            .to_string(),
+            "archive adapter target escapes its bound work directory"
+        );
+        fs::write(configure_root.join("conftest.a"), b"existing\n").unwrap();
+        assert_eq!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("clqs"),
+                    OsString::from("conftest.a"),
+                    OsString::from("conftest.o"),
+                ],
+                &root,
+                &configure_root,
+            )
+            .unwrap_err()
+            .to_string(),
+            "GHC configure archive probe target already exists"
+        );
+        fs::remove_file(configure_root.join("conftest.a")).unwrap();
+        fs::remove_file(configure_root.join("conftest.o")).unwrap();
+        assert_eq!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("clqs"),
+                    OsString::from("conftest.a"),
+                    OsString::from("conftest.o"),
+                ],
+                &root,
+                &configure_root,
+            )
+            .unwrap_err()
+            .to_string(),
+            "GHC configure archive probe fixture is not a regular real file"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn native_archive_adapter_uses_fixed_flattening_operations() {
         let root = std::env::temp_dir().join(format!(
             "hell-archive-adapter-arguments-{}-{}",
@@ -4932,6 +5354,8 @@ mod tests {
             ("qcls", "qclsL", OsStr::new("archive.a")),
             ("-qcls", "-qclsL", OsStr::new("archive.a")),
             ("qclsL", "qclsL", OsStr::new("archive.a")),
+            ("clqs", "qclsL", OsStr::new("archive.a")),
+            ("-clqs", "-qclsL", OsStr::new("archive.a")),
         ] {
             let normalized = normalize_native_archive_arguments(
                 &[

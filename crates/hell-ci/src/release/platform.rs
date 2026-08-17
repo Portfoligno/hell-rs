@@ -2010,12 +2010,16 @@ fn trusted_cargo_cache_fetch_arguments(
     }
     // cargo-deny 0.20.2 always shells out to exactly this frozen fetch shape
     // while checking, even when `--metadata-path` supplies a pre-captured
-    // document, so the staged home must satisfy it for the hosted target.
+    // document. Keep the redundant explicit flags in their observed order so
+    // the proof exercises the hosted child's argv rather than an equivalent
+    // command that happens to share `--frozen`.
     Ok(vec![
         OsString::from("fetch"),
-        OsString::from("--frozen"),
         OsString::from("--manifest-path"),
         manifest.as_os_str().to_owned(),
+        OsString::from("--frozen"),
+        OsString::from("--locked"),
+        OsString::from("--offline"),
     ])
 }
 
@@ -2704,7 +2708,7 @@ fn validate_posix_cargo_deny_home_post_state(
         || lock_metadata.len() != 0
         || lock_metadata.uid() != candidate_uid
         || lock_metadata.gid() != trusted_group_id
-        || lock_metadata.permissions().mode() & 0o7777 != 0o600
+        || lock_metadata.permissions().mode() & 0o7777 != 0o660
     {
         return Err("final cargo-deny cache identity or permissions differ from policy".to_owned());
     }
@@ -5698,7 +5702,11 @@ fn normalize_cargo_deny_cache_tree(
         fs::set_permissions(
             &path,
             fs::Permissions::from_mode(match (is_lock, is_advisory_root) {
-                (true, _) => 0o600,
+                // The lock is intentionally empty synchronization state. It is
+                // candidate-owned and trusted-group-writable so either side of
+                // the confinement boundary can acquire it, while immutable
+                // advisory payloads remain inaccessible for writes.
+                (true, _) => 0o660,
                 (_, true) => 0o750,
                 (_, _) if file_type.is_dir() => 0o555,
                 (_, _) => 0o444,
@@ -7418,9 +7426,11 @@ mod tests {
             trusted_cargo_cache_fetch_arguments(Path::new("/bound/candidate"), manifest).unwrap(),
             [
                 "fetch".into(),
-                "--frozen".into(),
                 "--manifest-path".into(),
                 manifest.as_os_str().to_owned(),
+                "--frozen".into(),
+                "--locked".into(),
+                "--offline".into(),
             ]
         );
         let cargo_home = Path::new("/private/var/tmp/hell-cargo-seed-1-2");
@@ -8342,8 +8352,28 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o660
         );
+        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                &home,
+                identity.uid(),
+                identity.uid(),
+                identity.gid(),
+                &advisory_lock_authority,
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
+        validate_posix_cargo_deny_home_post_state(
+            &home,
+            identity.uid(),
+            identity.uid(),
+            identity.gid(),
+            &advisory_lock_authority,
+        )
+        .unwrap();
         // cargo-deny 0.20.2 opens db.lock through tame-index with
         // read+write+create semantics, so both reopening the reserved lock and
         // creating a replacement lock in the advisory root must succeed for
@@ -8385,7 +8415,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
 
         std::fs::remove_file(&advisory_lock).unwrap();
         std::fs::write(&advisory_lock, b"replacement\n").unwrap();
-        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
         assert!(
             validate_posix_cargo_deny_home_post_state(
                 &home,
