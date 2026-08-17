@@ -2796,7 +2796,7 @@ fn posix_candidate_cargo_cache_inventory(
         let mode = metadata.permissions().mode() & 0o7777;
         let expected_mode = match (is_lock, is_advisory_root) {
             (true, _) => 0o600,
-            (_, true) => 0o700,
+            (_, true) => 0o750,
             (_, _) if directory => 0o555,
             (_, _) => 0o444,
         };
@@ -4783,7 +4783,7 @@ mod candidate_launch_policy_tests {
         // cargo-deny opens db.lock with read+write+create semantics, so the
         // advisory root itself must stay candidate-writable for lock creation
         // while every advisory database below it remains read-only.
-        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o750)).unwrap();
         fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555)).unwrap();
         for path in [&source, &staged] {
             fs::write(path, b"pinned cargo-deny\n").unwrap();
@@ -4967,7 +4967,7 @@ mod candidate_launch_policy_tests {
         fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_file(&advisory_lock).unwrap();
         fs::rename(&original_lock, &advisory_lock).unwrap();
-        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(advisory_root, fs::Permissions::from_mode(0o750)).unwrap();
         bound.revalidate().unwrap();
         fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(bound.revalidate().is_err());

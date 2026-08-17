@@ -2117,7 +2117,7 @@ fn windows_parent_prelaunch_diagnostic(target_arguments: &[OsString]) -> String 
         .map(|value| bounded_windows_prelaunch_value(value.as_os_str()))
         .unwrap_or_else(|error| format!("<unavailable:{error}>"));
     format!(
-        "restricted Windows target prelaunch evidence: program={},imports={imports},SystemRoot={system_root},PATH={path},cwd={cwd}",
+        "restricted Windows target prelaunch evidence: program={},imports={imports},SystemRoot={system_root},PATH={path},cwd={cwd},graphicalBinding=inherited-default",
         bounded_windows_prelaunch_value(program),
     )
 }
@@ -2705,11 +2705,14 @@ pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process
             .ok_or_else(|| std::io::Error::other("archive adapter argv[0] is missing"))?;
         let directory = archive_adapter_directory(&invoked)?;
         let current_directory = std::env::current_dir()?;
-        let normalized =
-            normalize_native_archive_arguments(arguments, &directory, &current_directory)?;
-        Command::new(directory.join(".authority").join("llvm-ar"))
-            .args(normalized)
-            .status()
+        let bound_llvm_ar = directory.join(".authority").join("llvm-ar");
+        if native_archive_identity_request(arguments) {
+            Command::new(&bound_llvm_ar).arg("--version").status()
+        } else {
+            let normalized =
+                normalize_native_archive_arguments(arguments, &directory, &current_directory)?;
+            Command::new(&bound_llvm_ar).args(normalized).status()
+        }
     })();
     match result {
         Ok(status) => status
@@ -2724,6 +2727,11 @@ pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(unix)]
+fn native_archive_identity_request(arguments: &[OsString]) -> bool {
+    arguments.len() == 1 && arguments[0] == OsStr::new("--version")
 }
 
 #[cfg(unix)]
@@ -3068,25 +3076,22 @@ const WINDOWS_RESTRICTING_SID_CONSTRAINTS: [WindowsRestrictingSidConstraint; 2] 
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsPrivateGraphicalAuthority {
-    LocalSystem,
-    LogonSession,
-    RestrictedCode,
+enum WindowsRestrictedGraphicalBinding {
+    InheritedDefault,
 }
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 3] = [
-    WindowsPrivateGraphicalAuthority::LocalSystem,
-    WindowsPrivateGraphicalAuthority::RestrictedCode,
-    WindowsPrivateGraphicalAuthority::LogonSession,
-];
+const WINDOWS_RESTRICTED_GRAPHICAL_BINDING: WindowsRestrictedGraphicalBinding =
+    WindowsRestrictedGraphicalBinding::InheritedDefault;
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_DESKTOP_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 3] = [
-    WindowsPrivateGraphicalAuthority::LocalSystem,
-    WindowsPrivateGraphicalAuthority::RestrictedCode,
-    WindowsPrivateGraphicalAuthority::LogonSession,
-];
+fn windows_restricted_graphical_binding_contract(
+    binding: WindowsRestrictedGraphicalBinding,
+) -> std::io::Result<()> {
+    match binding {
+        WindowsRestrictedGraphicalBinding::InheritedDefault => Ok(()),
+    }
+}
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3132,45 +3137,6 @@ fn relay_windows_restricted_diagnostic(
     destination.flush()
 }
 
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsPrivateWindowStationCreation {
-    CreateOnly,
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WindowsPrivateGraphicalSessionSpec {
-    window_station_name: String,
-    window_station_creation: WindowsPrivateWindowStationCreation,
-    desktop_name: String,
-    startup_binding: String,
-    inherit_handle: bool,
-    window_station_authorities: [WindowsPrivateGraphicalAuthority; 3],
-    desktop_authorities: [WindowsPrivateGraphicalAuthority; 3],
-}
-
-#[cfg(any(windows, test))]
-fn windows_private_graphical_session_spec(nonce: [u8; 16]) -> WindowsPrivateGraphicalSessionSpec {
-    use std::fmt::Write as _;
-
-    let mut window_station_name = String::from("hell-rs-release-");
-    for byte in nonce {
-        write!(&mut window_station_name, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    let desktop_name = "desktop".to_owned();
-    let startup_binding = format!("{window_station_name}\\{desktop_name}");
-    WindowsPrivateGraphicalSessionSpec {
-        window_station_name,
-        window_station_creation: WindowsPrivateWindowStationCreation::CreateOnly,
-        desktop_name,
-        startup_binding,
-        inherit_handle: false,
-        window_station_authorities: WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES,
-        desktop_authorities: WINDOWS_PRIVATE_DESKTOP_AUTHORITIES,
-    }
-}
-
 #[cfg(windows)]
 fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
     WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS.into_iter().fold(
@@ -3188,148 +3154,6 @@ fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
                 }
         },
     )
-}
-
-#[cfg(windows)]
-fn windows_private_graphical_acl(
-    logon_sid: firehazard::sid::Ptr<'_>,
-    restricted_sid: firehazard::sid::Ptr<'_>,
-    local_system_sid: firehazard::sid::Ptr<'_>,
-    authorities: [WindowsPrivateGraphicalAuthority; 3],
-) -> std::io::Result<firehazard::acl::Builder> {
-    let mut acl = firehazard::acl::Builder::new(firehazard::acl::REVISION);
-    for authority in authorities {
-        let sid = match authority {
-            WindowsPrivateGraphicalAuthority::LogonSession => logon_sid,
-            WindowsPrivateGraphicalAuthority::RestrictedCode => restricted_sid,
-            WindowsPrivateGraphicalAuthority::LocalSystem => local_system_sid,
-        };
-        acl.add_access_allowed_ace(
-            firehazard::acl::REVISION,
-            firehazard::access::GENERIC_ALL.into(),
-            sid,
-        )?;
-    }
-    acl.finish()?;
-    Ok(acl)
-}
-
-#[cfg(any(windows, test))]
-fn windows_private_graphical_authority_contract(
-    authorities: &[WindowsPrivateGraphicalAuthority],
-) -> std::io::Result<()> {
-    let expected = [
-        WindowsPrivateGraphicalAuthority::LocalSystem,
-        WindowsPrivateGraphicalAuthority::RestrictedCode,
-        WindowsPrivateGraphicalAuthority::LogonSession,
-    ];
-    if authorities.len() == expected.len()
-        && expected
-            .iter()
-            .all(|authority| authorities.contains(authority))
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "private graphical objects must grant LocalSystem and both restricting SIDs GENERIC_ALL",
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn create_windows_private_graphical_session(
-    logon_sid: firehazard::sid::Ptr<'_>,
-    restricted_sid: firehazard::sid::Ptr<'_>,
-    local_system_sid: firehazard::sid::Ptr<'_>,
-) -> std::io::Result<(
-    firehazard::winsta::OwnedHandle,
-    firehazard::desktop::OwnedHandle,
-    widestring::U16CString,
-)> {
-    let mut nonce = [0_u8; 16];
-    getrandom::getrandom(&mut nonce).map_err(|error| {
-        std::io::Error::other(format!("cannot name private window station: {error}"))
-    })?;
-    let spec = windows_private_graphical_session_spec(nonce);
-    windows_private_graphical_authority_contract(&spec.window_station_authorities)?;
-    windows_private_graphical_authority_contract(&spec.desktop_authorities)?;
-
-    let station_acl = windows_private_graphical_acl(
-        logon_sid,
-        restricted_sid,
-        local_system_sid,
-        spec.window_station_authorities,
-    )?;
-    let station_descriptor = firehazard::security::DescriptorBuilder::new()
-        .dacl(true, Some(station_acl.as_acl_ptr()), false)?
-        .finish();
-    let station_attributes =
-        firehazard::security::Attributes::new(Some(&station_descriptor), spec.inherit_handle);
-    let station_name =
-        widestring::U16CString::from_str(&spec.window_station_name).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("private window-station name contains NUL: {error}"),
-            )
-        })?;
-    let station_creation = match spec.window_station_creation {
-        WindowsPrivateWindowStationCreation::CreateOnly => firehazard::winsta::CWF_CREATE_ONLY,
-    };
-    let station = firehazard::create_window_station_w(
-        station_name.as_ucstr(),
-        station_creation,
-        firehazard::winsta::ALL_ACCESS,
-        Some(&station_attributes),
-    )?;
-
-    let original_station = firehazard::open_process_window_station()?;
-    firehazard::set_process_window_station(&station)?;
-    let desktop_acl = windows_private_graphical_acl(
-        logon_sid,
-        restricted_sid,
-        local_system_sid,
-        spec.desktop_authorities,
-    )?;
-    let desktop_descriptor = firehazard::security::DescriptorBuilder::new()
-        .dacl(true, Some(desktop_acl.as_acl_ptr()), false)?
-        .finish();
-    let desktop_attributes =
-        firehazard::security::Attributes::new(Some(&desktop_descriptor), spec.inherit_handle);
-    let desktop_name = widestring::U16CString::from_str(&spec.desktop_name).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("private desktop name contains NUL: {error}"),
-        )
-    })?;
-    let desktop_result = firehazard::create_desktop_w(
-        desktop_name.as_ucstr(),
-        (),
-        None,
-        None,
-        firehazard::access::GENERIC_ALL,
-        Some(&desktop_attributes),
-    );
-    if let Err(error) = firehazard::set_process_window_station(&original_station) {
-        // This launcher is an ephemeral one-child process. If restoration
-        // fails, retain both station handles until process exit rather than
-        // closing a process-bound station and obscuring the original error.
-        std::mem::forget(original_station);
-        std::mem::forget(station);
-        return Err(error.into());
-    }
-    // SetProcessWindowStation binds the duplicated handle itself. It cannot
-    // be closed while it remains the process station, and this dedicated
-    // launcher exits immediately after the child, so retain it until exit.
-    std::mem::forget(original_station);
-    let desktop = desktop_result?;
-    let startup_binding =
-        widestring::U16CString::from_str(spec.startup_binding).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("private desktop binding contains NUL: {error}"),
-            )
-        })?;
-    Ok((station, desktop, startup_binding))
 }
 
 #[cfg(windows)]
@@ -3374,8 +3198,6 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         firehazard::token::ALL_ACCESS,
     )?;
     let restricted_sid = firehazard::convert_string_sid_to_sid_w(widestring::u16cstr!("S-1-5-12"))?;
-    let local_system_sid =
-        firehazard::convert_string_sid_to_sid_w(widestring::u16cstr!("S-1-5-18"))?;
     let logon_groups = process_token.logon_sid()?;
     let [logon_group] = logon_groups.groups() else {
         return Err(std::io::Error::other(
@@ -3383,12 +3205,12 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         ));
     };
     // WRITE_RESTRICTED applies this second SID set only to writes. Restricted
-    // Code binds the explicitly prepared filesystem DACLs, while both restricting
-    // SIDs bind the ephemeral private station and desktop. Cargo imports USER32
-    // and COM DLLs whose initialization writes those graphical objects before
-    // Rust entry, and a write check grants access only when every restricting
-    // SID is admitted. CSRSS owns graphical-object setup in the LocalSystem
-    // account, so it must retain authority on the same private objects.
+    // Code binds the explicitly prepared filesystem DACLs while the exact logon
+    // SID retains session-scoped access to the runner's inherited station.
+    // Creating a private station also created an unvalidated CSRSS dependency:
+    // repeatedly widening its object DACL never allowed cargo's USER32/COM
+    // imports to initialize on hosted runners. Filesystem confinement does not
+    // require a private desktop, so preserve the runner's initialized station.
     let restricted = WINDOWS_RESTRICTING_SID_CONSTRAINTS.map(|constraint| match constraint {
         WindowsRestrictingSidConstraint::RestrictedCode => {
             firehazard::sid::AndAttributes::new(&restricted_sid, ())
@@ -3415,20 +3237,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     };
     firehazard::set_information_job_object(&job, limits)?;
 
-    let (private_window_station, private_desktop, private_desktop_name) =
-        create_windows_private_graphical_session(
-            logon_group.sid,
-            restricted_sid.as_sid_ptr(),
-            local_system_sid.as_sid_ptr(),
-        )?;
-    let desktop_name =
-        abistr::CStrNonNull::<u16>::from_units_with_nul(private_desktop_name.as_slice_with_nul())
-            .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("private desktop binding is not terminated: {error}"),
-            )
-        })?;
+    windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING)?;
     windows_restricted_stdio_contract(&WINDOWS_RESTRICTED_STDIO_HANDLES)?;
     let inheritable = firehazard::security::Attributes::new(None, true);
     let (stdin_read, stdin_write) = firehazard::io::create_pipe(Some(&inheritable), 0)?;
@@ -3446,7 +3255,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         &inherited_handles,
     )];
     let mut startup = firehazard::process::StartupInfoExW::default();
-    startup.startup_info.desktop = Some(desktop_name);
+    startup.startup_info.desktop = None;
     startup.startup_info.flags = WINDOWS_STARTF_USE_STD_HANDLES;
     startup.startup_info.std_input = Some((&stdin_read).into());
     startup.startup_info.std_output = Some((&stdout_write).into());
@@ -3489,8 +3298,6 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     stderr_relay
         .join()
         .map_err(|_| std::io::Error::other("restricted stderr relay panicked"))??;
-    drop(private_desktop);
-    drop(private_window_station);
     Ok((status, prelaunch_evidence))
 }
 
@@ -3981,6 +3788,7 @@ mod tests {
         assert!(diagnostic.contains("SystemRoot="));
         assert!(diagnostic.contains("PATH="));
         assert!(diagnostic.contains("cwd="));
+        assert!(diagnostic.contains("graphicalBinding=inherited-default"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4719,105 +4527,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES,
-            [
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-            ]
-        );
-        assert_eq!(
-            WINDOWS_PRIVATE_DESKTOP_AUTHORITIES,
-            [
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-            ]
+            WINDOWS_RESTRICTED_GRAPHICAL_BINDING,
+            WindowsRestrictedGraphicalBinding::InheritedDefault
         );
     }
 
     #[test]
-    fn windows_private_graphical_session_is_exact_nonce_bound_and_noninheritable() {
-        let first = windows_private_graphical_session_spec([0; 16]);
-        let second = windows_private_graphical_session_spec([0xff; 16]);
+    fn windows_restricted_graphical_binding_is_exact() {
         assert_eq!(
-            first.window_station_name,
-            "hell-rs-release-00000000000000000000000000000000"
+            WINDOWS_RESTRICTED_GRAPHICAL_BINDING,
+            WindowsRestrictedGraphicalBinding::InheritedDefault
         );
-        assert_eq!(
-            second.window_station_name,
-            "hell-rs-release-ffffffffffffffffffffffffffffffff"
+        assert!(
+            windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING)
+                .is_ok()
         );
-        for spec in [first, second] {
-            assert!(!spec.inherit_handle);
-            assert_eq!(
-                spec.window_station_creation,
-                WindowsPrivateWindowStationCreation::CreateOnly
-            );
-            assert_eq!(
-                spec.window_station_authorities,
-                [
-                    WindowsPrivateGraphicalAuthority::LocalSystem,
-                    WindowsPrivateGraphicalAuthority::RestrictedCode,
-                    WindowsPrivateGraphicalAuthority::LogonSession,
-                ]
-            );
-            assert_eq!(
-                spec.desktop_authorities,
-                [
-                    WindowsPrivateGraphicalAuthority::LocalSystem,
-                    WindowsPrivateGraphicalAuthority::RestrictedCode,
-                    WindowsPrivateGraphicalAuthority::LogonSession,
-                ]
-            );
-            assert!(
-                spec.window_station_name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            );
-            assert_eq!(spec.desktop_name, "desktop");
-            assert_eq!(
-                spec.startup_binding,
-                format!("{}\\desktop", spec.window_station_name)
-            );
-        }
-    }
-
-    #[test]
-    fn windows_private_graphical_authorities_are_order_insensitive_but_exact() {
-        for authorities in [
-            [
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-            ],
-            [
-                WindowsPrivateGraphicalAuthority::LogonSession,
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-            ],
-            [
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-            ],
-        ] {
-            assert!(windows_private_graphical_authority_contract(&authorities).is_ok());
-        }
-        for authorities in [
-            [
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::RestrictedCode,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-            ],
-            [
-                WindowsPrivateGraphicalAuthority::LogonSession,
-                WindowsPrivateGraphicalAuthority::LocalSystem,
-                WindowsPrivateGraphicalAuthority::LogonSession,
-            ],
-        ] {
-            assert!(windows_private_graphical_authority_contract(&authorities).is_err());
-        }
     }
 
     #[test]
@@ -5157,6 +4881,30 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>();
             assert!(posix_release_child_command(&arguments).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_archive_identity_request_is_exact() {
+        assert!(native_archive_identity_request(&[OsString::from(
+            "--version"
+        )]));
+        for arguments in [
+            vec![],
+            vec!["--version", "archive.a"],
+            vec!["-version"],
+            vec!["--help"],
+            vec!["q", "--version"],
+        ] {
+            let arguments = arguments
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert!(
+                !native_archive_identity_request(&arguments),
+                "unexpected identity request accepted: {arguments:?}"
+            );
         }
     }
 

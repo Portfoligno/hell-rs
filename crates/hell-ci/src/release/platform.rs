@@ -2634,7 +2634,7 @@ fn validate_posix_cargo_deny_home_post_state(
                 || !metadata.is_dir()
                 || metadata.uid() != candidate_uid
                 || metadata.gid() != trusted_group_id
-                || metadata.permissions().mode() & 0o7777 != 0o700
+                || metadata.permissions().mode() & 0o7777 != 0o750
             {
                 return Err(
                     "final cargo-deny cache identity or permissions differ from policy".to_owned(),
@@ -2647,10 +2647,11 @@ fn validate_posix_cargo_deny_home_post_state(
             if entries > POSIX_RUSTUP_STAGE_ENTRY_LIMIT {
                 return Err("final cargo-deny cache exceeds its resource bound".to_owned());
             }
-            // The advisory root is deliberately candidate-private. Inventory
-            // its trusted contents before the ownership transition, and retain
-            // the lock descriptor so its final metadata can be checked without
-            // granting the trusted enumerator access to candidate storage.
+            // The advisory root is candidate-controlled. The trusted reader
+            // group can enumerate directory metadata for launch-policy
+            // binding, while candidate-owned lock files remain unreadable to
+            // it. Retain the lock descriptor so its final metadata can be
+            // checked without opening candidate storage.
             continue;
         }
 
@@ -5698,7 +5699,7 @@ fn normalize_cargo_deny_cache_tree(
             &path,
             fs::Permissions::from_mode(match (is_lock, is_advisory_root) {
                 (true, _) => 0o600,
-                (_, true) => 0o700,
+                (_, true) => 0o750,
                 (_, _) if file_type.is_dir() => 0o555,
                 (_, _) => 0o444,
             }),
@@ -8333,7 +8334,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
                 .permissions()
                 .mode()
                 & 0o777,
-            0o700
+            0o750
         );
         assert_eq!(
             std::fs::metadata(&advisory_lock)
@@ -8380,7 +8381,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             )
             .is_err()
         );
-        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o750)).unwrap();
 
         std::fs::remove_file(&advisory_lock).unwrap();
         std::fs::write(&advisory_lock, b"replacement\n").unwrap();
