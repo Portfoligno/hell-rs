@@ -688,6 +688,17 @@ impl AdapterDirectory {
 
 impl Drop for AdapterDirectory {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let authority = self.path.join(".authority");
+            if fs::symlink_metadata(&authority).is_ok_and(|metadata| metadata.is_dir())
+                && fs::set_permissions(&authority, fs::Permissions::from_mode(0o755)).is_err()
+            {
+                return;
+            }
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -746,7 +757,7 @@ impl NativeArchiveAdapter {
         }
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::symlink;
+            use std::os::unix::fs::{PermissionsExt as _, symlink};
 
             let llvm_ar = resolve_path_executable(OsStr::new("llvm-ar"))?;
             let version = CommandSpec::new(llvm_ar.as_os_str(), Duration::from_secs(30))
@@ -776,24 +787,30 @@ impl NativeArchiveAdapter {
                 None => std::env::current_exe()
                     .map_err(|error| format!("cannot locate CI driver executable: {error}"))?,
             };
+            let authority = adapter_root.join(".authority");
+            fs::create_dir(&authority)
+                .map_err(|error| format!("cannot create macOS archive authority: {error}"))?;
+            fs::set_permissions(&authority, fs::Permissions::from_mode(0o555))
+                .map_err(|error| format!("cannot confine macOS archive authority: {error}"))?;
             symlink(&executable, adapter_root.join("ar"))
                 .map_err(|error| format!("cannot install macOS archive adapter: {error}"))?;
-            symlink(&llvm_ar, adapter_root.join("llvm-ar"))
+            symlink(&llvm_ar, authority.join("llvm-ar"))
                 .map_err(|error| format!("cannot bind LLVM archiver: {error}"))?;
-            fs::write(adapter_root.join("member.o"), b"native-archive-adapter\n")
+            let work = adapter_root.join(".stack-work");
+            fs::write(work.join("member.o"), b"native-archive-adapter\n")
                 .map_err(|error| format!("cannot write archiver probe member: {error}"))?;
             let inner = CommandSpec::new(
-                adapter_root.join("llvm-ar").as_os_str(),
+                authority.join("llvm-ar").as_os_str(),
                 Duration::from_secs(30),
             )
             .arguments(["qcls", "inner.a", "member.o"])
-            .current_directory(adapter_root)
+            .current_directory(&work)
             .run()
             .map_err(|error| format!("cannot build archiver probe input: {error}"))?;
             if !inner.status.success() || inner.timed_out {
                 return Err("LLVM archiver cannot build the nested-archive probe".to_owned());
             }
-            fs::write(adapter_root.join("response.rsp"), b"inner.a\n")
+            fs::write(work.join("response.rsp"), b"inner.a\n")
                 .map_err(|error| format!("cannot write archiver response probe: {error}"))?;
             let probe =
                 CommandSpec::new(adapter_root.join("ar").as_os_str(), Duration::from_secs(30))
@@ -807,16 +824,17 @@ impl NativeArchiveAdapter {
                 );
             }
             let table = CommandSpec::new(
-                adapter_root.join("llvm-ar").as_os_str(),
+                authority.join("llvm-ar").as_os_str(),
                 Duration::from_secs(30),
             )
             .arguments(["t", "outer.a"])
-            .current_directory(adapter_root)
+            .current_directory(&work)
             .run()
             .map_err(|error| format!("cannot inspect archiver flattening probe: {error}"))?;
             if !table.status.success() || table.timed_out || table.stdout != b"member.o\n" {
                 return Err("LLVM archiver did not flatten the nested archive exactly".to_owned());
             }
+            clean_native_archive_probe(&work)?;
             let path = native_archive_path(&inherited, adapter_root, &llvm_ar, &current_directory)?;
             let stack_yaml = write_native_stack_overlay(adapter_root, source)?;
             Ok(Self {
@@ -848,15 +866,21 @@ impl NativeArchiveAdapter {
     }
 
     pub(crate) fn stack_build(&self, source: &Path, timeout: Duration) -> CommandSpec {
-        self.apply(native_stack_build(source, self.stack_yaml_path(), timeout))
+        let stack_yaml = self.stack_yaml_path();
+        self.apply(native_stack_build(source, stack_yaml, timeout))
+            .current_directory(stack_yaml.parent().unwrap_or(source))
     }
 
     pub(crate) fn stack_path(&self, source: &Path) -> CommandSpec {
-        self.apply(native_stack_path(source, self.stack_yaml_path()))
+        let stack_yaml = self.stack_yaml_path();
+        self.apply(native_stack_path(source, stack_yaml))
+            .current_directory(stack_yaml.parent().unwrap_or(source))
     }
 
     pub(crate) fn stack_ghc_version(&self, source: &Path) -> CommandSpec {
-        self.apply(native_stack_ghc_version(source, self.stack_yaml_path()))
+        let stack_yaml = self.stack_yaml_path();
+        self.apply(native_stack_ghc_version(source, stack_yaml))
+            .current_directory(stack_yaml.parent().unwrap_or(source))
     }
 
     pub(crate) fn stack_provenance(&self, source: &Path) -> Result<NativeStackProvenance, String> {
@@ -921,6 +945,32 @@ fn prepare_adapter_work_directory(adapter_root: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot create candidate Stack work directory: {error}"))?;
     fs::set_permissions(&work_directory, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("cannot confine candidate Stack work directory: {error}"))
+}
+
+#[cfg(unix)]
+fn clean_native_archive_probe(work_directory: &Path) -> Result<(), String> {
+    for name in ["inner.a", "member.o", "outer.a", "response.rsp"] {
+        let path = work_directory.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&path).map_err(|error| {
+                    format!("cannot remove native archive probe output {name:?}: {error}")
+                })?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "native archive probe output {name:?} is not regular"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect native archive probe output {name:?}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn yaml_single_quoted_path(path: &Path) -> Result<String, String> {
@@ -2490,16 +2540,130 @@ fn verify_tracked_checkout(source: &Path, expected: &str) -> Result<(), String> 
 }
 
 #[cfg(unix)]
+fn validate_native_archive_arguments(
+    arguments: &[OsString],
+    current_directory: &Path,
+    work_directory: &Path,
+) -> std::io::Result<()> {
+    let mut positional_only = false;
+    for argument in arguments {
+        if positional_only {
+            continue;
+        }
+        if argument == OsStr::new("--") {
+            positional_only = true;
+            continue;
+        }
+        let Some(value) = argument.to_str() else {
+            return Err(std::io::Error::other(
+                "archive adapter arguments must be UTF-8",
+            ));
+        };
+        if let Some(response) = value.strip_prefix('@') {
+            validate_native_archive_response(response, current_directory, work_directory)?;
+        } else if value.starts_with('-') {
+            return Err(std::io::Error::other(format!(
+                "archive adapter received unsupported argument {value:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_native_archive_response(
+    response: &str,
+    current_directory: &Path,
+    work_directory: &Path,
+) -> std::io::Result<()> {
+    let response = Path::new(response);
+    let response = if response.is_absolute() {
+        response.to_path_buf()
+    } else {
+        current_directory.join(response)
+    };
+    let metadata = fs::symlink_metadata(&response).map_err(|error| {
+        std::io::Error::other(format!("cannot inspect archive response file: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "archive response file is not a regular real file",
+        ));
+    }
+    let canonical = fs::canonicalize(&response).map_err(|error| {
+        std::io::Error::other(format!("cannot bind archive response file: {error}"))
+    })?;
+    if !canonical.starts_with(work_directory) {
+        return Err(std::io::Error::other(
+            "archive response file escapes its bound work directory",
+        ));
+    }
+    let contents = fs::read_to_string(&canonical).map_err(|error| {
+        std::io::Error::other(format!("cannot read archive response file: {error}"))
+    })?;
+    for member in contents.lines() {
+        if member.is_empty()
+            || member != member.trim()
+            || member.contains([' ', '"', '\''])
+            || member.contains('\\')
+            || member.chars().any(char::is_control)
+            || member.starts_with('-')
+            || member.starts_with('@')
+        {
+            return Err(std::io::Error::other(
+                "archive response file contains an unsupported argument",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn archive_adapter_directory(invoked: &OsStr) -> std::io::Result<PathBuf> {
+    let invoked = Path::new(invoked);
+    let invoked_parent = invoked
+        .parent()
+        .ok_or_else(|| std::io::Error::other("archive adapter directory is missing"))?;
+    if !invoked_parent.as_os_str().is_empty() {
+        return fs::canonicalize(invoked_parent);
+    }
+
+    let current_executable = fs::canonicalize(std::env::current_exe()?)?;
+    let current_metadata = fs::symlink_metadata(&current_executable)?;
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| std::io::Error::other("archive adapter PATH is missing"))?;
+    let current_directory = std::env::current_dir()?;
+    for entry in std::env::split_paths(&path) {
+        let entry = if entry.is_absolute() {
+            entry
+        } else {
+            current_directory.join(entry)
+        };
+        let candidate = entry.join("ar");
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.dev() == current_metadata.dev() && metadata.ino() == current_metadata.ino() {
+            return fs::canonicalize(entry);
+        }
+    }
+    Err(std::io::Error::other(
+        "archive adapter invocation authority is missing",
+    ))
+}
+
+#[cfg(unix)]
 pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process::ExitCode {
     let result = (|| {
         let invoked = std::env::args_os()
             .next()
             .ok_or_else(|| std::io::Error::other("archive adapter argv[0] is missing"))?;
-        let directory = Path::new(&invoked)
-            .parent()
-            .ok_or_else(|| std::io::Error::other("archive adapter directory is missing"))?;
-        let normalized = normalize_native_archive_arguments(arguments)?;
-        Command::new(directory.join("llvm-ar"))
+        let directory = archive_adapter_directory(&invoked)?;
+        let current_directory = std::env::current_dir()?;
+        let normalized =
+            normalize_native_archive_arguments(arguments, &directory, &current_directory)?;
+        Command::new(directory.join(".authority").join("llvm-ar"))
             .args(normalized)
             .status()
     })();
@@ -2519,20 +2683,95 @@ pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process
 }
 
 #[cfg(unix)]
-fn normalize_native_archive_arguments(arguments: &[OsString]) -> std::io::Result<Vec<OsString>> {
+fn normalize_native_archive_arguments(
+    arguments: &[OsString],
+    adapter_root: &Path,
+    current_directory: &Path,
+) -> std::io::Result<Vec<OsString>> {
     let Some(first) = arguments.first() else {
         return Err(std::io::Error::other(
             "archive adapter arguments are missing",
         ));
     };
+    let work_directory = adapter_root.join(".stack-work");
+    let bound_work_directory = fs::canonicalize(&work_directory).map_err(|error| {
+        std::io::Error::other(format!("cannot bind archive work directory: {error}"))
+    })?;
+    let mut target_index = 1;
+    let (mut saw_symbol_table, mut saw_create_quietly) = (false, false);
+    while let Some(argument) = arguments.get(target_index) {
+        match argument.to_str() {
+            Some("s" | "-s") if !saw_symbol_table => {
+                saw_symbol_table = true;
+                target_index += 1;
+                continue;
+            }
+            Some("c" | "-c") if !saw_create_quietly => {
+                saw_create_quietly = true;
+                target_index += 1;
+                continue;
+            }
+            Some("s" | "-s" | "c" | "-c") => {
+                return Err(std::io::Error::other(
+                    "archive adapter modifier is repeated",
+                ));
+            }
+            _ => {}
+        }
+        break;
+    }
+    let Some(target) = arguments.get(target_index) else {
+        return Err(std::io::Error::other("archive adapter target is missing"));
+    };
+    if target.to_str().is_some_and(|value| value.starts_with('-')) {
+        return Err(std::io::Error::other(
+            "archive adapter target is an unsupported option",
+        ));
+    }
+    let target = Path::new(target);
+    let target_path = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        current_directory.join(target)
+    };
+    if fs::symlink_metadata(&target_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "archive adapter target may not be a symbolic link",
+        ));
+    }
+    let canonical_target = match fs::canonicalize(&target_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = target_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("archive adapter target parent is missing"))?;
+            let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+                std::io::Error::other(format!("cannot bind archive target parent: {error}"))
+            })?;
+            let name = target_path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("archive adapter target name is missing"))?;
+            canonical_parent.join(name)
+        }
+        Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "cannot inspect archive target: {error}"
+            )));
+        }
+    };
+    if !canonical_target.starts_with(&bound_work_directory) {
+        return Err(std::io::Error::other(
+            "archive adapter target escapes its bound work directory",
+        ));
+    }
+    validate_native_archive_arguments(
+        &arguments[target_index + 1..],
+        current_directory,
+        &bound_work_directory,
+    )?;
     let replacement = match first.to_str() {
         Some("r") | Some("-r") => {
-            let target = arguments
-                .iter()
-                .skip(1)
-                .find(|argument| !argument.to_string_lossy().starts_with('-'))
-                .ok_or_else(|| std::io::Error::other("replace archive target is missing"))?;
-            if Path::new(target).exists() {
+            if target_path.exists() {
                 return Err(std::io::Error::other(
                     "replace-to-append conversion requires a fresh archive target",
                 ));
@@ -2546,7 +2785,7 @@ fn normalize_native_archive_arguments(arguments: &[OsString]) -> std::io::Result
         Some("qcls") => Some("qclsL"),
         Some("-qcls") => Some("-qclsL"),
         Some("qL" | "-qL" | "qLc" | "-qLc" | "qcL" | "-qcL" | "qclsL" | "-qclsL") => None,
-        Some("t" | "-t") => None,
+        Some("t") | Some("-t") => None,
         Some(value) => {
             return Err(std::io::Error::other(format!(
                 "archive adapter received unsupported operation {value:?}"
@@ -2759,12 +2998,14 @@ fn parse_windows_restricted_launch_request(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsRestrictedTokenConstraint {
     DisableMaximumPrivileges,
+    LuaToken,
     WriteRestricted,
 }
 
 #[cfg(any(windows, test))]
-const WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS: [WindowsRestrictedTokenConstraint; 2] = [
+const WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS: [WindowsRestrictedTokenConstraint; 3] = [
     WindowsRestrictedTokenConstraint::DisableMaximumPrivileges,
+    WindowsRestrictedTokenConstraint::LuaToken,
     WindowsRestrictedTokenConstraint::WriteRestricted,
 ];
 
@@ -2785,15 +3026,20 @@ const WINDOWS_RESTRICTING_SID_CONSTRAINTS: [WindowsRestrictingSidConstraint; 2] 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsPrivateGraphicalAuthority {
     LogonSessionGenericAll,
+    RestrictedCodeGenericAll,
 }
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 1] =
-    [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll];
+const WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 2] = [
+    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+];
 
 #[cfg(any(windows, test))]
-const WINDOWS_PRIVATE_DESKTOP_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 1] =
-    [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll];
+const WINDOWS_PRIVATE_DESKTOP_AUTHORITIES: [WindowsPrivateGraphicalAuthority; 2] = [
+    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+];
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2853,8 +3099,8 @@ struct WindowsPrivateGraphicalSessionSpec {
     desktop_name: String,
     startup_binding: String,
     inherit_handle: bool,
-    window_station_authorities: [WindowsPrivateGraphicalAuthority; 1],
-    desktop_authorities: [WindowsPrivateGraphicalAuthority; 1],
+    window_station_authorities: [WindowsPrivateGraphicalAuthority; 2],
+    desktop_authorities: [WindowsPrivateGraphicalAuthority; 2],
 }
 
 #[cfg(any(windows, test))]
@@ -2888,6 +3134,7 @@ fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
                     WindowsRestrictedTokenConstraint::DisableMaximumPrivileges => {
                         firehazard::token::DISABLE_MAX_PRIVILEGE
                     }
+                    WindowsRestrictedTokenConstraint::LuaToken => firehazard::token::LUA_TOKEN,
                     WindowsRestrictedTokenConstraint::WriteRestricted => {
                         firehazard::token::WRITE_RESTRICTED
                     }
@@ -2897,15 +3144,23 @@ fn windows_restricted_token_flags() -> firehazard::token::RestrictedFlags {
 }
 
 #[cfg(windows)]
-fn windows_logon_generic_all_acl(
+fn windows_private_graphical_acl(
     logon_sid: firehazard::sid::Ptr<'_>,
+    restricted_sid: firehazard::sid::Ptr<'_>,
+    authorities: [WindowsPrivateGraphicalAuthority; 2],
 ) -> std::io::Result<firehazard::acl::Builder> {
     let mut acl = firehazard::acl::Builder::new(firehazard::acl::REVISION);
-    acl.add_access_allowed_ace(
-        firehazard::acl::REVISION,
-        firehazard::access::GENERIC_ALL.into(),
-        logon_sid,
-    )?;
+    for authority in authorities {
+        let sid = match authority {
+            WindowsPrivateGraphicalAuthority::LogonSessionGenericAll => logon_sid,
+            WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll => restricted_sid,
+        };
+        acl.add_access_allowed_ace(
+            firehazard::acl::REVISION,
+            firehazard::access::GENERIC_ALL.into(),
+            sid,
+        )?;
+    }
     acl.finish()?;
     Ok(acl)
 }
@@ -2913,6 +3168,7 @@ fn windows_logon_generic_all_acl(
 #[cfg(windows)]
 fn create_windows_private_graphical_session(
     logon_sid: firehazard::sid::Ptr<'_>,
+    restricted_sid: firehazard::sid::Ptr<'_>,
 ) -> std::io::Result<(
     firehazard::winsta::OwnedHandle,
     firehazard::desktop::OwnedHandle,
@@ -2923,11 +3179,17 @@ fn create_windows_private_graphical_session(
         std::io::Error::other(format!("cannot name private window station: {error}"))
     })?;
     let spec = windows_private_graphical_session_spec(nonce);
-    let [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll] =
-        spec.window_station_authorities;
-    let [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll] = spec.desktop_authorities;
+    let [
+        WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+        WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+    ] = spec.window_station_authorities;
+    let [
+        WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+        WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+    ] = spec.desktop_authorities;
 
-    let station_acl = windows_logon_generic_all_acl(logon_sid)?;
+    let station_acl =
+        windows_private_graphical_acl(logon_sid, restricted_sid, spec.window_station_authorities)?;
     let station_descriptor = firehazard::security::DescriptorBuilder::new()
         .dacl(true, Some(station_acl.as_acl_ptr()), false)?
         .finish();
@@ -2952,7 +3214,8 @@ fn create_windows_private_graphical_session(
 
     let original_station = firehazard::open_process_window_station()?;
     firehazard::set_process_window_station(&station)?;
-    let desktop_acl = windows_logon_generic_all_acl(logon_sid)?;
+    let desktop_acl =
+        windows_private_graphical_acl(logon_sid, restricted_sid, spec.desktop_authorities)?;
     let desktop_descriptor = firehazard::security::DescriptorBuilder::new()
         .dacl(true, Some(desktop_acl.as_acl_ptr()), false)?
         .finish();
@@ -3044,9 +3307,11 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         ));
     };
     // WRITE_RESTRICTED applies this second SID set only to writes. Restricted
-    // Code binds the explicitly prepared filesystem DACLs; the exact logon SID
-    // admits only session-scoped Windows objects such as the runner's window
-    // station and desktop, which the loader must initialize before Rust entry.
+    // Code binds the explicitly prepared filesystem DACLs, while both restricting
+    // SIDs bind only the ephemeral private station and desktop. Cargo imports
+    // USER32 and COM DLLs whose initialization can write those graphical objects
+    // before Rust entry, and a write check grants access only when every
+    // restricting SID is admitted.
     let restricted = WINDOWS_RESTRICTING_SID_CONSTRAINTS.map(|constraint| match constraint {
         WindowsRestrictingSidConstraint::RestrictedCode => {
             firehazard::sid::AndAttributes::new(&restricted_sid, ())
@@ -3074,7 +3339,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     firehazard::set_information_job_object(&job, limits)?;
 
     let (private_window_station, private_desktop, private_desktop_name) =
-        create_windows_private_graphical_session(logon_group.sid)?;
+        create_windows_private_graphical_session(logon_group.sid, restricted_sid.as_sid_ptr())?;
     let desktop_name =
         abistr::CStrNonNull::<u16>::from_units_with_nul(private_desktop_name.as_slice_with_nul())
             .map_err(|error| {
@@ -4361,6 +4626,7 @@ mod tests {
             WINDOWS_RESTRICTED_TOKEN_CONSTRAINTS,
             [
                 WindowsRestrictedTokenConstraint::DisableMaximumPrivileges,
+                WindowsRestrictedTokenConstraint::LuaToken,
                 WindowsRestrictedTokenConstraint::WriteRestricted,
             ]
         );
@@ -4373,11 +4639,17 @@ mod tests {
         );
         assert_eq!(
             WINDOWS_PRIVATE_WINDOW_STATION_AUTHORITIES,
-            [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll]
+            [
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+            ]
         );
         assert_eq!(
             WINDOWS_PRIVATE_DESKTOP_AUTHORITIES,
-            [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll]
+            [
+                WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+            ]
         );
     }
 
@@ -4401,13 +4673,18 @@ mod tests {
             );
             assert_eq!(
                 spec.window_station_authorities,
-                [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll]
+                [
+                    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                ]
             );
             assert_eq!(
                 spec.desktop_authorities,
-                [WindowsPrivateGraphicalAuthority::LogonSessionGenericAll]
+                [
+                    WindowsPrivateGraphicalAuthority::RestrictedCodeGenericAll,
+                    WindowsPrivateGraphicalAuthority::LogonSessionGenericAll,
+                ]
             );
-            assert_eq!(spec.window_station_name.len(), 48);
             assert!(
                 spec.window_station_name
                     .bytes()
@@ -4508,6 +4785,33 @@ mod tests {
             ]
         );
         assert_eq!(ghc.current_directory.as_deref(), Some(source));
+
+        let adapter_root = Path::new("/fixed/adapter");
+        let adapter = NativeArchiveAdapter {
+            _directory: None,
+            llvm_ar: None,
+            llvm_ar_version: None,
+            path: None,
+            stack_yaml: Some(adapter_root.join("stack.yaml")),
+        };
+        assert_eq!(
+            adapter
+                .stack_build(source, Duration::from_secs(1))
+                .current_directory
+                .as_deref(),
+            Some(adapter_root)
+        );
+        assert_eq!(
+            adapter.stack_path(source).current_directory.as_deref(),
+            Some(adapter_root)
+        );
+        assert_eq!(
+            adapter
+                .stack_ghc_version(source)
+                .current_directory
+                .as_deref(),
+            Some(adapter_root)
+        );
     }
 
     #[test]
@@ -4737,8 +5041,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_archive_adapter_uses_fixed_flattening_operations() {
-        let fresh =
-            std::env::temp_dir().join(format!("hell-archive-adapter-fresh-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "hell-archive-adapter-arguments-{}-{}",
+            std::process::id(),
+            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join(".stack-work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("objects.rsp"), b"object.o\n").unwrap();
+        let fresh = work.join("fresh.a");
         for (input, expected, target) in [
             ("r", "qL", fresh.as_os_str()),
             ("-r", "-qL", fresh.as_os_str()),
@@ -4752,50 +5063,178 @@ mod tests {
             ("-qcls", "-qclsL", OsStr::new("archive.a")),
             ("qclsL", "qclsL", OsStr::new("archive.a")),
         ] {
-            let normalized = normalize_native_archive_arguments(&[
-                OsString::from(input),
-                OsString::from(target),
-                OsString::from("@objects.rsp"),
-            ])
+            let normalized = normalize_native_archive_arguments(
+                &[
+                    OsString::from(input),
+                    OsString::from(target),
+                    OsString::from("@objects.rsp"),
+                ],
+                &root,
+                &work,
+            )
             .unwrap();
             assert_eq!(normalized[0], expected);
             assert_eq!(normalized[1], target);
             assert_eq!(normalized[2], "@objects.rsp");
         }
-        fs::write(&fresh, b"existing\n").unwrap();
-        assert!(
-            normalize_native_archive_arguments(&[
+        let macos = normalize_native_archive_arguments(
+            &[
                 OsString::from("-r"),
+                OsString::from("-s"),
+                OsString::from("-c"),
                 fresh.as_os_str().to_owned(),
                 OsString::from("@objects.rsp"),
-            ])
+            ],
+            &root,
+            &work,
+        )
+        .unwrap();
+        assert_eq!(macos[0], "-qL");
+        assert_eq!(macos[1], "-s");
+        assert_eq!(macos[2], "-c");
+        assert_eq!(macos[3], fresh.as_os_str());
+        fs::write(&fresh, b"existing\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("-q"),
+                    OsString::from("-s"),
+                    OsString::from("-s"),
+                    fresh.as_os_str().to_owned(),
+                    OsString::from("@objects.rsp"),
+                ],
+                &root,
+                &work,
+            )
             .is_err()
         );
-        fs::remove_file(fresh).unwrap();
-        let unsupported = normalize_native_archive_arguments(&[OsString::from("qv")]).unwrap_err();
+        fs::write(&fresh, b"existing\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("-r"),
+                    fresh.as_os_str().to_owned(),
+                    OsString::from("@objects.rsp"),
+                ],
+                &root,
+                &work,
+            )
+            .is_err()
+        );
+        fs::remove_file(&fresh).unwrap();
+        let unsupported = normalize_native_archive_arguments(
+            &[
+                OsString::from("qv"),
+                OsString::from("archive.a"),
+                OsString::from("@objects.rsp"),
+            ],
+            &root,
+            &work,
+        )
+        .unwrap_err();
         assert_eq!(
             unsupported.to_string(),
             "archive adapter received unsupported operation \"qv\""
         );
         assert_eq!(
             normalize_native_archive_arguments(
-                &[OsString::from("t"), OsString::from("archive.a"),]
+                &[
+                    OsString::from("t"),
+                    OsString::from("archive.a"),
+                    OsString::from("@objects.rsp"),
+                ],
+                &root,
+                &work,
             )
-            .unwrap(),
-            [OsString::from("t"), OsString::from("archive.a")]
+            .unwrap()
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+            ["t", "archive.a", "@objects.rsp"]
         );
         for operation in ["x", "s", "--version"] {
             assert!(
-                normalize_native_archive_arguments(&[OsString::from(operation)]).is_err(),
+                normalize_native_archive_arguments(
+                    &[
+                        OsString::from(operation),
+                        OsString::from("archive.a"),
+                        OsString::from("@objects.rsp"),
+                    ],
+                    &root,
+                    &work,
+                )
+                .is_err(),
                 "unsupported operation {operation:?} was accepted"
             );
         }
+        for argument in [
+            "--thin",
+            "--format=darwin",
+            "--output=/outside",
+            "--version",
+            "-M",
+        ] {
+            assert!(
+                normalize_native_archive_arguments(
+                    &[
+                        OsString::from("q"),
+                        OsString::from("archive.a"),
+                        OsString::from(argument),
+                    ],
+                    &root,
+                    &work,
+                )
+                .is_err(),
+                "unsupported argument {argument:?} was accepted"
+            );
+        }
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("q"),
+                    OsString::from("../archive.a"),
+                    OsString::from("@objects.rsp"),
+                ],
+                &root,
+                &work,
+            )
+            .is_err()
+        );
+        let outside = std::env::temp_dir().join(format!(
+            "hell-archive-adapter-outside-{}-{}",
+            std::process::id(),
+            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&outside, b"outside\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[OsString::from("t"), outside.as_os_str().to_owned(),],
+                &root,
+                &work,
+            )
+            .is_err()
+        );
+        fs::remove_file(&outside).unwrap();
+        fs::write(work.join("unsafe.rsp"), b"--thin\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("q"),
+                    OsString::from("archive.a"),
+                    OsString::from("@unsafe.rsp"),
+                ],
+                &root,
+                &work,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn native_adapter_starts_private_until_its_platform_authority_is_bound() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
         let base = std::env::temp_dir().join(format!(
             "hell-native-adapter-permissions-{}-{}",
@@ -4812,6 +5251,10 @@ mod tests {
         assert_eq!(root.permissions().mode() & 0o7777, 0o755);
         assert_eq!(work.permissions().mode() & 0o7777, 0o700);
         assert_eq!(root.uid(), work.uid());
+        let authority = path.join(".authority");
+        fs::create_dir(&authority).unwrap();
+        symlink("/bound/llvm-ar", authority.join("llvm-ar")).unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o555)).unwrap();
         drop(directory);
         assert!(!path.exists());
         assert_eq!(

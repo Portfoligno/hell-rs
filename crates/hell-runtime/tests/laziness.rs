@@ -1041,6 +1041,34 @@ fn set_current_directory_error_uses_the_pinned_guest_path_presentation() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_missing_source_copy_file_retains_the_pinned_empty_pair_postcondition() {
+    let directory = std::env::temp_dir().join(format!(
+        "hell-rs-windows-copy-missing-{}",
+        std::process::id()
+    ));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+
+    assert_eq!(
+        run_in(
+            "main = Directory.copyFile \"missing.txt\" \"target.txt\"\n",
+            directory.clone(),
+            true,
+        )
+        .unwrap(),
+        ""
+    );
+    let source = std::fs::metadata(directory.join("missing.txt")).unwrap();
+    let target = std::fs::metadata(directory.join("target.txt")).unwrap();
+    assert!(source.is_file());
+    assert!(target.is_file());
+    assert_eq!(source.len(), 0);
+    assert_eq!(target.len(), 0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn directory_error_presentations_are_dynamic_and_other_error_kinds_remain_generic() {
     for (label, source, internal, operation, path, target, rendered) in [

@@ -1342,9 +1342,13 @@ fn reserve_posix_cargo_deny_advisory_lock(home: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let advisory_root = home.join("advisory-dbs");
-    fs::create_dir(&advisory_root)
+    fs::create_dir_all(&advisory_root)
         .map_err(|error| format!("cannot reserve cargo-deny advisory root: {error}"))?;
     let lock = advisory_root.join("db.lock");
+    if fs::symlink_metadata(&lock).is_ok() {
+        fs::remove_file(&lock)
+            .map_err(|error| format!("cannot replace staged cargo-deny advisory lock: {error}"))?;
+    }
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1671,19 +1675,32 @@ impl TrustedCargoCacheSeed {
             &program_identity,
             "fetch",
         )?;
-        self.run_cargo(
+        let metadata = self.run_cargo_with_home(
             cargo,
             candidate_root,
             trusted_cargo_cache_metadata_arguments(candidate_root, &manifest)?,
             "metadata materialization",
+            &self.root,
         )?;
+        if metadata.stdout_truncated
+            || u64::try_from(metadata.stdout.len()).ok() != Some(metadata.stdout_bytes)
+        {
+            return Err("trusted Cargo metadata exceeds its capture authority".to_owned());
+        }
+        let metadata_path = self.root.join("hell-cargo-deny-metadata.json");
+        if fs::symlink_metadata(&metadata_path).is_ok() {
+            return Err("trusted cargo-deny metadata seed already exists".to_owned());
+        }
+        fs::write(&metadata_path, &metadata.stdout)
+            .map_err(|error| format!("cannot write trusted cargo-deny metadata seed: {error}"))?;
+        self.run_cargo_deny_advisories(cargo, candidate_root, &metadata_path)?;
         self.revalidate_inputs(
             cargo,
             candidate_root,
             &manifest_identity,
             &lock_identity,
             &program_identity,
-            "metadata materialization",
+            "advisory database materialization",
         )?;
         let vendor = self.vendor_root();
         if fs::symlink_metadata(&vendor).is_ok() {
@@ -1704,6 +1721,30 @@ impl TrustedCargoCacheSeed {
             "vendor materialization",
         )?;
         validate_trusted_cargo_cache_tree(&vendor)
+    }
+
+    fn run_cargo_deny_advisories(
+        &self,
+        cargo: &crate::command::ResolvedCargoExecutable,
+        candidate_root: &Path,
+        metadata: &Path,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let result = crate::command::CommandSpec::cargo_deny(Duration::from_mins(10))
+            .arguments(trusted_cargo_deny_advisory_arguments(&self.root, metadata)?)
+            .current_directory(candidate_root)
+            .environment("CARGO", cargo.invocation_path().as_os_str().to_owned())
+            .environment("CARGO_HOME", self.root.as_os_str())
+            .environment("CARGO_TARGET_DIR", self.root.join("target"))
+            .run()
+            .map_err(|error| format!("cannot run trusted cargo-deny advisory seed: {error}"))?;
+        if result.timed_out || !result.status.success() {
+            return Err(format!(
+                "trusted cargo-deny advisory seed failed with status {}",
+                result.status.code().unwrap_or(1)
+            ));
+        }
+        self.validate()
     }
 
     fn run_cargo(
@@ -1889,6 +1930,32 @@ fn trusted_cargo_cache_offline_metadata_arguments(
     let mut arguments = trusted_cargo_cache_metadata_arguments(candidate_root, manifest)?;
     arguments.insert(2, OsString::from("--offline"));
     Ok(arguments)
+}
+
+#[cfg(unix)]
+fn trusted_cargo_deny_advisory_arguments(
+    cargo_home: &Path,
+    metadata: &Path,
+) -> Result<Vec<OsString>, String> {
+    let expected = cargo_home.join("hell-cargo-deny-metadata.json");
+    if !cargo_home.is_absolute()
+        || cargo_home.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || metadata != expected
+    {
+        return Err("trusted cargo-deny advisory metadata seed is not exact".to_owned());
+    }
+    Ok(vec![
+        OsString::from("--metadata-path"),
+        metadata.as_os_str().to_owned(),
+        OsString::from("--all-features"),
+        OsString::from("check"),
+        OsString::from("advisories"),
+    ])
 }
 
 #[cfg(unix)]
@@ -3425,6 +3492,54 @@ fn require_posix_read_only_tree_except(
 }
 
 #[cfg(unix)]
+fn require_posix_archive_adapter_inventory(adapter: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    require_exact_directory_members(
+        adapter,
+        &[
+            OsString::from(".authority"),
+            OsString::from(".stack-work"),
+            OsString::from("ar"),
+            OsString::from("stack.yaml"),
+            OsString::from("stack.yaml.lock"),
+        ],
+        "native archive adapter inventory",
+    )?;
+    let authority = adapter.join(".authority");
+    require_exact_directory_members(
+        &authority,
+        &[OsString::from("llvm-ar")],
+        "native archive archiver authority",
+    )?;
+    let authority_metadata = fs::symlink_metadata(&authority)
+        .map_err(|error| format!("cannot inspect native archive archiver authority: {error}"))?;
+    let archiver_metadata = fs::symlink_metadata(authority.join("llvm-ar"))
+        .map_err(|error| format!("cannot inspect bound LLVM archiver: {error}"))?;
+    let launcher_metadata = fs::symlink_metadata(adapter.join("ar"))
+        .map_err(|error| format!("cannot inspect native archive launcher: {error}"))?;
+    let stack_yaml_metadata = fs::symlink_metadata(adapter.join("stack.yaml"))
+        .map_err(|error| format!("cannot inspect native Stack overlay: {error}"))?;
+    let stack_lock_metadata = fs::symlink_metadata(adapter.join("stack.yaml.lock"))
+        .map_err(|error| format!("cannot inspect native Stack lock: {error}"))?;
+    if authority_metadata.file_type().is_symlink()
+        || !authority_metadata.is_dir()
+        || authority_metadata.permissions().mode() & 0o7777 != 0o555
+        || !archiver_metadata.file_type().is_symlink()
+        || !launcher_metadata.file_type().is_symlink()
+        || stack_yaml_metadata.file_type().is_symlink()
+        || !stack_yaml_metadata.is_file()
+        || stack_lock_metadata.file_type().is_symlink()
+        || !stack_lock_metadata.is_file()
+    {
+        return Err(
+            "native archive adapter inventory contains an unexpected entry type".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn require_posix_archive_adapter_transition_state(
     parent: &Path,
     parent_identity: &PosixObjectIdentity,
@@ -3466,6 +3581,7 @@ fn require_posix_archive_adapter_transition_state(
             .to_os_string()],
         "native archive adapter authority",
     )?;
+    require_posix_archive_adapter_inventory(adapter)?;
     let observed_adapter = posix_object_identity(adapter)?;
     let observed_work_directory = posix_object_identity(work_directory)?;
     if !posix_same_object(&observed_adapter, adapter_identity)
@@ -7019,10 +7135,11 @@ mod tests {
         require_posix_archive_adapter_transition_state, reserve_posix_cargo_deny_advisory_lock,
         run_posix_stack_work_normalizer, trusted_cargo_cache_metadata_arguments,
         trusted_cargo_cache_offline_metadata_arguments, trusted_cargo_cache_seed_arguments,
-        trusted_cargo_vendor_arguments, validate_candidate_cache_normalizer_root,
-        validate_posix_adapter_installation_root, validate_posix_cargo_deny_home_post_state,
-        validate_posix_cargo_deny_home_root, validate_posix_stack_root,
-        validate_posix_stack_root_post_state, validate_staged_cargo_metadata,
+        trusted_cargo_deny_advisory_arguments, trusted_cargo_vendor_arguments,
+        validate_candidate_cache_normalizer_root, validate_posix_adapter_installation_root,
+        validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
+        validate_posix_stack_root, validate_posix_stack_root_post_state,
+        validate_staged_cargo_metadata,
     };
     #[cfg(unix)]
     use std::path::Path;
@@ -7066,6 +7183,25 @@ mod tests {
                 "--manifest-path".into(),
                 manifest.as_os_str().to_owned(),
             ]
+        );
+        let cargo_home = Path::new("/private/var/tmp/hell-cargo-seed-1-2");
+        let advisory_metadata = cargo_home.join("hell-cargo-deny-metadata.json");
+        assert_eq!(
+            trusted_cargo_deny_advisory_arguments(cargo_home, &advisory_metadata).unwrap(),
+            [
+                "--metadata-path".into(),
+                advisory_metadata.as_os_str().to_owned(),
+                "--all-features".into(),
+                "check".into(),
+                "advisories".into(),
+            ]
+        );
+        assert!(
+            trusted_cargo_deny_advisory_arguments(
+                cargo_home,
+                &cargo_home.join("unbound-metadata.json")
+            )
+            .is_err()
         );
         assert_eq!(
             trusted_cargo_vendor_arguments(
@@ -8098,7 +8234,12 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         let cached = home.join("warm-cache");
         std::fs::write(&cached, b"trusted staged cache\n").unwrap();
+        let advisory_root = home.join("advisory-dbs");
+        let advisory_lock = advisory_root.join("db.lock");
+        std::fs::create_dir(&advisory_root).unwrap();
+        std::fs::write(&advisory_lock, b"staged advisory authority\n").unwrap();
         reserve_posix_cargo_deny_advisory_lock(&home).unwrap();
+        assert_eq!(std::fs::metadata(&advisory_lock).unwrap().len(), 0);
         let metadata = std::fs::metadata(&home).unwrap();
         normalize_cargo_deny_cache_tree(&home, metadata.uid(), metadata.uid(), metadata.gid())
             .unwrap();
@@ -8133,7 +8274,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn archive_adapter_hosted_mode_transition_rejects_cleared_setgid_and_substitution() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let root = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -8145,7 +8286,14 @@ mod tests {
         let parent = root.join("archive-adapter");
         let adapter = parent.join("hell-ci-adapter");
         let work = adapter.join(".stack-work");
-        std::fs::create_dir_all(&work).unwrap();
+        let authority = adapter.join(".authority");
+        std::fs::create_dir_all(&authority).unwrap();
+        symlink("/bound/llvm-ar", authority.join("llvm-ar")).unwrap();
+        symlink("/bound/hell-ci", adapter.join("ar")).unwrap();
+        std::fs::write(adapter.join("stack.yaml"), b"overlay\n").unwrap();
+        std::fs::write(adapter.join("stack.yaml.lock"), b"lock\n").unwrap();
+        std::fs::create_dir(&work).unwrap();
+        std::fs::set_permissions(&authority, std::fs::Permissions::from_mode(0o555)).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o2770)).unwrap();
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o2755)).unwrap();
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o2770)).unwrap();
@@ -8166,6 +8314,41 @@ mod tests {
             &work_identity,
         )
         .unwrap();
+
+        let authority_sibling = parent.join("unexpected-authority");
+        std::fs::create_dir(&authority_sibling).unwrap();
+        assert!(
+            require_posix_archive_adapter_transition_state(
+                &parent,
+                &parent_identity,
+                owner,
+                group,
+                0o2770,
+                &adapter,
+                &adapter_identity,
+                &work,
+                &work_identity,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&authority_sibling).unwrap();
+        let adapter_sibling = adapter.join("unexpected-output.a");
+        std::fs::write(&adapter_sibling, b"unexpected\n").unwrap();
+        assert!(
+            require_posix_archive_adapter_transition_state(
+                &parent,
+                &parent_identity,
+                owner,
+                group,
+                0o2770,
+                &adapter,
+                &adapter_identity,
+                &work,
+                &work_identity,
+            )
+            .is_err()
+        );
+        std::fs::remove_file(&adapter_sibling).unwrap();
 
         // BSD clears setgid when an unprivileged owner is outside the directory
         // group. The hosted 02550 request therefore became this exact 00550
@@ -8214,10 +8397,30 @@ mod tests {
 
         let replacement = parent.join("replacement-adapter");
         let replacement_work = replacement.join(".stack-work");
-        std::fs::create_dir_all(&replacement_work).unwrap();
+        let replacement_authority = replacement.join(".authority");
+        std::fs::create_dir_all(&replacement_authority).unwrap();
+        symlink(
+            "/bound/replacement-llvm-ar",
+            replacement_authority.join("llvm-ar"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &replacement_authority,
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        symlink("/bound/replacement-hell-ci", replacement.join("ar")).unwrap();
+        std::fs::write(replacement.join("stack.yaml"), b"replacement-overlay\n").unwrap();
+        std::fs::write(replacement.join("stack.yaml.lock"), b"replacement-lock\n").unwrap();
+        std::fs::create_dir(&replacement_work).unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o2755)).unwrap();
         std::fs::set_permissions(&replacement_work, std::fs::Permissions::from_mode(0o2770))
             .unwrap();
+        std::fs::set_permissions(
+            adapter.join(".authority"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         std::fs::remove_dir_all(&adapter).unwrap();
         std::fs::rename(&replacement, &adapter).unwrap();
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o2755)).unwrap();
@@ -8236,6 +8439,11 @@ mod tests {
             )
             .is_err()
         );
+        std::fs::set_permissions(
+            adapter.join(".authority"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -5362,15 +5362,27 @@ impl Evaluator {
                             )
                         })?;
                     } else {
-                        let _bytes = std::fs::copy(source_path, target_path).map_err(|error| {
-                            RuntimeContext::directory_io_error(
-                                operation,
-                                RuntimeDirectoryOperation::CopyFile,
-                                Arc::clone(&source),
-                                Some(Arc::clone(&target)),
-                                &error,
-                            )
-                        })?;
+                        let copied = std::fs::copy(&source_path, &target_path);
+                        if let Err(error) = copied {
+                            #[cfg(windows)]
+                            let is_reviewed_windows_missing_source = error.kind()
+                                == std::io::ErrorKind::NotFound
+                                && windows_missing_source_copy_creates_empty_pair(
+                                    &source_path,
+                                    &target_path,
+                                );
+                            #[cfg(not(windows))]
+                            let is_reviewed_windows_missing_source = false;
+                            if !is_reviewed_windows_missing_source {
+                                return Err(RuntimeContext::directory_io_error(
+                                    operation,
+                                    RuntimeDirectoryOperation::CopyFile,
+                                    Arc::clone(&source),
+                                    Some(Arc::clone(&target)),
+                                    &error,
+                                ));
+                            }
+                        }
                     }
                     Ok(Thunk::evaluated(Value::Unit))
                 })))
@@ -8003,6 +8015,28 @@ fn process_command_is_executable(path: &Path) -> bool {
 #[cfg(windows)]
 fn process_command_is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+#[cfg(windows)]
+fn windows_missing_source_copy_creates_empty_pair(source: &Path, target: &Path) -> bool {
+    // The pinned directory 1.3.8.1 Windows implementation succeeds for a
+    // missing source and materializes empty source and destination files
+    // (upstream directory issue #177).  Creating the exact pair only after a
+    // NotFound copy result avoids converting unrelated missing-parent errors.
+    let source_handle = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(source);
+    let Ok(source_handle) = source_handle else {
+        return false;
+    };
+    drop(source_handle);
+
+    if std::fs::File::create(target).is_err() {
+        let _ = std::fs::remove_file(source);
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_lines)]

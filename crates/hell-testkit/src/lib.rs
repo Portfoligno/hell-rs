@@ -5,6 +5,7 @@ mod collection_authority;
 mod corpus;
 mod reviewed_set;
 mod runtime_obligations;
+mod windows_divergences;
 mod windows_presentation;
 
 use std::cell::RefCell;
@@ -9114,6 +9115,13 @@ pub enum DifferentialComparisonProjection {
         oracle_bytes: u64,
         candidate_bytes: u64,
     },
+    ReviewedWindowsDivergence {
+        case_id: &'static str,
+        builtin: &'static str,
+        mismatch_sha256: Digest,
+        mismatch_kinds: &'static [MismatchKind],
+        rationale: &'static str,
+    },
 }
 
 /// The exact upstream exception wrapper admitted by one reviewed failure case.
@@ -10468,27 +10476,39 @@ pub fn compare_case_observations(
     let mut mismatches = compare(oracle, candidate);
     let projection = reviewed_runtime_failure_stderr_projection(case, oracle, candidate);
     #[cfg(windows)]
-    let projection = windows_presentation::reviewed_windows_presentation_projection(
+    let projection = windows_divergences::reviewed_windows_divergence_projection(
         ClaimPlatform::Windows,
         case,
         oracle,
         candidate,
         &mismatches,
     )
+    .or_else(|| {
+        windows_presentation::reviewed_windows_presentation_projection(
+            ClaimPlatform::Windows,
+            case,
+            oracle,
+            candidate,
+            &mismatches,
+        )
+    })
     .or(projection);
     if let Some(projected) = &projection {
-        let field = match projected {
+        let projected_fields: Option<Vec<MismatchKind>> = match projected {
             DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
             | DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr { .. } => {
-                Some(MismatchKind::Stderr)
+                Some(vec![MismatchKind::Stderr])
             }
             DifferentialComparisonProjection::ReviewedWindowsPresentation { field, .. } => {
-                Some(field.mismatch_kind())
+                Some(vec![field.mismatch_kind()])
             }
+            DifferentialComparisonProjection::ReviewedWindowsDivergence {
+                mismatch_kinds, ..
+            } => Some(mismatch_kinds.to_vec()),
             DifferentialComparisonProjection::Exact => None,
         };
-        if let Some(field) = field {
-            mismatches.retain(|mismatch| mismatch.kind != field);
+        if let Some(fields) = &projected_fields {
+            mismatches.retain(|mismatch| !fields.contains(&mismatch.kind));
         }
     }
     (

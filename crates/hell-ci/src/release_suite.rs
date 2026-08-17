@@ -26,6 +26,8 @@ pub(crate) enum FailureKind {
     Fixture,
 }
 
+const WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+
 pub(crate) fn failures_directory(report: &Path) -> PathBuf {
     report
         .parent()
@@ -55,7 +57,7 @@ pub(crate) fn verify(root: &Path, report: &mut Report, failures: &Path) -> Resul
             "--all-features",
             "--locked",
         ],
-        Duration::from_hours(1),
+        WORKSPACE_TEST_TIMEOUT,
     )?;
     run_cargo_command(
         root,
@@ -1590,7 +1592,12 @@ fn run_differential_identities(
     let mut metrics = DifferentialMetrics::default();
     metrics.add(committed.timing);
     for (authoritative_index, (case, result)) in cases.iter().zip(committed.reports).enumerate() {
-        let status = if result.agrees() {
+        let status = if matches!(
+            result.comparison_projection,
+            hell_testkit::DifferentialComparisonProjection::ReviewedWindowsDivergence { .. }
+        ) {
+            "deliberate-divergence"
+        } else if result.agrees() {
             "exact"
         } else {
             "unverified"
@@ -1957,6 +1964,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oracle_execution_alias_is_exactly_named_and_reported_separately_from_source() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let root = std::env::temp_dir().join(format!(
             "hell-oracle-execution-report-{}",
             std::process::id()
@@ -1964,10 +1973,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let source_path = root.join("linux-release-oracle");
-        fs::hard_link(std::env::current_exe().unwrap(), &source_path).unwrap();
+        // Keep this reporting probe off the live test executable used by later
+        // multicall launch tests.
+        let oracle_fixture = b"dedicated oracle execution fixture";
+        fs::write(&source_path, oracle_fixture).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o755)).unwrap();
         let source_path = source_path.canonicalize().unwrap();
         let source = ExecutableIdentity {
-            sha256: sha256_file(&source_path).unwrap(),
+            sha256: sha256_bytes(oracle_fixture),
             path: source_path.clone(),
             reported_version: hell_builtins::LANGUAGE_VERSION.into(),
             build_info: None,

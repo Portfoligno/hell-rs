@@ -2460,6 +2460,9 @@ pub enum ObservationEquivalence {
     /// One exact Windows upstream presentation dialect differs while every
     /// non-stream observation and target-scoped semantic cause agrees.
     ReviewedWindowsPresentation(crate::WindowsPresentationField, Vec<RetainedMismatchFact>),
+    /// A complete reviewed Windows process-lifecycle divergence is retained
+    /// with both exact sides and its committed mismatch fingerprint.
+    ReviewedWindowsDivergence(Vec<RetainedMismatchFact>),
 }
 
 /// One canonical retained mismatch category and its bounded side digests.
@@ -2481,6 +2484,9 @@ pub enum RetainedObservationClassification {
         field: crate::WindowsPresentationField,
         raw_mismatches: Vec<RetainedMismatchFact>,
     },
+    ProjectedWindowsDivergence {
+        raw_mismatches: Vec<RetainedMismatchFact>,
+    },
     Normalized {
         normalizers: Vec<NormalizerId>,
         raw_mismatches: Vec<RetainedMismatchFact>,
@@ -2491,6 +2497,22 @@ pub enum RetainedObservationClassification {
         normalized_mismatches: Vec<RetainedMismatchFact>,
         fingerprint_sha256: Digest,
     },
+}
+
+fn projected_windows_divergence(
+    raw_mismatches: Vec<RetainedMismatchFact>,
+    mismatch_kinds: &[crate::MismatchKind],
+) -> std::io::Result<RetainedObservationClassification> {
+    let observed_kinds = raw_mismatches
+        .iter()
+        .map(|mismatch| mismatch.category)
+        .collect::<Vec<_>>();
+    if observed_kinds != mismatch_kinds {
+        return Err(std::io::Error::other(
+            "reviewed Windows divergence lacks its exact raw mismatch fields",
+        ));
+    }
+    Ok(RetainedObservationClassification::ProjectedWindowsDivergence { raw_mismatches })
 }
 
 /// Strictly classifies exact, normalized, or mismatching retained evidence.
@@ -2570,6 +2592,20 @@ pub fn classify_retained_observation_bundle(
                 raw_mismatches,
             },
         )
+    } else if normalized_mismatches.is_empty()
+        && matches!(
+            &projection,
+            crate::DifferentialComparisonProjection::ReviewedWindowsDivergence { .. }
+        )
+    {
+        let crate::DifferentialComparisonProjection::ReviewedWindowsDivergence {
+            mismatch_kinds,
+            ..
+        } = projection
+        else {
+            unreachable!("projection variant was matched above")
+        };
+        projected_windows_divergence(raw_mismatches, mismatch_kinds)
     } else if normalized_mismatches.is_empty() {
         if raw_mismatches.is_empty() {
             Ok(RetainedObservationClassification::Exact)
@@ -2635,11 +2671,25 @@ fn recompute_projected_mismatch_sides(
             ))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    let projection = match crate::windows_presentation::retained_windows_presentation_projection(
-        case, &authority,
+    let raw_projection_mismatches = mismatches
+        .iter()
+        .map(|mismatch| crate::DifferentialMismatch {
+            kind: mismatch.fact.category,
+            oracle: mismatch.oracle.clone(),
+            candidate: mismatch.candidate.clone(),
+        })
+        .collect::<Vec<_>>();
+    let projection = match crate::windows_divergences::retained_windows_divergence_projection(
+        &case.id,
+        &raw_projection_mismatches,
     ) {
         Some(reviewed) => reviewed,
-        None => retained_runtime_failure_stderr_projection(directory, case)?,
+        None => match crate::windows_presentation::retained_windows_presentation_projection(
+            case, &authority,
+        ) {
+            Some(reviewed) => reviewed,
+            None => retained_runtime_failure_stderr_projection(directory, case)?,
+        },
     };
     let projected_field = match &projection {
         crate::DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
@@ -2649,7 +2699,8 @@ fn recompute_projected_mismatch_sides(
         crate::DifferentialComparisonProjection::ReviewedWindowsPresentation { field, .. } => {
             Some(field.mismatch_kind())
         }
-        crate::DifferentialComparisonProjection::Exact => None,
+        crate::DifferentialComparisonProjection::ReviewedWindowsDivergence { .. }
+        | crate::DifferentialComparisonProjection::Exact => None,
     };
     if let Some(field) = projected_field {
         mismatches.retain(|mismatch| mismatch.fact.category != field);
@@ -3401,7 +3452,40 @@ fn comparison_projection_json(projection: &crate::DifferentialComparisonProjecti
             oracle_bytes,
             candidate_bytes,
         ),
+        crate::DifferentialComparisonProjection::ReviewedWindowsDivergence {
+            case_id,
+            builtin,
+            mismatch_sha256,
+            mismatch_kinds: _,
+            rationale,
+        } => windows_divergence_projection_json(case_id, builtin, mismatch_sha256, rationale),
     }
+}
+
+fn windows_divergence_projection_json(
+    case_id: &str,
+    builtin: &str,
+    mismatch_sha256: &Digest,
+    rationale: &str,
+) -> String {
+    let mut rationale_json = String::new();
+    push_json_string(&mut rationale_json, rationale);
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schemaVersion\": 4,\n",
+            "  \"kind\": \"reviewed-windows-divergence\",\n",
+            "  \"caseId\": \"{}\",\n",
+            "  \"builtin\": \"{}\",\n",
+            "  \"mismatchSha256\": \"{}\",\n",
+            "  \"rationale\": {}\n",
+            "}}\n"
+        ),
+        case_id,
+        builtin,
+        mismatch_sha256.hex(),
+        rationale_json,
+    )
 }
 
 fn parse_windows_comparison_projection_json(
@@ -3460,12 +3544,73 @@ fn parse_windows_comparison_projection_json(
     })())
 }
 
+fn parse_windows_divergence_projection_json(
+    document: &str,
+) -> Option<std::io::Result<crate::DifferentialComparisonProjection>> {
+    if !document.starts_with(concat!(
+        "{\n",
+        "  \"schemaVersion\": 4,\n",
+        "  \"kind\": \"reviewed-windows-divergence\",\n"
+    )) {
+        return None;
+    }
+    Some((|| {
+        let mut lines = document.lines();
+        if lines.next() != Some("{")
+            || lines.next() != Some("  \"schemaVersion\": 4,")
+            || lines.next() != Some("  \"kind\": \"reviewed-windows-divergence\",")
+        {
+            return Err(std::io::Error::other(
+                "Windows divergence projection schema is malformed",
+            ));
+        }
+        let case_id = projection_text_line(lines.next(), "caseId")?;
+        let builtin = projection_text_line(lines.next(), "builtin")?;
+        let mismatch_sha256 = projection_digest_line(lines.next(), "mismatchSha256")?;
+        let rationale = projection_text_line(lines.next(), "rationale")?;
+        if lines.next() != Some("}") || lines.next().is_some() {
+            return Err(std::io::Error::other(
+                "Windows divergence projection has unknown fields",
+            ));
+        }
+        let authority = crate::windows_divergences::retained_authority(
+            &case_id,
+            &builtin,
+            &mismatch_sha256.hex(),
+        )
+        .ok_or_else(|| {
+            std::io::Error::other("Windows divergence projection is not an exact reviewed record")
+        })?;
+        if rationale != authority.rationale {
+            return Err(std::io::Error::other(
+                "Windows divergence projection rationale differs from review",
+            ));
+        }
+        let projection = crate::DifferentialComparisonProjection::ReviewedWindowsDivergence {
+            case_id: authority.case_id,
+            builtin: authority.builtin,
+            mismatch_sha256,
+            mismatch_kinds: authority.mismatch_kinds,
+            rationale: authority.rationale,
+        };
+        if comparison_projection_json(&projection) != document {
+            return Err(std::io::Error::other(
+                "Windows divergence projection is noncanonical",
+            ));
+        }
+        Ok(projection)
+    })())
+}
+
 fn parse_comparison_projection_json(
     document: &str,
 ) -> std::io::Result<crate::DifferentialComparisonProjection> {
     let exact = crate::DifferentialComparisonProjection::Exact;
     if document == comparison_projection_json(&exact) {
         return Ok(exact);
+    }
+    if let Some(divergence) = parse_windows_divergence_projection_json(document) {
+        return divergence;
     }
     if let Some(windows) = parse_windows_comparison_projection_json(document) {
         return windows;
@@ -3561,6 +3706,15 @@ fn projection_digest_line(line: Option<&str>, field: &str) -> std::io::Result<Di
         .and_then(|line| line.strip_suffix('"'))
         .ok_or_else(|| std::io::Error::other("comparison projection digest is malformed"))?;
     Digest::from_hex(value).map_err(std::io::Error::other)
+}
+
+fn projection_text_line(line: Option<&str>, field: &str) -> std::io::Result<String> {
+    let prefix = format!("  \"{field}\": \"");
+    line.map(|line| line.strip_suffix(',').unwrap_or(line))
+        .and_then(|line| line.strip_prefix(&prefix))
+        .and_then(|line| line.strip_suffix('"'))
+        .map(str::to_owned)
+        .ok_or_else(|| std::io::Error::other("comparison projection text is malformed"))
 }
 
 fn projection_u64_line(line: Option<&str>, field: &str) -> std::io::Result<u64> {
@@ -3714,6 +3868,9 @@ pub fn classify_observation_bundle_for_case(
             field,
             raw_mismatches,
         )),
+        RetainedObservationClassification::ProjectedWindowsDivergence { raw_mismatches } => Ok(
+            ObservationEquivalence::ReviewedWindowsDivergence(raw_mismatches),
+        ),
         RetainedObservationClassification::Normalized { normalizers, .. } => {
             Ok(ObservationEquivalence::Normalized(normalizers))
         }
@@ -8715,7 +8872,7 @@ fn push_os_json_string(output: &mut String, value: &OsStr) {
     push_json_string(output, &value.to_string_lossy());
 }
 
-fn push_json_string(output: &mut String, value: &str) {
+pub(crate) fn push_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
         match character {
@@ -8878,6 +9035,38 @@ mod tests {
             candidate: observation(crate::ExecutableRole::Candidate),
             comparison_projection: crate::DifferentialComparisonProjection::Exact,
             mismatches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reviewed_windows_divergence_projection_round_trips_exactly() {
+        for (case_id, builtin, mismatch_sha256) in [
+            (
+                "runtime-typed-thread-delay-forced-argument-failure",
+                "Concurrent.threadDelay",
+                "9ea41783a7bd7d7505b62fc603c027d547f0b2590459baa688a68c1ed51afa48",
+            ),
+            (
+                "runtime-interaction-timeout-process",
+                "Timeout.timeout",
+                "536f5d413d57fb66294475eae66f1bd0222d79a5f69e240d1c6fec095812481e",
+            ),
+        ] {
+            let authority =
+                crate::windows_divergences::retained_authority(case_id, builtin, mismatch_sha256)
+                    .expect("reviewed Windows divergence authority");
+            let projection = crate::DifferentialComparisonProjection::ReviewedWindowsDivergence {
+                case_id,
+                builtin,
+                mismatch_sha256: Digest::from_hex(mismatch_sha256).unwrap(),
+                mismatch_kinds: authority.mismatch_kinds,
+                rationale: authority.rationale,
+            };
+            let document = comparison_projection_json(&projection);
+            assert_eq!(
+                parse_comparison_projection_json(&document).unwrap(),
+                projection
+            );
         }
     }
 

@@ -2236,11 +2236,7 @@ fn retained_runtime_failure_projection_is_manifest_bound_and_recomputed() {
             payload_sha256,
             ..
         } => (*exception_family, *payload_sha256),
-        DifferentialComparisonProjection::Exact
-        | DifferentialComparisonProjection::ReviewedRuntimeFailureStderr { .. }
-        | DifferentialComparisonProjection::ReviewedWindowsPresentation { .. } => {
-            panic!("strict reviewed projection disappeared")
-        }
+        _ => panic!("strict reviewed projection disappeared"),
     };
     forged.comparison_projection =
         DifferentialComparisonProjection::ReviewedRuntimeFailureExceptionStderr {
