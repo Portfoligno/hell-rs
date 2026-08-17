@@ -658,7 +658,6 @@ pub enum ProcessScope {
 
 pub(crate) struct NativeArchiveAdapter {
     _directory: Option<AdapterDirectory>,
-    ar_path: Option<PathBuf>,
     llvm_ar: Option<PathBuf>,
     llvm_ar_version: Option<String>,
     path: Option<OsString>,
@@ -736,6 +735,22 @@ fn accepted_llvm_ar_version(output: &str) -> bool {
 }
 
 #[cfg(unix)]
+fn install_native_archive_adapter(
+    adapter_root: &Path,
+    confined_launcher: &Path,
+    llvm_ar: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let authority = adapter_root.join(".authority");
+    fs::create_dir(&authority)
+        .map_err(|error| format!("cannot create macOS archive authority: {error}"))?;
+    symlink(confined_launcher, adapter_root.join("ar"))
+        .map_err(|error| format!("cannot install macOS archive adapter: {error}"))?;
+    bind_and_freeze_native_archive_authority(&authority, llvm_ar)
+}
+
+#[cfg(unix)]
 fn bind_and_freeze_native_archive_authority(
     authority: &Path,
     llvm_ar: &Path,
@@ -790,7 +805,6 @@ impl NativeArchiveAdapter {
         if !enabled {
             return Ok(Self {
                 _directory: None,
-                ar_path: None,
                 llvm_ar: None,
                 llvm_ar_version: None,
                 path: None,
@@ -804,8 +818,6 @@ impl NativeArchiveAdapter {
         }
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::symlink;
-
             let llvm_ar = resolve_path_executable(OsStr::new("llvm-ar"))?;
             let version = CommandSpec::new(llvm_ar.as_os_str(), Duration::from_secs(30))
                 .argument("--version")
@@ -823,8 +835,6 @@ impl NativeArchiveAdapter {
             let inherited = std::env::var_os("PATH").ok_or_else(|| {
                 "standard PATH is required for the macOS archive adapter".to_owned()
             })?;
-            let current_directory = std::env::current_dir()
-                .map_err(|error| format!("cannot resolve archive adapter PATH: {error}"))?;
             let directory = create_adapter_directory(base)?;
             let adapter_root = directory.path();
             prepare_adapter_work_directory(adapter_root)?;
@@ -834,14 +844,8 @@ impl NativeArchiveAdapter {
                 None => std::env::current_exe()
                     .map_err(|error| format!("cannot locate CI driver executable: {error}"))?,
             };
+            install_native_archive_adapter(adapter_root, &executable, &llvm_ar)?;
             let authority = adapter_root.join(".authority");
-            fs::create_dir(&authority)
-                .map_err(|error| format!("cannot create macOS archive authority: {error}"))?;
-            symlink(&executable, adapter_root.join("ar"))
-                .map_err(|error| format!("cannot install macOS archive adapter: {error}"))?;
-            symlink(&executable, adapter_root.join("llvm-ar"))
-                .map_err(|error| format!("cannot install macOS LLVM archive adapter: {error}"))?;
-            bind_and_freeze_native_archive_authority(&authority, &llvm_ar)?;
             let work = adapter_root.join(".stack-work");
             fs::write(work.join("member.o"), b"native-archive-adapter\n")
                 .map_err(|error| format!("cannot write archiver probe member: {error}"))?;
@@ -876,12 +880,10 @@ impl NativeArchiveAdapter {
                 return Err("LLVM archiver did not flatten the nested archive exactly".to_owned());
             }
             clean_native_archive_probe(&work)?;
-            let path = native_archive_path(&inherited, adapter_root, &llvm_ar, &current_directory)?;
+            let path = native_archive_path(&inherited, adapter_root)?;
             let stack_yaml = write_native_stack_overlay(adapter_root, source)?;
-            let ar_path = adapter_root.join("ar");
             Ok(Self {
                 _directory: Some(directory),
-                ar_path: Some(ar_path),
                 llvm_ar: Some(llvm_ar),
                 llvm_ar_version: Some(llvm_ar_version),
                 path: Some(path),
@@ -896,12 +898,9 @@ impl NativeArchiveAdapter {
     }
 
     pub(crate) fn apply(&self, command: CommandSpec) -> CommandSpec {
-        match (&self.path, &self.ar_path) {
-            (Some(path), Some(ar_path)) => {
-                command.environment("PATH", path).environment("AR", ar_path)
-            }
-            (None, None) => command,
-            _ => panic!("macOS archive adapter PATH and AR bindings are incomplete"),
+        match &self.path {
+            Some(path) => command.environment("PATH", path),
+            None => command,
         }
     }
 
@@ -1033,7 +1032,11 @@ fn yaml_single_quoted_path(path: &Path) -> Result<String, String> {
     if value.chars().any(char::is_control) {
         return Err("native Stack source path contains a control character".to_owned());
     }
-    Ok(format!("'{}'", value.replace('\'', "''")))
+    Ok(yaml_single_quoted(value))
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn write_native_stack_overlay(directory: &Path, source: &Path) -> Result<PathBuf, String> {
@@ -1054,8 +1057,19 @@ fn write_native_stack_overlay(directory: &Path, source: &Path) -> Result<PathBuf
     let canonical_source = fs::canonicalize(source)
         .map_err(|error| format!("cannot canonicalize native Stack source: {error}"))?;
     let package = yaml_single_quoted_path(&canonical_source)?;
+    let canonical_adapter = fs::canonicalize(directory)
+        .map_err(|error| format!("cannot canonicalize native archive adapter: {error}"))?;
+    let adapter = yaml_single_quoted_path(&canonical_adapter)?;
+    let ar = canonical_adapter.join("ar");
+    let ar_value = ar
+        .to_str()
+        .ok_or_else(|| "native archive adapter path is not UTF-8".to_owned())?;
+    if ar_value.chars().any(char::is_control) {
+        return Err("native archive adapter path contains a control character".to_owned());
+    }
+    let configure_ar = yaml_single_quoted(&format!("--with-ar={ar_value}"));
     let overlay = format!(
-        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\nallow-different-user: true\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
+        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\nallow-different-user: true\nextra-prog-path:\n  - {adapter}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
     );
     let overlay_path = directory.join("stack.yaml");
     fs::write(&overlay_path, overlay)
@@ -1065,26 +1079,8 @@ fn write_native_stack_overlay(directory: &Path, source: &Path) -> Result<PathBuf
     Ok(overlay_path)
 }
 
-fn native_archive_path(
-    inherited: &OsStr,
-    adapter_root: &Path,
-    llvm_ar: &Path,
-    current_directory: &Path,
-) -> Result<OsString, String> {
-    let llvm_ar = fs::canonicalize(llvm_ar)
-        .map_err(|error| format!("cannot canonicalize LLVM archiver: {error}"))?;
-    let provision_directory = llvm_ar
-        .parent()
-        .ok_or_else(|| "LLVM archiver has no provision directory".to_owned())?;
-    let mut paths = vec![adapter_root.to_owned()];
-    paths.extend(std::env::split_paths(inherited).filter(|entry| {
-        let resolved = if entry.is_absolute() {
-            entry.clone()
-        } else {
-            current_directory.join(entry)
-        };
-        fs::canonicalize(&resolved).is_ok_and(|resolved| resolved != provision_directory)
-    }));
+fn native_archive_path(inherited: &OsStr, adapter_root: &Path) -> Result<OsString, String> {
+    let paths = std::iter::once(adapter_root.to_owned()).chain(std::env::split_paths(inherited));
     std::env::join_paths(paths)
         .map_err(|error| format!("cannot construct archive adapter PATH: {error}"))
 }
@@ -3317,6 +3313,40 @@ fn windows_restricted_canary_command_line(program: &Path, arguments: &[&str]) ->
 }
 
 #[cfg(windows)]
+struct WindowsRestrictedLaunchPlan {
+    application: PathBuf,
+    command_line: Vec<u16>,
+}
+
+#[cfg(windows)]
+fn windows_restricted_canary_launch_plan(
+    program: &Path,
+    arguments: &[&str],
+) -> WindowsRestrictedLaunchPlan {
+    WindowsRestrictedLaunchPlan {
+        application: program.to_path_buf(),
+        command_line: windows_restricted_canary_command_line(program, arguments),
+    }
+}
+
+#[cfg(windows)]
+fn windows_restricted_child_launch_plan(
+    launcher: &Path,
+    target_token: &OsStr,
+) -> WindowsRestrictedLaunchPlan {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    WindowsRestrictedLaunchPlan {
+        application: launcher.to_path_buf(),
+        command_line: "hell-test-helper __release-argv-child "
+            .encode_utf16()
+            .chain(target_token.encode_wide())
+            .chain(std::iter::once(0))
+            .collect(),
+    }
+}
+
+#[cfg(windows)]
 fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, String)> {
     use std::os::windows::ffi::OsStrExt as _;
 
@@ -3341,11 +3371,7 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         ));
     }
     let target_token = hell_testkit::encode_windows_argv(&request.target_arguments)?;
-    let mut command_line = "hell-test-helper __release-argv-child "
-        .encode_utf16()
-        .chain(target_token.encode_wide())
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let launcher_plan = windows_restricted_child_launch_plan(&launcher, &target_token);
     let process_token = firehazard::open_process_token(
         firehazard::get_current_process(),
         firehazard::token::ALL_ACCESS,
@@ -3383,15 +3409,13 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
         .is_some_and(|name| name.eq_ignore_ascii_case(OsStr::new("cargo.exe")))
     {
         let target_canary = resolve_windows_restricted_target_canary(&target_program)?;
-        let mut target_canary_command_line = windows_restricted_canary_command_line(
-            &target_canary.program,
-            &target_canary.arguments,
-        );
+        let mut target_canary_plan =
+            windows_restricted_canary_launch_plan(&target_canary.program, &target_canary.arguments);
         let target_canary_status = windows_create_restricted_process(
             &token,
             &job,
-            &target_canary.program,
-            &mut target_canary_command_line,
+            &target_canary_plan.application,
+            &mut target_canary_plan.command_line,
         )?;
         eprintln!(
             "{}",
@@ -3404,16 +3428,24 @@ fn windows_restricted_child(arguments: &[OsString]) -> std::io::Result<(u32, Str
     }
 
     let canary = resolve_windows_supported_launch_canary(&system_root)?;
-    let mut command_line =
-        windows_restricted_canary_command_line(&canary.program, &canary.arguments);
-    let status =
-        windows_create_restricted_process(&token, &job, &canary.program, &mut command_line)?;
+    let mut canary_plan = windows_restricted_canary_launch_plan(&canary.program, &canary.arguments);
+    let status = windows_create_restricted_process(
+        &token,
+        &job,
+        &canary_plan.application,
+        &mut canary_plan.command_line,
+    )?;
     eprintln!("{}", windows_restricted_canary_diagnostic(&canary, status));
     if let Some(error) = windows_restricted_canary_failure(&canary, status) {
         return Err(std::io::Error::other(error));
     }
 
-    let status = windows_create_restricted_process(&token, &job, &launcher, &mut command_line)?;
+    let status = windows_create_restricted_process(
+        &token,
+        &job,
+        &launcher_plan.application,
+        &mut launcher_plan.command_line,
+    )?;
     drop(job);
     Ok((status, prelaunch_evidence))
 }
@@ -4756,6 +4788,37 @@ mod tests {
         assert_eq!(target.arguments, ["--version"]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_restricted_child_plan_is_coherent_and_separate_from_canary() {
+        let launcher = Path::new(r"C:\staged\hell-test-helper.exe");
+        let target_token = OsStr::new("encoded-target-argv");
+        let child = windows_restricted_child_launch_plan(launcher, target_token);
+        let canary = windows_restricted_canary_launch_plan(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            &["/d", "/c", "exit", "0"],
+        );
+
+        let decode = |plan: &WindowsRestrictedLaunchPlan| {
+            String::from_utf16(&plan.command_line[..plan.command_line.len() - 1]).unwrap()
+        };
+        assert_eq!(child.application, launcher);
+        assert_eq!(
+            decode(&child),
+            "hell-test-helper __release-argv-child encoded-target-argv"
+        );
+        assert_eq!(
+            canary.application,
+            Path::new(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(
+            decode(&canary),
+            r#""C:\Windows\System32\cmd.exe" /d /c exit 0"#
+        );
+        assert_ne!(child.application, canary.application);
+        assert_ne!(child.command_line, canary.command_line);
+    }
+
     #[test]
     fn environment_reporting_never_contains_values() {
         let spec = CommandSpec::new("program", Duration::from_secs(1))
@@ -4847,7 +4910,6 @@ mod tests {
         let adapter_root = Path::new("/fixed/adapter");
         let adapter = NativeArchiveAdapter {
             _directory: None,
-            ar_path: None,
             llvm_ar: None,
             llvm_ar_version: None,
             path: None,
@@ -4875,11 +4937,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_archive_adapter_binds_ar_and_exact_clqs_without_ld() {
-        let adapter_root = Path::new("/fixed/macOS-archive-adapter");
+    fn native_archive_adapter_uses_standard_path_and_exact_clqs_without_custom_tools() {
         let adapter = NativeArchiveAdapter {
             _directory: None,
-            ar_path: Some(adapter_root.join("ar")),
             llvm_ar: None,
             llvm_ar_version: None,
             path: Some(OsString::from("/confined/path")),
@@ -4888,14 +4948,9 @@ mod tests {
         let spec = adapter.apply(CommandSpec::new("program", Duration::from_secs(1)));
         assert_eq!(
             spec.environment,
-            [
-                (OsString::from("PATH"), OsString::from("/confined/path")),
-                (
-                    OsString::from("AR"),
-                    adapter_root.join("ar").into_os_string()
-                ),
-            ]
+            [(OsString::from("PATH"), OsString::from("/confined/path"))]
         );
+        assert!(!spec.environment_names().iter().any(|name| name == "AR"));
         assert!(!spec.environment_names().iter().any(|name| name == "LD"));
 
         let root = std::env::temp_dir().join(format!(
@@ -4948,7 +5003,6 @@ mod tests {
         .unwrap();
         let adapter = NativeArchiveAdapter {
             _directory: None,
-            ar_path: None,
             llvm_ar: None,
             llvm_ar_version: None,
             path: None,
@@ -4971,7 +5025,7 @@ mod tests {
     #[test]
     fn native_stack_overlay_preserves_policy_and_scopes_the_link_fix() {
         let base = std::env::temp_dir().join(format!(
-            "hell-native-stack-overlay-{}-{}",
+            "hell-native-stack-overlay-{}-{}'s base",
             std::process::id(),
             ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -4990,9 +5044,25 @@ mod tests {
         let directory = create_adapter_directory(&base).unwrap();
         let overlay = write_native_stack_overlay(directory.path(), &source).unwrap();
         let content = fs::read_to_string(&overlay).unwrap();
+        let canonical_adapter = fs::canonicalize(directory.path()).unwrap();
+        let adapter_yaml = format!(
+            "'{}'",
+            canonical_adapter.display().to_string().replace('\'', "''")
+        );
+        let configure_ar = format!(
+            "'--with-ar={}'",
+            canonical_adapter
+                .join("ar")
+                .display()
+                .to_string()
+                .replace('\'', "''")
+        );
         assert!(content.starts_with("resolver: nightly-2024-10-21\npackages:\n"));
         assert!(content.contains("oracle''s source'\n"));
         assert!(content.contains("system-ghc: true\nallow-different-user: true\n"));
+        assert!(content.contains(&format!(
+            "extra-prog-path:\n  - {adapter_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
+        )));
         assert!(content.contains("  \"$everything\": \"-split-sections -j\"\n"));
         assert!(content.contains("  unix-time: \"-optl-all_load\"\n"));
         assert!(content.contains("  network-control: \"-fforce-recomp\"\n"));
@@ -5037,9 +5107,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_archive_path_removes_only_the_provision_directory() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-
+    fn native_archive_path_preserves_the_inherited_provision_path() {
         let base = std::env::temp_dir().join(format!(
             "hell-native-archive-path-{}-{}",
             std::process::id(),
@@ -5047,73 +5115,32 @@ mod tests {
         ));
         let adapter = base.join("adapter");
         let provision = base.join("llvm-keg/bin");
-        let provision_alias = base.join("provision-alias");
-        let broad = base.join("broad");
         let first = base.join("first");
         let second = base.join("second");
-        for directory in [&adapter, &provision, &broad, &first, &second] {
+        for directory in [&adapter, &provision, &first, &second] {
             fs::create_dir_all(directory).unwrap();
         }
-        symlink(&provision, &provision_alias).unwrap();
-        let llvm_ar = provision.join("llvm-ar");
-        let launcher = base.join("hell-ci");
-        for executable in [
-            llvm_ar.clone(),
-            launcher.clone(),
-            broad.join("clang"),
-            first.join("clang"),
-        ] {
-            fs::write(&executable, b"not executed\n").unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        symlink(&llvm_ar, broad.join("llvm-ar")).unwrap();
-        symlink(&launcher, adapter.join("llvm-ar")).unwrap();
+        let relative = Path::new("relative/provision");
         let inherited = std::env::join_paths([
             provision.as_path(),
             first.as_path(),
-            provision_alias.as_path(),
-            Path::new("broad"),
+            relative,
             second.as_path(),
             first.as_path(),
         ])
         .unwrap();
-        let filtered = native_archive_path(&inherited, &adapter, &llvm_ar, &base).unwrap();
-        let paths = std::env::split_paths(&filtered).collect::<Vec<_>>();
+        let joined = native_archive_path(&inherited, &adapter).unwrap();
+        let paths = std::env::split_paths(&joined).collect::<Vec<_>>();
         assert_eq!(
             paths,
             [
                 adapter.clone(),
+                provision.clone(),
                 first.clone(),
-                Path::new("broad").to_path_buf(),
+                relative.to_path_buf(),
                 second.clone(),
                 first.clone()
             ]
-        );
-        assert!(paths.iter().skip(1).all(|entry| {
-            let resolved = if entry.is_absolute() {
-                entry.clone()
-            } else {
-                base.join(entry)
-            };
-            fs::canonicalize(resolved).unwrap() != fs::canonicalize(&provision).unwrap()
-        }));
-        let clang = paths
-            .iter()
-            .map(|entry| entry.join("clang"))
-            .find(|candidate| candidate.is_file())
-            .unwrap();
-        assert_eq!(clang, first.join("clang"));
-        assert_eq!(
-            fs::canonicalize(base.join("broad")).unwrap(),
-            fs::canonicalize(&broad).unwrap()
-        );
-        assert_eq!(
-            fs::canonicalize(broad.join("llvm-ar")).unwrap(),
-            fs::canonicalize(&llvm_ar).unwrap()
-        );
-        assert_ne!(
-            fs::canonicalize(adapter.join("llvm-ar")).unwrap(),
-            fs::canonicalize(broad.join("llvm-ar")).unwrap()
         );
         fs::remove_dir_all(base).unwrap();
     }
@@ -5535,6 +5562,94 @@ mod tests {
         );
         fs::remove_file(&llvm_ar).unwrap();
         fs::remove_dir(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_archive_adapter_inventory_closes_after_top_level_llvm_ar_removal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!(
+            "hell-native-adapter-inventory-{}-{}",
+            std::process::id(),
+            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("stack.yaml"),
+            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
+        )
+        .unwrap();
+        fs::write(
+            source.join("stack.yaml.lock"),
+            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock"),
+        )
+        .unwrap();
+        let directory = create_adapter_directory(&base).unwrap();
+        let path = directory.path().to_owned();
+        prepare_adapter_work_directory(&path).unwrap();
+        let confined_launcher = base.join("confined-launcher");
+        let llvm_ar = base.join("reviewed-llvm-ar");
+        for executable in [&confined_launcher, &llvm_ar] {
+            fs::write(executable, b"bound executable\n").unwrap();
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        install_native_archive_adapter(&path, &confined_launcher, &llvm_ar).unwrap();
+        let overlay = write_native_stack_overlay(&path, &source).unwrap();
+
+        let mut entries = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                ".authority".to_owned(),
+                ".stack-work".to_owned(),
+                "ar".to_owned(),
+                "stack.yaml".to_owned(),
+                "stack.yaml.lock".to_owned()
+            ]
+        );
+        assert!(fs::symlink_metadata(path.join("llvm-ar")).is_err());
+        assert!(
+            fs::symlink_metadata(path.join("ar"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::canonicalize(path.join("ar")).unwrap(),
+            fs::canonicalize(&confined_launcher).unwrap()
+        );
+        let authority = path.join(".authority");
+        assert_eq!(
+            fs::metadata(&authority).unwrap().permissions().mode() & 0o7777,
+            0o555
+        );
+        let mut authority_entries = fs::read_dir(&authority)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        authority_entries.sort();
+        assert_eq!(authority_entries, ["llvm-ar".to_owned()]);
+        assert_eq!(
+            fs::canonicalize(authority.join("llvm-ar")).unwrap(),
+            fs::canonicalize(&llvm_ar).unwrap()
+        );
+        let overlay_content = fs::read_to_string(&overlay).unwrap();
+        assert!(overlay_content.contains("extra-prog-path:\n"));
+        assert!(overlay_content.contains("configure-options:\n"));
+        assert!(overlay_content.contains("--with-ar="));
+
+        drop(directory);
+        assert!(!path.exists());
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_file(&confined_launcher).unwrap();
+        fs::remove_file(&llvm_ar).unwrap();
+        fs::remove_dir(&base).unwrap();
     }
 
     #[cfg(unix)]

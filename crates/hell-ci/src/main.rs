@@ -653,7 +653,7 @@ fn native_archive_adapter_dispatch(invoked: Option<&OsStr>) -> bool {
         .map(Path::new)
         .and_then(Path::file_name)
         .and_then(OsStr::to_str)
-        .is_some_and(|name| matches!(name, "ar" | "llvm-ar"))
+        .is_some_and(|name| name == "ar")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -780,13 +780,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_archive_adapter_dispatch_accepts_only_ar_and_llvm_ar() {
+    fn native_archive_adapter_dispatch_accepts_only_ar() {
         assert!(native_archive_adapter_dispatch(Some(OsStr::new("ar"))));
         assert!(native_archive_adapter_dispatch(Some(OsStr::new(
             "/fixed/adapter/ar"
         ))));
-        assert!(native_archive_adapter_dispatch(Some(OsStr::new("llvm-ar"))));
-        assert!(native_archive_adapter_dispatch(Some(OsStr::new(
+        assert!(!native_archive_adapter_dispatch(Some(OsStr::new(
+            "llvm-ar"
+        ))));
+        assert!(!native_archive_adapter_dispatch(Some(OsStr::new(
             "/fixed/adapter/llvm-ar"
         ))));
         assert!(!native_archive_adapter_dispatch(Some(OsStr::new("ld"))));
