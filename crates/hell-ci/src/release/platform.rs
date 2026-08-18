@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::command::{CommandResult, CommandSpec, with_release_candidate_environment};
-use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
+use crate::json::{
+    JsonValue, canonical_json_bytes, json_member, parse_json, require_exact_json_keys,
+};
 use crate::report::Report;
 
 use super::archive::{ArchiveInput, create, extract_binary};
@@ -25,6 +27,9 @@ static POSIX_CARGO_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 static POSIX_CARGO_METADATA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+const TRUSTED_CARGO_DENY_VERSION: &str = "0.20.2";
 
 #[cfg(unix)]
 static POSIX_STACK_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -170,7 +175,17 @@ pub(crate) fn run(
     let prepared_oracle = confinement.retain_oracle(&unretained_oracle)?;
     unretained_oracle.cleanup()?;
     require_candidate_target(&root, &target)?;
-
+    #[cfg(unix)]
+    let dependency_policy = match (
+        confinement.dependency_policy_protection.as_ref(),
+        confinement.cargo_deny_home_protection.as_ref(),
+    ) {
+        (Some(policy), Some(metadata)) => Some((policy, metadata)),
+        (Some(_), None) => {
+            return Err("Linux dependency-policy metadata authority is absent".to_owned());
+        }
+        (None, _) => None,
+    };
     let mut gates = BTreeMap::from([
         ("runner-identity", true),
         ("candidate-checkout", true),
@@ -239,6 +254,8 @@ pub(crate) fn run(
                 &mut retained_outputs,
                 prepared_oracle,
                 &oracle_inventory_digest,
+                #[cfg(unix)]
+                dependency_policy,
             )
         },
     );
@@ -253,10 +270,12 @@ pub(crate) fn run(
         return Err("oracle source changed during candidate execution".to_owned());
     }
     require_candidate_target(&root, &target)?;
-    // The digest sibling is an internal hand-off used by the differential
-    // verifier.  It is deliberately not part of the exact platform artifact.
-    fs::remove_file(output.join("dependency-policy.sha256"))
-        .map_err(|error| format!("cannot remove transient dependency digest: {error}"))?;
+    // Native dependency attestations still use the transient digest hand-off.
+    // Linux retains only the exact immutable trusted result verified above.
+    if platform != ReleasePlatform::LinuxX86_64 {
+        fs::remove_file(output.join("dependency-policy.sha256"))
+            .map_err(|error| format!("cannot remove transient dependency digest: {error}"))?;
+    }
 
     let binary = target.join("release").join(platform.executable());
     require_real_binary_path(&target, &binary)?;
@@ -614,21 +633,24 @@ fn establish_candidate_process_confinement(
     // final candidate authorities. Materialize cargo-deny's cache and metadata
     // against that exact execution checkout so no hosted-workspace path leaks
     // into the candidate invocation.
-    let cargo_deny_home_protection = (platform == ReleasePlatform::LinuxX86_64)
-        .then(|| {
-            stage_posix_cargo_deny_home(
+    let (cargo_deny_home_protection, dependency_policy_protection) =
+        if platform == ReleasePlatform::LinuxX86_64 {
+            let (home, policy) = stage_posix_cargo_deny_home(
                 platform,
                 &sudo,
                 &adapter_protection,
                 target,
                 &source_protection.candidate,
+                candidate_sha,
                 &cargo,
                 uid,
                 trusted_owner,
                 trusted_group,
-            )
-        })
-        .transpose()?;
+            )?;
+            (Some(home), Some(policy))
+        } else {
+            (None, None)
+        };
     let cargo_protection =
         stage_posix_executable(platform, &sudo, cargo.canonical_identity(), "cargo")?;
     let stack = (platform == ReleasePlatform::MacosAarch64)
@@ -639,18 +661,6 @@ fn establish_candidate_process_confinement(
         .as_ref()
         .map(|resolved| {
             stage_posix_executable(platform, &sudo, resolved.canonical_identity(), "stack")
-        })
-        .transpose()?;
-    let cargo_deny = (platform == ReleasePlatform::LinuxX86_64)
-        .then(|| {
-            crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("cargo-deny"))
-        })
-        .transpose()
-        .map_err(|error| format!("cannot bind pinned cargo-deny authority: {error}"))?;
-    let cargo_deny_protection = cargo_deny
-        .as_ref()
-        .map(|resolved| {
-            stage_posix_executable(platform, &sudo, resolved.canonical_identity(), "cargo-deny")
         })
         .transpose()?;
     let candidate_identity = hell_testkit::PosixCandidateIdentity::new(
@@ -669,36 +679,6 @@ fn establish_candidate_process_confinement(
         cargo_protection.sha256,
         posix_cargo_source_authority(&cargo_authority, rustup_protection.as_ref())?,
     );
-    if let (Some(resolved), Some(protection)) = (&cargo_deny, &cargo_deny_protection) {
-        let home_protection = cargo_deny_home_protection
-            .as_ref()
-            .ok_or_else(|| "Linux cargo-deny home authority is absent".to_owned())?;
-        let metadata = fs::metadata(resolved.canonical_identity())
-            .map_err(|error| format!("cannot inspect pinned cargo-deny authority: {error}"))?;
-        let source_sha256 = hell_testkit::sha256_file(resolved.canonical_identity())
-            .map_err(|error| format!("cannot hash pinned cargo-deny authority: {error}"))?;
-        launch_authorities =
-            launch_authorities.cargo_deny(hell_testkit::PosixCargoDenyAuthority::new(
-                hell_testkit::PosixStandardExecutableIdentity::new(
-                    resolved.invocation_path().to_path_buf(),
-                    resolved.canonical_identity().to_path_buf(),
-                    metadata.dev(),
-                    metadata.ino(),
-                ),
-                source_sha256,
-                protection.adapter.clone(),
-                protection.sha256,
-                home_protection.home.clone(),
-                hell_testkit::PosixCargoDenyMetadataAuthority::new(
-                    home_protection.metadata.directory.clone(),
-                    home_protection.metadata.path.clone(),
-                    home_protection.metadata.size,
-                    home_protection.metadata.sha256,
-                    home_protection.metadata.trusted_owner,
-                ),
-                hell_testkit::PosixCargoDenyCacheOwnership::new(trusted_owner, trusted_group),
-            ));
-    }
     if let (Some(resolved), Some(protection)) = (&stack, &stack_protection) {
         let metadata = fs::metadata(resolved.canonical_identity())
             .map_err(|error| format!("cannot inspect required Stack authority: {error}"))?;
@@ -744,8 +724,8 @@ fn establish_candidate_process_confinement(
         },
         _adapter_protection: adapter_protection,
         _cargo_protection: cargo_protection,
-        _cargo_deny_protection: cargo_deny_protection,
         cargo_deny_home_protection,
+        dependency_policy_protection,
         _stack_protection: stack_protection,
         stack_root_protection,
         _rustup_protection: rustup_protection,
@@ -1108,6 +1088,24 @@ struct PosixCargoDenyMetadataProtection {
 }
 
 #[cfg(unix)]
+struct PosixDependencyPolicyProtection {
+    parent: PathBuf,
+    parent_identity: PosixObjectIdentity,
+    directory: PathBuf,
+    directory_identity: PosixObjectIdentity,
+    path: PathBuf,
+    file_identity: PosixObjectIdentity,
+    size: u64,
+    sha256: hell_testkit::Digest,
+    cargo_deny_sha256: hell_testkit::Digest,
+    cargo_deny_version: String,
+    trusted_owner: u32,
+    sudo: PathBuf,
+    tools: PosixAdapterTools,
+    active: bool,
+}
+
+#[cfg(unix)]
 struct PosixStackRootProtection {
     parent: PathBuf,
     parent_identity: PosixObjectIdentity,
@@ -1265,6 +1263,68 @@ impl Drop for PosixCargoDenyMetadataProtection {
 }
 
 #[cfg(unix)]
+impl PosixDependencyPolicyProtection {
+    fn validate(&self) -> Result<(), String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let file = fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("cannot inspect dependency-policy authority: {error}"))?;
+        if !self.active
+            || validate_posix_adapter_installation_root(ReleasePlatform::LinuxX86_64, &self.parent)?
+                != self.parent
+            || posix_object_identity(&self.parent)? != self.parent_identity
+            || !posix_dependency_policy_is_exact(&self.parent, &self.directory, &self.path)
+            || posix_object_identity(&self.directory)? != self.directory_identity
+            || posix_object_identity(&self.path)? != self.file_identity
+            || self.directory_identity.owner != self.trusted_owner
+            || self.directory_identity.mode != 0o555
+            || file.file_type().is_symlink()
+            || !file.is_file()
+            || file.nlink() != 1
+            || file.uid() != self.trusted_owner
+            || file.permissions().mode() & 0o7777 != 0o444
+            || file.len() != self.size
+            || hell_testkit::sha256_file(&self.path)
+                .map_err(|error| format!("cannot rehash dependency-policy result: {error}"))?
+                != self.sha256
+        {
+            return Err("dependency-policy authority changed".to_owned());
+        }
+        require_exact_directory_members(
+            &self.directory,
+            &[std::ffi::OsString::from("dependency-policy.json")],
+            "dependency-policy authority",
+        )?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        self.validate()?;
+        trusted_tool_status(
+            &self.sudo,
+            &self.tools.remove_file,
+            [
+                "-rf",
+                "--",
+                path_text(&self.directory, "dependency-policy cleanup")?,
+            ],
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PosixDependencyPolicyProtection {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(unix)]
 impl Drop for PosixCargoDenyHomeProtection {
     fn drop(&mut self) {
         let _ = self.cleanup();
@@ -1278,11 +1338,18 @@ fn stage_posix_cargo_deny_home(
     adapter: &PosixAdapterProtection,
     target: &Path,
     candidate_root: &Path,
+    candidate_sha: &str,
     cargo: &crate::command::ResolvedCargoExecutable,
     candidate_uid: u32,
     trusted_owner: u32,
     trusted_group_id: u32,
-) -> Result<PosixCargoDenyHomeProtection, String> {
+) -> Result<
+    (
+        PosixCargoDenyHomeProtection,
+        PosixDependencyPolicyProtection,
+    ),
+    String,
+> {
     let target_identity = posix_object_identity(target)?;
     let tools = resolve_posix_adapter_tools(platform)?;
     let environment_root = target.join("release-child-environment");
@@ -1297,7 +1364,9 @@ fn stage_posix_cargo_deny_home(
         .map_err(|error| format!("cannot reserve candidate cargo-deny home: {error}"))?;
     let copy_result = (|| {
         let mut seed = TrustedCargoCacheSeed::create(platform)?;
-        seed.fetch(cargo, candidate_root)?;
+        seed.fetch(cargo, candidate_root, candidate_sha)?;
+        let policy_document = fs::read(seed.root().join("dependency-policy.json"))
+            .map_err(|error| format!("cannot read trusted dependency-policy result: {error}"))?;
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
         copy_posix_cargo_cache_tree(seed.root(), &home, &mut entries, &mut bytes)?;
@@ -1306,6 +1375,8 @@ fn stage_posix_cargo_deny_home(
         let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
             stage_posix_cargo_deny_metadata(platform, sudo, &tools, &metadata, trusted_owner)?;
+        let policy =
+            stage_posix_dependency_policy(platform, sudo, &tools, &policy_document, trusted_owner)?;
         normalize_posix_cargo_deny_home_with_adapter(
             sudo,
             adapter,
@@ -1323,9 +1394,9 @@ fn stage_posix_cargo_deny_home(
             &advisory_lock,
         )?;
         seed.cleanup()?;
-        Ok((metadata, advisory_lock))
+        Ok((metadata, advisory_lock, policy))
     })();
-    let (metadata, advisory_lock) = match copy_result {
+    let (metadata, advisory_lock, policy) = match copy_result {
         Ok(authority) => authority,
         Err(error) => {
             if let Ok(home_text) = path_text(&home, "partial candidate cargo-deny home cleanup") {
@@ -1334,19 +1405,22 @@ fn stage_posix_cargo_deny_home(
             return Err(error);
         }
     };
-    Ok(PosixCargoDenyHomeProtection {
-        target: target.to_path_buf(),
-        target_identity,
-        home,
-        sudo: sudo.to_path_buf(),
-        tools,
-        candidate_uid,
-        trusted_owner,
-        trusted_group_id,
-        advisory_lock,
-        metadata,
-        active: true,
-    })
+    Ok((
+        PosixCargoDenyHomeProtection {
+            target: target.to_path_buf(),
+            target_identity,
+            home,
+            sudo: sudo.to_path_buf(),
+            tools,
+            candidate_uid,
+            trusted_owner,
+            trusted_group_id,
+            advisory_lock,
+            metadata,
+            active: true,
+        },
+        policy,
+    ))
 }
 
 #[cfg(unix)]
@@ -1481,6 +1555,127 @@ fn stage_posix_cargo_deny_metadata(
     })();
     if prepare.is_err() {
         if let Ok(directory_text) = path_text(&directory, "partial cargo-deny metadata cleanup") {
+            let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
+        }
+    }
+    prepare
+}
+
+#[cfg(unix)]
+fn stage_posix_dependency_policy(
+    platform: ReleasePlatform,
+    sudo: &Path,
+    tools: &PosixAdapterTools,
+    document: &[u8],
+    trusted_owner: u32,
+) -> Result<PosixDependencyPolicyProtection, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if platform != ReleasePlatform::LinuxX86_64 {
+        return Err("dependency-policy authority is only supported on Linux".to_owned());
+    }
+    let text = std::str::from_utf8(document)
+        .map_err(|_| "dependency-policy result is not UTF-8".to_owned())?;
+    let parsed = parse_json(text)?;
+    let parsed_object = parsed.object()?;
+    let cargo_deny_sha256 = hell_testkit::Digest::from_hex(
+        json_member(parsed_object, "cargoDenyExecutableSha256")?.string()?,
+    )
+    .map_err(|_| "dependency-policy cargo-deny digest is invalid".to_owned())?;
+    let cargo_deny_version = json_member(parsed_object, "cargoDenyVersion")?
+        .string()?
+        .to_owned();
+    if cargo_deny_version != TRUSTED_CARGO_DENY_VERSION {
+        return Err("dependency-policy cargo-deny version differs from policy".to_owned());
+    }
+    let parent = posix_adapter_installation_root(platform)?;
+    let parent_identity = posix_object_identity(&parent)?;
+    let sequence = POSIX_CARGO_METADATA_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = parent.join(format!(
+        "hell-dependency-policy-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory)
+        .map_err(|error| format!("cannot reserve dependency-policy authority: {error}"))?;
+    let path = directory.join("dependency-policy.json");
+    let prepare = (|| {
+        fs::write(&path, document)
+            .map_err(|error| format!("cannot write dependency-policy result: {error}"))?;
+        let owner = trusted_owner.to_string();
+        for entry in [&directory, &path] {
+            trusted_tool_status(
+                sudo,
+                &tools.change_owner,
+                [owner.as_str(), path_text(entry, "dependency-policy owner")?],
+            )?;
+        }
+        trusted_tool_status(
+            sudo,
+            &tools.chmod,
+            posix_chmod_arguments(
+                platform,
+                "0444",
+                path_text(&path, "dependency-policy result")?,
+            )?,
+        )?;
+        trusted_tool_status(
+            sudo,
+            &tools.chmod,
+            posix_chmod_arguments(
+                platform,
+                "0555",
+                path_text(&directory, "dependency-policy directory")?,
+            )?,
+        )?;
+        let directory_metadata = fs::symlink_metadata(&directory)
+            .map_err(|error| format!("cannot inspect dependency-policy directory: {error}"))?;
+        let file_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect dependency-policy result: {error}"))?;
+        let size = u64::try_from(document.len())
+            .map_err(|_| "dependency-policy size exceeds u64".to_owned())?;
+        let sha256 = hell_testkit::sha256_bytes(document);
+        if posix_object_identity(&parent)? != parent_identity
+            || !posix_dependency_policy_is_exact(&parent, &directory, &path)
+            || directory_metadata.file_type().is_symlink()
+            || !directory_metadata.is_dir()
+            || directory_metadata.uid() != trusted_owner
+            || directory_metadata.permissions().mode() & 0o7777 != 0o555
+            || file_metadata.file_type().is_symlink()
+            || !file_metadata.is_file()
+            || file_metadata.nlink() != 1
+            || file_metadata.uid() != trusted_owner
+            || file_metadata.permissions().mode() & 0o7777 != 0o444
+            || file_metadata.len() != size
+            || hell_testkit::sha256_file(&path)
+                .map_err(|error| format!("cannot hash dependency-policy result: {error}"))?
+                != sha256
+        {
+            return Err("dependency-policy authority differs after staging".to_owned());
+        }
+        require_exact_directory_members(
+            &directory,
+            &[std::ffi::OsString::from("dependency-policy.json")],
+            "dependency-policy authority",
+        )?;
+        Ok(PosixDependencyPolicyProtection {
+            parent,
+            parent_identity,
+            directory: directory.clone(),
+            directory_identity: posix_object_identity(&directory)?,
+            path: path.clone(),
+            file_identity: posix_object_identity(&path)?,
+            size,
+            sha256,
+            cargo_deny_sha256,
+            cargo_deny_version,
+            trusted_owner,
+            sudo: sudo.to_path_buf(),
+            tools: tools.clone(),
+            active: true,
+        })
+    })();
+    if prepare.is_err() {
+        if let Ok(directory_text) = path_text(&directory, "partial dependency-policy cleanup") {
             let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
         }
     }
@@ -1668,6 +1863,7 @@ impl TrustedCargoCacheSeed {
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
         candidate_root: &Path,
+        candidate_sha: &str,
     ) -> Result<(), String> {
         let manifest = candidate_root.join("Cargo.toml");
         let manifest_identity = TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.toml")?;
@@ -1710,7 +1906,18 @@ impl TrustedCargoCacheSeed {
         }
         fs::write(&metadata_path, &metadata.stdout)
             .map_err(|error| format!("cannot write trusted cargo-deny metadata seed: {error}"))?;
-        self.run_cargo_deny_authority_checks(cargo, candidate_root, &metadata_path)?;
+        let policy = self.run_cargo_deny_authority_checks(
+            cargo,
+            candidate_root,
+            candidate_sha,
+            &metadata_path,
+        )?;
+        let policy_path = self.root.join("dependency-policy.json");
+        if fs::symlink_metadata(&policy_path).is_ok() {
+            return Err("trusted dependency-policy result already exists".to_owned());
+        }
+        fs::write(&policy_path, &policy)
+            .map_err(|error| format!("cannot write trusted dependency-policy result: {error}"))?;
         self.revalidate_inputs(
             cargo,
             candidate_root,
@@ -1752,9 +1959,24 @@ impl TrustedCargoCacheSeed {
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
         candidate_root: &Path,
+        candidate_sha: &str,
         metadata: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         self.validate()?;
+        let cargo_deny =
+            crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("cargo-deny"))?;
+        let cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
+            .map_err(|error| format!("cannot hash trusted cargo-deny authority: {error}"))?;
+        let version = tool_output(
+            CommandSpec::cargo_deny(Duration::from_secs(30))
+                .argument("--version")
+                .current_directory(candidate_root)
+                .environment("CARGO_HOME", self.root.as_os_str()),
+            "cargo-deny",
+        )?;
+        if version != format!("cargo-deny {TRUSTED_CARGO_DENY_VERSION}") {
+            return Err("trusted cargo-deny authority version differs from policy".to_owned());
+        }
         let result = crate::command::CommandSpec::cargo_deny(Duration::from_mins(10))
             .arguments(trusted_cargo_deny_authority_arguments(
                 &self.root, metadata,
@@ -1771,7 +1993,20 @@ impl TrustedCargoCacheSeed {
                 result.status.code().unwrap_or(1)
             ));
         }
-        self.validate()
+        let observed_cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
+            .map_err(|error| format!("cannot rehash trusted cargo-deny authority: {error}"))?;
+        if observed_cargo_deny_sha256 != cargo_deny_sha256 {
+            return Err("trusted cargo-deny authority changed during policy checks".to_owned());
+        }
+        self.validate()?;
+        let metadata_document = fs::read(metadata)
+            .map_err(|error| format!("cannot read trusted cargo-deny metadata: {error}"))?;
+        build_dependency_policy_result(
+            candidate_root,
+            candidate_sha,
+            &metadata_document,
+            cargo_deny_sha256,
+        )
     }
 
     fn run_cargo(
@@ -2180,31 +2415,136 @@ fn trusted_cargo_deny_authority_arguments(
     // License and source checking read package content that is not present in
     // the captured Cargo metadata graph. Keep those package-content
     // authorities in the trusted seed, together with advisory-database access.
+    // `bans` stays here as well: cargo-deny 0.20.2 performs its Cargo
+    // bootstrap for every category, so there is no fetch-free candidate split.
     Ok(vec![
         OsString::from("--metadata-path"),
         metadata.as_os_str().to_owned(),
         OsString::from("--all-features"),
         OsString::from("check"),
         OsString::from("advisories"),
+        OsString::from("bans"),
         OsString::from("licenses"),
         OsString::from("sources"),
     ])
 }
 
 #[cfg(unix)]
-fn candidate_cargo_deny_arguments() -> Vec<OsString> {
-    // cargo-deny 0.20.2 has no separate `--disable-fetch` flag and still runs
-    // its fixed Cargo fetch probe even when the launcher supplies bound
-    // metadata. Its tested `--frozen` mode treats that expected offline probe
-    // error as nonfatal and then consumes the bound metadata. Advisory
-    // databases, license contents, and source authorities remain in the
-    // trusted seed; the confined child checks only metadata-only policies.
-    vec![
-        OsString::from("--frozen"),
-        OsString::from("--all-features"),
-        OsString::from("check"),
-        OsString::from("bans"),
-    ]
+fn dependency_policy_input_sha256(root: &Path, name: &str) -> Result<String, String> {
+    hell_testkit::sha256_file(&root.join(name))
+        .map(|digest| digest.hex())
+        .map_err(|error| format!("cannot hash dependency-policy input {name}: {error}"))
+}
+
+#[cfg(unix)]
+fn build_dependency_policy_result(
+    candidate_root: &Path,
+    candidate_sha: &str,
+    metadata: &[u8],
+    cargo_deny_sha256: hell_testkit::Digest,
+) -> Result<Vec<u8>, String> {
+    let cargo_deny = cargo_deny_sha256.hex();
+    let cargo_lock = dependency_policy_input_sha256(candidate_root, "Cargo.lock")?;
+    let cargo_manifest = dependency_policy_input_sha256(candidate_root, "Cargo.toml")?;
+    let cargo_metadata = hell_testkit::sha256_bytes(metadata).hex();
+    let deny_policy = dependency_policy_input_sha256(candidate_root, "deny.toml")?;
+    let document = object([
+        ("candidateSourceCommit", string(candidate_sha)),
+        ("cargoDenyExecutableSha256", string(&cargo_deny)),
+        ("cargoDenyVersion", string(TRUSTED_CARGO_DENY_VERSION)),
+        ("cargoLockSha256", string(&cargo_lock)),
+        ("cargoManifestSha256", string(&cargo_manifest)),
+        ("cargoMetadataSha256", string(&cargo_metadata)),
+        (
+            "categories",
+            JsonValue::Array(
+                ["advisories", "bans", "licenses", "sources"]
+                    .into_iter()
+                    .map(string)
+                    .collect(),
+            ),
+        ),
+        ("denyPolicySha256", string(&deny_policy)),
+        ("result", string("passed")),
+        ("schemaVersion", number(2)),
+        ("workflow", string("release.yml")),
+    ]);
+    canonical_json_bytes(&document)
+}
+
+#[cfg(unix)]
+fn verify_dependency_policy_result(
+    document: &[u8],
+    candidate_root: &Path,
+    candidate_sha: &str,
+    metadata_sha256: &hell_testkit::Digest,
+    cargo_deny_sha256: &hell_testkit::Digest,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(document)
+        .map_err(|_| "dependency-policy result is not UTF-8".to_owned())?;
+    let parsed = parse_json(text)?;
+    let object = parsed.object()?;
+    require_exact_json_keys(
+        object,
+        &[
+            "candidateSourceCommit",
+            "cargoDenyExecutableSha256",
+            "cargoDenyVersion",
+            "cargoLockSha256",
+            "cargoManifestSha256",
+            "cargoMetadataSha256",
+            "categories",
+            "denyPolicySha256",
+            "result",
+            "schemaVersion",
+            "workflow",
+        ],
+    )?;
+    if canonical_json_bytes(&parsed)? != document {
+        return Err("dependency-policy result is not canonical".to_owned());
+    }
+    let expected = [
+        ("candidateSourceCommit", candidate_sha.to_owned()),
+        ("cargoDenyExecutableSha256", cargo_deny_sha256.hex()),
+        ("cargoDenyVersion", TRUSTED_CARGO_DENY_VERSION.to_owned()),
+        (
+            "cargoLockSha256",
+            dependency_policy_input_sha256(candidate_root, "Cargo.lock")?,
+        ),
+        (
+            "cargoManifestSha256",
+            dependency_policy_input_sha256(candidate_root, "Cargo.toml")?,
+        ),
+        ("cargoMetadataSha256", metadata_sha256.hex()),
+        (
+            "denyPolicySha256",
+            dependency_policy_input_sha256(candidate_root, "deny.toml")?,
+        ),
+        ("result", "passed".to_owned()),
+        ("workflow", "release.yml".to_owned()),
+    ];
+    for (name, value) in expected {
+        if json_member(object, name)?.string()? != value {
+            return Err(format!(
+                "dependency-policy {name} differs from its bound input"
+            ));
+        }
+    }
+    if json_member(object, "schemaVersion")?.number()? != 2 {
+        return Err("dependency-policy schema version is not exact".to_owned());
+    }
+    let categories = json_member(object, "categories")?.array()?;
+    if categories.len() != 4
+        || categories
+            .iter()
+            .zip(["advisories", "bans", "licenses", "sources"])
+            .any(|(observed, expected)| {
+                observed.string().is_ok_and(|observed| observed != expected)
+            })
+    {
+        return Err("dependency-policy category inventory is partial or reordered".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2641,6 +2981,29 @@ fn posix_cargo_deny_metadata_is_exact(parent: &Path, directory: &Path, path: &Pa
         && canonical_number(process)
         && canonical_number(sequence)
         && path == directory.join("metadata.json")
+}
+
+#[cfg(unix)]
+fn posix_dependency_policy_is_exact(parent: &Path, directory: &Path, path: &Path) -> bool {
+    let Some(name) = directory.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    let Some((process, sequence)) = name
+        .strip_prefix("hell-dependency-policy-")
+        .and_then(|suffix| suffix.split_once('-'))
+    else {
+        return false;
+    };
+    let canonical_number = |value: &str| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|number| value == number.to_string())
+    };
+    parent == Path::new("/var/tmp")
+        && directory.parent() == Some(parent)
+        && canonical_number(process)
+        && canonical_number(sequence)
+        && path == directory.join("dependency-policy.json")
 }
 
 #[cfg(unix)]
@@ -4989,9 +5352,9 @@ struct CandidateConfinement {
     #[cfg(unix)]
     _cargo_protection: PosixAdapterProtection,
     #[cfg(unix)]
-    _cargo_deny_protection: Option<PosixAdapterProtection>,
-    #[cfg(unix)]
     cargo_deny_home_protection: Option<PosixCargoDenyHomeProtection>,
+    #[cfg(unix)]
+    dependency_policy_protection: Option<PosixDependencyPolicyProtection>,
     #[cfg(unix)]
     _stack_protection: Option<PosixAdapterProtection>,
     #[cfg(unix)]
@@ -5010,6 +5373,10 @@ struct CandidateConfinement {
 
 impl CandidateConfinement {
     fn cleanup_dependency_policy_cache(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(mut protection) = self.dependency_policy_protection.take() {
+            protection.cleanup()?;
+        }
         #[cfg(unix)]
         if let Some(mut protection) = self.cargo_deny_home_protection.take() {
             protection.cleanup()?;
@@ -6048,6 +6415,10 @@ fn run_platform_gates(
     retained: &mut BTreeMap<String, Vec<u8>>,
     prepared_oracle: hell_testkit::ExecutableIdentity,
     oracle_source_sha256: &str,
+    #[cfg(unix)] dependency_policy: Option<(
+        &PosixDependencyPolicyProtection,
+        &PosixCargoDenyHomeProtection,
+    )>,
 ) -> Result<(), String> {
     let oracle_identity = prepared_oracle.clone();
     require_executable_digest(
@@ -6061,23 +6432,28 @@ fn run_platform_gates(
     }
     #[cfg(unix)]
     if platform == ReleasePlatform::LinuxX86_64 {
-        command_gate(
+        let (policy, cargo_deny_home) = dependency_policy
+            .ok_or_else(|| "Linux dependency-policy authority is absent".to_owned())?;
+        policy.validate()?;
+        cargo_deny_home.metadata.validate()?;
+        let policy_document = read_regular(&policy.path)?;
+        verify_dependency_policy_result(
+            &policy_document,
+            root,
+            &plan.resolution.candidate_sha,
+            &cargo_deny_home.metadata.sha256,
+            &policy.cargo_deny_sha256,
+        )?;
+        if policy.cargo_deny_version != TRUSTED_CARGO_DENY_VERSION {
+            return Err("dependency-policy cargo-deny version drifted".to_owned());
+        }
+        retained.insert("dependency-policy.json".to_owned(), policy_document);
+        in_process_gate(
             "dependency-policy",
-            CommandSpec::cargo_deny(Duration::from_mins(10))
-                .arguments(candidate_cargo_deny_arguments())
-                .current_directory(root),
+            Ok("verified the trusted immutable all-category dependency-policy result".to_owned()),
             gates,
             evidence,
         )?;
-        crate::release_suite::release_dependency_attestation(
-            root,
-            &output.join("dependency-policy.json"),
-            &plan.resolution.candidate_sha,
-        )?;
-        retained.insert(
-            "dependency-policy.json".to_owned(),
-            read_regular(&output.join("dependency-policy.json"))?,
-        );
         in_process_gate(
             "conformance-policy",
             crate::compatibility::release_conformance_policy(root),
@@ -7416,7 +7792,7 @@ mod tests {
     #[cfg(unix)]
     use super::{
         LINUX_ORACLE_NAME, LinuxOracleAcquisition, PosixAdapterToolPaths,
-        candidate_cargo_deny_arguments, configure_staged_cargo_home_directory_source,
+        build_dependency_policy_result, configure_staged_cargo_home_directory_source,
         copy_posix_cargo_cache_tree, normalize_candidate_cache_tree,
         normalize_candidate_owned_cache_tree, normalize_cargo_deny_cache_tree,
         posix_acl_removal_arguments, posix_adapter_authority_chain, posix_adapter_cleanup_is_exact,
@@ -7436,6 +7812,7 @@ mod tests {
         validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
         validate_posix_stack_root, validate_posix_stack_root_post_state,
         validate_staged_cargo_metadata, validate_staged_vendor_covers_frozen_lock,
+        verify_dependency_policy_result,
     };
     #[cfg(unix)]
     use std::path::Path;
@@ -7503,6 +7880,7 @@ mod tests {
                 "--all-features".into(),
                 "check".into(),
                 "advisories".into(),
+                "bans".into(),
                 "licenses".into(),
                 "sources".into(),
             ]
@@ -7510,40 +7888,14 @@ mod tests {
         let trusted_arguments =
             trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata).unwrap();
         assert!(trusted_arguments.contains(&OsString::from("advisories")));
+        assert!(trusted_arguments.contains(&OsString::from("bans")));
         assert!(trusted_arguments.contains(&OsString::from("licenses")));
         assert!(trusted_arguments.contains(&OsString::from("sources")));
-        assert!(!trusted_arguments.contains(&OsString::from("bans")));
         assert!(
             !trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata)
                 .unwrap()
                 .iter()
                 .any(|argument| argument == "--offline")
-        );
-        let candidate_arguments = candidate_cargo_deny_arguments();
-        assert_eq!(
-            candidate_arguments,
-            [
-                OsString::from("--frozen"),
-                OsString::from("--all-features"),
-                OsString::from("check"),
-                OsString::from("bans"),
-            ]
-        );
-        assert!(candidate_arguments.contains(&OsString::from("bans")));
-        assert!(!candidate_arguments.contains(&OsString::from("sources")));
-        assert!(!candidate_arguments.contains(&OsString::from("advisories")));
-        assert!(!candidate_arguments.contains(&OsString::from("licenses")));
-        assert!(candidate_arguments.contains(&OsString::from("--frozen")));
-        assert!(!candidate_arguments.contains(&OsString::from("--offline")));
-        assert!(!candidate_arguments.contains(&OsString::from("--locked")));
-        assert!(
-            !candidate_arguments.iter().any(|argument| {
-                argument == "--metadata-path"
-                    || argument
-                        .to_str()
-                        .is_some_and(|argument| argument.starts_with("--metadata-path="))
-            }),
-            "candidate argv must preserve the launcher's trusted metadata binding"
         );
         assert!(
             trusted_cargo_deny_authority_arguments(
@@ -8000,6 +8352,117 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             .unwrap(),
             ("macOS".to_owned(), "ARM64".to_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_dependency_policy_gate_does_not_spawn_cargo_deny() {
+        let source = include_str!("platform.rs");
+        assert!(!source.contains(&["fn candidate_cargo_", "deny_arguments",].concat()));
+        let start = source
+            .find("if platform == ReleasePlatform::LinuxX86_64 {\n        let (policy, cargo_deny_home)")
+            .expect("Linux dependency-policy gate marker");
+        let end = source[start..]
+            .find("in_process_gate(\n            \"conformance-policy\"")
+            .map(|offset| start + offset)
+            .expect("Linux conformance gate marker");
+        let gate = &source[start..end];
+        assert!(
+            !gate.contains("CommandSpec::cargo_deny"),
+            "candidate dependency-policy gate must verify the trusted result without spawning cargo-deny"
+        );
+        assert!(gate.contains("verify_dependency_policy_result"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_policy_result_rejects_identity_config_and_category_drift() {
+        let root = std::env::temp_dir().join(format!(
+            "hell-dependency-policy-drift-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), b"lock\n").unwrap();
+        std::fs::write(root.join("deny.toml"), b"[advisories]\n").unwrap();
+        let metadata = b"bound metadata";
+        let cargo_deny = hell_testkit::sha256_bytes(b"cargo-deny");
+        let candidate = "a".repeat(40);
+        let document =
+            build_dependency_policy_result(&root, &candidate, metadata, cargo_deny).unwrap();
+        verify_dependency_policy_result(
+            &document,
+            &root,
+            &candidate,
+            &hell_testkit::sha256_bytes(metadata),
+            &cargo_deny,
+        )
+        .unwrap();
+
+        let crate::json::JsonValue::Object(mut forged_object) =
+            crate::json::parse_json(String::from_utf8(document.clone()).unwrap().as_str()).unwrap()
+        else {
+            panic!("dependency-policy result must be an object");
+        };
+        forged_object.insert(
+            "candidateSourceCommit".to_owned(),
+            crate::json::JsonValue::String("b".repeat(40)),
+        );
+        let forged =
+            crate::json::canonical_json_bytes(&crate::json::JsonValue::Object(forged_object))
+                .unwrap();
+        assert!(
+            verify_dependency_policy_result(
+                &forged,
+                &root,
+                &candidate,
+                &hell_testkit::sha256_bytes(metadata),
+                &cargo_deny,
+            )
+            .is_err()
+        );
+
+        let crate::json::JsonValue::Object(mut partial_object) =
+            crate::json::parse_json(String::from_utf8(document.clone()).unwrap().as_str()).unwrap()
+        else {
+            panic!("dependency-policy result must be an object");
+        };
+        let crate::json::JsonValue::Array(mut categories) =
+            partial_object.remove("categories").unwrap()
+        else {
+            panic!("dependency-policy categories must be an array");
+        };
+        categories.remove(1);
+        partial_object.insert(
+            "categories".to_owned(),
+            crate::json::JsonValue::Array(categories),
+        );
+        let partial =
+            crate::json::canonical_json_bytes(&crate::json::JsonValue::Object(partial_object))
+                .unwrap();
+        assert!(
+            verify_dependency_policy_result(
+                &partial,
+                &root,
+                &candidate,
+                &hell_testkit::sha256_bytes(metadata),
+                &cargo_deny,
+            )
+            .is_err()
+        );
+
+        std::fs::write(root.join("deny.toml"), b"[advisories-v2]\n").unwrap();
+        assert!(
+            verify_dependency_policy_result(
+                &document,
+                &root,
+                &candidate,
+                &hell_testkit::sha256_bytes(metadata),
+                &cargo_deny,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

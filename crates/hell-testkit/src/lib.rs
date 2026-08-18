@@ -1113,26 +1113,19 @@ pub fn configure_windows_restricted_child_path(
 ///
 /// # Errors
 ///
-/// Returns an error if PATH or SystemRoot differs from its bound parent value,
-/// is removed or duplicated, or if any bound directory identity changed.
+/// Returns an error if the mapped-tool PATH or SystemRoot differs from its
+/// bound parent value, is removed or duplicated, or if any bound directory
+/// identity changed.
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn configure_windows_restricted_child_environment(
     toolchain: &WindowsToolchainAuthority,
     environment: &mut Vec<(OsString, Option<OsString>)>,
-    requires_trusted_loader_environment: bool,
+    requires_trusted_path: bool,
 ) -> std::io::Result<()> {
-    configure_windows_restricted_child_path(
-        toolchain,
-        environment,
-        requires_trusted_loader_environment,
-    )?;
+    configure_windows_restricted_child_path(toolchain, environment, requires_trusted_path)?;
     toolchain.system_root.revalidate()?;
-    configure_windows_standard_system_root_value(
-        environment,
-        &toolchain.system_root.value,
-        requires_trusted_loader_environment,
-    )
+    configure_windows_standard_system_root_value(environment, &toolchain.system_root.value, true)
 }
 
 #[cfg(windows)]
@@ -15314,6 +15307,226 @@ impl Iterator for DeterministicUtf8 {
             }
             text
         })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_restricted_environment_tests {
+    use super::{
+        Command, WindowsLaunchAuthorities, WindowsToolchainAuthority,
+        WindowsToolchainExecutableAuthority, configure_windows_restricted_child_environment,
+        decode_windows_argv, sha256_file,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct Fixture {
+        root: PathBuf,
+        stack: PathBuf,
+        cargo_proxy: PathBuf,
+        staged_cargo: PathBuf,
+        restricted_path: OsString,
+        system_root: OsString,
+        toolchain: WindowsToolchainAuthority,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "hell-windows-restricted-environment-{}-{label}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            let tool_file = |directory: &str, name: &str, bytes: &[u8]| {
+                let directory = root.join(directory);
+                fs::create_dir_all(&directory).unwrap();
+                let path = directory.join(name);
+                fs::write(&path, bytes).unwrap();
+                fs::canonicalize(path).unwrap()
+            };
+            let cargo_proxy = tool_file("proxy-cargo", "cargo.exe", b"cargo proxy");
+            let rustc_proxy = tool_file("proxy-rustc", "rustc.exe", b"rustc proxy");
+            let source_cargo = tool_file("source-cargo", "cargo.exe", b"cargo");
+            let staged_cargo = tool_file("stage/bin", "cargo.exe", b"cargo");
+            let source_rustc = tool_file("source-rustc", "rustc.exe", b"rustc");
+            let staged_rustc = tool_file("stage/bin", "rustc.exe", b"rustc");
+            let stack = tool_file("unmapped", "stack.exe", b"stack");
+            let launcher = tool_file("launch", "hell-ci.exe", b"launcher");
+            let adapter = tool_file("launch", "hell-test-helper.exe", b"adapter");
+            let first = cargo_proxy.parent().unwrap().to_path_buf();
+            let second = source_cargo.parent().unwrap().to_path_buf();
+            let system32 = tool_file("Windows/System32", "kernel32.dll", b"system kernel")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let system_root_path = system32.parent().unwrap().to_path_buf();
+            let entries = vec![
+                first.clone(),
+                second,
+                first,
+                system32,
+                system_root_path.clone(),
+            ];
+            let trusted_path = std::env::join_paths(&entries).unwrap();
+            let system_root = system_root_path.into_os_string();
+            let (inventory_root, inventory_files, inventory_directories) =
+                inventory(&root.join("stage"));
+            let mapping = |proxy: &Path, source: &Path, staged: &Path| {
+                WindowsToolchainExecutableAuthority::rustup_proxy(
+                    proxy.to_path_buf(),
+                    proxy.to_path_buf(),
+                    source.to_path_buf(),
+                    staged.to_path_buf(),
+                )
+            };
+            let toolchain = WindowsToolchainAuthority::new(
+                mapping(&cargo_proxy, &source_cargo, &staged_cargo),
+                mapping(&rustc_proxy, &source_rustc, &staged_rustc),
+                inventory_root,
+                inventory_files,
+                inventory_directories,
+                trusted_path.clone(),
+                system_root.clone(),
+            )
+            .unwrap();
+            let restricted_path = toolchain.restricted_child_path(&trusted_path).unwrap();
+
+            Self {
+                root,
+                stack,
+                cargo_proxy,
+                staged_cargo,
+                restricted_path,
+                system_root,
+                toolchain,
+            }
+        }
+
+        fn launch_authorities(&self, label: &str) -> WindowsLaunchAuthorities {
+            let launcher = self.root.join(format!("{label}-hell-ci.exe"));
+            let adapter = self.root.join(format!("{label}-hell-test-helper.exe"));
+            fs::write(&launcher, b"launcher").unwrap();
+            fs::write(&adapter, b"adapter").unwrap();
+            WindowsLaunchAuthorities::new(
+                launcher,
+                sha256_file(&launcher).unwrap(),
+                adapter,
+                sha256_file(&adapter).unwrap(),
+                self.toolchain.clone(),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn inventory(root: &Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
+        let root = fs::canonicalize(root).unwrap();
+        let mut files = Vec::new();
+        let mut directories = vec![root.clone()];
+        let mut pending = vec![root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = fs::canonicalize(entry.unwrap().path()).unwrap();
+                if path.is_dir() {
+                    directories.push(path.clone());
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        (root, files, directories)
+    }
+
+    fn explicit_environment(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
+        command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(|value| value.to_owned())))
+            .collect()
+    }
+
+    #[test]
+    fn unmapped_stack_launch_keeps_system_root_without_inheriting_path() {
+        let fixture = Fixture::new("unmapped");
+        let authorities = fixture.launch_authorities("unmapped");
+        let mut command = Command::new(&fixture.stack);
+        authorities.wrap(&mut command, None).unwrap();
+        let environment = explicit_environment(&command);
+
+        assert_eq!(environment.len(), 1);
+        assert_eq!(
+            environment.get(OsStr::new("PATH")).map(Option::as_ref),
+            None
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("SystemRoot"))
+                .map(Option::as_ref),
+            Some(Some(fixture.system_root.as_os_str()))
+        );
+    }
+
+    #[test]
+    fn mapped_cargo_launch_rewrites_path_and_keeps_system_root() {
+        let fixture = Fixture::new("mapped");
+        let authorities = fixture.launch_authorities("mapped");
+        let mut command = Command::new(&fixture.cargo_proxy);
+        authorities.wrap(&mut command, None).unwrap();
+        let environment = explicit_environment(&command);
+
+        assert_eq!(environment.len(), 2);
+        assert_eq!(
+            environment.get(OsStr::new("PATH")).map(Option::as_ref),
+            Some(Some(fixture.restricted_path.as_os_str()))
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("SystemRoot"))
+                .map(Option::as_ref),
+            Some(Some(fixture.system_root.as_os_str()))
+        );
+        let encoded = command.get_args().nth(1).unwrap();
+        let target = decode_windows_argv(encoded).unwrap()[2].clone();
+        assert_eq!(target, fixture.staged_cargo.as_os_str());
+    }
+
+    #[test]
+    fn malformed_system_root_is_rejected_for_unmapped_launches() {
+        let fixture = Fixture::new("malformed");
+        let rejected = [
+            vec![(OsString::from("SystemRoot"), None)],
+            vec![(
+                OsString::from("SystemRoot"),
+                Some(OsString::from(r"D:\ForgedWindows")),
+            )],
+            vec![(OsString::from("SystemRoot"), Some(OsString::new()))],
+            vec![
+                (
+                    OsString::from("SystemRoot"),
+                    Some(fixture.system_root.clone()),
+                ),
+                (
+                    OsString::from("SYSTEMROOT"),
+                    Some(fixture.system_root.clone()),
+                ),
+            ],
+        ];
+        for mut environment in rejected {
+            assert!(
+                configure_windows_restricted_child_environment(
+                    &fixture.toolchain,
+                    &mut environment,
+                    false,
+                )
+                .is_err()
+            );
+        }
     }
 }
 
