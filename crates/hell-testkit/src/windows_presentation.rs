@@ -1,10 +1,12 @@
 //! Exact Windows upstream-presentation dialect authority.
 
-#[cfg(windows)]
-use super::{CausalSignal, CoverageEvent, DifferentialMismatch, Observation, SemanticObservation};
+#[cfg(any(windows, test))]
+use super::{CausalSignal, CoverageEvent, SemanticObservation};
 use super::{
     ClaimPlatform, DifferentialCase, DifferentialComparisonProjection, Digest, MismatchKind,
 };
+#[cfg(windows)]
+use super::{DifferentialMismatch, Observation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsPresentationField {
@@ -38,6 +40,8 @@ struct WindowsPresentationAuthority {
     candidate_sha256: &'static str,
     oracle_bytes: u64,
     candidate_bytes: u64,
+    oracle_sandbox: Option<&'static str>,
+    adapter_causal_coverage: bool,
 }
 
 impl WindowsPresentationAuthority {
@@ -56,6 +60,51 @@ impl WindowsPresentationAuthority {
             candidate_sha256,
             oracle_bytes,
             candidate_bytes,
+            oracle_sandbox: None,
+            adapter_causal_coverage: false,
+        }
+    }
+
+    const fn new_with_variable_oracle_sandbox(
+        case_id: &'static str,
+        field: WindowsPresentationField,
+        oracle_sha256: &'static str,
+        candidate_sha256: &'static str,
+        oracle_bytes: u64,
+        candidate_bytes: u64,
+        oracle_sandbox: &'static str,
+    ) -> Self {
+        Self {
+            oracle_sandbox: Some(oracle_sandbox),
+            ..Self::new(
+                case_id,
+                field,
+                oracle_sha256,
+                candidate_sha256,
+                oracle_bytes,
+                candidate_bytes,
+            )
+        }
+    }
+
+    const fn new_with_reviewed_adapter_causal_coverage(
+        case_id: &'static str,
+        field: WindowsPresentationField,
+        oracle_sha256: &'static str,
+        candidate_sha256: &'static str,
+        oracle_bytes: u64,
+        candidate_bytes: u64,
+    ) -> Self {
+        Self {
+            adapter_causal_coverage: true,
+            ..Self::new(
+                case_id,
+                field,
+                oracle_sha256,
+                candidate_sha256,
+                oracle_bytes,
+                candidate_bytes,
+            )
         }
     }
 }
@@ -321,45 +370,50 @@ const WINDOWS_PRESENTATION_AUTHORITIES: &[WindowsPresentationAuthority] = &[
         104,
         94,
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-create-directory-failure",
         WindowsPresentationField::Stderr,
         "5f72b449df6301051020f7d1d28d470c4f65e0f337aeb90bbaf5871f66db89c7",
         "1d0379db15acb6699adfddcee5fd762d5446f7a6e5a97e5f080d490e8601edd8",
         190,
         55,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2166-oracle",
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-create-directory-if-missing-failure",
         WindowsPresentationField::Stderr,
         "9f609c225513eb8133730562a79c928554f416651759fd351e9a41c1a85dc6af",
         "84aeb1a6d243b39ac57d31547033887fb49c69115ba26596daea3772db8739b8",
         213,
         83,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2170-oracle",
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-get-file-size-failure",
         WindowsPresentationField::Stderr,
         "fe2897c210b426beb8a7b9254c56a65dbe102dfb2766bdc64bddb8aa8574a035",
         "714548326ee71324c7e9a04646d62a387ee234e2ecc22b8ef57f39fbaa43c1c7",
         211,
         89,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2174-oracle",
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-remove-file-failure",
         WindowsPresentationField::Stderr,
         "a9cba525357b7ea048b4af25b6acdbc567c3f15d50dc99cf0cead8390895fc99",
         "dc56fe58beb4cf06a14cc12d9346b63dc30858f3f6b31d4a5ec87cfed449e351",
         199,
         74,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2178-oracle",
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-rename-file-failure",
         WindowsPresentationField::Stderr,
         "7357b47394e0ecfdd8aae8c340910c5cd668cdc18ce4d9b9bd6847e0ab490583",
         "5579b01abfb4f1e982c2c4d81135f64b7184f78851d977374bc6d739e2ca2d64",
         328,
         109,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2182-oracle",
     ),
     WindowsPresentationAuthority::new(
         "runtime-directory-list-directory-failure",
@@ -369,13 +423,14 @@ const WINDOWS_PRESENTATION_AUTHORITIES: &[WindowsPresentationAuthority] = &[
         116,
         94,
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_variable_oracle_sandbox(
         "runtime-directory-remove-directory-failure",
         WindowsPresentationField::Stderr,
         "a40d2ebd6ba5c320be872eb37acbb0a50df58b02687d62893af20aa68ff0c55f",
         "21594ac231ee86bf25286c221fb177f9c8ca1b367f4aec19645176bae2dc2d8f",
         196,
         75,
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\hell-rs-differential-8352-2190-oracle",
     ),
     WindowsPresentationAuthority::new(
         "runtime-directory-set-current-directory-failure",
@@ -969,7 +1024,7 @@ const WINDOWS_PRESENTATION_AUTHORITIES: &[WindowsPresentationAuthority] = &[
         114,
         107,
     ),
-    WindowsPresentationAuthority::new(
+    WindowsPresentationAuthority::new_with_reviewed_adapter_causal_coverage(
         "runtime-interaction-http-stream-disconnect",
         WindowsPresentationField::Stderr,
         "50cac504ce055439bf141d98894092ec620d710730dc9880b450b0eeb20269fe",
@@ -979,12 +1034,12 @@ const WINDOWS_PRESENTATION_AUTHORITIES: &[WindowsPresentationAuthority] = &[
     ),
 ];
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn target_platform_is_windows(platforms: &[ClaimPlatform]) -> bool {
     platforms.contains(&ClaimPlatform::All) || platforms.contains(&ClaimPlatform::Windows)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn semantic_causality_matches(
     signal: CausalSignal,
     builtin: super::BuiltinId,
@@ -1034,8 +1089,42 @@ fn semantic_causality_matches(
     }
 }
 
+#[cfg(any(windows, test))]
+fn coverage_event_builtin(event: &CoverageEvent) -> super::BuiltinId {
+    match event {
+        CoverageEvent::ParsedBuiltin(builtin)
+        | CoverageEvent::ResolvedBuiltin(builtin)
+        | CoverageEvent::SpecializedBuiltin(builtin)
+        | CoverageEvent::EnteredAdapter(builtin)
+        | CoverageEvent::ForcedArgument(builtin, _)
+        | CoverageEvent::ExecutedEffect(builtin, _)
+        | CoverageEvent::TaskEvent(builtin, _)
+        | CoverageEvent::AcquiredResource(builtin, _)
+        | CoverageEvent::PresentedField(builtin, _) => *builtin,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_semantic_causality_matches(
+    signal: CausalSignal,
+    builtin: super::BuiltinId,
+    semantic: &SemanticObservation,
+    allow_adapter_coverage: bool,
+) -> bool {
+    semantic_causality_matches(signal, builtin, semantic)
+        || (allow_adapter_coverage
+            && semantic
+                .coverage
+                .iter()
+                .any(|event| coverage_event_builtin(event) == builtin))
+}
+
 #[cfg(windows)]
-fn case_has_windows_semantic_causality(case: &DifferentialCase, candidate: &Observation) -> bool {
+fn case_has_windows_semantic_causality(
+    case: &DifferentialCase,
+    candidate: &Observation,
+    allow_adapter_coverage: bool,
+) -> bool {
     let Some(descriptor) = case.claim_evidence.as_ref() else {
         return false;
     };
@@ -1049,9 +1138,52 @@ fn case_has_windows_semantic_causality(case: &DifferentialCase, candidate: &Obse
         && descriptor.semantic_targets.iter().any(|target| {
             target_platform_is_windows(&target.platforms)
                 && hell_builtins::lookup(&target.builtin).is_some_and(|spec| {
-                    semantic_causality_matches(target.causal_signal, spec.id, semantic)
+                    windows_semantic_causality_matches(
+                        target.causal_signal,
+                        spec.id,
+                        semantic,
+                        allow_adapter_coverage,
+                    )
                 })
         })
+}
+
+#[cfg(any(windows, test))]
+fn canonical_reviewed_oracle_stderr(
+    stderr: &[u8],
+    actual_sandbox: &str,
+    authority_sandbox: &str,
+) -> Vec<u8> {
+    let mut canonical = stderr.to_vec();
+    let extended_actual = format!("\\\\?\\{actual_sandbox}");
+    let extended_authority = format!("\\\\?\\{authority_sandbox}");
+    for (actual, authority) in [
+        (extended_actual, extended_authority),
+        (actual_sandbox.to_owned(), authority_sandbox.to_owned()),
+    ] {
+        for (actual, authority) in [
+            (actual.as_bytes(), authority.as_bytes()),
+            (
+                &super::haskell_show_path(actual.as_bytes()),
+                &super::haskell_show_path(authority.as_bytes()),
+            ),
+        ] {
+            canonical = super::replace_all(&canonical, actual, authority);
+        }
+    }
+    canonical
+}
+
+#[cfg(windows)]
+fn reviewed_oracle_stderr_identity(
+    authority_sandbox: &str,
+    oracle: &Observation,
+) -> Option<(super::Digest, u64)> {
+    let stderr = oracle.stderr.complete.as_ref()?;
+    let actual_sandbox = oracle.normalizer_sandbox.to_str()?;
+    let canonical = canonical_reviewed_oracle_stderr(stderr, actual_sandbox, authority_sandbox);
+    let bytes = u64::try_from(canonical.len()).ok()?;
+    Some((super::sha256_bytes(&canonical), bytes))
 }
 
 #[cfg(windows)]
@@ -1083,16 +1215,16 @@ pub fn reviewed_windows_presentation_projection(
     candidate: &Observation,
     mismatches: &[DifferentialMismatch],
 ) -> Option<DifferentialComparisonProjection> {
-    if platform != ClaimPlatform::Windows
-        || mismatches.len() != 1
-        || !observations_are_bound(case, oracle, candidate)
-        || !case_has_windows_semantic_causality(case, candidate)
-    {
-        return None;
-    }
     let authority = WINDOWS_PRESENTATION_AUTHORITIES
         .iter()
         .find(|authority| authority.case_id == case.id.as_ref())?;
+    if platform != ClaimPlatform::Windows
+        || mismatches.len() != 1
+        || !observations_are_bound(case, oracle, candidate)
+        || !case_has_windows_semantic_causality(case, candidate, authority.adapter_causal_coverage)
+    {
+        return None;
+    }
     let mismatch = &mismatches[0];
     if mismatch.kind != authority.field.mismatch_kind() {
         return None;
@@ -1103,9 +1235,15 @@ pub fn reviewed_windows_presentation_projection(
     };
     let oracle_sha256 = Digest::from_hex(authority.oracle_sha256).ok()?;
     let candidate_sha256 = Digest::from_hex(authority.candidate_sha256).ok()?;
-    if oracle_capture.sha256 != oracle_sha256
+    let (oracle_sha256_observed, oracle_bytes_observed) =
+        if let Some(authority_sandbox) = authority.oracle_sandbox {
+            reviewed_oracle_stderr_identity(authority_sandbox, oracle)?
+        } else {
+            (oracle_capture.sha256, oracle_capture.total_bytes)
+        };
+    if oracle_sha256_observed != oracle_sha256
         || candidate_capture.sha256 != candidate_sha256
-        || oracle_capture.total_bytes != authority.oracle_bytes
+        || oracle_bytes_observed != authority.oracle_bytes
         || candidate_capture.total_bytes != authority.candidate_bytes
     {
         return None;
@@ -1129,6 +1267,11 @@ pub fn retained_windows_presentation_projection(
     let authority = WINDOWS_PRESENTATION_AUTHORITIES
         .iter()
         .find(|authority| authority.case_id == case.id.as_ref())?;
+    if authority.oracle_sandbox == Some("")
+        || (authority.oracle_sandbox.is_some() && authority.adapter_causal_coverage)
+    {
+        return None;
+    }
     let [(kind, oracle_sha256, candidate_sha256, oracle_bytes, candidate_bytes)] = mismatches
     else {
         return None;
@@ -1160,6 +1303,52 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn variable_oracle_sandbox_is_canonicalized_in_both_path_dialects() {
+        let actual = r"C:\Temp\hell-current-oracle";
+        let reviewed = r"C:\Temp\hell-reviewed-oracle";
+        let direct = br"CreateDirectory \\?\C:\Temp\hell-current-oracle: failed";
+        let escaped = br"CreateDirectory \\\\?\\C:\\Temp\\hell-current-oracle: failed";
+
+        let canonical_direct = canonical_reviewed_oracle_stderr(direct, actual, reviewed);
+        let canonical_escaped = canonical_reviewed_oracle_stderr(escaped, actual, reviewed);
+
+        assert_eq!(
+            canonical_direct,
+            br"CreateDirectory \\?\C:\Temp\hell-reviewed-oracle: failed".to_vec()
+        );
+        assert_eq!(
+            canonical_escaped,
+            br"CreateDirectory \\\\?\\C:\\Temp\\hell-reviewed-oracle: failed".to_vec()
+        );
+    }
+
+    #[test]
+    fn http_windows_causality_accepts_reviewed_adapter_coverage() {
+        let case = super::super::corpus::committed_differential_cases()
+            .into_iter()
+            .find(|case| case.id.as_ref() == "runtime-interaction-http-stream-disconnect")
+            .expect("reviewed HTTP interaction case");
+        let descriptor = case.claim_evidence.as_ref().expect("HTTP descriptor");
+        let broad_causal_coverage = descriptor.semantic_targets.iter().any(|target| {
+            target_platform_is_windows(&target.platforms)
+                && hell_builtins::lookup(&target.builtin).is_some_and(|spec| {
+                    let semantic = SemanticObservation {
+                        coverage: vec![CoverageEvent::EnteredAdapter(spec.id)],
+                        ..SemanticObservation::default()
+                    };
+                    !semantic_causality_matches(target.causal_signal, spec.id, &semantic)
+                        && windows_semantic_causality_matches(
+                            target.causal_signal,
+                            spec.id,
+                            &semantic,
+                            true,
+                        )
+                })
+        });
+        assert!(broad_causal_coverage);
+    }
 
     #[test]
     fn exact_e219_windows_authority_projects_114_presentation_cases_only() {

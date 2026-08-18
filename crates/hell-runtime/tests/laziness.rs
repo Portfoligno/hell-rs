@@ -934,14 +934,18 @@ fn assert_directory_error(
 fn directory_os_errors_match_the_pinned_operation_and_guest_path_presentations() {
     for (label, source, internal, operation, path, target, rendered) in [
         (
-            "copy",
-            "main = Directory.copyFile \"missing.txt\" \"target.txt\"\n",
+            // A source in a missing directory still fails on Windows.  A
+            // directly missing source is the reviewed directory 1.3.8.1
+            // Windows empty-pair postcondition and is covered separately.
+            "copy-missing-parent",
+            "main = Directory.copyFile \"missing/source.txt\" \"target.txt\"\n",
             "Directory.copyFile",
             RuntimeDirectoryOperation::CopyFile,
-            "missing.txt",
+            "missing/source.txt",
             Some("target.txt"),
             concat!(
-                "hell: missing.txt: copyFile:atomicCopyFileContents:withReplacementFile:",
+                "hell: missing/source.txt: copyFile:atomicCopyFileContents:",
+                "withReplacementFile:",
                 "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
             ),
         ),
@@ -1041,18 +1045,49 @@ fn set_current_directory_error_uses_the_pinned_guest_path_presentation() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_missing_source_copy_file_retains_the_pinned_empty_pair_postcondition() {
+    let directory = std::env::temp_dir().join(format!(
+        "hell-rs-windows-copy-missing-{}",
+        std::process::id()
+    ));
+    let _already_absent = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+
+    assert_eq!(
+        run_in(
+            "main = Directory.copyFile \"missing.txt\" \"target.txt\"\n",
+            directory.clone(),
+            true,
+        )
+        .unwrap(),
+        ""
+    );
+    let source = std::fs::metadata(directory.join("missing.txt")).unwrap();
+    let target = std::fs::metadata(directory.join("target.txt")).unwrap();
+    assert!(source.is_file());
+    assert!(target.is_file());
+    assert_eq!(source.len(), 0);
+    assert_eq!(target.len(), 0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn directory_error_presentations_are_dynamic_and_other_error_kinds_remain_generic() {
     for (label, source, internal, operation, path, target, rendered) in [
         (
-            "copy-alternate",
-            "main = Directory.copyFile \"other-source\" \"other-target\"\n",
+            // Keep the alternate-path proof outside the reviewed Windows
+            // missing-source success postcondition.
+            "copy-alternate-missing-parent",
+            "main = Directory.copyFile \"other-missing/other-source\" \"other-target\"\n",
             "Directory.copyFile",
             RuntimeDirectoryOperation::CopyFile,
-            "other-source",
+            "other-missing/other-source",
             Some("other-target"),
             concat!(
-                "hell: other-source: copyFile:atomicCopyFileContents:withReplacementFile:",
+                "hell: other-missing/other-source: copyFile:atomicCopyFileContents:",
+                "withReplacementFile:",
                 "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
             ),
         ),
