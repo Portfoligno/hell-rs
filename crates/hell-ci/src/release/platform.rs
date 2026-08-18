@@ -1364,14 +1364,20 @@ fn stage_posix_cargo_deny_home(
         .map_err(|error| format!("cannot reserve candidate cargo-deny home: {error}"))?;
     let copy_result = (|| {
         let mut seed = TrustedCargoCacheSeed::create(platform)?;
-        seed.fetch(cargo, candidate_root, candidate_sha)?;
-        let policy_document = fs::read(seed.root().join("dependency-policy.json"))
-            .map_err(|error| format!("cannot read trusted dependency-policy result: {error}"))?;
+        seed.fetch(cargo, candidate_root)?;
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
         copy_posix_cargo_cache_tree(seed.root(), &home, &mut entries, &mut bytes)?;
         remove_staged_cargo_package_fallback(&home)?;
         let metadata = seed.prove_staged_home_offline(cargo, candidate_root, &home)?;
+        let final_metadata =
+            replace_final_home_cargo_deny_metadata(candidate_root, &home, &metadata)?;
+        let policy_document = run_final_home_cargo_deny_authority_checks(
+            cargo,
+            candidate_root,
+            candidate_sha,
+            &final_metadata,
+        )?;
         let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
             stage_posix_cargo_deny_metadata(platform, sudo, &tools, &metadata, trusted_owner)?;
@@ -1393,6 +1399,12 @@ fn stage_posix_cargo_deny_home(
             trusted_group_id,
             &advisory_lock,
         )?;
+        if metadata.sha256 != final_metadata.sha256 {
+            return Err(
+                "retained cargo-deny metadata differs from its final-home input".to_owned(),
+            );
+        }
+        final_metadata.validate()?;
         seed.cleanup()?;
         Ok((metadata, advisory_lock, policy))
     })();
@@ -1863,7 +1875,6 @@ impl TrustedCargoCacheSeed {
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
         candidate_root: &Path,
-        candidate_sha: &str,
     ) -> Result<(), String> {
         let manifest = candidate_root.join("Cargo.toml");
         let manifest_identity = TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.toml")?;
@@ -1906,18 +1917,13 @@ impl TrustedCargoCacheSeed {
         }
         fs::write(&metadata_path, &metadata.stdout)
             .map_err(|error| format!("cannot write trusted cargo-deny metadata seed: {error}"))?;
-        let policy = self.run_cargo_deny_authority_checks(
+        run_trusted_cargo_deny_authority_checks(
             cargo,
             candidate_root,
-            candidate_sha,
+            &self.root,
             &metadata_path,
+            &metadata.stdout,
         )?;
-        let policy_path = self.root.join("dependency-policy.json");
-        if fs::symlink_metadata(&policy_path).is_ok() {
-            return Err("trusted dependency-policy result already exists".to_owned());
-        }
-        fs::write(&policy_path, &policy)
-            .map_err(|error| format!("cannot write trusted dependency-policy result: {error}"))?;
         self.revalidate_inputs(
             cargo,
             candidate_root,
@@ -1953,60 +1959,6 @@ impl TrustedCargoCacheSeed {
             return Err("trusted Cargo lock changed during vendor materialization".to_owned());
         }
         validate_staged_vendor_covers_frozen_lock(&lock_document, &vendor)
-    }
-
-    fn run_cargo_deny_authority_checks(
-        &self,
-        cargo: &crate::command::ResolvedCargoExecutable,
-        candidate_root: &Path,
-        candidate_sha: &str,
-        metadata: &Path,
-    ) -> Result<Vec<u8>, String> {
-        self.validate()?;
-        let cargo_deny =
-            crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("cargo-deny"))?;
-        let cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
-            .map_err(|error| format!("cannot hash trusted cargo-deny authority: {error}"))?;
-        let version = tool_output(
-            CommandSpec::cargo_deny(Duration::from_secs(30))
-                .argument("--version")
-                .current_directory(candidate_root)
-                .environment("CARGO_HOME", self.root.as_os_str()),
-            "cargo-deny",
-        )?;
-        if version != format!("cargo-deny {TRUSTED_CARGO_DENY_VERSION}") {
-            return Err("trusted cargo-deny authority version differs from policy".to_owned());
-        }
-        let result = crate::command::CommandSpec::cargo_deny(Duration::from_mins(10))
-            .arguments(trusted_cargo_deny_authority_arguments(
-                &self.root, metadata,
-            )?)
-            .current_directory(candidate_root)
-            .environment("CARGO", cargo.invocation_path().as_os_str().to_owned())
-            .environment("CARGO_HOME", self.root.as_os_str())
-            .environment("CARGO_TARGET_DIR", self.root.join("target"))
-            .run()
-            .map_err(|error| format!("cannot run trusted cargo-deny authority checks: {error}"))?;
-        if result.timed_out || !result.status.success() {
-            return Err(format!(
-                "trusted cargo-deny authority checks failed with status {}",
-                result.status.code().unwrap_or(1)
-            ));
-        }
-        let observed_cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
-            .map_err(|error| format!("cannot rehash trusted cargo-deny authority: {error}"))?;
-        if observed_cargo_deny_sha256 != cargo_deny_sha256 {
-            return Err("trusted cargo-deny authority changed during policy checks".to_owned());
-        }
-        self.validate()?;
-        let metadata_document = fs::read(metadata)
-            .map_err(|error| format!("cannot read trusted cargo-deny metadata: {error}"))?;
-        build_dependency_policy_result(
-            candidate_root,
-            candidate_sha,
-            &metadata_document,
-            cargo_deny_sha256,
-        )
     }
 
     fn run_cargo(
@@ -2393,6 +2345,166 @@ fn validate_staged_vendor_covers_frozen_lock(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_cargo_deny_metadata_document(
+    cargo_home: &Path,
+    metadata: &Path,
+    document: &[u8],
+) -> Result<hell_testkit::Digest, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    trusted_cargo_deny_authority_arguments(cargo_home, metadata)?;
+    let file_metadata = fs::symlink_metadata(metadata)
+        .map_err(|error| format!("cannot inspect trusted cargo-deny metadata: {error}"))?;
+    if file_metadata.file_type().is_symlink()
+        || !file_metadata.is_file()
+        || file_metadata.nlink() != 1
+        || fs::canonicalize(metadata)
+            .map_err(|error| format!("cannot canonicalize trusted cargo-deny metadata: {error}"))?
+            != metadata
+    {
+        return Err("trusted cargo-deny metadata is redirected or linked".to_owned());
+    }
+    let observed = fs::read(metadata)
+        .map_err(|error| format!("cannot read trusted cargo-deny metadata: {error}"))?;
+    let sha256 = hell_testkit::sha256_bytes(document);
+    if observed != document
+        || hell_testkit::sha256_file(metadata)
+            .map_err(|error| format!("cannot hash trusted cargo-deny metadata: {error}"))?
+            != sha256
+    {
+        return Err("trusted cargo-deny metadata differs from its captured bytes".to_owned());
+    }
+    Ok(sha256)
+}
+
+#[cfg(unix)]
+fn run_trusted_cargo_deny_authority_checks(
+    cargo: &crate::command::ResolvedCargoExecutable,
+    candidate_root: &Path,
+    cargo_home: &Path,
+    metadata: &Path,
+    metadata_document: &[u8],
+) -> Result<hell_testkit::Digest, String> {
+    let metadata_sha256 =
+        validate_cargo_deny_metadata_document(cargo_home, metadata, metadata_document)?;
+    let cargo_deny =
+        crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("cargo-deny"))?;
+    let cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
+        .map_err(|error| format!("cannot hash trusted cargo-deny authority: {error}"))?;
+    let version = tool_output(
+        CommandSpec::cargo_deny(Duration::from_secs(30))
+            .argument("--version")
+            .current_directory(candidate_root)
+            .environment("CARGO_HOME", cargo_home.as_os_str()),
+        "cargo-deny",
+    )?;
+    if version != format!("cargo-deny {TRUSTED_CARGO_DENY_VERSION}") {
+        return Err("trusted cargo-deny authority version differs from policy".to_owned());
+    }
+    let result = CommandSpec::cargo_deny(Duration::from_mins(10))
+        .arguments(trusted_cargo_deny_authority_arguments(
+            cargo_home, metadata,
+        )?)
+        .current_directory(candidate_root)
+        .environment("CARGO", cargo.invocation_path().as_os_str().to_owned())
+        .environment("CARGO_HOME", cargo_home.as_os_str())
+        .environment("CARGO_TARGET_DIR", cargo_home.join("target"))
+        .run()
+        .map_err(|error| format!("cannot run trusted cargo-deny authority checks: {error}"))?;
+    if result.timed_out || !result.status.success() {
+        return Err(format!(
+            "trusted cargo-deny authority checks failed with status {}",
+            result.status.code().unwrap_or(1)
+        ));
+    }
+    let observed_cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
+        .map_err(|error| format!("cannot rehash trusted cargo-deny authority: {error}"))?;
+    let observed_metadata_sha256 =
+        validate_cargo_deny_metadata_document(cargo_home, metadata, metadata_document)?;
+    if observed_cargo_deny_sha256 != cargo_deny_sha256
+        || observed_metadata_sha256 != metadata_sha256
+    {
+        return Err("trusted cargo-deny authority changed during policy checks".to_owned());
+    }
+    Ok(cargo_deny_sha256)
+}
+
+#[cfg(unix)]
+struct FinalCargoDenyMetadata {
+    home: PathBuf,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    sha256: hell_testkit::Digest,
+}
+
+#[cfg(unix)]
+impl FinalCargoDenyMetadata {
+    fn validate(&self) -> Result<(), String> {
+        let observed_sha256 =
+            validate_cargo_deny_metadata_document(&self.home, &self.path, &self.bytes)?;
+        if observed_sha256 != self.sha256 {
+            return Err("captured final-home cargo-deny metadata digest changed".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn replace_final_home_cargo_deny_metadata(
+    candidate_root: &Path,
+    home: &Path,
+    document: &[u8],
+) -> Result<FinalCargoDenyMetadata, String> {
+    validate_staged_cargo_metadata(document, candidate_root, home)?;
+    let path = home.join("hell-cargo-deny-metadata.json");
+    let prior = fs::read(&path)
+        .map_err(|error| format!("cannot read copied cargo-deny metadata seed: {error}"))?;
+    validate_cargo_deny_metadata_document(home, &path, &prior)?;
+    fs::write(&path, document)
+        .map_err(|error| format!("cannot write final-home cargo-deny metadata: {error}"))?;
+    let sha256 = validate_cargo_deny_metadata_document(home, &path, document)?;
+    validate_trusted_cargo_cache_tree(home)?;
+    Ok(FinalCargoDenyMetadata {
+        home: home.to_path_buf(),
+        path,
+        bytes: document.to_vec(),
+        sha256,
+    })
+}
+
+#[cfg(unix)]
+fn run_final_home_cargo_deny_authority_checks(
+    cargo: &crate::command::ResolvedCargoExecutable,
+    candidate_root: &Path,
+    candidate_sha: &str,
+    metadata: &FinalCargoDenyMetadata,
+) -> Result<Vec<u8>, String> {
+    let cargo_deny_sha256 = run_trusted_cargo_deny_authority_checks(
+        cargo,
+        candidate_root,
+        &metadata.home,
+        &metadata.path,
+        &metadata.bytes,
+    )?;
+    metadata.validate()?;
+    validate_trusted_cargo_cache_tree(&metadata.home)?;
+    let policy = build_dependency_policy_result(
+        candidate_root,
+        candidate_sha,
+        &metadata.bytes,
+        cargo_deny_sha256,
+    )?;
+    verify_dependency_policy_result(
+        &policy,
+        candidate_root,
+        candidate_sha,
+        &metadata.sha256,
+        &cargo_deny_sha256,
+    )?;
+    Ok(policy)
 }
 
 #[cfg(unix)]
@@ -7802,17 +7914,17 @@ mod tests {
         posix_rustup_cleanup_is_exact, posix_rustup_inventory_cost,
         posix_rustup_selected_inventory, posix_source_cleanup_is_exact, posix_stack_root_is_exact,
         posix_stack_work_is_exact, remove_staged_cargo_package_fallback,
-        require_exact_directory_members, require_inventory_snapshot,
-        require_posix_archive_adapter_transition_state, reserve_posix_cargo_deny_advisory_lock,
-        run_posix_stack_work_normalizer, staged_cargo_vendor_root,
-        trusted_cargo_cache_fetch_arguments, trusted_cargo_cache_metadata_arguments,
-        trusted_cargo_cache_offline_metadata_arguments, trusted_cargo_cache_seed_arguments,
-        trusted_cargo_deny_authority_arguments, trusted_cargo_vendor_arguments,
-        validate_candidate_cache_normalizer_root, validate_posix_adapter_installation_root,
-        validate_posix_cargo_deny_home_post_state, validate_posix_cargo_deny_home_root,
-        validate_posix_stack_root, validate_posix_stack_root_post_state,
-        validate_staged_cargo_metadata, validate_staged_vendor_covers_frozen_lock,
-        verify_dependency_policy_result,
+        replace_final_home_cargo_deny_metadata, require_exact_directory_members,
+        require_inventory_snapshot, require_posix_archive_adapter_transition_state,
+        reserve_posix_cargo_deny_advisory_lock, run_posix_stack_work_normalizer,
+        staged_cargo_vendor_root, trusted_cargo_cache_fetch_arguments,
+        trusted_cargo_cache_metadata_arguments, trusted_cargo_cache_offline_metadata_arguments,
+        trusted_cargo_cache_seed_arguments, trusted_cargo_deny_authority_arguments,
+        trusted_cargo_vendor_arguments, validate_candidate_cache_normalizer_root,
+        validate_posix_adapter_installation_root, validate_posix_cargo_deny_home_post_state,
+        validate_posix_cargo_deny_home_root, validate_posix_stack_root,
+        validate_posix_stack_root_post_state, validate_staged_cargo_metadata,
+        validate_staged_vendor_covers_frozen_lock, verify_dependency_policy_result,
     };
     #[cfg(unix)]
     use std::path::Path;
@@ -8372,6 +8484,116 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             "candidate dependency-policy gate must verify the trusted result without spawning cargo-deny"
         );
         assert!(gate.contains("verify_dependency_policy_result"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_home_metadata_policy_binds_one_captured_byte_stream() {
+        use crate::json::canonical_json_bytes;
+
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("hell-final-metadata-policy-{}", std::process::id()));
+        let candidate = root.join("candidate");
+        let seed_home = root.join("seed-home");
+        let final_home = root.join("final-home");
+        let seed_registry = staged_cargo_vendor_root(&seed_home).join("reviewed-1.0.0/Cargo.toml");
+        let final_registry =
+            staged_cargo_vendor_root(&final_home).join("reviewed-1.0.0/Cargo.toml");
+        std::fs::create_dir_all(candidate.join("member")).unwrap();
+        std::fs::create_dir_all(seed_registry.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(final_registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            candidate.join("member/Cargo.toml"),
+            b"[package]\nname='member'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        for (home, registry) in [(&seed_home, &seed_registry), (&final_home, &final_registry)] {
+            std::fs::write(registry, b"[package]\nname='reviewed'\nversion='1.0.0'\n").unwrap();
+            std::fs::write(
+                registry.parent().unwrap().join(".cargo-checksum.json"),
+                b"{}\n",
+            )
+            .unwrap();
+            std::fs::write(home.join("config.toml"), b"[source]\n").unwrap();
+        }
+        std::fs::write(candidate.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::write(candidate.join("Cargo.lock"), b"lock\n").unwrap();
+        std::fs::write(candidate.join("deny.toml"), b"[advisories]\n").unwrap();
+
+        let seed_metadata = canonical_json_bytes(&staged_metadata_fixture(
+            &candidate,
+            &seed_home,
+            &seed_registry,
+        ))
+        .unwrap();
+        let final_metadata = canonical_json_bytes(&staged_metadata_fixture(
+            &candidate,
+            &final_home,
+            &final_registry,
+        ))
+        .unwrap();
+        validate_staged_cargo_metadata(&seed_metadata, &candidate, &seed_home).unwrap();
+        validate_staged_cargo_metadata(&final_metadata, &candidate, &final_home).unwrap();
+        assert_ne!(seed_metadata, final_metadata);
+
+        let metadata_path = final_home.join("hell-cargo-deny-metadata.json");
+        std::fs::write(&metadata_path, &seed_metadata).unwrap();
+        let captured =
+            replace_final_home_cargo_deny_metadata(&candidate, &final_home, &final_metadata)
+                .unwrap();
+        assert_eq!(captured.bytes, final_metadata);
+        assert_eq!(std::fs::read(&captured.path).unwrap(), final_metadata);
+        assert_eq!(captured.sha256, hell_testkit::sha256_bytes(&final_metadata));
+
+        let cargo_deny = hell_testkit::sha256_bytes(b"cargo-deny");
+        let candidate_sha = "a".repeat(40);
+        let seed_policy =
+            build_dependency_policy_result(&candidate, &candidate_sha, &seed_metadata, cargo_deny)
+                .unwrap();
+        assert!(
+            verify_dependency_policy_result(
+                &seed_policy,
+                &candidate,
+                &candidate_sha,
+                &captured.sha256,
+                &cargo_deny,
+            )
+            .is_err(),
+            "temporary-seed metadata must not verify against retained final-home metadata"
+        );
+
+        let final_policy =
+            build_dependency_policy_result(&candidate, &candidate_sha, &captured.bytes, cargo_deny)
+                .unwrap();
+        verify_dependency_policy_result(
+            &final_policy,
+            &candidate,
+            &candidate_sha,
+            &captured.sha256,
+            &cargo_deny,
+        )
+        .unwrap();
+
+        let mut semantically_same_metadata = Vec::with_capacity(final_metadata.len() + 2);
+        semantically_same_metadata.push(b' ');
+        semantically_same_metadata.extend_from_slice(&final_metadata);
+        semantically_same_metadata.push(b'\n');
+        validate_staged_cargo_metadata(&semantically_same_metadata, &candidate, &final_home)
+            .unwrap();
+        assert!(
+            verify_dependency_policy_result(
+                &final_policy,
+                &candidate,
+                &candidate_sha,
+                &hell_testkit::sha256_bytes(&semantically_same_metadata),
+                &cargo_deny,
+            )
+            .is_err(),
+            "metadata identity must remain byte-exact rather than semantic"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

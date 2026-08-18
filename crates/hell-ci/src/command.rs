@@ -913,19 +913,26 @@ impl NativeArchiveAdapter {
     pub(crate) fn stack_build(&self, source: &Path, timeout: Duration) -> CommandSpec {
         let stack_yaml = self.stack_yaml_path();
         self.apply(native_stack_build(source, stack_yaml, timeout))
-            .current_directory(stack_yaml.parent().unwrap_or(source))
+            .current_directory(self.stack_command_directory(source))
     }
 
     pub(crate) fn stack_path(&self, source: &Path) -> CommandSpec {
         let stack_yaml = self.stack_yaml_path();
         self.apply(native_stack_path(source, stack_yaml))
-            .current_directory(stack_yaml.parent().unwrap_or(source))
+            .current_directory(self.stack_command_directory(source))
     }
 
     pub(crate) fn stack_ghc_version(&self, source: &Path) -> CommandSpec {
         let stack_yaml = self.stack_yaml_path();
         self.apply(native_stack_ghc_version(source, stack_yaml))
-            .current_directory(stack_yaml.parent().unwrap_or(source))
+            .current_directory(self.stack_command_directory(source))
+    }
+
+    fn stack_command_directory(&self, source: &Path) -> PathBuf {
+        match self.stack_yaml.as_deref() {
+            Some(configured) => configured.parent().unwrap_or(source).to_path_buf(),
+            None => source.to_path_buf(),
+        }
     }
 
     pub(crate) fn stack_provenance(&self, source: &Path) -> Result<NativeStackProvenance, String> {
@@ -1069,7 +1076,7 @@ fn write_native_stack_overlay(directory: &Path, source: &Path) -> Result<PathBuf
     }
     let configure_ar = yaml_single_quoted(&format!("--with-ar={ar_value}"));
     let overlay = format!(
-        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\nallow-different-user: true\nextra-path:\n  - {adapter}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
+        "resolver: nightly-2024-10-21\npackages:\n  - {package}\nsystem-ghc: true\ninstall-ghc: false\nallow-different-user: true\nextra-path:\n  - {adapter}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n  \"$everything\": \"-split-sections -j\"\n  unix-time: \"-optl-all_load\"\n  network-control: \"-fforce-recomp\"\n"
     );
     let overlay_path = directory.join("stack.yaml");
     fs::write(&overlay_path, overlay)
@@ -4935,6 +4942,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disabled_native_stack_commands_keep_the_source_directory() {
+        let source = Path::new("/fixed/oracle-source");
+        let adapter =
+            NativeArchiveAdapter::for_macos(false, Path::new("/fixed/adapter-base"), source, None)
+                .unwrap();
+
+        for command in [
+            adapter.stack_build(source, Duration::from_secs(1)),
+            adapter.stack_path(source),
+            adapter.stack_ghc_version(source),
+        ] {
+            assert_eq!(command.current_directory.as_deref(), Some(source));
+        }
+
+        let ghc = adapter.stack_ghc_version(source);
+        assert_eq!(
+            ghc.display_arguments(),
+            [
+                "--lock-file",
+                "error-on-write",
+                "--stack-yaml",
+                "stack.yaml",
+                "exec",
+                "--",
+                "ghc",
+                "--numeric-version",
+            ]
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_archive_adapter_uses_standard_path_and_exact_clqs_without_custom_tools() {
@@ -5059,7 +5097,10 @@ mod tests {
         );
         assert!(content.starts_with("resolver: nightly-2024-10-21\npackages:\n"));
         assert!(content.contains("oracle''s source'\n"));
-        assert!(content.contains("system-ghc: true\nallow-different-user: true\n"));
+        assert!(
+            content.contains("system-ghc: true\ninstall-ghc: false\nallow-different-user: true\n")
+        );
+        assert!(!content.contains("install-ghc: true"));
         assert!(content.contains(&format!(
             "extra-path:\n  - {adapter_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
         )));
