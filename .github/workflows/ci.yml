@@ -245,6 +245,7 @@ jobs:
           enable-stack: true
           stack-no-global: true
           stack-version: 3.11.1
+          ghc-version: 9.8.2
       - name: Restore Cargo downloads
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

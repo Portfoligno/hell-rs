@@ -2177,9 +2177,9 @@ fn trusted_cargo_deny_authority_arguments(
     {
         return Err("trusted cargo-deny authority metadata seed is not exact".to_owned());
     }
-    // License checking reads package source files that are not present in the
-    // captured Cargo metadata graph. Keep that package-content authority in
-    // the trusted seed, together with advisory-database access.
+    // License and source checking read package content that is not present in
+    // the captured Cargo metadata graph. Keep those package-content
+    // authorities in the trusted seed, together with advisory-database access.
     Ok(vec![
         OsString::from("--metadata-path"),
         metadata.as_os_str().to_owned(),
@@ -2187,6 +2187,7 @@ fn trusted_cargo_deny_authority_arguments(
         OsString::from("check"),
         OsString::from("advisories"),
         OsString::from("licenses"),
+        OsString::from("sources"),
     ])
 }
 
@@ -2196,14 +2197,13 @@ fn candidate_cargo_deny_arguments() -> Vec<OsString> {
     // its fixed Cargo fetch probe even when the launcher supplies bound
     // metadata. Its tested `--frozen` mode treats that expected offline probe
     // error as nonfatal and then consumes the bound metadata. Advisory
-    // databases and license package contents remain in the trusted seed; the
-    // confined child checks only graph-driven policies.
+    // databases, license contents, and source authorities remain in the
+    // trusted seed; the confined child checks only metadata-only policies.
     vec![
         OsString::from("--frozen"),
         OsString::from("--all-features"),
         OsString::from("check"),
         OsString::from("bans"),
-        OsString::from("sources"),
     ]
 }
 
@@ -7504,14 +7504,15 @@ mod tests {
                 "check".into(),
                 "advisories".into(),
                 "licenses".into(),
+                "sources".into(),
             ]
         );
         let trusted_arguments =
             trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata).unwrap();
         assert!(trusted_arguments.contains(&OsString::from("advisories")));
         assert!(trusted_arguments.contains(&OsString::from("licenses")));
+        assert!(trusted_arguments.contains(&OsString::from("sources")));
         assert!(!trusted_arguments.contains(&OsString::from("bans")));
-        assert!(!trusted_arguments.contains(&OsString::from("sources")));
         assert!(
             !trusted_cargo_deny_authority_arguments(cargo_home, &authority_metadata)
                 .unwrap()
@@ -7526,11 +7527,10 @@ mod tests {
                 OsString::from("--all-features"),
                 OsString::from("check"),
                 OsString::from("bans"),
-                OsString::from("sources"),
             ]
         );
         assert!(candidate_arguments.contains(&OsString::from("bans")));
-        assert!(candidate_arguments.contains(&OsString::from("sources")));
+        assert!(!candidate_arguments.contains(&OsString::from("sources")));
         assert!(!candidate_arguments.contains(&OsString::from("advisories")));
         assert!(!candidate_arguments.contains(&OsString::from("licenses")));
         assert!(candidate_arguments.contains(&OsString::from("--frozen")));
