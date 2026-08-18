@@ -15313,7 +15313,7 @@ impl Iterator for DeterministicUtf8 {
 #[cfg(all(test, windows))]
 mod windows_restricted_environment_tests {
     use super::{
-        Command, WindowsLaunchAuthorities, WindowsToolchainAuthority,
+        CandidateLaunchPolicy, Command, WindowsLaunchAuthorities, WindowsToolchainAuthority,
         WindowsToolchainExecutableAuthority, configure_windows_restricted_child_environment,
         decode_windows_argv, sha256_file,
     };
@@ -15353,8 +15353,6 @@ mod windows_restricted_environment_tests {
             let source_rustc = tool_file("source-rustc", "rustc.exe", b"rustc");
             let staged_rustc = tool_file("stage/bin", "rustc.exe", b"rustc");
             let stack = tool_file("unmapped", "stack.exe", b"stack");
-            let launcher = tool_file("launch", "hell-ci.exe", b"launcher");
-            let adapter = tool_file("launch", "hell-test-helper.exe", b"adapter");
             let first = cargo_proxy.parent().unwrap().to_path_buf();
             let second = source_cargo.parent().unwrap().to_path_buf();
             let system32 = tool_file("Windows/System32", "kernel32.dll", b"system kernel")
@@ -15404,18 +15402,21 @@ mod windows_restricted_environment_tests {
             }
         }
 
-        fn launch_authorities(&self, label: &str) -> WindowsLaunchAuthorities {
+        fn launch_policy(&self, label: &str) -> CandidateLaunchPolicy {
             let launcher = self.root.join(format!("{label}-hell-ci.exe"));
             let adapter = self.root.join(format!("{label}-hell-test-helper.exe"));
             fs::write(&launcher, b"launcher").unwrap();
             fs::write(&adapter, b"adapter").unwrap();
-            WindowsLaunchAuthorities::new(
+            let launcher_sha256 = sha256_file(&launcher).unwrap();
+            let adapter_sha256 = sha256_file(&adapter).unwrap();
+            let authorities = WindowsLaunchAuthorities::new(
                 launcher,
-                sha256_file(&launcher).unwrap(),
+                launcher_sha256,
                 adapter,
-                sha256_file(&adapter).unwrap(),
+                adapter_sha256,
                 self.toolchain.clone(),
-            )
+            );
+            CandidateLaunchPolicy::windows(authorities, vec![self.root.clone()]).unwrap()
         }
     }
 
@@ -15454,9 +15455,9 @@ mod windows_restricted_environment_tests {
     #[test]
     fn unmapped_stack_launch_keeps_system_root_without_inheriting_path() {
         let fixture = Fixture::new("unmapped");
-        let authorities = fixture.launch_authorities("unmapped");
+        let policy = fixture.launch_policy("unmapped");
         let mut command = Command::new(&fixture.stack);
-        authorities.wrap(&mut command, None).unwrap();
+        policy.wrap(&mut command, None).unwrap();
         let environment = explicit_environment(&command);
 
         assert_eq!(environment.len(), 1);
@@ -15468,28 +15469,28 @@ mod windows_restricted_environment_tests {
             environment
                 .get(OsStr::new("SystemRoot"))
                 .map(Option::as_ref),
-            Some(Some(fixture.system_root.as_os_str()))
+            Some(Some(&fixture.system_root))
         );
     }
 
     #[test]
     fn mapped_cargo_launch_rewrites_path_and_keeps_system_root() {
         let fixture = Fixture::new("mapped");
-        let authorities = fixture.launch_authorities("mapped");
+        let policy = fixture.launch_policy("mapped");
         let mut command = Command::new(&fixture.cargo_proxy);
-        authorities.wrap(&mut command, None).unwrap();
+        policy.wrap(&mut command, None).unwrap();
         let environment = explicit_environment(&command);
 
         assert_eq!(environment.len(), 2);
         assert_eq!(
             environment.get(OsStr::new("PATH")).map(Option::as_ref),
-            Some(Some(fixture.restricted_path.as_os_str()))
+            Some(Some(&fixture.restricted_path))
         );
         assert_eq!(
             environment
                 .get(OsStr::new("SystemRoot"))
                 .map(Option::as_ref),
-            Some(Some(fixture.system_root.as_os_str()))
+            Some(Some(&fixture.system_root))
         );
         let encoded = command.get_args().nth(1).unwrap();
         let target = decode_windows_argv(encoded).unwrap()[2].clone();
