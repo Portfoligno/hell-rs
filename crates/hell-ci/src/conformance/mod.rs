@@ -35,10 +35,57 @@ pub(crate) use ledger::{
 };
 pub(crate) use verify::independently_reconstruct_partition;
 
+pub(crate) use evidence::assurance_relabeled_native_evidence;
+pub(crate) use ledger::{
+    assurance_duplicate_cell, assurance_exemption_expired_at_plan_time,
+    assurance_exemption_selector_mismatch, assurance_final_cell_omission,
+};
+
 /// The first named, fail-closed release standard.
 pub(crate) const RELEASE_STANDARD: &str = "upstream-release-v1";
 pub(crate) const GENERATED_AGREEMENT_MAY_VERIFY: bool = false;
 pub(crate) const GENERATED_MISMATCH_BLOCKS: bool = true;
+
+pub(crate) fn fuzz_validate_evidence_repository(
+    value: &crate::json::JsonValue,
+) -> Result<(), String> {
+    let (plan, _repository, trusted) = fuzz_repository_frame(value)?;
+    trusted.validate()?;
+    plan.validate(&canonical_universe()?)
+}
+
+pub(crate) fn fuzz_reconstruct_partition(value: &crate::json::JsonValue) -> Result<(), String> {
+    let (plan, repository, trusted) = fuzz_repository_frame(value)?;
+    derive_partition(&plan, &canonical_universe()?, &repository, &trusted).map(|_| ())
+}
+
+fn fuzz_repository_frame(
+    value: &crate::json::JsonValue,
+) -> Result<(ConformancePlan, EvidenceRepository, TrustedEvidenceBindings), String> {
+    let fields = value.object()?;
+    crate::json::require_exact_json_keys(
+        fields,
+        &["conformancePlan", "manifests", "members", "schemaVersion"],
+    )?;
+    if crate::json::json_member(fields, "schemaVersion")?.number()? != 1 {
+        return Err("unsupported evidence repository fuzz frame schema".to_owned());
+    }
+    let plan = ConformancePlan::parse(crate::json::json_member(fields, "conformancePlan")?)?;
+    let manifests = crate::json::json_member(fields, "manifests")?
+        .array()?
+        .iter()
+        .map(EvidenceManifest::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let trusted = TrustedEvidenceBindings::from_manifests(&plan, &manifests)?;
+    let members = crate::json::json_member(fields, "members")?
+        .object()?
+        .iter()
+        .map(|(path, value)| Ok((path.clone(), value.string()?.as_bytes().to_vec())))
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    let repository =
+        EvidenceRepository::from_archive_members(&manifests, &members, &trusted, &plan)?;
+    Ok((plan, repository, trusted))
+}
 
 pub(crate) fn recognizes(arguments: &[OsString]) -> bool {
     arguments
@@ -77,10 +124,8 @@ fn run_audit_cli(arguments: &[OsString]) -> Result<String, String> {
         }
         index += 2;
     }
-    audit(
-        candidate_root.ok_or_else(conformance_audit_usage)?,
-        output.ok_or_else(conformance_audit_usage)?,
-    )
+    let candidate_root = candidate_root.ok_or_else(conformance_audit_usage)?;
+    audit(&candidate_root, output.ok_or_else(conformance_audit_usage)?)
 }
 
 fn run_generate_requirements_cli(arguments: &[OsString]) -> Result<String, String> {
@@ -111,8 +156,8 @@ fn conformance_usage() -> String {
     )
 }
 
-fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
-    let candidate_root = std::fs::canonicalize(&candidate_root).map_err(|error| {
+fn audit(candidate_root: &Path, output: PathBuf) -> Result<String, String> {
+    let candidate_root = std::fs::canonicalize(candidate_root).map_err(|error| {
         format!(
             "cannot canonicalize conformance audit root {}: {error}",
             candidate_root.display()
@@ -125,48 +170,73 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
     let cases = hell_testkit::committed_differential_cases();
     hell_testkit::validate_evidence_catalog(&cases)
         .map_err(|error| format!("invalid committed conformance case catalog: {error}"))?;
+    let counts = audit_requirement_catalog(requirements, &cases)?;
+    let report = conformance_audit_report(&control_summary, &counts)?;
+    let path = if output.extension().is_some() {
+        output
+    } else {
+        output.join("conformance-audit.json")
+    };
+    crate::release::manifest::write_json(&path, &report)?;
+    Ok(format!(
+        "wrote nonrelease conformance audit with {} projected blockers to {}",
+        counts.required_cells,
+        path.display()
+    ))
+}
+
+#[derive(Default)]
+struct AuditCounts {
+    required_cells: u64,
+    excluded_cells: u64,
+    missing_mappings: u64,
+    missing_obligation_mappings: u64,
+    missing_committed_case_mappings: u64,
+    unavailable_validators: u64,
+    unavailable_normalizers: u64,
+    mapped_obligations: u64,
+    stale_cases: Vec<String>,
+}
+
+fn audit_requirement_catalog(
+    requirements: &[hell_builtins::CompatibilityRequirement],
+    cases: &[hell_testkit::DifferentialCase],
+) -> Result<AuditCounts, String> {
     let case_ids = cases
         .iter()
         .map(|case| case.id.as_ref())
         .collect::<std::collections::BTreeSet<_>>();
     let mut referenced = std::collections::BTreeSet::new();
-    let mut required_cells = 0_u64;
-    let mut excluded_cells = 0_u64;
-    let mut missing_mappings = 0_u64;
-    let mut missing_obligation_mappings = 0_u64;
-    let mut missing_committed_case_mappings = 0_u64;
-    let mut unavailable_validators = 0_u64;
-    let mut unavailable_normalizers = 0_u64;
-    let mut mapped_obligations = 0_u64;
+    let mut counts = AuditCounts::default();
     for requirement in requirements {
         for dimension in &requirement.dimensions {
             for profile in ProfileId::ALL {
                 for platform in ConformancePlatform::ALL {
                     if profile == ProfileId::Sandboxed {
-                        excluded_cells += 1;
+                        counts.excluded_cells += 1;
                         continue;
                     }
-                    required_cells += 1;
+                    counts.required_cells += 1;
                     let scope = dimension
                         .scopes
                         .iter()
                         .find(|scope| audit_scope_matches(scope, profile, platform))
                         .ok_or_else(|| "requirement scope disappeared during audit".to_owned())?;
                     if scope.obligations.is_empty() {
-                        missing_obligation_mappings += 1;
+                        counts.missing_obligation_mappings += 1;
                     }
                     if scope.evidence.is_empty() {
-                        missing_committed_case_mappings += 1;
+                        counts.missing_committed_case_mappings += 1;
                     }
                     if scope.obligations.is_empty() || scope.evidence.is_empty() {
-                        missing_mappings += 1;
+                        counts.missing_mappings += 1;
                     }
                     if scope
                         .normalizers
                         .iter()
                         .any(|normalizer| !normalizer_replay_available(*normalizer))
                     {
-                        unavailable_normalizers += 1;
+                        counts.unavailable_normalizers += 1;
                     }
                     for reference in scope.evidence {
                         let parsed = hell_builtins::parse_differential_reference(reference)
@@ -180,7 +250,7 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
                         referenced.insert(parsed.case_id);
                     }
                     for obligation in scope.obligations {
-                        mapped_obligations += 1;
+                        counts.mapped_obligations += 1;
                         let unavailable = !semantic_validator_available(dimension.dimension)
                             || scope.evidence.iter().all(|reference| {
                                 hell_builtins::parse_differential_reference(reference)
@@ -212,24 +282,31 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
                                     })
                             });
                         if unavailable {
-                            unavailable_validators += 1;
+                            counts.unavailable_validators += 1;
                         }
                     }
                 }
             }
         }
     }
-    let stale_cases = cases
+    counts.stale_cases = cases
         .iter()
         .filter(|case| case.claim_evidence.is_some() && !referenced.contains(case.id.as_ref()))
         .map(|case| case.id.to_string())
         .collect::<Vec<_>>();
+    Ok(counts)
+}
+
+fn conformance_audit_report(
+    control_summary: &AuditControlSummary,
+    counts: &AuditCounts,
+) -> Result<crate::json::JsonValue, String> {
     let total_cells =
         u64::try_from(canonical_universe()?.len()).map_err(|_| "audit universe count overflow")?;
     // This command deliberately consumes no candidate evidence. Its projected
     // partition must therefore classify every Required cell as missing rather
     // than adding overlapping catalog diagnostics as if they were cells.
-    let blocked_cells_projected = required_cells;
+    let blocked_cells_projected = counts.required_cells;
     let projected_partition = crate::release::schema::object([
         (
             "blockedMissingEvidence",
@@ -237,7 +314,10 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
         ),
         ("blockedMismatch", crate::release::schema::number(0)),
         ("blockedInvalid", crate::release::schema::number(0)),
-        ("excluded", crate::release::schema::number(excluded_cells)),
+        (
+            "excluded",
+            crate::release::schema::number(counts.excluded_cells),
+        ),
         ("exempted", crate::release::schema::number(0)),
         ("notApplicable", crate::release::schema::number(0)),
         ("verified", crate::release::schema::number(0)),
@@ -254,7 +334,7 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
         ),
         (
             "excludedCells",
-            crate::release::schema::number(excluded_cells),
+            crate::release::schema::number(counts.excluded_cells),
         ),
         (
             "divergenceDefinitionsWithoutExactReleaseActivation",
@@ -268,25 +348,25 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
         ),
         (
             "mappedObligations",
-            crate::release::schema::number(mapped_obligations),
+            crate::release::schema::number(counts.mapped_obligations),
         ),
         (
             "missingMappings",
-            crate::release::schema::number(missing_mappings),
+            crate::release::schema::number(counts.missing_mappings),
         ),
         (
             "missingCommittedCaseMappings",
-            crate::release::schema::number(missing_committed_case_mappings),
+            crate::release::schema::number(counts.missing_committed_case_mappings),
         ),
         (
             "missingObligationMappings",
-            crate::release::schema::number(missing_obligation_mappings),
+            crate::release::schema::number(counts.missing_obligation_mappings),
         ),
         ("notApplicableCells", crate::release::schema::number(0)),
         ("projectedPartition", projected_partition),
         (
             "requiredCells",
-            crate::release::schema::number(required_cells),
+            crate::release::schema::number(counts.required_cells),
         ),
         (
             "releaseExemptions",
@@ -296,13 +376,14 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
         (
             "staleUnreferencedCases",
             crate::release::schema::number(
-                u64::try_from(stale_cases.len()).map_err(|_| "stale case count overflow")?,
+                u64::try_from(counts.stale_cases.len()).map_err(|_| "stale case count overflow")?,
             ),
         ),
         (
             "staleUnreferencedCaseIds",
             crate::json::JsonValue::Array(
-                stale_cases
+                counts
+                    .stale_cases
                     .iter()
                     .map(|case_id| crate::release::schema::string(case_id))
                     .collect(),
@@ -312,24 +393,15 @@ fn audit(candidate_root: PathBuf, output: PathBuf) -> Result<String, String> {
         ("totalCells", crate::release::schema::number(total_cells)),
         (
             "unavailableNormalizers",
-            crate::release::schema::number(unavailable_normalizers),
+            crate::release::schema::number(counts.unavailable_normalizers),
         ),
         (
             "unavailableValidators",
-            crate::release::schema::number(unavailable_validators),
+            crate::release::schema::number(counts.unavailable_validators),
         ),
         ("verifiedCellsProjected", crate::release::schema::number(0)),
     ]);
-    let path = if output.extension().is_some() {
-        output
-    } else {
-        output.join("conformance-audit.json")
-    };
-    crate::release::manifest::write_json(&path, &report)?;
-    Ok(format!(
-        "wrote nonrelease conformance audit with {blocked_cells_projected} projected blockers to {}",
-        path.display()
-    ))
+    Ok(report)
 }
 
 const fn semantic_validator_available(dimension: hell_builtins::CompatibilityDimension) -> bool {
@@ -364,6 +436,14 @@ struct GeneratedRequirementsSummary {
     conflicting_cells: u64,
 }
 
+type GeneratedCandidateGroups = std::collections::BTreeMap<
+    (u16, usize, ConformancePlatform),
+    std::collections::BTreeMap<Vec<String>, GeneratedMappingCandidates>,
+>;
+type GeneratedMappings =
+    std::collections::BTreeMap<(u16, usize, ConformancePlatform), GeneratedMapping>;
+type ObligationAuthority = std::collections::BTreeMap<(String, &'static str), Vec<String>>;
+
 fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSummary), String> {
     let cases = hell_testkit::committed_differential_cases();
     hell_testkit::validate_evidence_catalog(&cases)
@@ -373,35 +453,47 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
         .enumerate()
         .map(|(index, case)| (case.id.to_string(), index))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let semantic_obligations = hell_testkit::applicable_runtime_obligation_cells()
-        .into_iter()
-        .map(|cell| {
-            (
-                (cell.builtin.to_string(), cell.dimension.as_str()),
-                cell.obligations
-                    .into_iter()
-                    .map(|obligation| obligation.0.to_string())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let portable_obligations = hell_testkit::portable_native_oracle_obligation_cells()
-        .into_iter()
-        .map(|cell| {
-            (
-                (cell.builtin.to_string(), cell.dimension.as_str()),
-                cell.obligations
-                    .into_iter()
-                    .map(|obligation| obligation.0.to_string())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut candidates = std::collections::BTreeMap::<
-        (u16, usize, ConformancePlatform),
-        std::collections::BTreeMap<Vec<String>, GeneratedMappingCandidates>,
-    >::new();
-    for case in &cases {
+    let semantic_obligations: ObligationAuthority =
+        hell_testkit::applicable_runtime_obligation_cells()
+            .into_iter()
+            .map(|cell| {
+                (
+                    (cell.builtin.to_string(), cell.dimension.as_str()),
+                    cell.obligations
+                        .into_iter()
+                        .map(|obligation| obligation.0.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+    let portable_obligations: ObligationAuthority =
+        hell_testkit::portable_native_oracle_obligation_cells()
+            .into_iter()
+            .map(|cell| {
+                (
+                    (cell.builtin.to_string(), cell.dimension.as_str()),
+                    cell.obligations
+                        .into_iter()
+                        .map(|obligation| obligation.0.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+    let candidates = collect_generated_mapping_candidates(&cases)?;
+    let (mappings, conflicting_cells) = resolve_generated_mappings(
+        candidates,
+        &case_order,
+        &semantic_obligations,
+        &portable_obligations,
+    )?;
+    render_generated_requirements(&mappings, conflicting_cells)
+}
+
+fn collect_generated_mapping_candidates(
+    cases: &[hell_testkit::DifferentialCase],
+) -> Result<GeneratedCandidateGroups, String> {
+    let mut candidates = GeneratedCandidateGroups::new();
+    for case in cases {
         let Some(descriptor) = &case.claim_evidence else {
             continue;
         };
@@ -442,7 +534,15 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             }
         }
     }
+    Ok(candidates)
+}
 
+fn resolve_generated_mappings(
+    candidates: GeneratedCandidateGroups,
+    case_order: &std::collections::BTreeMap<String, usize>,
+    semantic_obligations: &ObligationAuthority,
+    portable_obligations: &ObligationAuthority,
+) -> Result<(GeneratedMappings, u64), String> {
     let mut mappings = std::collections::BTreeMap::new();
     let mut conflicting_cells = 0_u64;
     for ((builtin_id, dimension_index, platform), groups) in candidates {
@@ -501,7 +601,13 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             conflicting_cells = conflicting_cells.saturating_add(1);
         }
     }
+    Ok((mappings, conflicting_cells))
+}
 
+fn render_generated_requirements(
+    mappings: &GeneratedMappings,
+    conflicting_cells: u64,
+) -> Result<(String, GeneratedRequirementsSummary), String> {
     let mut output = String::new();
     output.push_str("schema_version = 3\n");
     writeln!(output, "baseline = {:?}", hell_builtins::LANGUAGE_VERSION)
@@ -518,15 +624,17 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
     output.push_str("\n[default_requirement]\n");
     write_requirement_scope(
         &mut output,
-        &["upstream", "sandboxed"],
-        &["linux-x86_64", "macos-aarch64", "windows-x86_64"],
-        "catalog-default-review-required",
-        "committed-differential-corpus",
-        &[],
-        &[],
-        &[],
-        "No release evidence mapping has been approved for this cell.",
-        "compatibility",
+        &RequirementScope {
+            profiles: &["upstream", "sandboxed"],
+            platforms: &["linux-x86_64", "macos-aarch64", "windows-x86_64"],
+            applicability_rule: "catalog-default-review-required",
+            evidence_strategy: "committed-differential-corpus",
+            evidence: &[],
+            normalizers: &[],
+            obligations: &[],
+            rationale: "No release evidence mapping has been approved for this cell.",
+            review_group: "compatibility",
+        },
     );
 
     let mut referenced = std::collections::BTreeSet::new();
@@ -536,115 +644,14 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             .iter()
             .enumerate()
         {
-            let platform_mappings = ConformancePlatform::ALL
-                .iter()
-                .filter_map(|platform| {
-                    mappings
-                        .get(&(builtin.id.0, dimension_index, *platform))
-                        .map(|mapping| (*platform, mapping.clone()))
-                })
-                .collect::<Vec<_>>();
-            if platform_mappings.is_empty() {
-                continue;
-            }
-            output.push_str("\n[[overrides]]\n");
-            writeln!(output, "builtin = {:?}", builtin.name)
-                .expect("writing to String cannot fail");
-            write_toml_string_array(&mut output, "dimensions", &[dimension.as_str().to_owned()]);
-
-            let mut emitted = std::collections::BTreeSet::new();
-            for (_, mapping) in &platform_mappings {
-                if !emitted.insert((
-                    mapping.evidence.clone(),
-                    mapping.normalizers.clone(),
-                    mapping.obligations.clone(),
-                )) {
-                    continue;
-                }
-                let platforms = platform_mappings
-                    .iter()
-                    .filter(|(_, candidate)| candidate == mapping)
-                    .map(|(platform, _)| platform.as_str())
-                    .collect::<Vec<_>>();
-                output.push_str("\n[[overrides.scopes]]\n");
-                let evidence = mapping
-                    .evidence
-                    .iter()
-                    .map(|case_id| {
-                        referenced.insert(case_id.clone());
-                        format!("differential:{case_id}")
-                    })
-                    .collect::<Vec<_>>();
-                let portable_failure_gap = hell_testkit::portable_native_oracle_failure_unavailable(
-                    builtin.name,
-                    *dimension,
-                );
-                let (applicability_rule, rationale, review_group) = if portable_failure_gap {
-                    (
-                        "portable-native-oracle-host-failure-unavailable",
-                        "The operation remains semantically fallible, but no deterministic portable native-oracle failure trigger exists; available success/order evidence is mapped while effect-failure remains missing and release-blocking.",
-                        "portable-native-oracle-host-failure-gap",
-                    )
-                } else {
-                    (
-                        "descriptor-v8-reviewed-runtime-target",
-                        "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations.",
-                        "descriptor-v8-runtime-authority",
-                    )
-                };
-                write_requirement_scope(
-                    &mut output,
-                    &["upstream"],
-                    &platforms,
-                    applicability_rule,
-                    "native-oracle",
-                    &evidence,
-                    &mapping.normalizers,
-                    &mapping.obligations,
-                    rationale,
-                    review_group,
-                );
-                mapped_cells = mapped_cells.saturating_add(
-                    u64::try_from(platforms.len()).map_err(|_| "mapped platform count overflow")?,
-                );
-            }
-            let missing = ConformancePlatform::ALL
-                .iter()
-                .filter(|platform| {
-                    !platform_mappings
-                        .iter()
-                        .any(|(mapped, _)| mapped == *platform)
-                })
-                .map(|platform| platform.as_str())
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                output.push_str("\n[[overrides.scopes]]\n");
-                write_requirement_scope(
-                    &mut output,
-                    &["upstream"],
-                    &missing,
-                    "catalog-default-review-required",
-                    "committed-differential-corpus",
-                    &[],
-                    &[],
-                    &[],
-                    "No complete descriptor-authorized evidence mapping exists for this platform cell.",
-                    "compatibility",
-                );
-            }
-            output.push_str("\n[[overrides.scopes]]\n");
-            write_requirement_scope(
+            mapped_cells = mapped_cells.saturating_add(write_generated_override(
                 &mut output,
-                &["sandboxed"],
-                &["linux-x86_64", "macos-aarch64", "windows-x86_64"],
-                "sandboxed-profile-review-required",
-                "committed-differential-corpus",
-                &[],
-                &[],
-                &[],
-                "The sandboxed profile is outside upstream-release-v1 and has no approved release evidence mapping.",
-                "compatibility",
-            );
+                &mut referenced,
+                mappings,
+                builtin,
+                dimension_index,
+                *dimension,
+            )?);
         }
     }
     Ok((
@@ -656,6 +663,153 @@ fn generated_requirements_catalog() -> Result<(String, GeneratedRequirementsSumm
             conflicting_cells,
         },
     ))
+}
+
+fn write_generated_override(
+    output: &mut String,
+    referenced: &mut std::collections::BTreeSet<String>,
+    mappings: &GeneratedMappings,
+    builtin: &hell_builtins::BuiltinSpec,
+    dimension_index: usize,
+    dimension: hell_builtins::CompatibilityDimension,
+) -> Result<u64, String> {
+    let platform_mappings = ConformancePlatform::ALL
+        .iter()
+        .filter_map(|platform| {
+            mappings
+                .get(&(builtin.id.0, dimension_index, *platform))
+                .map(|mapping| (*platform, mapping.clone()))
+        })
+        .collect::<Vec<_>>();
+    if platform_mappings.is_empty() {
+        return Ok(0);
+    }
+    output.push_str("\n[[overrides]]\n");
+    writeln!(output, "builtin = {:?}", builtin.name).expect("writing to String cannot fail");
+    write_toml_string_array(output, "dimensions", &[dimension.as_str().to_owned()]);
+    let mapped_cells = write_generated_mapped_scopes(
+        output,
+        referenced,
+        builtin.name,
+        dimension,
+        &platform_mappings,
+    )?;
+    write_generated_unmapped_scopes(output, &platform_mappings);
+    Ok(mapped_cells)
+}
+
+fn write_generated_mapped_scopes(
+    output: &mut String,
+    referenced: &mut std::collections::BTreeSet<String>,
+    builtin: &str,
+    dimension: hell_builtins::CompatibilityDimension,
+    platform_mappings: &[(ConformancePlatform, GeneratedMapping)],
+) -> Result<u64, String> {
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut mapped_cells = 0_u64;
+    for (_, mapping) in platform_mappings {
+        if !emitted.insert((
+            mapping.evidence.clone(),
+            mapping.normalizers.clone(),
+            mapping.obligations.clone(),
+        )) {
+            continue;
+        }
+        let platforms = platform_mappings
+            .iter()
+            .filter(|(_, candidate)| candidate == mapping)
+            .map(|(platform, _)| platform.as_str())
+            .collect::<Vec<_>>();
+        let evidence = mapping
+            .evidence
+            .iter()
+            .map(|case_id| {
+                referenced.insert(case_id.clone());
+                format!("differential:{case_id}")
+            })
+            .collect::<Vec<_>>();
+        let portable_gap =
+            hell_testkit::portable_native_oracle_failure_unavailable(builtin, dimension);
+        let (rule, rationale, group) = if portable_gap {
+            (
+                "portable-native-oracle-host-failure-unavailable",
+                "The operation remains semantically fallible, but no deterministic portable native-oracle failure trigger exists; available success/order evidence is mapped while effect-failure remains missing and release-blocking.",
+                "portable-native-oracle-host-failure-gap",
+            )
+        } else {
+            (
+                "descriptor-v8-reviewed-runtime-target",
+                "Mechanically projected from exact reviewed descriptor-v8 targets and registry-derived obligations.",
+                "descriptor-v8-runtime-authority",
+            )
+        };
+        output.push_str("\n[[overrides.scopes]]\n");
+        write_requirement_scope(
+            output,
+            &RequirementScope {
+                profiles: &["upstream"],
+                platforms: &platforms,
+                applicability_rule: rule,
+                evidence_strategy: "native-oracle",
+                evidence: &evidence,
+                normalizers: &mapping.normalizers,
+                obligations: &mapping.obligations,
+                rationale,
+                review_group: group,
+            },
+        );
+        mapped_cells = mapped_cells.saturating_add(
+            u64::try_from(platforms.len()).map_err(|_| "mapped platform count overflow")?,
+        );
+    }
+    Ok(mapped_cells)
+}
+
+fn write_generated_unmapped_scopes(
+    output: &mut String,
+    platform_mappings: &[(ConformancePlatform, GeneratedMapping)],
+) {
+    let missing = ConformancePlatform::ALL
+        .iter()
+        .filter(|platform| {
+            !platform_mappings
+                .iter()
+                .any(|(mapped, _)| mapped == *platform)
+        })
+        .map(|platform| platform.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        output.push_str("\n[[overrides.scopes]]\n");
+        write_requirement_scope(
+            output,
+            &RequirementScope {
+                profiles: &["upstream"],
+                platforms: &missing,
+                applicability_rule: "catalog-default-review-required",
+                evidence_strategy: "committed-differential-corpus",
+                evidence: &[],
+                normalizers: &[],
+                obligations: &[],
+                rationale: "No complete descriptor-authorized evidence mapping exists for this platform cell.",
+                review_group: "compatibility",
+            },
+        );
+    }
+    output.push_str("\n[[overrides.scopes]]\n");
+    write_requirement_scope(
+        output,
+        &RequirementScope {
+            profiles: &["sandboxed"],
+            platforms: &["linux-x86_64", "macos-aarch64", "windows-x86_64"],
+            applicability_rule: "sandboxed-profile-review-required",
+            evidence_strategy: "committed-differential-corpus",
+            evidence: &[],
+            normalizers: &[],
+            obligations: &[],
+            rationale: "The sandboxed profile is outside upstream-release-v1 and has no approved release evidence mapping.",
+            review_group: "compatibility",
+        },
+    );
 }
 
 fn portable_failure_gap_is_stale(
@@ -691,23 +845,24 @@ fn target_supports_platform(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_requirement_scope(
-    output: &mut String,
-    profiles: &[&str],
-    platforms: &[&str],
-    applicability_rule: &str,
-    evidence_strategy: &str,
-    evidence: &[String],
-    normalizers: &[String],
-    obligations: &[String],
-    rationale: &str,
-    review_group: &str,
-) {
+struct RequirementScope<'a> {
+    applicability_rule: &'a str,
+    evidence: &'a [String],
+    evidence_strategy: &'a str,
+    normalizers: &'a [String],
+    obligations: &'a [String],
+    platforms: &'a [&'a str],
+    profiles: &'a [&'a str],
+    rationale: &'a str,
+    review_group: &'a str,
+}
+
+fn write_requirement_scope(output: &mut String, scope: &RequirementScope<'_>) {
     write_toml_string_array(
         output,
         "profiles",
-        &profiles
+        &scope
+            .profiles
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>(),
@@ -715,21 +870,27 @@ fn write_requirement_scope(
     write_toml_string_array(
         output,
         "platforms",
-        &platforms
+        &scope
+            .platforms
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>(),
     );
-    writeln!(output, "applicability_rule = {applicability_rule:?}")
+    writeln!(
+        output,
+        "applicability_rule = {:?}",
+        scope.applicability_rule
+    )
+    .expect("writing to String cannot fail");
+    writeln!(output, "evidence_strategy = {:?}", scope.evidence_strategy)
         .expect("writing to String cannot fail");
-    writeln!(output, "evidence_strategy = {evidence_strategy:?}")
-        .expect("writing to String cannot fail");
-    write_toml_string_array(output, "evidence", evidence);
-    write_toml_string_array(output, "normalizers", normalizers);
-    write_toml_string_array(output, "obligations", obligations);
-    writeln!(output, "rationale = {rationale:?}").expect("writing to String cannot fail");
+    write_toml_string_array(output, "evidence", scope.evidence);
+    write_toml_string_array(output, "normalizers", scope.normalizers);
+    write_toml_string_array(output, "obligations", scope.obligations);
+    writeln!(output, "rationale = {:?}", scope.rationale).expect("writing to String cannot fail");
     output.push_str("tracking_issue = \"COMPAT-EVIDENCE\"\n");
-    writeln!(output, "review_group = {review_group:?}").expect("writing to String cannot fail");
+    writeln!(output, "review_group = {:?}", scope.review_group)
+        .expect("writing to String cannot fail");
 }
 
 fn write_toml_string_array(output: &mut String, key: &str, values: &[String]) {
@@ -855,6 +1016,9 @@ pub(crate) fn audit_controls(root: &Path) -> Result<(), String> {
 
 fn current_utc_date() -> Result<String, String> {
     const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+    const YEAR_PATTERN: &str = "YYYY";
+    const MONTH_PATTERN: &str = "MM";
+    const DAY_PATTERN: &str = "DD";
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system time precedes the Unix epoch")?
@@ -879,9 +1043,6 @@ fn current_utc_date() -> Result<String, String> {
     let year = u64::try_from(year).map_err(|_| "system date year is negative")?;
     let month = u64::try_from(month).map_err(|_| "system date month is negative")?;
     let day = u64::try_from(day).map_err(|_| "system date day is negative")?;
-    const YEAR_PATTERN: &str = "YYYY";
-    const MONTH_PATTERN: &str = "MM";
-    const DAY_PATTERN: &str = "DD";
     let date = format!(
         "{year:0year_width$}-{month:0month_width$}-{day:0day_width$}",
         year_width = YEAR_PATTERN.len(),
@@ -940,184 +1101,9 @@ pub(crate) fn build_release_conformance_plan(
     let requirements = hell_builtins::compatibility_requirements();
     hell_builtins::validate_compatibility_requirements(requirements)
         .map_err(|error| format!("invalid compatibility requirement catalog: {error:?}"))?;
-    let mut exemption_by_cell = std::collections::BTreeMap::new();
-    for exemption in exemptions {
-        if exemption_by_cell
-            .insert(exemption.cell.clone(), exemption)
-            .is_some()
-        {
-            return Err("multiple release exemptions target one cell".to_owned());
-        }
-    }
-    let committed_cases = hell_testkit::committed_differential_cases()
-        .into_iter()
-        .map(|case| (case.id.to_string(), case))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    hell_testkit::validate_evidence_catalog(&committed_cases.values().cloned().collect::<Vec<_>>())
-        .map_err(|error| format!("invalid committed conformance case catalog: {error}"))?;
-    let mut cells = Vec::with_capacity(17_040);
-    for requirement in requirements {
-        let builtin = hell_builtins::registry()
-            .get(usize::from(requirement.builtin.0))
-            .ok_or_else(|| "requirement builtin is absent from registry".to_owned())?;
-        for dimension in &requirement.dimensions {
-            for profile in ProfileId::ALL {
-                for platform in ConformancePlatform::ALL {
-                    let scope = dimension
-                        .scopes
-                        .iter()
-                        .find(|scope| {
-                            scope.profiles.iter().any(|value| {
-                                matches!(
-                                    (value, profile),
-                                    (
-                                        hell_builtins::ExecutionProfile::Upstream,
-                                        ProfileId::Upstream
-                                    ) | (
-                                        hell_builtins::ExecutionProfile::Sandboxed,
-                                        ProfileId::Sandboxed
-                                    )
-                                )
-                            }) && scope.platforms.iter().any(|value| {
-                                matches!(
-                                    (value, platform),
-                                    (
-                                        hell_builtins::RequirementPlatform::LinuxX86_64,
-                                        ConformancePlatform::LinuxX86_64
-                                    ) | (
-                                        hell_builtins::RequirementPlatform::MacosAarch64,
-                                        ConformancePlatform::MacosAarch64
-                                    ) | (
-                                        hell_builtins::RequirementPlatform::WindowsX86_64,
-                                        ConformancePlatform::WindowsX86_64
-                                    )
-                                )
-                            })
-                        })
-                        .ok_or_else(|| {
-                            format!(
-                                "requirement scope is missing for {} {} {} {}",
-                                builtin.name,
-                                dimension.dimension.as_str(),
-                                profile.as_str(),
-                                platform.as_str()
-                            )
-                        })?;
-                    let key = CellKey::new(builtin.name, dimension.dimension, profile, platform)?;
-                    let (disposition, obligations) = if profile == ProfileId::Sandboxed {
-                        (
-                            ScopeDisposition::Excluded {
-                                scope_id: "upstream-release-v1-sandboxed".to_owned(),
-                                rationale: "The sandboxed profile is outside upstream-release-v1."
-                                    .to_owned(),
-                            },
-                            Vec::new(),
-                        )
-                    } else {
-                        let obligation_ids = if scope.obligations.is_empty() {
-                            vec!["unmapped-release-evidence"]
-                        } else {
-                            scope.obligations.to_vec()
-                        };
-                        let strategy = match scope.strategy {
-                            hell_builtins::RequirementStrategy::NativeOracle => {
-                                EvidenceStrategy::NativeOracle
-                            }
-                            hell_builtins::RequirementStrategy::PortableStatic => {
-                                EvidenceStrategy::PortableStatic
-                            }
-                            hell_builtins::RequirementStrategy::StructuralInvariant => {
-                                EvidenceStrategy::StructuralInvariant
-                            }
-                            hell_builtins::RequirementStrategy::CommittedDifferentialCorpus => {
-                                EvidenceStrategy::CommittedDifferentialCorpus
-                            }
-                            hell_builtins::RequirementStrategy::CrossPlatformRelation => {
-                                EvidenceStrategy::CrossPlatformRelation
-                            }
-                        };
-                        let normalizers = scope
-                            .normalizers
-                            .iter()
-                            .map(|normalizer| normalizer.as_str().to_owned())
-                            .collect::<Vec<_>>();
-                        let referenced_cases = scope
-                            .evidence
-                            .iter()
-                            .map(|reference| {
-                                let case_id =
-                                    hell_builtins::parse_differential_reference(reference)
-                                        .map_err(|_| {
-                                            format!("invalid differential reference {reference:?}")
-                                        })?
-                                        .case_id;
-                                let case = committed_cases.get(case_id).ok_or_else(|| {
-                                    format!(
-                                        "requirement references unknown committed case {case_id:?}"
-                                    )
-                                })?;
-                                Ok(((*case_id).to_owned(), case))
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
-                        for (case_id, case) in &referenced_cases {
-                            if !obligation_ids.iter().any(|obligation| {
-                                case_authorizes(case, &key, obligation, &normalizers)
-                            }) {
-                                return Err(format!(
-                                    "requirement case {case_id:?} does not authorize any declared obligation for {key}"
-                                ));
-                            }
-                        }
-                        (
-                            ScopeDisposition::Required {
-                                decision_id: scope.applicability_rule.to_owned(),
-                            },
-                            obligation_ids
-                                .into_iter()
-                                .map(|id| {
-                                    let cases = referenced_cases
-                                        .iter()
-                                        .filter(|(_, case)| {
-                                            case_authorizes(case, &key, id, &normalizers)
-                                        })
-                                        .map(|(case_id, case)| {
-                                            (
-                                                case_id.clone(),
-                                                hell_testkit::case_descriptor_sha256(case).hex(),
-                                            )
-                                        })
-                                        .collect::<std::collections::BTreeMap<_, _>>();
-                                    PlannedObligation {
-                                        id: id.to_owned(),
-                                        strategy,
-                                        case_ids: referenced_cases
-                                            .iter()
-                                            .filter(|(_, case)| {
-                                                case_authorizes(case, &key, id, &normalizers)
-                                            })
-                                            .map(|(case_id, _)| case_id.clone())
-                                            .collect(),
-                                        case_descriptor_sha256: cases,
-                                        allowed_normalizers: normalizers.clone(),
-                                    }
-                                })
-                                .collect(),
-                        )
-                    };
-                    let exemption = exemption_by_cell.remove(&key);
-                    cells.push(PlannedCell {
-                        key,
-                        scope: disposition,
-                        obligations,
-                        exemption,
-                    });
-                }
-            }
-        }
-    }
-    if !exemption_by_cell.is_empty() {
-        return Err("release exemption targets a cell outside the canonical universe".to_owned());
-    }
+    let mut exemption_by_cell = index_release_exemptions(exemptions)?;
+    let committed_cases = committed_release_cases()?;
+    let cells = build_planned_cells(requirements, &committed_cases, &mut exemption_by_cell)?;
     let mut plan = ConformancePlan {
         standard: RELEASE_STANDARD.to_owned(),
         candidate_sha: candidate_sha.to_owned(),
@@ -1146,6 +1132,197 @@ pub(crate) fn build_release_conformance_plan(
     plan.validate(&canonical_universe()?)?;
     validate_plan_case_authority(&plan)?;
     Ok(plan)
+}
+
+type CommittedCases = std::collections::BTreeMap<String, hell_testkit::DifferentialCase>;
+
+fn index_release_exemptions(
+    exemptions: Vec<PlannedExemption>,
+) -> Result<std::collections::BTreeMap<CellKey, PlannedExemption>, String> {
+    let mut by_cell = std::collections::BTreeMap::new();
+    for exemption in exemptions {
+        if by_cell.insert(exemption.cell.clone(), exemption).is_some() {
+            return Err("multiple release exemptions target one cell".to_owned());
+        }
+    }
+    Ok(by_cell)
+}
+
+fn committed_release_cases() -> Result<CommittedCases, String> {
+    let cases = hell_testkit::committed_differential_cases();
+    hell_testkit::validate_evidence_catalog(&cases)
+        .map_err(|error| format!("invalid committed conformance case catalog: {error}"))?;
+    Ok(cases
+        .into_iter()
+        .map(|case| (case.id.to_string(), case))
+        .collect())
+}
+
+fn build_planned_cells(
+    requirements: &[hell_builtins::CompatibilityRequirement],
+    committed_cases: &CommittedCases,
+    exemption_by_cell: &mut std::collections::BTreeMap<CellKey, PlannedExemption>,
+) -> Result<Vec<PlannedCell>, String> {
+    let mut cells = Vec::with_capacity(17_040);
+    for requirement in requirements {
+        let builtin = hell_builtins::registry()
+            .get(usize::from(requirement.builtin.0))
+            .ok_or_else(|| "requirement builtin is absent from registry".to_owned())?;
+        for dimension in &requirement.dimensions {
+            for profile in ProfileId::ALL {
+                for platform in ConformancePlatform::ALL {
+                    cells.push(build_planned_cell(
+                        builtin.name,
+                        dimension,
+                        profile,
+                        platform,
+                        committed_cases,
+                        exemption_by_cell,
+                    )?);
+                }
+            }
+        }
+    }
+    if !exemption_by_cell.is_empty() {
+        return Err("release exemption targets a cell outside the canonical universe".to_owned());
+    }
+    Ok(cells)
+}
+
+fn build_planned_cell(
+    builtin: &str,
+    dimension: &hell_builtins::DimensionRequirement,
+    profile: ProfileId,
+    platform: ConformancePlatform,
+    committed_cases: &CommittedCases,
+    exemption_by_cell: &mut std::collections::BTreeMap<CellKey, PlannedExemption>,
+) -> Result<PlannedCell, String> {
+    let scope = dimension
+        .scopes
+        .iter()
+        .find(|scope| audit_scope_matches(scope, profile, platform))
+        .ok_or_else(|| {
+            format!(
+                "requirement scope is missing for {} {} {} {}",
+                builtin,
+                dimension.dimension.as_str(),
+                profile.as_str(),
+                platform.as_str()
+            )
+        })?;
+    let key = CellKey::new(builtin, dimension.dimension, profile, platform)?;
+    let (disposition, obligations) = planned_scope(&key, scope, committed_cases)?;
+    Ok(PlannedCell {
+        exemption: exemption_by_cell.remove(&key),
+        key,
+        scope: disposition,
+        obligations,
+    })
+}
+
+fn planned_scope(
+    key: &CellKey,
+    scope: &hell_builtins::ScopedRequirement,
+    committed_cases: &CommittedCases,
+) -> Result<(ScopeDisposition, Vec<PlannedObligation>), String> {
+    if key.profile == ProfileId::Sandboxed {
+        return Ok((
+            ScopeDisposition::Excluded {
+                scope_id: "upstream-release-v1-sandboxed".to_owned(),
+                rationale: "The sandboxed profile is outside upstream-release-v1.".to_owned(),
+            },
+            Vec::new(),
+        ));
+    }
+    let obligations = build_required_obligations(key, scope, committed_cases)?;
+    Ok((
+        ScopeDisposition::Required {
+            decision_id: scope.applicability_rule.to_owned(),
+        },
+        obligations,
+    ))
+}
+
+fn build_required_obligations(
+    key: &CellKey,
+    scope: &hell_builtins::ScopedRequirement,
+    committed_cases: &CommittedCases,
+) -> Result<Vec<PlannedObligation>, String> {
+    let obligation_ids = if scope.obligations.is_empty() {
+        vec!["unmapped-release-evidence"]
+    } else {
+        scope.obligations.to_vec()
+    };
+    let normalizers = scope
+        .normalizers
+        .iter()
+        .map(|normalizer| normalizer.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let referenced_cases = scope
+        .evidence
+        .iter()
+        .map(|reference| {
+            let case_id = hell_builtins::parse_differential_reference(reference)
+                .map_err(|_| format!("invalid differential reference {reference:?}"))?
+                .case_id;
+            let case = committed_cases.get(case_id).ok_or_else(|| {
+                format!("requirement references unknown committed case {case_id:?}")
+            })?;
+            Ok(((*case_id).to_owned(), case))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (case_id, case) in &referenced_cases {
+        if !obligation_ids
+            .iter()
+            .any(|id| case_authorizes(case, key, id, &normalizers))
+        {
+            return Err(format!(
+                "requirement case {case_id:?} does not authorize any declared obligation for {key}"
+            ));
+        }
+    }
+    let strategy = evidence_strategy(scope.strategy);
+    Ok(obligation_ids
+        .into_iter()
+        .map(|id| {
+            let authorized = referenced_cases
+                .iter()
+                .filter(|(_, case)| case_authorizes(case, key, id, &normalizers));
+            PlannedObligation {
+                id: id.to_owned(),
+                strategy,
+                case_ids: authorized
+                    .clone()
+                    .map(|(case_id, _)| case_id.clone())
+                    .collect(),
+                case_descriptor_sha256: authorized
+                    .map(|(case_id, case)| {
+                        (
+                            case_id.clone(),
+                            hell_testkit::case_descriptor_sha256(case).hex(),
+                        )
+                    })
+                    .collect(),
+                allowed_normalizers: normalizers.clone(),
+            }
+        })
+        .collect())
+}
+
+const fn evidence_strategy(strategy: hell_builtins::RequirementStrategy) -> EvidenceStrategy {
+    match strategy {
+        hell_builtins::RequirementStrategy::NativeOracle => EvidenceStrategy::NativeOracle,
+        hell_builtins::RequirementStrategy::PortableStatic => EvidenceStrategy::PortableStatic,
+        hell_builtins::RequirementStrategy::StructuralInvariant => {
+            EvidenceStrategy::StructuralInvariant
+        }
+        hell_builtins::RequirementStrategy::CommittedDifferentialCorpus => {
+            EvidenceStrategy::CommittedDifferentialCorpus
+        }
+        hell_builtins::RequirementStrategy::CrossPlatformRelation => {
+            EvidenceStrategy::CrossPlatformRelation
+        }
+    }
 }
 
 fn case_authorizes(
@@ -1298,7 +1475,7 @@ mod tests {
             std::process::id(),
             crate::test_thread_name_component(std::thread::current().name())
         ));
-        let message = audit(candidate_root.to_owned(), output.clone()).unwrap();
+        let message = audit(candidate_root, output.clone()).unwrap();
         assert!(message.contains("8520 projected blockers"));
         let document = std::fs::read_to_string(&output).unwrap();
         let report = crate::json::parse_json(&document).unwrap();

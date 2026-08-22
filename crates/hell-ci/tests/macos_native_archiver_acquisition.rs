@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -35,23 +36,56 @@ impl Drop for Fixture {
     }
 }
 
-fn run_receipted_verifier(command: &str, receipt: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg(command)
-        .arg(receipt)
-        .output()
-        .expect("macOS native archiver verifier must execute")
+fn run_command(command: &mut Command) -> hell_testkit::SupervisedOutput {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_mins(10))
+        .expect("macOS native archiver verifier must execute");
+    assert!(
+        !output.timed_out,
+        "macOS native archiver verifier timed out"
+    );
+    assert!(
+        output
+            .phase_timings
+            .iter()
+            .any(|phase| phase.name == "quiescence-complete")
+    );
+    assert_eq!(
+        output.phase_timings.last().map(|phase| phase.name),
+        Some("stdin-joined")
+    );
+    output
 }
 
-fn require_terminal_receipt(receipt: &Path, expected_case: &str, output: &Output) {
+fn run_receipted_verifier(command: &str, receipt: &Path) -> hell_testkit::SupervisedOutput {
+    let mut verifier = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    verifier.arg(command).arg(receipt);
+    run_command(&mut verifier)
+}
+
+fn captured(capture: &hell_testkit::BoundedCapture) -> &[u8] {
+    capture
+        .complete
+        .as_deref()
+        .expect("supervised output must fit the bounded complete capture")
+}
+
+fn stderr(output: &hell_testkit::SupervisedOutput) -> String {
+    String::from_utf8_lossy(captured(&output.stderr)).into_owned()
+}
+
+fn require_terminal_receipt(
+    receipt: &Path,
+    expected_case: &str,
+    output: &hell_testkit::SupervisedOutput,
+) {
     let receipt = fs::read_to_string(receipt).unwrap_or_else(|error| {
         panic!(
             "native archiver receipt must be readable: {error}; stdout={}; stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(captured(&output.stdout)),
+            stderr(output),
         )
     });
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    eprint!("{}", stderr(output));
     eprint!("{receipt}");
     let lines = receipt.lines().collect::<Vec<_>>();
     assert!(
@@ -115,11 +149,7 @@ fn homebrew_real_positive_acquires_stages_executes_and_cleans_once() {
         "homebrew-real-positive-acquire-stage-execute-cleanup",
         &output,
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]
@@ -132,35 +162,21 @@ fn system_only_graph_parser_rpath_escape_and_mutation_are_deterministic() {
         "synthetic-system-topology-parser-and-mutation-negatives",
         &output,
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]
 fn sealed_synthetic_archiver_receipt_avoids_repeated_closure_scans() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-macos-native-archiver-receipt")
-        .output()
-        .expect("macOS native archiver receipt verifier must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-macos-native-archiver-receipt");
+    let output = run_command(&mut command);
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]
 fn synthetic_dependency_receipt_rejects_authority_mutation_but_allows_sibling_churn() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-macos-native-archiver-dependency-receipt")
-        .output()
-        .expect("macOS native archiver dependency verifier must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-macos-native-archiver-dependency-receipt");
+    let output = run_command(&mut command);
+    assert!(output.status.success(), "{}", stderr(&output));
 }

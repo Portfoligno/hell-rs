@@ -1,0 +1,118 @@
+schema-version = 1
+protocol-id = "hell-rs-ci-v1"
+base-workflows = ".github/workflows"
+protocol-projection = "ci/protocol/v1.audit.json"
+action-metadata = "ci/actions/metadata-v1.json"
+
+[[vector]]
+id = "known-good-workflows"
+valid = true
+mutation = "none"
+
+[[vector]]
+id = "workflow-command-chain"
+valid = false
+mutation = "append-command-chain"
+diagnostic = "workflow.run.multiple-invocations"
+
+[[vector]]
+id = "workflow-custom-env"
+valid = false
+mutation = "add-custom-step-environment"
+diagnostic = "workflow.environment.custom"
+
+[[vector]]
+id = "workflow-unpinned-action"
+valid = false
+mutation = "replace-action-sha-with-tag"
+diagnostic = "workflow.action.unpinned"
+
+[[vector]]
+id = "workflow-manual-drift"
+valid = false
+mutation = "change-generated-workflow-name"
+diagnostic = "workflow.generated.drift"
+
+[[vector]]
+id = "workflow-attest-contents-write"
+valid = false
+mutation = "grant-attest-contents-write"
+diagnostic = "workflow.permission.attest"
+
+[[vector]]
+id = "workflow-publish-id-token-write"
+valid = false
+mutation = "grant-publish-id-token-write"
+diagnostic = "workflow.permission.publish"
+
+[[vector]]
+id = "workflow-deep-parser-in-publish"
+valid = false
+mutation = "invoke-deep-verifier-in-publish"
+diagnostic = "workflow.privilege.deep-parser"
+
+[[vector]]
+id = "workflow-explicit-shell"
+valid = false
+mutation = "add-shell-key"
+diagnostic = "workflow.shell.explicit"
+
+[[vector]]
+id = "workflow-multiline-run"
+valid = false
+mutation = "add-run-newline"
+diagnostic = "workflow.run.multiline"
+
+[[vector]]
+id = "workflow-secret-expression"
+valid = false
+mutation = "add-secret-expression"
+diagnostic = "workflow.expression.secret"
+
+[[vector]]
+id = "workflow-input-expression-in-run"
+valid = false
+mutation = "add-input-expression"
+diagnostic = "workflow.expression.untrusted-input"
+
+[[vector]]
+id = "workflow-missing-artifact-failure"
+valid = false
+mutation = "ignore-missing-critical-upload"
+diagnostic = "workflow.artifact.missing-policy"
+
+[[vector]]
+id = "workflow-artifact-name-download"
+valid = false
+mutation = "replace-artifact-id-with-name"
+diagnostic = "workflow.artifact.selection"
+
+[[vector]]
+id = "workflow-summary-always"
+valid = false
+mutation = "replace-not-cancelled-with-always"
+diagnostic = "workflow.summary.cancellation"
+
+[[vector]]
+id = "workflow-summary-omits-verifier"
+valid = false
+mutation = "remove-summary-verifier-need"
+diagnostic = "workflow.summary.graph"
+
+[[vector]]
+id = "workflow-regression-global-cancellation"
+valid = false
+mutation = "remove-ref-from-regression-concurrency"
+diagnostic = "workflow.concurrency.scope"
+
+[[vector]]
+id = "workflow-release-cancels"
+valid = false
+mutation = "enable-release-cancellation"
+diagnostic = "workflow.concurrency.release"
+
+[[vector]]
+id = "workflow-merge-group-while-disabled"
+valid = false
+mutation = "add-disabled-merge-group"
+diagnostic = "workflow.trigger.merge-group"

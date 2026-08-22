@@ -1,5 +1,3 @@
-mod release_workflow;
-
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,30 +25,37 @@ pub(crate) struct RepositoryInventoryReceipt {
     paths: Vec<PathBuf>,
     status: Option<i32>,
     timed_out: bool,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    capture: RepositoryInventoryCapture,
     stdout_bytes: u64,
     stderr_bytes: u64,
     stdout_sha256: hell_testkit::Digest,
     stderr_sha256: hell_testkit::Digest,
-    cleanup_id: Option<u64>,
-    termination_forced: bool,
-    termination_reaped: bool,
-    #[cfg(windows)]
-    candidate_quiescence_complete: bool,
+    termination: RepositoryInventoryTermination,
     #[cfg(windows)]
     windows_launch_control: Option<hell_testkit::WindowsLaunchControlReceipt>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RepositoryInventoryCapture {
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RepositoryInventoryTermination {
+    cleanup_id: Option<u64>,
+    forced: bool,
+    reaped: bool,
+    #[cfg(windows)]
+    candidate_quiescence_complete: bool,
 }
 
 pub fn check_repository(root: &Path) -> Result<(), String> {
     let inventory = tracked_files(root)?;
     inventory.validate()?;
     let tracked = inventory.paths;
-    let mut failures = Vec::new();
-    for path in &tracked {
-        check_tracked_file(root, path, &mut failures);
-    }
-    release_workflow::check(root, &tracked, &mut failures);
+    let mut failures = tracked_file_failures(root, &tracked);
+    failures.extend(crate::protocol::repository_failures(root));
     check_dormant_collection_activation(root, &mut failures);
     if failures.is_empty() {
         Ok(())
@@ -59,20 +64,39 @@ pub fn check_repository(root: &Path) -> Result<(), String> {
     }
 }
 
+pub(crate) fn check_text_files(root: &Path) -> Result<(), String> {
+    let inventory = tracked_files(root)?;
+    inventory.validate()?;
+    let failures = tracked_file_failures(root, &inventory.paths);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+fn tracked_file_failures(root: &Path, tracked: &[PathBuf]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for path in tracked {
+        check_tracked_file(root, path, &mut failures);
+    }
+    failures
+}
+
 impl RepositoryInventoryReceipt {
     fn validate(&self) -> Result<(), String> {
         if self.status != Some(0)
             || fs::canonicalize(&self.root).ok().as_deref() != Some(self.root.as_path())
             || self.timed_out
-            || self.stdout_truncated
-            || self.stderr_truncated
+            || self.capture.stdout_truncated
+            || self.capture.stderr_truncated
             || self.stderr_bytes != 0
             || self.stdout_bytes < u64::try_from(self.paths.len()).unwrap_or(u64::MAX)
             || self.stdout_sha256 == hell_testkit::Digest::default()
             || self.stderr_sha256 != hell_testkit::sha256_bytes(&[])
-            || self.cleanup_id.is_none()
-            || !self.termination_forced
-            || !self.termination_reaped
+            || self.termination.cleanup_id.is_none()
+            || !self.termination.forced
+            || !self.termination.reaped
         {
             return Err("repository inventory terminal receipt is inconsistent".to_owned());
         }
@@ -84,9 +108,10 @@ impl RepositoryInventoryReceipt {
                 || control.program_bytes.is_none()
                 || control.program_sha256.is_none()
                 || control.current_directory != self.root
-                || control.termination_forced != self.termination_forced
-                || control.termination_reaped != self.termination_reaped
-                || control.candidate_quiescence_complete != self.candidate_quiescence_complete
+                || control.termination_forced != self.termination.forced
+                || control.termination_reaped != self.termination.reaped
+                || control.candidate_quiescence_complete
+                    != self.termination.candidate_quiescence_complete
         }) {
             return Err("repository inventory Windows launch receipt is incomplete".to_owned());
         }
@@ -224,32 +249,56 @@ fn tracked_files(root: &Path) -> Result<RepositoryInventoryReceipt, String> {
         paths,
         status: result.status.code(),
         timed_out: result.timed_out,
-        stdout_truncated: result.stdout_truncated,
-        stderr_truncated: result.stderr_truncated,
+        capture: RepositoryInventoryCapture {
+            stdout_truncated: result.stdout_truncated,
+            stderr_truncated: result.stderr_truncated,
+        },
         stdout_bytes: result.stdout_bytes,
         stderr_bytes: result.stderr_bytes,
         stdout_sha256: result.stdout_sha256,
         stderr_sha256: result.stderr_sha256,
-        cleanup_id: result.cleanup_id,
-        termination_forced: result.termination_forced,
-        termination_reaped: result.termination_reaped,
-        #[cfg(windows)]
-        candidate_quiescence_complete: result.candidate_quiescence_complete,
+        termination: RepositoryInventoryTermination {
+            cleanup_id: result.termination.cleanup_id,
+            forced: result.termination.forced,
+            reaped: result.termination.reaped,
+            #[cfg(windows)]
+            candidate_quiescence_complete: result.termination.candidate_quiescence_complete,
+        },
         #[cfg(windows)]
         windows_launch_control: result.windows_launch_control,
     })
 }
 
 fn repository_inventory_evidence(result: &crate::command::CommandResult) -> JsonValue {
-    let bounded = |bytes: &[u8]| {
-        let rendered = String::from_utf8_lossy(bytes);
-        let boundary = (0..=rendered.len().min(REPOSITORY_INVENTORY_DETAIL_LIMIT))
-            .rev()
-            .find(|boundary| rendered.is_char_boundary(*boundary))
-            .unwrap_or_default();
-        JsonValue::String(rendered[..boundary].to_owned())
+    let evidence = repository_inventory_base_evidence(result);
+    #[cfg(windows)]
+    let evidence = {
+        let mut evidence = evidence;
+        evidence.insert(
+            "launchControl".to_owned(),
+            result
+                .windows_launch_control
+                .as_ref()
+                .map_or(JsonValue::Null, repository_inventory_launch_control),
+        );
+        evidence
     };
-    let evidence = BTreeMap::from([
+    JsonValue::Object(evidence)
+}
+
+fn bounded_repository_inventory_detail(bytes: &[u8]) -> JsonValue {
+    let rendered = String::from_utf8_lossy(bytes);
+    let boundary = (0..=rendered.len().min(REPOSITORY_INVENTORY_DETAIL_LIMIT))
+        .rev()
+        .find(|boundary| rendered.is_char_boundary(*boundary))
+        .unwrap_or_default();
+    JsonValue::String(rendered[..boundary].to_owned())
+}
+
+fn repository_inventory_base_evidence(
+    result: &crate::command::CommandResult,
+) -> BTreeMap<String, JsonValue> {
+    BTreeMap::from([
         ("schemaVersion".to_owned(), JsonValue::Number(2)),
         (
             "durationMillis".to_owned(),
@@ -282,19 +331,22 @@ fn repository_inventory_evidence(result: &crate::command::CommandResult) -> Json
         ("timedOut".to_owned(), JsonValue::Bool(result.timed_out)),
         (
             "cleanupId".to_owned(),
-            result.cleanup_id.map_or(JsonValue::Null, JsonValue::Number),
+            result
+                .termination
+                .cleanup_id
+                .map_or(JsonValue::Null, JsonValue::Number),
         ),
         (
             "terminationForced".to_owned(),
-            JsonValue::Bool(result.termination_forced),
+            JsonValue::Bool(result.termination.forced),
         ),
         (
             "terminationReaped".to_owned(),
-            JsonValue::Bool(result.termination_reaped),
+            JsonValue::Bool(result.termination.reaped),
         ),
         (
             "candidateQuiescenceComplete".to_owned(),
-            JsonValue::Bool(result.candidate_quiescence_complete),
+            JsonValue::Bool(result.termination.candidate_quiescence_complete),
         ),
         (
             "stdoutBytes".to_owned(),
@@ -320,91 +372,89 @@ fn repository_inventory_evidence(result: &crate::command::CommandResult) -> Json
             "stderrTruncated".to_owned(),
             JsonValue::Bool(result.stderr_truncated),
         ),
-        ("stdoutDetail".to_owned(), bounded(&result.stdout)),
-        ("stderrDetail".to_owned(), bounded(&result.stderr)),
-    ]);
-    #[cfg(windows)]
-    let evidence = {
-        let mut evidence = evidence;
-        evidence.insert(
-            "launchControl".to_owned(),
-            result
-                .windows_launch_control
-                .as_ref()
-                .map_or(JsonValue::Null, |control| {
-                    JsonValue::Object(BTreeMap::from([
-                        ("bytes".to_owned(), JsonValue::Number(control.bytes)),
-                        (
-                            "candidateQuiescenceComplete".to_owned(),
-                            JsonValue::Bool(control.candidate_quiescence_complete),
-                        ),
-                        (
-                            "currentDirectory".to_owned(),
-                            JsonValue::String(control.current_directory.display().to_string()),
-                        ),
-                        (
-                            "program".to_owned(),
-                            control.program.as_ref().map_or(JsonValue::Null, |path| {
-                                JsonValue::String(path.display().to_string())
-                            }),
-                        ),
-                        (
-                            "programBytes".to_owned(),
-                            control
-                                .program_bytes
-                                .map_or(JsonValue::Null, JsonValue::Number),
-                        ),
-                        (
-                            "programSha256".to_owned(),
-                            control
-                                .program_sha256
-                                .map_or(JsonValue::Null, |digest| JsonValue::String(digest.hex())),
-                        ),
-                        (
-                            "phases".to_owned(),
-                            JsonValue::Array(
-                                control
-                                    .phases
-                                    .iter()
-                                    .map(|phase| JsonValue::String((*phase).to_owned()))
-                                    .collect(),
-                            ),
-                        ),
-                        (
-                            "requestSha256".to_owned(),
-                            JsonValue::String(control.request_sha256.hex()),
-                        ),
-                        (
-                            "schemaVersion".to_owned(),
-                            JsonValue::Number(control.schema_version),
-                        ),
-                        ("sha256".to_owned(), JsonValue::String(control.sha256.hex())),
-                        (
-                            "state".to_owned(),
-                            JsonValue::String(control.state.to_owned()),
-                        ),
-                        (
-                            "statusCode".to_owned(),
-                            control
-                                .status_code
-                                .and_then(|code| u64::try_from(code).ok())
-                                .map_or(JsonValue::Null, JsonValue::Number),
-                        ),
-                        ("timedOut".to_owned(), JsonValue::Bool(control.timed_out)),
-                        (
-                            "terminationForced".to_owned(),
-                            JsonValue::Bool(control.termination_forced),
-                        ),
-                        (
-                            "terminationReaped".to_owned(),
-                            JsonValue::Bool(control.termination_reaped),
-                        ),
-                    ]))
-                }),
-        );
-        evidence
-    };
-    JsonValue::Object(evidence)
+        (
+            "stdoutDetail".to_owned(),
+            bounded_repository_inventory_detail(&result.stdout),
+        ),
+        (
+            "stderrDetail".to_owned(),
+            bounded_repository_inventory_detail(&result.stderr),
+        ),
+    ])
+}
+
+#[cfg(windows)]
+fn repository_inventory_launch_control(
+    control: &hell_testkit::WindowsLaunchControlReceipt,
+) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        ("bytes".to_owned(), JsonValue::Number(control.bytes)),
+        (
+            "candidateQuiescenceComplete".to_owned(),
+            JsonValue::Bool(control.candidate_quiescence_complete),
+        ),
+        (
+            "currentDirectory".to_owned(),
+            JsonValue::String(control.current_directory.display().to_string()),
+        ),
+        (
+            "program".to_owned(),
+            control.program.as_ref().map_or(JsonValue::Null, |path| {
+                JsonValue::String(path.display().to_string())
+            }),
+        ),
+        (
+            "programBytes".to_owned(),
+            control
+                .program_bytes
+                .map_or(JsonValue::Null, JsonValue::Number),
+        ),
+        (
+            "programSha256".to_owned(),
+            control
+                .program_sha256
+                .map_or(JsonValue::Null, |digest| JsonValue::String(digest.hex())),
+        ),
+        (
+            "phases".to_owned(),
+            JsonValue::Array(
+                control
+                    .phases
+                    .iter()
+                    .map(|phase| JsonValue::String((*phase).to_owned()))
+                    .collect(),
+            ),
+        ),
+        (
+            "requestSha256".to_owned(),
+            JsonValue::String(control.request_sha256.hex()),
+        ),
+        (
+            "schemaVersion".to_owned(),
+            JsonValue::Number(control.schema_version),
+        ),
+        ("sha256".to_owned(), JsonValue::String(control.sha256.hex())),
+        (
+            "state".to_owned(),
+            JsonValue::String(control.state.to_owned()),
+        ),
+        (
+            "statusCode".to_owned(),
+            control
+                .status_code
+                .and_then(|code| u64::try_from(code).ok())
+                .map_or(JsonValue::Null, JsonValue::Number),
+        ),
+        ("timedOut".to_owned(), JsonValue::Bool(control.timed_out)),
+        (
+            "terminationForced".to_owned(),
+            JsonValue::Bool(control.termination_forced),
+        ),
+        (
+            "terminationReaped".to_owned(),
+            JsonValue::Bool(control.termination_reaped),
+        ),
+    ]))
 }
 
 fn require_repository_inventory_command(
@@ -583,27 +633,5 @@ fn check_dormant_collection_activation(root: &Path, failures: &mut Vec<String>) 
     })();
     if let Err(error) = result {
         failures.push(error);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dormant_activation_is_bound_and_fail_closed() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut failures = Vec::new();
-        check_dormant_collection_activation(&root, &mut failures);
-        assert!(failures.is_empty(), "{failures:?}");
-    }
-
-    #[test]
-    fn shell_extensions_and_missing_newline_are_rejected() {
-        assert!(matches!(
-            Path::new("tool.sh").extension().and_then(|v| v.to_str()),
-            Some("sh")
-        ));
-        assert!(textual(Path::new("source.rs"), b"fn main() {}"));
     }
 }

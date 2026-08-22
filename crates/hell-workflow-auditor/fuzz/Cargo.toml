@@ -1,0 +1,40 @@
+[package]
+name = "hell-workflow-auditor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.assurance]
+cargo-fuzz-version = "0.13.2"
+cargo-fuzz-toolchain = "nightly-2026-07-31"
+
+[dependencies]
+hell-workflow-auditor = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "workflow_yaml_subset"
+path = "fuzz_targets/workflow_yaml_subset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workflow_expression"
+path = "fuzz_targets/workflow_expression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workflow_run_invocation"
+path = "fuzz_targets/workflow_run_invocation.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

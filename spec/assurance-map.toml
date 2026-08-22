@@ -1,0 +1,178 @@
+schema-version = 1
+map-id = "hell-rs-release-assurance-v1"
+
+[[claim]]
+id = "REL-DUAL-ADMISSION"
+statement = "Release authority requires admitted primary and independent decisions with exact semantic agreement."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/release/final_verify.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/final-verify"]
+vectors = ["known-good", "primary-accepts-independent-rejects", "independent-accepts-primary-rejects"]
+fuzz-targets = ["release_acceptance", "independent_ledger"]
+mutants = ["digest-binding-inverted"]
+residual-assumptions = ["shared-rust-toolchain", "shared-normative-specification"]
+
+[[claim]]
+id = "REL-DIGEST-BINDING"
+statement = "Every verifier decision binds the exact normative protocol, candidate, workflow, plans, inventories, ledger, subjects, and release gate."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/release/assemble.rs", "crates/hell-ci/src/release/final_verify.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/assemble", "release/final-verify"]
+vectors = ["wrong-candidate-sha", "wrong-workflow-sha", "wrong-source-inventory-digest", "release-gate-bound-to-another-subject-manifest"]
+fuzz-targets = ["release_plan", "independent_release_plan"]
+mutants = ["digest-binding-inverted"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-ADMISSION-LEDGER-COMPLETE"
+statement = "Every conformance cell has exactly one verifier-derived final disposition."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/conformance/ledger.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/final-verify"]
+vectors = ["missing-cell", "duplicate-cell", "contradictory-evidence-for-one-cell", "blocked-count-hidden-by-forged-summary"]
+fuzz-targets = ["partition_reconstruction", "independent_ledger"]
+mutants = ["drop-final-cell", "accept-duplicate-cell"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-EVIDENCE-PLATFORM-BOUND"
+statement = "Evidence is bound to the exact candidate, executable, oracle, case, profile, and native platform."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/conformance/evidence.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/linux", "release/macos", "release/windows", "release/final-verify"]
+vectors = ["wrong-oracle-identity", "wrong-executable-digest", "linux-evidence-relabeled-as-windows", "evidence-replayed-into-another-case"]
+fuzz-targets = ["evidence_repository", "independent_evidence"]
+mutants = ["ignore-evidence-platform"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-EXEMPTION-EXACT"
+statement = "An exemption matches every selector and independently derived mismatch fingerprint exactly."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/conformance/ledger.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/final-verify"]
+vectors = ["exemption-with-mismatched-selector", "expired-exemption"]
+fuzz-targets = ["release_acceptance", "independent_exemption"]
+mutants = ["compare-exemption-id-only"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-EXEMPTION-PLAN-TIME"
+statement = "Exemption expiry is evaluated against the fixed plan instant and never wall-clock time."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/conformance/ledger.rs", "crates/hell-release-verifier/src/verifier.rs"]
+workflow-gates = ["release/final-verify"]
+vectors = ["expired-exemption", "exemption-uses-wall-clock-time"]
+fuzz-targets = ["independent_exemption"]
+mutants = ["use-wall-clock-for-exemption"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-ARCHIVE-EXACT"
+statement = "Release archives use the bounded canonical single-member gzip and GNU tar subset with an exact safe inventory."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/release/archive.rs", "crates/hell-release-verifier/src/archive.rs"]
+workflow-gates = ["release/linux", "release/macos", "release/windows", "release/final-verify"]
+vectors = ["extra-archive-member", "duplicate-archive-member", "archive-path-traversal", "absolute-archive-path", "archive-symbolic-link", "malformed-tar-checksum", "trailing-gzip-member", "decompression-limit-exceeded"]
+fuzz-targets = ["gzip_framing", "gnu_tar_subset", "independent_gzip", "independent_gnu_tar"]
+mutants = ["allow-extra-archive-member"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-SUBJECTS-EXACT"
+statement = "Attestation and publication consume exactly the verifier-derived subject manifest."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/release/verify.rs", "crates/hell-release-verifier/src/verifier.rs", "crates/hell-release-publisher/src/lib.rs"]
+workflow-gates = ["release/final-verify", "release/attest", "release/publish"]
+vectors = ["subject-omitted-from-manifest", "unlisted-extra-subject"]
+fuzz-targets = ["subjects_manifest", "independent_subjects"]
+mutants = ["ignore-subject"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-PRIVILEGE-SPLIT"
+statement = "Deep parsing is read-only, OIDC and release-write are separated, and candidate code never executes in privileged jobs."
+severity = "release-blocking"
+implementation = ["ci/protocol/v1.toml", "crates/hell-workflow-auditor/src/lib.rs"]
+workflow-gates = ["release/final-verify", "release/attest", "release/publish"]
+vectors = ["workflow-attest-contents-write", "workflow-publish-id-token-write", "workflow-deep-parser-in-publish"]
+fuzz-targets = ["workflow_yaml_subset", "workflow_expression"]
+mutants = ["grant-contents-write-to-attest", "grant-id-token-write-to-publish"]
+residual-assumptions = ["github-job-isolation"]
+
+[[claim]]
+id = "REL-ENVELOPE-BOUND"
+statement = "Attestation and publication shallow-check the canonical envelope and exact subject files after read-only dual admission."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/release/final_verify.rs", "crates/hell-release-verifier/src/verifier.rs", "crates/hell-release-publisher/src/lib.rs"]
+workflow-gates = ["release/final-verify", "release/attest", "release/publish"]
+vectors = ["publisher-envelope-predecessor-mismatch", "release-gate-bound-to-another-subject-manifest", "wrong-governance-profile", "wrong-native-environment-receipt"]
+fuzz-targets = ["publication_envelope", "independent_publication_envelope"]
+mutants = ["skip-shallow-envelope-verification"]
+residual-assumptions = []
+
+[[claim]]
+id = "REL-GOVERNANCE-TRISTATE"
+statement = "Unavailable governance information is a bound residual assumption and never a matched control."
+severity = "release-blocking"
+implementation = ["ci/governance-policy.toml", "crates/hell-ci/src/release/governance.rs"]
+workflow-gates = ["release/resolve", "release/governance", "release/final-verify", "release/publish"]
+vectors = ["governance-ruleset-unavailable-residual", "wrong-governance-profile"]
+fuzz-targets = ["governance_api_response", "governance_profile"]
+mutants = ["unavailable-governance-is-matched"]
+residual-assumptions = ["workflow-permissions-api-unavailable", "actions-policy-api-unavailable", "ruleset-api-unavailable", "tag-rules-api-unavailable", "immutable-release-api-unavailable", "merge-queue-api-unavailable"]
+
+[[claim]]
+id = "REL-PUBLISH-STATE-CLOSED"
+statement = "The publisher accepts only absent, exact machine draft, or exact immutable published state and never overwrites unknown state."
+severity = "release-blocking"
+implementation = ["crates/hell-release-publisher/src/lib.rs"]
+workflow-gates = ["release/publish"]
+vectors = ["publisher-conflicting-draft", "publisher-conflicting-tag", "publisher-unexpected-asset"]
+fuzz-targets = ["publication_envelope"]
+mutants = ["accept-unknown-publisher-draft"]
+residual-assumptions = ["github-release-api-availability"]
+
+[[claim]]
+id = "CI-TYPED-PROTOCOL"
+statement = "All six workflows are deterministic renderings of the typed manifest and pass an independently implemented audit."
+severity = "release-blocking"
+implementation = ["ci/protocol/v1.toml", "ci/protocol/v1.audit.json", "crates/hell-ci/src/protocol/mod.rs", "crates/hell-workflow-auditor/src/lib.rs"]
+workflow-gates = ["ci/plan", "release/resolve"]
+vectors = ["workflow-command-chain", "workflow-custom-env", "workflow-unpinned-action", "workflow-manual-drift"]
+fuzz-targets = ["workflow_yaml_subset", "workflow_run_invocation"]
+mutants = ["grant-contents-write-to-attest", "grant-id-token-write-to-publish"]
+residual-assumptions = []
+
+[[claim]]
+id = "CI-TERMINAL-SUMMARY"
+statement = "A producer failure or skipped verifier yields one failing terminal readiness summary and cannot appear admitted."
+severity = "release-blocking"
+implementation = ["crates/hell-ci/src/readiness.rs", ".github/workflows/ci.yml"]
+workflow-gates = ["ci/summary"]
+vectors = ["summary-producer-failed", "summary-verifier-skipped", "summary-forged-job-state", "summary-missing-job-state", "summary-malformed-job-state", "summary-extra-job-state", "summary-missing-artifact"]
+fuzz-targets = ["release_acceptance"]
+mutants = []
+residual-assumptions = ["github-required-check-is-summary"]
+
+[[claim]]
+id = "CI-SEMANTIC-CAPABILITIES"
+statement = "Ambient environment access, child-environment mutation, and subprocess launch are confined to exact sealed Rust capability items."
+severity = "release-blocking"
+implementation = [".clippy.toml", "ci/rust-capabilities.toml", "crates/hell-ci/src/github_runtime.rs", "crates/hell-ci/src/process_environment.rs", "crates/hell-host/src/process_environment.rs", "crates/hell-host/src/process_tree.rs", "crates/hell-release-publisher/src/github_runtime.rs"]
+workflow-gates = ["ci/plan", "release/resolve"]
+vectors = ["rust-capability-renamed-environment-access", "rust-capability-aliased-environment-access", "rust-capability-reexported-environment-access", "rust-capability-broad-lint-allow", "rust-capability-unapproved-compile-time-environment"]
+fuzz-targets = []
+mutants = []
+residual-assumptions = []
+
+[[claim]]
+id = "REL-NATIVE-ENVIRONMENT"
+statement = "Each required native platform report binds its observed environment and immutable external-input lock."
+severity = "release-blocking"
+implementation = ["ci/external-inputs.toml", "crates/hell-ci/src/release/platform.rs"]
+workflow-gates = ["release/linux", "release/macos", "release/windows"]
+vectors = ["wrong-native-environment-receipt"]
+fuzz-targets = ["native_environment"]
+mutants = []
+residual-assumptions = ["github-hosted-runner-operation"]

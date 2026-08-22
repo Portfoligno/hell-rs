@@ -124,6 +124,10 @@ pub(crate) struct ReleasePlan {
     pub source_inventory_sha256: String,
     pub build_inputs_sha256: String,
     pub policy_sha256: String,
+    pub governance_declaration_sha256: String,
+    pub governance_profile_sha256: String,
+    pub residual_assumption_set_sha256: String,
+    pub external_inputs_sha256: String,
     pub trusted_conformance_inputs_sha256: String,
     pub conformance_plan_sha256: String,
     pub conformance_standard: String,
@@ -213,6 +217,7 @@ impl ReleasePlan {
             ),
             ("conformanceStandard", string(&self.conformance_standard)),
             ("defaultBranch", string(&self.resolution.default_branch)),
+            ("externalInputsSha256", string(&self.external_inputs_sha256)),
             (
                 "expectedPlatforms",
                 JsonValue::Array(
@@ -223,11 +228,23 @@ impl ReleasePlan {
                 ),
             ),
             ("policySha256", string(&self.policy_sha256)),
+            (
+                "governanceDeclarationSha256",
+                string(&self.governance_declaration_sha256),
+            ),
+            (
+                "governanceProfileSha256",
+                string(&self.governance_profile_sha256),
+            ),
             ("releaseBinary", string("hell")),
             ("releasePackage", string("hell-cli")),
             ("prerelease", JsonValue::Bool(self.prerelease)),
             ("repository", string(&self.resolution.repository)),
             ("repositoryId", number(self.resolution.repository_id)),
+            (
+                "residualAssumptionSetSha256",
+                string(&self.residual_assumption_set_sha256),
+            ),
             ("runAttempt", number(self.resolution.run_attempt)),
             ("runId", number(self.resolution.run_id)),
             (
@@ -259,58 +276,7 @@ impl ReleasePlan {
 
     pub(crate) fn parse(value: &JsonValue) -> Result<Self, String> {
         let object = value.object()?;
-        require_exact_json_keys(
-            object,
-            &[
-                "actor",
-                "actorId",
-                "buildInputsSha256",
-                "candidateBranch",
-                "candidateSha",
-                "changelogSha256",
-                "commitAuthor",
-                "commitCommitter",
-                "conformancePlanSha256",
-                "conformanceStandard",
-                "defaultBranch",
-                "expectedPlatforms",
-                "planSha256",
-                "policySha256",
-                "releaseBinary",
-                "releasePackage",
-                "prerelease",
-                "releaseEvaluationInstant",
-                "repository",
-                "repositoryId",
-                "runAttempt",
-                "runId",
-                "schemaVersion",
-                "sourceDateEpoch",
-                "sourceInventorySha256",
-                "tag",
-                "trustedConformanceInputsSha256",
-                "version",
-                "workflowRef",
-                "workflowSha",
-            ],
-        )?;
-        if json_member(object, "schemaVersion")?.number()? != 2 {
-            return Err("unsupported release plan schema".to_owned());
-        }
-        if json_member(object, "releaseBinary")?.string()? != "hell"
-            || json_member(object, "releasePackage")?.string()? != "hell-cli"
-        {
-            return Err("release plan package identity differs".to_owned());
-        }
-        let platforms = json_member(object, "expectedPlatforms")?.array()?;
-        if platforms.len() != PLATFORMS.len()
-            || !platforms
-                .iter()
-                .zip(PLATFORMS)
-                .all(|(value, platform)| value.string() == Ok(platform.id()))
-        {
-            return Err("release plan platform set differs from policy".to_owned());
-        }
+        validate_release_plan_json_shape(object)?;
         let mut plan = Self {
             resolution: Resolution {
                 repository: text(object, "repository")?,
@@ -333,6 +299,10 @@ impl ReleasePlan {
             source_inventory_sha256: text(object, "sourceInventorySha256")?,
             build_inputs_sha256: text(object, "buildInputsSha256")?,
             policy_sha256: text(object, "policySha256")?,
+            governance_declaration_sha256: text(object, "governanceDeclarationSha256")?,
+            governance_profile_sha256: text(object, "governanceProfileSha256")?,
+            residual_assumption_set_sha256: text(object, "residualAssumptionSetSha256")?,
+            external_inputs_sha256: text(object, "externalInputsSha256")?,
             trusted_conformance_inputs_sha256: text(object, "trustedConformanceInputsSha256")?,
             conformance_plan_sha256: text(object, "conformancePlanSha256")?,
             conformance_standard: text(object, "conformanceStandard")?,
@@ -341,35 +311,112 @@ impl ReleasePlan {
             commit_committer: text(object, "commitCommitter")?,
             plan_sha256: text(object, "planSha256")?,
         };
-        require_sha(&plan.resolution.candidate_sha, "candidate SHA")?;
-        require_sha(&plan.resolution.workflow_sha, "workflow SHA")?;
-        crate::conformance::validate_utc_instant(&plan.release_evaluation_instant)?;
-        for (value, label) in [
-            (&plan.source_inventory_sha256, "source inventory digest"),
-            (&plan.build_inputs_sha256, "build inputs digest"),
-            (&plan.policy_sha256, "policy digest"),
-            (
-                &plan.trusted_conformance_inputs_sha256,
-                "trusted conformance inputs digest",
-            ),
-            (&plan.conformance_plan_sha256, "conformance plan digest"),
-            (&plan.changelog_sha256, "changelog digest"),
-            (&plan.plan_sha256, "plan digest"),
-        ] {
-            require_digest(value, label)?;
-        }
-        if plan.conformance_standard != crate::conformance::RELEASE_STANDARD {
-            return Err("release plan conformance standard differs".to_owned());
-        }
-        let stated = std::mem::take(&mut plan.plan_sha256);
-        let observed =
-            hell_testkit::sha256_bytes(&canonical_json_bytes(&plan.json_without_digest())?).hex();
-        plan.plan_sha256 = stated;
-        if observed != plan.plan_sha256 {
-            return Err("release plan self-digest mismatch".to_owned());
-        }
+        validate_parsed_release_plan(&mut plan)?;
         Ok(plan)
     }
+}
+
+fn validate_release_plan_json_shape(
+    object: &std::collections::BTreeMap<String, JsonValue>,
+) -> Result<(), String> {
+    require_exact_json_keys(
+        object,
+        &[
+            "actor",
+            "actorId",
+            "buildInputsSha256",
+            "candidateBranch",
+            "candidateSha",
+            "changelogSha256",
+            "commitAuthor",
+            "commitCommitter",
+            "conformancePlanSha256",
+            "conformanceStandard",
+            "defaultBranch",
+            "externalInputsSha256",
+            "expectedPlatforms",
+            "governanceDeclarationSha256",
+            "governanceProfileSha256",
+            "planSha256",
+            "policySha256",
+            "releaseBinary",
+            "releasePackage",
+            "prerelease",
+            "releaseEvaluationInstant",
+            "repository",
+            "repositoryId",
+            "residualAssumptionSetSha256",
+            "runAttempt",
+            "runId",
+            "schemaVersion",
+            "sourceDateEpoch",
+            "sourceInventorySha256",
+            "tag",
+            "trustedConformanceInputsSha256",
+            "version",
+            "workflowRef",
+            "workflowSha",
+        ],
+    )?;
+    if json_member(object, "schemaVersion")?.number()? != 2 {
+        return Err("unsupported release plan schema".to_owned());
+    }
+    if json_member(object, "releaseBinary")?.string()? != "hell"
+        || json_member(object, "releasePackage")?.string()? != "hell-cli"
+    {
+        return Err("release plan package identity differs".to_owned());
+    }
+    let platforms = json_member(object, "expectedPlatforms")?.array()?;
+    if platforms.len() != PLATFORMS.len()
+        || !platforms
+            .iter()
+            .zip(PLATFORMS)
+            .all(|(value, platform)| value.string() == Ok(platform.id()))
+    {
+        return Err("release plan platform set differs from policy".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_parsed_release_plan(plan: &mut ReleasePlan) -> Result<(), String> {
+    require_sha(&plan.resolution.candidate_sha, "candidate SHA")?;
+    require_sha(&plan.resolution.workflow_sha, "workflow SHA")?;
+    crate::conformance::validate_utc_instant(&plan.release_evaluation_instant)?;
+    for (value, label) in [
+        (&plan.source_inventory_sha256, "source inventory digest"),
+        (&plan.build_inputs_sha256, "build inputs digest"),
+        (&plan.policy_sha256, "policy digest"),
+        (
+            &plan.governance_declaration_sha256,
+            "governance declaration digest",
+        ),
+        (&plan.governance_profile_sha256, "governance profile digest"),
+        (
+            &plan.residual_assumption_set_sha256,
+            "residual assumption set digest",
+        ),
+        (&plan.external_inputs_sha256, "external-input lock digest"),
+        (
+            &plan.trusted_conformance_inputs_sha256,
+            "trusted conformance inputs digest",
+        ),
+        (&plan.conformance_plan_sha256, "conformance plan digest"),
+        (&plan.changelog_sha256, "changelog digest"),
+        (&plan.plan_sha256, "plan digest"),
+    ] {
+        require_digest(value, label)?;
+    }
+    if plan.conformance_standard != crate::conformance::RELEASE_STANDARD {
+        return Err("release plan conformance standard differs".to_owned());
+    }
+    let stated = std::mem::take(&mut plan.plan_sha256);
+    let observed =
+        hell_testkit::sha256_bytes(&canonical_json_bytes(&plan.json_without_digest())?).hex();
+    plan.plan_sha256 = stated;
+    if observed != plan.plan_sha256 {
+        return Err("release plan self-digest mismatch".to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn object<const N: usize>(fields: [(&str, JsonValue); N]) -> JsonValue {

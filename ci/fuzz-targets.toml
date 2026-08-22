@@ -1,0 +1,582 @@
+schema-version = 1
+orchestrator = "hell-ci-fuzz-smoke-v1"
+toolchain = "nightly-2026-07-31"
+cargo-fuzz-version = "0.13.2"
+runs-per-target = 64
+timeout-seconds = 10
+
+[[target]]
+id = "strict_json"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "strict_json"
+source = "crates/hell-ci/fuzz/fuzz_targets/strict_json.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/strict_json/"]
+corpus = "crates/hell-ci/fuzz/corpus/strict_json"
+artifact-directory = "ci-out/fuzz-artifacts/strict_json"
+invariant = "bounded-no-panic"
+
+[[target]]
+id = "release_plan"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "release_plan"
+source = "crates/hell-ci/fuzz/fuzz_targets/release_plan.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/release_plan/"]
+corpus = "crates/hell-ci/fuzz/corpus/release_plan"
+artifact-directory = "ci-out/fuzz-artifacts/release_plan"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "conformance_plan"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "conformance_plan"
+source = "crates/hell-ci/fuzz/fuzz_targets/conformance_plan.rs"
+maximum-input-bytes = 16777216
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_prefix=ci-out/fuzz-artifacts/conformance_plan/"]
+corpus = "crates/hell-ci/fuzz/corpus/conformance_plan"
+artifact-directory = "ci-out/fuzz-artifacts/conformance_plan"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "trusted_inputs"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "trusted_inputs"
+source = "crates/hell-ci/fuzz/fuzz_targets/trusted_inputs.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/trusted_inputs/"]
+corpus = "crates/hell-ci/fuzz/corpus/trusted_inputs"
+artifact-directory = "ci-out/fuzz-artifacts/trusted_inputs"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "platform_report"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "platform_report"
+source = "crates/hell-ci/fuzz/fuzz_targets/platform_report.rs"
+maximum-input-bytes = 8388608
+maximum-depth = 64
+maximum-records = 131072
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=8388608", "-artifact_prefix=ci-out/fuzz-artifacts/platform_report/"]
+corpus = "crates/hell-ci/fuzz/corpus/platform_report"
+artifact-directory = "ci-out/fuzz-artifacts/platform_report"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "evidence_manifest"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "evidence_manifest"
+source = "crates/hell-ci/fuzz/fuzz_targets/evidence_manifest.rs"
+maximum-input-bytes = 16777216
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_prefix=ci-out/fuzz-artifacts/evidence_manifest/"]
+corpus = "crates/hell-ci/fuzz/corpus/evidence_manifest"
+artifact-directory = "ci-out/fuzz-artifacts/evidence_manifest"
+invariant = "exact-inventory"
+
+[[target]]
+id = "evidence_repository"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "evidence_repository"
+source = "crates/hell-ci/fuzz/fuzz_targets/evidence_repository.rs"
+maximum-input-bytes = 33554432
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=33554432", "-artifact_prefix=ci-out/fuzz-artifacts/evidence_repository/"]
+corpus = "crates/hell-ci/fuzz/corpus/evidence_repository"
+artifact-directory = "ci-out/fuzz-artifacts/evidence_repository"
+invariant = "exact-inventory"
+
+[[target]]
+id = "partition_reconstruction"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "partition_reconstruction"
+source = "crates/hell-ci/fuzz/fuzz_targets/partition_reconstruction.rs"
+maximum-input-bytes = 33554432
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=33554432", "-artifact_prefix=ci-out/fuzz-artifacts/partition_reconstruction/"]
+corpus = "crates/hell-ci/fuzz/corpus/partition_reconstruction"
+artifact-directory = "ci-out/fuzz-artifacts/partition_reconstruction"
+invariant = "complete-ledger"
+
+[[target]]
+id = "release_acceptance"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "release_acceptance"
+source = "crates/hell-ci/fuzz/fuzz_targets/release_acceptance.rs"
+maximum-input-bytes = 16777216
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_prefix=ci-out/fuzz-artifacts/release_acceptance/"]
+corpus = "crates/hell-ci/fuzz/corpus/release_acceptance"
+artifact-directory = "ci-out/fuzz-artifacts/release_acceptance"
+invariant = "recompute-admission"
+
+[[target]]
+id = "subjects_manifest"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "subjects_manifest"
+source = "crates/hell-ci/fuzz/fuzz_targets/subjects_manifest.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/subjects_manifest/"]
+corpus = "crates/hell-ci/fuzz/corpus/subjects_manifest"
+artifact-directory = "ci-out/fuzz-artifacts/subjects_manifest"
+invariant = "exact-inventory"
+
+[[target]]
+id = "release_gate"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "release_gate"
+source = "crates/hell-ci/fuzz/fuzz_targets/release_gate.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/release_gate/"]
+corpus = "crates/hell-ci/fuzz/corpus/release_gate"
+artifact-directory = "ci-out/fuzz-artifacts/release_gate"
+invariant = "strict-binding"
+
+[[target]]
+id = "publication_envelope"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "publication_envelope"
+source = "crates/hell-ci/fuzz/fuzz_targets/publication_envelope.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 32
+maximum-records = 16384
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/publication_envelope/"]
+corpus = "crates/hell-ci/fuzz/corpus/publication_envelope"
+artifact-directory = "ci-out/fuzz-artifacts/publication_envelope"
+invariant = "strict-binding"
+
+[[target]]
+id = "governance_api_response"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "governance_api_response"
+source = "crates/hell-ci/fuzz/fuzz_targets/governance_api_response.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/governance_api_response/"]
+corpus = "crates/hell-ci/fuzz/corpus/governance_api_response"
+artifact-directory = "ci-out/fuzz-artifacts/governance_api_response"
+invariant = "tri-state-no-false-match"
+
+[[target]]
+id = "governance_profile"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "governance_profile"
+source = "crates/hell-ci/fuzz/fuzz_targets/governance_profile.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/governance_profile/"]
+corpus = "crates/hell-ci/fuzz/corpus/governance_profile"
+artifact-directory = "ci-out/fuzz-artifacts/governance_profile"
+invariant = "strict-binding"
+
+[[target]]
+id = "native_environment"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "native_environment"
+source = "crates/hell-ci/fuzz/fuzz_targets/native_environment.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/native_environment/"]
+corpus = "crates/hell-ci/fuzz/corpus/native_environment"
+artifact-directory = "ci-out/fuzz-artifacts/native_environment"
+invariant = "strict-binding"
+
+[[target]]
+id = "gzip_framing"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "gzip_framing"
+source = "crates/hell-ci/fuzz/fuzz_targets/gzip_framing.rs"
+maximum-input-bytes = 67108864
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=67108864", "-artifact_prefix=ci-out/fuzz-artifacts/gzip_framing/"]
+corpus = "crates/hell-ci/fuzz/corpus/gzip_framing"
+artifact-directory = "ci-out/fuzz-artifacts/gzip_framing"
+invariant = "bounded-single-member"
+
+[[target]]
+id = "gnu_tar_subset"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "gnu_tar_subset"
+source = "crates/hell-ci/fuzz/fuzz_targets/gnu_tar_subset.rs"
+maximum-input-bytes = 67108864
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=67108864", "-artifact_prefix=ci-out/fuzz-artifacts/gnu_tar_subset/"]
+corpus = "crates/hell-ci/fuzz/corpus/gnu_tar_subset"
+artifact-directory = "ci-out/fuzz-artifacts/gnu_tar_subset"
+invariant = "canonical-safe-paths"
+
+[[target]]
+id = "release_bundle_inventory"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "release_bundle_inventory"
+source = "crates/hell-ci/fuzz/fuzz_targets/release_bundle_inventory.rs"
+maximum-input-bytes = 67108864
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=67108864", "-artifact_prefix=ci-out/fuzz-artifacts/release_bundle_inventory/"]
+corpus = "crates/hell-ci/fuzz/corpus/release_bundle_inventory"
+artifact-directory = "ci-out/fuzz-artifacts/release_bundle_inventory"
+invariant = "exact-inventory"
+
+[[target]]
+id = "workflow_yaml_subset"
+implementation = "workflow-auditor"
+class = "workflow-auditor"
+fuzz-directory = "crates/hell-workflow-auditor/fuzz"
+cargo-target = "workflow_yaml_subset"
+source = "crates/hell-workflow-auditor/fuzz/fuzz_targets/workflow_yaml_subset.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/workflow_yaml_subset/"]
+corpus = "crates/hell-workflow-auditor/fuzz/corpus/workflow_yaml_subset"
+artifact-directory = "ci-out/fuzz-artifacts/workflow_yaml_subset"
+invariant = "bounded-supported-subset"
+
+[[target]]
+id = "workflow_expression"
+implementation = "workflow-auditor"
+class = "workflow-auditor"
+fuzz-directory = "crates/hell-workflow-auditor/fuzz"
+cargo-target = "workflow_expression"
+source = "crates/hell-workflow-auditor/fuzz/fuzz_targets/workflow_expression.rs"
+maximum-input-bytes = 65536
+maximum-depth = 16
+maximum-records = 4096
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=65536", "-artifact_prefix=ci-out/fuzz-artifacts/workflow_expression/"]
+corpus = "crates/hell-workflow-auditor/fuzz/corpus/workflow_expression"
+artifact-directory = "ci-out/fuzz-artifacts/workflow_expression"
+invariant = "whole-token-only"
+
+[[target]]
+id = "workflow_run_invocation"
+implementation = "workflow-auditor"
+class = "workflow-auditor"
+fuzz-directory = "crates/hell-workflow-auditor/fuzz"
+cargo-target = "workflow_run_invocation"
+source = "crates/hell-workflow-auditor/fuzz/fuzz_targets/workflow_run_invocation.rs"
+maximum-input-bytes = 65536
+maximum-depth = 16
+maximum-records = 4096
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=65536", "-artifact_prefix=ci-out/fuzz-artifacts/workflow_run_invocation/"]
+corpus = "crates/hell-workflow-auditor/fuzz/corpus/workflow_run_invocation"
+artifact-directory = "ci-out/fuzz-artifacts/workflow_run_invocation"
+invariant = "single-invocation"
+
+[[target]]
+id = "independent_strict_json"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_strict_json"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_strict_json.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/independent_strict_json/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_strict_json"
+artifact-directory = "ci-out/fuzz-artifacts/independent_strict_json"
+invariant = "bounded-no-panic"
+
+[[target]]
+id = "independent_release_plan"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_release_plan"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_release_plan.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/independent_release_plan/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_release_plan"
+artifact-directory = "ci-out/fuzz-artifacts/independent_release_plan"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "independent_conformance_plan"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_conformance_plan"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_conformance_plan.rs"
+maximum-input-bytes = 16777216
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_prefix=ci-out/fuzz-artifacts/independent_conformance_plan/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_conformance_plan"
+artifact-directory = "ci-out/fuzz-artifacts/independent_conformance_plan"
+invariant = "strict-typed-parse"
+
+[[target]]
+id = "independent_evidence"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_evidence"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_evidence.rs"
+maximum-input-bytes = 33554432
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=33554432", "-artifact_prefix=ci-out/fuzz-artifacts/independent_evidence/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_evidence"
+artifact-directory = "ci-out/fuzz-artifacts/independent_evidence"
+invariant = "exact-inventory"
+
+[[target]]
+id = "independent_ledger"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_ledger"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_ledger.rs"
+maximum-input-bytes = 33554432
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=33554432", "-artifact_prefix=ci-out/fuzz-artifacts/independent_ledger/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_ledger"
+artifact-directory = "ci-out/fuzz-artifacts/independent_ledger"
+invariant = "complete-ledger"
+
+[[target]]
+id = "independent_exemption"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_exemption"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_exemption.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 32
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/independent_exemption/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_exemption"
+artifact-directory = "ci-out/fuzz-artifacts/independent_exemption"
+invariant = "exact-selector-and-plan-time"
+
+[[target]]
+id = "independent_gzip"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_gzip"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_gzip.rs"
+maximum-input-bytes = 67108864
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=67108864", "-artifact_prefix=ci-out/fuzz-artifacts/independent_gzip/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_gzip"
+artifact-directory = "ci-out/fuzz-artifacts/independent_gzip"
+invariant = "bounded-single-member"
+
+[[target]]
+id = "independent_gnu_tar"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_gnu_tar"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_gnu_tar.rs"
+maximum-input-bytes = 67108864
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=67108864", "-artifact_prefix=ci-out/fuzz-artifacts/independent_gnu_tar/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_gnu_tar"
+artifact-directory = "ci-out/fuzz-artifacts/independent_gnu_tar"
+invariant = "canonical-safe-paths"
+
+[[target]]
+id = "independent_subjects"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_subjects"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_subjects.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 8
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/independent_subjects/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_subjects"
+artifact-directory = "ci-out/fuzz-artifacts/independent_subjects"
+invariant = "exact-inventory"
+
+[[target]]
+id = "independent_publication_envelope"
+implementation = "independent"
+class = "independent-verifier"
+fuzz-directory = "crates/hell-release-verifier/fuzz"
+cargo-target = "independent_publication_envelope"
+source = "crates/hell-release-verifier/fuzz/fuzz_targets/independent_publication_envelope.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 32
+maximum-records = 16384
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/independent_publication_envelope/"]
+corpus = "crates/hell-release-verifier/fuzz/corpus/independent_publication_envelope"
+artifact-directory = "ci-out/fuzz-artifacts/independent_publication_envelope"
+invariant = "strict-binding"
+
+[[target]]
+id = "requirement_toml"
+implementation = "primary"
+class = "retained-semantic-regression"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "requirement_toml"
+source = "crates/hell-ci/fuzz/fuzz_targets/requirement_toml.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/requirement_toml/"]
+corpus = "crates/hell-ci/fuzz/corpus/requirement_toml"
+artifact-directory = "ci-out/fuzz-artifacts/requirement_toml"
+invariant = "strict-requirement-catalog"
+
+[[target]]
+id = "normalizer_toml"
+implementation = "primary"
+class = "retained-semantic-regression"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "normalizer_toml"
+source = "crates/hell-ci/fuzz/fuzz_targets/normalizer_toml.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/normalizer_toml/"]
+corpus = "crates/hell-ci/fuzz/corpus/normalizer_toml"
+artifact-directory = "ci-out/fuzz-artifacts/normalizer_toml"
+invariant = "strict-normalizer-catalog"
+
+[[target]]
+id = "divergence_toml"
+implementation = "primary"
+class = "retained-semantic-regression"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "divergence_toml"
+source = "crates/hell-ci/fuzz/fuzz_targets/divergence_toml.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/divergence_toml/"]
+corpus = "crates/hell-ci/fuzz/corpus/divergence_toml"
+artifact-directory = "ci-out/fuzz-artifacts/divergence_toml"
+invariant = "strict-divergence-catalog"
+
+[[target]]
+id = "normalizer_replay"
+implementation = "primary"
+class = "retained-semantic-regression"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "normalizer_replay"
+source = "crates/hell-ci/fuzz/fuzz_targets/normalizer_replay.rs"
+maximum-input-bytes = 4194304
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=4194304", "-artifact_prefix=ci-out/fuzz-artifacts/normalizer_replay/"]
+corpus = "crates/hell-ci/fuzz/corpus/normalizer_replay"
+artifact-directory = "ci-out/fuzz-artifacts/normalizer_replay"
+invariant = "normalizer-replay-no-panic"
+
+[[target]]
+id = "semantic_trace"
+implementation = "primary"
+class = "retained-semantic-regression"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "semantic_trace"
+source = "crates/hell-ci/fuzz/fuzz_targets/semantic_trace.rs"
+maximum-input-bytes = 16777216
+maximum-depth = 64
+maximum-records = 262144
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_prefix=ci-out/fuzz-artifacts/semantic_trace/"]
+corpus = "crates/hell-ci/fuzz/corpus/semantic_trace"
+artifact-directory = "ci-out/fuzz-artifacts/semantic_trace"
+invariant = "semantic-trace-no-panic"

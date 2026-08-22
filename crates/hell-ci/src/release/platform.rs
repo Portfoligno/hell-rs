@@ -13,10 +13,13 @@ use std::time::Duration;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
+#[cfg(windows)]
+use crate::command::NativeProcessSpec;
 use crate::command::{CommandResult, CommandSpec, with_release_candidate_environment};
 #[cfg(unix)]
 use crate::json::require_exact_json_keys;
 use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 use crate::report::Report;
 
 use super::archive::{ArchiveInput, create, extract_binary};
@@ -65,31 +68,31 @@ struct NativeOracleCleanupDeadlines {
 }
 
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_CONSTRUCTION_EXECUTION_BUDGET: Duration = Duration::from_secs(18 * 60);
+const MAC_NATIVE_ORACLE_CONSTRUCTION_EXECUTION_BUDGET: Duration = Duration::from_mins(18);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_CONSTRUCTION_COMPLETION_BUDGET: Duration = Duration::from_secs(20 * 60);
+const MAC_NATIVE_ORACLE_CONSTRUCTION_COMPLETION_BUDGET: Duration = Duration::from_mins(20);
 #[cfg(target_os = "macos")]
 const MAC_NATIVE_ORACLE_ARCHIVER_EXECUTION_BUDGET: Duration = Duration::from_secs(90);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_ARCHIVER_COMPLETION_BUDGET: Duration = Duration::from_secs(2 * 60);
+const MAC_NATIVE_ORACLE_ARCHIVER_COMPLETION_BUDGET: Duration = Duration::from_mins(2);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_PRIMARY_EXECUTION_BUDGET: Duration = Duration::from_secs(90 * 60);
+const MAC_NATIVE_ORACLE_PRIMARY_EXECUTION_BUDGET: Duration = Duration::from_mins(90);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_PRIMARY_COMPLETION_BUDGET: Duration = Duration::from_secs(100 * 60);
+const MAC_NATIVE_ORACLE_PRIMARY_COMPLETION_BUDGET: Duration = Duration::from_mins(100);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_QUIESCENCE_BUDGET: Duration = Duration::from_secs(102 * 60);
+const MAC_NATIVE_ORACLE_QUIESCENCE_BUDGET: Duration = Duration::from_mins(102);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_BROKER_STOP_BUDGET: Duration = Duration::from_secs(104 * 60);
+const MAC_NATIVE_ORACLE_BROKER_STOP_BUDGET: Duration = Duration::from_mins(104);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_SOURCE_CLEANUP_BUDGET: Duration = Duration::from_secs(108 * 60);
+const MAC_NATIVE_ORACLE_SOURCE_CLEANUP_BUDGET: Duration = Duration::from_mins(108);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_ADAPTER_CLEANUP_BUDGET: Duration = Duration::from_secs(112 * 60);
+const MAC_NATIVE_ORACLE_ADAPTER_CLEANUP_BUDGET: Duration = Duration::from_mins(112);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_FINAL_RESTORE_BUDGET: Duration = Duration::from_secs(114 * 60);
+const MAC_NATIVE_ORACLE_FINAL_RESTORE_BUDGET: Duration = Duration::from_mins(114);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_ADAPTER_CLOSE_BUDGET: Duration = Duration::from_secs(118 * 60);
+const MAC_NATIVE_ORACLE_ADAPTER_CLOSE_BUDGET: Duration = Duration::from_mins(118);
 #[cfg(target_os = "macos")]
-const MAC_NATIVE_ORACLE_FINAL_ATTESTATION_BUDGET: Duration = Duration::from_secs(120 * 60);
+const MAC_NATIVE_ORACLE_FINAL_ATTESTATION_BUDGET: Duration = Duration::from_hours(2);
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
@@ -233,13 +236,13 @@ const WINDOWS_TOOLCHAIN_STAGE_ENTRY_LIMIT: usize = 100_000;
 const WINDOWS_TOOLCHAIN_STAGE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 
 #[cfg(windows)]
-const WINDOWS_TOOLCHAIN_CONSTRUCTION_BUDGET: Duration = Duration::from_secs(30 * 60);
+const WINDOWS_TOOLCHAIN_CONSTRUCTION_BUDGET: Duration = Duration::from_mins(30);
 
 #[cfg(windows)]
-const WINDOWS_TOOLCHAIN_CONSTRUCTION_CLEANUP_RESERVE: Duration = Duration::from_secs(30 * 60);
+const WINDOWS_TOOLCHAIN_CONSTRUCTION_CLEANUP_RESERVE: Duration = Duration::from_mins(30);
 
 #[cfg(windows)]
-const WINDOWS_TOOLCHAIN_LIFECYCLE_EXECUTION_BUDGET: Duration = Duration::from_secs(120 * 60);
+const WINDOWS_TOOLCHAIN_LIFECYCLE_EXECUTION_BUDGET: Duration = Duration::from_mins(120);
 
 #[cfg(windows)]
 #[derive(Clone, Copy)]
@@ -270,33 +273,53 @@ impl WindowsToolchainConstructionEnvelope {
     }
 }
 
-pub(crate) fn run(
+struct PlatformRunAuthority {
     platform: ReleasePlatform,
-    required_gates: String,
-    plan_path: PathBuf,
-    conformance_plan_path: PathBuf,
+    plan: ReleasePlan,
+    conformance_plan: crate::conformance::ConformancePlan,
     root: PathBuf,
     oracle_source: PathBuf,
     output: PathBuf,
-) -> Result<String, String> {
-    if required_gates.split(',').collect::<Vec<_>>() != expected_gates(platform) {
-        return Err("release platform required gate inventory differs from policy".to_owned());
-    }
-    let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
-    let conformance_plan = validate_conformance_plan(&plan, &conformance_plan_path)?;
+    workspace_target: PathBuf,
+    runner_identity: (String, String),
+    image_os: String,
+    image_version: String,
+    oracle_inventory_before: JsonValue,
+    oracle_inventory_digest: String,
+    license: Vec<u8>,
+    notice: Vec<u8>,
+    readme: Vec<u8>,
+    inventory: JsonValue,
+    inventory_bytes: Vec<u8>,
+}
+
+fn prepare_platform_run_authority(
+    platform: ReleasePlatform,
+    plan_path: &Path,
+    conformance_plan_path: &Path,
+    root: PathBuf,
+    oracle_source: PathBuf,
+    output: PathBuf,
+) -> Result<PlatformRunAuthority, String> {
+    let environment = ProcessEnvironment::from_process();
+    let plan = ReleasePlan::parse(&read_json(plan_path)?)?;
+    let conformance_plan = validate_conformance_plan(&plan, conformance_plan_path)?;
     let root = fs::canonicalize(root)
         .map_err(|error| format!("cannot canonicalize candidate root: {error}"))?;
     let oracle_source = fs::canonicalize(oracle_source)
         .map_err(|error| format!("cannot canonicalize oracle root: {error}"))?;
     validate_checkout(&root, &plan)?;
-    let runner_identity = validate_runner(platform)?;
+    let runner_identity = validate_runner(platform, &environment)?;
+    let image_os =
+        optional_standard_environment_value(&environment, StandardVariable::ImageOs, "ImageOS")?;
+    let image_version = optional_standard_environment_value(
+        &environment,
+        StandardVariable::ImageVersion,
+        "ImageVersion",
+    )?;
     let oracle_inventory_before = pinned_oracle_source_inventory(&oracle_source)?;
     let oracle_inventory_digest =
         hell_testkit::sha256_bytes(&canonical_json_bytes(&oracle_inventory_before)?).hex();
-    // Retain and bind every trusted package input before establishing the
-    // candidate principal. The POSIX confinement path copies this exact clean
-    // checkout into a root-owned, read-only authority that the candidate can
-    // traverse without gaining access to hosted-runner workspace ancestors.
     let license = read_regular(&root.join("LICENSES/BSD-3-Clause-Hell.txt"))?;
     let notice = read_regular(&root.join("NOTICE"))?;
     let readme = read_regular(&root.join("README.md"))?;
@@ -308,15 +331,7 @@ pub(crate) fn run(
     if read_regular(&root.join("deny.toml"))? != include_bytes!("../../../../deny.toml") {
         return Err("candidate dependency policy differs from trusted automation".to_owned());
     }
-    if output.exists() {
-        return Err("platform output already exists".to_owned());
-    }
-    fs::create_dir_all(output.join("archive"))
-        .map_err(|error| format!("cannot create platform output: {error}"))?;
-    fs::create_dir(output.join("conformance-evidence"))
-        .map_err(|error| format!("cannot create conformance evidence output: {error}"))?;
-    fs::create_dir(output.join("conformance-observations"))
-        .map_err(|error| format!("cannot create conformance observation output: {error}"))?;
+    prepare_platform_output(platform, &output)?;
     let output = fs::canonicalize(output)
         .map_err(|error| format!("cannot canonicalize platform output: {error}"))?;
     let workspace_target = root
@@ -327,637 +342,83 @@ pub(crate) fn run(
         return Err("candidate target directory is not absolute".to_owned());
     }
     require_candidate_target(&root, &workspace_target)?;
-    let mut confinement = establish_candidate_process_confinement(
+    Ok(PlatformRunAuthority {
         platform,
-        &root,
-        &oracle_source,
-        &inventory,
-        &oracle_inventory_before,
-        &plan.resolution.candidate_sha,
-        &workspace_target,
-        &output,
-    )?;
-    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || -> Result<String, String> {
-            let target = confinement.candidate_target().to_path_buf();
-            let candidate_execution_root = confinement.candidate_root().to_path_buf();
-            let oracle_execution_root = confinement.oracle_root().to_path_buf();
-            let candidate_environment_root = confinement.candidate_environment_root(&target);
-            write_atomic(&output.join("source-inventory.json"), &inventory_bytes)?;
-            let (tools, unretained_oracle) = {
-                #[cfg(target_os = "macos")]
-                let native_oracle_lifecycle = (platform == ReleasePlatform::MacosAarch64)
-                    .then(MacNativeOracleLifecycleEnvelope::new)
-                    .transpose()?;
-                #[cfg(target_os = "macos")]
-                let archive_adapter = if platform == ReleasePlatform::MacosAarch64 {
-                    let envelope = native_oracle_lifecycle
-                        .ok_or_else(|| "macOS native oracle lifecycle is absent".to_owned())?
-                        .construction;
-                    crate::command::NativeArchiveAdapter::for_macos_with_envelope(
-                        true,
-                        confinement.archive_adapter_base(&target),
-                        &oracle_execution_root,
-                        confinement.archive_launcher(),
-                        Some(envelope),
-                    )?
-                } else {
-                    crate::command::NativeArchiveAdapter::for_macos(
-                        false,
-                        confinement.archive_adapter_base(&target),
-                        &oracle_execution_root,
-                        confinement.archive_launcher(),
-                    )?
-                };
-                #[cfg(not(target_os = "macos"))]
-                let archive_adapter = crate::command::NativeArchiveAdapter::for_macos(
-                    platform == ReleasePlatform::MacosAarch64,
-                    confinement.archive_adapter_base(&target),
-                    &oracle_execution_root,
-                    confinement.archive_launcher(),
-                )?;
-                #[cfg(unix)]
-                let mut archive_adapter = archive_adapter;
-                #[cfg(target_os = "macos")]
-                let native_archive_authorization_deadline =
-                    native_oracle_lifecycle.map(|value| value.command.execution);
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let native_archive_authorization_deadline = None;
-                #[cfg(unix)]
-                let archive_adapter_seal = (platform == ReleasePlatform::MacosAarch64)
-                    .then(|| {
-                        confinement.seal_archive_adapter_authority(
-                            &mut archive_adapter,
-                            native_archive_authorization_deadline,
-                        )
-                    })
-                    .transpose();
-                #[cfg(unix)]
-                let launch_policy = if platform == ReleasePlatform::MacosAarch64 {
-                    confinement
-                        .policy
-                        .clone()
-                        .with_posix_stack_work_authority(
-                            &oracle_execution_root,
-                            confinement.stack_work_authority()?,
-                        )
-                        .map_err(|error| {
-                            format!("cannot bind native Stack work authority: {error}")
-                        })
-                } else {
-                    Ok(confinement.policy.clone())
-                };
-                #[cfg(not(unix))]
-                let launch_policy = confinement.policy().cloned();
-                #[cfg(target_os = "macos")]
-                let native_oracle_deadlines = native_oracle_lifecycle.map(|value| value.command);
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let native_oracle_deadlines: Option<NativeOracleCommandDeadlines> = None;
-                #[cfg(not(unix))]
-                let native_oracle_deadlines = None;
-                #[cfg(unix)]
-                let result = match (&archive_adapter_seal, &launch_policy) {
-                    (Ok(_), Ok(launch_policy)) => {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hell_testkit::with_candidate_launch_policy(
-                                launch_policy,
-                                || -> Result<_, String> {
-                                    let unretained_oracle = prepare_oracle(
-                                        platform,
-                                        &oracle_execution_root,
-                                        &output,
-                                        &archive_adapter,
-                                        native_oracle_deadlines,
-                                    )?;
-                                    Ok((
-                                        tool_identities(
-                                            platform,
-                                            &candidate_execution_root,
-                                            &oracle_execution_root,
-                                            &archive_adapter,
-                                        )?,
-                                        unretained_oracle,
-                                    ))
-                                },
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err("native oracle preparation panicked before explicit cleanup"
-                                .to_owned())
-                        })
-                    }
-                    (Err(error), _) | (_, Err(error)) => Err(error.clone()),
-                };
-                #[cfg(not(unix))]
-                let result = match &launch_policy {
-                    Ok(launch_policy) => {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hell_testkit::with_candidate_launch_policy(
-                                launch_policy,
-                                || -> Result<_, String> {
-                                    let unretained_oracle = prepare_oracle(
-                                        platform,
-                                        &oracle_execution_root,
-                                        &output,
-                                        &archive_adapter,
-                                        native_oracle_deadlines,
-                                    )?;
-                                    Ok((
-                                        tool_identities(
-                                            platform,
-                                            &candidate_execution_root,
-                                            &oracle_execution_root,
-                                            &archive_adapter,
-                                        )?,
-                                        unretained_oracle,
-                                    ))
-                                },
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err("native oracle preparation panicked before explicit cleanup"
-                                .to_owned())
-                        })
-                    }
-                    Err(error) => Err(error.clone()),
-                };
-                #[cfg(unix)]
-                let archive_cleanup_transition = Instant::now();
-                #[cfg(target_os = "macos")]
-                let archive_cleanup_deadlines = native_oracle_lifecycle
-                    .map(|value| Ok(value.cleanup))
-                    .unwrap_or_else(|| {
-                        let outer = archive_cleanup_transition
-                            .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
-                            .ok_or_else(|| {
-                                "archive cleanup outer deadline overflowed".to_owned()
-                            })?;
-                        transition_cleanup_deadlines(archive_cleanup_transition, outer)
-                    });
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let archive_cleanup_deadlines = archive_cleanup_transition
-                    .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
-                    .ok_or_else(|| "archive cleanup outer deadline overflowed".to_owned())
-                    .and_then(|outer| {
-                        transition_cleanup_deadlines(archive_cleanup_transition, outer)
-                    });
-                #[cfg(unix)]
-                let quiescence = match archive_adapter_seal.as_ref() {
-                    Ok(Some(_)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        archive_cleanup_deadlines.clone().and_then(|deadlines| {
-                            launch_policy
-                                .as_ref()
-                                .unwrap_or(&confinement.policy)
-                                .posix_quiescence_receipt_until(deadlines.quiescence)
-                                .map_err(|error| {
-                                    format!(
-                                        "cannot retain archive cleanup quiescence receipt: {error}"
-                                    )
-                                })
-                        })
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err("archive cleanup quiescence receipt acquisition panicked".to_owned())
-                    })
-                    .map(Some),
-                    Ok(None) | Err(_) => Ok(None),
-                };
-                #[cfg(target_os = "macos")]
-                let input_broker_cleanup =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        archive_cleanup_deadlines.clone().and_then(|deadlines| {
-                            archive_adapter.stop_input_broker_until(deadlines.broker_stop)
-                        })
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err("native archive input staging cleanup panicked".to_owned())
-                    });
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let input_broker_cleanup: Result<(), String> = Ok(());
-                #[cfg(unix)]
-                let restore = match (archive_adapter_seal, &quiescence, &input_broker_cleanup) {
-                    (Err(error), _, _) => Err(format!(
-                        "archive restoration skipped after adapter seal failure: {error}"
-                    )),
-                    (Ok(Some(seal)), Ok(Some(receipt)), Ok(())) => {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            archive_cleanup_deadlines
-                                .clone()
-                                .and_then(|deadlines| seal.restore(receipt.clone(), deadlines))
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err("native archive restoration panicked before adapter cleanup"
-                                .to_owned())
-                        })
-                    }
-                    (Ok(None), Ok(None), Ok(())) => Ok(()),
-                    (Ok(Some(_)), Err(_), _) => Err(
-                        "archive restoration skipped without an exact quiescence receipt"
-                            .to_owned(),
-                    ),
-                    (Ok(Some(_)), _, Err(_)) => Err(
-                        "archive restoration skipped while input staging cleanup remained active"
-                            .to_owned(),
-                    ),
-                    _ => Err(
-                        "archive cleanup quiescence receipt topology is inconsistent".to_owned(),
-                    ),
-                };
-                #[cfg(target_os = "macos")]
-                let adapter_cleanup_path = archive_adapter.directory_path().map(Path::to_path_buf);
-                #[cfg(target_os = "macos")]
-                let finalization = match archive_cleanup_deadlines {
-                    Ok(deadlines) => run_native_oracle_finalizer(
-                        deadlines,
-                        |deadline| archive_adapter.close_until(deadline),
-                        |deadline| {
-                            attest_native_archive_adapter_absence(
-                                adapter_cleanup_path.as_deref(),
-                                deadline,
-                            )
-                        },
-                    ),
-                    Err(error) => NativeOracleFinalizationResults {
-                        adapter_close: Err(error.clone()),
-                        final_attestation: Err(error),
-                    },
-                };
-                #[cfg(target_os = "macos")]
-                let adapter_cleanup = finalization.adapter_close;
-                #[cfg(target_os = "macos")]
-                let adapter_attestation = finalization.final_attestation;
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let adapter_cleanup = archive_adapter.close();
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let adapter_attestation: Result<(), String> = Ok(());
-                #[cfg(not(unix))]
-                drop(archive_adapter);
-                #[cfg(unix)]
-                {
-                    let mut failures = Vec::new();
-                    let value = match result {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            failures.push(("primary", error));
-                            None
-                        }
-                    };
-                    if let Err(error) = quiescence {
-                        failures.push(("quiescence", error));
-                    }
-                    if let Err(error) = input_broker_cleanup {
-                        failures.push(("input-staging-cleanup", error));
-                    }
-                    if let Err(error) = restore {
-                        failures.push(("restoration", error));
-                    }
-                    if let Err(error) = adapter_cleanup {
-                        failures.push(("adapter-cleanup", error));
-                    }
-                    if let Err(error) = adapter_attestation {
-                        failures.push(("adapter-final-attestation", error));
-                    }
-                    if failures.is_empty() {
-                        value.ok_or_else(|| {
-                            "native oracle preparation result is absent".to_owned()
-                        })?
-                    } else {
-                        return Err(ordered_bounded_failures(
-                            "native oracle preparation and archive restoration failed",
-                            failures,
-                        ));
-                    }
-                }
-                #[cfg(not(unix))]
-                result?
-            };
-            confinement.require_candidate_environment("after oracle preparation")?;
-            let prepared_oracle = confinement.retain_oracle(&unretained_oracle)?;
-            unretained_oracle.cleanup()?;
-            require_candidate_target(&root, &workspace_target)?;
-            confinement.require_candidate_environment("before platform gates")?;
-            #[cfg(unix)]
-            let dependency_policy = match (
-                confinement.dependency_policy_protection.as_ref(),
-                confinement.cargo_deny_home_protection.as_ref(),
-            ) {
-                (Some(policy), Some(metadata)) => Some((policy, metadata)),
-                (Some(_), None) => {
-                    return Err("Linux dependency-policy metadata authority is absent".to_owned());
-                }
-                (None, _) => None,
-            };
-            let mut gates = BTreeMap::from([
-                ("runner-identity", true),
-                ("candidate-checkout", true),
-                ("oracle-checkout", true),
-            ]);
-            let mut evidence = BTreeMap::new();
-            evidence.insert(
-                "runner-identity".to_owned(),
-                object([
-                    ("arch", string(&runner_identity.1)),
-                    ("os", string(&runner_identity.0)),
-                    ("schemaVersion", number(1)),
-                    ("state", string("passed")),
-                ]),
-            );
-            evidence.insert(
-                "candidate-checkout".to_owned(),
-                object([
-                    ("schemaVersion", number(1)),
-                    ("sha", string(&plan.resolution.candidate_sha)),
-                    ("state", string("passed")),
-                ]),
-            );
-            evidence.insert(
-                "oracle-checkout".to_owned(),
-                object([
-                    ("schemaVersion", number(1)),
-                    ("sha", string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff")),
-                    ("sourceInventorySha256", string(&oracle_inventory_digest)),
-                    ("state", string("passed")),
-                ]),
-            );
-            gates.insert("conformance-plan-binding", true);
-            evidence.insert(
-                "conformance-plan-binding".to_owned(),
-                object([
-                    (
-                        "conformancePlanSha256",
-                        string(&conformance_plan.plan_sha256),
-                    ),
-                    ("platform", string(platform.id())),
-                    ("schemaVersion", number(1)),
-                    ("state", string("passed")),
-                    (
-                        "trustedInputsSha256",
-                        string(&conformance_plan.trusted_inputs_sha256),
-                    ),
-                ]),
-            );
-            let mut retained_outputs =
-                BTreeMap::from([("source-inventory.json".to_owned(), inventory_bytes)]);
-            #[cfg(windows)]
-            let mut windows_release_binary = None;
-            let platform_gate_result = with_release_candidate_environment(
-                &target,
-                &candidate_environment_root,
-                plan.source_date_epoch,
-                confinement.policy()?,
-                || {
-                    run_platform_gates(
-                        platform,
-                        &plan,
-                        &conformance_plan,
-                        &candidate_execution_root,
-                        &oracle_execution_root,
-                        &output,
-                        &mut gates,
-                        &mut evidence,
-                        &mut retained_outputs,
-                        prepared_oracle,
-                        &oracle_inventory_digest,
-                        #[cfg(unix)]
-                        dependency_policy,
-                        #[cfg(windows)]
-                        &mut windows_release_binary,
-                    )
-                },
-            );
-            let post_platform_environment = confinement
-                .require_candidate_environment("after platform gates before trusted cleanup");
-            #[cfg(windows)]
-            let post_platform_binary =
-                windows_release_binary.as_ref().map_or(Ok(()), |authority| {
-                    authority.validate(
-                        "after platform gates before trusted cleanup",
-                        gates.get("release-build") == Some(&true),
-                    )
-                });
-            let dependency_cleanup = confinement.cleanup_dependency_policy_cache();
-            compose_platform_gate_cleanup(platform_gate_result, dependency_cleanup)?;
-            post_platform_environment?;
-            #[cfg(windows)]
-            post_platform_binary?;
-            #[cfg(windows)]
-            if let Some(authority) = windows_release_binary.as_ref() {
-                authority.validate(
-                    "after trusted dependency-policy cleanup",
-                    gates.get("release-build") == Some(&true),
-                )?;
-            }
-            confinement.require_bound_sources("after trusted dependency-policy cleanup")?;
-            require_source_inventory(&root, &plan.source_inventory_sha256)?;
-            let oracle_inventory_after = pinned_oracle_source_inventory(&oracle_source)?;
-            if hell_testkit::sha256_bytes(&canonical_json_bytes(&oracle_inventory_after)?).hex()
-                != oracle_inventory_digest
-            {
-                return Err("oracle source changed during candidate execution".to_owned());
-            }
-            require_candidate_target(&root, &workspace_target)?;
-            confinement.export_candidate_target(&workspace_target)?;
-            // Native dependency attestations still use the transient digest hand-off.
-            // Linux retains only the exact immutable trusted result verified above.
-            if platform != ReleasePlatform::LinuxX86_64 {
-                fs::remove_file(output.join("dependency-policy.sha256")).map_err(|error| {
-                    format!("cannot remove transient dependency digest: {error}")
-                })?;
-            }
-            #[cfg(windows)]
-            if let Some(authority) = windows_release_binary.as_ref() {
-                authority.validate(
-                    "before packaging after transient dependency digest removal",
-                    gates.get("release-build") == Some(&true),
-                )?;
-            }
+        plan,
+        conformance_plan,
+        root,
+        oracle_source,
+        output,
+        workspace_target,
+        runner_identity,
+        image_os,
+        image_version,
+        oracle_inventory_before,
+        oracle_inventory_digest,
+        license,
+        notice,
+        readme,
+        inventory,
+        inventory_bytes,
+    })
+}
 
-            #[cfg(windows)]
-            let binary = windows_release_binary
-                .as_ref()
-                .ok_or_else(|| {
-                    "Windows release binary authority is absent before packaging".to_owned()
-                })?
-                .bound_binary_path()?
-                .to_path_buf();
-            #[cfg(not(windows))]
-            let binary = {
-                let binary = target.join("release").join(platform.executable());
-                require_real_binary_path(&target, &binary)?;
-                binary
-            };
-            let archive_name = format!("hell-v{}-{}.tar.gz", plan.version, platform.id());
-            let archive_path = output.join("archive").join(&archive_name);
-            let archive_sha256 = create(&ArchiveInput {
-                platform,
-                version: &plan.version,
-                source_date_epoch: plan.source_date_epoch,
-                executable: &binary,
-                license: &license,
-                notice: &notice,
-                readme: &readme,
-                output: &archive_path,
-            })?;
-            // Snapshot every candidate-adjacent output before the final executable
-            // smoke test. The candidate runs as the same workspace user, so the trusted
-            // parent rewrites these retained bytes after process-tree quiescence.
-            let retained_archive = read_regular(&archive_path)?;
-            let unpacked_root = transient_path(&root, &format!("unpacked-{}", platform.id()));
-            let unpacked = extract_binary(
-                &archive_path,
-                platform,
-                &plan.version,
-                plan.source_date_epoch,
-                &unpacked_root,
-            )?;
-            let smoke = with_release_candidate_environment(
-                &target,
-                &candidate_environment_root,
-                plan.source_date_epoch,
-                confinement.policy()?,
-                || {
-                    CommandSpec::new(unpacked.as_os_str(), Duration::from_secs(30))
-                        .argument("--help")
-                        .run()
-                },
-            )
-            .map_err(|error| format!("cannot smoke-test packaged executable: {error}"))?;
-            if !smoke.status.success() || smoke.timed_out {
-                return Err("packaged executable smoke test failed".to_owned());
-            }
-            require_real_output_directories(&output)?;
-            write_atomic(&archive_path, &retained_archive)?;
-            for (name, bytes) in retained_outputs {
-                write_atomic(&output.join(name), &bytes)?;
-            }
-            gates.insert("archive-verification", true);
-            gates.insert("package-smoke", true);
-            evidence.insert(
-                "archive-verification".to_owned(),
-                object([
-                    ("archiveSha256", string(&archive_sha256)),
-                    ("schemaVersion", number(1)),
-                    ("state", string("passed")),
-                ]),
-            );
-            evidence.insert(
-                "package-smoke".to_owned(),
-                object([
-                    ("executable", string(platform.executable())),
-                    ("schemaVersion", number(1)),
-                    ("state", string("passed")),
-                ]),
-            );
-            fs::remove_dir_all(&unpacked_root)
-                .map_err(|error| format!("cannot remove unpacked smoke-test directory: {error}"))?;
-            let expected = expected_gates(platform);
-            if gates
-                .keys()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                != expected.iter().copied().collect()
-                || gates.values().any(|passed| !passed)
-                || evidence
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    != expected.iter().copied().collect()
-            {
-                return Err("release platform gate implementation is incomplete".to_owned());
-            }
-            let ordered_gates = expected
-                .iter()
-                .map(|name| {
-                    object([
-                        ("name", string(name)),
-                        ("passed", JsonValue::Bool(gates[name])),
-                    ])
-                })
-                .collect();
-            let conformance_gate = evidence
-                .get("conformance-evidence")
-                .ok_or_else(|| "conformance evidence gate is absent".to_owned())?
-                .object()?
-                .clone();
-            let report = object([
-                (
-                    "assignedObligationCount",
-                    json_member(&conformance_gate, "assignedObligations")?.clone(),
-                ),
-                ("archiveName", string(&archive_name)),
-                ("archiveSha256", string(&archive_sha256)),
-                ("buildInputsSha256", string(&plan.build_inputs_sha256)),
-                ("candidateSha", string(&plan.resolution.candidate_sha)),
-                (
-                    "conformancePlanSha256",
-                    string(&plan.conformance_plan_sha256),
-                ),
-                ("conformanceStandard", string(&plan.conformance_standard)),
-                ("evidence", JsonValue::Object(evidence)),
-                (
-                    "evidenceManifestSha256",
-                    json_member(&conformance_gate, "manifestSha256")?.clone(),
-                ),
-                (
-                    "exploratoryObservationCount",
-                    json_member(&conformance_gate, "exploratoryRecords")?.clone(),
-                ),
-                ("gates", JsonValue::Array(ordered_gates)),
-                ("imageOS", string(&env::var("ImageOS").unwrap_or_default())),
-                (
-                    "imageVersion",
-                    string(&env::var("ImageVersion").unwrap_or_default()),
-                ),
-                ("planSha256", string(&plan.plan_sha256)),
-                ("platform", string(platform.id())),
-                (
-                    "producedEvidenceRecordCount",
-                    json_member(&conformance_gate, "producedRecords")?.clone(),
-                ),
-                ("runAttempt", number(plan.resolution.run_attempt)),
-                ("runId", number(plan.resolution.run_id)),
-                ("schemaVersion", number(2)),
-                ("state", string("passed")),
-                ("tag", string(&plan.tag)),
-                ("toolIdentities", JsonValue::Object(tools)),
-                (
-                    "trustedConformanceInputsSha256",
-                    string(&plan.trusted_conformance_inputs_sha256),
-                ),
-                (
-                    "unclassifiedMismatchCount",
-                    json_member(&conformance_gate, "unclassifiedMismatches")?.clone(),
-                ),
-                ("version", string(&plan.version)),
-                ("workflowSha", string(&plan.resolution.workflow_sha)),
-            ]);
-            write_json(&output.join("platform-report.json"), &report)?;
-            write_json(
-                &output.join("package-report.json"),
-                &object([
-                    ("archiveSha256", string(&archive_sha256)),
-                    ("schemaVersion", number(1)),
-                    ("state", string("verified")),
-                ]),
-            )?;
-            write_json(
-                &output.join("archive-manifest.json"),
-                &object([
-                    ("archiveName", string(&archive_name)),
-                    ("archiveSha256", string(&archive_sha256)),
-                    ("schemaVersion", number(1)),
-                ]),
-            )?;
-            verify_final_platform_inventory(&output, platform, &archive_name)?;
-            Ok(format!("completed {} release gate", platform.id()))
-        },
-    ))
+fn prepare_platform_output(platform: ReleasePlatform, output: &Path) -> Result<(), String> {
+    if output.exists() {
+        return Err("platform output already exists".to_owned());
+    }
+    fs::create_dir_all(output.join("archive"))
+        .map_err(|error| format!("cannot create platform output: {error}"))?;
+    fs::create_dir(output.join("conformance-evidence"))
+        .map_err(|error| format!("cannot create conformance evidence output: {error}"))?;
+    fs::create_dir(output.join("conformance-observations"))
+        .map_err(|error| format!("cannot create conformance observation output: {error}"))?;
+    let trusted_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    super::native_environment::collect_for_platform(
+        platform,
+        &trusted_root.join("ci/external-inputs.toml"),
+        &output.join("native-environment.json"),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn run(
+    platform: ReleasePlatform,
+    plan_path: impl Into<PathBuf>,
+    conformance_plan_path: impl Into<PathBuf>,
+    root: PathBuf,
+    oracle_source: PathBuf,
+    output: PathBuf,
+) -> Result<String, String> {
+    let plan_path = plan_path.into();
+    let conformance_plan_path = conformance_plan_path.into();
+    let authority = prepare_platform_run_authority(
+        platform,
+        &plan_path,
+        &conformance_plan_path,
+        root,
+        oracle_source,
+        output,
+    )?;
+    let mut confinement = establish_candidate_process_confinement(&CandidateConfinementInput {
+        platform: authority.platform,
+        candidate_root: &authority.root,
+        oracle_root: &authority.oracle_source,
+        candidate_inventory: &authority.inventory,
+        oracle_inventory: &authority.oracle_inventory_before,
+        candidate_sha: &authority.plan.resolution.candidate_sha,
+        workspace_target: &authority.workspace_target,
+        output: &authority.output,
+    })?;
+    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_confined_platform(authority, &mut confinement)
+    }))
     .unwrap_or_else(|_| {
         Err("release platform gate panicked after acquiring confinement".to_owned())
     });
     let principal_cleanup = confinement.finish_candidate_principal();
     #[cfg(windows)]
-    let toolchain_cleanup = { confinement.close_windows_toolchain() };
+    let toolchain_cleanup = confinement.close_windows_toolchain();
     #[cfg(not(windows))]
     let toolchain_cleanup = Ok(());
     match (primary, principal_cleanup, toolchain_cleanup) {
@@ -968,6 +429,984 @@ pub(crate) fn run(
             .collect::<Vec<_>>()
             .join("; additionally, ")),
     }
+}
+
+fn execute_confined_platform(
+    authority: PlatformRunAuthority,
+    confinement: &mut CandidateConfinement,
+) -> Result<String, String> {
+    let PlatformRunAuthority {
+        platform,
+        plan,
+        conformance_plan,
+        root,
+        oracle_source,
+        output,
+        workspace_target,
+        runner_identity,
+        image_os,
+        image_version,
+        oracle_inventory_before: _,
+        oracle_inventory_digest,
+        license,
+        notice,
+        readme,
+        inventory: _,
+        inventory_bytes,
+    } = authority;
+    let mut oracle_input = ConfinedPlatformOracleInput {
+        platform,
+        root: &root,
+        workspace_target: &workspace_target,
+        output: &output,
+        inventory_bytes: &inventory_bytes,
+        confinement,
+    };
+    let prepared = prepare_confined_platform_oracle(&mut oracle_input)?;
+    let target = prepared.target;
+    let candidate_execution_root = prepared.candidate_execution_root;
+    let candidate_environment_root = prepared.candidate_environment_root;
+    let tools = prepared.tools;
+    let prepared_oracle = prepared.prepared_oracle;
+    let gate_execution = execute_confined_platform_gates(PlatformGateExecutionInput {
+        platform,
+        plan: &plan,
+        conformance_plan: &conformance_plan,
+        root: &root,
+        oracle_source: &oracle_source,
+        output: &output,
+        workspace_target: &workspace_target,
+        target: &target,
+        candidate_execution_root: &candidate_execution_root,
+        candidate_environment_root: &candidate_environment_root,
+        runner_identity: &runner_identity,
+        oracle_inventory_digest: &oracle_inventory_digest,
+        inventory_bytes,
+        prepared_oracle: &prepared_oracle,
+        confinement,
+    })?;
+    let PlatformGateExecution {
+        retained_outputs,
+        gates,
+        evidence,
+        #[cfg(windows)]
+        windows_release_binary,
+    } = gate_execution;
+    let packaged = package_platform_candidate(PlatformPackageInput {
+        platform,
+        plan: &plan,
+        root: &root,
+        output: &output,
+        target: &target,
+        candidate_environment_root: &candidate_environment_root,
+        confinement,
+        license: &license,
+        notice: &notice,
+        readme: &readme,
+        retained_outputs,
+        gates,
+        evidence,
+        #[cfg(windows)]
+        windows_release_binary: windows_release_binary.as_ref(),
+    })?;
+    write_platform_reports(&PlatformReportInput {
+        platform,
+        plan: &plan,
+        output: &output,
+        image_os: &image_os,
+        image_version: &image_version,
+        tools,
+        packaged,
+    })?;
+    Ok(format!("completed {} release gate", platform.id()))
+}
+
+struct ConfinedPlatformOracleInput<'a> {
+    platform: ReleasePlatform,
+    root: &'a Path,
+    workspace_target: &'a Path,
+    output: &'a Path,
+    inventory_bytes: &'a [u8],
+    confinement: &'a mut CandidateConfinement,
+}
+
+struct PreparedPlatformOracle {
+    target: PathBuf,
+    candidate_execution_root: PathBuf,
+    candidate_environment_root: PathBuf,
+    tools: BTreeMap<String, JsonValue>,
+    prepared_oracle: hell_testkit::ExecutableIdentity,
+}
+
+struct NativeOracleSetup<'a> {
+    confinement: &'a CandidateConfinement,
+    archive_adapter: crate::command::NativeArchiveAdapter,
+    #[cfg(unix)]
+    archive_adapter_seal: Result<Option<PosixArchiveAdapterSeal<'a>>, String>,
+    launch_policy: Result<hell_testkit::CandidateLaunchPolicy, String>,
+    native_deadlines: Option<NativeOracleCommandDeadlines>,
+    #[cfg(target_os = "macos")]
+    lifecycle: Option<MacNativeOracleLifecycleEnvelope>,
+}
+
+struct NativeOracleExecutionInput<'a> {
+    platform: ReleasePlatform,
+    candidate_execution_root: &'a Path,
+    oracle_execution_root: &'a Path,
+    output: &'a Path,
+}
+
+struct NativeOraclePreparation {
+    tools: BTreeMap<String, JsonValue>,
+    oracle: UnretainedOracle,
+}
+
+#[cfg(unix)]
+struct NativeOracleRestorationResults {
+    quiescence: Result<Option<hell_testkit::PosixCandidateQuiescenceReceipt>, String>,
+    input_broker_cleanup: Result<(), String>,
+    restoration: Result<(), String>,
+}
+
+fn prepare_confined_platform_oracle(
+    input: &mut ConfinedPlatformOracleInput<'_>,
+) -> Result<PreparedPlatformOracle, String> {
+    let target = input.confinement.candidate_target().to_path_buf();
+    let candidate_execution_root = input.confinement.candidate_root().to_path_buf();
+    let oracle_execution_root = input.confinement.oracle_root().to_path_buf();
+    let candidate_environment_root = input.confinement.candidate_environment_root(&target);
+    write_atomic(
+        &input.output.join("source-inventory.json"),
+        input.inventory_bytes,
+    )?;
+    let setup = create_native_oracle_setup(
+        input.platform,
+        &target,
+        &oracle_execution_root,
+        input.confinement,
+    )?;
+    let primary = execute_native_oracle_preparation(
+        &NativeOracleExecutionInput {
+            platform: input.platform,
+            candidate_execution_root: &candidate_execution_root,
+            oracle_execution_root: &oracle_execution_root,
+            output: input.output,
+        },
+        &setup,
+    );
+    let NativeOraclePreparation {
+        tools,
+        oracle: unretained_oracle,
+    } = complete_native_oracle_setup(setup, primary)?;
+    input
+        .confinement
+        .require_candidate_environment("after oracle preparation")?;
+    let prepared_oracle = input.confinement.retain_oracle(&unretained_oracle)?;
+    unretained_oracle.cleanup()?;
+    require_candidate_target(input.root, input.workspace_target)?;
+    Ok(PreparedPlatformOracle {
+        target,
+        candidate_execution_root,
+        candidate_environment_root,
+        tools,
+        prepared_oracle,
+    })
+}
+
+fn create_native_oracle_setup<'a>(
+    platform: ReleasePlatform,
+    target: &Path,
+    oracle_execution_root: &Path,
+    confinement: &'a CandidateConfinement,
+) -> Result<NativeOracleSetup<'a>, String> {
+    #[cfg(target_os = "macos")]
+    let lifecycle = (platform == ReleasePlatform::MacosAarch64)
+        .then(MacNativeOracleLifecycleEnvelope::new)
+        .transpose()?;
+    #[cfg(target_os = "macos")]
+    let mut archive_adapter = if platform == ReleasePlatform::MacosAarch64 {
+        let envelope = lifecycle
+            .ok_or_else(|| "macOS native oracle lifecycle is absent".to_owned())?
+            .construction;
+        crate::command::NativeArchiveAdapter::for_macos_with_envelope(
+            true,
+            confinement.archive_adapter_base(target),
+            oracle_execution_root,
+            confinement.archive_launcher(),
+            Some(envelope),
+        )?
+    } else {
+        create_portable_archive_adapter(platform, target, oracle_execution_root, confinement)?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut archive_adapter =
+        create_portable_archive_adapter(platform, target, oracle_execution_root, confinement)?;
+    #[cfg(target_os = "macos")]
+    let authorization_deadline = lifecycle.map(|value| value.command.execution);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let authorization_deadline = None;
+    #[cfg(unix)]
+    let archive_adapter_seal = (platform == ReleasePlatform::MacosAarch64)
+        .then(|| {
+            confinement.seal_archive_adapter_authority(&mut archive_adapter, authorization_deadline)
+        })
+        .transpose();
+    let launch_policy = native_oracle_launch_policy(platform, oracle_execution_root, confinement)?;
+    #[cfg(target_os = "macos")]
+    let native_deadlines = lifecycle.map(|value| value.command);
+    #[cfg(not(target_os = "macos"))]
+    let native_deadlines = None;
+    Ok(NativeOracleSetup {
+        confinement,
+        archive_adapter,
+        #[cfg(unix)]
+        archive_adapter_seal,
+        launch_policy,
+        native_deadlines,
+        #[cfg(target_os = "macos")]
+        lifecycle,
+    })
+}
+
+fn create_portable_archive_adapter(
+    platform: ReleasePlatform,
+    target: &Path,
+    oracle_execution_root: &Path,
+    confinement: &CandidateConfinement,
+) -> Result<crate::command::NativeArchiveAdapter, String> {
+    crate::command::NativeArchiveAdapter::for_macos(
+        platform == ReleasePlatform::MacosAarch64,
+        confinement.archive_adapter_base(target),
+        oracle_execution_root,
+        confinement.archive_launcher(),
+    )
+}
+
+#[cfg(unix)]
+fn native_oracle_launch_policy(
+    platform: ReleasePlatform,
+    oracle_execution_root: &Path,
+    confinement: &CandidateConfinement,
+) -> Result<Result<hell_testkit::CandidateLaunchPolicy, String>, String> {
+    if platform == ReleasePlatform::MacosAarch64 {
+        return Ok(confinement
+            .policy()?
+            .clone()
+            .with_posix_stack_work_authority(
+                oracle_execution_root,
+                confinement.stack_work_authority()?,
+            )
+            .map_err(|error| format!("cannot bind native Stack work authority: {error}")));
+    }
+    Ok(confinement.policy().cloned())
+}
+
+#[cfg(not(unix))]
+fn native_oracle_launch_policy(
+    _platform: ReleasePlatform,
+    _oracle_execution_root: &Path,
+    confinement: &CandidateConfinement,
+) -> Result<Result<hell_testkit::CandidateLaunchPolicy, String>, String> {
+    Ok(confinement.policy().cloned())
+}
+
+fn execute_native_oracle_preparation(
+    input: &NativeOracleExecutionInput<'_>,
+    setup: &NativeOracleSetup<'_>,
+) -> Result<NativeOraclePreparation, String> {
+    #[cfg(unix)]
+    if let Err(error) = &setup.archive_adapter_seal {
+        return Err(error.clone());
+    }
+    let launch_policy = setup.launch_policy.as_ref().map_err(Clone::clone)?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hell_testkit::with_candidate_launch_policy(launch_policy, || {
+            let oracle = prepare_oracle(
+                input.platform,
+                input.oracle_execution_root,
+                input.output,
+                &setup.archive_adapter,
+                setup.native_deadlines,
+            )?;
+            let tools = tool_identities(
+                input.platform,
+                input.candidate_execution_root,
+                input.oracle_execution_root,
+                &setup.archive_adapter,
+            )?;
+            Ok(NativeOraclePreparation { tools, oracle })
+        })
+    }))
+    .unwrap_or_else(|_| {
+        Err("native oracle preparation panicked before explicit cleanup".to_owned())
+    })
+}
+
+fn complete_native_oracle_setup(
+    mut setup: NativeOracleSetup<'_>,
+    primary: Result<NativeOraclePreparation, String>,
+) -> Result<NativeOraclePreparation, String> {
+    #[cfg(unix)]
+    {
+        let cleanup_deadlines = native_oracle_cleanup_deadlines(&setup);
+        let restoration = restore_native_oracle_authority(
+            setup.confinement,
+            &mut setup.archive_adapter,
+            setup.archive_adapter_seal,
+            &setup.launch_policy,
+            cleanup_deadlines.clone(),
+        );
+        let finalization = finalize_native_oracle_adapter(setup.archive_adapter, cleanup_deadlines);
+        compose_native_oracle_results(primary, restoration, finalization)
+    }
+    #[cfg(not(unix))]
+    {
+        drop(setup.archive_adapter);
+        primary
+    }
+}
+
+#[cfg(unix)]
+fn native_oracle_cleanup_deadlines(
+    setup: &NativeOracleSetup<'_>,
+) -> Result<NativeOracleCleanupDeadlines, String> {
+    let transition = Instant::now();
+    #[cfg(target_os = "macos")]
+    if let Some(lifecycle) = setup.lifecycle {
+        return Ok(lifecycle.cleanup);
+    }
+    let outer = transition
+        .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
+        .ok_or_else(|| "archive cleanup outer deadline overflowed".to_owned())?;
+    transition_cleanup_deadlines(transition, outer)
+}
+
+#[cfg(unix)]
+fn restore_native_oracle_authority(
+    confinement: &CandidateConfinement,
+    archive_adapter: &mut crate::command::NativeArchiveAdapter,
+    seal: Result<Option<PosixArchiveAdapterSeal<'_>>, String>,
+    launch_policy: &Result<hell_testkit::CandidateLaunchPolicy, String>,
+    deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> NativeOracleRestorationResults {
+    let quiescence = match seal.as_ref() {
+        Ok(Some(_)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deadlines.clone().and_then(|deadlines| {
+                launch_policy
+                    .as_ref()
+                    .unwrap_or(confinement.policy()?)
+                    .posix_quiescence_receipt_until(deadlines.quiescence)
+                    .map_err(|error| {
+                        format!("cannot retain archive cleanup quiescence receipt: {error}")
+                    })
+            })
+        }))
+        .unwrap_or_else(|_| {
+            Err("archive cleanup quiescence receipt acquisition panicked".to_owned())
+        })
+        .map(Some),
+        Ok(None) | Err(_) => Ok(None),
+    };
+    let input_broker_cleanup = stop_native_archive_input_broker(archive_adapter, deadlines.clone());
+    let restoration =
+        restore_native_archive_seal(seal, &quiescence, &input_broker_cleanup, deadlines);
+    NativeOracleRestorationResults {
+        quiescence,
+        input_broker_cleanup,
+        restoration,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_native_archive_input_broker(
+    archive_adapter: &mut crate::command::NativeArchiveAdapter,
+    deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deadlines
+            .and_then(|deadlines| archive_adapter.stop_input_broker_until(deadlines.broker_stop))
+    }))
+    .unwrap_or_else(|_| Err("native archive input staging cleanup panicked".to_owned()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn stop_native_archive_input_broker(
+    _archive_adapter: &mut crate::command::NativeArchiveAdapter,
+    _deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_native_archive_seal(
+    seal: Result<Option<PosixArchiveAdapterSeal<'_>>, String>,
+    quiescence: &Result<Option<hell_testkit::PosixCandidateQuiescenceReceipt>, String>,
+    input_broker_cleanup: &Result<(), String>,
+    deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> Result<(), String> {
+    match (seal, quiescence, input_broker_cleanup) {
+        (Err(error), _, _) => Err(format!(
+            "archive restoration skipped after adapter seal failure: {error}"
+        )),
+        (Ok(Some(seal)), Ok(Some(receipt)), Ok(())) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                deadlines.and_then(|deadlines| seal.restore(receipt.clone(), deadlines))
+            }))
+            .unwrap_or_else(|_| {
+                Err("native archive restoration panicked before adapter cleanup".to_owned())
+            })
+        }
+        (Ok(None), Ok(None), Ok(())) => Ok(()),
+        (Ok(Some(_)), Err(_), _) => {
+            Err("archive restoration skipped without an exact quiescence receipt".to_owned())
+        }
+        (Ok(Some(_)), _, Err(_)) => Err(
+            "archive restoration skipped while input staging cleanup remained active".to_owned(),
+        ),
+        _ => Err("archive cleanup quiescence receipt topology is inconsistent".to_owned()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finalize_native_oracle_adapter(
+    archive_adapter: crate::command::NativeArchiveAdapter,
+    deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> NativeOracleFinalizationResults {
+    let cleanup_path = archive_adapter.directory_path().map(Path::to_path_buf);
+    match deadlines {
+        Ok(deadlines) => run_native_oracle_finalizer(
+            deadlines,
+            |deadline| archive_adapter.close_until(deadline),
+            |deadline| attest_native_archive_adapter_absence(cleanup_path.as_deref(), deadline),
+        ),
+        Err(error) => NativeOracleFinalizationResults {
+            adapter_close: Err(error.clone()),
+            final_attestation: Err(error),
+        },
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn finalize_native_oracle_adapter(
+    archive_adapter: crate::command::NativeArchiveAdapter,
+    _deadlines: Result<NativeOracleCleanupDeadlines, String>,
+) -> NativeOracleFinalizationResults {
+    NativeOracleFinalizationResults {
+        adapter_close: archive_adapter.close(),
+        final_attestation: Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn compose_native_oracle_results(
+    primary: Result<NativeOraclePreparation, String>,
+    restoration: NativeOracleRestorationResults,
+    finalization: NativeOracleFinalizationResults,
+) -> Result<NativeOraclePreparation, String> {
+    let mut failures = Vec::new();
+    let value = match primary {
+        Ok(value) => Some(value),
+        Err(error) => {
+            failures.push(("primary", error));
+            None
+        }
+    };
+    for (phase, result) in [
+        ("quiescence", restoration.quiescence.map(drop)),
+        ("input-staging-cleanup", restoration.input_broker_cleanup),
+        ("restoration", restoration.restoration),
+        ("adapter-cleanup", finalization.adapter_close),
+        ("adapter-final-attestation", finalization.final_attestation),
+    ] {
+        if let Err(error) = result {
+            failures.push((phase, error));
+        }
+    }
+    if failures.is_empty() {
+        value.ok_or_else(|| "native oracle preparation result is absent".to_owned())
+    } else {
+        Err(ordered_bounded_failures(
+            "native oracle preparation and archive restoration failed",
+            failures,
+        ))
+    }
+}
+
+struct PlatformGateExecution {
+    retained_outputs: BTreeMap<String, Vec<u8>>,
+    gates: BTreeMap<&'static str, bool>,
+    evidence: BTreeMap<String, JsonValue>,
+    #[cfg(windows)]
+    windows_release_binary: Option<WindowsReleaseBinaryAuthority>,
+}
+
+struct PlatformGateExecutionInput<'a> {
+    platform: ReleasePlatform,
+    plan: &'a ReleasePlan,
+    conformance_plan: &'a crate::conformance::ConformancePlan,
+    root: &'a Path,
+    oracle_source: &'a Path,
+    output: &'a Path,
+    workspace_target: &'a Path,
+    target: &'a Path,
+    candidate_execution_root: &'a Path,
+    candidate_environment_root: &'a Path,
+    runner_identity: &'a (String, String),
+    oracle_inventory_digest: &'a str,
+    inventory_bytes: Vec<u8>,
+    prepared_oracle: &'a hell_testkit::ExecutableIdentity,
+    confinement: &'a mut CandidateConfinement,
+}
+
+fn execute_confined_platform_gates(
+    mut input: PlatformGateExecutionInput<'_>,
+) -> Result<PlatformGateExecution, String> {
+    input
+        .confinement
+        .require_candidate_environment("before platform gates")?;
+    #[cfg(unix)]
+    let dependency_policy = match (
+        input.confinement.dependency_policy_protection.as_ref(),
+        input.confinement.cargo_deny_home_protection.as_ref(),
+    ) {
+        (Some(policy), Some(metadata)) => Some((policy, metadata)),
+        (Some(_), None) => {
+            return Err("Linux dependency-policy metadata authority is absent".to_owned());
+        }
+        (None, _) => None,
+    };
+    let (mut gates, mut evidence) = initial_platform_gate_state(&input);
+    let mut retained_outputs = BTreeMap::from([(
+        "source-inventory.json".to_owned(),
+        std::mem::take(&mut input.inventory_bytes),
+    )]);
+    #[cfg(windows)]
+    let mut windows_release_binary = None;
+    let gate_result = with_release_candidate_environment(
+        input.target,
+        input.candidate_environment_root,
+        input.plan.source_date_epoch,
+        input.confinement.policy()?,
+        || {
+            run_platform_gates(PlatformGateInput {
+                platform: input.platform,
+                plan: input.plan,
+                conformance_plan: input.conformance_plan,
+                root: input.candidate_execution_root,
+                output: input.output,
+                gates: &mut gates,
+                evidence: &mut evidence,
+                retained: &mut retained_outputs,
+                prepared_oracle: input.prepared_oracle,
+                oracle_source_sha256: input.oracle_inventory_digest,
+                #[cfg(unix)]
+                dependency_policy,
+                #[cfg(windows)]
+                windows_release_binary: &mut windows_release_binary,
+            })
+        },
+    );
+    validate_platform_gate_cleanup(
+        &mut input,
+        gate_result,
+        &gates,
+        #[cfg(windows)]
+        windows_release_binary.as_ref(),
+    )?;
+    input
+        .confinement
+        .require_bound_sources("after trusted dependency-policy cleanup")?;
+    require_source_inventory(input.root, &input.plan.source_inventory_sha256)?;
+    let oracle_inventory_after = pinned_oracle_source_inventory(input.oracle_source)?;
+    if hell_testkit::sha256_bytes(&canonical_json_bytes(&oracle_inventory_after)?).hex()
+        != input.oracle_inventory_digest
+    {
+        return Err("oracle source changed during candidate execution".to_owned());
+    }
+    require_candidate_target(input.root, input.workspace_target)?;
+    input
+        .confinement
+        .export_candidate_target(input.workspace_target)?;
+    if input.platform != ReleasePlatform::LinuxX86_64 {
+        fs::remove_file(input.output.join("dependency-policy.sha256"))
+            .map_err(|error| format!("cannot remove transient dependency digest: {error}"))?;
+    }
+    #[cfg(windows)]
+    if let Some(authority) = windows_release_binary.as_ref() {
+        authority.validate(
+            "before packaging after transient dependency digest removal",
+            gates.get("release-build") == Some(&true),
+        )?;
+    }
+    Ok(PlatformGateExecution {
+        retained_outputs,
+        gates,
+        evidence,
+        #[cfg(windows)]
+        windows_release_binary,
+    })
+}
+
+fn initial_platform_gate_state(
+    input: &PlatformGateExecutionInput<'_>,
+) -> (BTreeMap<&'static str, bool>, BTreeMap<String, JsonValue>) {
+    let gates = BTreeMap::from([
+        ("runner-identity", true),
+        ("candidate-checkout", true),
+        ("oracle-checkout", true),
+        ("conformance-plan-binding", true),
+    ]);
+    let evidence = BTreeMap::from([
+        (
+            "runner-identity".to_owned(),
+            object([
+                ("arch", string(&input.runner_identity.1)),
+                ("os", string(&input.runner_identity.0)),
+                ("schemaVersion", number(1)),
+                ("state", string("passed")),
+            ]),
+        ),
+        (
+            "candidate-checkout".to_owned(),
+            object([
+                ("schemaVersion", number(1)),
+                ("sha", string(&input.plan.resolution.candidate_sha)),
+                ("state", string("passed")),
+            ]),
+        ),
+        (
+            "oracle-checkout".to_owned(),
+            object([
+                ("schemaVersion", number(1)),
+                ("sha", string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff")),
+                (
+                    "sourceInventorySha256",
+                    string(input.oracle_inventory_digest),
+                ),
+                ("state", string("passed")),
+            ]),
+        ),
+        (
+            "conformance-plan-binding".to_owned(),
+            object([
+                (
+                    "conformancePlanSha256",
+                    string(&input.conformance_plan.plan_sha256),
+                ),
+                ("platform", string(input.platform.id())),
+                ("schemaVersion", number(1)),
+                ("state", string("passed")),
+                (
+                    "trustedInputsSha256",
+                    string(&input.conformance_plan.trusted_inputs_sha256),
+                ),
+            ]),
+        ),
+    ]);
+    (gates, evidence)
+}
+
+fn validate_platform_gate_cleanup(
+    input: &mut PlatformGateExecutionInput<'_>,
+    gate_result: Result<(), String>,
+    _gates: &BTreeMap<&'static str, bool>,
+    #[cfg(windows)] windows_release_binary: Option<&WindowsReleaseBinaryAuthority>,
+) -> Result<(), String> {
+    let post_environment = input
+        .confinement
+        .require_candidate_environment("after platform gates before trusted cleanup");
+    #[cfg(windows)]
+    let post_binary = windows_release_binary.map_or(Ok(()), |authority| {
+        authority.validate(
+            "after platform gates before trusted cleanup",
+            _gates.get("release-build") == Some(&true),
+        )
+    });
+    let dependency_cleanup = input.confinement.cleanup_dependency_policy_cache();
+    compose_platform_gate_cleanup(gate_result, dependency_cleanup)?;
+    post_environment?;
+    #[cfg(windows)]
+    {
+        post_binary?;
+        if let Some(authority) = windows_release_binary {
+            authority.validate(
+                "after trusted dependency-policy cleanup",
+                _gates.get("release-build") == Some(&true),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+struct PlatformPackageInput<'a> {
+    platform: ReleasePlatform,
+    plan: &'a ReleasePlan,
+    root: &'a Path,
+    output: &'a Path,
+    target: &'a Path,
+    candidate_environment_root: &'a Path,
+    confinement: &'a CandidateConfinement,
+    license: &'a [u8],
+    notice: &'a [u8],
+    readme: &'a [u8],
+    retained_outputs: BTreeMap<String, Vec<u8>>,
+    gates: BTreeMap<&'static str, bool>,
+    evidence: BTreeMap<String, JsonValue>,
+    #[cfg(windows)]
+    windows_release_binary: Option<&'a WindowsReleaseBinaryAuthority>,
+}
+
+struct PackagedPlatform {
+    archive_name: String,
+    archive_sha256: String,
+    ordered_gates: Vec<JsonValue>,
+    evidence: BTreeMap<String, JsonValue>,
+}
+
+fn package_platform_candidate(
+    mut input: PlatformPackageInput<'_>,
+) -> Result<PackagedPlatform, String> {
+    #[cfg(windows)]
+    let binary = input
+        .windows_release_binary
+        .ok_or_else(|| "Windows release binary authority is absent before packaging".to_owned())?
+        .bound_binary_path()?
+        .to_path_buf();
+    #[cfg(not(windows))]
+    let binary = {
+        let binary = input
+            .target
+            .join("release")
+            .join(input.platform.executable());
+        require_real_binary_path(input.target, &binary)?;
+        binary
+    };
+    let archive_name = format!(
+        "hell-v{}-{}.tar.gz",
+        input.plan.version,
+        input.platform.id()
+    );
+    let archive_path = input.output.join("archive").join(&archive_name);
+    let archive_sha256 = create(&ArchiveInput {
+        platform: input.platform,
+        version: &input.plan.version,
+        source_date_epoch: input.plan.source_date_epoch,
+        executable: &binary,
+        license: input.license,
+        notice: input.notice,
+        readme: input.readme,
+        output: &archive_path,
+    })?;
+    let retained_archive = read_regular(&archive_path)?;
+    let unpacked_root = transient_path(input.root, &format!("unpacked-{}", input.platform.id()));
+    let unpacked = extract_binary(
+        &archive_path,
+        input.platform,
+        &input.plan.version,
+        input.plan.source_date_epoch,
+        &unpacked_root,
+    )?;
+    let smoke = with_release_candidate_environment(
+        input.target,
+        input.candidate_environment_root,
+        input.plan.source_date_epoch,
+        input.confinement.policy()?,
+        || {
+            CommandSpec::new(unpacked.as_os_str(), Duration::from_secs(30))
+                .argument("--help")
+                .run()
+        },
+    )
+    .map_err(|error| format!("cannot smoke-test packaged executable: {error}"))?;
+    if !smoke.status.success() || smoke.timed_out {
+        return Err("packaged executable smoke test failed".to_owned());
+    }
+    require_real_output_directories(input.output)?;
+    write_atomic(&archive_path, &retained_archive)?;
+    for (name, bytes) in input.retained_outputs {
+        write_atomic(&input.output.join(name), &bytes)?;
+    }
+    record_platform_package_gates(
+        input.platform,
+        &archive_sha256,
+        &mut input.gates,
+        &mut input.evidence,
+    );
+    fs::remove_dir_all(&unpacked_root)
+        .map_err(|error| format!("cannot remove unpacked smoke-test directory: {error}"))?;
+    let ordered_gates =
+        validate_complete_platform_gates(input.platform, &input.gates, &input.evidence)?;
+    Ok(PackagedPlatform {
+        archive_name,
+        archive_sha256,
+        ordered_gates,
+        evidence: input.evidence,
+    })
+}
+
+fn record_platform_package_gates(
+    platform: ReleasePlatform,
+    archive_sha256: &str,
+    gates: &mut BTreeMap<&'static str, bool>,
+    evidence: &mut BTreeMap<String, JsonValue>,
+) {
+    gates.insert("archive-verification", true);
+    gates.insert("package-smoke", true);
+    evidence.insert(
+        "archive-verification".to_owned(),
+        object([
+            ("archiveSha256", string(archive_sha256)),
+            ("schemaVersion", number(1)),
+            ("state", string("passed")),
+        ]),
+    );
+    evidence.insert(
+        "package-smoke".to_owned(),
+        object([
+            ("executable", string(platform.executable())),
+            ("schemaVersion", number(1)),
+            ("state", string("passed")),
+        ]),
+    );
+}
+
+fn validate_complete_platform_gates(
+    platform: ReleasePlatform,
+    gates: &BTreeMap<&'static str, bool>,
+    evidence: &BTreeMap<String, JsonValue>,
+) -> Result<Vec<JsonValue>, String> {
+    let expected = expected_gates(platform);
+    if gates.keys().copied().collect::<BTreeSet<_>>() != expected.iter().copied().collect()
+        || gates.values().any(|passed| !passed)
+        || evidence.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            != expected.iter().copied().collect()
+    {
+        return Err("release platform gate implementation is incomplete".to_owned());
+    }
+    Ok(expected
+        .iter()
+        .map(|name| {
+            object([
+                ("name", string(name)),
+                ("passed", JsonValue::Bool(gates[name])),
+            ])
+        })
+        .collect())
+}
+
+struct PlatformReportInput<'a> {
+    platform: ReleasePlatform,
+    plan: &'a ReleasePlan,
+    output: &'a Path,
+    image_os: &'a str,
+    image_version: &'a str,
+    tools: BTreeMap<String, JsonValue>,
+    packaged: PackagedPlatform,
+}
+
+fn write_platform_reports(input: &PlatformReportInput<'_>) -> Result<(), String> {
+    let conformance_gate = input
+        .packaged
+        .evidence
+        .get("conformance-evidence")
+        .ok_or_else(|| "conformance evidence gate is absent".to_owned())?
+        .object()?
+        .clone();
+    let report = build_platform_report(input, &conformance_gate)?;
+    write_json(&input.output.join("platform-report.json"), &report)?;
+    write_json(
+        &input.output.join("package-report.json"),
+        &object([
+            ("archiveSha256", string(&input.packaged.archive_sha256)),
+            ("schemaVersion", number(1)),
+            ("state", string("verified")),
+        ]),
+    )?;
+    write_json(
+        &input.output.join("archive-manifest.json"),
+        &object([
+            ("archiveName", string(&input.packaged.archive_name)),
+            ("archiveSha256", string(&input.packaged.archive_sha256)),
+            ("schemaVersion", number(1)),
+        ]),
+    )?;
+    verify_final_platform_inventory(input.output, input.platform, &input.packaged.archive_name)
+}
+
+fn build_platform_report(
+    input: &PlatformReportInput<'_>,
+    conformance_gate: &BTreeMap<String, JsonValue>,
+) -> Result<JsonValue, String> {
+    Ok(object([
+        (
+            "assignedObligationCount",
+            json_member(conformance_gate, "assignedObligations")?.clone(),
+        ),
+        ("archiveName", string(&input.packaged.archive_name)),
+        ("archiveSha256", string(&input.packaged.archive_sha256)),
+        ("buildInputsSha256", string(&input.plan.build_inputs_sha256)),
+        ("candidateSha", string(&input.plan.resolution.candidate_sha)),
+        (
+            "conformancePlanSha256",
+            string(&input.plan.conformance_plan_sha256),
+        ),
+        (
+            "conformanceStandard",
+            string(&input.plan.conformance_standard),
+        ),
+        (
+            "evidence",
+            JsonValue::Object(input.packaged.evidence.clone()),
+        ),
+        (
+            "evidenceManifestSha256",
+            json_member(conformance_gate, "manifestSha256")?.clone(),
+        ),
+        (
+            "externalInputsSha256",
+            string(&input.plan.external_inputs_sha256),
+        ),
+        (
+            "exploratoryObservationCount",
+            json_member(conformance_gate, "exploratoryRecords")?.clone(),
+        ),
+        (
+            "gates",
+            JsonValue::Array(input.packaged.ordered_gates.clone()),
+        ),
+        ("imageOS", string(input.image_os)),
+        ("imageVersion", string(input.image_version)),
+        (
+            "nativeEnvironmentSha256",
+            string(&super::native_environment::verify_receipt(
+                &input.output.join("native-environment.json"),
+                input.platform,
+                &input.plan.external_inputs_sha256,
+            )?),
+        ),
+        ("planSha256", string(&input.plan.plan_sha256)),
+        ("platform", string(input.platform.id())),
+        (
+            "producedEvidenceRecordCount",
+            json_member(conformance_gate, "producedRecords")?.clone(),
+        ),
+        ("runAttempt", number(input.plan.resolution.run_attempt)),
+        ("runId", number(input.plan.resolution.run_id)),
+        ("schemaVersion", number(2)),
+        ("state", string("passed")),
+        ("tag", string(&input.plan.tag)),
+        ("toolIdentities", JsonValue::Object(input.tools.clone())),
+        (
+            "trustedConformanceInputsSha256",
+            string(&input.plan.trusted_conformance_inputs_sha256),
+        ),
+        (
+            "unclassifiedMismatchCount",
+            json_member(conformance_gate, "unclassifiedMismatches")?.clone(),
+        ),
+        ("version", string(&input.plan.version)),
+        ("workflowSha", string(&input.plan.resolution.workflow_sha)),
+    ]))
 }
 
 fn compose_platform_gate_cleanup(
@@ -984,252 +1423,306 @@ fn compose_platform_gate_cleanup(
     }
 }
 
-#[cfg(unix)]
-fn establish_candidate_process_confinement(
+struct CandidateConfinementInput<'a> {
     platform: ReleasePlatform,
-    candidate_root: &Path,
-    oracle_root: &Path,
-    candidate_inventory: &JsonValue,
-    oracle_inventory: &JsonValue,
-    candidate_sha: &str,
-    workspace_target: &Path,
-    output: &Path,
-) -> Result<CandidateConfinement, String> {
+    candidate_root: &'a Path,
+    oracle_root: &'a Path,
+    candidate_inventory: &'a JsonValue,
+    oracle_inventory: &'a JsonValue,
+    candidate_sha: &'a str,
+    workspace_target: &'a Path,
+    output: &'a Path,
+}
+
+#[cfg(unix)]
+struct CreatedPosixPrincipal {
+    principal: String,
+    group: String,
+    uid: u32,
+    cleanup: PosixPrincipalCleanup,
+}
+
+#[cfg(unix)]
+struct PosixCandidatePrincipalAuthority {
+    process_authorities: Arc<ResolvedPosixProcessAuthorities>,
+    sudo: PathBuf,
+    principal: String,
+    group: String,
+    uid: u32,
+    cleanup: PosixPrincipalCleanup,
+    candidate_group_ids: Vec<u32>,
+    trusted_owner: u32,
+    trusted_group: u32,
+}
+
+#[cfg(unix)]
+fn acquire_posix_candidate_principal(
+    input: &CandidateConfinementInput<'_>,
+) -> Result<PosixCandidatePrincipalAuthority, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let process_authorities = ResolvedPosixProcessAuthorities::resolve()?;
     let sudo = process_authorities.sudo.invocation_path().to_path_buf();
-    let chmod_path = posix_adapter_tool_paths(platform)?.chmod;
-    let chmod = crate::command::resolve_absolute_standard_executable(Path::new(chmod_path))
-        .map_err(|error| format!("cannot bind trusted chmod authority: {error}"))?;
-    let (principal, group, uid, principal_cleanup) = match platform {
+    let created = match input.platform {
         ReleasePlatform::LinuxX86_64 => {
-            allocate_linux_candidate_principal(Arc::clone(&process_authorities), "hellrel")?
+            let (principal, group, uid, cleanup) =
+                allocate_linux_candidate_principal(Arc::clone(&process_authorities), "hellrel")?;
+            CreatedPosixPrincipal {
+                principal,
+                group,
+                uid,
+                cleanup,
+            }
         }
         ReleasePlatform::MacosAarch64 => {
-            let principal = format!("hellrel{}", std::process::id());
-            let group = principal.clone();
-            let uid = 550_u32
-                .checked_add(std::process::id() % 40)
-                .ok_or_else(|| "candidate UID overflow".to_owned())?;
-            let uid_text = uid.to_string();
-            let mut cleanup = PosixPrincipalCleanup::new(
-                platform,
-                Arc::clone(&process_authorities),
-                principal.clone(),
-                group.clone(),
-                Some(uid),
-                Some(uid),
-            )?;
-            let reservation_deadline =
-                posix_identity_query_deadline("macOS candidate reservation")?;
-            if posix_principal_uid(reservation_deadline, platform, &principal)?.is_some()
-                || posix_group_gid(reservation_deadline, &group)?.is_some()
-            {
-                return Err(
-                    "macOS candidate principal or group name is already occupied".to_owned(),
-                );
-            }
-            macos_principal_mutation(
-                &mut cleanup,
-                [
-                    "-n",
-                    "--",
-                    "/usr/sbin/dseditgroup",
-                    "-o",
-                    "create",
-                    "-i",
-                    &uid_text,
-                    &group,
-                ],
-            )?;
-            if !cleanup.group_created {
-                return Err("macOS candidate group creation had no observable effect".to_owned());
-            }
-            for (property, value) in [
-                ("UniqueID", uid_text.as_str()),
-                ("PrimaryGroupID", uid_text.as_str()),
-                ("UserShell", "/usr/bin/false"),
-                ("NFSHomeDirectory", "/var/empty"),
-            ] {
-                let record = Path::new("/Users").join(&principal);
-                macos_principal_mutation(
-                    &mut cleanup,
-                    [
-                        "-n",
-                        "--",
-                        "/usr/bin/dscl",
-                        ".",
-                        "-create",
-                        record
-                            .to_str()
-                            .ok_or_else(|| "candidate account path is not UTF-8".to_owned())?,
-                        property,
-                        value,
-                    ],
-                )?;
-            }
-            if !cleanup.user_created {
-                return Err("macOS candidate user creation had no observable effect".to_owned());
-            }
-            (principal, group, uid, cleanup)
+            create_macos_candidate_principal(Arc::clone(&process_authorities))?
         }
         ReleasePlatform::WindowsX86_64 => {
             return Err("Windows platform selected the POSIX confinement path".to_owned());
         }
     };
-    let id = &process_authorities.identity;
+    let identity = &process_authorities.identity;
     for (option, label) in [("-u", "UID"), ("-g", "primary GID")] {
-        require_exact_posix_candidate_identity(&id, option, &principal, uid, label)?;
+        require_exact_posix_candidate_identity(
+            identity,
+            option,
+            &created.principal,
+            created.uid,
+            label,
+        )?;
     }
-    let group_output =
-        exact_posix_candidate_identity_output(&id, "-G", &principal, "complete group inventory")?;
-    let candidate_group_ids =
-        posix_candidate_group_inventory(&group_output, uid).ok_or_else(|| {
+    let group_output = exact_posix_candidate_identity_output(
+        identity,
+        "-G",
+        &created.principal,
+        "complete group inventory",
+    )?;
+    let candidate_group_ids = posix_candidate_group_inventory(&group_output, created.uid)
+        .ok_or_else(|| {
             "candidate complete group inventory is not canonical or omits the primary GID"
                 .to_owned()
         })?;
-    use std::os::unix::fs::MetadataExt as _;
-
-    let trusted_checkout_metadata = fs::symlink_metadata(candidate_root)
+    let checkout_metadata = fs::symlink_metadata(input.candidate_root)
         .map_err(|error| format!("cannot inspect trusted candidate checkout owner: {error}"))?;
-    let trusted_owner = trusted_checkout_metadata.uid();
-    let trusted_group = trusted_checkout_metadata.gid();
+    let trusted_owner = checkout_metadata.uid();
+    let trusted_group = checkout_metadata.gid();
     if candidate_group_ids.contains(&trusted_group) {
         return Err(
             "candidate account unexpectedly belongs to the trusted runner group".to_owned(),
         );
     }
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve trusted POSIX adapter: {error}"))?;
-    let adapter_protection = stage_posix_executable(platform, &sudo, &current_exe, "hell-ci")?;
-    let cargo = crate::command::resolve_standard_cargo_executable()?;
-    let stack_root_protection = (platform == ReleasePlatform::MacosAarch64)
-        .then(|| stage_posix_stack_root(platform, &sudo, &adapter_protection, uid, trusted_group))
-        .transpose()?;
-    for protected in [candidate_root, oracle_root] {
-        if platform == ReleasePlatform::MacosAarch64 {
-            trusted_tool_status(
-                &sudo,
-                &chmod,
-                [
-                    "-RN",
-                    protected
-                        .to_str()
-                        .ok_or_else(|| "protected path is not UTF-8".to_owned())?,
-                ],
-            )?;
-        }
-        trusted_tool_status(
-            &sudo,
-            &chmod,
+    Ok(PosixCandidatePrincipalAuthority {
+        process_authorities,
+        sudo,
+        principal: created.principal,
+        group: created.group,
+        uid: created.uid,
+        cleanup: created.cleanup,
+        candidate_group_ids,
+        trusted_owner,
+        trusted_group,
+    })
+}
+
+#[cfg(unix)]
+fn create_macos_candidate_principal(
+    authorities: Arc<ResolvedPosixProcessAuthorities>,
+) -> Result<CreatedPosixPrincipal, String> {
+    let platform = ReleasePlatform::MacosAarch64;
+    let principal = format!("hellrel{}", std::process::id());
+    let group = principal.clone();
+    let uid = 550_u32
+        .checked_add(std::process::id() % 40)
+        .ok_or_else(|| "candidate UID overflow".to_owned())?;
+    let uid_text = uid.to_string();
+    let mut cleanup = PosixPrincipalCleanup::new(
+        platform,
+        authorities,
+        principal.clone(),
+        group.clone(),
+        Some(uid),
+        Some(uid),
+    );
+    let deadline = posix_identity_query_deadline("macOS candidate reservation")?;
+    if posix_principal_uid(deadline, platform, &principal)?.is_some()
+        || posix_group_gid(deadline, &group)?.is_some()
+    {
+        return Err("macOS candidate principal or group name is already occupied".to_owned());
+    }
+    macos_principal_mutation(
+        &mut cleanup,
+        [
+            "-n",
+            "--",
+            "/usr/sbin/dseditgroup",
+            "-o",
+            "create",
+            "-i",
+            &uid_text,
+            &group,
+        ],
+    )?;
+    if !cleanup.group_created {
+        return Err("macOS candidate group creation had no observable effect".to_owned());
+    }
+    for (property, value) in [
+        ("UniqueID", uid_text.as_str()),
+        ("PrimaryGroupID", uid_text.as_str()),
+        ("UserShell", "/usr/bin/false"),
+        ("NFSHomeDirectory", "/var/empty"),
+    ] {
+        let record = Path::new("/Users").join(&principal);
+        macos_principal_mutation(
+            &mut cleanup,
             [
-                "-R",
-                "a-w",
-                protected
+                "-n",
+                "--",
+                "/usr/bin/dscl",
+                ".",
+                "-create",
+                record
                     .to_str()
-                    .ok_or_else(|| "protected path is not UTF-8".to_owned())?,
+                    .ok_or_else(|| "candidate account path is not UTF-8".to_owned())?,
+                property,
+                value,
             ],
         )?;
     }
-    set_posix_mode(output, 0o700)?;
-    let cargo_authority = crate::command::resolve_posix_cargo_authority(&cargo, candidate_root)?;
-    let rustup_authority = match &cargo_authority {
-        crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
-            return reject_native_posix_cargo_authority();
-        }
-        crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => Some(authority),
-    };
-    let rustup_protection = rustup_authority
-        .map(|authority| stage_posix_rustup_authority(platform, &sudo, authority))
-        .transpose()?;
-    let mut source_protection = stage_posix_sources(
-        platform,
-        &sudo,
-        candidate_root,
-        oracle_root,
-        candidate_inventory,
-        oracle_inventory,
-        candidate_sha,
-        workspace_target,
-        &group,
-        trusted_owner,
+    if !cleanup.user_created {
+        return Err("macOS candidate user creation had no observable effect".to_owned());
+    }
+    Ok(CreatedPosixPrincipal {
+        principal,
+        group,
         uid,
-        uid,
-        trusted_group,
-    )?;
+        cleanup,
+    })
+}
+
+#[cfg(unix)]
+struct PosixCandidateSourceStage {
+    source_protection: PosixSourceProtection,
+    candidate_target: PosixCandidateTargetProtection,
+    isolated: PathBuf,
+    cargo_deny_home_protection: Option<PosixCargoDenyHomeProtection>,
+    dependency_policy_protection: Option<PosixDependencyPolicyProtection>,
+}
+
+#[cfg(unix)]
+fn stage_posix_candidate_sources(
+    input: &CandidateConfinementInput<'_>,
+    principal: &PosixCandidatePrincipalAuthority,
+    adapter: &PosixAdapterProtection,
+    cargo: &crate::command::ResolvedCargoExecutable,
+) -> Result<PosixCandidateSourceStage, String> {
+    let mut source_protection = stage_posix_sources(&PosixSourceStageInput {
+        platform: input.platform,
+        sudo: &principal.sudo,
+        candidate_source: input.candidate_root,
+        oracle_source: input.oracle_root,
+        candidate_inventory: input.candidate_inventory,
+        oracle_inventory: input.oracle_inventory,
+        candidate_sha: input.candidate_sha,
+        target: input.workspace_target,
+        candidate_group: &principal.group,
+        trusted_owner: principal.trusted_owner,
+        candidate_uid: principal.uid,
+        candidate_primary_gid: principal.uid,
+        trusted_group_id: principal.trusted_group,
+    })?;
     let candidate_target = stage_posix_candidate_target(
-        &sudo,
-        &adapter_protection,
-        workspace_target,
+        &principal.sudo,
+        adapter,
+        input.workspace_target,
         &source_protection.transient,
-        trusted_owner,
-        trusted_group,
-        uid,
+        principal.trusted_owner,
+        principal.trusted_group,
+        principal.uid,
     )?;
     let candidate_environment = construct_posix_candidate_environment(
-        platform,
-        &sudo,
+        input.platform,
+        &principal.sudo,
         &source_protection.tools,
         &source_protection.transient,
-        trusted_owner,
-        uid,
+        principal.trusted_owner,
+        principal.uid,
     )?;
     let isolated = candidate_environment.root.path().to_path_buf();
     source_protection.candidate_environment = Some(candidate_environment);
     validate_posix_sources(&source_protection, "after candidate environment capture")?;
-    probe_posix_candidate_home(platform, &sudo, &principal, &isolated.join("home"))?;
+    probe_posix_candidate_home(
+        input.platform,
+        &principal.sudo,
+        &principal.principal,
+        &isolated.join("home"),
+    )?;
     source_protection.validate_candidate_environment("after candidate home probes")?;
-    // The whole-target normalizer and protected source staging establish the
-    // final candidate authorities. Materialize cargo-deny's cache and metadata
-    // against that exact execution checkout so no hosted-workspace path leaks
-    // into the candidate invocation.
     let (cargo_deny_home_protection, dependency_policy_protection) =
-        if platform == ReleasePlatform::LinuxX86_64 {
-            let (home, policy) = stage_posix_cargo_deny_home(
-                platform,
-                &sudo,
-                &adapter_protection,
-                candidate_target.path(),
-                &source_protection.candidate,
-                candidate_sha,
-                &cargo,
-                uid,
-                trusted_owner,
-                trusted_group,
-            )?;
+        if input.platform == ReleasePlatform::LinuxX86_64 {
+            let (home, policy) = stage_posix_cargo_deny_home(&PosixCargoDenyStageInput {
+                platform: input.platform,
+                sudo: &principal.sudo,
+                adapter,
+                target: candidate_target.path(),
+                candidate_root: &source_protection.candidate,
+                candidate_sha: input.candidate_sha,
+                cargo,
+                candidate_uid: principal.uid,
+                trusted_owner: principal.trusted_owner,
+                trusted_group_id: principal.trusted_group,
+            })?;
             (Some(home), Some(policy))
         } else {
             (None, None)
         };
     source_protection.validate_candidate_environment("after trusted dependency-policy staging")?;
-    let cargo_protection =
-        stage_posix_executable(platform, &sudo, cargo.canonical_identity(), "cargo")?;
-    let stack = (platform == ReleasePlatform::MacosAarch64)
-        .then(|| crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("stack")))
-        .transpose()
-        .map_err(|error| format!("cannot bind required Stack authority: {error}"))?;
-    let stack_protection = stack
-        .as_ref()
-        .map(|resolved| {
-            stage_posix_executable(platform, &sudo, resolved.canonical_identity(), "stack")
-        })
-        .transpose()?;
+    Ok(PosixCandidateSourceStage {
+        source_protection,
+        candidate_target,
+        isolated,
+        cargo_deny_home_protection,
+        dependency_policy_protection,
+    })
+}
+
+#[cfg(unix)]
+struct PosixCandidateLaunchInput<'a> {
+    principal: &'a PosixCandidatePrincipalAuthority,
+    adapter: &'a PosixAdapterProtection,
+    cargo: &'a crate::command::ResolvedCargoExecutable,
+    cargo_protection: &'a PosixAdapterProtection,
+    cargo_authority: &'a crate::command::ResolvedPosixCargoAuthority,
+    rustup: Option<&'a PosixRustupProtection>,
+    stack: Option<&'a crate::command::ResolvedStandardExecutable>,
+    stack_protection: Option<&'a PosixAdapterProtection>,
+    stack_root: Option<&'a PosixStackRootProtection>,
+    source_stage: &'a PosixCandidateSourceStage,
+}
+
+#[cfg(unix)]
+fn build_posix_candidate_launch_policy(
+    input: &PosixCandidateLaunchInput<'_>,
+) -> Result<hell_testkit::CandidateLaunchPolicy, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let principal = input.principal;
     let candidate_identity = hell_testkit::PosixCandidateIdentity::new(
-        principal.clone(),
-        uid,
-        uid,
-        candidate_group_ids,
-        group.clone(),
+        principal.principal.clone(),
+        principal.uid,
+        principal.uid,
+        principal.candidate_group_ids.clone(),
+        principal.group.clone(),
     )
     .map_err(|error| format!("cannot bind candidate account identity: {error}"))?;
     let mut launch_authorities = hell_testkit::PosixLaunchAuthorities::new(
-        adapter_protection.adapter.clone(),
-        adapter_protection.sha256,
-        cargo.canonical_identity().to_path_buf(),
-        cargo_protection.adapter.clone(),
-        cargo_protection.sha256,
-        posix_cargo_source_authority(&cargo_authority, rustup_protection.as_ref())?,
+        input.adapter.adapter.clone(),
+        input.adapter.sha256,
+        input.cargo.canonical_identity().to_path_buf(),
+        input.cargo_protection.adapter.clone(),
+        input.cargo_protection.sha256,
+        posix_cargo_source_authority(input.cargo_authority, input.rustup)?,
     );
-    if let (Some(resolved), Some(protection)) = (&stack, &stack_protection) {
+    if let (Some(resolved), Some(protection)) = (input.stack, input.stack_protection) {
         let metadata = fs::metadata(resolved.canonical_identity())
             .map_err(|error| format!("cannot inspect required Stack authority: {error}"))?;
         let source_sha256 = hell_testkit::sha256_file(resolved.canonical_identity())
@@ -1244,57 +1737,166 @@ fn establish_candidate_process_confinement(
             source_sha256,
             protection.adapter.clone(),
             protection.sha256,
-            stack_root_protection
-                .as_ref()
+            input
+                .stack_root
                 .ok_or_else(|| "macOS Stack-root authority is absent".to_owned())?
                 .root
                 .clone(),
-            trusted_group,
+            principal.trusted_group,
         ));
     }
     let mut writable_roots = vec![
-        candidate_target.path().to_path_buf(),
-        source_protection.transient.clone(),
+        input.source_stage.candidate_target.path().to_path_buf(),
+        input.source_stage.source_protection.transient.clone(),
     ];
-    if let Some(protection) = &stack_root_protection {
+    if let Some(protection) = input.stack_root {
         writable_roots.push(protection.root.clone());
     }
     let policy = hell_testkit::CandidateLaunchPolicy::posix_with_process_authorities(
-        sudo.clone(),
-        process_authorities.launch_authorities()?,
+        principal.sudo.clone(),
+        principal.process_authorities.launch_authorities()?,
         launch_authorities,
         candidate_identity,
         writable_roots,
     )
     .map_err(|error| format!("cannot establish candidate launch policy: {error}"))?;
     preflight_posix_driver_receipt_as_candidate(
-        candidate_target.path(),
-        &isolated,
+        input.source_stage.candidate_target.path(),
+        &input.source_stage.isolated,
         &policy,
-        &source_protection.candidate,
-        &adapter_protection,
+        &input.source_stage.source_protection.candidate,
+        input.adapter,
     )?;
     preflight_exact_staged_rustc_as_candidate(
-        candidate_target.path(),
-        &isolated,
+        input.source_stage.candidate_target.path(),
+        &input.source_stage.isolated,
         &policy,
-        &source_protection.candidate,
-        rustup_protection.as_ref().ok_or_else(|| {
+        &input.source_stage.source_protection.candidate,
+        input.rustup.ok_or_else(|| {
             "staged Rustup authority is absent before production gates".to_owned()
         })?,
     )?;
+    Ok(policy)
+}
+
+#[cfg(unix)]
+fn protect_posix_candidate_checkouts(
+    input: &CandidateConfinementInput<'_>,
+    principal: &PosixCandidatePrincipalAuthority,
+    chmod: &crate::command::ResolvedStandardExecutable,
+) -> Result<(), String> {
+    for protected in [input.candidate_root, input.oracle_root] {
+        if input.platform == ReleasePlatform::MacosAarch64 {
+            trusted_tool_status(
+                &principal.sudo,
+                chmod,
+                [
+                    "-RN",
+                    protected
+                        .to_str()
+                        .ok_or_else(|| "protected path is not UTF-8".to_owned())?,
+                ],
+            )?;
+        }
+        trusted_tool_status(
+            &principal.sudo,
+            chmod,
+            [
+                "-R",
+                "a-w",
+                protected
+                    .to_str()
+                    .ok_or_else(|| "protected path is not UTF-8".to_owned())?,
+            ],
+        )?;
+    }
+    set_posix_mode(input.output, 0o700)
+}
+
+#[cfg(unix)]
+fn establish_candidate_process_confinement(
+    input: &CandidateConfinementInput<'_>,
+) -> Result<CandidateConfinement, String> {
+    let principal = acquire_posix_candidate_principal(input)?;
+    let chmod_path = posix_adapter_tool_paths(input.platform)?.chmod;
+    let chmod = crate::command::resolve_absolute_standard_executable(Path::new(chmod_path))
+        .map_err(|error| format!("cannot bind trusted chmod authority: {error}"))?;
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve trusted POSIX adapter: {error}"))?;
+    let adapter_protection =
+        stage_posix_executable(input.platform, &principal.sudo, &current_exe, "hell-ci")?;
+    let cargo = crate::command::resolve_standard_cargo_executable()?;
+    let stack_root_protection = (input.platform == ReleasePlatform::MacosAarch64)
+        .then(|| {
+            stage_posix_stack_root(
+                input.platform,
+                &principal.sudo,
+                &adapter_protection,
+                principal.uid,
+                principal.trusted_group,
+            )
+        })
+        .transpose()?;
+    protect_posix_candidate_checkouts(input, &principal, &chmod)?;
+    let cargo_authority =
+        crate::command::resolve_posix_cargo_authority(&cargo, input.candidate_root)?;
+    let rustup_authority = match &cargo_authority {
+        crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
+            return reject_native_posix_cargo_authority();
+        }
+        crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => Some(authority),
+    };
+    let rustup_protection = rustup_authority
+        .map(|authority| stage_posix_rustup_authority(input.platform, &principal.sudo, authority))
+        .transpose()?;
+    let source_stage =
+        stage_posix_candidate_sources(input, &principal, &adapter_protection, &cargo)?;
+    let cargo_protection = stage_posix_executable(
+        input.platform,
+        &principal.sudo,
+        cargo.canonical_identity(),
+        "cargo",
+    )?;
+    let stack = (input.platform == ReleasePlatform::MacosAarch64)
+        .then(|| crate::command::resolve_standard_path_executable(std::ffi::OsStr::new("stack")))
+        .transpose()
+        .map_err(|error| format!("cannot bind required Stack authority: {error}"))?;
+    let stack_protection = stack
+        .as_ref()
+        .map(|resolved| {
+            stage_posix_executable(
+                input.platform,
+                &principal.sudo,
+                resolved.canonical_identity(),
+                "stack",
+            )
+        })
+        .transpose()?;
+    let policy = build_posix_candidate_launch_policy(&PosixCandidateLaunchInput {
+        principal: &principal,
+        adapter: &adapter_protection,
+        cargo: &cargo,
+        cargo_protection: &cargo_protection,
+        cargo_authority: &cargo_authority,
+        rustup: rustup_protection.as_ref(),
+        stack: stack.as_ref(),
+        stack_protection: stack_protection.as_ref(),
+        stack_root: stack_root_protection.as_ref(),
+        source_stage: &source_stage,
+    })?;
     Ok(CandidateConfinement {
-        policy,
-        _cleanup: principal_cleanup,
-        _adapter_protection: adapter_protection,
+        policy: Some(policy),
+        archive_launcher: Some(adapter_protection.adapter.clone()),
+        cleanup: principal.cleanup,
+        adapter_protection,
         _cargo_protection: cargo_protection,
-        cargo_deny_home_protection,
-        dependency_policy_protection,
+        cargo_deny_home_protection: source_stage.cargo_deny_home_protection,
+        dependency_policy_protection: source_stage.dependency_policy_protection,
         _stack_protection: stack_protection,
         stack_root_protection,
         _rustup_protection: rustup_protection,
-        candidate_target,
-        source_protection,
+        candidate_target: source_stage.candidate_target,
+        source_protection: source_stage.source_protection,
     })
 }
 
@@ -1368,23 +1970,19 @@ fn preflight_exact_staged_rustc_as_candidate(
         .join("toolchains")
         .join(rustup.toolchain.as_os_str())
         .join("bin/rustc");
-    let probe = with_release_candidate_environment(
-        candidate_target,
-        environment_root,
-        1,
-        policy,
-        || {
+    let probe =
+        with_release_candidate_environment(candidate_target, environment_root, 1, policy, || {
             CommandSpec::new(staged_rustc.as_os_str(), Duration::from_mins(5))
                 .argument("-vV")
                 .current_directory(current_directory)
                 .run()
-        },
-    )
-    .map_err(|error| {
-        format!(
-            "cannot execute exact staged Rust compiler as candidate: path={staged_rustc:?}; error={error}"
-        )
-    })?;
+        })
+        .map_err(|error| {
+            format!(
+                "cannot execute exact staged Rust compiler as candidate: path={}; error={error}",
+                staged_rustc.display()
+            )
+        })?;
     let lines = probe
         .stdout
         .split(|byte| *byte == b'\n')
@@ -1411,7 +2009,8 @@ fn preflight_exact_staged_rustc_as_candidate(
         || !has_identity
     {
         return Err(format!(
-            "exact staged Rust compiler candidate preflight failed: path={staged_rustc:?}; status={:?}; stderr={}",
+            "exact staged Rust compiler candidate preflight failed: path={}; status={:?}; stderr={}",
+            staged_rustc.display(),
             probe.status.code(),
             String::from_utf8_lossy(&probe.stderr)
         ));
@@ -1830,14 +2429,16 @@ pub(crate) fn verify_windows_candidate_target_authority_for_integration() -> Res
         verify_windows_staged_toolchain_seal_for_integration(&authority, execution_deadline)?;
         require_candidate_target(&candidate, &target)?;
         owner.confinement = Some(establish_candidate_process_confinement(
-            ReleasePlatform::WindowsX86_64,
-            &candidate,
-            &oracle,
-            &JsonValue::Null,
-            &JsonValue::Null,
-            "0000000000000000000000000000000000000000",
-            &target,
-            &output,
+            &CandidateConfinementInput {
+                platform: ReleasePlatform::WindowsX86_64,
+                candidate_root: &candidate,
+                oracle_root: &oracle,
+                candidate_inventory: &JsonValue::Null,
+                oracle_inventory: &JsonValue::Null,
+                candidate_sha: "0000000000000000000000000000000000000000",
+                workspace_target: &target,
+                output: &output,
+            },
         )?);
         let confinement = owner
             .confinement
@@ -2251,41 +2852,32 @@ fn posix_no_follow_operation_limit(entry_limit: usize) -> Result<usize, String> 
 }
 
 #[cfg(unix)]
-fn remove_posix_no_follow_forest(
+type PosixPendingRemoval = (PathBuf, PosixObjectIdentity, bool, usize);
+
+#[cfg(unix)]
+fn admit_posix_no_follow_operation(operations: &mut usize, limit: usize) -> Result<(), String> {
+    *operations = operations
+        .checked_add(1)
+        .filter(|count| *count <= limit)
+        .ok_or_else(|| "bounded no-follow cleanup exceeds its global operation bound".to_owned())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn discover_posix_no_follow_roots(
     roots: &[PosixNoFollowRemovalRoot<'_>],
     policy: PosixNoFollowRemovalPolicy,
-    mut validate_roots: impl FnMut() -> Result<(), String>,
-    mut open_directory: impl FnMut(&Path) -> Result<(), String>,
-    mut unlink_file: impl FnMut(&Path) -> Result<(), String>,
-    mut remove_directory: impl FnMut(&Path) -> Result<(), String>,
-) -> Result<(), String> {
-    fn admit_operation(operations: &mut usize, limit: usize) -> Result<(), String> {
-        *operations = operations
-            .checked_add(1)
-            .filter(|count| *count <= limit)
-            .ok_or_else(|| {
-                "bounded no-follow cleanup exceeds its global operation bound".to_owned()
-            })?;
-        Ok(())
-    }
-
-    let require_time = || {
-        policy
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| "bounded no-follow cleanup deadline expired".to_owned())
-            .map(|_| ())
-    };
+    validate_roots: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(Vec<PosixPendingRemoval>, usize, usize), String> {
     let mut discovered = roots.len();
-    let mut operations = 0usize;
+    let mut operations = 0;
     if discovered > policy.entry_limit {
         return Err("bounded no-follow cleanup exceeds its global entry bound".to_owned());
     }
     let mut pending = Vec::new();
     for root in roots {
-        require_time()?;
-        admit_operation(&mut operations, policy.operation_limit)?;
+        require_posix_no_follow_time(policy.deadline)?;
+        admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
         validate_roots()?;
         let mut children = Vec::new();
         for entry in fs::read_dir(root.directory)
@@ -2309,16 +2901,39 @@ fn remove_posix_no_follow_forest(
                 path,
                 posix_object_identity_from_metadata(&metadata),
                 false,
-                1usize,
+                1,
             ));
         }
         children.sort_by(|left, right| left.0.cmp(&right.0));
         pending.extend(children.into_iter().rev());
     }
+    Ok((pending, discovered, operations))
+}
+
+#[cfg(unix)]
+fn require_posix_no_follow_time(deadline: Instant) -> Result<(), String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "bounded no-follow cleanup deadline expired".to_owned())
+        .map(|_| ())
+}
+
+#[cfg(unix)]
+fn remove_posix_no_follow_forest(
+    roots: &[PosixNoFollowRemovalRoot<'_>],
+    policy: PosixNoFollowRemovalPolicy,
+    mut validate_roots: impl FnMut() -> Result<(), String>,
+    mut open_directory: impl FnMut(&Path) -> Result<(), String>,
+    mut unlink_file: impl FnMut(&Path) -> Result<(), String>,
+    mut remove_directory: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let (mut pending, mut discovered, mut operations) =
+        discover_posix_no_follow_roots(roots, policy, &mut validate_roots)?;
 
     while let Some((path, receipt, visited, depth)) = pending.pop() {
-        require_time()?;
-        admit_operation(&mut operations, policy.operation_limit)?;
+        require_posix_no_follow_time(policy.deadline)?;
+        admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
         validate_roots()?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("cannot revalidate bounded no-follow member: {error}"))?;
@@ -2327,16 +2942,16 @@ fn remove_posix_no_follow_forest(
         }
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
             if visited {
-                admit_operation(&mut operations, policy.operation_limit)?;
+                admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
                 remove_directory(&path)?;
             } else {
                 if depth >= policy.depth_limit {
                     return Err("bounded no-follow cleanup exceeds its depth bound".to_owned());
                 }
-                admit_operation(&mut operations, policy.operation_limit)?;
+                admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
                 open_directory(&path)?;
-                require_time()?;
-                admit_operation(&mut operations, policy.operation_limit)?;
+                require_posix_no_follow_time(policy.deadline)?;
+                admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
                 validate_roots()?;
                 let opened_metadata = fs::symlink_metadata(&path).map_err(|error| {
                     format!("cannot rebind opened bounded no-follow directory: {error}")
@@ -2355,7 +2970,7 @@ fn remove_posix_no_follow_forest(
                 for entry in fs::read_dir(&path).map_err(|error| {
                     format!("cannot enumerate bounded no-follow directory: {error}")
                 })? {
-                    require_time()?;
+                    require_posix_no_follow_time(policy.deadline)?;
                     discovered = discovered
                         .checked_add(1)
                         .filter(|count| *count <= policy.entry_limit)
@@ -2382,7 +2997,7 @@ fn remove_posix_no_follow_forest(
                 continue;
             }
         } else if metadata.is_file() || metadata.file_type().is_symlink() {
-            admit_operation(&mut operations, policy.operation_limit)?;
+            admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
             unlink_file(&path)?;
         } else {
             return Err("bounded no-follow cleanup found an unsupported entry type".to_owned());
@@ -2397,8 +3012,8 @@ fn remove_posix_no_follow_forest(
             }
         }
     }
-    require_time()?;
-    admit_operation(&mut operations, policy.operation_limit)?;
+    require_posix_no_follow_time(policy.deadline)?;
+    admit_posix_no_follow_operation(&mut operations, policy.operation_limit)?;
     validate_roots()
 }
 
@@ -2478,13 +3093,13 @@ fn cleanup_posix_source_stack_work_before_snapshot(
 #[cfg(unix)]
 fn require_posix_archive_cleanup_quiescence(
     receipt: Option<&hell_testkit::PosixCandidateQuiescenceReceipt>,
-    expected_uid: u32,
-    expected_gid: u32,
+    expected_user_id: u32,
+    expected_group_id: u32,
 ) -> Result<(), String> {
     let receipt = receipt.ok_or_else(|| {
         "candidate quiescence receipt is absent before archive cleanup".to_owned()
     })?;
-    if !receipt.matches_numeric_identity(expected_uid, expected_gid) {
+    if !receipt.matches_numeric_identity(expected_user_id, expected_group_id) {
         return Err(format!(
             "candidate quiescence receipt identity differs before archive cleanup: principal={}",
             receipt.principal()
@@ -2583,7 +3198,7 @@ impl PosixArchiveAdapterSeal<'_> {
             self.candidate_primary_gid,
         )?;
         require_posix_archive_adapter_transition_state_phase(
-            PosixArchiveAdapterTransitionState {
+            &PosixArchiveAdapterTransitionState {
                 parent: &self.parent,
                 parent_identity: &self.parent_identity,
                 parent_owner: self.parent_owner,
@@ -2613,7 +3228,7 @@ impl PosixArchiveAdapterSeal<'_> {
             },
             |deadline| self.cleanup_adapter_stack_work(deadline),
             |deadline| {
-                require_posix_archive_adapter_transition_state(self.transition_state(0o2550))?;
+                require_posix_archive_adapter_transition_state(&self.transition_state(0o2550))?;
                 trusted_tool_status_before(
                     deadline,
                     &self.sudo,
@@ -2624,7 +3239,7 @@ impl PosixArchiveAdapterSeal<'_> {
                         path_text(&self.parent, "native archive adapter authority")?,
                     )?,
                 )?;
-                require_posix_archive_adapter_transition_state(self.transition_state(0o2770))
+                require_posix_archive_adapter_transition_state(&self.transition_state(0o2770))
             },
         )
     }
@@ -2651,7 +3266,7 @@ impl PosixArchiveAdapterSeal<'_> {
             },
             || {
                 require_posix_archive_adapter_transition_state_phase(
-                    self.transition_state(0o2550),
+                    &self.transition_state(0o2550),
                     false,
                 )
             },
@@ -2680,7 +3295,7 @@ impl PosixArchiveAdapterSeal<'_> {
                 )
             },
         )?;
-        require_posix_archive_adapter_transition_state(self.transition_state(0o2550))
+        require_posix_archive_adapter_transition_state(&self.transition_state(0o2550))
     }
 
     fn transition_mutable_directory_to_cleanup_owner(
@@ -3159,17 +3774,22 @@ impl Drop for PosixCargoDenyHomeProtection {
 }
 
 #[cfg(unix)]
-fn stage_posix_cargo_deny_home(
+struct PosixCargoDenyStageInput<'a> {
     platform: ReleasePlatform,
-    sudo: &Path,
-    adapter: &PosixAdapterProtection,
-    target: &Path,
-    candidate_root: &Path,
-    candidate_sha: &str,
-    cargo: &crate::command::ResolvedCargoExecutable,
+    sudo: &'a Path,
+    adapter: &'a PosixAdapterProtection,
+    target: &'a Path,
+    candidate_root: &'a Path,
+    candidate_sha: &'a str,
+    cargo: &'a crate::command::ResolvedCargoExecutable,
     candidate_uid: u32,
     trusted_owner: u32,
     trusted_group_id: u32,
+}
+
+#[cfg(unix)]
+fn stage_posix_cargo_deny_home(
+    input: &PosixCargoDenyStageInput<'_>,
 ) -> Result<
     (
         PosixCargoDenyHomeProtection,
@@ -3177,6 +3797,18 @@ fn stage_posix_cargo_deny_home(
     ),
     String,
 > {
+    let PosixCargoDenyStageInput {
+        platform,
+        sudo,
+        adapter,
+        target,
+        candidate_root,
+        candidate_sha,
+        cargo,
+        candidate_uid,
+        trusted_owner,
+        trusted_group_id,
+    } = *input;
     let target_identity = posix_object_identity(target)?;
     let tools = resolve_posix_adapter_tools(platform)?;
     let environment_root = target.join("release-child-environment");
@@ -3392,12 +4024,33 @@ fn stage_posix_cargo_deny_metadata(
             active: true,
         })
     })();
-    if prepare.is_err() {
-        if let Ok(directory_text) = path_text(&directory, "partial cargo-deny metadata cleanup") {
-            let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
-        }
+    if prepare.is_err()
+        && let Ok(directory_text) = path_text(&directory, "partial cargo-deny metadata cleanup")
+    {
+        let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
     }
     prepare
+}
+
+#[cfg(unix)]
+fn dependency_policy_tool_identity(
+    document: &[u8],
+) -> Result<(hell_testkit::Digest, String), String> {
+    let text = std::str::from_utf8(document)
+        .map_err(|_| "dependency-policy result is not UTF-8".to_owned())?;
+    let parsed = parse_json(text)?;
+    let parsed_object = parsed.object()?;
+    let digest = hell_testkit::Digest::from_hex(
+        json_member(parsed_object, "cargoDenyExecutableSha256")?.string()?,
+    )
+    .map_err(|_| "dependency-policy cargo-deny digest is invalid".to_owned())?;
+    let version = json_member(parsed_object, "cargoDenyVersion")?
+        .string()?
+        .to_owned();
+    if version != TRUSTED_CARGO_DENY_VERSION {
+        return Err("dependency-policy cargo-deny version differs from policy".to_owned());
+    }
+    Ok((digest, version))
 }
 
 #[cfg(unix)]
@@ -3413,20 +4066,7 @@ fn stage_posix_dependency_policy(
     if platform != ReleasePlatform::LinuxX86_64 {
         return Err("dependency-policy authority is only supported on Linux".to_owned());
     }
-    let text = std::str::from_utf8(document)
-        .map_err(|_| "dependency-policy result is not UTF-8".to_owned())?;
-    let parsed = parse_json(text)?;
-    let parsed_object = parsed.object()?;
-    let cargo_deny_sha256 = hell_testkit::Digest::from_hex(
-        json_member(parsed_object, "cargoDenyExecutableSha256")?.string()?,
-    )
-    .map_err(|_| "dependency-policy cargo-deny digest is invalid".to_owned())?;
-    let cargo_deny_version = json_member(parsed_object, "cargoDenyVersion")?
-        .string()?
-        .to_owned();
-    if cargo_deny_version != TRUSTED_CARGO_DENY_VERSION {
-        return Err("dependency-policy cargo-deny version differs from policy".to_owned());
-    }
+    let (cargo_deny_sha256, cargo_deny_version) = dependency_policy_tool_identity(document)?;
     let parent = posix_adapter_installation_root(platform)?;
     let parent_identity = posix_object_identity(&parent)?;
     let sequence = POSIX_CARGO_METADATA_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -3513,10 +4153,10 @@ fn stage_posix_dependency_policy(
             active: true,
         })
     })();
-    if prepare.is_err() {
-        if let Ok(directory_text) = path_text(&directory, "partial dependency-policy cleanup") {
-            let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
-        }
+    if prepare.is_err()
+        && let Ok(directory_text) = path_text(&directory, "partial dependency-policy cleanup")
+    {
+        let _ = trusted_tool_status(sudo, &tools.remove_file, ["-rf", "--", directory_text]);
     }
     prepare
 }
@@ -3808,7 +4448,7 @@ impl TrustedCargoCacheSeed {
         cargo_home: &Path,
     ) -> Result<CommandResult, String> {
         self.validate()?;
-        let result = crate::command::CommandSpec::trusted_cargo(Duration::from_secs(300), cargo)
+        let result = crate::command::CommandSpec::trusted_cargo(Duration::from_mins(5), cargo)
             .arguments(arguments)
             .current_directory(candidate_root)
             .environment("CARGO_HOME", cargo_home.as_os_str())
@@ -4222,7 +4862,7 @@ fn run_trusted_cargo_deny_authority_checks(
     let cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
         .map_err(|error| format!("cannot hash trusted cargo-deny authority: {error}"))?;
     let version = tool_output(
-        CommandSpec::cargo_deny(Duration::from_secs(30))
+        &CommandSpec::cargo_deny(Duration::from_secs(30))
             .argument("--version")
             .current_directory(candidate_root)
             .environment("CARGO_HOME", cargo_home.as_os_str()),
@@ -4371,7 +5011,7 @@ fn trusted_cargo_deny_authority_arguments(
 #[cfg(unix)]
 fn dependency_policy_input_sha256(root: &Path, name: &str) -> Result<String, String> {
     hell_testkit::sha256_file(&root.join(name))
-        .map(|digest| digest.hex())
+        .map(hell_digest::Digest::hex)
         .map_err(|error| format!("cannot hash dependency-policy input {name}: {error}"))
 }
 
@@ -5136,8 +5776,184 @@ fn validate_posix_stack_root_post_state(
 }
 
 #[cfg(unix)]
+fn verify_posix_post_state_members(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root_metadata = fs::metadata(root)
+        .map_err(|error| format!("cannot inspect POSIX post-state verifier root: {error}"))?;
+    let owner = root_metadata.uid();
+    let group = root_metadata.gid();
+    verify_posix_cargo_deny_post_state(root, owner, group)?;
+    verify_posix_stack_post_state(root, owner, group)
+}
+
+#[cfg(unix)]
+fn verify_posix_cargo_deny_post_state(root: &Path, owner: u32, group: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let cargo_home = root.join("cargo-home");
+    let advisory_root = cargo_home.join("advisory-dbs");
+    let advisory_lock_path = advisory_root.join("advisory-lock");
+    fs::create_dir(&cargo_home)
+        .map_err(|error| format!("cannot create cargo-deny verifier home: {error}"))?;
+    fs::create_dir(&advisory_root)
+        .map_err(|error| format!("cannot create cargo-deny advisory verifier root: {error}"))?;
+    let advisory_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&advisory_lock_path)
+        .map_err(|error| format!("cannot create cargo-deny advisory verifier lock: {error}"))?;
+    fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot confine cargo-deny verifier home: {error}"))?;
+    fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o750))
+        .map_err(|error| format!("cannot confine cargo-deny advisory verifier root: {error}"))?;
+    advisory_lock
+        .set_permissions(fs::Permissions::from_mode(0o660))
+        .map_err(|error| format!("cannot confine cargo-deny advisory verifier lock: {error}"))?;
+    validate_posix_cargo_deny_home_post_state(&cargo_home, owner, owner, group, &advisory_lock)?;
+    let advisory_alias = root.join("advisory-lock-alias");
+    fs::hard_link(&advisory_lock_path, &advisory_alias)
+        .map_err(|error| format!("cannot alias cargo-deny advisory verifier lock: {error}"))?;
+    if validate_posix_cargo_deny_home_post_state(&cargo_home, owner, owner, group, &advisory_lock)
+        .is_ok()
+    {
+        return Err("cargo-deny post-state accepted a multiply-linked lock".to_owned());
+    }
+    fs::remove_file(&advisory_alias)
+        .map_err(|error| format!("cannot remove advisory verifier alias: {error}"))
+}
+
+#[cfg(unix)]
+fn verify_posix_stack_post_state(root: &Path, owner: u32, group: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let stack_root = root.join("stack-root");
+    let stack_member = stack_root.join("member");
+    fs::create_dir(&stack_root)
+        .map_err(|error| format!("cannot create Stack-root verifier: {error}"))?;
+    fs::write(&stack_member, b"member\n")
+        .map_err(|error| format!("cannot create Stack-root verifier member: {error}"))?;
+    fs::set_permissions(&stack_root, fs::Permissions::from_mode(0o750))
+        .map_err(|error| format!("cannot confine Stack-root verifier: {error}"))?;
+    fs::set_permissions(&stack_member, fs::Permissions::from_mode(0o640))
+        .map_err(|error| format!("cannot confine Stack-root verifier member: {error}"))?;
+    validate_posix_stack_root_post_state(&stack_root, owner, group)?;
+    let stack_alias = root.join("stack-member-alias");
+    fs::hard_link(&stack_member, &stack_alias)
+        .map_err(|error| format!("cannot alias Stack-root verifier member: {error}"))?;
+    if validate_posix_stack_root_post_state(&stack_root, owner, group).is_ok() {
+        return Err("Stack-root post-state accepted a multiply-linked member".to_owned());
+    }
+    fs::remove_file(&stack_alias)
+        .map_err(|error| format!("cannot remove Stack-root verifier alias: {error}"))
+}
+
+#[cfg(unix)]
+struct PosixPostStateCleanup<'a> {
+    parent: &'a Path,
+    parent_identity: &'a PosixObjectIdentity,
+    root: &'a Path,
+    creation_identity: Option<&'a PosixObjectIdentity>,
+    root_handle: Option<&'a fs::File>,
+    root_identity: Option<&'a PosixObjectIdentity>,
+    initialized: bool,
+}
+
+#[cfg(unix)]
+fn cleanup_posix_post_state_verifier(context: &PosixPostStateCleanup<'_>) -> Result<(), String> {
+    if context.root.parent() != Some(context.parent)
+        || posix_object_identity(context.parent)? != *context.parent_identity
+    {
+        return Err("POSIX post-state verifier root changed before cleanup".to_owned());
+    }
+    match (context.creation_identity, context.root_handle) {
+        (Some(creation_identity), Some(root_handle)) => {
+            let retained_identity =
+                posix_object_identity_from_metadata(&root_handle.metadata().map_err(|error| {
+                    format!("cannot revalidate retained POSIX verifier root: {error}")
+                })?);
+            if !posix_same_object(&retained_identity, creation_identity)
+                || !posix_same_object(&posix_object_identity(context.root)?, creation_identity)
+            {
+                return Err("POSIX post-state verifier root changed before cleanup".to_owned());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("POSIX post-state verifier root receipt is incomplete".to_owned()),
+    }
+    if context.initialized {
+        validate_posix_post_state_final_root(context)?;
+        open_posix_post_state_cleanup_directories(context.root)?;
+        return fs::remove_dir_all(context.root)
+            .map_err(|error| format!("cannot remove POSIX post-state verifier root: {error}"));
+    }
+    let metadata = fs::symlink_metadata(context.root).map_err(|error| {
+        format!("cannot inspect partial POSIX post-state verifier root: {error}")
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(
+            "partial POSIX post-state verifier root was substituted before cleanup".to_owned(),
+        );
+    }
+    fs::remove_dir(context.root)
+        .map_err(|error| format!("cannot remove partial POSIX post-state verifier root: {error}"))
+}
+
+#[cfg(unix)]
+fn validate_posix_post_state_final_root(context: &PosixPostStateCleanup<'_>) -> Result<(), String> {
+    let root_identity = context
+        .root_identity
+        .ok_or_else(|| "POSIX post-state verifier final root receipt is missing".to_owned())?;
+    let root_handle = context
+        .root_handle
+        .ok_or_else(|| "POSIX post-state verifier root handle was not retained".to_owned())?;
+    let retained_identity = posix_object_identity_from_metadata(
+        &root_handle
+            .metadata()
+            .map_err(|error| format!("cannot revalidate final POSIX verifier root: {error}"))?,
+    );
+    if retained_identity != *root_identity || posix_object_identity(context.root)? != *root_identity
+    {
+        return Err("POSIX post-state verifier final root receipt changed".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_posix_post_state_cleanup_directories(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for directory in [
+        root.join("cargo-home").join("advisory-dbs"),
+        root.join("cargo-home"),
+        root.join("stack-root"),
+    ] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(
+                    |error| format!("cannot open POSIX post-state verifier cleanup: {error}"),
+                )?;
+            }
+            Ok(_) => {
+                return Err(
+                    "POSIX post-state verifier cleanup directory was substituted".to_owned(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect POSIX post-state verifier cleanup: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub(crate) fn verify_posix_post_state_metadata_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
 
     let parent = fs::canonicalize(env::temp_dir())
         .map_err(|error| format!("cannot canonicalize POSIX verifier temp root: {error}"))?;
@@ -5197,161 +6013,16 @@ pub(crate) fn verify_posix_post_state_metadata_for_integration() -> Result<(), S
         initialized = true;
         Ok(())
     })();
-    let result = initialization.and_then(|()| {
-        let root_metadata = fs::metadata(&root)
-            .map_err(|error| format!("cannot inspect POSIX post-state verifier root: {error}"))?;
-        let owner = root_metadata.uid();
-        let group = root_metadata.gid();
-
-        let cargo_home = root.join("cargo-home");
-        let advisory_root = cargo_home.join("advisory-dbs");
-        let advisory_lock_path = advisory_root.join("advisory-lock");
-        fs::create_dir(&cargo_home)
-            .map_err(|error| format!("cannot create cargo-deny verifier home: {error}"))?;
-        fs::create_dir(&advisory_root)
-            .map_err(|error| format!("cannot create cargo-deny advisory verifier root: {error}"))?;
-        let advisory_lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&advisory_lock_path)
-            .map_err(|error| format!("cannot create cargo-deny advisory verifier lock: {error}"))?;
-        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o555))
-            .map_err(|error| format!("cannot confine cargo-deny verifier home: {error}"))?;
-        fs::set_permissions(&advisory_root, fs::Permissions::from_mode(0o750)).map_err(
-            |error| format!("cannot confine cargo-deny advisory verifier root: {error}"),
-        )?;
-        advisory_lock
-            .set_permissions(fs::Permissions::from_mode(0o660))
-            .map_err(|error| {
-                format!("cannot confine cargo-deny advisory verifier lock: {error}")
-            })?;
-        validate_posix_cargo_deny_home_post_state(
-            &cargo_home,
-            owner,
-            owner,
-            group,
-            &advisory_lock,
-        )?;
-        let advisory_alias = root.join("advisory-lock-alias");
-        fs::hard_link(&advisory_lock_path, &advisory_alias)
-            .map_err(|error| format!("cannot alias cargo-deny advisory verifier lock: {error}"))?;
-        if validate_posix_cargo_deny_home_post_state(
-            &cargo_home,
-            owner,
-            owner,
-            group,
-            &advisory_lock,
-        )
-        .is_ok()
-        {
-            return Err("cargo-deny post-state accepted a multiply-linked lock".to_owned());
-        }
-        fs::remove_file(&advisory_alias)
-            .map_err(|error| format!("cannot remove advisory verifier alias: {error}"))?;
-
-        let stack_root = root.join("stack-root");
-        let stack_member = stack_root.join("member");
-        fs::create_dir(&stack_root)
-            .map_err(|error| format!("cannot create Stack-root verifier: {error}"))?;
-        fs::write(&stack_member, b"member\n")
-            .map_err(|error| format!("cannot create Stack-root verifier member: {error}"))?;
-        fs::set_permissions(&stack_root, fs::Permissions::from_mode(0o750))
-            .map_err(|error| format!("cannot confine Stack-root verifier: {error}"))?;
-        fs::set_permissions(&stack_member, fs::Permissions::from_mode(0o640))
-            .map_err(|error| format!("cannot confine Stack-root verifier member: {error}"))?;
-        validate_posix_stack_root_post_state(&stack_root, owner, group)?;
-        let stack_alias = root.join("stack-member-alias");
-        fs::hard_link(&stack_member, &stack_alias)
-            .map_err(|error| format!("cannot alias Stack-root verifier member: {error}"))?;
-        if validate_posix_stack_root_post_state(&stack_root, owner, group).is_ok() {
-            return Err("Stack-root post-state accepted a multiply-linked member".to_owned());
-        }
-        fs::remove_file(&stack_alias)
-            .map_err(|error| format!("cannot remove Stack-root verifier alias: {error}"))?;
-        Ok(())
+    let result = initialization.and_then(|()| verify_posix_post_state_members(&root));
+    let cleanup = cleanup_posix_post_state_verifier(&PosixPostStateCleanup {
+        parent: &parent,
+        parent_identity: &parent_identity,
+        root: &root,
+        creation_identity: creation_identity.as_ref(),
+        root_handle: root_handle.as_ref(),
+        root_identity: root_identity.as_ref(),
+        initialized,
     });
-    let cleanup = (|| {
-        if root.parent() != Some(parent.as_path())
-            || posix_object_identity(&parent)? != parent_identity
-        {
-            return Err("POSIX post-state verifier root changed before cleanup".to_owned());
-        }
-        match (creation_identity.as_ref(), root_handle.as_ref()) {
-            (Some(creation_identity), Some(root_handle)) => {
-                let retained_identity =
-                    posix_object_identity_from_metadata(&root_handle.metadata().map_err(
-                        |error| format!("cannot revalidate retained POSIX verifier root: {error}"),
-                    )?);
-                if !posix_same_object(&retained_identity, creation_identity)
-                    || !posix_same_object(&posix_object_identity(&root)?, creation_identity)
-                {
-                    return Err("POSIX post-state verifier root changed before cleanup".to_owned());
-                }
-            }
-            (None, None) => {}
-            _ => {
-                return Err("POSIX post-state verifier root receipt is incomplete".to_owned());
-            }
-        }
-        if initialized {
-            let root_identity = root_identity.as_ref().ok_or_else(|| {
-                "POSIX post-state verifier final root receipt is missing".to_owned()
-            })?;
-            let root_handle = root_handle.as_ref().ok_or_else(|| {
-                "POSIX post-state verifier root handle was not retained".to_owned()
-            })?;
-            let retained_identity =
-                posix_object_identity_from_metadata(&root_handle.metadata().map_err(|error| {
-                    format!("cannot revalidate final POSIX verifier root: {error}")
-                })?);
-            if retained_identity != *root_identity
-                || posix_object_identity(&root)? != *root_identity
-            {
-                return Err("POSIX post-state verifier final root receipt changed".to_owned());
-            }
-        }
-        if !initialized {
-            let metadata = fs::symlink_metadata(&root).map_err(|error| {
-                format!("cannot inspect partial POSIX post-state verifier root: {error}")
-            })?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(
-                    "partial POSIX post-state verifier root was substituted before cleanup"
-                        .to_owned(),
-                );
-            }
-            return fs::remove_dir(&root).map_err(|error| {
-                format!("cannot remove partial POSIX post-state verifier root: {error}")
-            });
-        }
-        for directory in [
-            root.join("cargo-home").join("advisory-dbs"),
-            root.join("cargo-home"),
-            root.join("stack-root"),
-        ] {
-            match fs::symlink_metadata(&directory) {
-                Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
-                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(
-                        |error| format!("cannot open POSIX post-state verifier cleanup: {error}"),
-                    )?;
-                }
-                Ok(_) => {
-                    return Err(
-                        "POSIX post-state verifier cleanup directory was substituted".to_owned(),
-                    );
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot inspect POSIX post-state verifier cleanup: {error}"
-                    ));
-                }
-            }
-        }
-        fs::remove_dir_all(&root)
-            .map_err(|error| format!("cannot remove POSIX post-state verifier root: {error}"))
-    })();
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
@@ -5371,6 +6042,24 @@ impl Drop for PosixRustupProtection {
 }
 
 #[cfg(unix)]
+struct PosixRustupStage {
+    platform: ReleasePlatform,
+    installation_root: PathBuf,
+    installation_root_identity: PosixObjectIdentity,
+    tools: PosixAdapterTools,
+    acl_setter: Option<crate::command::ResolvedStandardExecutable>,
+    acl_reader: Option<crate::command::ResolvedStandardExecutable>,
+    directory: PathBuf,
+    directory_identity: PosixObjectIdentity,
+    home: PathBuf,
+    toolchains: PathBuf,
+    update_hashes: PathBuf,
+    staged_toolchain: PathBuf,
+    staged_settings: PathBuf,
+    staged_update_hash: PathBuf,
+}
+
+#[cfg(unix)]
 fn stage_posix_rustup_authority(
     platform: ReleasePlatform,
     sudo: &Path,
@@ -5381,32 +6070,7 @@ fn stage_posix_rustup_authority(
         authority.toolchain(),
         "standard Rustup",
     )?;
-    let installation_root = posix_adapter_installation_root(platform)?;
-    let installation_root_identity = posix_object_identity(&installation_root)?;
-    let tools = resolve_posix_adapter_tools(platform)?;
-    let linux_setfacl = (platform == ReleasePlatform::LinuxX86_64)
-        .then(|| {
-            crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/setfacl"))
-                .map_err(|error| format!("cannot bind Linux Rustup ACL authority: {error}"))
-        })
-        .transpose()?;
-    let linux_getfacl = (platform == ReleasePlatform::LinuxX86_64)
-        .then(|| {
-            crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/getfacl"))
-                .map_err(|error| format!("cannot bind Linux Rustup ACL verifier: {error}"))
-        })
-        .transpose()?;
-    let sequence = POSIX_ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let directory = installation_root.join(format!(
-        "hell-rs-posix-rustup-{}-{sequence}",
-        std::process::id()
-    ));
-    let home = directory.join("rustup-home");
-    let toolchains = home.join("toolchains");
-    let update_hashes = home.join("update-hashes");
-    let staged_toolchain = toolchains.join(authority.toolchain());
-    let staged_settings = home.join("settings.toml");
-    let staged_update_hash = update_hashes.join(authority.toolchain());
+    let stage = reserve_posix_rustup_stage(platform, sudo, authority.toolchain())?;
     let source_toolchain = authority
         .home()
         .join("toolchains")
@@ -5417,6 +6081,96 @@ fn stage_posix_rustup_authority(
         .join("update-hashes")
         .join(authority.toolchain());
 
+    let result = (|| {
+        create_posix_rustup_stage_members(sudo, &stage)?;
+        trusted_tool_status(
+            sudo,
+            &stage.tools.copy,
+            [
+                "--",
+                path_text(&source_settings, "standard Rustup settings")?,
+                path_text(&stage.staged_settings, "staged Rustup settings")?,
+            ],
+        )?;
+        trusted_tool_status(
+            sudo,
+            &stage.tools.copy,
+            [
+                "--",
+                path_text(&source_update_hash, "standard Rustup update hash")?,
+                path_text(&stage.staged_update_hash, "staged Rustup update hash")?,
+            ],
+        )?;
+        trusted_tool_status(
+            sudo,
+            &stage.tools.copy,
+            [
+                "-R",
+                "--",
+                path_text(&source_toolchain, "standard Rustup toolchain")?,
+                path_text(&stage.staged_toolchain, "staged Rustup toolchain")?,
+            ],
+        )?;
+        protect_posix_rustup_stage(sudo, &stage)?;
+        let protection = PosixRustupProtection {
+            platform,
+            installation_root: stage.installation_root.clone(),
+            installation_root_identity: stage.installation_root_identity.clone(),
+            directory: stage.directory.clone(),
+            directory_identity: stage.directory_identity.clone(),
+            home: stage.home.clone(),
+            source_home: authority.home().to_path_buf(),
+            toolchain: authority.toolchain().to_os_string(),
+            proxy_identity: authority.proxy_identity().clone(),
+            rustc_authority: authority.rustc_authority().clone(),
+            inventory: source_inventory,
+            linux_getfacl: stage.acl_reader.clone(),
+            sudo: sudo.to_path_buf(),
+            tools: stage.tools.clone(),
+        };
+        validate_posix_rustup_authority(&protection)?;
+        Ok(protection)
+    })();
+    if result.is_err() {
+        let _ = cleanup_posix_rustup_paths(
+            platform,
+            sudo,
+            &stage.tools,
+            &stage.installation_root,
+            &stage.installation_root_identity,
+            &stage.directory,
+            &stage.directory_identity,
+        );
+    }
+    result
+}
+
+#[cfg(unix)]
+fn reserve_posix_rustup_stage(
+    platform: ReleasePlatform,
+    sudo: &Path,
+    toolchain: &OsStr,
+) -> Result<PosixRustupStage, String> {
+    let installation_root = posix_adapter_installation_root(platform)?;
+    let installation_root_identity = posix_object_identity(&installation_root)?;
+    let tools = resolve_posix_adapter_tools(platform)?;
+    let acl_setter = (platform == ReleasePlatform::LinuxX86_64)
+        .then(|| {
+            crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/setfacl"))
+                .map_err(|error| format!("cannot bind Linux Rustup ACL authority: {error}"))
+        })
+        .transpose()?;
+    let acl_reader = (platform == ReleasePlatform::LinuxX86_64)
+        .then(|| {
+            crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/getfacl"))
+                .map_err(|error| format!("cannot bind Linux Rustup ACL verifier: {error}"))
+        })
+        .transpose()?;
+    let sequence = POSIX_ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = installation_root.join(format!(
+        "hell-rs-posix-rustup-{}-{sequence}",
+        std::process::id()
+    ));
     trusted_tool_status(
         sudo,
         &tools.mkdir,
@@ -5428,152 +6182,114 @@ fn stage_posix_rustup_authority(
         ],
     )
     .map_err(|error| format!("cannot reserve staged Rustup authority: {error}"))?;
-    if platform == ReleasePlatform::MacosAarch64 {
+    clear_posix_rustup_acl(
+        platform,
+        sudo,
+        &tools,
+        acl_setter.as_ref(),
+        &directory,
+        false,
+    )?;
+    let directory_identity = posix_object_identity(&directory)?;
+    let home = directory.join("rustup-home");
+    Ok(PosixRustupStage {
+        platform,
+        installation_root,
+        installation_root_identity,
+        tools,
+        acl_setter,
+        acl_reader,
+        directory,
+        directory_identity,
+        toolchains: home.join("toolchains"),
+        update_hashes: home.join("update-hashes"),
+        staged_toolchain: home.join("toolchains").join(toolchain),
+        staged_settings: home.join("settings.toml"),
+        staged_update_hash: home.join("update-hashes").join(toolchain),
+        home,
+    })
+}
+
+#[cfg(unix)]
+fn create_posix_rustup_stage_members(sudo: &Path, stage: &PosixRustupStage) -> Result<(), String> {
+    for path in [&stage.home, &stage.toolchains, &stage.update_hashes] {
         trusted_tool_status(
+            sudo,
+            &stage.tools.mkdir,
+            [
+                "-m",
+                "0555",
+                "--",
+                path_text(path, "staged Rustup directory")?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_posix_rustup_acl(
+    platform: ReleasePlatform,
+    sudo: &Path,
+    tools: &PosixAdapterTools,
+    acl_setter: Option<&crate::command::ResolvedStandardExecutable>,
+    path: &Path,
+    recursive: bool,
+) -> Result<(), String> {
+    if platform == ReleasePlatform::MacosAarch64 {
+        return trusted_tool_status(
             sudo,
             &tools.chmod,
             posix_acl_removal_arguments(
                 platform,
-                false,
-                path_text(&directory, "staged Rustup authority ACL")?,
+                recursive,
+                path_text(path, "staged Rustup authority ACL")?,
             )?,
-        )?;
-    } else if let Some(setfacl) = &linux_setfacl {
-        trusted_tool_status(
-            sudo,
-            setfacl,
-            [
-                "-b",
-                "-k",
-                "--",
-                path_text(&directory, "staged Rustup authority ACL")?,
-            ],
-        )?;
-    }
-    let directory_identity = posix_object_identity(&directory)?;
-    let result = (|| {
-        for path in [&home, &toolchains, &update_hashes] {
-            trusted_tool_status(
-                sudo,
-                &tools.mkdir,
-                [
-                    "-m",
-                    "0555",
-                    "--",
-                    path_text(path, "staged Rustup directory")?,
-                ],
-            )?;
-        }
-        trusted_tool_status(
-            sudo,
-            &tools.copy,
-            [
-                "--",
-                path_text(&source_settings, "standard Rustup settings")?,
-                path_text(&staged_settings, "staged Rustup settings")?,
-            ],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.copy,
-            [
-                "--",
-                path_text(&source_update_hash, "standard Rustup update hash")?,
-                path_text(&staged_update_hash, "staged Rustup update hash")?,
-            ],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.copy,
-            [
-                "-R",
-                "--",
-                path_text(&source_toolchain, "standard Rustup toolchain")?,
-                path_text(&staged_toolchain, "staged Rustup toolchain")?,
-            ],
-        )?;
-        if platform == ReleasePlatform::MacosAarch64 {
-            trusted_tool_status(
-                sudo,
-                &tools.chmod,
-                posix_acl_removal_arguments(
-                    platform,
-                    true,
-                    path_text(&home, "staged Rustup ACL authority")?,
-                )?,
-            )?;
-        } else if let Some(setfacl) = &linux_setfacl {
-            trusted_tool_status(
-                sudo,
-                setfacl,
-                [
-                    "-R",
-                    "-b",
-                    "-k",
-                    "--",
-                    path_text(&home, "staged Rustup ACL authority")?,
-                ],
-            )?;
-        }
-        for (path, label) in [
-            (&staged_settings, "staged Rustup settings"),
-            (&staged_update_hash, "staged Rustup update hash"),
-        ] {
-            trusted_tool_status(
-                sudo,
-                &tools.chmod,
-                posix_chmod_arguments(platform, "0444", path_text(path, label)?)?,
-            )?;
-        }
-        trusted_tool_status(
-            sudo,
-            &tools.chmod,
-            [
-                "-R",
-                "a+rX",
-                path_text(&staged_toolchain, "staged Rustup toolchain")?,
-            ],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.chmod,
-            [
-                "-R",
-                "a-w",
-                path_text(&staged_toolchain, "staged Rustup toolchain")?,
-            ],
-        )?;
-        let protection = PosixRustupProtection {
-            platform,
-            installation_root: installation_root.clone(),
-            installation_root_identity: installation_root_identity.clone(),
-            directory: directory.clone(),
-            directory_identity: directory_identity.clone(),
-            home: home.clone(),
-            source_home: authority.home().to_path_buf(),
-            toolchain: authority.toolchain().to_os_string(),
-            proxy_identity: authority.proxy_identity().clone(),
-            rustc_authority: authority.rustc_authority().clone(),
-            inventory: source_inventory,
-            linux_getfacl,
-            sudo: sudo.to_path_buf(),
-            tools: tools.clone(),
-        };
-        validate_posix_rustup_authority(&protection)?;
-        Ok(protection)
-    })();
-    if result.is_err() {
-        let _ = cleanup_posix_rustup_paths(
-            platform,
-            sudo,
-            &tools,
-            &installation_root,
-            &installation_root_identity,
-            &directory,
-            &directory_identity,
         );
     }
-    result
+    if let Some(setfacl) = acl_setter {
+        let mut arguments = vec![OsString::from("-b"), OsString::from("-k")];
+        if recursive {
+            arguments.insert(0, OsString::from("-R"));
+        }
+        arguments.extend([OsString::from("--"), path.as_os_str().to_owned()]);
+        trusted_tool_status(sudo, setfacl, arguments)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_posix_rustup_stage(sudo: &Path, stage: &PosixRustupStage) -> Result<(), String> {
+    clear_posix_rustup_acl(
+        stage.platform,
+        sudo,
+        &stage.tools,
+        stage.acl_setter.as_ref(),
+        &stage.home,
+        true,
+    )?;
+    for (path, label) in [
+        (&stage.staged_settings, "staged Rustup settings"),
+        (&stage.staged_update_hash, "staged Rustup update hash"),
+    ] {
+        trusted_tool_status(
+            sudo,
+            &stage.tools.chmod,
+            posix_chmod_arguments(stage.platform, "0444", path_text(path, label)?)?,
+        )?;
+    }
+    for mode in ["a+rX", "a-w"] {
+        trusted_tool_status(
+            sudo,
+            &stage.tools.chmod,
+            [
+                "-R",
+                mode,
+                path_text(&stage.staged_toolchain, "staged Rustup toolchain")?,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -5789,8 +6505,12 @@ fn posix_rustup_selected_inventory(
             .strip_prefix(home)
             .map_err(|_| format!("{label} selected entry escapes its home"))?
             .to_path_buf();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("cannot inspect {label} entry {relative:?}: {error}"))?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "cannot inspect {label} entry {}: {error}",
+                relative.display()
+            )
+        })?;
         if metadata.file_type().is_symlink()
             || (!metadata.is_dir() && !metadata.is_file())
             || (metadata.is_file() && metadata.nlink() != 1)
@@ -5807,7 +6527,9 @@ fn posix_rustup_selected_inventory(
         let sha256 = (!directory)
             .then(|| hell_testkit::sha256_file(&path))
             .transpose()
-            .map_err(|error| format!("cannot hash {label} entry {relative:?}: {error}"))?;
+            .map_err(|error| {
+                format!("cannot hash {label} entry {}: {error}", relative.display())
+            })?;
         inventory.push(PosixRustupInventoryEntry {
             relative,
             directory,
@@ -5872,7 +6594,7 @@ fn require_exact_directory_members(
         let append = |detail: &mut String, names: &[OsString]| {
             for (position, name) in names.iter().enumerate() {
                 let separator = if position == 0 { "" } else { ", " };
-                let rendered = format!("{name:?}");
+                let rendered = name.to_string_lossy();
                 let Some(next_len) = detail
                     .len()
                     .checked_add(separator.len())
@@ -5955,21 +6677,229 @@ impl Drop for PosixSourceProtection {
 }
 
 #[cfg(unix)]
-fn stage_posix_sources(
+struct PosixSourceStageInput<'a> {
     platform: ReleasePlatform,
-    sudo: &Path,
-    candidate_source: &Path,
-    oracle_source: &Path,
-    candidate_inventory: &JsonValue,
-    oracle_inventory: &JsonValue,
-    candidate_sha: &str,
-    target: &Path,
-    candidate_group: &str,
+    sudo: &'a Path,
+    candidate_source: &'a Path,
+    oracle_source: &'a Path,
+    candidate_inventory: &'a JsonValue,
+    oracle_inventory: &'a JsonValue,
+    candidate_sha: &'a str,
+    target: &'a Path,
+    candidate_group: &'a str,
     trusted_owner: u32,
     candidate_uid: u32,
     candidate_primary_gid: u32,
     trusted_group_id: u32,
+}
+
+#[cfg(unix)]
+struct PosixSourceStagePaths {
+    installation_root: PathBuf,
+    installation_root_identity: PosixObjectIdentity,
+    directory: PathBuf,
+    candidate: PathBuf,
+    oracle: PathBuf,
+    stack_work: Option<PathBuf>,
+    transient: PathBuf,
+    archive_adapter: PathBuf,
+    retained_oracle: PathBuf,
+}
+
+#[cfg(unix)]
+fn create_posix_source_stage_members(
+    input: &PosixSourceStageInput<'_>,
+    paths: &PosixSourceStagePaths,
+    tools: &PosixAdapterTools,
+) -> Result<(), String> {
+    let sudo = input.sudo;
+    trusted_tool_status(
+        sudo,
+        &tools.copy,
+        [
+            "-R",
+            "--",
+            path_text(input.candidate_source, "candidate source")?,
+            path_text(&paths.candidate, "staged candidate source")?,
+        ],
+    )?;
+    trusted_tool_status(
+        sudo,
+        &tools.copy,
+        [
+            "-R",
+            "--",
+            path_text(input.oracle_source, "oracle source")?,
+            path_text(&paths.oracle, "staged oracle source")?,
+        ],
+    )?;
+    if let Some(stack_work) = &paths.stack_work {
+        trusted_tool_status(
+            sudo,
+            &tools.mkdir,
+            [
+                "-m",
+                "0750",
+                "--",
+                path_text(stack_work, "candidate Stack work authority")?,
+            ],
+        )?;
+    }
+    let transient = path_text(&paths.transient, "candidate transient authority")?;
+    trusted_tool_status(sudo, &tools.mkdir, ["-m", "3770", "--", transient])?;
+    let adapter = path_text(&paths.archive_adapter, "native archive adapter authority")?;
+    trusted_tool_status(sudo, &tools.mkdir, ["-m", "2770", "--", adapter])?;
+    let owner = input.trusted_owner.to_string();
+    trusted_tool_status(sudo, &tools.change_owner, [owner.as_str(), adapter])?;
+    trusted_tool_status(sudo, &tools.change_group, [input.candidate_group, adapter])?;
+    trusted_tool_status(
+        sudo,
+        &tools.chmod,
+        posix_chmod_arguments(input.platform, "2770", adapter)?,
+    )?;
+    trusted_tool_status(
+        sudo,
+        &tools.mkdir,
+        [
+            "-m",
+            "0555",
+            "--",
+            path_text(&paths.retained_oracle, "retained oracle authority")?,
+        ],
+    )?;
+    for transition in POSIX_TRANSIENT_AUTHORITY_TRANSITIONS {
+        match transition {
+            PosixTransientAuthorityTransition::ChangeOwner => {
+                trusted_tool_status(sudo, &tools.change_owner, [owner.as_str(), transient])?;
+            }
+            PosixTransientAuthorityTransition::ChangeGroup => trusted_tool_status(
+                sudo,
+                &tools.change_group,
+                [input.candidate_group, transient],
+            )?,
+            PosixTransientAuthorityTransition::RestoreMode03770 => trusted_tool_status(
+                sudo,
+                &tools.chmod,
+                posix_chmod_arguments(input.platform, "3770", transient)?,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_posix_source_stage(
+    input: &PosixSourceStageInput<'_>,
+    paths: &PosixSourceStagePaths,
+    tools: &PosixAdapterTools,
+) -> Result<(), String> {
+    if input.platform == ReleasePlatform::MacosAarch64 {
+        for protected in [&paths.candidate, &paths.oracle] {
+            trusted_tool_status(
+                input.sudo,
+                &tools.chmod,
+                posix_acl_removal_arguments(
+                    input.platform,
+                    true,
+                    path_text(protected, "staged protected source")?,
+                )?,
+            )?;
+        }
+    }
+    for protected in [&paths.candidate, &paths.oracle] {
+        let protected = path_text(protected, "staged protected source")?;
+        trusted_tool_status(input.sudo, &tools.chmod, ["-R", "a+rX", protected])?;
+        trusted_tool_status(input.sudo, &tools.chmod, ["-R", "a-w", protected])?;
+    }
+    if let Some(stack_work) = &paths.stack_work {
+        let uid = input.candidate_uid.to_string();
+        let group = input.trusted_group_id.to_string();
+        let path = path_text(stack_work, "candidate Stack work authority")?;
+        trusted_tool_status(input.sudo, &tools.change_owner, [uid.as_str(), path])?;
+        trusted_tool_status(input.sudo, &tools.change_group, [group.as_str(), path])?;
+        trusted_tool_status(
+            input.sudo,
+            &tools.chmod,
+            posix_chmod_arguments(input.platform, "0750", path)?,
+        )?;
+    }
+    trusted_tool_status(
+        input.sudo,
+        &tools.chmod,
+        posix_chmod_arguments(
+            input.platform,
+            "0555",
+            path_text(&paths.directory, "POSIX source authority")?,
+        )?,
+    )
+}
+
+#[cfg(unix)]
+fn bind_posix_source_protection(
+    input: &PosixSourceStageInput<'_>,
+    paths: &PosixSourceStagePaths,
+    tools: &PosixAdapterTools,
 ) -> Result<PosixSourceProtection, String> {
+    if paths.transient.parent() != Some(paths.directory.as_path())
+        || paths.archive_adapter.parent() != Some(paths.directory.as_path())
+        || paths.retained_oracle.parent() != Some(paths.directory.as_path())
+        || [
+            paths.transient.as_path(),
+            paths.archive_adapter.as_path(),
+            paths.retained_oracle.as_path(),
+        ]
+        .contains(&input.target)
+    {
+        return Err("candidate transient source authority differs from policy".to_owned());
+    }
+    let protection = PosixSourceProtection {
+        platform: input.platform,
+        installation_root: paths.installation_root.clone(),
+        installation_root_identity: paths.installation_root_identity.clone(),
+        directory: paths.directory.clone(),
+        directory_identity: posix_object_identity(&paths.directory)?,
+        candidate: paths.candidate.clone(),
+        oracle: paths.oracle.clone(),
+        stack_work: paths.stack_work.clone(),
+        stack_work_identity: paths
+            .stack_work
+            .as_deref()
+            .map(posix_object_identity)
+            .transpose()?,
+        stack_work_owner: input.candidate_uid,
+        stack_work_group: input.trusted_group_id,
+        candidate_uid: input.candidate_uid,
+        candidate_primary_gid: input.candidate_primary_gid,
+        transient: paths.transient.clone(),
+        transient_identity: posix_object_identity(&paths.transient)?,
+        transient_owner: input.trusted_owner,
+        transient_group: input.candidate_uid,
+        candidate_environment: None,
+        archive_adapter: paths.archive_adapter.clone(),
+        archive_adapter_identity: posix_object_identity(&paths.archive_adapter)?,
+        archive_adapter_owner: input.trusted_owner,
+        archive_adapter_group: input.candidate_uid,
+        retained_oracle: paths.retained_oracle.clone(),
+        retained_oracle_directory_identity: posix_object_identity(&paths.retained_oracle)?,
+        retained_oracle_file: None,
+        candidate_inventory: input.candidate_inventory.clone(),
+        oracle_inventory: input.oracle_inventory.clone(),
+        candidate_sha: input.candidate_sha.to_owned(),
+        sudo: input.sudo.to_path_buf(),
+        tools: tools.clone(),
+        active: true,
+    };
+    validate_posix_sources(&protection, "after POSIX source staging")?;
+    Ok(protection)
+}
+
+#[cfg(unix)]
+fn stage_posix_sources(input: &PosixSourceStageInput<'_>) -> Result<PosixSourceProtection, String> {
+    let platform = input.platform;
+    let sudo = input.sudo;
+    let candidate_source = input.candidate_source;
+    let oracle_source = input.oracle_source;
+    let candidate_sha = input.candidate_sha;
     require_clean_checkout(candidate_source, candidate_sha, "candidate")?;
     require_clean_checkout(
         oracle_source,
@@ -5985,214 +6915,132 @@ fn stage_posix_sources(
         std::process::id(),
         &candidate_sha[..12]
     ));
-    let candidate = directory.join("candidate");
-    let oracle = directory.join("oracle");
-    let stack_work =
-        (platform == ReleasePlatform::MacosAarch64).then(|| oracle.join(".stack-work"));
-    let transient = directory.join("release-gate-transient");
-    let archive_adapter = directory.join("archive-adapter");
-    let retained_oracle = directory.join("retained-oracle");
-    let directory_text = path_text(&directory, "POSIX source authority")?;
-    let candidate_text = path_text(&candidate, "staged candidate source")?;
-    let oracle_text = path_text(&oracle, "staged oracle source")?;
-    let transient_text = path_text(&transient, "candidate transient authority")?;
-    let archive_adapter_text = path_text(&archive_adapter, "native archive adapter authority")?;
-    let retained_oracle_text = path_text(&retained_oracle, "retained oracle authority")?;
-    let candidate_source_text = path_text(candidate_source, "candidate source")?;
-    let oracle_source_text = path_text(oracle_source, "oracle source")?;
+    let paths = PosixSourceStagePaths {
+        installation_root,
+        installation_root_identity,
+        candidate: directory.join("candidate"),
+        oracle: directory.join("oracle"),
+        stack_work: (platform == ReleasePlatform::MacosAarch64)
+            .then(|| directory.join("oracle/.stack-work")),
+        transient: directory.join("release-gate-transient"),
+        archive_adapter: directory.join("archive-adapter"),
+        retained_oracle: directory.join("retained-oracle"),
+        directory,
+    };
 
-    trusted_tool_status(sudo, &tools.mkdir, ["-m", "0755", "--", directory_text])
-        .map_err(|error| format!("cannot reserve POSIX source authority: {error}"))?;
-    let reserved_directory_identity = posix_object_identity(&directory)?;
+    trusted_tool_status(
+        sudo,
+        &tools.mkdir,
+        [
+            "-m",
+            "0755",
+            "--",
+            path_text(&paths.directory, "POSIX source authority")?,
+        ],
+    )
+    .map_err(|error| format!("cannot reserve POSIX source authority: {error}"))?;
+    let reserved_directory_identity = posix_object_identity(&paths.directory)?;
     let result = (|| {
-        trusted_tool_status(
-            sudo,
-            &tools.copy,
-            ["-R", "--", candidate_source_text, candidate_text],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.copy,
-            ["-R", "--", oracle_source_text, oracle_text],
-        )?;
-        if let Some(stack_work) = &stack_work {
-            trusted_tool_status(
-                sudo,
-                &tools.mkdir,
-                [
-                    "-m",
-                    "0750",
-                    "--",
-                    path_text(stack_work, "candidate Stack work authority")?,
-                ],
-            )?;
-        }
-        trusted_tool_status(sudo, &tools.mkdir, ["-m", "3770", "--", transient_text])?;
-        trusted_tool_status(
-            sudo,
-            &tools.mkdir,
-            ["-m", "2770", "--", archive_adapter_text],
-        )?;
-        let trusted_owner_text = trusted_owner.to_string();
-        trusted_tool_status(
-            sudo,
-            &tools.change_owner,
-            [trusted_owner_text.as_str(), archive_adapter_text],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.change_group,
-            [candidate_group, archive_adapter_text],
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.chmod,
-            posix_chmod_arguments(platform, "2770", archive_adapter_text)?,
-        )?;
-        trusted_tool_status(
-            sudo,
-            &tools.mkdir,
-            ["-m", "0555", "--", retained_oracle_text],
-        )?;
-        for transition in POSIX_TRANSIENT_AUTHORITY_TRANSITIONS {
-            match transition {
-                PosixTransientAuthorityTransition::ChangeOwner => trusted_tool_status(
-                    sudo,
-                    &tools.change_owner,
-                    [trusted_owner_text.as_str(), transient_text],
-                )?,
-                PosixTransientAuthorityTransition::ChangeGroup => trusted_tool_status(
-                    sudo,
-                    &tools.change_group,
-                    [candidate_group, transient_text],
-                )?,
-                PosixTransientAuthorityTransition::RestoreMode03770 => trusted_tool_status(
-                    sudo,
-                    &tools.chmod,
-                    posix_chmod_arguments(platform, "3770", transient_text)?,
-                )?,
-            }
-        }
-        if platform == ReleasePlatform::MacosAarch64 {
-            for protected in [&candidate, &oracle] {
-                trusted_tool_status(
-                    sudo,
-                    &tools.chmod,
-                    posix_acl_removal_arguments(
-                        platform,
-                        true,
-                        path_text(protected, "staged protected source")?,
-                    )?,
-                )?;
-            }
-        }
-        for protected in [&candidate, &oracle] {
-            trusted_tool_status(
-                sudo,
-                &tools.chmod,
-                [
-                    "-R",
-                    "a+rX",
-                    path_text(protected, "staged protected source")?,
-                ],
-            )?;
-            trusted_tool_status(
-                sudo,
-                &tools.chmod,
-                [
-                    "-R",
-                    "a-w",
-                    path_text(protected, "staged protected source")?,
-                ],
-            )?;
-        }
-        if let Some(stack_work) = &stack_work {
-            let candidate_uid = candidate_uid.to_string();
-            let trusted_group_id = trusted_group_id.to_string();
-            let stack_work_text = path_text(stack_work, "candidate Stack work authority")?;
-            trusted_tool_status(
-                sudo,
-                &tools.change_owner,
-                [candidate_uid.as_str(), stack_work_text],
-            )?;
-            trusted_tool_status(
-                sudo,
-                &tools.change_group,
-                [trusted_group_id.as_str(), stack_work_text],
-            )?;
-            trusted_tool_status(
-                sudo,
-                &tools.chmod,
-                posix_chmod_arguments(platform, "0750", stack_work_text)?,
-            )?;
-        }
-        trusted_tool_status(
-            sudo,
-            &tools.chmod,
-            posix_chmod_arguments(platform, "0555", directory_text)?,
-        )?;
-        // Reserve each transient path before delegation so the candidate cannot
-        // substitute the cleanup or adapter authorities.
-        if transient.parent() != Some(&directory)
-            || archive_adapter.parent() != Some(&directory)
-            || retained_oracle.parent() != Some(&directory)
-            || target == transient
-            || target == archive_adapter
-            || target == retained_oracle
-        {
-            return Err("candidate transient source authority differs from policy".to_owned());
-        }
-        let protection = PosixSourceProtection {
-            platform,
-            installation_root: installation_root.clone(),
-            installation_root_identity: installation_root_identity.clone(),
-            directory: directory.clone(),
-            directory_identity: posix_object_identity(&directory)?,
-            candidate: candidate.clone(),
-            oracle: oracle.clone(),
-            stack_work: stack_work.clone(),
-            stack_work_identity: stack_work
-                .as_deref()
-                .map(posix_object_identity)
-                .transpose()?,
-            stack_work_owner: candidate_uid,
-            stack_work_group: trusted_group_id,
-            candidate_uid,
-            candidate_primary_gid,
-            transient: transient.clone(),
-            transient_identity: posix_object_identity(&transient)?,
-            transient_owner: trusted_owner,
-            transient_group: candidate_uid,
-            candidate_environment: None,
-            archive_adapter: archive_adapter.clone(),
-            archive_adapter_identity: posix_object_identity(&archive_adapter)?,
-            archive_adapter_owner: trusted_owner,
-            archive_adapter_group: candidate_uid,
-            retained_oracle: retained_oracle.clone(),
-            retained_oracle_directory_identity: posix_object_identity(&retained_oracle)?,
-            retained_oracle_file: None,
-            candidate_inventory: candidate_inventory.clone(),
-            oracle_inventory: oracle_inventory.clone(),
-            candidate_sha: candidate_sha.to_owned(),
-            sudo: sudo.to_path_buf(),
-            tools: tools.clone(),
-            active: true,
-        };
-        validate_posix_sources(&protection, "after POSIX source staging")?;
-        Ok(protection)
+        create_posix_source_stage_members(input, &paths, &tools)?;
+        protect_posix_source_stage(input, &paths, &tools)?;
+        bind_posix_source_protection(input, &paths, &tools)
     })();
     if result.is_err() {
         let _ = cleanup_posix_source_paths(
             platform,
             sudo,
             &tools,
-            &installation_root,
-            &installation_root_identity,
-            &directory,
-            &posix_object_identity(&directory).unwrap_or(reserved_directory_identity),
+            &paths.installation_root,
+            &paths.installation_root_identity,
+            &paths.directory,
+            &posix_object_identity(&paths.directory).unwrap_or(reserved_directory_identity),
         );
     }
     result
+}
+
+#[cfg(unix)]
+fn validate_posix_transient_source_authorities(
+    protection: &PosixSourceProtection,
+    checkpoint: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let transient = fs::symlink_metadata(&protection.transient)
+        .map_err(|error| format!("cannot inspect candidate transient authority: {error}"))?;
+    if transient.file_type().is_symlink()
+        || !transient.is_dir()
+        || posix_object_identity(&protection.transient)? != protection.transient_identity
+        || transient.uid() != protection.transient_owner
+        || transient.gid() != protection.transient_group
+        || transient.permissions().mode() & 0o7777 != 0o3770
+    {
+        return Err("candidate transient authority changed".to_owned());
+    }
+    if let Some(environment) = &protection.candidate_environment {
+        validate_posix_candidate_environment(&protection.transient, environment, checkpoint)?;
+    }
+    let adapter = fs::symlink_metadata(&protection.archive_adapter)
+        .map_err(|error| format!("cannot inspect native archive adapter authority: {error}"))?;
+    if adapter.file_type().is_symlink()
+        || !adapter.is_dir()
+        || posix_object_identity(&protection.archive_adapter)?
+            != protection.archive_adapter_identity
+        || adapter.uid() != protection.archive_adapter_owner
+        || adapter.gid() != protection.archive_adapter_group
+        || adapter.permissions().mode() & 0o7777 != 0o2770
+    {
+        return Err("native archive adapter authority changed".to_owned());
+    }
+    require_exact_directory_members(
+        &protection.archive_adapter,
+        &[],
+        "native archive adapter authority",
+    )
+}
+
+#[cfg(unix)]
+fn validate_posix_staged_source_stack_work(
+    protection: &PosixSourceProtection,
+) -> Result<bool, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let Some(stack_work) = &protection.stack_work else {
+        if protection.stack_work_identity.is_some() {
+            return Err("candidate Stack work authority identity is unexpected".to_owned());
+        }
+        return Ok(false);
+    };
+    if stack_work != &protection.oracle.join(".stack-work") {
+        return Err("candidate Stack work authority escapes staged oracle".to_owned());
+    }
+    let metadata = match fs::symlink_metadata(stack_work) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect candidate Stack work authority: {error}"
+            ));
+        }
+    };
+    let identity = protection
+        .stack_work_identity
+        .as_ref()
+        .ok_or_else(|| "candidate Stack work authority identity is absent".to_owned())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || posix_object_identity(stack_work)? != *identity
+        || metadata.uid() != protection.stack_work_owner
+        || metadata.gid() != protection.stack_work_group
+        || metadata.permissions().mode() & 0o7777 != 0o750
+        || fs::read_dir(stack_work)
+            .map_err(|error| format!("cannot enumerate candidate Stack work authority: {error}"))?
+            .next()
+            .is_some()
+    {
+        return Err("candidate Stack work authority changed before use".to_owned());
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -6243,76 +7091,8 @@ fn validate_posix_sources(
         ],
         "POSIX source authority",
     )?;
-    let transient_metadata = fs::symlink_metadata(&protection.transient)
-        .map_err(|error| format!("cannot inspect candidate transient authority: {error}"))?;
-    if transient_metadata.file_type().is_symlink()
-        || !transient_metadata.is_dir()
-        || posix_object_identity(&protection.transient)? != protection.transient_identity
-        || transient_metadata.uid() != protection.transient_owner
-        || transient_metadata.gid() != protection.transient_group
-        || transient_metadata.permissions().mode() & 0o7777 != 0o3770
-    {
-        return Err("candidate transient authority changed".to_owned());
-    }
-    if let Some(environment) = &protection.candidate_environment {
-        validate_posix_candidate_environment(&protection.transient, environment, checkpoint)?;
-    }
-    let adapter_metadata = fs::symlink_metadata(&protection.archive_adapter)
-        .map_err(|error| format!("cannot inspect native archive adapter authority: {error}"))?;
-    if adapter_metadata.file_type().is_symlink()
-        || !adapter_metadata.is_dir()
-        || posix_object_identity(&protection.archive_adapter)?
-            != protection.archive_adapter_identity
-        || adapter_metadata.uid() != protection.archive_adapter_owner
-        || adapter_metadata.gid() != protection.archive_adapter_group
-        || adapter_metadata.permissions().mode() & 0o7777 != 0o2770
-    {
-        return Err("native archive adapter authority changed".to_owned());
-    }
-    require_exact_directory_members(
-        &protection.archive_adapter,
-        &[],
-        "native archive adapter authority",
-    )?;
-    let stack_work_present = if let Some(stack_work) = &protection.stack_work {
-        if stack_work != &protection.oracle.join(".stack-work") {
-            return Err("candidate Stack work authority escapes staged oracle".to_owned());
-        }
-        match fs::symlink_metadata(stack_work) {
-            Ok(metadata) => {
-                let identity = protection.stack_work_identity.as_ref().ok_or_else(|| {
-                    "candidate Stack work authority identity is absent".to_owned()
-                })?;
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                    || posix_object_identity(stack_work)? != *identity
-                    || metadata.uid() != protection.stack_work_owner
-                    || metadata.gid() != protection.stack_work_group
-                    || metadata.permissions().mode() & 0o7777 != 0o750
-                    || fs::read_dir(stack_work)
-                        .map_err(|error| {
-                            format!("cannot enumerate candidate Stack work authority: {error}")
-                        })?
-                        .next()
-                        .is_some()
-                {
-                    return Err("candidate Stack work authority changed before use".to_owned());
-                }
-                true
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect candidate Stack work authority: {error}"
-                ));
-            }
-        }
-    } else {
-        if protection.stack_work_identity.is_some() {
-            return Err("candidate Stack work authority identity is unexpected".to_owned());
-        }
-        false
-    };
+    validate_posix_transient_source_authorities(protection, checkpoint)?;
+    let stack_work_present = validate_posix_staged_source_stack_work(protection)?;
     require_clean_checkout(
         &protection.candidate,
         &protection.candidate_sha,
@@ -6729,9 +7509,58 @@ fn capture_posix_candidate_environment(
 }
 
 #[cfg(unix)]
+struct CandidateEnvironmentVerifierFixture {
+    root: PathBuf,
+    transient: PathBuf,
+    trusted_owner: u32,
+    candidate_group: u32,
+}
+
+#[cfg(unix)]
+fn allocate_posix_verifier_root(label: &str, sequence: &AtomicU64) -> Result<PathBuf, String> {
+    let temporary_root = fs::canonicalize(env::temp_dir())
+        .map_err(|error| format!("cannot canonicalize {label} temp root: {error}"))?;
+    for _ in 0..16 {
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        let path = temporary_root.join(format!("{label}-{}-{sequence}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("cannot create {label} root: {error}")),
+        }
+    }
+    Err(format!("cannot allocate collision-free {label} root"))
+}
+
+#[cfg(unix)]
+fn allocate_candidate_environment_verifier() -> Result<CandidateEnvironmentVerifierFixture, String>
+{
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = allocate_posix_verifier_root(
+        "hell-candidate-environment-verifier",
+        &POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE,
+    )?;
+    let transient = root.join("transient");
+    fs::create_dir(&transient)
+        .map_err(|error| format!("cannot create candidate verifier transient root: {error}"))?;
+    let metadata = fs::symlink_metadata(&transient)
+        .map_err(|error| format!("cannot inspect candidate verifier transient root: {error}"))?;
+    let trusted_group = metadata.gid();
+    Ok(CandidateEnvironmentVerifierFixture {
+        root,
+        transient,
+        trusted_owner: metadata.uid(),
+        candidate_group: trusted_group
+            .checked_add(1)
+            .unwrap_or_else(|| trusted_group.saturating_sub(1)),
+    })
+}
+
+#[cfg(unix)]
 pub(crate) fn verify_posix_candidate_environment_construction_for_integration() -> Result<(), String>
 {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
+    use std::os::unix::fs::symlink;
 
     #[cfg(target_os = "linux")]
     let platform = ReleasePlatform::LinuxX86_64;
@@ -6745,41 +7574,7 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
         .invocation_path()
         .to_path_buf();
     let tools = resolve_posix_adapter_tools(platform)?;
-    let temporary_root = fs::canonicalize(env::temp_dir())
-        .map_err(|error| format!("cannot canonicalize candidate verifier temp root: {error}"))?;
-    let mut fixture = None;
-    for _ in 0..16 {
-        let sequence =
-            POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = temporary_root.join(format!(
-            "hell-candidate-environment-verifier-{}-{sequence}",
-            std::process::id()
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                fixture = Some(path);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot create candidate environment verifier root: {error}"
-                ));
-            }
-        }
-    }
-    let fixture =
-        fixture.ok_or_else(|| "cannot allocate candidate environment verifier root".to_owned())?;
-    let transient = fixture.join("transient");
-    fs::create_dir(&transient)
-        .map_err(|error| format!("cannot create candidate verifier transient root: {error}"))?;
-    let metadata = fs::symlink_metadata(&transient)
-        .map_err(|error| format!("cannot inspect candidate verifier transient root: {error}"))?;
-    let trusted_owner = metadata.uid();
-    let trusted_group = metadata.gid();
-    let candidate_group = trusted_group
-        .checked_add(1)
-        .unwrap_or_else(|| trusted_group.saturating_sub(1));
+    let fixture = allocate_candidate_environment_verifier()?;
 
     let result = (|| {
         if platform == ReleasePlatform::MacosAarch64 {
@@ -6789,7 +7584,7 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
                 [
                     "+a",
                     "everyone allow write,file_inherit,directory_inherit",
-                    path_text(&transient, "candidate verifier transient root")?,
+                    path_text(&fixture.transient, "candidate verifier transient root")?,
                 ],
             )?;
         }
@@ -6797,12 +7592,12 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
             platform,
             &sudo,
             &tools,
-            &transient,
-            trusted_owner,
-            candidate_group,
+            &fixture.transient,
+            fixture.trusted_owner,
+            fixture.candidate_group,
         )?;
         validate_posix_candidate_environment(
-            &transient,
+            &fixture.transient,
             &protection,
             "external privileged construction verification",
         )?;
@@ -6812,8 +7607,8 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
             .map_err(|error| format!("cannot create candidate sandbox verifier: {error}"))?;
         hell_testkit::prepare_posix_writable_directory_for_integration(
             &sudo,
-            candidate_group,
-            &transient,
+            fixture.candidate_group,
+            &fixture.transient,
             &sandbox,
         )
         .map_err(|error| format!("candidate sandbox construction failed: {error}"))?;
@@ -6826,8 +7621,8 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
             .map_err(|error| format!("cannot create candidate redirect probe: {error}"))?;
         if hell_testkit::prepare_posix_writable_directory_for_integration(
             &sudo,
-            candidate_group,
-            &transient,
+            fixture.candidate_group,
+            &fixture.transient,
             &redirect,
         )
         .is_ok()
@@ -6843,11 +7638,11 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
             posix_acl_removal_arguments(
                 platform,
                 true,
-                path_text(&fixture, "candidate verifier cleanup root")?,
+                path_text(&fixture.root, "candidate verifier cleanup root")?,
             )?,
         );
     }
-    let cleanup = fs::remove_dir_all(&fixture)
+    let cleanup = fs::remove_dir_all(&fixture.root)
         .map_err(|error| format!("cannot remove candidate environment verifier: {error}"));
     result.and(cleanup)
 }
@@ -6884,9 +7679,36 @@ fn combine_candidate_target_verifier_results(
 }
 
 #[cfg(unix)]
-pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+struct CandidateTargetVerifierContext {
+    platform: ReleasePlatform,
+    process_authorities: Arc<ResolvedPosixProcessAuthorities>,
+    sudo: PathBuf,
+    adapter: PosixAdapterProtection,
+    fixture: PathBuf,
+    transient: PathBuf,
+    transient_cleanup: PosixVerifierTransientCleanup,
+    sequence: u64,
+}
 
+#[cfg(unix)]
+struct CandidateTargetWorkspace {
+    workspace: PathBuf,
+    target: PathBuf,
+    trusted_owner: u32,
+    trusted_group: u32,
+}
+
+#[cfg(unix)]
+struct CandidateTargetPrincipal {
+    name: String,
+    group: String,
+    user_id: u32,
+    group_id: u32,
+    group_ids: Vec<u32>,
+}
+
+#[cfg(unix)]
+fn allocate_candidate_target_verifier_context() -> Result<CandidateTargetVerifierContext, String> {
     #[cfg(target_os = "linux")]
     let platform = ReleasePlatform::LinuxX86_64;
     #[cfg(target_os = "macos")]
@@ -6899,661 +7721,990 @@ pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Resul
     let temporary_root = fs::canonicalize(env::temp_dir())
         .map_err(|error| format!("cannot canonicalize candidate target verifier root: {error}"))?;
     let sequence = POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let fixture = temporary_root.join(format!(
+    let name = format!(
         "hell-candidate-target-verifier-{}-{sequence}",
         std::process::id()
-    ));
-    let transient = posix_adapter_installation_root(platform)?.join(format!(
-        "hell-candidate-target-verifier-{}-{sequence}",
-        std::process::id()
-    ));
+    );
+    let fixture = temporary_root.join(&name);
+    let transient = posix_adapter_installation_root(platform)?.join(name);
     fs::create_dir(&fixture)
         .map_err(|error| format!("cannot create candidate target verifier fixture: {error}"))?;
     fs::create_dir(&transient).map_err(|error| {
         format!("cannot create /var/tmp candidate target verifier authority: {error}")
     })?;
     let transient_cleanup = PosixVerifierTransientCleanup::bind(platform, &transient, &adapter)?;
-    let mut principal_cleanup = None;
-    let result = (|| {
-        let workspace = fixture.join("hosted-workspace");
-        let workspace_target = workspace.join("candidate-target");
-        fs::create_dir(&workspace)
-            .map_err(|error| format!("cannot create hosted target verifier workspace: {error}"))?;
-        fs::create_dir(&workspace_target)
-            .map_err(|error| format!("cannot create hosted target verifier cache: {error}"))?;
-        fs::create_dir(workspace_target.join("seed"))
-            .map_err(|error| format!("cannot create target verifier seed: {error}"))?;
-        fs::write(workspace_target.join("seed/input"), b"trusted-cache-seed\n")
-            .map_err(|error| format!("cannot write target verifier seed: {error}"))?;
-        fs::hard_link(
-            workspace_target.join("seed/input"),
-            workspace_target.join("seed/alias"),
-        )
+    Ok(CandidateTargetVerifierContext {
+        platform,
+        process_authorities,
+        sudo,
+        adapter,
+        fixture,
+        transient,
+        transient_cleanup,
+        sequence,
+    })
+}
+
+#[cfg(unix)]
+fn prepare_candidate_target_workspace(fixture: &Path) -> Result<CandidateTargetWorkspace, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let workspace = fixture.join("hosted-workspace");
+    let target = workspace.join("candidate-target");
+    fs::create_dir(&workspace)
+        .map_err(|error| format!("cannot create hosted target verifier workspace: {error}"))?;
+    fs::create_dir(&target)
+        .map_err(|error| format!("cannot create hosted target verifier cache: {error}"))?;
+    fs::create_dir(target.join("seed"))
+        .map_err(|error| format!("cannot create target verifier seed: {error}"))?;
+    fs::write(target.join("seed/input"), b"trusted-cache-seed\n")
+        .map_err(|error| format!("cannot write target verifier seed: {error}"))?;
+    fs::hard_link(target.join("seed/input"), target.join("seed/alias"))
         .map_err(|error| format!("cannot create in-tree target verifier hard link: {error}"))?;
-        let external_source = fixture.join("external-hardlink-source");
-        let external_probe = fixture.join("external-hardlink-probe");
-        fs::write(&external_source, b"external-cache-alias\n")
-            .map_err(|error| format!("cannot write external hard-link source: {error}"))?;
-        fs::create_dir(&external_probe)
-            .map_err(|error| format!("cannot create external hard-link probe: {error}"))?;
-        fs::hard_link(&external_source, external_probe.join("member"))
-            .map_err(|error| format!("cannot create external hard-link probe: {error}"))?;
-        let external_error = posix_candidate_target_receipt(&external_probe)
-            .expect_err("an out-of-tree hard link must be rejected before candidate execution");
-        if external_error != "candidate target contains a hard link outside its authority"
-            || fs::read(&external_source)
-                .map_err(|error| format!("cannot reread external hard-link source: {error}"))?
-                != b"external-cache-alias\n"
-        {
-            return Err("candidate target external hard-link rejection was not exact".to_owned());
-        }
-        fs::remove_dir_all(&external_probe)
-            .map_err(|error| format!("cannot remove external hard-link probe: {error}"))?;
-        fs::remove_file(&external_source)
-            .map_err(|error| format!("cannot remove external hard-link source: {error}"))?;
-        let metadata = fs::symlink_metadata(&workspace_target)
-            .map_err(|error| format!("cannot inspect target verifier cache: {error}"))?;
-        let trusted_owner = metadata.uid();
-        let trusted_group = metadata.gid();
-        let id = &process_authorities.identity;
-        let (principal, group, candidate_uid, candidate_gid) = match platform {
-            ReleasePlatform::LinuxX86_64 => {
-                let (principal, group, id, cleanup) = allocate_linux_candidate_principal(
-                    Arc::clone(&process_authorities),
-                    "helltgt",
-                )?;
-                principal_cleanup = Some(cleanup);
-                principal_cleanup
-                    .as_mut()
-                    .expect("candidate cleanup was retained")
-                    .attach_verifier_transient(transient_cleanup.clone())?;
-                (principal, group, id, id)
-            }
-            ReleasePlatform::MacosAarch64 => {
-                let principal = format!("helltgt{}x{sequence}", std::process::id());
-                let group = principal.clone();
-                let candidate_id = 590_u32
-                    .checked_add(std::process::id() % 40)
-                    .ok_or_else(|| "candidate target verifier UID overflow".to_owned())?;
-                let candidate_id_text = candidate_id.to_string();
-                let mut cleanup = PosixPrincipalCleanup::new(
-                    platform,
-                    Arc::clone(&process_authorities),
-                    principal.clone(),
-                    group.clone(),
-                    Some(candidate_id),
-                    Some(candidate_id),
-                )?;
-                cleanup.attach_verifier_transient(transient_cleanup.clone())?;
-                principal_cleanup = Some(cleanup);
-                let cleanup = principal_cleanup
-                    .as_mut()
-                    .expect("candidate cleanup was retained");
-                let reservation_deadline =
-                    posix_identity_query_deadline("macOS verifier candidate reservation")?;
-                if posix_principal_uid(reservation_deadline, platform, &principal)?.is_some()
-                    || posix_group_gid(reservation_deadline, &group)?.is_some()
-                {
-                    return Err(
-                        "macOS candidate verifier principal or group name is already occupied"
-                            .to_owned(),
-                    );
-                }
-                macos_principal_mutation(
-                    cleanup,
-                    [
-                        "-n",
-                        "--",
-                        "/usr/sbin/dseditgroup",
-                        "-o",
-                        "create",
-                        "-i",
-                        &candidate_id_text,
-                        &group,
-                    ],
-                )?;
-                if !cleanup.group_created {
-                    return Err(
-                        "macOS candidate verifier group creation had no observable effect"
-                            .to_owned(),
-                    );
-                }
-                for (property, value) in [
-                    ("UniqueID", candidate_id_text.as_str()),
-                    ("PrimaryGroupID", candidate_id_text.as_str()),
-                    ("UserShell", "/usr/bin/false"),
-                    ("NFSHomeDirectory", "/var/empty"),
-                ] {
-                    let record = Path::new("/Users").join(&principal);
-                    macos_principal_mutation(
-                        cleanup,
-                        [
-                            "-n",
-                            "--",
-                            "/usr/bin/dscl",
-                            ".",
-                            "-create",
-                            record.to_str().ok_or_else(|| {
-                                "candidate target verifier account path is not UTF-8".to_owned()
-                            })?,
-                            property,
-                            value,
-                        ],
-                    )?;
-                }
-                if !cleanup.user_created {
-                    return Err(
-                        "macOS candidate verifier user creation had no observable effect"
-                            .to_owned(),
-                    );
-                }
-                (principal, group, candidate_id, candidate_id)
-            }
-            ReleasePlatform::WindowsX86_64 => unreachable!(),
-        };
-        require_exact_posix_candidate_identity(id, "-u", &principal, candidate_uid, "UID")?;
-        require_exact_posix_candidate_identity(id, "-g", &principal, candidate_gid, "primary GID")?;
-        let group_output = exact_posix_candidate_identity_output(
-            id,
-            "-G",
-            &principal,
-            "candidate target verifier complete group inventory",
-        )?;
-        let candidate_group_ids = posix_candidate_group_inventory(&group_output, candidate_gid)
-            .ok_or_else(|| {
-                "candidate target verifier group inventory is not canonical".to_owned()
-            })?;
-        if candidate_group_ids.contains(&trusted_group) {
-            return Err(
-                "candidate target verifier unexpectedly belongs to the trusted runner group"
-                    .to_owned(),
-            );
-        }
-        let mut protection = stage_posix_candidate_target(
-            &sudo,
-            &adapter,
-            &workspace_target,
-            &transient,
-            trusted_owner,
-            trusted_group,
-            candidate_gid,
-        )?;
-        if protection.path() != transient.join("candidate-target")
-            || protection.path().starts_with(&workspace)
-            || fs::read(protection.path().join("seed/input"))
-                .map_err(|error| format!("cannot read staged target verifier seed: {error}"))?
-                != b"trusted-cache-seed\n"
-        {
-            return Err(
-                "candidate target import did not establish the separate staged authority"
-                    .to_owned(),
-            );
-        }
-        let staged_input = fs::symlink_metadata(protection.path().join("seed/input"))
-            .map_err(|error| format!("cannot inspect staged target verifier seed: {error}"))?;
-        let staged_alias = fs::symlink_metadata(protection.path().join("seed/alias"))
-            .map_err(|error| format!("cannot inspect staged target verifier alias: {error}"))?;
-        if staged_input.nlink() != 1
-            || staged_alias.nlink() != 1
-            || (staged_input.dev(), staged_input.ino()) == (staged_alias.dev(), staged_alias.ino())
-            || fs::read(protection.path().join("seed/alias"))
-                .map_err(|error| format!("cannot read staged target verifier alias: {error}"))?
-                != b"trusted-cache-seed\n"
-        {
-            return Err("candidate target import retained an in-tree hard-link alias".to_owned());
-        }
-        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("cannot confine hosted target verifier ancestry: {error}"))?;
-        let project = transient.join("candidate-project");
-        fs::create_dir(&project)
-            .map_err(|error| format!("cannot create candidate target verifier project: {error}"))?;
-        fs::write(
-            project.join("Cargo.toml"),
-            b"[package]\nname = \"posix-target-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"posix-target-probe\"\npath = \"main.rs\"\n",
-        )
-        .map_err(|error| format!("cannot write candidate target verifier manifest: {error}"))?;
-        fs::write(
-            project.join("Cargo.lock"),
-            b"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"posix-target-probe\"\nversion = \"0.0.0\"\n",
-        )
-        .map_err(|error| format!("cannot write candidate target verifier lockfile: {error}"))?;
-        fs::write(
-            project.join("main.rs"),
-            b"use std::{env, ffi::OsStr, fs, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path};\nfn main() {\n    let mut args = env::args_os().skip(1);\n    let staged = args.next().expect(\"staged target\");\n    let hosted = args.next().expect(\"hosted target\");\n    let mode = args.next();\n    assert!(args.next().is_none());\n    assert_eq!(env::var_os(\"CARGO_TARGET_DIR\").as_deref(), Some(staged.as_os_str()));\n    let staged = Path::new(&staged);\n    if mode.as_deref() == Some(OsStr::new(\"cleanup-hostile\")) {\n        let hostile = staged.join(\"cleanup-hostile\");\n        fs::create_dir_all(hostile.join(\"nested\")).unwrap();\n        fs::write(hostile.join(\"nested/retained\"), b\"candidate-owned\\n\").unwrap();\n        fs::set_permissions(hostile.join(\"nested/retained\"), fs::Permissions::from_mode(0o400)).unwrap();\n        fs::set_permissions(hostile.join(\"nested\"), fs::Permissions::from_mode(0o500)).unwrap();\n        fs::set_permissions(&hostile, fs::Permissions::from_mode(0o500)).unwrap();\n        return;\n    }\n    assert!(mode.is_none());\n    assert!(matches!(fs::symlink_metadata(&hosted), Err(error) if error.kind() == ErrorKind::PermissionDenied));\n    let direct = Path::new(&hosted).join(\"candidate-direct-write\");\n    assert!(matches!(fs::OpenOptions::new().write(true).create_new(true).open(direct), Err(error) if error.kind() == ErrorKind::PermissionDenied));\n    fs::create_dir_all(staged.join(\"cache\")).unwrap();\n    fs::create_dir_all(staged.join(\"evidence\")).unwrap();\n    fs::write(staged.join(\"cache/compiler-state\"), b\"candidate-cache\\n\").unwrap();\n    fs::write(staged.join(\"evidence/hosted-target-inaccessible\"), b\"permission-denied\\n\").unwrap();\n}\n",
-        )
-        .map_err(|error| format!("cannot write candidate target verifier source: {error}"))?;
+    verify_external_candidate_target_hard_link_rejection(fixture)?;
+    let metadata = fs::symlink_metadata(&target)
+        .map_err(|error| format!("cannot inspect target verifier cache: {error}"))?;
+    Ok(CandidateTargetWorkspace {
+        workspace,
+        target,
+        trusted_owner: metadata.uid(),
+        trusted_group: metadata.gid(),
+    })
+}
 
-        let cargo = crate::command::resolve_standard_cargo_executable()?;
-        let cargo_authority = crate::command::resolve_posix_cargo_authority(&cargo, &project)?;
-        let rustup_authority = match &cargo_authority {
-            crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
-                return reject_native_posix_cargo_authority();
-            }
-            crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => Some(authority),
-        };
-        let rustup_protection = rustup_authority
-            .map(|authority| stage_posix_rustup_authority(platform, &sudo, authority))
-            .transpose()?;
-        let cargo_protection =
-            stage_posix_executable(platform, &sudo, cargo.canonical_identity(), "cargo")?;
-        let candidate_identity = hell_testkit::PosixCandidateIdentity::new(
-            principal.clone(),
-            candidate_uid,
-            candidate_gid,
-            candidate_group_ids,
-            group,
-        )
-        .map_err(|error| format!("cannot bind candidate target verifier identity: {error}"))?;
-        let launch_authorities = hell_testkit::PosixLaunchAuthorities::new(
-            adapter.adapter.clone(),
-            adapter.sha256,
-            cargo.canonical_identity().to_path_buf(),
-            cargo_protection.adapter.clone(),
-            cargo_protection.sha256,
-            posix_cargo_source_authority(&cargo_authority, rustup_protection.as_ref())?,
-        );
-        let policy = hell_testkit::CandidateLaunchPolicy::posix_with_process_authorities(
-            sudo.clone(),
-            process_authorities.launch_authorities()?,
-            launch_authorities,
-            candidate_identity,
-            vec![protection.path().to_path_buf()],
-        )
-        .map_err(|error| format!("cannot establish candidate target verifier policy: {error}"))?;
-        let isolated = protection.path().join("release-child-environment");
-        fs::create_dir(&isolated).map_err(|error| {
-            format!("cannot create candidate target verifier environment: {error}")
-        })?;
-        for directory in ["home", "cargo", "sccache", "tmp"] {
-            let path = isolated.join(directory);
-            fs::create_dir(&path).map_err(|error| {
-                format!("cannot create candidate target verifier {directory}: {error}")
-            })?;
-            hell_testkit::prepare_posix_writable_directory_for_integration(
-                &sudo,
-                candidate_gid,
-                protection.path(),
-                &path,
-            )
-            .map_err(|error| {
-                format!("cannot delegate candidate target verifier {directory}: {error}")
-            })?;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Read as _;
-            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-            use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+fn verify_external_candidate_target_hard_link_rejection(fixture: &Path) -> Result<(), String> {
+    let source = fixture.join("external-hardlink-source");
+    let probe = fixture.join("external-hardlink-probe");
+    fs::write(&source, b"external-cache-alias\n")
+        .map_err(|error| format!("cannot write external hard-link source: {error}"))?;
+    fs::create_dir(&probe)
+        .map_err(|error| format!("cannot create external hard-link probe: {error}"))?;
+    fs::hard_link(&source, probe.join("member"))
+        .map_err(|error| format!("cannot create external hard-link probe: {error}"))?;
+    let error = posix_candidate_target_receipt(&probe)
+        .expect_err("an out-of-tree hard link must be rejected before candidate execution");
+    if error != "candidate target contains a hard link outside its authority"
+        || fs::read(&source)
+            .map_err(|error| format!("cannot reread external hard-link source: {error}"))?
+            != b"external-cache-alias\n"
+    {
+        return Err("candidate target external hard-link rejection was not exact".to_owned());
+    }
+    fs::remove_dir_all(&probe)
+        .map_err(|error| format!("cannot remove external hard-link probe: {error}"))?;
+    fs::remove_file(&source)
+        .map_err(|error| format!("cannot remove external hard-link source: {error}"))
+}
 
-            let broker_adapter = fixture.join("derived-native-archive-broker");
-            let broker_authority = broker_adapter.join(".authority");
-            let broker_inputs = broker_authority.join("inputs");
-            fs::create_dir(&broker_adapter)
-                .and_then(|()| fs::create_dir(&broker_authority))
-                .and_then(|()| fs::create_dir(&broker_inputs))
-                .map_err(|error| format!("cannot create derived broker fixture: {error}"))?;
-            fs::set_permissions(&broker_adapter, fs::Permissions::from_mode(0o2755))
-                .and_then(|()| {
-                    fs::set_permissions(&broker_authority, fs::Permissions::from_mode(0o555))
-                })
-                .map_err(|error| format!("cannot seal derived broker fixture: {error}"))?;
-            let candidate_group = candidate_gid.to_string();
-            trusted_tool_status(
-                &sudo,
-                &adapter.tools.change_group,
-                [
-                    candidate_group.as_str(),
-                    path_text(&broker_inputs, "derived broker input staging")?,
-                ],
+#[cfg(unix)]
+struct CandidateTargetPrincipalInput<'a> {
+    platform: ReleasePlatform,
+    process_authorities: &'a Arc<ResolvedPosixProcessAuthorities>,
+    transient_cleanup: &'a PosixVerifierTransientCleanup,
+    sequence: u64,
+    trusted_group: u32,
+}
+
+#[cfg(unix)]
+fn allocate_candidate_target_principal(
+    input: &CandidateTargetPrincipalInput<'_>,
+    cleanup: &mut Option<PosixPrincipalCleanup>,
+) -> Result<CandidateTargetPrincipal, String> {
+    let (name, group, user_id, group_id) = match input.platform {
+        ReleasePlatform::LinuxX86_64 => {
+            let (name, group, id, value) = allocate_linux_candidate_principal(
+                Arc::clone(input.process_authorities),
+                "helltgt",
             )?;
-            fs::set_permissions(&broker_inputs, fs::Permissions::from_mode(0o2710))
-                .map_err(|error| format!("cannot confine derived broker fixture: {error}"))?;
-            let fake_root = fs::canonicalize("/tmp")
-                .map_err(|error| format!("cannot bind fake broker parent: {error}"))?
-                .join(format!(
-                    "hell-ci-fake-archive-broker-{}-{sequence}",
-                    std::process::id()
-                ));
-            fs::create_dir(&fake_root)
-                .map_err(|error| format!("cannot create fake broker fixture: {error}"))?;
-            fs::set_permissions(&fake_root, fs::Permissions::from_mode(0o711))
-                .map_err(|error| format!("cannot confine fake broker fixture: {error}"))?;
-            let fake_socket = fake_root.join("s");
-            let fake_listener = UnixListener::bind(&fake_socket)
-                .map_err(|error| format!("cannot bind fake broker fixture: {error}"))?;
-            fs::set_permissions(&fake_socket, fs::Permissions::from_mode(0o622))
-                .map_err(|error| format!("cannot delegate fake broker fixture: {error}"))?;
-            let fake_root_metadata = fs::symlink_metadata(&fake_root)
-                .map_err(|error| format!("cannot bind fake broker root receipt: {error}"))?;
-            let fake_socket_metadata = fs::symlink_metadata(&fake_socket)
-                .map_err(|error| format!("cannot bind fake broker socket receipt: {error}"))?;
-            let trusted_fixture_metadata = fs::metadata(&fixture)
-                .map_err(|error| format!("cannot bind trusted fixture owner: {error}"))?;
-            if fake_root_metadata.file_type().is_symlink()
-                || !fake_root_metadata.is_dir()
-                || fake_root_metadata.uid() != trusted_fixture_metadata.uid()
-                || fake_root_metadata.permissions().mode() & 0o7777 != 0o711
-                || !fake_socket_metadata.file_type().is_socket()
-                || fake_socket_metadata.uid() != fake_root_metadata.uid()
-                || fake_socket_metadata.permissions().mode() & 0o7777 != 0o622
-            {
-                return Err("fake broker candidate-connectability receipt differs".to_owned());
-            }
-            let broker_deadline = Instant::now()
-                .checked_add(Duration::from_secs(30))
-                .ok_or_else(|| "derived broker cleanup deadline overflowed".to_owned())?;
-            let mut derived_broker =
-                match crate::command::NativeArchiveInputBroker::start_for_integration(
-                    &broker_inputs,
-                    candidate_uid,
-                    4,
-                    64,
-                ) {
-                    Ok(broker) => broker,
-                    Err(primary) => {
-                        drop(fake_listener);
-                        let cleanup = fs::remove_file(&fake_socket)
-                            .and_then(|()| fs::remove_dir(&fake_root))
-                            .map_err(|error| {
-                                format!("cannot clean failed fake broker fixture: {error}")
-                            });
-                        return match cleanup {
-                            Ok(()) => Err(primary),
-                            Err(cleanup) => Err(format!("{primary}; {cleanup}")),
-                        };
-                    }
-                };
-            let descendant = with_release_candidate_environment(
-                protection.path(),
-                &isolated,
-                1,
-                &policy,
-                || {
-                    CommandSpec::new(adapter.adapter.as_os_str(), Duration::from_secs(30))
-                        .argument("__verify-native-archive-broker-descendant-launcher")
-                        .argument(&broker_adapter)
-                        .argument(&fake_socket)
-                        .argument(isolated.join("tmp"))
-                        .current_directory(&project)
-                        .run()
-                },
-            )
-            .map_err(|error| format!("cannot run restricted broker descendant: {error}"));
-            let descendant = descendant.and_then(|result| {
-                if result.status.success() && !result.timed_out {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "restricted broker descendant failed: status={:?}; stderr={}",
-                        result.status.code(),
-                        String::from_utf8_lossy(&result.stderr)
-                    ))
-                }
-            });
-            let fake_observation = (|| {
-                fake_listener
-                    .set_nonblocking(true)
-                    .map_err(|error| format!("cannot bound fake broker observation: {error}"))?;
-                let (mut control, _) = fake_listener.accept().map_err(|error| {
-                    format!("candidate did not prove fake broker connectability: {error}")
-                })?;
-                control
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .map_err(|error| format!("cannot bound fake broker marker: {error}"))?;
-                let mut marker =
-                    [0_u8; crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER.len()];
-                control
-                    .read_exact(&mut marker)
-                    .map_err(|error| format!("cannot read fake broker marker: {error}"))?;
-                if marker != *crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER {
-                    return Err("candidate fake broker connectivity marker differs".to_owned());
-                }
-                match fake_listener.accept() {
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-                    Ok(_) => Err(
-                        "sealed-capability adapter connected to the typed decoy broker".to_owned(),
-                    ),
-                    Err(error) => Err(format!("cannot observe fake broker endpoint: {error}")),
-                }
-            })();
-            drop(fake_listener);
-            let broker_cleanup = derived_broker.close_until(broker_deadline);
-            let fake_cleanup = fs::remove_file(&fake_socket)
-                .and_then(|()| fs::remove_dir(&fake_root))
-                .map_err(|error| format!("cannot clean fake broker fixture: {error}"));
-            let mut failures = Vec::new();
-            if let Err(error) = descendant {
-                failures.push(error);
-            }
-            if let Err(error) = fake_observation {
-                failures.push(error);
-            }
-            if let Err(error) = broker_cleanup {
-                failures.push(format!("derived broker cleanup: {error}"));
-            } else if fs::read_dir(&broker_inputs)
-                .map_err(|error| format!("cannot attest derived broker cleanup: {error}"))?
-                .next()
-                .is_some()
-            {
-                failures.push("derived broker staging remains after cleanup".to_owned());
-            }
-            if let Err(error) = fake_cleanup {
-                failures.push(error);
-            }
-            if !failures.is_empty() {
-                return Err(failures.join("; "));
-            }
+            *cleanup = Some(value);
+            cleanup
+                .as_mut()
+                .expect("candidate cleanup was retained")
+                .attach_verifier_transient(input.transient_cleanup.clone())?;
+            (name, group, id, id)
         }
-        let rustup_protection = rustup_protection.as_ref().ok_or_else(|| {
-            "candidate target verifier staged Rustup authority is absent".to_owned()
-        })?;
-        preflight_exact_staged_rustc_as_candidate(
-            protection.path(),
-            &isolated,
-            &policy,
-            &project,
-            rustup_protection,
-        )?;
-        let build =
-            with_release_candidate_environment(protection.path(), &isolated, 1, &policy, || {
-                CommandSpec::trusted_cargo(Duration::from_mins(5), &cargo)
-                    .arguments(["build", "--release", "--locked", "--offline"])
-                    .current_directory(&project)
-                    .run()
-            })
-            .map_err(|error| format!("cannot run restricted candidate Cargo build: {error}"))?;
-        if !build.status.success() || build.timed_out {
-            return Err(format!(
-                "restricted candidate Cargo build failed: status={:?}; stderr={}",
-                build.status.code(),
-                String::from_utf8_lossy(&build.stderr)
-            ));
-        }
-        let artifact = protection.path().join("release/posix-target-probe");
-        let artifact_metadata = fs::symlink_metadata(&artifact)
-            .map_err(|error| format!("cannot inspect candidate Cargo artifact: {error}"))?;
-        if !artifact_metadata.is_file()
-            || artifact_metadata.file_type().is_symlink()
-            || artifact_metadata.uid() != candidate_uid
-            || project.join("target").exists()
-        {
-            return Err("candidate Cargo output differs from its staged authority".to_owned());
-        }
-        let probe =
-            with_release_candidate_environment(protection.path(), &isolated, 1, &policy, || {
-                CommandSpec::new(artifact.as_os_str(), Duration::from_secs(30))
-                    .argument(protection.path())
-                    .argument(&workspace_target)
-                    .current_directory(&project)
-                    .run()
-            })
-            .map_err(|error| format!("cannot run restricted candidate target artifact: {error}"))?;
-        if !probe.status.success() || probe.timed_out {
-            return Err(format!(
-                "restricted candidate target artifact failed: status={:?}; stderr={}",
-                probe.status.code(),
-                String::from_utf8_lossy(&probe.stderr)
-            ));
-        }
-        if workspace_target.join("candidate-direct-write").exists() {
-            return Err("candidate reached the hosted target through confined ancestry".to_owned());
-        }
-        let hosted_identity_before_export = posix_object_identity(&workspace_target)?;
-        let hosted_input_before_export = fs::symlink_metadata(workspace_target.join("seed/input"))
-            .map_err(|error| format!("cannot inspect hosted cache seed before export: {error}"))?;
-        let hosted_alias_before_export = fs::symlink_metadata(workspace_target.join("seed/alias"))
-            .map_err(|error| format!("cannot inspect hosted cache alias before export: {error}"))?;
-        if hosted_input_before_export.nlink() != 2
-            || (
-                hosted_input_before_export.dev(),
-                hosted_input_before_export.ino(),
-            ) != (
-                hosted_alias_before_export.dev(),
-                hosted_alias_before_export.ino(),
-            )
-        {
-            return Err(
-                "hosted target verifier hard-link fixture changed before export".to_owned(),
-            );
-        }
-        let mut export_receipt = PosixCandidateTargetExportReceipt::default();
-        let injected = export_posix_candidate_target_with_fault(
-            &adapter,
-            &mut protection,
-            &workspace_target,
-            PosixCandidateTargetExportFault::AfterBackupRename,
-            &mut export_receipt,
+        ReleasePlatform::MacosAarch64 => allocate_macos_candidate_target_principal(input, cleanup)?,
+        ReleasePlatform::WindowsX86_64 => unreachable!(),
+    };
+    let identity = &input.process_authorities.identity;
+    require_exact_posix_candidate_identity(identity, "-u", &name, user_id, "UID")?;
+    require_exact_posix_candidate_identity(identity, "-g", &name, group_id, "primary GID")?;
+    let output = exact_posix_candidate_identity_output(
+        identity,
+        "-G",
+        &name,
+        "candidate target verifier complete group inventory",
+    )?;
+    let group_ids = posix_candidate_group_inventory(&output, group_id)
+        .ok_or_else(|| "candidate target verifier group inventory is not canonical".to_owned())?;
+    if group_ids.contains(&input.trusted_group) {
+        return Err(
+            "candidate target verifier unexpectedly belongs to the trusted runner group".to_owned(),
         );
-        if export_receipt.phase != PosixCandidateTargetExportPhase::InjectedRollbackComplete {
-            return Err(format!(
-                "candidate target export fault hook was not reached: phase={:?}; result={injected:?}",
-                export_receipt.phase
-            ));
+    }
+    Ok(CandidateTargetPrincipal {
+        name,
+        group,
+        user_id,
+        group_id,
+        group_ids,
+    })
+}
+
+#[cfg(unix)]
+fn allocate_macos_candidate_target_principal(
+    input: &CandidateTargetPrincipalInput<'_>,
+    retained_cleanup: &mut Option<PosixPrincipalCleanup>,
+) -> Result<(String, String, u32, u32), String> {
+    let principal = format!("helltgt{}x{}", std::process::id(), input.sequence);
+    let group = principal.clone();
+    let id = 590_u32
+        .checked_add(std::process::id() % 40)
+        .ok_or_else(|| "candidate target verifier UID overflow".to_owned())?;
+    let id_text = id.to_string();
+    let mut cleanup = PosixPrincipalCleanup::new(
+        input.platform,
+        Arc::clone(input.process_authorities),
+        principal.clone(),
+        group.clone(),
+        Some(id),
+        Some(id),
+    );
+    cleanup.attach_verifier_transient(input.transient_cleanup.clone())?;
+    *retained_cleanup = Some(cleanup);
+    let cleanup = retained_cleanup
+        .as_mut()
+        .expect("candidate cleanup was retained");
+    let deadline = posix_identity_query_deadline("macOS verifier candidate reservation")?;
+    if posix_principal_uid(deadline, input.platform, &principal)?.is_some()
+        || posix_group_gid(deadline, &group)?.is_some()
+    {
+        return Err(
+            "macOS candidate verifier principal or group name is already occupied".to_owned(),
+        );
+    }
+    macos_principal_mutation(
+        cleanup,
+        [
+            "-n",
+            "--",
+            "/usr/sbin/dseditgroup",
+            "-o",
+            "create",
+            "-i",
+            &id_text,
+            &group,
+        ],
+    )?;
+    if !cleanup.group_created {
+        return Err("macOS candidate verifier group creation had no observable effect".to_owned());
+    }
+    for (property, value) in [
+        ("UniqueID", id_text.as_str()),
+        ("PrimaryGroupID", id_text.as_str()),
+        ("UserShell", "/usr/bin/false"),
+        ("NFSHomeDirectory", "/var/empty"),
+    ] {
+        let record = Path::new("/Users").join(&principal);
+        macos_principal_mutation(
+            cleanup,
+            [
+                "-n",
+                "--",
+                "/usr/bin/dscl",
+                ".",
+                "-create",
+                record.to_str().ok_or_else(|| {
+                    "candidate target verifier account path is not UTF-8".to_owned()
+                })?,
+                property,
+                value,
+            ],
+        )?;
+    }
+    if !cleanup.user_created {
+        return Err("macOS candidate verifier user creation had no observable effect".to_owned());
+    }
+    Ok((principal, group, id, id))
+}
+
+#[cfg(unix)]
+struct CandidateTargetStageInput<'a> {
+    sudo: &'a Path,
+    adapter: &'a PosixAdapterProtection,
+    transient: &'a Path,
+    workspace: &'a CandidateTargetWorkspace,
+    principal: &'a CandidateTargetPrincipal,
+}
+
+#[cfg(unix)]
+fn stage_candidate_target_for_verifier(
+    input: &CandidateTargetStageInput<'_>,
+) -> Result<PosixCandidateTargetProtection, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let protection = stage_posix_candidate_target(
+        input.sudo,
+        input.adapter,
+        &input.workspace.target,
+        input.transient,
+        input.workspace.trusted_owner,
+        input.workspace.trusted_group,
+        input.principal.group_id,
+    )?;
+    if protection.path() != input.transient.join("candidate-target")
+        || protection.path().starts_with(&input.workspace.workspace)
+        || fs::read(protection.path().join("seed/input"))
+            .map_err(|error| format!("cannot read staged target verifier seed: {error}"))?
+            != b"trusted-cache-seed\n"
+    {
+        return Err(
+            "candidate target import did not establish the separate staged authority".to_owned(),
+        );
+    }
+    let staged_input = fs::symlink_metadata(protection.path().join("seed/input"))
+        .map_err(|error| format!("cannot inspect staged target verifier seed: {error}"))?;
+    let staged_alias = fs::symlink_metadata(protection.path().join("seed/alias"))
+        .map_err(|error| format!("cannot inspect staged target verifier alias: {error}"))?;
+    if staged_input.nlink() != 1
+        || staged_alias.nlink() != 1
+        || (staged_input.dev(), staged_input.ino()) == (staged_alias.dev(), staged_alias.ino())
+        || fs::read(protection.path().join("seed/alias"))
+            .map_err(|error| format!("cannot read staged target verifier alias: {error}"))?
+            != b"trusted-cache-seed\n"
+    {
+        return Err("candidate target import retained an in-tree hard-link alias".to_owned());
+    }
+    fs::set_permissions(
+        &input.workspace.workspace,
+        fs::Permissions::from_mode(0o700),
+    )
+    .map_err(|error| format!("cannot confine hosted target verifier ancestry: {error}"))?;
+    Ok(protection)
+}
+
+#[cfg(unix)]
+fn write_candidate_target_probe_project(transient: &Path) -> Result<PathBuf, String> {
+    let project = transient.join("candidate-project");
+    fs::create_dir(&project)
+        .map_err(|error| format!("cannot create candidate target verifier project: {error}"))?;
+    fs::write(
+        project.join("Cargo.toml"),
+        b"[package]\nname = \"posix-target-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"posix-target-probe\"\npath = \"main.rs\"\n",
+    )
+    .map_err(|error| format!("cannot write candidate target verifier manifest: {error}"))?;
+    fs::write(
+        project.join("Cargo.lock"),
+        b"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"posix-target-probe\"\nversion = \"0.0.0\"\n",
+    )
+    .map_err(|error| format!("cannot write candidate target verifier lockfile: {error}"))?;
+    fs::write(project.join("main.rs"), CANDIDATE_TARGET_PROBE_SOURCE)
+        .map_err(|error| format!("cannot write candidate target verifier source: {error}"))?;
+    Ok(project)
+}
+
+#[cfg(unix)]
+const CANDIDATE_TARGET_PROBE_SOURCE: &[u8] = b"use std::{env, ffi::OsStr, fs, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path};\nfn main() {\n    let mut args = env::args_os().skip(1);\n    let staged = args.next().expect(\"staged target\");\n    let hosted = args.next().expect(\"hosted target\");\n    let mode = args.next();\n    assert!(args.next().is_none());\n    assert_eq!(env::var_os(\"CARGO_TARGET_DIR\").as_deref(), Some(staged.as_os_str()));\n    let staged = Path::new(&staged);\n    if mode.as_deref() == Some(OsStr::new(\"cleanup-hostile\")) {\n        let hostile = staged.join(\"cleanup-hostile\");\n        fs::create_dir_all(hostile.join(\"nested\")).unwrap();\n        fs::write(hostile.join(\"nested/retained\"), b\"candidate-owned\\n\").unwrap();\n        fs::set_permissions(hostile.join(\"nested/retained\"), fs::Permissions::from_mode(0o400)).unwrap();\n        fs::set_permissions(hostile.join(\"nested\"), fs::Permissions::from_mode(0o500)).unwrap();\n        fs::set_permissions(&hostile, fs::Permissions::from_mode(0o500)).unwrap();\n        return;\n    }\n    assert!(mode.is_none());\n    assert!(matches!(fs::symlink_metadata(&hosted), Err(error) if error.kind() == ErrorKind::PermissionDenied));\n    let direct = Path::new(&hosted).join(\"candidate-direct-write\");\n    assert!(matches!(fs::OpenOptions::new().write(true).create_new(true).open(direct), Err(error) if error.kind() == ErrorKind::PermissionDenied));\n    fs::create_dir_all(staged.join(\"cache\")).unwrap();\n    fs::create_dir_all(staged.join(\"evidence\")).unwrap();\n    fs::write(staged.join(\"cache/compiler-state\"), b\"candidate-cache\\n\").unwrap();\n    fs::write(staged.join(\"evidence/hosted-target-inaccessible\"), b\"permission-denied\\n\").unwrap();\n}\n";
+
+#[cfg(unix)]
+struct CandidateTargetLaunch {
+    cargo: crate::command::ResolvedCargoExecutable,
+    rustup: PosixRustupProtection,
+    policy: hell_testkit::CandidateLaunchPolicy,
+    isolated: PathBuf,
+}
+
+#[cfg(unix)]
+struct CandidateTargetLaunchInput<'a> {
+    platform: ReleasePlatform,
+    sudo: &'a Path,
+    adapter: &'a PosixAdapterProtection,
+    process_authorities: &'a ResolvedPosixProcessAuthorities,
+    project: &'a Path,
+    protection: &'a PosixCandidateTargetProtection,
+    principal: CandidateTargetPrincipal,
+}
+
+#[cfg(unix)]
+fn prepare_candidate_target_launch(
+    input: CandidateTargetLaunchInput<'_>,
+) -> Result<CandidateTargetLaunch, String> {
+    let cargo = crate::command::resolve_standard_cargo_executable()?;
+    let cargo_authority = crate::command::resolve_posix_cargo_authority(&cargo, input.project)?;
+    let rustup_authority = match &cargo_authority {
+        crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
+            return reject_native_posix_cargo_authority();
         }
-        if !matches!(injected, Err(ref error) if error == "injected candidate target export failure after backup rename")
-        {
-            return Err("candidate target export fault result was not exact".to_owned());
-        }
-        let hosted_input_after_rollback = fs::symlink_metadata(workspace_target.join("seed/input"))
-            .map_err(|error| format!("cannot inspect hosted cache seed after rollback: {error}"))?;
-        let hosted_alias_after_rollback = fs::symlink_metadata(workspace_target.join("seed/alias"))
-            .map_err(|error| {
-                format!("cannot inspect hosted cache alias after rollback: {error}")
-            })?;
-        if posix_object_identity(&workspace_target)? != hosted_identity_before_export
-            || (
-                hosted_input_after_rollback.dev(),
-                hosted_input_after_rollback.ino(),
-            ) != (
-                hosted_input_before_export.dev(),
-                hosted_input_before_export.ino(),
-            )
-            || (
-                hosted_alias_after_rollback.dev(),
-                hosted_alias_after_rollback.ino(),
-            ) != (
-                hosted_alias_before_export.dev(),
-                hosted_alias_before_export.ino(),
-            )
-            || fs::read(workspace_target.join("seed/input")).map_err(|error| {
-                format!("cannot reread hosted cache after injected export failure: {error}")
-            })? != b"trusted-cache-seed\n"
-            || workspace_target.join("release/posix-target-probe").exists()
-            || workspace_target.join("cache/compiler-state").exists()
-            || workspace_target
-                .with_file_name(format!(
-                    "candidate-target-export-replacement-{}",
-                    std::process::id()
-                ))
-                .exists()
-            || workspace_target
-                .with_file_name(format!(
-                    "candidate-target-export-backup-{}",
-                    std::process::id()
-                ))
-                .exists()
-        {
-            return Err(
-                "candidate target export failure did not retain the exact old hosted cache"
-                    .to_owned(),
-            );
-        }
-        export_posix_candidate_target(&adapter, &mut protection, &workspace_target)?;
-        let exported_artifact = fs::symlink_metadata(
-            workspace_target.join("release/posix-target-probe"),
-        )
-        .map_err(|error| format!("cannot inspect hosted target verifier artifact: {error}"))?;
-        if !exported_artifact.is_file()
-            || exported_artifact.file_type().is_symlink()
-            || fs::read(workspace_target.join("cache/compiler-state"))
-                .map_err(|error| format!("cannot read hosted target verifier cache: {error}"))?
-                != b"candidate-cache\n"
-            || fs::read(workspace_target.join("evidence/hosted-target-inaccessible"))
-                .map_err(|error| format!("cannot read hosted target verifier evidence: {error}"))?
-                != b"permission-denied\n"
-            || fs::read(workspace_target.join("seed/input"))
-                .map_err(|error| format!("cannot reread hosted target verifier seed: {error}"))?
-                != b"trusted-cache-seed\n"
-            || fs::read(workspace_target.join("seed/alias"))
-                .map_err(|error| format!("cannot reread hosted target verifier alias: {error}"))?
-                != b"trusted-cache-seed\n"
-        {
-            return Err("candidate target trusted export differs from staged output".to_owned());
-        }
-        let exported_input = fs::symlink_metadata(workspace_target.join("seed/input"))
-            .map_err(|error| format!("cannot inspect exported target verifier seed: {error}"))?;
-        let exported_alias = fs::symlink_metadata(workspace_target.join("seed/alias"))
-            .map_err(|error| format!("cannot inspect exported target verifier alias: {error}"))?;
-        if exported_input.nlink() != 1
-            || exported_alias.nlink() != 1
-            || (exported_input.dev(), exported_input.ino())
-                == (exported_alias.dev(), exported_alias.ino())
-        {
-            return Err("candidate target export retained an in-tree hard-link alias".to_owned());
-        }
-        let cleanup_probe =
-            with_release_candidate_environment(protection.path(), &isolated, 1, &policy, || {
-                CommandSpec::new(artifact.as_os_str(), Duration::from_secs(30))
-                    .argument(protection.path())
-                    .argument(&workspace_target)
-                    .argument("cleanup-hostile")
-                    .current_directory(&project)
-                    .run()
-            })
-            .map_err(|error| {
-                format!("cannot create candidate-owned target cleanup fixture: {error}")
-            })?;
-        let hostile = protection.path().join("cleanup-hostile");
-        let hostile_metadata = fs::symlink_metadata(&hostile).map_err(|error| {
-            format!("cannot inspect candidate-owned target cleanup fixture: {error}")
+        crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => authority,
+    };
+    let rustup = stage_posix_rustup_authority(input.platform, input.sudo, rustup_authority)?;
+    let cargo_protection = stage_posix_executable(
+        input.platform,
+        input.sudo,
+        cargo.canonical_identity(),
+        "cargo",
+    )?;
+    let identity = hell_testkit::PosixCandidateIdentity::new(
+        input.principal.name,
+        input.principal.user_id,
+        input.principal.group_id,
+        input.principal.group_ids,
+        input.principal.group,
+    )
+    .map_err(|error| format!("cannot bind candidate target verifier identity: {error}"))?;
+    let launch_authorities = hell_testkit::PosixLaunchAuthorities::new(
+        input.adapter.adapter.clone(),
+        input.adapter.sha256,
+        cargo.canonical_identity().to_path_buf(),
+        cargo_protection.adapter.clone(),
+        cargo_protection.sha256,
+        posix_cargo_source_authority(&cargo_authority, Some(&rustup))?,
+    );
+    let policy = hell_testkit::CandidateLaunchPolicy::posix_with_process_authorities(
+        input.sudo.to_path_buf(),
+        input.process_authorities.launch_authorities()?,
+        launch_authorities,
+        identity,
+        vec![input.protection.path().to_path_buf()],
+    )
+    .map_err(|error| format!("cannot establish candidate target verifier policy: {error}"))?;
+    let isolated = prepare_candidate_target_isolated_environment(
+        input.sudo,
+        input.principal.group_id,
+        input.protection.path(),
+    )?;
+    Ok(CandidateTargetLaunch {
+        cargo,
+        rustup,
+        policy,
+        isolated,
+    })
+}
+
+#[cfg(unix)]
+fn prepare_candidate_target_isolated_environment(
+    sudo: &Path,
+    candidate_group_id: u32,
+    target: &Path,
+) -> Result<PathBuf, String> {
+    let isolated = target.join("release-child-environment");
+    fs::create_dir(&isolated)
+        .map_err(|error| format!("cannot create candidate target verifier environment: {error}"))?;
+    for directory in ["home", "cargo", "sccache", "tmp"] {
+        let path = isolated.join(directory);
+        fs::create_dir(&path).map_err(|error| {
+            format!("cannot create candidate target verifier {directory}: {error}")
         })?;
-        if !cleanup_probe.status.success()
-            || cleanup_probe.timed_out
-            || hostile_metadata.file_type().is_symlink()
-            || !hostile_metadata.is_dir()
-            || hostile_metadata.uid() != candidate_uid
-            || hostile_metadata.permissions().mode() & 0o7777 != 0o500
+        hell_testkit::prepare_posix_writable_directory_for_integration(
+            sudo,
+            candidate_group_id,
+            target,
+            &path,
+        )
+        .map_err(|error| {
+            format!("cannot delegate candidate target verifier {directory}: {error}")
+        })?;
+    }
+    Ok(isolated)
+}
+
+#[cfg(target_os = "macos")]
+struct CandidateTargetBrokerInput<'a> {
+    fixture: &'a Path,
+    sequence: u64,
+    sudo: &'a Path,
+    adapter: &'a PosixAdapterProtection,
+    candidate_user_id: u32,
+    candidate_group_id: u32,
+    target: &'a Path,
+    isolated: &'a Path,
+    policy: &'a hell_testkit::CandidateLaunchPolicy,
+    project: &'a Path,
+}
+
+#[cfg(target_os = "macos")]
+struct FakeArchiveBrokerFixture {
+    root: PathBuf,
+    socket: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(target_os = "macos")]
+fn verify_candidate_target_broker(input: &CandidateTargetBrokerInput<'_>) -> Result<(), String> {
+    let (broker_adapter, broker_inputs) = prepare_derived_archive_broker(input)?;
+    let fake = prepare_fake_archive_broker(input.fixture, input.sequence)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| "derived broker cleanup deadline overflowed".to_owned())?;
+    let mut broker = match crate::command::NativeArchiveInputBroker::start_for_integration(
+        &broker_inputs,
+        input.candidate_user_id,
+        4,
+        64,
+    ) {
+        Ok(broker) => broker,
+        Err(primary) => return combine_fake_broker_start_failure(fake, primary),
+    };
+    let descendant = run_candidate_target_broker_descendant(input, &broker_adapter, &fake.socket);
+    let observation = observe_fake_archive_broker(&fake.listener);
+    drop(fake.listener);
+    let broker_cleanup = broker.close_until(deadline);
+    let staging_absence = broker_cleanup.as_ref().map_or(Ok(()), |()| {
+        if fs::read_dir(&broker_inputs)
+            .map_err(|error| format!("cannot attest derived broker cleanup: {error}"))?
+            .next()
+            .is_none()
         {
-            return Err("candidate-owned target cleanup fixture differs from policy".to_owned());
+            Ok(())
+        } else {
+            Err("derived broker staging remains after cleanup".to_owned())
         }
-        verify_linux_candidate_principal_rollback(&sudo)?;
+    });
+    let fake_cleanup = remove_fake_archive_broker(&fake.root, &fake.socket);
+    combine_candidate_target_broker_results(
+        descendant,
+        observation,
+        broker_cleanup,
+        staging_absence,
+        fake_cleanup,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_derived_archive_broker(
+    input: &CandidateTargetBrokerInput<'_>,
+) -> Result<(PathBuf, PathBuf), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let adapter = input.fixture.join("derived-native-archive-broker");
+    let authority = adapter.join(".authority");
+    let inputs = authority.join("inputs");
+    fs::create_dir(&adapter)
+        .and_then(|()| fs::create_dir(&authority))
+        .and_then(|()| fs::create_dir(&inputs))
+        .map_err(|error| format!("cannot create derived broker fixture: {error}"))?;
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o2755))
+        .and_then(|()| fs::set_permissions(&authority, fs::Permissions::from_mode(0o555)))
+        .map_err(|error| format!("cannot seal derived broker fixture: {error}"))?;
+    let candidate_group = input.candidate_group_id.to_string();
+    trusted_tool_status(
+        input.sudo,
+        &input.adapter.tools.change_group,
+        [
+            candidate_group.as_str(),
+            path_text(&inputs, "derived broker input staging")?,
+        ],
+    )?;
+    fs::set_permissions(&inputs, fs::Permissions::from_mode(0o2710))
+        .map_err(|error| format!("cannot confine derived broker fixture: {error}"))?;
+    Ok((adapter, inputs))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_fake_archive_broker(
+    trusted_fixture: &Path,
+    sequence: u64,
+) -> Result<FakeArchiveBrokerFixture, String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::net::UnixListener;
+
+    let root = fs::canonicalize("/tmp")
+        .map_err(|error| format!("cannot bind fake broker parent: {error}"))?
+        .join(format!(
+            "hell-ci-fake-archive-broker-{}-{sequence}",
+            std::process::id()
+        ));
+    fs::create_dir(&root).map_err(|error| format!("cannot create fake broker fixture: {error}"))?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o711))
+        .map_err(|error| format!("cannot confine fake broker fixture: {error}"))?;
+    let socket = root.join("s");
+    let listener = UnixListener::bind(&socket)
+        .map_err(|error| format!("cannot bind fake broker fixture: {error}"))?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o622))
+        .map_err(|error| format!("cannot delegate fake broker fixture: {error}"))?;
+    let root_metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot bind fake broker root receipt: {error}"))?;
+    let socket_metadata = fs::symlink_metadata(&socket)
+        .map_err(|error| format!("cannot bind fake broker socket receipt: {error}"))?;
+    let trusted_metadata = fs::metadata(trusted_fixture)
+        .map_err(|error| format!("cannot bind trusted fixture owner: {error}"))?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != trusted_metadata.uid()
+        || root_metadata.permissions().mode() & 0o7777 != 0o711
+        || !socket_metadata.file_type().is_socket()
+        || socket_metadata.uid() != root_metadata.uid()
+        || socket_metadata.permissions().mode() & 0o7777 != 0o622
+    {
+        return Err("fake broker candidate-connectability receipt differs".to_owned());
+    }
+    Ok(FakeArchiveBrokerFixture {
+        root,
+        socket,
+        listener,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_candidate_target_broker_descendant(
+    input: &CandidateTargetBrokerInput<'_>,
+    broker_adapter: &Path,
+    fake_socket: &Path,
+) -> Result<(), String> {
+    let result =
+        with_release_candidate_environment(input.target, input.isolated, 1, input.policy, || {
+            CommandSpec::new(input.adapter.adapter.as_os_str(), Duration::from_secs(30))
+                .argument("__verify-native-archive-broker-descendant-launcher")
+                .argument(broker_adapter)
+                .argument(fake_socket)
+                .argument(input.isolated.join("tmp"))
+                .current_directory(input.project)
+                .run()
+        })
+        .map_err(|error| format!("cannot run restricted broker descendant: {error}"))?;
+    if result.status.success() && !result.timed_out {
         Ok(())
-    })();
-    let lifecycle_cleanup = match principal_cleanup.take() {
+    } else {
+        Err(format!(
+            "restricted broker descendant failed: status={:?}; stderr={}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr)
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn observe_fake_archive_broker(listener: &std::os::unix::net::UnixListener) -> Result<(), String> {
+    use std::io::Read as _;
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot bound fake broker observation: {error}"))?;
+    let (mut control, _) = listener
+        .accept()
+        .map_err(|error| format!("candidate did not prove fake broker connectability: {error}"))?;
+    control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("cannot bound fake broker marker: {error}"))?;
+    let mut marker = [0_u8; crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER.len()];
+    control
+        .read_exact(&mut marker)
+        .map_err(|error| format!("cannot read fake broker marker: {error}"))?;
+    if marker != *crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER {
+        return Err("candidate fake broker connectivity marker differs".to_owned());
+    }
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Ok(_) => Err("sealed-capability adapter connected to the typed decoy broker".to_owned()),
+        Err(error) => Err(format!("cannot observe fake broker endpoint: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn combine_fake_broker_start_failure(
+    fake: FakeArchiveBrokerFixture,
+    primary: String,
+) -> Result<(), String> {
+    drop(fake.listener);
+    match remove_fake_archive_broker(&fake.root, &fake.socket) {
+        Ok(()) => Err(primary),
+        Err(cleanup) => Err(format!("{primary}; {cleanup}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_fake_archive_broker(root: &Path, socket: &Path) -> Result<(), String> {
+    fs::remove_file(socket)
+        .and_then(|()| fs::remove_dir(root))
+        .map_err(|error| format!("cannot clean fake broker fixture: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn combine_candidate_target_broker_results(
+    descendant: Result<(), String>,
+    observation: Result<(), String>,
+    broker_cleanup: Result<(), String>,
+    staging_absence: Result<(), String>,
+    fake_cleanup: Result<(), String>,
+) -> Result<(), String> {
+    let failures = [
+        descendant,
+        observation,
+        broker_cleanup.map_err(|error| format!("derived broker cleanup: {error}")),
+        staging_absence,
+        fake_cleanup,
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(unix)]
+struct CandidateTargetProbeInput<'a> {
+    cargo: &'a crate::command::ResolvedCargoExecutable,
+    rustup: &'a PosixRustupProtection,
+    policy: &'a hell_testkit::CandidateLaunchPolicy,
+    isolated: &'a Path,
+    project: &'a Path,
+    target: &'a PosixCandidateTargetProtection,
+    workspace_target: &'a Path,
+    candidate_user_id: u32,
+}
+
+#[cfg(unix)]
+fn build_and_run_candidate_target_probe(
+    input: &CandidateTargetProbeInput<'_>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    preflight_exact_staged_rustc_as_candidate(
+        input.target.path(),
+        input.isolated,
+        input.policy,
+        input.project,
+        input.rustup,
+    )?;
+    let build = with_release_candidate_environment(
+        input.target.path(),
+        input.isolated,
+        1,
+        input.policy,
+        || {
+            CommandSpec::trusted_cargo(Duration::from_mins(5), input.cargo)
+                .arguments(["build", "--release", "--locked", "--offline"])
+                .current_directory(input.project)
+                .run()
+        },
+    )
+    .map_err(|error| format!("cannot run restricted candidate Cargo build: {error}"))?;
+    if !build.status.success() || build.timed_out {
+        return Err(format!(
+            "restricted candidate Cargo build failed: status={:?}; stderr={}",
+            build.status.code(),
+            String::from_utf8_lossy(&build.stderr)
+        ));
+    }
+    let artifact = input.target.path().join("release/posix-target-probe");
+    let metadata = fs::symlink_metadata(&artifact)
+        .map_err(|error| format!("cannot inspect candidate Cargo artifact: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != input.candidate_user_id
+        || input.project.join("target").exists()
+    {
+        return Err("candidate Cargo output differs from its staged authority".to_owned());
+    }
+    let probe = with_release_candidate_environment(
+        input.target.path(),
+        input.isolated,
+        1,
+        input.policy,
+        || {
+            CommandSpec::new(artifact.as_os_str(), Duration::from_secs(30))
+                .argument(input.target.path())
+                .argument(input.workspace_target)
+                .current_directory(input.project)
+                .run()
+        },
+    )
+    .map_err(|error| format!("cannot run restricted candidate target artifact: {error}"))?;
+    if !probe.status.success() || probe.timed_out {
+        return Err(format!(
+            "restricted candidate target artifact failed: status={:?}; stderr={}",
+            probe.status.code(),
+            String::from_utf8_lossy(&probe.stderr)
+        ));
+    }
+    if input
+        .workspace_target
+        .join("candidate-direct-write")
+        .exists()
+    {
+        return Err("candidate reached the hosted target through confined ancestry".to_owned());
+    }
+    Ok(artifact)
+}
+
+#[cfg(unix)]
+fn verify_candidate_target_export_rollback(
+    adapter: &PosixAdapterProtection,
+    protection: &mut PosixCandidateTargetProtection,
+    workspace_target: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let hosted_identity = posix_object_identity(workspace_target)?;
+    let input_before = fs::symlink_metadata(workspace_target.join("seed/input"))
+        .map_err(|error| format!("cannot inspect hosted cache seed before export: {error}"))?;
+    let alias_before = fs::symlink_metadata(workspace_target.join("seed/alias"))
+        .map_err(|error| format!("cannot inspect hosted cache alias before export: {error}"))?;
+    if input_before.nlink() != 2
+        || (input_before.dev(), input_before.ino()) != (alias_before.dev(), alias_before.ino())
+    {
+        return Err("hosted target verifier hard-link fixture changed before export".to_owned());
+    }
+    let mut receipt = PosixCandidateTargetExportReceipt::default();
+    let injected = export_posix_candidate_target_with_fault(
+        adapter,
+        protection,
+        workspace_target,
+        PosixCandidateTargetExportFault::AfterBackupRename,
+        &mut receipt,
+    );
+    if receipt.phase != PosixCandidateTargetExportPhase::InjectedRollbackComplete {
+        return Err(format!(
+            "candidate target export fault hook was not reached: phase={:?}; result={injected:?}",
+            receipt.phase
+        ));
+    }
+    if !matches!(injected, Err(ref error) if error == "injected candidate target export failure after backup rename")
+    {
+        return Err("candidate target export fault result was not exact".to_owned());
+    }
+    let input_after = fs::symlink_metadata(workspace_target.join("seed/input"))
+        .map_err(|error| format!("cannot inspect hosted cache seed after rollback: {error}"))?;
+    let alias_after = fs::symlink_metadata(workspace_target.join("seed/alias"))
+        .map_err(|error| format!("cannot inspect hosted cache alias after rollback: {error}"))?;
+    let process = std::process::id();
+    if posix_object_identity(workspace_target)? != hosted_identity
+        || (input_after.dev(), input_after.ino()) != (input_before.dev(), input_before.ino())
+        || (alias_after.dev(), alias_after.ino()) != (alias_before.dev(), alias_before.ino())
+        || fs::read(workspace_target.join("seed/input")).map_err(|error| {
+            format!("cannot reread hosted cache after injected export failure: {error}")
+        })? != b"trusted-cache-seed\n"
+        || workspace_target.join("release/posix-target-probe").exists()
+        || workspace_target.join("cache/compiler-state").exists()
+        || workspace_target
+            .with_file_name(format!("candidate-target-export-replacement-{process}"))
+            .exists()
+        || workspace_target
+            .with_file_name(format!("candidate-target-export-backup-{process}"))
+            .exists()
+    {
+        return Err(
+            "candidate target export failure did not retain the exact old hosted cache".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn export_and_validate_candidate_target(
+    adapter: &PosixAdapterProtection,
+    protection: &mut PosixCandidateTargetProtection,
+    workspace_target: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    export_posix_candidate_target(adapter, protection, workspace_target)?;
+    let artifact = fs::symlink_metadata(workspace_target.join("release/posix-target-probe"))
+        .map_err(|error| format!("cannot inspect hosted target verifier artifact: {error}"))?;
+    if !artifact.is_file()
+        || artifact.file_type().is_symlink()
+        || fs::read(workspace_target.join("cache/compiler-state"))
+            .map_err(|error| format!("cannot read hosted target verifier cache: {error}"))?
+            != b"candidate-cache\n"
+        || fs::read(workspace_target.join("evidence/hosted-target-inaccessible"))
+            .map_err(|error| format!("cannot read hosted target verifier evidence: {error}"))?
+            != b"permission-denied\n"
+        || fs::read(workspace_target.join("seed/input"))
+            .map_err(|error| format!("cannot reread hosted target verifier seed: {error}"))?
+            != b"trusted-cache-seed\n"
+        || fs::read(workspace_target.join("seed/alias"))
+            .map_err(|error| format!("cannot reread hosted target verifier alias: {error}"))?
+            != b"trusted-cache-seed\n"
+    {
+        return Err("candidate target trusted export differs from staged output".to_owned());
+    }
+    let exported_input = fs::symlink_metadata(workspace_target.join("seed/input"))
+        .map_err(|error| format!("cannot inspect exported target verifier seed: {error}"))?;
+    let exported_alias = fs::symlink_metadata(workspace_target.join("seed/alias"))
+        .map_err(|error| format!("cannot inspect exported target verifier alias: {error}"))?;
+    if exported_input.nlink() != 1
+        || exported_alias.nlink() != 1
+        || (exported_input.dev(), exported_input.ino())
+            == (exported_alias.dev(), exported_alias.ino())
+    {
+        return Err("candidate target export retained an in-tree hard-link alias".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct CandidateTargetCleanupProbeInput<'a> {
+    artifact: &'a Path,
+    target: &'a PosixCandidateTargetProtection,
+    workspace_target: &'a Path,
+    isolated: &'a Path,
+    policy: &'a hell_testkit::CandidateLaunchPolicy,
+    project: &'a Path,
+    candidate_user_id: u32,
+}
+
+#[cfg(unix)]
+fn verify_candidate_target_cleanup_probe(
+    input: &CandidateTargetCleanupProbeInput<'_>,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let result = with_release_candidate_environment(
+        input.target.path(),
+        input.isolated,
+        1,
+        input.policy,
+        || {
+            CommandSpec::new(input.artifact.as_os_str(), Duration::from_secs(30))
+                .argument(input.target.path())
+                .argument(input.workspace_target)
+                .argument("cleanup-hostile")
+                .current_directory(input.project)
+                .run()
+        },
+    )
+    .map_err(|error| format!("cannot create candidate-owned target cleanup fixture: {error}"))?;
+    let hostile = input.target.path().join("cleanup-hostile");
+    let metadata = fs::symlink_metadata(&hostile).map_err(|error| {
+        format!("cannot inspect candidate-owned target cleanup fixture: {error}")
+    })?;
+    if !result.status.success()
+        || result.timed_out
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != input.candidate_user_id
+        || metadata.permissions().mode() & 0o7777 != 0o500
+    {
+        return Err("candidate-owned target cleanup fixture differs from policy".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finish_candidate_target_verifier(
+    result: Result<(), String>,
+    principal_cleanup: Option<PosixPrincipalCleanup>,
+    transient_cleanup: &PosixVerifierTransientCleanup,
+    process_authorities: &ResolvedPosixProcessAuthorities,
+    fixture: &Path,
+) -> Result<(), String> {
+    let lifecycle_cleanup = match principal_cleanup {
         Some(cleanup) => cleanup.finish(),
         None => Instant::now()
             .checked_add(Duration::from_secs(30))
             .ok_or_else(|| "candidate verifier cleanup deadline overflowed".to_owned())
-            .and_then(|deadline| transient_cleanup.cleanup_until(&process_authorities, deadline)),
+            .and_then(|deadline| transient_cleanup.cleanup_until(process_authorities, deadline)),
     };
     let transient_absence = transient_cleanup.require_absent();
-    let fixture_cleanup = fs::remove_dir_all(&fixture)
+    let fixture_cleanup = fs::remove_dir_all(fixture)
         .map_err(|error| format!("cannot remove candidate target verifier fixture: {error}"));
     combine_candidate_target_verifier_results(
         result,
         lifecycle_cleanup,
         transient_absence,
         fixture_cleanup,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Result<(), String> {
+    let CandidateTargetVerifierContext {
+        platform,
+        process_authorities,
+        sudo,
+        adapter,
+        fixture,
+        transient,
+        transient_cleanup,
+        sequence,
+    } = allocate_candidate_target_verifier_context()?;
+    let mut principal_cleanup = None;
+    let result = (|| {
+        let workspace_authority = prepare_candidate_target_workspace(&fixture)?;
+        let workspace_target = workspace_authority.target.clone();
+        let trusted_group = workspace_authority.trusted_group;
+        let principal_authority = allocate_candidate_target_principal(
+            &CandidateTargetPrincipalInput {
+                platform,
+                process_authorities: &process_authorities,
+                transient_cleanup: &transient_cleanup,
+                sequence,
+                trusted_group,
+            },
+            &mut principal_cleanup,
+        )?;
+        let candidate_user_id = principal_authority.user_id;
+        let candidate_group_id = principal_authority.group_id;
+        let mut protection = stage_candidate_target_for_verifier(&CandidateTargetStageInput {
+            sudo: &sudo,
+            adapter: &adapter,
+            transient: &transient,
+            workspace: &workspace_authority,
+            principal: &principal_authority,
+        })?;
+        let project = write_candidate_target_probe_project(&transient)?;
+        let CandidateTargetLaunch {
+            cargo,
+            rustup: rustup_protection,
+            policy,
+            isolated,
+        } = prepare_candidate_target_launch(CandidateTargetLaunchInput {
+            platform,
+            sudo: &sudo,
+            adapter: &adapter,
+            process_authorities: &process_authorities,
+            project: &project,
+            protection: &protection,
+            principal: principal_authority,
+        })?;
+        #[cfg(target_os = "macos")]
+        verify_candidate_target_broker(&CandidateTargetBrokerInput {
+            fixture: &fixture,
+            sequence,
+            sudo: &sudo,
+            adapter: &adapter,
+            candidate_user_id,
+            candidate_group_id,
+            target: protection.path(),
+            isolated: &isolated,
+            policy: &policy,
+            project: &project,
+        })?;
+        let artifact = build_and_run_candidate_target_probe(&CandidateTargetProbeInput {
+            cargo: &cargo,
+            rustup: &rustup_protection,
+            policy: &policy,
+            isolated: &isolated,
+            project: &project,
+            target: &protection,
+            workspace_target: &workspace_target,
+            candidate_user_id,
+        })?;
+        verify_candidate_target_export_rollback(&adapter, &mut protection, &workspace_target)?;
+        export_and_validate_candidate_target(&adapter, &mut protection, &workspace_target)?;
+        verify_candidate_target_cleanup_probe(&CandidateTargetCleanupProbeInput {
+            artifact: &artifact,
+            target: &protection,
+            workspace_target: &workspace_target,
+            isolated: &isolated,
+            policy: &policy,
+            project: &project,
+            candidate_user_id,
+        })?;
+        #[cfg(target_os = "linux")]
+        verify_linux_candidate_principal_rollback(&sudo)?;
+        Ok(())
+    })();
+    finish_candidate_target_verifier(
+        result,
+        principal_cleanup.take(),
+        &transient_cleanup,
+        &process_authorities,
+        &fixture,
     )
 }
 
@@ -7653,8 +8804,15 @@ pub(crate) fn verify_posix_native_cargo_rejection_for_integration() -> Result<()
 
 #[cfg(unix)]
 pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
+    verify_linux_principal_reservation_planner()?;
+    verify_posix_process_inventory_parser()?;
+    verify_macos_directory_service_parsers()?;
+    verify_linux_acl_parser()?;
+    verify_posix_rustc_binding_fixture()
+}
 
+#[cfg(unix)]
+fn verify_linux_principal_reservation_planner() -> Result<(), String> {
     let allocation_policy = LinuxPrincipalIdPolicy {
         first: 1_000,
         span: 4,
@@ -7668,12 +8826,14 @@ pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), Str
     )?;
     let mut occupied = LinuxPrincipalOccupancy::default();
     occupied.uids.insert(first.id);
-    let occupied_uid =
+    let after_occupied_user =
         planned_linux_principal_candidate(allocation_policy, "hellplan", 10, 0, &occupied)?;
-    occupied.gids.insert(occupied_uid.id);
-    let occupied_gid =
+    occupied.gids.insert(after_occupied_user.id);
+    let after_occupied_group =
         planned_linux_principal_candidate(allocation_policy, "hellplan", 10, 0, &occupied)?;
-    occupied.principals.insert(occupied_gid.principal.clone());
+    occupied
+        .principals
+        .insert(after_occupied_group.principal.clone());
     let stale_name =
         planned_linux_principal_candidate(allocation_policy, "hellplan", 10, 0, &occupied)?;
     let mut concurrent = LinuxPrincipalOccupancy::default();
@@ -7687,16 +8847,20 @@ pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), Str
     exhausted
         .uids
         .extend(allocation_policy.first..allocation_policy.first + allocation_policy.span);
-    if first == occupied_uid
-        || occupied_uid == occupied_gid
-        || occupied_gid == stale_name
+    if first == after_occupied_user
+        || after_occupied_user == after_occupied_group
+        || after_occupied_group == stale_name
         || first == second
         || planned_linux_principal_candidate(allocation_policy, "hellplan", 10, 0, &exhausted)
             .is_ok()
     {
         return Err("Linux principal reservation planner is not collision-closed".to_owned());
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn verify_posix_process_inventory_parser() -> Result<(), String> {
     if !posix_process_inventory_is_canonical(b"1\n22\n")
         || posix_process_inventory_is_canonical(b"")
         || posix_process_inventory_is_canonical(b"1")
@@ -7707,7 +8871,11 @@ pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), Str
     {
         return Err("POSIX process inventory verifier is not fail-closed".to_owned());
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn verify_macos_directory_service_parsers() -> Result<(), String> {
     let directory_service_inventory = b"nobody -2\nhellcandidate 550\nroot 0\n";
     if macos_directory_service_inventory_id(
         directory_service_inventory,
@@ -7761,7 +8929,11 @@ pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), Str
             "macOS construction side-effect receipt verifier is not fail-closed".to_owned(),
         );
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn verify_linux_acl_parser() -> Result<(), String> {
     let base_acl = b"# file: /authority\n# owner: root\n# group: root\nuser::r-x\ngroup::r-x\nother::r-x\n\n# file: /authority/rustc\n# owner: root\n# group: root\nuser::r-x\ngroup::r-x\nother::r-x\n\n";
     if !linux_getfacl_output_is_exact_base_acl(base_acl, 2)
         || linux_getfacl_output_is_exact_base_acl(base_acl, 1)
@@ -7780,6 +8952,12 @@ pub(crate) fn verify_posix_rustc_environment_for_integration() -> Result<(), Str
     {
         return Err("Linux base-only ACL framing verifier is not fail-closed".to_owned());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_posix_rustc_binding_fixture() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
     let temporary_root = fs::canonicalize(env::temp_dir())
         .map_err(|error| format!("cannot canonicalize Rust compiler verifier root: {error}"))?;
@@ -7875,7 +9053,7 @@ fn validate_posix_candidate_environment(
         .validate_exact_children(checkpoint, &expected)?;
     if protection.children.len() != expected.len() {
         return Err(format!(
-            "candidate environment child checkpoint inventory changed: checkpoint={checkpoint:?}; expectedCount={}; observedCount={}",
+            "candidate environment child checkpoint inventory changed: checkpoint={checkpoint}; expectedCount={}; observedCount={}",
             expected.len(),
             protection.children.len()
         ));
@@ -7884,8 +9062,9 @@ fn validate_posix_candidate_environment(
         let expected_path = protection.root.path().join(name);
         if authority.path() != expected_path {
             return Err(format!(
-                "candidate environment child authority path changed: checkpoint={checkpoint:?}; expectedPath={expected_path:?}; observedPath={:?}",
-                authority.path()
+                "candidate environment child authority path changed: checkpoint={checkpoint}; expectedPath={}; observedPath={}",
+                expected_path.display(),
+                authority.path().display()
             ));
         }
         authority.validate(checkpoint)?;
@@ -7972,14 +9151,100 @@ pub(crate) fn verify_posix_candidate_home_test_authority_for_integration() -> Re
 }
 
 #[cfg(unix)]
-fn require_posix_archive_adapter_inventory_phase(
+fn validate_posix_archive_adapter_metadata(
     adapter: &Path,
-    require_clean_stack_work: bool,
+    authority: &Path,
+    toolchain: &Path,
+    work: &Path,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
+    let authority_metadata = fs::symlink_metadata(authority)
+        .map_err(|error| format!("cannot inspect native archive archiver authority: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let input_staging_metadata = fs::symlink_metadata(authority.join("inputs"))
+        .map_err(|error| format!("cannot inspect native archive input staging: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let archiver_path = authority.join("llvm").join("bin").join("llvm-ar");
+    #[cfg(not(target_os = "macos"))]
+    let archiver_path = authority.join("llvm-ar");
+    #[cfg(target_os = "macos")]
+    crate::command::BoundNativeArchiver::bind_existing_for_publisher(&archiver_path)?
+        .revalidate()?;
+    let archiver_metadata = fs::symlink_metadata(&archiver_path)
+        .map_err(|error| format!("cannot inspect bound LLVM archiver: {error}"))?;
+    let metadata = [
+        fs::symlink_metadata(adapter.join("ar"))
+            .map_err(|error| format!("cannot inspect native archive launcher: {error}"))?,
+        fs::symlink_metadata(adapter.join("stack.yaml"))
+            .map_err(|error| format!("cannot inspect native Stack overlay: {error}"))?,
+        fs::symlink_metadata(adapter.join("stack.yaml.lock"))
+            .map_err(|error| format!("cannot inspect native Stack lock: {error}"))?,
+        fs::symlink_metadata(toolchain)
+            .map_err(|error| format!("cannot inspect staged toolchain authority: {error}"))?,
+        fs::symlink_metadata(work.join("tmp")).map_err(|error| {
+            format!("cannot inspect candidate Stack temporary directory: {error}")
+        })?,
+    ];
+    #[cfg(target_os = "macos")]
+    let archiver_type_invalid = archiver_metadata.file_type().is_symlink()
+        || !archiver_metadata.is_file()
+        || archiver_metadata.permissions().mode() & 0o7777 != 0o555
+        || archiver_metadata.nlink() != 1;
+    #[cfg(not(target_os = "macos"))]
+    let archiver_type_invalid = !archiver_metadata.file_type().is_symlink();
+    let [
+        launcher,
+        stack_yaml,
+        stack_lock,
+        toolchain_metadata,
+        temporary,
+    ] = metadata;
+    let invalid_input_staging = {
+        #[cfg(target_os = "macos")]
+        {
+            input_staging_metadata.file_type().is_symlink()
+                || !input_staging_metadata.is_dir()
+                || !matches!(
+                    input_staging_metadata.permissions().mode() & 0o7777,
+                    0o700 | 0o2710
+                )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    };
+    if authority_metadata.file_type().is_symlink()
+        || !authority_metadata.is_dir()
+        || authority_metadata.permissions().mode() & 0o7777 != 0o555
+        || invalid_input_staging
+        || archiver_type_invalid
+        || !launcher.file_type().is_symlink()
+        || stack_yaml.file_type().is_symlink()
+        || !stack_yaml.is_file()
+        || stack_lock.file_type().is_symlink()
+        || !stack_lock.is_file()
+        || toolchain_metadata.file_type().is_symlink()
+        || !toolchain_metadata.is_dir()
+        || toolchain_metadata.permissions().mode() & 0o7777 != 0o555
+        || temporary.file_type().is_symlink()
+        || !temporary.is_dir()
+    {
+        return Err(
+            "native archive adapter inventory contains an unexpected entry type".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_posix_archive_adapter_inventory_phase(
+    adapter: &Path,
+    require_clean_stack_work: bool,
+) -> Result<(), String> {
     require_exact_directory_members(
         adapter,
         &[
@@ -8043,72 +9308,7 @@ fn require_posix_archive_adapter_inventory_phase(
     }
     let toolchain_inventory = crate::command::BoundNativeToolchainInventory::bind(adapter)?;
     toolchain_inventory.revalidate()?;
-    let authority_metadata = fs::symlink_metadata(&authority)
-        .map_err(|error| format!("cannot inspect native archive archiver authority: {error}"))?;
-    #[cfg(target_os = "macos")]
-    let input_staging_metadata = fs::symlink_metadata(authority.join("inputs"))
-        .map_err(|error| format!("cannot inspect native archive input staging: {error}"))?;
-    #[cfg(target_os = "macos")]
-    let archiver_path = authority.join("llvm").join("bin").join("llvm-ar");
-    #[cfg(not(target_os = "macos"))]
-    let archiver_path = authority.join("llvm-ar");
-    #[cfg(target_os = "macos")]
-    crate::command::BoundNativeArchiver::bind_existing_for_publisher(&archiver_path)?
-        .revalidate()?;
-    let archiver_metadata = fs::symlink_metadata(&archiver_path)
-        .map_err(|error| format!("cannot inspect bound LLVM archiver: {error}"))?;
-    let launcher_metadata = fs::symlink_metadata(adapter.join("ar"))
-        .map_err(|error| format!("cannot inspect native archive launcher: {error}"))?;
-    let stack_yaml_metadata = fs::symlink_metadata(adapter.join("stack.yaml"))
-        .map_err(|error| format!("cannot inspect native Stack overlay: {error}"))?;
-    let stack_lock_metadata = fs::symlink_metadata(adapter.join("stack.yaml.lock"))
-        .map_err(|error| format!("cannot inspect native Stack lock: {error}"))?;
-    let toolchain_metadata = fs::symlink_metadata(&toolchain)
-        .map_err(|error| format!("cannot inspect staged toolchain authority: {error}"))?;
-    let temporary_metadata = fs::symlink_metadata(work.join("tmp"))
-        .map_err(|error| format!("cannot inspect candidate Stack temporary directory: {error}"))?;
-    #[cfg(target_os = "macos")]
-    let archiver_type_invalid = archiver_metadata.file_type().is_symlink()
-        || !archiver_metadata.is_file()
-        || archiver_metadata.permissions().mode() & 0o7777 != 0o555
-        || archiver_metadata.nlink() != 1;
-    #[cfg(not(target_os = "macos"))]
-    let archiver_type_invalid = !archiver_metadata.file_type().is_symlink();
-    if authority_metadata.file_type().is_symlink()
-        || !authority_metadata.is_dir()
-        || authority_metadata.permissions().mode() & 0o7777 != 0o555
-        || {
-            #[cfg(target_os = "macos")]
-            {
-                input_staging_metadata.file_type().is_symlink()
-                    || !input_staging_metadata.is_dir()
-                    || !matches!(
-                        input_staging_metadata.permissions().mode() & 0o7777,
-                        0o700 | 0o2710
-                    )
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                false
-            }
-        }
-        || archiver_type_invalid
-        || !launcher_metadata.file_type().is_symlink()
-        || stack_yaml_metadata.file_type().is_symlink()
-        || !stack_yaml_metadata.is_file()
-        || stack_lock_metadata.file_type().is_symlink()
-        || !stack_lock_metadata.is_file()
-        || toolchain_metadata.file_type().is_symlink()
-        || !toolchain_metadata.is_dir()
-        || toolchain_metadata.permissions().mode() & 0o7777 != 0o555
-        || temporary_metadata.file_type().is_symlink()
-        || !temporary_metadata.is_dir()
-    {
-        return Err(
-            "native archive adapter inventory contains an unexpected entry type".to_owned(),
-        );
-    }
-    Ok(())
+    validate_posix_archive_adapter_metadata(adapter, &authority, &toolchain, &work)
 }
 
 #[cfg(unix)]
@@ -8128,14 +9328,14 @@ struct PosixArchiveAdapterTransitionState<'a> {
 
 #[cfg(unix)]
 fn require_posix_archive_adapter_transition_state(
-    state: PosixArchiveAdapterTransitionState<'_>,
+    state: &PosixArchiveAdapterTransitionState<'_>,
 ) -> Result<(), String> {
     require_posix_archive_adapter_transition_state_phase(state, true)
 }
 
 #[cfg(unix)]
 fn require_posix_archive_adapter_transition_state_phase(
-    state: PosixArchiveAdapterTransitionState<'_>,
+    state: &PosixArchiveAdapterTransitionState<'_>,
     require_clean_stack_work: bool,
 ) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -8152,7 +9352,7 @@ fn require_posix_archive_adapter_transition_state_phase(
         work_directory_identity,
         temporary_directory,
         temporary_directory_identity,
-    } = state;
+    } = *state;
 
     let observed_parent = posix_object_identity(parent)?;
     let parent_metadata = fs::symlink_metadata(parent)
@@ -8211,164 +9411,143 @@ fn require_posix_archive_adapter_transition_state_phase(
 }
 
 #[cfg(unix)]
-pub(crate) fn verify_posix_source_stack_work_cleanup_order_for_integration() -> Result<(), String> {
+fn verify_source_stack_cleanup_success(root: &Path) -> Result<(), String> {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-    let temporary_root = fs::canonicalize(env::temp_dir()).map_err(|error| {
-        format!("cannot canonicalize Stack cleanup verifier temp root: {error}")
-    })?;
-    let mut root = None;
-    for _ in 0..16 {
-        let sequence = POSIX_ARCHIVE_TRANSITION_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = temporary_root.join(format!(
-            "hell-source-stack-cleanup-verifier-{}-{sequence}",
-            std::process::id()
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                root = Some(candidate);
-                break;
+    let source = root.join("oracle");
+    let stack_work = source.join(".stack-work");
+    let sentinel = root.join("external-sentinel");
+    fs::create_dir_all(stack_work.join("nested/child"))
+        .map_err(|error| format!("cannot create source Stack cleanup fixture: {error}"))?;
+    fs::write(stack_work.join("nested/child/member"), b"member\n")
+        .map_err(|error| format!("cannot write source Stack cleanup member: {error}"))?;
+    fs::write(&sentinel, b"sentinel\n")
+        .map_err(|error| format!("cannot write source Stack cleanup sentinel: {error}"))?;
+    symlink(&sentinel, stack_work.join("external-link"))
+        .map_err(|error| format!("cannot create source Stack cleanup sentinel link: {error}"))?;
+    let source_identity = posix_object_identity(&source)?;
+    let stack_work_identity = posix_object_identity(&stack_work)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "source Stack cleanup verifier deadline overflowed".to_owned())?;
+    let snapshot_calls = std::cell::Cell::new(0_u8);
+    let receipt = cleanup_posix_source_stack_work_before_snapshot(
+        PosixSourceStackCleanupContext {
+            source: &source,
+            stack_work: &stack_work,
+            deadline,
+        },
+        || {
+            if posix_object_identity(&source)? != source_identity
+                || posix_object_identity(&stack_work)? != stack_work_identity
+            {
+                return Err("source Stack cleanup verifier authority changed".to_owned());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot create source Stack cleanup verifier root: {error}"
-                ));
+            Ok(())
+        },
+        |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("cannot open source Stack cleanup directory: {error}"))
+        },
+        |path| {
+            fs::remove_file(path)
+                .map_err(|error| format!("cannot unlink source Stack cleanup member: {error}"))
+        },
+        |path| {
+            fs::remove_dir(path)
+                .map_err(|error| format!("cannot remove source Stack cleanup directory: {error}"))
+        },
+        |_| {
+            snapshot_calls.set(snapshot_calls.get().saturating_add(1));
+            if fs::symlink_metadata(&stack_work).is_ok() {
+                return Err("snapshot validation preceded exact Stack root absence".to_owned());
             }
-        }
+            if fs::read(&sentinel)
+                .map_err(|error| format!("cannot read source Stack cleanup sentinel: {error}"))?
+                != b"sentinel\n"
+            {
+                return Err("source Stack cleanup followed an external symlink".to_owned());
+            }
+            Ok(())
+        },
+    )?;
+    if receipt.source_identity != source_identity || snapshot_calls.get() != 1 {
+        return Err("source Stack cleanup phase receipt/order is not exact".to_owned());
     }
-    let root = root.ok_or_else(|| {
-        "cannot allocate a collision-free source Stack cleanup verifier root".to_owned()
-    })?;
-    let result = (|| {
-        let source = root.join("oracle");
-        let stack_work = source.join(".stack-work");
-        let sentinel = root.join("external-sentinel");
-        fs::create_dir_all(stack_work.join("nested/child"))
-            .map_err(|error| format!("cannot create source Stack cleanup fixture: {error}"))?;
-        fs::write(stack_work.join("nested/child/member"), b"member\n")
-            .map_err(|error| format!("cannot write source Stack cleanup member: {error}"))?;
-        fs::write(&sentinel, b"sentinel\n")
-            .map_err(|error| format!("cannot write source Stack cleanup sentinel: {error}"))?;
-        symlink(&sentinel, stack_work.join("external-link")).map_err(|error| {
-            format!("cannot create source Stack cleanup sentinel link: {error}")
-        })?;
-        let source_identity = posix_object_identity(&source)?;
-        let stack_work_identity = posix_object_identity(&stack_work)?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or_else(|| "source Stack cleanup verifier deadline overflowed".to_owned())?;
-        let snapshot_calls = std::cell::Cell::new(0_u8);
-        let receipt = cleanup_posix_source_stack_work_before_snapshot(
-            PosixSourceStackCleanupContext {
-                source: &source,
-                stack_work: &stack_work,
-                deadline,
-            },
-            || {
-                if posix_object_identity(&source)? != source_identity
-                    || posix_object_identity(&stack_work)? != stack_work_identity
-                {
-                    return Err("source Stack cleanup verifier authority changed".to_owned());
-                }
-                Ok(())
-            },
-            |path| {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                    .map_err(|error| format!("cannot open source Stack cleanup directory: {error}"))
-            },
-            |path| {
-                fs::remove_file(path)
-                    .map_err(|error| format!("cannot unlink source Stack cleanup member: {error}"))
-            },
-            |path| {
-                fs::remove_dir(path).map_err(|error| {
-                    format!("cannot remove source Stack cleanup directory: {error}")
-                })
-            },
-            |_| {
-                snapshot_calls.set(snapshot_calls.get().saturating_add(1));
-                if fs::symlink_metadata(&stack_work).is_ok() {
-                    return Err("snapshot validation preceded exact Stack root absence".to_owned());
-                }
-                if fs::read(&sentinel).map_err(|error| {
-                    format!("cannot read source Stack cleanup sentinel: {error}")
-                })? != b"sentinel\n"
-                {
-                    return Err("source Stack cleanup followed an external symlink".to_owned());
-                }
-                Ok(())
-            },
-        )?;
-        if receipt.source_identity != source_identity || snapshot_calls.get() != 1 {
-            return Err("source Stack cleanup phase receipt/order is not exact".to_owned());
-        }
+    Ok(())
+}
 
-        let expired_source = root.join("expired-oracle");
-        let expired_stack_work = expired_source.join(".stack-work");
-        fs::create_dir_all(&expired_stack_work)
-            .map_err(|error| format!("cannot create expired Stack cleanup fixture: {error}"))?;
-        fs::write(expired_stack_work.join("member"), b"member\n")
-            .map_err(|error| format!("cannot write expired Stack cleanup member: {error}"))?;
-        let expired_snapshot_calls = std::cell::Cell::new(0_u8);
-        let expired = cleanup_posix_source_stack_work_before_snapshot(
-            PosixSourceStackCleanupContext {
-                source: &expired_source,
-                stack_work: &expired_stack_work,
-                deadline: Instant::now(),
-            },
-            || Ok(()),
-            |_| Ok(()),
-            |path| {
-                fs::remove_file(path)
-                    .map_err(|error| format!("cannot remove expired Stack member: {error}"))
-            },
-            |path| {
-                fs::remove_dir(path)
-                    .map_err(|error| format!("cannot remove expired Stack directory: {error}"))
-            },
-            |_| {
-                expired_snapshot_calls.set(expired_snapshot_calls.get().saturating_add(1));
-                Ok(())
-            },
-        )
-        .expect_err("expired Stack cleanup must fail before snapshot validation");
-        if !expired.contains("deadline expired")
-            || expired_snapshot_calls.get() != 0
-            || !expired_stack_work.join("member").is_file()
-        {
-            return Err(
-                "expired Stack cleanup launched snapshot work or mutated its tree".to_owned(),
-            );
-        }
-        Ok(())
-    })();
+#[cfg(unix)]
+fn verify_source_stack_cleanup_expiry(root: &Path) -> Result<(), String> {
+    let source = root.join("expired-oracle");
+    let stack_work = source.join(".stack-work");
+    fs::create_dir_all(&stack_work)
+        .map_err(|error| format!("cannot create expired Stack cleanup fixture: {error}"))?;
+    fs::write(stack_work.join("member"), b"member\n")
+        .map_err(|error| format!("cannot write expired Stack cleanup member: {error}"))?;
+    let snapshot_calls = std::cell::Cell::new(0_u8);
+    let expired = cleanup_posix_source_stack_work_before_snapshot(
+        PosixSourceStackCleanupContext {
+            source: &source,
+            stack_work: &stack_work,
+            deadline: Instant::now(),
+        },
+        || Ok(()),
+        |_| Ok(()),
+        |path| {
+            fs::remove_file(path)
+                .map_err(|error| format!("cannot remove expired Stack member: {error}"))
+        },
+        |path| {
+            fs::remove_dir(path)
+                .map_err(|error| format!("cannot remove expired Stack directory: {error}"))
+        },
+        |_| {
+            snapshot_calls.set(snapshot_calls.get().saturating_add(1));
+            Ok(())
+        },
+    )
+    .expect_err("expired Stack cleanup must fail before snapshot validation");
+    if !expired.contains("deadline expired")
+        || snapshot_calls.get() != 0
+        || !stack_work.join("member").is_file()
+    {
+        return Err("expired Stack cleanup launched snapshot work or mutated its tree".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_posix_source_stack_work_cleanup_order_for_integration() -> Result<(), String> {
+    let root = allocate_posix_verifier_root(
+        "hell-source-stack-cleanup-verifier",
+        &POSIX_ARCHIVE_TRANSITION_VERIFIER_SEQUENCE,
+    )?;
+    let result = verify_source_stack_cleanup_success(&root)
+        .and_then(|()| verify_source_stack_cleanup_expiry(&root));
     let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove source Stack cleanup verifier: {error}"));
     result.and(cleanup)
 }
 
 #[cfg(unix)]
-pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-    let simulated_phase_entry = Instant::now();
-    let simulated_preparation_completion = simulated_phase_entry
+fn verify_archive_cleanup_deadline_partition() -> Result<(), String> {
+    let phase_entry = Instant::now();
+    let preparation_completion = phase_entry
         .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET + Duration::from_secs(1))
         .ok_or_else(|| "archive transition verifier clock overflowed".to_owned())?;
-    let simulated_outer = simulated_preparation_completion
-        .checked_add(Duration::from_secs(120))
+    let outer = preparation_completion
+        .checked_add(Duration::from_mins(2))
         .ok_or_else(|| "archive transition verifier outer clock overflowed".to_owned())?;
-    let simulated_cleanup =
-        transition_cleanup_deadlines(simulated_preparation_completion, simulated_outer)?;
-    let simulated_expected = simulated_preparation_completion
+    let cleanup = transition_cleanup_deadlines(preparation_completion, outer)?;
+    let expected = preparation_completion
         .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
         .ok_or_else(|| "archive transition verifier cleanup clock overflowed".to_owned())?;
-    if simulated_cleanup.source_work != simulated_expected
-        || simulated_cleanup.adapter_close != simulated_expected
-        || simulated_cleanup.final_attestation != simulated_expected
-        || simulated_cleanup.source_work
-            <= simulated_phase_entry
+    if cleanup.source_work != expected
+        || cleanup.adapter_close != expected
+        || cleanup.final_attestation != expected
+        || cleanup.source_work
+            <= phase_entry
                 .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
                 .ok_or_else(|| {
                     "archive transition verifier stale cleanup clock overflowed".to_owned()
@@ -8376,54 +9555,62 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
     {
         return Err("archive cleanup budget started before preparation completed".to_owned());
     }
-    let clipped_outer = simulated_preparation_completion
+    let clipped_outer = preparation_completion
         .checked_add(Duration::from_secs(7))
         .ok_or_else(|| "archive transition verifier clipped clock overflowed".to_owned())?;
-    let clipped = transition_cleanup_deadlines(simulated_preparation_completion, clipped_outer)?;
+    let clipped = transition_cleanup_deadlines(preparation_completion, clipped_outer)?;
     if clipped.quiescence != clipped_outer
         || clipped.source_work != clipped_outer
         || clipped.final_attestation != clipped_outer
     {
         return Err("archive cleanup deadline escaped its enclosing completion reserve".to_owned());
     }
+    Ok(())
+}
 
-    let phase_now = Instant::now();
-    let phase_deadline = |seconds: u64| {
-        phase_now
-            .checked_add(Duration::from_secs(seconds))
+#[cfg(unix)]
+fn archive_phase_verifier_deadlines() -> Result<NativeOracleCleanupDeadlines, String> {
+    let now = Instant::now();
+    let deadline = |seconds: u64| {
+        now.checked_add(Duration::from_secs(seconds))
             .ok_or_else(|| "archive phase verifier deadline overflowed".to_owned())
     };
-    let phase_deadlines = NativeOracleCleanupDeadlines {
-        quiescence: phase_deadline(1)?,
+    Ok(NativeOracleCleanupDeadlines {
+        quiescence: deadline(1)?,
         #[cfg(target_os = "macos")]
-        broker_stop: phase_deadline(2)?,
-        source_work: phase_now
+        broker_stop: deadline(2)?,
+        source_work: now
             .checked_sub(Duration::from_secs(1))
             .ok_or_else(|| "archive phase verifier expired deadline underflowed".to_owned())?,
-        adapter_work: phase_deadline(3)?,
-        final_restore: phase_deadline(4)?,
-        adapter_close: phase_deadline(5)?,
-        final_attestation: phase_deadline(6)?,
-    };
-    let phase_order = std::cell::RefCell::new(Vec::new());
+        adapter_work: deadline(3)?,
+        final_restore: deadline(4)?,
+        adapter_close: deadline(5)?,
+        final_attestation: deadline(6)?,
+    })
+}
+
+#[cfg(unix)]
+fn verify_archive_cleanup_phase_reservation() -> Result<(), String> {
+    let deadlines = archive_phase_verifier_deadlines()?;
+    let order = std::cell::RefCell::new(Vec::new());
     let restoration = run_native_oracle_restoration_phases(
-        phase_deadlines,
+        deadlines,
         |deadline| {
-            phase_order.borrow_mut().push("source");
+            order.borrow_mut().push("source");
             if deadline >= Instant::now() {
                 return Err("source cleanup verifier deadline was not expired".to_owned());
             }
             Err("source cleanup verifier exhausted its phase".to_owned())
         },
         |deadline| {
-            phase_order.borrow_mut().push("adapter");
+            order.borrow_mut().push("adapter");
             if deadline <= Instant::now() {
                 return Err("adapter cleanup verifier lost its reserve".to_owned());
             }
             Ok(())
         },
         |deadline| {
-            phase_order.borrow_mut().push("restore");
+            order.borrow_mut().push("restore");
             if deadline <= Instant::now() {
                 return Err("final restore verifier lost its reserve".to_owned());
             }
@@ -8432,16 +9619,16 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
     )
     .expect_err("expired source cleanup must remain a typed primary restoration failure");
     let finalization = run_native_oracle_finalizer(
-        phase_deadlines,
+        deadlines,
         |deadline| {
-            phase_order.borrow_mut().push("close");
+            order.borrow_mut().push("close");
             if deadline <= Instant::now() {
                 return Err("retained close verifier lost its reserve".to_owned());
             }
             Ok(())
         },
         |deadline| {
-            phase_order.borrow_mut().push("attest");
+            order.borrow_mut().push("attest");
             if deadline <= Instant::now() {
                 return Err("final attestation verifier lost its reserve".to_owned());
             }
@@ -8452,42 +9639,52 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
         != "native archive adapter restoration failed; source-work-cleanup: source cleanup verifier exhausted its phase"
         || finalization.adapter_close.is_err()
         || finalization.final_attestation.is_err()
-        || phase_order.into_inner() != ["source", "adapter", "restore", "close", "attest"]
+        || order.into_inner() != ["source", "adapter", "restore", "close", "attest"]
     {
         return Err(
             "source cleanup exhaustion starved or reordered a later reserved cleanup phase"
                 .to_owned(),
         );
     }
-    let panic_order = std::cell::RefCell::new(Vec::new());
-    let panic_restoration = run_native_oracle_restoration_phases(
-        phase_deadlines,
+    verify_archive_cleanup_panic_reservation(deadlines)
+}
+
+#[cfg(unix)]
+fn verify_archive_cleanup_panic_reservation(
+    deadlines: NativeOracleCleanupDeadlines,
+) -> Result<(), String> {
+    let order = std::cell::RefCell::new(Vec::new());
+    let restoration = run_native_oracle_restoration_phases(
+        deadlines,
         |_| {
-            panic_order.borrow_mut().push("source-panic");
+            order.borrow_mut().push("source-panic");
             panic!("injected source cleanup panic")
         },
         |_| {
-            panic_order.borrow_mut().push("adapter-after-panic");
+            order.borrow_mut().push("adapter-after-panic");
             Ok(())
         },
         |_| {
-            panic_order.borrow_mut().push("restore-after-panic");
+            order.borrow_mut().push("restore-after-panic");
             Ok(())
         },
     )
     .expect_err("source cleanup panic must become a typed restoration failure");
-    if !panic_restoration.contains("source work cleanup panicked")
-        || panic_order.into_inner()
-            != ["source-panic", "adapter-after-panic", "restore-after-panic"]
+    if !restoration.contains("source work cleanup panicked")
+        || order.into_inner() != ["source-panic", "adapter-after-panic", "restore-after-panic"]
     {
         return Err("source cleanup panic skipped a later reserved phase".to_owned());
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn verify_archive_cleanup_receipt_and_expiry() -> Result<(), String> {
     hell_testkit::verify_posix_candidate_quiescence_receipt_binding_for_integration()
         .map_err(|error| format!("candidate quiescence receipt verifier failed: {error}"))?;
-    let missing_receipt = require_posix_archive_cleanup_quiescence(None, 41_001, 41_002)
+    let missing = require_posix_archive_cleanup_quiescence(None, 41_001, 41_002)
         .expect_err("archive cleanup must reject a missing quiescence receipt");
-    if !missing_receipt.contains("receipt is absent") {
+    if !missing.contains("receipt is absent") {
         return Err("missing archive cleanup receipt diagnostic is not exact".to_owned());
     }
     let expired_checkout = git_head_before(Path::new("."), Instant::now())
@@ -8504,101 +9701,116 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
     if !expired_tree.contains("deadline expired") {
         return Err("late archive tree attestation restarted its deadline".to_owned());
     }
+    Ok(())
+}
 
-    fn open_fixture_tree_for_cleanup(root: &Path) -> Result<(), String> {
-        let metadata = fs::symlink_metadata(root)
+#[cfg(unix)]
+fn open_archive_verifier_tree_for_cleanup(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut pending = vec![root.to_owned()];
+    while let Some(root) = pending.pop() {
+        let metadata = fs::symlink_metadata(&root)
             .map_err(|error| format!("cannot inspect archive verifier cleanup tree: {error}"))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Ok(());
+            continue;
         }
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|error| {
             format!(
                 "cannot open archive verifier cleanup directory {}: {error}",
                 root.display()
             )
         })?;
-        let children = fs::read_dir(root)
-            .map_err(|error| format!("cannot enumerate archive verifier cleanup tree: {error}"))?;
-        for child in children {
-            let child =
-                child.map_err(|error| format!("cannot inspect archive verifier child: {error}"))?;
-            open_fixture_tree_for_cleanup(&child.path())?;
-        }
-        Ok(())
-    }
-
-    fn stage_adapter(adapter: &Path, label: &str) -> Result<(), String> {
-        let work = adapter.join(".stack-work");
-        let toolchain = adapter.join(".toolchain");
-        let authority = adapter.join(".authority");
-        fs::create_dir_all(&authority)
-            .map_err(|error| format!("cannot create archive verifier authority: {error}"))?;
-        fs::create_dir_all(work.join("tmp"))
-            .map_err(|error| format!("cannot create archive verifier work tree: {error}"))?;
-        fs::create_dir_all(toolchain.join("system-ghc-9.8.2"))
-            .map_err(|error| format!("cannot create archive verifier GHC inventory: {error}"))?;
-        fs::create_dir(toolchain.join("system-tools"))
-            .map_err(|error| format!("cannot create archive verifier tool inventory: {error}"))?;
-        #[cfg(target_os = "macos")]
+        for child in fs::read_dir(&root)
+            .map_err(|error| format!("cannot enumerate archive verifier cleanup tree: {error}"))?
         {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let inputs = authority.join("inputs");
-            fs::create_dir(&inputs).map_err(|error| {
-                format!("cannot create archive verifier input staging: {error}")
-            })?;
-            fs::set_permissions(&inputs, fs::Permissions::from_mode(0o2710)).map_err(|error| {
-                format!("cannot confine archive verifier input staging: {error}")
-            })?;
-            let llvm = authority.join("llvm");
-            let llvm_bin = llvm.join("bin");
-            fs::create_dir_all(&llvm_bin)
-                .map_err(|error| format!("cannot create archive verifier LLVM prefix: {error}"))?;
-            fs::copy(
-                std::env::current_exe().map_err(|error| {
-                    format!("cannot locate archive verifier executable: {error}")
-                })?,
-                llvm_bin.join("llvm-ar"),
-            )
-            .map_err(|error| format!("cannot create archive verifier archiver: {error}"))?;
-            fs::set_permissions(llvm_bin.join("llvm-ar"), fs::Permissions::from_mode(0o555))
-                .map_err(|error| format!("cannot confine archive verifier archiver: {error}"))?;
-            fs::set_permissions(&llvm_bin, fs::Permissions::from_mode(0o555))
-                .map_err(|error| format!("cannot confine archive verifier LLVM bin: {error}"))?;
-            fs::set_permissions(&llvm, fs::Permissions::from_mode(0o555))
-                .map_err(|error| format!("cannot confine archive verifier LLVM prefix: {error}"))?;
+            pending.push(
+                child
+                    .map_err(|error| format!("cannot inspect archive verifier child: {error}"))?
+                    .path(),
+            );
         }
-        #[cfg(not(target_os = "macos"))]
-        symlink(format!("/bound/{label}-llvm-ar"), authority.join("llvm-ar"))
-            .map_err(|error| format!("cannot create archive verifier archiver link: {error}"))?;
-        symlink(format!("/bound/{label}-hell-ci"), adapter.join("ar"))
-            .map_err(|error| format!("cannot create archive verifier launcher link: {error}"))?;
-        fs::write(adapter.join("stack.yaml"), format!("{label}-overlay\n"))
-            .map_err(|error| format!("cannot write archive verifier overlay: {error}"))?;
-        fs::write(adapter.join("stack.yaml.lock"), format!("{label}-lock\n"))
-            .map_err(|error| format!("cannot write archive verifier lock: {error}"))?;
-        for (path, mode) in [
-            (authority, 0o555),
-            (toolchain.join("system-ghc-9.8.2"), 0o555),
-            (toolchain.join("system-tools"), 0o555),
-            (toolchain, 0o555),
-            (adapter.to_owned(), 0o2755),
-            (work.clone(), 0o3770),
-            (work.join("tmp"), 0o2770),
-        ] {
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).map_err(|error| {
-                format!(
-                    "cannot set archive verifier mode on {}: {error}",
-                    path.display()
-                )
-            })?;
-        }
-        Ok(())
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn stage_archive_transition_adapter(adapter: &Path, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = adapter.join(".stack-work");
+    let toolchain = adapter.join(".toolchain");
+    let authority = adapter.join(".authority");
+    fs::create_dir_all(&authority)
+        .map_err(|error| format!("cannot create archive verifier authority: {error}"))?;
+    fs::create_dir_all(work.join("tmp"))
+        .map_err(|error| format!("cannot create archive verifier work tree: {error}"))?;
+    fs::create_dir_all(toolchain.join("system-ghc-9.8.2"))
+        .map_err(|error| format!("cannot create archive verifier GHC inventory: {error}"))?;
+    fs::create_dir(toolchain.join("system-tools"))
+        .map_err(|error| format!("cannot create archive verifier tool inventory: {error}"))?;
+    #[cfg(target_os = "macos")]
+    stage_archive_transition_archiver(&authority)?;
+    #[cfg(not(target_os = "macos"))]
+    symlink(format!("/bound/{label}-llvm-ar"), authority.join("llvm-ar"))
+        .map_err(|error| format!("cannot create archive verifier archiver link: {error}"))?;
+    symlink(format!("/bound/{label}-hell-ci"), adapter.join("ar"))
+        .map_err(|error| format!("cannot create archive verifier launcher link: {error}"))?;
+    fs::write(adapter.join("stack.yaml"), format!("{label}-overlay\n"))
+        .map_err(|error| format!("cannot write archive verifier overlay: {error}"))?;
+    fs::write(adapter.join("stack.yaml.lock"), format!("{label}-lock\n"))
+        .map_err(|error| format!("cannot write archive verifier lock: {error}"))?;
+    for (path, mode) in [
+        (authority, 0o555),
+        (toolchain.join("system-ghc-9.8.2"), 0o555),
+        (toolchain.join("system-tools"), 0o555),
+        (toolchain, 0o555),
+        (adapter.to_owned(), 0o2755),
+        (work.clone(), 0o3770),
+        (work.join("tmp"), 0o2770),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).map_err(|error| {
+            format!(
+                "cannot set archive verifier mode on {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_archive_transition_archiver(authority: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let inputs = authority.join("inputs");
+    fs::create_dir(&inputs)
+        .map_err(|error| format!("cannot create archive verifier input staging: {error}"))?;
+    fs::set_permissions(&inputs, fs::Permissions::from_mode(0o2710))
+        .map_err(|error| format!("cannot confine archive verifier input staging: {error}"))?;
+    let llvm = authority.join("llvm");
+    let bin = llvm.join("bin");
+    fs::create_dir_all(&bin)
+        .map_err(|error| format!("cannot create archive verifier LLVM prefix: {error}"))?;
+    fs::copy(
+        std::env::current_exe()
+            .map_err(|error| format!("cannot locate archive verifier executable: {error}"))?,
+        bin.join("llvm-ar"),
+    )
+    .map_err(|error| format!("cannot create archive verifier archiver: {error}"))?;
+    fs::set_permissions(bin.join("llvm-ar"), fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot confine archive verifier archiver: {error}"))?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot confine archive verifier LLVM bin: {error}"))?;
+    fs::set_permissions(&llvm, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot confine archive verifier LLVM prefix: {error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn allocate_archive_transition_verifier_root() -> Result<PathBuf, String> {
     let temporary_root = fs::canonicalize(env::temp_dir())
         .map_err(|error| format!("cannot canonicalize archive verifier temp root: {error}"))?;
-    let mut root = None;
     for _ in 0..16 {
         let sequence = POSIX_ARCHIVE_TRANSITION_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = temporary_root.join(format!(
@@ -8606,10 +9818,7 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
             std::process::id()
         ));
         match fs::create_dir(&candidate) {
-            Ok(()) => {
-                root = Some(candidate);
-                break;
-            }
+            Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(format!(
@@ -8618,546 +9827,637 @@ pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Resul
             }
         }
     }
-    let root = root.ok_or_else(|| {
-        "cannot allocate a collision-free archive transition verifier root".to_owned()
-    })?;
-    let result = (|| {
-        let sentinel = root.join("external-sentinel");
-        fs::write(&sentinel, b"sentinel\n")
-            .map_err(|error| format!("cannot write no-follow sentinel: {error}"))?;
-        let forest = root.join("bounded-forest");
-        fs::create_dir_all(forest.join("nested/child"))
-            .map_err(|error| format!("cannot create bounded remover forest: {error}"))?;
-        fs::write(forest.join("nested/child/member"), b"member\n")
-            .map_err(|error| format!("cannot write bounded remover member: {error}"))?;
-        symlink(&sentinel, forest.join("external-link"))
-            .map_err(|error| format!("cannot link bounded remover sentinel: {error}"))?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or_else(|| "bounded remover verifier deadline overflowed".to_owned())?;
-        remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &forest,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 16,
-                depth_limit: 8,
-                operation_limit: 64,
-                deadline,
-            },
-            || Ok(()),
-            |path| {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                    format!("cannot open bounded remover verifier directory: {error}")
-                })
-            },
-            |path| {
-                fs::remove_file(path)
-                    .map_err(|error| format!("cannot unlink verifier member: {error}"))
-            },
-            |path| {
-                fs::remove_dir(path)
-                    .map_err(|error| format!("cannot remove verifier directory: {error}"))
-            },
-        )?;
-        require_exact_directory_members(&forest, &[], "bounded no-follow verifier forest")?;
-        fs::remove_dir(&forest)
-            .map_err(|error| format!("cannot remove emptied no-follow verifier root: {error}"))?;
-        if fs::symlink_metadata(&forest).is_ok() {
-            return Err("emptied no-follow verifier root remains present".to_owned());
-        }
-        if fs::read(&sentinel)
-            .map_err(|error| format!("cannot read no-follow sentinel: {error}"))?
-            != b"sentinel\n"
-        {
-            return Err("bounded remover followed an external symlink".to_owned());
-        }
+    Err("cannot allocate a collision-free archive transition verifier root".to_owned())
+}
 
-        let oversize = root.join("bounded-oversize");
-        fs::create_dir(&oversize)
-            .map_err(|error| format!("cannot create oversize verifier root: {error}"))?;
-        for name in ["one", "two"] {
-            fs::write(oversize.join(name), b"member\n")
-                .map_err(|error| format!("cannot write oversize verifier member: {error}"))?;
-        }
-        let late_mutations = std::cell::Cell::new(0usize);
-        let oversize_error = remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &oversize,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 2,
-                depth_limit: 8,
-                operation_limit: 8,
-                deadline,
-            },
-            || Ok(()),
-            |_| {
-                late_mutations.set(late_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                late_mutations.set(late_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                late_mutations.set(late_mutations.get() + 1);
-                Ok(())
-            },
-        )
-        .err()
-        .ok_or_else(|| "bounded remover accepted an oversized forest".to_owned())?;
-        if !oversize_error.contains("global entry bound") || late_mutations.get() != 0 {
-            return Err("oversized forest launched a late remover mutation".to_owned());
-        }
+#[cfg(unix)]
+const ARCHIVE_VERIFIER_ENTRY_LIMIT: usize = 6;
 
-        const ALL_DIRECTORY_ENTRY_LIMIT: usize = 6;
-        let all_directories = root.join("bounded-all-directories");
-        fs::create_dir(&all_directories)
-            .map_err(|error| format!("cannot create all-directory verifier root: {error}"))?;
-        for index in 0..ALL_DIRECTORY_ENTRY_LIMIT - 1 {
-            fs::create_dir(all_directories.join(index.to_string()))
-                .map_err(|error| format!("cannot create all-directory verifier member: {error}"))?;
-        }
-        remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &all_directories,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: ALL_DIRECTORY_ENTRY_LIMIT,
-                depth_limit: 8,
-                operation_limit: posix_no_follow_operation_limit(ALL_DIRECTORY_ENTRY_LIMIT)?,
-                deadline,
-            },
-            || Ok(()),
-            |_| Ok(()),
-            |_| Err("all-directory verifier unexpectedly admitted a file".to_owned()),
-            |path| fs::remove_dir(path).map_err(|error| error.to_string()),
-        )?;
-        if fs::read_dir(&all_directories)
-            .map_err(|error| format!("cannot inspect all-directory verifier root: {error}"))?
-            .next()
-            .is_some()
-        {
-            return Err("all-directory forest remained at its admitted bound".to_owned());
-        }
+#[cfg(unix)]
+fn verify_bounded_remover_success(root: &Path) -> Result<Instant, String> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let excessive_directories = root.join("bounded-excessive-directories");
-        fs::create_dir(&excessive_directories)
-            .map_err(|error| format!("cannot create excessive-directory verifier root: {error}"))?;
-        for index in 0..ALL_DIRECTORY_ENTRY_LIMIT {
-            fs::create_dir(excessive_directories.join(index.to_string())).map_err(|error| {
-                format!("cannot create excessive-directory verifier member: {error}")
-            })?;
-        }
-        let excessive_mutations = std::cell::Cell::new(0usize);
-        let excessive_error = remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &excessive_directories,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: ALL_DIRECTORY_ENTRY_LIMIT,
-                depth_limit: 8,
-                operation_limit: posix_no_follow_operation_limit(ALL_DIRECTORY_ENTRY_LIMIT)?,
-                deadline,
-            },
-            || Ok(()),
-            |_| {
-                excessive_mutations.set(excessive_mutations.get().saturating_add(1));
-                Ok(())
-            },
-            |_| {
-                excessive_mutations.set(excessive_mutations.get().saturating_add(1));
-                Ok(())
-            },
-            |_| {
-                excessive_mutations.set(excessive_mutations.get().saturating_add(1));
-                Ok(())
-            },
-        )
-        .expect_err("bounded remover accepted one excess directory");
-        let remaining_directories = fs::read_dir(&excessive_directories)
-            .map_err(|error| format!("cannot inspect excessive-directory verifier: {error}"))?
-            .count();
-        if !excessive_error.contains("global entry bound")
-            || excessive_mutations.get() != 0
-            || remaining_directories != ALL_DIRECTORY_ENTRY_LIMIT
-        {
-            return Err("excessive directory forest launched a late remover mutation".to_owned());
-        }
+    let sentinel = root.join("external-sentinel");
+    fs::write(&sentinel, b"sentinel\n")
+        .map_err(|error| format!("cannot write no-follow sentinel: {error}"))?;
+    let forest = root.join("bounded-forest");
+    fs::create_dir_all(forest.join("nested/child"))
+        .map_err(|error| format!("cannot create bounded remover forest: {error}"))?;
+    fs::write(forest.join("nested/child/member"), b"member\n")
+        .map_err(|error| format!("cannot write bounded remover member: {error}"))?;
+    symlink(&sentinel, forest.join("external-link"))
+        .map_err(|error| format!("cannot link bounded remover sentinel: {error}"))?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "bounded remover verifier deadline overflowed".to_owned())?;
+    remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &forest,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 16,
+            depth_limit: 8,
+            operation_limit: 64,
+            deadline,
+        },
+        || Ok(()),
+        |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("cannot open bounded remover verifier directory: {error}"))
+        },
+        |path| {
+            fs::remove_file(path).map_err(|error| format!("cannot unlink verifier member: {error}"))
+        },
+        |path| {
+            fs::remove_dir(path)
+                .map_err(|error| format!("cannot remove verifier directory: {error}"))
+        },
+    )?;
+    require_exact_directory_members(&forest, &[], "bounded no-follow verifier forest")?;
+    fs::remove_dir(&forest)
+        .map_err(|error| format!("cannot remove emptied no-follow verifier root: {error}"))?;
+    if fs::symlink_metadata(&forest).is_ok() {
+        return Err("emptied no-follow verifier root remains present".to_owned());
+    }
+    if fs::read(&sentinel).map_err(|error| format!("cannot read no-follow sentinel: {error}"))?
+        != b"sentinel\n"
+    {
+        return Err("bounded remover followed an external symlink".to_owned());
+    }
+    Ok(deadline)
+}
 
-        let operation_bound = root.join("bounded-operations");
-        fs::create_dir(&operation_bound)
-            .map_err(|error| format!("cannot create operation-bound verifier root: {error}"))?;
-        fs::write(operation_bound.join("member"), b"member\n")
-            .map_err(|error| format!("cannot write operation-bound verifier member: {error}"))?;
-        let operation_mutations = std::cell::Cell::new(0usize);
-        let operation_error = remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &operation_bound,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 8,
-                depth_limit: 8,
-                operation_limit: 1,
-                deadline,
-            },
-            || Ok(()),
-            |_| {
-                operation_mutations.set(operation_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                operation_mutations.set(operation_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                operation_mutations.set(operation_mutations.get() + 1);
-                Ok(())
-            },
-        )
-        .expect_err("bounded remover accepted an excessive operation count");
-        if !operation_error.contains("global operation bound")
-            || operation_mutations.get() != 0
-            || !operation_bound.join("member").is_file()
-        {
-            return Err("operation-bounded forest launched a late remover mutation".to_owned());
-        }
+#[cfg(unix)]
+fn verify_bounded_remover_entry_limits(root: &Path, deadline: Instant) -> Result<(), String> {
+    let oversize = root.join("bounded-oversize");
+    fs::create_dir(&oversize)
+        .map_err(|error| format!("cannot create oversize verifier root: {error}"))?;
+    for name in ["one", "two"] {
+        fs::write(oversize.join(name), b"member\n")
+            .map_err(|error| format!("cannot write oversize verifier member: {error}"))?;
+    }
+    let mutations = std::cell::Cell::new(0usize);
+    let error = remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &oversize,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 2,
+            depth_limit: 8,
+            operation_limit: 8,
+            deadline,
+        },
+        || Ok(()),
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+    )
+    .err()
+    .ok_or_else(|| "bounded remover accepted an oversized forest".to_owned())?;
+    if !error.contains("global entry bound") || mutations.get() != 0 {
+        return Err("oversized forest launched a late remover mutation".to_owned());
+    }
+    let admitted = root.join("bounded-all-directories");
+    fs::create_dir(&admitted)
+        .map_err(|error| format!("cannot create all-directory verifier root: {error}"))?;
+    for index in 0..ARCHIVE_VERIFIER_ENTRY_LIMIT - 1 {
+        fs::create_dir(admitted.join(index.to_string()))
+            .map_err(|error| format!("cannot create all-directory verifier member: {error}"))?;
+    }
+    remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &admitted,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: ARCHIVE_VERIFIER_ENTRY_LIMIT,
+            depth_limit: 8,
+            operation_limit: posix_no_follow_operation_limit(ARCHIVE_VERIFIER_ENTRY_LIMIT)?,
+            deadline,
+        },
+        || Ok(()),
+        |_| Ok(()),
+        |_| Err("all-directory verifier unexpectedly admitted a file".to_owned()),
+        |path| fs::remove_dir(path).map_err(|error| error.to_string()),
+    )?;
+    if fs::read_dir(&admitted)
+        .map_err(|error| format!("cannot inspect all-directory verifier root: {error}"))?
+        .next()
+        .is_some()
+    {
+        return Err("all-directory forest remained at its admitted bound".to_owned());
+    }
+    Ok(())
+}
 
-        let expired = root.join("bounded-expired");
-        fs::create_dir(&expired)
-            .map_err(|error| format!("cannot create expired verifier root: {error}"))?;
-        fs::write(expired.join("member"), b"member\n")
-            .map_err(|error| format!("cannot write expired verifier member: {error}"))?;
-        let expired_deadline = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .ok_or_else(|| "cannot construct expired verifier deadline".to_owned())?;
-        let expired_mutations = std::cell::Cell::new(0usize);
-        if remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &expired,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 8,
-                depth_limit: 8,
-                operation_limit: 32,
-                deadline: expired_deadline,
-            },
-            || Ok(()),
-            |_| {
-                expired_mutations.set(expired_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                expired_mutations.set(expired_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                expired_mutations.set(expired_mutations.get() + 1);
-                Ok(())
-            },
-        )
-        .is_ok()
-            || expired_mutations.get() != 0
-        {
-            return Err("expired cleanup launched a late remover mutation".to_owned());
-        }
+#[cfg(unix)]
+fn record_archive_verifier_mutation(counter: &std::cell::Cell<usize>) {
+    counter.set(counter.get().saturating_add(1));
+}
 
-        let substituted = root.join("bounded-substituted");
-        let displaced = root.join("bounded-displaced");
-        fs::create_dir(&substituted)
-            .map_err(|error| format!("cannot create substitution verifier root: {error}"))?;
-        fs::write(substituted.join("member"), b"member\n")
-            .map_err(|error| format!("cannot write substitution verifier member: {error}"))?;
-        let substituted_identity = posix_object_identity(&substituted)?;
-        fs::rename(&substituted, &displaced)
-            .map_err(|error| format!("cannot displace substitution verifier root: {error}"))?;
-        fs::create_dir(&substituted)
-            .map_err(|error| format!("cannot replace substitution verifier root: {error}"))?;
-        fs::write(substituted.join("replacement"), b"replacement\n")
-            .map_err(|error| format!("cannot write substitution replacement: {error}"))?;
-        let substitution_mutations = std::cell::Cell::new(0usize);
-        if remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &substituted,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 8,
-                depth_limit: 8,
-                operation_limit: 32,
-                deadline,
-            },
-            || {
-                if posix_object_identity(&substituted)? != substituted_identity {
-                    return Err("verifier root changed after receipt binding".to_owned());
-                }
-                Ok(())
-            },
-            |_| {
-                substitution_mutations.set(substitution_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                substitution_mutations.set(substitution_mutations.get() + 1);
-                Ok(())
-            },
-            |_| {
-                substitution_mutations.set(substitution_mutations.get() + 1);
-                Ok(())
-            },
-        )
-        .is_ok()
-            || substitution_mutations.get() != 0
-        {
-            return Err("substituted root launched a late remover mutation".to_owned());
-        }
+#[cfg(unix)]
+fn verify_bounded_remover_excess_and_operations(
+    root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let excessive = root.join("bounded-excessive-directories");
+    fs::create_dir(&excessive)
+        .map_err(|error| format!("cannot create excessive-directory verifier root: {error}"))?;
+    for index in 0..ARCHIVE_VERIFIER_ENTRY_LIMIT {
+        fs::create_dir(excessive.join(index.to_string())).map_err(|error| {
+            format!("cannot create excessive-directory verifier member: {error}")
+        })?;
+    }
+    let mutations = std::cell::Cell::new(0usize);
+    let error = remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &excessive,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: ARCHIVE_VERIFIER_ENTRY_LIMIT,
+            depth_limit: 8,
+            operation_limit: posix_no_follow_operation_limit(ARCHIVE_VERIFIER_ENTRY_LIMIT)?,
+            deadline,
+        },
+        || Ok(()),
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+    )
+    .expect_err("bounded remover accepted one excess directory");
+    let remaining = fs::read_dir(&excessive)
+        .map_err(|error| format!("cannot inspect excessive-directory verifier: {error}"))?
+        .count();
+    if !error.contains("global entry bound")
+        || mutations.get() != 0
+        || remaining != ARCHIVE_VERIFIER_ENTRY_LIMIT
+    {
+        return Err("excessive directory forest launched a late remover mutation".to_owned());
+    }
+    verify_bounded_remover_operation_limit(root, deadline)
+}
 
-        let depth = root.join("bounded-depth");
-        fs::create_dir_all(depth.join("one/two/three"))
-            .map_err(|error| format!("cannot create depth verifier tree: {error}"))?;
-        let depth_error = remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &depth,
-                retained_child: None,
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 16,
-                depth_limit: 2,
-                operation_limit: 64,
-                deadline,
-            },
-            || Ok(()),
-            |path| {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                    .map_err(|error| format!("cannot open depth verifier member: {error}"))
-            },
-            |path| {
-                fs::remove_file(path)
-                    .map_err(|error| format!("cannot unlink depth verifier member: {error}"))
-            },
-            |path| {
-                fs::remove_dir(path)
-                    .map_err(|error| format!("cannot remove depth verifier member: {error}"))
-            },
-        )
-        .err()
-        .ok_or_else(|| "bounded remover accepted excessive depth".to_owned())?;
-        if !depth_error.contains("depth bound") {
-            return Err("depth verifier diagnostic is not exact".to_owned());
-        }
+#[cfg(unix)]
+fn verify_bounded_remover_operation_limit(root: &Path, deadline: Instant) -> Result<(), String> {
+    let operation_bound = root.join("bounded-operations");
+    fs::create_dir(&operation_bound)
+        .map_err(|error| format!("cannot create operation-bound verifier root: {error}"))?;
+    fs::write(operation_bound.join("member"), b"member\n")
+        .map_err(|error| format!("cannot write operation-bound verifier member: {error}"))?;
+    let mutations = std::cell::Cell::new(0usize);
+    let error = remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &operation_bound,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 8,
+            depth_limit: 8,
+            operation_limit: 1,
+            deadline,
+        },
+        || Ok(()),
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+    )
+    .expect_err("bounded remover accepted an excessive operation count");
+    if !error.contains("global operation bound")
+        || mutations.get() != 0
+        || !operation_bound.join("member").is_file()
+    {
+        return Err("operation-bounded forest launched a late remover mutation".to_owned());
+    }
+    Ok(())
+}
 
-        let composite = ordered_bounded_failures(
-            "composite verifier",
-            [
-                ("primary", "primary failure".to_owned()),
-                ("restoration", "restoration failure".to_owned()),
-            ],
-        );
-        let primary_position = composite
-            .find("primary: primary failure")
-            .ok_or_else(|| "composite verifier lost its primary failure".to_owned())?;
-        let restoration_position = composite
-            .find("restoration: restoration failure")
-            .ok_or_else(|| "composite verifier lost its restoration failure".to_owned())?;
-        if primary_position >= restoration_position {
-            return Err("composite verifier reordered restoration before primary".to_owned());
-        }
+#[cfg(unix)]
+fn verify_bounded_remover_expiry(root: &Path) -> Result<(), String> {
+    let expired = root.join("bounded-expired");
+    fs::create_dir(&expired)
+        .map_err(|error| format!("cannot create expired verifier root: {error}"))?;
+    fs::write(expired.join("member"), b"member\n")
+        .map_err(|error| format!("cannot write expired verifier member: {error}"))?;
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .ok_or_else(|| "cannot construct expired verifier deadline".to_owned())?;
+    let mutations = std::cell::Cell::new(0usize);
+    if remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &expired,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 8,
+            depth_limit: 8,
+            operation_limit: 32,
+            deadline,
+        },
+        || Ok(()),
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+    )
+    .is_ok()
+        || mutations.get() != 0
+    {
+        return Err("expired cleanup launched a late remover mutation".to_owned());
+    }
+    Ok(())
+}
 
-        let parent = root.join("archive-adapter");
-        let adapter = parent.join("hell-ci-adapter");
-        let work = adapter.join(".stack-work");
-        let temporary = work.join("tmp");
-        fs::create_dir_all(&parent)
-            .map_err(|error| format!("cannot create archive verifier parent: {error}"))?;
-        stage_adapter(&adapter, "initial")?;
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2770))
-            .map_err(|error| format!("cannot set archive verifier parent mode: {error}"))?;
-
-        let parent_identity = posix_object_identity(&parent)?;
-        let adapter_identity = posix_object_identity(&adapter)?;
-        let work_identity = posix_object_identity(&work)?;
-        let temporary_identity = posix_object_identity(&temporary)?;
-        let owner = parent_identity.owner;
-        let group = parent_identity.group;
-        let validate = |parent_mode| {
-            require_posix_archive_adapter_transition_state(PosixArchiveAdapterTransitionState {
-                parent: &parent,
-                parent_identity: &parent_identity,
-                parent_owner: owner,
-                parent_group: group,
-                parent_mode,
-                adapter: &adapter,
-                adapter_identity: &adapter_identity,
-                work_directory: &work,
-                work_directory_identity: &work_identity,
-                temporary_directory: &temporary,
-                temporary_directory_identity: &temporary_identity,
-            })
-        };
-        let validate_active = |parent_mode| {
-            require_posix_archive_adapter_transition_state_phase(
-                PosixArchiveAdapterTransitionState {
-                    parent: &parent,
-                    parent_identity: &parent_identity,
-                    parent_owner: owner,
-                    parent_group: group,
-                    parent_mode,
-                    adapter: &adapter,
-                    adapter_identity: &adapter_identity,
-                    work_directory: &work,
-                    work_directory_identity: &work_identity,
-                    temporary_directory: &temporary,
-                    temporary_directory_identity: &temporary_identity,
-                },
-                false,
-            )
-        };
-        validate(0o2770)?;
-
-        let project_database = work.join("stack.sqlite3");
-        let project_lock = work.join("stack.sqlite3.pantry-write-lock");
-        let project_install = work.join("install");
-        let temporary_build = temporary.join("stack-deadbeef");
-        fs::write(&project_database, b"stack-project-database\n")
-            .map_err(|error| format!("cannot write archive verifier project database: {error}"))?;
-        fs::write(&project_lock, b"stack-project-lock\n")
-            .map_err(|error| format!("cannot write archive verifier project lock: {error}"))?;
-        fs::create_dir(&project_install)
-            .map_err(|error| format!("cannot create archive verifier install state: {error}"))?;
-        fs::create_dir(&temporary_build)
-            .map_err(|error| format!("cannot create archive verifier temporary state: {error}"))?;
-        validate_active(0o2770)?;
-        let active_error = match validate(0o2770) {
-            Err(error) => error,
-            Ok(()) => {
-                return Err(
-                    "clean archive transition accepted active Stack project state".to_owned(),
-                );
+#[cfg(unix)]
+fn verify_bounded_remover_substitution(root: &Path, deadline: Instant) -> Result<(), String> {
+    let substituted = root.join("bounded-substituted");
+    let displaced = root.join("bounded-displaced");
+    fs::create_dir(&substituted)
+        .map_err(|error| format!("cannot create substitution verifier root: {error}"))?;
+    fs::write(substituted.join("member"), b"member\n")
+        .map_err(|error| format!("cannot write substitution verifier member: {error}"))?;
+    let identity = posix_object_identity(&substituted)?;
+    fs::rename(&substituted, &displaced)
+        .map_err(|error| format!("cannot displace substitution verifier root: {error}"))?;
+    fs::create_dir(&substituted)
+        .map_err(|error| format!("cannot replace substitution verifier root: {error}"))?;
+    fs::write(substituted.join("replacement"), b"replacement\n")
+        .map_err(|error| format!("cannot write substitution replacement: {error}"))?;
+    let mutations = std::cell::Cell::new(0usize);
+    if remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &substituted,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 8,
+            depth_limit: 8,
+            operation_limit: 32,
+            deadline,
+        },
+        || {
+            if posix_object_identity(&substituted)? != identity {
+                return Err("verifier root changed after receipt binding".to_owned());
             }
-        };
-        if !active_error.contains("extra=")
-            || !active_error.contains("stack.sqlite3")
-            || !active_error.contains("install")
-        {
-            return Err("archive transition did not report bounded active members".to_owned());
-        }
-        fs::remove_file(&project_database)
-            .map_err(|error| format!("cannot remove archive verifier project database: {error}"))?;
-        fs::remove_file(&project_lock)
-            .map_err(|error| format!("cannot remove archive verifier project lock: {error}"))?;
-        fs::remove_dir(&project_install)
-            .map_err(|error| format!("cannot remove archive verifier install state: {error}"))?;
-        fs::remove_dir(&temporary_build)
-            .map_err(|error| format!("cannot remove archive verifier temporary state: {error}"))?;
-        validate(0o2770)?;
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+        |_| {
+            record_archive_verifier_mutation(&mutations);
+            Ok(())
+        },
+    )
+    .is_ok()
+        || mutations.get() != 0
+    {
+        return Err("substituted root launched a late remover mutation".to_owned());
+    }
+    Ok(())
+}
 
-        let toolchain_extra = adapter.join(".toolchain/unexpected-tool");
-        fs::set_permissions(
-            adapter.join(".toolchain"),
-            fs::Permissions::from_mode(0o755),
-        )
+#[cfg(unix)]
+fn verify_bounded_remover_depth_and_failure_order(
+    root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let depth = root.join("bounded-depth");
+    fs::create_dir_all(depth.join("one/two/three"))
+        .map_err(|error| format!("cannot create depth verifier tree: {error}"))?;
+    let error = remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &depth,
+            retained_child: None,
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 16,
+            depth_limit: 2,
+            operation_limit: 64,
+            deadline,
+        },
+        || Ok(()),
+        |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("cannot open depth verifier member: {error}"))
+        },
+        |path| {
+            fs::remove_file(path)
+                .map_err(|error| format!("cannot unlink depth verifier member: {error}"))
+        },
+        |path| {
+            fs::remove_dir(path)
+                .map_err(|error| format!("cannot remove depth verifier member: {error}"))
+        },
+    )
+    .err()
+    .ok_or_else(|| "bounded remover accepted excessive depth".to_owned())?;
+    if !error.contains("depth bound") {
+        return Err("depth verifier diagnostic is not exact".to_owned());
+    }
+    let composite = ordered_bounded_failures(
+        "composite verifier",
+        [
+            ("primary", "primary failure".to_owned()),
+            ("restoration", "restoration failure".to_owned()),
+        ],
+    );
+    let primary = composite
+        .find("primary: primary failure")
+        .ok_or_else(|| "composite verifier lost its primary failure".to_owned())?;
+    let restoration = composite
+        .find("restoration: restoration failure")
+        .ok_or_else(|| "composite verifier lost its restoration failure".to_owned())?;
+    if primary >= restoration {
+        return Err("composite verifier reordered restoration before primary".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ArchiveAdapterTransitionFixture {
+    parent: PathBuf,
+    adapter: PathBuf,
+    work: PathBuf,
+    temporary: PathBuf,
+    parent_identity: PosixObjectIdentity,
+    adapter_identity: PosixObjectIdentity,
+    work_identity: PosixObjectIdentity,
+    temporary_identity: PosixObjectIdentity,
+}
+
+#[cfg(unix)]
+impl ArchiveAdapterTransitionFixture {
+    fn validate(&self, parent_mode: u32) -> Result<(), String> {
+        require_posix_archive_adapter_transition_state(&self.state(parent_mode))
+    }
+
+    fn validate_active(&self, parent_mode: u32) -> Result<(), String> {
+        require_posix_archive_adapter_transition_state_phase(&self.state(parent_mode), false)
+    }
+
+    fn state(&self, parent_mode: u32) -> PosixArchiveAdapterTransitionState<'_> {
+        PosixArchiveAdapterTransitionState {
+            parent: &self.parent,
+            parent_identity: &self.parent_identity,
+            parent_owner: self.parent_identity.owner,
+            parent_group: self.parent_identity.group,
+            parent_mode,
+            adapter: &self.adapter,
+            adapter_identity: &self.adapter_identity,
+            work_directory: &self.work,
+            work_directory_identity: &self.work_identity,
+            temporary_directory: &self.temporary,
+            temporary_directory_identity: &self.temporary_identity,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_archive_adapter_transition_fixture(
+    root: &Path,
+) -> Result<ArchiveAdapterTransitionFixture, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = root.join("archive-adapter");
+    let adapter = parent.join("hell-ci-adapter");
+    let work = adapter.join(".stack-work");
+    let temporary = work.join("tmp");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("cannot create archive verifier parent: {error}"))?;
+    stage_archive_transition_adapter(&adapter, "initial")?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o2770))
+        .map_err(|error| format!("cannot set archive verifier parent mode: {error}"))?;
+    let fixture = ArchiveAdapterTransitionFixture {
+        parent_identity: posix_object_identity(&parent)?,
+        adapter_identity: posix_object_identity(&adapter)?,
+        work_identity: posix_object_identity(&work)?,
+        temporary_identity: posix_object_identity(&temporary)?,
+        parent,
+        adapter,
+        work,
+        temporary,
+    };
+    fixture.validate(0o2770)?;
+    Ok(fixture)
+}
+
+#[cfg(unix)]
+fn verify_archive_adapter_active_project_state(
+    fixture: &ArchiveAdapterTransitionFixture,
+) -> Result<(), String> {
+    let database = fixture.work.join("stack.sqlite3");
+    let lock = fixture.work.join("stack.sqlite3.pantry-write-lock");
+    let install = fixture.work.join("install");
+    let build = fixture.temporary.join("stack-deadbeef");
+    fs::write(&database, b"stack-project-database\n")
+        .map_err(|error| format!("cannot write archive verifier project database: {error}"))?;
+    fs::write(&lock, b"stack-project-lock\n")
+        .map_err(|error| format!("cannot write archive verifier project lock: {error}"))?;
+    fs::create_dir(&install)
+        .map_err(|error| format!("cannot create archive verifier install state: {error}"))?;
+    fs::create_dir(&build)
+        .map_err(|error| format!("cannot create archive verifier temporary state: {error}"))?;
+    fixture.validate_active(0o2770)?;
+    let Err(error) = fixture.validate(0o2770) else {
+        return Err("clean archive transition accepted active Stack project state".to_owned());
+    };
+    if !error.contains("extra=") || !error.contains("stack.sqlite3") || !error.contains("install") {
+        return Err("archive transition did not report bounded active members".to_owned());
+    }
+    fs::remove_file(&database)
+        .map_err(|error| format!("cannot remove archive verifier project database: {error}"))?;
+    fs::remove_file(&lock)
+        .map_err(|error| format!("cannot remove archive verifier project lock: {error}"))?;
+    fs::remove_dir(&install)
+        .map_err(|error| format!("cannot remove archive verifier install state: {error}"))?;
+    fs::remove_dir(&build)
+        .map_err(|error| format!("cannot remove archive verifier temporary state: {error}"))?;
+    fixture.validate(0o2770)
+}
+
+#[cfg(unix)]
+fn verify_archive_adapter_immutable_inventory(
+    fixture: &ArchiveAdapterTransitionFixture,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let toolchain = fixture.adapter.join(".toolchain");
+    let extra = toolchain.join("unexpected-tool");
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o755))
         .map_err(|error| format!("cannot open archive verifier toolchain: {error}"))?;
-        fs::write(&toolchain_extra, b"unexpected\n")
-            .map_err(|error| format!("cannot write archive verifier toolchain extra: {error}"))?;
-        fs::set_permissions(
-            adapter.join(".toolchain"),
-            fs::Permissions::from_mode(0o555),
-        )
+    fs::write(&extra, b"unexpected\n")
+        .map_err(|error| format!("cannot write archive verifier toolchain extra: {error}"))?;
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o555))
         .map_err(|error| format!("cannot freeze archive verifier toolchain: {error}"))?;
-        let toolchain_error = match validate_active(0o2770) {
-            Err(error) => error,
-            Ok(()) => {
-                return Err(
-                    "active transition accepted an unexpected immutable toolchain member"
-                        .to_owned(),
-                );
-            }
-        };
-        if !toolchain_error.contains("extra=") || !toolchain_error.contains("unexpected-tool") {
-            return Err("immutable toolchain mismatch diagnostic is not exact".to_owned());
-        }
-        fs::set_permissions(
-            adapter.join(".toolchain"),
-            fs::Permissions::from_mode(0o755),
-        )
+    let Err(error) = fixture.validate_active(0o2770) else {
+        return Err(
+            "active transition accepted an unexpected immutable toolchain member".to_owned(),
+        );
+    };
+    if !error.contains("extra=") || !error.contains("unexpected-tool") {
+        return Err("immutable toolchain mismatch diagnostic is not exact".to_owned());
+    }
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o755))
         .map_err(|error| format!("cannot reopen archive verifier toolchain: {error}"))?;
-        fs::remove_file(&toolchain_extra)
-            .map_err(|error| format!("cannot remove archive verifier toolchain extra: {error}"))?;
-        fs::set_permissions(
-            adapter.join(".toolchain"),
-            fs::Permissions::from_mode(0o555),
-        )
+    fs::remove_file(&extra)
+        .map_err(|error| format!("cannot remove archive verifier toolchain extra: {error}"))?;
+    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o555))
         .map_err(|error| format!("cannot refreeze archive verifier toolchain: {error}"))?;
-        validate(0o2770)?;
+    fixture.validate(0o2770)
+}
 
-        let authority_sibling = parent.join("unexpected-authority");
-        fs::create_dir(&authority_sibling)
-            .map_err(|error| format!("cannot create archive verifier sibling: {error}"))?;
-        if validate(0o2770).is_ok() {
-            return Err("archive transition accepted an unexpected authority sibling".to_owned());
-        }
-        fs::remove_dir(&authority_sibling)
-            .map_err(|error| format!("cannot remove archive verifier sibling: {error}"))?;
+#[cfg(unix)]
+fn verify_archive_adapter_inventory_and_modes(
+    fixture: &ArchiveAdapterTransitionFixture,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
-        let adapter_sibling = adapter.join("unexpected-output.a");
-        fs::write(&adapter_sibling, b"unexpected\n")
-            .map_err(|error| format!("cannot write archive verifier output: {error}"))?;
-        if validate(0o2770).is_ok() {
-            return Err("archive transition accepted an unexpected adapter member".to_owned());
-        }
-        fs::remove_file(&adapter_sibling)
-            .map_err(|error| format!("cannot remove archive verifier output: {error}"))?;
+    let authority_sibling = fixture.parent.join("unexpected-authority");
+    fs::create_dir(&authority_sibling)
+        .map_err(|error| format!("cannot create archive verifier sibling: {error}"))?;
+    if fixture.validate(0o2770).is_ok() {
+        return Err("archive transition accepted an unexpected authority sibling".to_owned());
+    }
+    fs::remove_dir(&authority_sibling)
+        .map_err(|error| format!("cannot remove archive verifier sibling: {error}"))?;
+    let adapter_sibling = fixture.adapter.join("unexpected-output.a");
+    fs::write(&adapter_sibling, b"unexpected\n")
+        .map_err(|error| format!("cannot write archive verifier output: {error}"))?;
+    if fixture.validate(0o2770).is_ok() {
+        return Err("archive transition accepted an unexpected adapter member".to_owned());
+    }
+    fs::remove_file(&adapter_sibling)
+        .map_err(|error| format!("cannot remove archive verifier output: {error}"))?;
+    fs::set_permissions(&fixture.temporary, fs::Permissions::from_mode(0o770))
+        .map_err(|error| format!("cannot clear archive verifier temporary setgid: {error}"))?;
+    if fixture.validate(0o2770).is_ok() {
+        return Err("archive transition accepted a cleared temporary setgid bit".to_owned());
+    }
+    fs::set_permissions(&fixture.temporary, fs::Permissions::from_mode(0o2770))
+        .map_err(|error| format!("cannot restore archive verifier temporary mode: {error}"))?;
+    fs::set_permissions(&fixture.parent, fs::Permissions::from_mode(0o550))
+        .map_err(|error| format!("cannot simulate cleared parent setgid: {error}"))?;
+    if fixture.validate(0o2550).is_ok() {
+        return Err("archive transition accepted a cleared parent setgid bit".to_owned());
+    }
+    fs::set_permissions(&fixture.parent, fs::Permissions::from_mode(0o2550))
+        .map_err(|error| format!("cannot set archive verifier sealed mode: {error}"))?;
+    fixture.validate(0o2550)?;
+    fs::set_permissions(&fixture.parent, fs::Permissions::from_mode(0o2770))
+        .map_err(|error| format!("cannot restore archive verifier parent mode: {error}"))?;
+    fixture.validate(0o2770)
+}
 
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o770))
-            .map_err(|error| format!("cannot clear archive verifier temporary setgid: {error}"))?;
-        if validate(0o2770).is_ok() {
-            return Err("archive transition accepted a cleared temporary setgid bit".to_owned());
-        }
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o2770))
-            .map_err(|error| format!("cannot restore archive verifier temporary mode: {error}"))?;
+#[cfg(unix)]
+fn verify_archive_adapter_identity_substitution(
+    fixture: &ArchiveAdapterTransitionFixture,
+) -> Result<(), String> {
+    let replacement = fixture.parent.join("replacement-adapter");
+    stage_archive_transition_adapter(&replacement, "replacement")?;
+    open_archive_verifier_tree_for_cleanup(&fixture.adapter)?;
+    fs::remove_dir_all(&fixture.adapter)
+        .map_err(|error| format!("cannot remove original adapter: {error}"))?;
+    fs::rename(&replacement, &fixture.adapter)
+        .map_err(|error| format!("cannot substitute archive adapter: {error}"))?;
+    if fixture.validate(0o2770).is_ok() {
+        return Err("archive transition accepted an adapter identity substitution".to_owned());
+    }
+    Ok(())
+}
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o550))
-            .map_err(|error| format!("cannot simulate cleared parent setgid: {error}"))?;
-        if validate(0o2550).is_ok() {
-            return Err("archive transition accepted a cleared parent setgid bit".to_owned());
-        }
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2550))
-            .map_err(|error| format!("cannot set archive verifier sealed mode: {error}"))?;
-        validate(0o2550)?;
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2770))
-            .map_err(|error| format!("cannot restore archive verifier parent mode: {error}"))?;
-        validate(0o2770)?;
+#[cfg(unix)]
+pub(crate) fn verify_posix_archive_adapter_transition_for_integration() -> Result<(), String> {
+    verify_archive_cleanup_deadline_partition()?;
+    verify_archive_cleanup_phase_reservation()?;
+    verify_archive_cleanup_receipt_and_expiry()?;
 
-        let replacement = parent.join("replacement-adapter");
-        stage_adapter(&replacement, "replacement")?;
-        open_fixture_tree_for_cleanup(&adapter)?;
-        fs::remove_dir_all(&adapter)
-            .map_err(|error| format!("cannot remove original adapter: {error}"))?;
-        fs::rename(&replacement, &adapter)
-            .map_err(|error| format!("cannot substitute archive adapter: {error}"))?;
-        if validate(0o2770).is_ok() {
-            return Err("archive transition accepted an adapter identity substitution".to_owned());
-        }
-        Ok(())
+    let root = allocate_archive_transition_verifier_root()?;
+    let result = (|| {
+        let deadline = verify_bounded_remover_success(&root)?;
+        verify_bounded_remover_entry_limits(&root, deadline)?;
+        verify_bounded_remover_excess_and_operations(&root, deadline)?;
+        verify_bounded_remover_expiry(&root)?;
+        verify_bounded_remover_substitution(&root, deadline)?;
+        verify_bounded_remover_depth_and_failure_order(&root, deadline)?;
+
+        let fixture = prepare_archive_adapter_transition_fixture(&root)?;
+        verify_archive_adapter_active_project_state(&fixture)?;
+        verify_archive_adapter_immutable_inventory(&fixture)?;
+        verify_archive_adapter_inventory_and_modes(&fixture)?;
+        verify_archive_adapter_identity_substitution(&fixture)
     })();
-    let cleanup = open_fixture_tree_for_cleanup(&root).and_then(|()| {
+    let cleanup = open_archive_verifier_tree_for_cleanup(&root).and_then(|()| {
         fs::remove_dir_all(&root)
             .map_err(|error| format!("cannot remove archive transition verifier root: {error}"))
     });
     result.and(cleanup)
 }
+#[cfg(target_os = "macos")]
+struct MacosArchiveCleanupFixture {
+    platform: ReleasePlatform,
+    sudo: PathBuf,
+    tools: PosixAdapterTools,
+    trusted_owner: u32,
+    trusted_group: u32,
+    candidate_owner: u32,
+    root: PathBuf,
+    work: PathBuf,
+    nested: PathBuf,
+    child: PathBuf,
+    member: PathBuf,
+    sentinel: PathBuf,
+    escaped: PathBuf,
+    expired: PathBuf,
+    deadline: Instant,
+}
 
 #[cfg(target_os = "macos")]
-pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
-
+fn prepare_macos_archive_cleanup_fixture() -> Result<MacosArchiveCleanupFixture, String> {
     let platform = ReleasePlatform::MacosAarch64;
     let sudo = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/sudo"))
         .map_err(|error| format!("cannot bind archive cleanup verifier sudo: {error}"))?
@@ -9171,7 +10471,33 @@ pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result
         .ok_or_else(|| "archive cleanup verifier candidate uid overflowed".to_owned())?;
     let temporary_root = fs::canonicalize("/private/tmp")
         .map_err(|error| format!("cannot bind archive cleanup verifier root: {error}"))?;
-    let mut root = None;
+    let root = allocate_macos_archive_cleanup_root(&temporary_root)?;
+    let work = root.join("work");
+    let nested = work.join("candidate-owned");
+    let child = nested.join("child");
+    Ok(MacosArchiveCleanupFixture {
+        platform,
+        sudo,
+        tools,
+        trusted_owner,
+        trusted_group,
+        candidate_owner,
+        member: child.join("member.o"),
+        sentinel: root.join("sentinel"),
+        escaped: nested.join("sentinel-link"),
+        expired: work.join("expired"),
+        root,
+        work,
+        nested,
+        child,
+        deadline: Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| "archive cleanup verifier deadline overflowed".to_owned())?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_macos_archive_cleanup_root(temporary_root: &Path) -> Result<PathBuf, String> {
     for _ in 0..16 {
         let sequence = POSIX_ARCHIVE_TRANSITION_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = temporary_root.join(format!(
@@ -9179,10 +10505,7 @@ pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result
             std::process::id()
         ));
         match fs::create_dir(&candidate) {
-            Ok(()) => {
-                root = Some(candidate);
-                break;
-            }
+            Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(format!(
@@ -9191,148 +10514,164 @@ pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result
             }
         }
     }
-    let root = root.ok_or_else(|| "archive cleanup verifier allocation exhausted".to_owned())?;
-    let work = root.join("work");
-    let nested = work.join("candidate-owned");
-    let child = nested.join("child");
-    let member = child.join("member.o");
-    let sentinel = root.join("sentinel");
-    let escaped = nested.join("sentinel-link");
-    let expired = work.join("expired");
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| "archive cleanup verifier deadline overflowed".to_owned())?;
-    let result = (|| {
-        fs::create_dir(&work)
-            .and_then(|()| fs::create_dir(&nested))
-            .and_then(|()| fs::create_dir(&child))
-            .and_then(|()| fs::write(&member, b"member\n"))
-            .and_then(|()| fs::write(&sentinel, b"sentinel\n"))
-            .and_then(|()| symlink(&sentinel, &escaped))
-            .and_then(|()| fs::create_dir(&expired))
-            .map_err(|error| format!("cannot create archive cleanup principal fixture: {error}"))?;
-        let candidate = candidate_owner.to_string();
-        for directory in [&nested, &child, &expired] {
-            trusted_tool_status_before(
-                deadline,
-                &sudo,
-                &tools.change_owner,
-                [
-                    candidate.as_str(),
-                    path_text(directory, "candidate-owned cleanup verifier directory")?,
-                ],
-            )?;
-            trusted_tool_status_before(
-                deadline,
-                &sudo,
-                &tools.chmod,
-                posix_chmod_arguments(
-                    platform,
-                    "700",
-                    path_text(directory, "candidate-owned cleanup verifier mode")?,
-                )?,
-            )?;
-        }
+    Err("archive cleanup verifier allocation exhausted".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_macos_archive_cleanup_fixture(fixture: &MacosArchiveCleanupFixture) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    fs::create_dir(&fixture.work)
+        .and_then(|()| fs::create_dir(&fixture.nested))
+        .and_then(|()| fs::create_dir(&fixture.child))
+        .and_then(|()| fs::write(&fixture.member, b"member\n"))
+        .and_then(|()| fs::write(&fixture.sentinel, b"sentinel\n"))
+        .and_then(|()| symlink(&fixture.sentinel, &fixture.escaped))
+        .and_then(|()| fs::create_dir(&fixture.expired))
+        .map_err(|error| format!("cannot create archive cleanup principal fixture: {error}"))?;
+    let candidate = fixture.candidate_owner.to_string();
+    for directory in [&fixture.nested, &fixture.child, &fixture.expired] {
         trusted_tool_status_before(
-            deadline,
-            &sudo,
-            &tools.chmod,
+            fixture.deadline,
+            &fixture.sudo,
+            &fixture.tools.change_owner,
             [
-                "+a",
-                "everyone allow read",
-                path_text(&child, "candidate-owned cleanup verifier ACL")?,
+                candidate.as_str(),
+                path_text(directory, "candidate-owned cleanup verifier directory")?,
             ],
         )?;
-        if fs::read_dir(&nested).is_ok_and(|mut entries| entries.next().is_some()) {
-            return Err(
-                "trusted runner retained candidate-owned directory traversal before transition"
-                    .to_owned(),
-            );
-        }
-        remove_posix_no_follow_forest(
-            &[PosixNoFollowRemovalRoot {
-                directory: &work,
-                retained_child: Some(&expired),
-            }],
-            PosixNoFollowRemovalPolicy {
-                entry_limit: 32,
-                depth_limit: 8,
-                operation_limit: 128,
-                deadline,
-            },
-            || Ok(()),
-            |path| {
-                transition_posix_mutable_directory_to_cleanup_owner(
-                    platform,
-                    &sudo,
-                    &tools,
-                    path,
-                    trusted_owner,
-                    trusted_group,
-                    deadline,
-                )
-            },
-            |path| {
-                trusted_tool_status_before(
-                    deadline,
-                    &sudo,
-                    &tools.remove_file,
-                    [
-                        "-f",
-                        "--",
-                        path_text(path, "archive cleanup verifier member")?,
-                    ],
-                )
-            },
-            |path| {
-                trusted_tool_status_before(
-                    deadline,
-                    &sudo,
-                    &tools.remove_directory,
-                    ["--", path_text(path, "archive cleanup verifier directory")?],
-                )
-            },
+        trusted_tool_status_before(
+            fixture.deadline,
+            &fixture.sudo,
+            &fixture.tools.chmod,
+            posix_chmod_arguments(
+                fixture.platform,
+                "700",
+                path_text(directory, "candidate-owned cleanup verifier mode")?,
+            )?,
         )?;
-        if fs::read(&sentinel)
-            .map_err(|error| format!("cannot read archive cleanup sentinel: {error}"))?
-            != b"sentinel\n"
-            || fs::symlink_metadata(&nested).is_ok()
-        {
-            return Err(
-                "archive cleanup principal transition followed an escape or retained its tree"
-                    .to_owned(),
-            );
-        }
-        let expired_before = fs::symlink_metadata(&expired)
-            .map_err(|error| format!("cannot inspect expired cleanup fixture: {error}"))?;
-        let expired_error = transition_posix_mutable_directory_to_cleanup_owner(
-            platform,
-            &sudo,
-            &tools,
-            &expired,
-            trusted_owner,
-            trusted_group,
-            Instant::now(),
-        )
-        .expect_err("expired cleanup transition must reject before a trusted mutation");
-        let expired_after = fs::symlink_metadata(&expired)
-            .map_err(|error| format!("cannot revalidate expired cleanup fixture: {error}"))?;
-        if !expired_error.contains("deadline")
-            || expired_before.uid() != candidate_owner
-            || expired_after.uid() != candidate_owner
-            || expired_before.mode() != expired_after.mode()
-        {
-            return Err("expired cleanup transition launched a late authority mutation".to_owned());
-        }
-        Ok(())
+    }
+    trusted_tool_status_before(
+        fixture.deadline,
+        &fixture.sudo,
+        &fixture.tools.chmod,
+        [
+            "+a",
+            "everyone allow read",
+            path_text(&fixture.child, "candidate-owned cleanup verifier ACL")?,
+        ],
+    )?;
+    if fs::read_dir(&fixture.nested).is_ok_and(|mut entries| entries.next().is_some()) {
+        return Err(
+            "trusted runner retained candidate-owned directory traversal before transition"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn exercise_macos_archive_cleanup_tree(fixture: &MacosArchiveCleanupFixture) -> Result<(), String> {
+    remove_posix_no_follow_forest(
+        &[PosixNoFollowRemovalRoot {
+            directory: &fixture.work,
+            retained_child: Some(&fixture.expired),
+        }],
+        PosixNoFollowRemovalPolicy {
+            entry_limit: 32,
+            depth_limit: 8,
+            operation_limit: 128,
+            deadline: fixture.deadline,
+        },
+        || Ok(()),
+        |path| {
+            transition_posix_mutable_directory_to_cleanup_owner(
+                fixture.platform,
+                &fixture.sudo,
+                &fixture.tools,
+                path,
+                fixture.trusted_owner,
+                fixture.trusted_group,
+                fixture.deadline,
+            )
+        },
+        |path| {
+            trusted_tool_status_before(
+                fixture.deadline,
+                &fixture.sudo,
+                &fixture.tools.remove_file,
+                [
+                    "-f",
+                    "--",
+                    path_text(path, "archive cleanup verifier member")?,
+                ],
+            )
+        },
+        |path| {
+            trusted_tool_status_before(
+                fixture.deadline,
+                &fixture.sudo,
+                &fixture.tools.remove_directory,
+                ["--", path_text(path, "archive cleanup verifier directory")?],
+            )
+        },
+    )?;
+    if fs::read(&fixture.sentinel)
+        .map_err(|error| format!("cannot read archive cleanup sentinel: {error}"))?
+        != b"sentinel\n"
+        || fs::symlink_metadata(&fixture.nested).is_ok()
+    {
+        return Err(
+            "archive cleanup principal transition followed an escape or retained its tree"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_archive_cleanup_expiry(fixture: &MacosArchiveCleanupFixture) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let before = fs::symlink_metadata(&fixture.expired)
+        .map_err(|error| format!("cannot inspect expired cleanup fixture: {error}"))?;
+    let error = transition_posix_mutable_directory_to_cleanup_owner(
+        fixture.platform,
+        &fixture.sudo,
+        &fixture.tools,
+        &fixture.expired,
+        fixture.trusted_owner,
+        fixture.trusted_group,
+        Instant::now(),
+    )
+    .expect_err("expired cleanup transition must reject before a trusted mutation");
+    let after = fs::symlink_metadata(&fixture.expired)
+        .map_err(|error| format!("cannot revalidate expired cleanup fixture: {error}"))?;
+    if !error.contains("deadline")
+        || before.uid() != fixture.candidate_owner
+        || after.uid() != fixture.candidate_owner
+        || before.mode() != after.mode()
+    {
+        return Err("expired cleanup transition launched a late authority mutation".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result<(), String> {
+    let fixture = prepare_macos_archive_cleanup_fixture()?;
+    let result = (|| {
+        stage_macos_archive_cleanup_fixture(&fixture)?;
+        exercise_macos_archive_cleanup_tree(&fixture)?;
+        verify_macos_archive_cleanup_expiry(&fixture)
     })();
     let cleanup = trusted_tool_status(
-        &sudo,
-        &tools.remove_file,
+        &fixture.sudo,
+        &fixture.tools.remove_file,
         [
             "-rf",
             "--",
-            path_text(&root, "archive cleanup verifier finalizer")?,
+            path_text(&fixture.root, "archive cleanup verifier finalizer")?,
         ],
     );
     match (result, cleanup) {
@@ -9346,12 +10685,29 @@ pub(crate) fn verify_macos_archive_cleanup_principal_for_integration() -> Result
 }
 
 #[cfg(unix)]
-fn seal_posix_archive_adapter_authority<'a>(
+struct PosixArchiveAdapterPreseal {
+    adapter: PathBuf,
+    adapter_name: OsString,
+    work_directory: PathBuf,
+    temporary_directory: PathBuf,
+    input_staging: PathBuf,
+    stack_work: PathBuf,
+    stack_work_identity: PosixObjectIdentity,
+}
+
+#[cfg(unix)]
+struct PosixArchiveAdapterIdentities {
+    adapter: PosixObjectIdentity,
+    work_directory: PosixObjectIdentity,
+    temporary_directory: PosixObjectIdentity,
+}
+
+#[cfg(unix)]
+fn validate_posix_archive_adapter_preseal(
     protection: &PosixSourceProtection,
-    normalizer: &'a PosixAdapterProtection,
-    archive_adapter: &mut crate::command::NativeArchiveAdapter,
-    authorization_deadline: Option<Instant>,
-) -> Result<PosixArchiveAdapterSeal<'a>, String> {
+    normalizer: &PosixAdapterProtection,
+    archive_adapter: &crate::command::NativeArchiveAdapter,
+) -> Result<PosixArchiveAdapterPreseal, String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let adapter = archive_adapter
@@ -9360,7 +10716,8 @@ fn seal_posix_archive_adapter_authority<'a>(
         .to_path_buf();
     let adapter_name = adapter
         .file_name()
-        .ok_or_else(|| "native archive adapter name is absent".to_owned())?;
+        .ok_or_else(|| "native archive adapter name is absent".to_owned())?
+        .to_os_string();
     if !protection.active || adapter.parent() != Some(&protection.archive_adapter) {
         return Err("native archive adapter child is outside its authority".to_owned());
     }
@@ -9368,13 +10725,15 @@ fn seal_posix_archive_adapter_authority<'a>(
     let stack_work = protection
         .stack_work
         .as_ref()
-        .ok_or_else(|| "candidate Stack work authority is absent".to_owned())?;
+        .ok_or_else(|| "candidate Stack work authority is absent".to_owned())?
+        .clone();
     let stack_work_identity = protection
         .stack_work_identity
         .as_ref()
-        .ok_or_else(|| "candidate Stack work authority identity is absent".to_owned())?;
-    if stack_work != &protection.oracle.join(".stack-work")
-        || posix_object_identity(stack_work)? != *stack_work_identity
+        .ok_or_else(|| "candidate Stack work authority identity is absent".to_owned())?
+        .clone();
+    if stack_work != protection.oracle.join(".stack-work")
+        || posix_object_identity(&stack_work)? != stack_work_identity
     {
         return Err("candidate Stack work authority changed before sealing".to_owned());
     }
@@ -9389,7 +10748,7 @@ fn seal_posix_archive_adapter_authority<'a>(
         .map_err(|error| format!("cannot inspect candidate Stack work directory: {error}"))?;
     let temporary_metadata = fs::symlink_metadata(&temporary_directory)
         .map_err(|error| format!("cannot inspect candidate Stack temporary directory: {error}"))?;
-    let input_staging_metadata = fs::symlink_metadata(&input_staging)
+    let input_metadata = fs::symlink_metadata(&input_staging)
         .map_err(|error| format!("cannot inspect native archive input staging: {error}"))?;
     if parent_metadata.file_type().is_symlink()
         || !parent_metadata.is_dir()
@@ -9403,31 +10762,66 @@ fn seal_posix_archive_adapter_authority<'a>(
         || adapter_metadata.uid() != protection.archive_adapter_owner
         || adapter_metadata.gid() != protection.archive_adapter_group
         || adapter_metadata.permissions().mode() & 0o7777 != 0o755
-        || work_metadata.file_type().is_symlink()
-        || !work_metadata.is_dir()
-        || work_metadata.uid() != protection.archive_adapter_owner
-        || work_metadata.permissions().mode() & 0o7777 != 0o700
-        || temporary_metadata.file_type().is_symlink()
-        || !temporary_metadata.is_dir()
-        || temporary_metadata.uid() != protection.archive_adapter_owner
-        || temporary_metadata.permissions().mode() & 0o7777 != 0o770
-        || input_staging_metadata.file_type().is_symlink()
-        || !input_staging_metadata.is_dir()
-        || input_staging_metadata.uid() != protection.archive_adapter_owner
-        || input_staging_metadata.permissions().mode() & 0o7777 != 0o700
+        || !posix_mutable_archive_directory_is_exact(
+            &work_metadata,
+            protection.archive_adapter_owner,
+            0o700,
+        )
+        || !posix_mutable_archive_directory_is_exact(
+            &temporary_metadata,
+            protection.archive_adapter_owner,
+            0o770,
+        )
+        || !posix_mutable_archive_directory_is_exact(
+            &input_metadata,
+            protection.archive_adapter_owner,
+            0o700,
+        )
     {
         return Err("native archive adapter authority differs before sealing".to_owned());
     }
+    Ok(PosixArchiveAdapterPreseal {
+        adapter,
+        adapter_name,
+        work_directory,
+        temporary_directory,
+        input_staging,
+        stack_work,
+        stack_work_identity,
+    })
+}
+
+#[cfg(unix)]
+fn posix_mutable_archive_directory_is_exact(
+    metadata: &fs::Metadata,
+    owner: u32,
+    mode: u32,
+) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    !metadata.file_type().is_symlink()
+        && metadata.is_dir()
+        && metadata.uid() == owner
+        && metadata.permissions().mode() & 0o7777 == mode
+}
+
+#[cfg(unix)]
+fn transition_posix_archive_adapter_children(
+    protection: &PosixSourceProtection,
+    preseal: &PosixArchiveAdapterPreseal,
+) -> Result<PosixArchiveAdapterIdentities, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     require_exact_directory_members(
         &protection.archive_adapter,
-        &[adapter_name.to_os_string()],
+        std::slice::from_ref(&preseal.adapter_name),
         "native archive adapter authority",
     )?;
     let group = protection.archive_adapter_group.to_string();
     for path in [
-        &adapter,
-        work_directory.as_path(),
-        temporary_directory.as_path(),
+        &preseal.adapter,
+        &preseal.work_directory,
+        &preseal.temporary_directory,
     ] {
         trusted_tool_status(
             &protection.sudo,
@@ -9438,76 +10832,85 @@ fn seal_posix_archive_adapter_authority<'a>(
             ],
         )?;
     }
-    let candidate_group = protection.candidate_primary_gid.to_string();
     trusted_tool_status(
         &protection.sudo,
         &protection.tools.change_group,
         [
-            candidate_group.as_str(),
-            path_text(&input_staging, "native archive input staging")?,
+            protection.candidate_primary_gid.to_string().as_str(),
+            path_text(&preseal.input_staging, "native archive input staging")?,
         ],
     )?;
-    trusted_tool_status(
-        &protection.sudo,
-        &protection.tools.chmod,
-        posix_chmod_arguments(
-            protection.platform,
-            "2755",
-            path_text(&adapter, "native archive adapter")?,
-        )?,
-    )?;
-    trusted_tool_status(
-        &protection.sudo,
-        &protection.tools.chmod,
-        posix_chmod_arguments(
-            protection.platform,
-            "2710",
-            path_text(&input_staging, "native archive input staging")?,
-        )?,
-    )?;
-    let sealed_input_staging = fs::symlink_metadata(&input_staging)
+    set_posix_archive_adapter_modes(protection, preseal)?;
+    let sealed_input = fs::symlink_metadata(&preseal.input_staging)
         .map_err(|error| format!("cannot retain sealed native archive input staging: {error}"))?;
-    if sealed_input_staging.file_type().is_symlink()
-        || !sealed_input_staging.is_dir()
-        || sealed_input_staging.uid() != protection.archive_adapter_owner
-        || sealed_input_staging.gid() != protection.candidate_primary_gid
-        || sealed_input_staging.permissions().mode() & 0o7777 != 0o2710
+    if !posix_mutable_archive_directory_is_exact(
+        &sealed_input,
+        protection.archive_adapter_owner,
+        0o2710,
+    ) || sealed_input.gid() != protection.candidate_primary_gid
     {
         return Err("native archive input staging differs after seal transition".to_owned());
     }
-    trusted_tool_status(
-        &protection.sudo,
-        &protection.tools.chmod,
-        posix_chmod_arguments(
-            protection.platform,
+    Ok(PosixArchiveAdapterIdentities {
+        adapter: posix_object_identity(&preseal.adapter)?,
+        work_directory: posix_object_identity(&preseal.work_directory)?,
+        temporary_directory: posix_object_identity(&preseal.temporary_directory)?,
+    })
+}
+
+#[cfg(unix)]
+fn set_posix_archive_adapter_modes(
+    protection: &PosixSourceProtection,
+    preseal: &PosixArchiveAdapterPreseal,
+) -> Result<(), String> {
+    for (mode, path, label) in [
+        ("2755", &preseal.adapter, "native archive adapter"),
+        (
+            "2710",
+            &preseal.input_staging,
+            "native archive input staging",
+        ),
+        (
             "3770",
-            path_text(&work_directory, "candidate Stack work directory")?,
-        )?,
-    )?;
-    trusted_tool_status(
-        &protection.sudo,
-        &protection.tools.chmod,
-        posix_chmod_arguments(
-            protection.platform,
+            &preseal.work_directory,
+            "candidate Stack work directory",
+        ),
+        (
             "2770",
-            path_text(&temporary_directory, "candidate Stack temporary directory")?,
-        )?,
-    )?;
-    let adapter_identity = posix_object_identity(&adapter)?;
-    let work_directory_identity = posix_object_identity(&work_directory)?;
-    let temporary_directory_identity = posix_object_identity(&temporary_directory)?;
-    require_posix_archive_adapter_transition_state(PosixArchiveAdapterTransitionState {
+            &preseal.temporary_directory,
+            "candidate Stack temporary directory",
+        ),
+    ] {
+        trusted_tool_status(
+            &protection.sudo,
+            &protection.tools.chmod,
+            posix_chmod_arguments(protection.platform, mode, path_text(path, label)?)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn seal_posix_archive_adapter_authority<'a>(
+    protection: &PosixSourceProtection,
+    normalizer: &'a PosixAdapterProtection,
+    archive_adapter: &mut crate::command::NativeArchiveAdapter,
+    authorization_deadline: Option<Instant>,
+) -> Result<PosixArchiveAdapterSeal<'a>, String> {
+    let preseal = validate_posix_archive_adapter_preseal(protection, normalizer, archive_adapter)?;
+    let identities = transition_posix_archive_adapter_children(protection, &preseal)?;
+    require_posix_archive_adapter_transition_state(&PosixArchiveAdapterTransitionState {
         parent: &protection.archive_adapter,
         parent_identity: &protection.archive_adapter_identity,
         parent_owner: protection.archive_adapter_owner,
         parent_group: protection.archive_adapter_group,
         parent_mode: 0o2770,
-        adapter: &adapter,
-        adapter_identity: &adapter_identity,
-        work_directory: &work_directory,
-        work_directory_identity: &work_directory_identity,
-        temporary_directory: &temporary_directory,
-        temporary_directory_identity: &temporary_directory_identity,
+        adapter: &preseal.adapter,
+        adapter_identity: &identities.adapter,
+        work_directory: &preseal.work_directory,
+        work_directory_identity: &identities.work_directory,
+        temporary_directory: &preseal.temporary_directory,
+        temporary_directory_identity: &identities.temporary_directory,
     })?;
     trusted_tool_status(
         &protection.sudo,
@@ -9527,18 +10930,18 @@ fn seal_posix_archive_adapter_authority<'a>(
         parent_identity: protection.archive_adapter_identity.clone(),
         parent_owner: protection.archive_adapter_owner,
         parent_group: protection.archive_adapter_group,
-        adapter,
-        adapter_identity,
-        work_directory,
-        work_directory_identity,
-        temporary_directory,
-        temporary_directory_identity,
+        adapter: preseal.adapter,
+        adapter_identity: identities.adapter,
+        work_directory: preseal.work_directory,
+        work_directory_identity: identities.work_directory,
+        temporary_directory: preseal.temporary_directory,
+        temporary_directory_identity: identities.temporary_directory,
         source_parent: protection.directory.clone(),
         source_parent_identity: protection.directory_identity.clone(),
         source: protection.oracle.clone(),
         source_identity: posix_object_identity(&protection.oracle)?,
-        stack_work: stack_work.clone(),
-        stack_work_identity: stack_work_identity.clone(),
+        stack_work: preseal.stack_work,
+        stack_work_identity: preseal.stack_work_identity,
         candidate_uid: protection.candidate_uid,
         candidate_primary_gid: protection.candidate_primary_gid,
         quiescence_receipt: None,
@@ -9546,23 +10949,19 @@ fn seal_posix_archive_adapter_authority<'a>(
         sudo: protection.sudo.clone(),
         tools: protection.tools.clone(),
     };
-    if let Err(error) =
-        require_posix_archive_adapter_transition_state(PosixArchiveAdapterTransitionState {
-            parent: &sealed.parent,
-            parent_identity: &sealed.parent_identity,
-            parent_owner: sealed.parent_owner,
-            parent_group: sealed.parent_group,
-            parent_mode: 0o2550,
-            adapter: &sealed.adapter,
-            adapter_identity: &sealed.adapter_identity,
-            work_directory: &sealed.work_directory,
-            work_directory_identity: &sealed.work_directory_identity,
-            temporary_directory: &sealed.temporary_directory,
-            temporary_directory_identity: &sealed.temporary_directory_identity,
-        })
-    {
-        return Err(error);
-    }
+    require_posix_archive_adapter_transition_state(&PosixArchiveAdapterTransitionState {
+        parent: &sealed.parent,
+        parent_identity: &sealed.parent_identity,
+        parent_owner: sealed.parent_owner,
+        parent_group: sealed.parent_group,
+        parent_mode: 0o2550,
+        adapter: &sealed.adapter,
+        adapter_identity: &sealed.adapter_identity,
+        work_directory: &sealed.work_directory,
+        work_directory_identity: &sealed.work_directory_identity,
+        temporary_directory: &sealed.temporary_directory,
+        temporary_directory_identity: &sealed.temporary_directory_identity,
+    })?;
     if let Err(error) = archive_adapter.retain_sealed_authority(
         protection.archive_adapter_group,
         protection.candidate_uid,
@@ -9828,14 +11227,94 @@ fn validate_posix_adapter_installation_root(
 }
 
 #[cfg(unix)]
+struct PosixAdapterStage<'a> {
+    platform: ReleasePlatform,
+    sudo: &'a Path,
+    source: &'a Path,
+    source_identity: &'a PosixObjectIdentity,
+    source_sha256: hell_testkit::Digest,
+    installation_root: &'a Path,
+    installation_root_identity: &'a PosixObjectIdentity,
+    directory: &'a Path,
+    directory_identity: &'a PosixObjectIdentity,
+    staged: &'a Path,
+    staged_name: &'static str,
+    tools: &'a PosixAdapterTools,
+}
+
+#[cfg(unix)]
+fn populate_posix_adapter(stage: &PosixAdapterStage<'_>) -> Result<PosixAdapterProtection, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let source_text = path_text(stage.source, "trusted POSIX adapter source")?;
+    let staged_text = path_text(stage.staged, "trusted POSIX adapter path")?;
+    trusted_tool_status(
+        stage.sudo,
+        &stage.tools.copy,
+        ["--", source_text, staged_text],
+    )?;
+    trusted_tool_status(
+        stage.sudo,
+        &stage.tools.chmod,
+        posix_chmod_arguments(stage.platform, "0555", staged_text)?,
+    )?;
+    let canonical_directory = fs::canonicalize(stage.directory)
+        .map_err(|error| format!("cannot canonicalize POSIX adapter directory: {error}"))?;
+    let canonical_staged = fs::canonicalize(stage.staged)
+        .map_err(|error| format!("cannot canonicalize staged POSIX adapter: {error}"))?;
+    let directory_metadata = fs::symlink_metadata(stage.directory)
+        .map_err(|error| format!("cannot inspect POSIX adapter directory: {error}"))?;
+    let staged_metadata = fs::symlink_metadata(stage.staged)
+        .map_err(|error| format!("cannot inspect staged POSIX adapter: {error}"))?;
+    let adapter_identity = posix_object_identity(stage.staged)?;
+    if validate_posix_adapter_installation_root(stage.platform, stage.installation_root)?
+        != stage.installation_root
+        || posix_object_identity(stage.installation_root)? != *stage.installation_root_identity
+        || posix_object_identity(stage.source)? != *stage.source_identity
+        || hell_testkit::sha256_file(stage.source)
+            .map_err(|error| format!("cannot rehash trusted POSIX adapter source: {error}"))?
+            != stage.source_sha256
+        || canonical_directory != stage.directory
+        || canonical_staged != stage.staged
+        || directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || staged_metadata.file_type().is_symlink()
+        || !staged_metadata.is_file()
+        || directory_metadata.uid() != 0
+        || directory_metadata.gid() != 0
+        || staged_metadata.uid() != 0
+        || staged_metadata.gid() != 0
+        || directory_metadata.permissions().mode() & 0o7777 != 0o555
+        || staged_metadata.permissions().mode() & 0o7777 != 0o555
+        || *stage.directory_identity != posix_object_identity(stage.directory)?
+        || hell_testkit::sha256_file(stage.staged)
+            .map_err(|error| format!("cannot rehash staged POSIX adapter: {error}"))?
+            != stage.source_sha256
+    {
+        return Err("staged POSIX adapter identity or permissions differ".to_owned());
+    }
+    Ok(PosixAdapterProtection {
+        platform: stage.platform,
+        installation_root: stage.installation_root.to_path_buf(),
+        installation_root_identity: stage.installation_root_identity.clone(),
+        directory: stage.directory.to_path_buf(),
+        directory_identity: stage.directory_identity.clone(),
+        adapter: stage.staged.to_path_buf(),
+        adapter_identity,
+        sha256: stage.source_sha256,
+        staged_name: stage.staged_name,
+        sudo: stage.sudo.to_path_buf(),
+        tools: stage.tools.clone(),
+    })
+}
+
+#[cfg(unix)]
 fn stage_posix_executable(
     platform: ReleasePlatform,
     sudo: &Path,
     source_path: &Path,
     staged_name: &'static str,
 ) -> Result<PosixAdapterProtection, String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
     if !matches!(staged_name, "hell-ci" | "cargo" | "cargo-deny" | "stack") {
         return Err("trusted POSIX executable name differs from policy".to_owned());
     }
@@ -9865,85 +11344,32 @@ fn stage_posix_executable(
         .map_err(|error| format!("cannot reserve trusted POSIX adapter directory: {error}"))?;
     let directory_identity = posix_object_identity(&directory)?;
     let staged = directory.join(staged_name);
-    let staged_text = staged
-        .to_str()
-        .ok_or_else(|| "trusted POSIX adapter path is not UTF-8".to_owned())?;
-    let source_text = source
-        .to_str()
-        .ok_or_else(|| "trusted POSIX adapter source is not UTF-8".to_owned())?;
-    let mut cleanup = true;
-    let result = (|| {
-        trusted_tool_status(sudo, &tools.copy, ["--", source_text, staged_text])?;
-        trusted_tool_status(
-            sudo,
-            &tools.chmod,
-            posix_chmod_arguments(platform, "0555", staged_text)?,
-        )?;
-
-        let canonical_directory = fs::canonicalize(&directory)
-            .map_err(|error| format!("cannot canonicalize POSIX adapter directory: {error}"))?;
-        let canonical_staged = fs::canonicalize(&staged)
-            .map_err(|error| format!("cannot canonicalize staged POSIX adapter: {error}"))?;
-        let directory_metadata = fs::symlink_metadata(&directory)
-            .map_err(|error| format!("cannot inspect POSIX adapter directory: {error}"))?;
-        let staged_metadata = fs::symlink_metadata(&staged)
-            .map_err(|error| format!("cannot inspect staged POSIX adapter: {error}"))?;
-        let adapter_identity = posix_object_identity(&staged)?;
-        if validate_posix_adapter_installation_root(platform, &installation_root)?
-            != installation_root
-            || posix_object_identity(&installation_root)? != installation_root_identity
-            || posix_object_identity(&source)? != source_identity
-            || hell_testkit::sha256_file(&source)
-                .map_err(|error| format!("cannot rehash trusted POSIX adapter source: {error}"))?
-                != source_sha256
-            || canonical_directory != directory
-            || canonical_staged != staged
-            || directory_metadata.file_type().is_symlink()
-            || !directory_metadata.is_dir()
-            || staged_metadata.file_type().is_symlink()
-            || !staged_metadata.is_file()
-            || directory_metadata.uid() != 0
-            || directory_metadata.gid() != 0
-            || staged_metadata.uid() != 0
-            || staged_metadata.gid() != 0
-            || directory_metadata.permissions().mode() & 0o7777 != 0o555
-            || staged_metadata.permissions().mode() & 0o7777 != 0o555
-            || directory_identity != posix_object_identity(&directory)?
-            || hell_testkit::sha256_file(&staged)
-                .map_err(|error| format!("cannot rehash staged POSIX adapter: {error}"))?
-                != source_sha256
-        {
-            return Err("staged POSIX adapter identity or permissions differ".to_owned());
-        }
-        Ok(PosixAdapterProtection {
-            platform,
-            installation_root: installation_root.clone(),
-            installation_root_identity: installation_root_identity.clone(),
-            directory: directory.clone(),
-            directory_identity: directory_identity.clone(),
-            adapter: staged.clone(),
-            adapter_identity,
-            sha256: source_sha256,
-            staged_name,
-            sudo: sudo.to_path_buf(),
-            tools: tools.clone(),
-        })
-    })();
-    if result.is_ok() {
-        cleanup = false;
-    }
-    if cleanup {
-        let _ = cleanup_posix_adapter_paths(
+    let result = populate_posix_adapter(&PosixAdapterStage {
+        platform,
+        sudo,
+        source: &source,
+        source_identity: &source_identity,
+        source_sha256,
+        installation_root: &installation_root,
+        installation_root_identity: &installation_root_identity,
+        directory: &directory,
+        directory_identity: &directory_identity,
+        staged: &staged,
+        staged_name,
+        tools: &tools,
+    });
+    if result.is_err() {
+        let _ = cleanup_posix_adapter_paths(&PosixAdapterCleanup {
             platform,
             sudo,
-            &tools,
-            &installation_root,
-            &installation_root_identity,
-            &directory,
-            &directory_identity,
-            &staged,
+            tools: &tools,
+            installation_root: &installation_root,
+            installation_root_identity: &installation_root_identity,
+            directory: &directory,
+            directory_identity: &directory_identity,
+            adapter: &staged,
             staged_name,
-        );
+        });
     }
     result
 }
@@ -9957,31 +11383,45 @@ fn cleanup_posix_adapter(protection: &PosixAdapterProtection) -> Result<(), Stri
     {
         return Err("POSIX adapter identity changed before cleanup".to_owned());
     }
-    cleanup_posix_adapter_paths(
-        protection.platform,
-        &protection.sudo,
-        &protection.tools,
-        &protection.installation_root,
-        &protection.installation_root_identity,
-        &protection.directory,
-        &protection.directory_identity,
-        &protection.adapter,
-        protection.staged_name,
-    )
+    cleanup_posix_adapter_paths(&PosixAdapterCleanup {
+        platform: protection.platform,
+        sudo: &protection.sudo,
+        tools: &protection.tools,
+        installation_root: &protection.installation_root,
+        installation_root_identity: &protection.installation_root_identity,
+        directory: &protection.directory,
+        directory_identity: &protection.directory_identity,
+        adapter: &protection.adapter,
+        staged_name: protection.staged_name,
+    })
 }
 
 #[cfg(unix)]
-fn cleanup_posix_adapter_paths(
+struct PosixAdapterCleanup<'a> {
     platform: ReleasePlatform,
-    sudo: &Path,
-    tools: &PosixAdapterTools,
-    installation_root: &Path,
-    installation_root_identity: &PosixObjectIdentity,
-    directory: &Path,
-    directory_identity: &PosixObjectIdentity,
-    adapter: &Path,
-    staged_name: &str,
-) -> Result<(), String> {
+    sudo: &'a Path,
+    tools: &'a PosixAdapterTools,
+    installation_root: &'a Path,
+    installation_root_identity: &'a PosixObjectIdentity,
+    directory: &'a Path,
+    directory_identity: &'a PosixObjectIdentity,
+    adapter: &'a Path,
+    staged_name: &'a str,
+}
+
+#[cfg(unix)]
+fn cleanup_posix_adapter_paths(input: &PosixAdapterCleanup<'_>) -> Result<(), String> {
+    let PosixAdapterCleanup {
+        platform,
+        sudo,
+        tools,
+        installation_root,
+        installation_root_identity,
+        directory,
+        directory_identity,
+        adapter,
+        staged_name,
+    } = *input;
     if validate_posix_adapter_installation_root(platform, installation_root)? != installation_root
         || posix_object_identity(installation_root)? != *installation_root_identity
         || !posix_adapter_cleanup_is_exact(installation_root, directory, adapter, staged_name)
@@ -10633,15 +12073,15 @@ fn stage_windows_toolchain_until_with_entry_gate(
 
 #[cfg(windows)]
 fn establish_candidate_process_confinement(
-    _platform: ReleasePlatform,
-    candidate_root: &Path,
-    oracle_root: &Path,
-    _candidate_inventory: &JsonValue,
-    _oracle_inventory: &JsonValue,
-    _candidate_sha: &str,
-    target: &Path,
-    output: &Path,
+    input: CandidateConfinementInput<'_>,
 ) -> Result<CandidateConfinement, String> {
+    let CandidateConfinementInput {
+        candidate_root,
+        oracle_root,
+        workspace_target: target,
+        output,
+        ..
+    } = input;
     let toolchain_envelope = WindowsToolchainConstructionEnvelope::new()?;
     let cargo = crate::command::resolve_cargo_executable()?;
     let rustup = crate::command::resolve_windows_rustup_authority(&cargo, candidate_root)?;
@@ -10656,8 +12096,11 @@ fn establish_candidate_process_confinement(
             .iter()
             .map(|directory| toolchain.root.join(directory))
             .collect();
-        let trusted_parent_path = std::env::var_os("PATH")
-            .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?;
+        let environment = ProcessEnvironment::from_process();
+        let trusted_parent_path = environment
+            .value(StandardVariable::Path)
+            .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?
+            .to_os_string();
         let trusted_parent_system_root = hell_testkit::capture_windows_standard_system_root()
             .map_err(|error| format!("cannot bind trusted Windows SystemRoot: {error}"))?;
         let toolchain_authority =
@@ -10747,10 +12190,11 @@ fn establish_candidate_process_confinement(
     };
     Ok(CandidateConfinement {
         policy: Some(policy),
+        archive_launcher: None,
         candidate_root: candidate_root.to_path_buf(),
         oracle_root: oracle_root.to_path_buf(),
         candidate_target: target.to_path_buf(),
-        _toolchain: toolchain,
+        toolchain,
         toolchain_completion_deadline: toolchain_envelope.completion_deadline,
     })
 }
@@ -10832,8 +12276,11 @@ impl NightlyWindowsLaunchAuthority {
                 .iter()
                 .map(|directory| protection.root.join(directory))
                 .collect();
-            let trusted_parent_path = std::env::var_os("PATH")
-                .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?;
+            let environment = ProcessEnvironment::from_process();
+            let trusted_parent_path = environment
+                .value(StandardVariable::Path)
+                .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?
+                .to_os_string();
             let trusted_parent_system_root =
                 hell_testkit::capture_windows_standard_system_root()
                     .map_err(|error| format!("cannot bind trusted Windows SystemRoot: {error}"))?;
@@ -11164,7 +12611,9 @@ mod windows_confinement {
     }
 
     fn resolve_icacls() -> Result<PathBuf, String> {
-        let system_root = std::env::var_os("SystemRoot")
+        let environment = ProcessEnvironment::from_process();
+        let system_root = environment
+            .value(StandardVariable::SystemRoot)
             .ok_or_else(|| "standard SystemRoot is unavailable".to_owned())?;
         let system32 = PathBuf::from(system_root)
             .join("System32")
@@ -11196,9 +12645,9 @@ mod windows_confinement {
     }
 
     fn run_icacls(icacls: &Path, path: &Path, arguments: &[&str]) -> Result<(), String> {
-        let output = std::process::Command::new(icacls)
-            .arg(path)
-            .args(arguments)
+        let output = NativeProcessSpec::new(icacls.as_os_str())
+            .argument(path.as_os_str())
+            .arguments(arguments.iter().copied())
             .output()
             .map_err(|error| format!("cannot launch Windows icacls.exe: {error}"))?;
         if !output.status.success() {
@@ -11243,14 +12692,12 @@ fn windows_confinement_icacls_grants(writable: bool, is_directory: bool) -> [&'s
 }
 
 struct CandidateConfinement {
-    #[cfg(unix)]
-    policy: hell_testkit::CandidateLaunchPolicy,
-    #[cfg(windows)]
     policy: Option<hell_testkit::CandidateLaunchPolicy>,
+    archive_launcher: Option<PathBuf>,
     #[cfg(unix)]
-    _cleanup: PosixPrincipalCleanup,
+    cleanup: PosixPrincipalCleanup,
     #[cfg(unix)]
-    _adapter_protection: PosixAdapterProtection,
+    adapter_protection: PosixAdapterProtection,
     #[cfg(unix)]
     _cargo_protection: PosixAdapterProtection,
     #[cfg(unix)]
@@ -11274,24 +12721,21 @@ struct CandidateConfinement {
     #[cfg(windows)]
     candidate_target: PathBuf,
     #[cfg(windows)]
-    _toolchain: WindowsToolchainProtection,
+    toolchain: WindowsToolchainProtection,
     #[cfg(windows)]
     toolchain_completion_deadline: Instant,
 }
 
 impl CandidateConfinement {
     fn policy(&self) -> Result<&hell_testkit::CandidateLaunchPolicy, String> {
-        #[cfg(unix)]
-        return Ok(&self.policy);
-        #[cfg(windows)]
         self.policy
             .as_ref()
-            .ok_or_else(|| "Windows candidate launch policy was already closed".to_owned())
+            .ok_or_else(|| "candidate launch policy was already closed".to_owned())
     }
 
     fn finish_candidate_principal(&mut self) -> Result<(), String> {
         #[cfg(unix)]
-        return self._cleanup.cleanup();
+        return self.cleanup.cleanup();
         #[cfg(windows)]
         Ok(())
     }
@@ -11304,9 +12748,9 @@ impl CandidateConfinement {
     #[cfg(windows)]
     fn close_windows_toolchain_until(&mut self, deadline: Instant) -> Result<(), String> {
         drop(self.policy.take());
-        self._toolchain
+        self.toolchain
             .cleanup_until_with_retry(deadline, "release toolchain")?;
-        match fs::symlink_metadata(&self._toolchain.root) {
+        match fs::symlink_metadata(&self.toolchain.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!(
                 "cannot attest Windows release toolchain absence: {error}"
@@ -11325,7 +12769,7 @@ impl CandidateConfinement {
     fn export_candidate_target(&mut self, workspace_target: &Path) -> Result<(), String> {
         #[cfg(unix)]
         return export_posix_candidate_target(
-            &self._adapter_protection,
+            &self.adapter_protection,
             &mut self.candidate_target,
             workspace_target,
         );
@@ -11363,7 +12807,7 @@ impl CandidateConfinement {
         if let Some(mut protection) = self.stack_root_protection.take() {
             normalize_posix_stack_root_with_adapter(
                 &protection.sudo,
-                &self._adapter_protection,
+                &self.adapter_protection,
                 &protection.root,
                 protection.candidate_uid,
                 protection.trusted_group_id,
@@ -11373,10 +12817,7 @@ impl CandidateConfinement {
         Ok(())
     }
     fn archive_launcher(&self) -> Option<&Path> {
-        #[cfg(unix)]
-        return Some(&self._adapter_protection.adapter);
-        #[cfg(windows)]
-        return None;
+        self.archive_launcher.as_deref()
     }
 
     fn archive_adapter_base<'a>(&'a self, _target: &'a Path) -> &'a Path {
@@ -11394,7 +12835,7 @@ impl CandidateConfinement {
     ) -> Result<PosixArchiveAdapterSeal<'_>, String> {
         seal_posix_archive_adapter_authority(
             &self.source_protection,
-            &self._adapter_protection,
+            &self.adapter_protection,
             archive_adapter,
             authorization_deadline,
         )
@@ -11763,8 +13204,8 @@ impl PosixPrincipalCleanup {
         group: String,
         uid: Option<u32>,
         gid: Option<u32>,
-    ) -> Result<Self, String> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             platform,
             authorities,
             principal,
@@ -11777,7 +13218,7 @@ impl PosixPrincipalCleanup {
             ordering: None,
             deadline: None,
             active: true,
-        })
+        }
     }
 
     fn attach_verifier_transient(
@@ -11834,16 +13275,29 @@ impl PosixPrincipalCleanup {
         if !self.active {
             return Ok(());
         }
-        let deadline = match self.deadline {
-            Some(deadline) => deadline,
-            None => {
-                let deadline = Instant::now()
-                    .checked_add(Duration::from_secs(30))
-                    .ok_or_else(|| "candidate process quiescence deadline overflowed".to_owned())?;
-                self.deadline = Some(deadline);
-                deadline
-            }
-        };
+        let deadline = self.cleanup_deadline()?;
+        self.prepare_principal_cleanup(deadline)?;
+        match self.platform {
+            ReleasePlatform::LinuxX86_64 => self.cleanup_linux_principal(deadline)?,
+            ReleasePlatform::MacosAarch64 => self.cleanup_macos_principal(deadline)?,
+            ReleasePlatform::WindowsX86_64 => {}
+        }
+        self.active = false;
+        Ok(())
+    }
+
+    fn cleanup_deadline(&mut self) -> Result<Instant, String> {
+        if let Some(deadline) = self.deadline {
+            return Ok(deadline);
+        }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| "candidate process quiescence deadline overflowed".to_owned())?;
+        self.deadline = Some(deadline);
+        Ok(deadline)
+    }
+
+    fn prepare_principal_cleanup(&mut self, deadline: Instant) -> Result<(), String> {
         let observed_uid = self
             .user_created
             .then(|| posix_principal_uid(deadline, self.platform, &self.principal))
@@ -11878,156 +13332,137 @@ impl PosixPrincipalCleanup {
         {
             ordering.observe_user_absent()?;
         }
-        match self.platform {
-            ReleasePlatform::LinuxX86_64 => {
-                if self.user_created {
-                    if let Some(ordering) = &self.ordering {
-                        ordering.require_user_deletion()?;
-                    }
-                    let expected = self.uid.ok_or_else(|| {
-                        "candidate principal UID receipt disappeared after process quiescence"
-                            .to_owned()
-                    })?;
-                    self.require_exact_identity_until(
-                        deadline,
-                        "-u",
-                        expected,
-                        "UID after process quiescence",
-                    )?;
-                    let result = self.command_until(
-                        deadline,
-                        [
-                            OsString::from("-n"),
-                            OsString::from("--"),
-                            OsString::from("/usr/sbin/userdel"),
-                            OsString::from(&self.principal),
-                        ],
-                    )?;
-                    if result.timed_out || !result.status.success() {
-                        return Err("candidate principal deletion did not succeed".to_owned());
-                    }
-                    if posix_principal_uid(deadline, self.platform, &self.principal)?.is_some() {
-                        return Err(
-                            "candidate principal remains present after successful deletion"
-                                .to_owned(),
-                        );
-                    }
-                    if let Some(ordering) = &mut self.ordering {
-                        ordering.observe_user_absent()?;
-                    }
-                    self.user_created = false;
-                }
-                if self.group_created {
-                    if let Some(ordering) = &self.ordering {
-                        ordering.require_group_deletion()?;
-                    }
-                    if let Some(observed) = posix_group_gid(deadline, &self.group)? {
-                        if self.gid.is_some_and(|expected| expected != observed) {
-                            return Err("candidate group GID changed before cleanup".to_owned());
-                        }
-                        self.gid = Some(observed);
-                        let result = self.command_until(
-                            deadline,
-                            [
-                                OsString::from("-n"),
-                                OsString::from("--"),
-                                OsString::from("/usr/sbin/groupdel"),
-                                OsString::from(&self.group),
-                            ],
-                        )?;
-                        if result.timed_out || !result.status.success() {
-                            return Err("candidate group deletion did not succeed".to_owned());
-                        }
-                    }
-                    if posix_group_gid(deadline, &self.group)?.is_some() {
-                        return Err(
-                            "candidate group remains present after successful cleanup".to_owned()
-                        );
-                    }
-                    self.group_created = false;
-                }
+        Ok(())
+    }
+
+    fn cleanup_linux_principal(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.user_created {
+            self.require_user_deletion_ready(deadline)?;
+            let result = self.command_until(
+                deadline,
+                [
+                    OsString::from("-n"),
+                    OsString::from("--"),
+                    OsString::from("/usr/sbin/userdel"),
+                    OsString::from(&self.principal),
+                ],
+            )?;
+            if result.timed_out || !result.status.success() {
+                return Err("candidate principal deletion did not succeed".to_owned());
             }
-            ReleasePlatform::MacosAarch64 => {
-                if self.user_created {
-                    if let Some(ordering) = &self.ordering {
-                        ordering.require_user_deletion()?;
-                    }
-                    let expected = self.uid.ok_or_else(|| {
-                        "candidate principal UID receipt disappeared after process quiescence"
-                            .to_owned()
-                    })?;
-                    self.require_exact_identity_until(
-                        deadline,
-                        "-u",
-                        expected,
-                        "UID after process quiescence",
-                    )?;
-                    let result = self.command_until(
-                        deadline,
-                        [
-                            OsString::from("-n"),
-                            OsString::from("--"),
-                            OsString::from("/usr/bin/dscl"),
-                            OsString::from("."),
-                            OsString::from("-delete"),
-                            Path::new("/Users").join(&self.principal).into_os_string(),
-                        ],
-                    )?;
-                    if result.timed_out || !result.status.success() {
-                        return Err(
-                            "candidate directory-service cleanup did not succeed".to_owned()
-                        );
-                    }
-                    if posix_principal_uid(deadline, self.platform, &self.principal)?.is_some() {
-                        return Err(
-                            "candidate principal remains present after directory-service deletion"
-                                .to_owned(),
-                        );
-                    }
-                    if let Some(ordering) = &mut self.ordering {
-                        ordering.observe_user_absent()?;
-                    }
-                    self.user_created = false;
-                }
-                if self.group_created {
-                    if let Some(ordering) = &self.ordering {
-                        ordering.require_group_deletion()?;
-                    }
-                    let observed = posix_group_gid(deadline, &self.group)?.ok_or_else(|| {
-                        "created candidate group disappeared before cleanup".to_owned()
-                    })?;
-                    if self.gid.is_some_and(|expected| expected != observed) {
-                        return Err("candidate group GID changed before cleanup".to_owned());
-                    }
-                    self.gid = Some(observed);
-                    let result = self.command_until(
-                        deadline,
-                        [
-                            OsString::from("-n"),
-                            OsString::from("--"),
-                            OsString::from("/usr/bin/dscl"),
-                            OsString::from("."),
-                            OsString::from("-delete"),
-                            Path::new("/Groups").join(&self.group).into_os_string(),
-                        ],
-                    )?;
-                    if result.timed_out || !result.status.success() {
-                        return Err(
-                            "candidate directory-service cleanup did not succeed".to_owned()
-                        );
-                    }
-                    if posix_group_gid(deadline, &self.group)?.is_some() {
-                        return Err(
-                            "candidate group remains present after directory-service deletion"
-                                .to_owned(),
-                        );
-                    }
-                    self.group_created = false;
-                }
-            }
-            ReleasePlatform::WindowsX86_64 => {}
+            self.confirm_user_absent(deadline, "successful deletion")?;
         }
-        self.active = false;
+        self.cleanup_linux_group(deadline)
+    }
+
+    fn cleanup_linux_group(&mut self, deadline: Instant) -> Result<(), String> {
+        if !self.group_created {
+            return Ok(());
+        }
+        if let Some(ordering) = &self.ordering {
+            ordering.require_group_deletion()?;
+        }
+        if let Some(observed) = posix_group_gid(deadline, &self.group)? {
+            if self.gid.is_some_and(|expected| expected != observed) {
+                return Err("candidate group GID changed before cleanup".to_owned());
+            }
+            self.gid = Some(observed);
+            let result = self.command_until(
+                deadline,
+                [
+                    OsString::from("-n"),
+                    OsString::from("--"),
+                    OsString::from("/usr/sbin/groupdel"),
+                    OsString::from(&self.group),
+                ],
+            )?;
+            if result.timed_out || !result.status.success() {
+                return Err("candidate group deletion did not succeed".to_owned());
+            }
+        }
+        if posix_group_gid(deadline, &self.group)?.is_some() {
+            return Err("candidate group remains present after successful cleanup".to_owned());
+        }
+        self.group_created = false;
+        Ok(())
+    }
+
+    fn cleanup_macos_principal(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.user_created {
+            self.require_user_deletion_ready(deadline)?;
+            let result = self.command_until(
+                deadline,
+                [
+                    OsString::from("-n"),
+                    OsString::from("--"),
+                    OsString::from("/usr/bin/dscl"),
+                    OsString::from("."),
+                    OsString::from("-delete"),
+                    Path::new("/Users").join(&self.principal).into_os_string(),
+                ],
+            )?;
+            if result.timed_out || !result.status.success() {
+                return Err("candidate directory-service cleanup did not succeed".to_owned());
+            }
+            self.confirm_user_absent(deadline, "directory-service deletion")?;
+        }
+        self.cleanup_macos_group(deadline)
+    }
+
+    fn cleanup_macos_group(&mut self, deadline: Instant) -> Result<(), String> {
+        if !self.group_created {
+            return Ok(());
+        }
+        if let Some(ordering) = &self.ordering {
+            ordering.require_group_deletion()?;
+        }
+        let observed = posix_group_gid(deadline, &self.group)?
+            .ok_or_else(|| "created candidate group disappeared before cleanup".to_owned())?;
+        if self.gid.is_some_and(|expected| expected != observed) {
+            return Err("candidate group GID changed before cleanup".to_owned());
+        }
+        self.gid = Some(observed);
+        let result = self.command_until(
+            deadline,
+            [
+                OsString::from("-n"),
+                OsString::from("--"),
+                OsString::from("/usr/bin/dscl"),
+                OsString::from("."),
+                OsString::from("-delete"),
+                Path::new("/Groups").join(&self.group).into_os_string(),
+            ],
+        )?;
+        if result.timed_out || !result.status.success() {
+            return Err("candidate directory-service cleanup did not succeed".to_owned());
+        }
+        if posix_group_gid(deadline, &self.group)?.is_some() {
+            return Err(
+                "candidate group remains present after directory-service deletion".to_owned(),
+            );
+        }
+        self.group_created = false;
+        Ok(())
+    }
+
+    fn require_user_deletion_ready(&self, deadline: Instant) -> Result<(), String> {
+        if let Some(ordering) = &self.ordering {
+            ordering.require_user_deletion()?;
+        }
+        let expected = self.uid.ok_or_else(|| {
+            "candidate principal UID receipt disappeared after process quiescence".to_owned()
+        })?;
+        self.require_exact_identity_until(deadline, "-u", expected, "UID after process quiescence")
+    }
+
+    fn confirm_user_absent(&mut self, deadline: Instant, phase: &str) -> Result<(), String> {
+        if posix_principal_uid(deadline, self.platform, &self.principal)?.is_some() {
+            return Err(format!("candidate principal remains present after {phase}"));
+        }
+        if let Some(ordering) = &mut self.ordering {
+            ordering.observe_user_absent()?;
+        }
+        self.user_created = false;
         Ok(())
     }
 
@@ -12177,12 +13612,12 @@ impl PosixPrincipalCleanup {
 
 #[cfg(unix)]
 fn macos_construction_receipt_flags(
-    expected_uid: Option<u32>,
-    expected_gid: Option<u32>,
+    expected_user_id: Option<u32>,
+    expected_group_id: Option<u32>,
     user_created: bool,
     group_created: bool,
-    observed_uid: Option<u32>,
-    observed_gid: Option<u32>,
+    observed_user_id: Option<u32>,
+    observed_group_id: Option<u32>,
 ) -> Result<(bool, bool), String> {
     let update =
         |label: &str, expected: Option<u32>, created: bool, observed: Option<u32>| match observed {
@@ -12196,8 +13631,13 @@ fn macos_construction_receipt_flags(
             None => Ok(false),
         };
     Ok((
-        update("principal", expected_uid, user_created, observed_uid)?,
-        update("group", expected_gid, group_created, observed_gid)?,
+        update(
+            "principal",
+            expected_user_id,
+            user_created,
+            observed_user_id,
+        )?,
+        update("group", expected_group_id, group_created, observed_group_id)?,
     ))
 }
 
@@ -12392,7 +13832,7 @@ fn macos_directory_service_inventory_id(
             ));
         }
         let fields = line
-            .split(|byte| byte.is_ascii_whitespace())
+            .split(u8::is_ascii_whitespace)
             .filter(|field| !field.is_empty())
             .collect::<Vec<_>>();
         if fields.len() != 2 {
@@ -12737,7 +14177,7 @@ fn allocate_linux_candidate_principal_with_user_tool(
             group.clone(),
             Some(id),
             Some(id),
-        )?;
+        );
         let group_result = match candidate_principal_mutation(
             sudo,
             &groupadd,
@@ -12917,11 +14357,6 @@ fn verify_linux_candidate_principal_rollback(sudo: &Path) -> Result<(), String> 
             "injected Linux user-creation failure left a principal or group behind".to_owned(),
         );
     }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn verify_linux_candidate_principal_rollback(_sudo: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -13419,8 +14854,6 @@ impl PosixCandidateTargetReceipt {
 
 #[cfg(unix)]
 fn posix_candidate_target_receipt(root: &Path) -> Result<PosixCandidateTargetReceipt, String> {
-    use std::os::unix::fs::MetadataExt as _;
-
     let root = fs::canonicalize(root)
         .map_err(|error| format!("cannot canonicalize candidate target manifest root: {error}"))?;
     let mut budget = PosixCandidateTargetBudget::default();
@@ -13428,121 +14861,169 @@ fn posix_candidate_target_receipt(root: &Path) -> Result<PosixCandidateTargetRec
     let mut topology = BTreeMap::new();
     let mut pending = vec![root.clone()];
     while let Some(path) = pending.pop() {
-        let before = fs::symlink_metadata(&path)
-            .map_err(|error| format!("cannot inspect candidate target manifest entry: {error}"))?;
-        let file_type = before.file_type();
-        if file_type.is_symlink()
-            || (!file_type.is_dir() && !file_type.is_file())
-            || fs::canonicalize(&path).map_err(|error| {
-                format!("cannot canonicalize candidate target manifest entry: {error}")
-            })? != path
-        {
+        let (before, sha256) = capture_posix_candidate_target_entry(
+            &root,
+            &path,
+            &mut budget,
+            &mut manifest,
+            &mut topology,
+        )?;
+        let directory_names = queue_posix_candidate_target_children(&path, &before, &mut pending)?;
+        revalidate_posix_candidate_target_entry(&path, &before, sha256, directory_names)?;
+    }
+    validate_posix_candidate_target_links(&topology)?;
+    Ok(PosixCandidateTargetReceipt { manifest, topology })
+}
+
+#[cfg(unix)]
+fn capture_posix_candidate_target_entry(
+    root: &Path,
+    path: &Path,
+    budget: &mut PosixCandidateTargetBudget,
+    manifest: &mut BTreeMap<PathBuf, PosixCandidateTargetManifestEntry>,
+    topology: &mut BTreeMap<PathBuf, PosixCandidateTargetTopologyEntry>,
+) -> Result<(fs::Metadata, Option<hell_testkit::Digest>), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect candidate target manifest entry: {error}"))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink()
+        || (!file_type.is_dir() && !file_type.is_file())
+        || fs::canonicalize(path).map_err(|error| {
+            format!("cannot canonicalize candidate target manifest entry: {error}")
+        })? != path
+    {
+        return Err("candidate target manifest contains a redirected or special entry".to_owned());
+    }
+    let bytes = if file_type.is_file() {
+        metadata.len()
+    } else {
+        0
+    };
+    budget.account(bytes)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "candidate target manifest entry escapes its root".to_owned())?
+        .to_path_buf();
+    let sha256 = file_type
+        .is_file()
+        .then(|| hell_testkit::sha256_file(path))
+        .transpose()
+        .map_err(|error| format!("cannot hash candidate target manifest entry: {error}"))?;
+    if manifest
+        .insert(
+            relative.clone(),
+            PosixCandidateTargetManifestEntry {
+                directory: file_type.is_dir(),
+                bytes,
+                sha256,
+            },
+        )
+        .is_some()
+    {
+        return Err("candidate target manifest contains a duplicate path".to_owned());
+    }
+    if topology
+        .insert(
+            relative,
+            PosixCandidateTargetTopologyEntry {
+                directory: file_type.is_dir(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                links: metadata.nlink(),
+                owner: metadata.uid(),
+                group: metadata.gid(),
+                mode: metadata.mode(),
+                bytes,
+            },
+        )
+        .is_some()
+    {
+        return Err("candidate target topology contains a duplicate path".to_owned());
+    }
+    Ok((metadata, sha256))
+}
+
+#[cfg(unix)]
+fn queue_posix_candidate_target_children(
+    path: &Path,
+    metadata: &fs::Metadata,
+    pending: &mut Vec<PathBuf>,
+) -> Result<Option<BTreeSet<OsString>>, String> {
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("cannot enumerate candidate target manifest directory: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| (entry.file_name(), entry.path()))
+                .map_err(|error| {
+                    format!("cannot inspect candidate target manifest member: {error}")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let names = entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    pending.extend(entries.into_iter().rev().map(|(_, child)| child));
+    Ok(Some(names))
+}
+
+#[cfg(unix)]
+fn revalidate_posix_candidate_target_entry(
+    path: &Path,
+    before: &fs::Metadata,
+    sha256: Option<hell_testkit::Digest>,
+    directory_names: Option<BTreeSet<OsString>>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot revalidate candidate target manifest entry: {error}"))?;
+    if after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.len() != before.len()
+        || after.nlink() != before.nlink()
+        || after.uid() != before.uid()
+        || after.gid() != before.gid()
+        || after.mode() != before.mode()
+        || after.file_type() != before.file_type()
+    {
+        return Err("candidate target changed while its manifest was captured".to_owned());
+    }
+    if let Some(expected_names) = directory_names {
+        let observed_names = fs::read_dir(path)
+            .map_err(|error| {
+                format!("cannot re-enumerate candidate target manifest directory: {error}")
+            })?
+            .map(|entry| {
+                entry.map(|entry| entry.file_name()).map_err(|error| {
+                    format!("cannot revalidate candidate target manifest member: {error}")
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if observed_names != expected_names {
             return Err(
-                "candidate target manifest contains a redirected or special entry".to_owned(),
+                "candidate target directory changed while its manifest was captured".to_owned(),
             );
         }
-        let bytes = if file_type.is_file() { before.len() } else { 0 };
-        budget.account(bytes)?;
-        let relative = path
-            .strip_prefix(&root)
-            .map_err(|_| "candidate target manifest entry escapes its root".to_owned())?
-            .to_path_buf();
-        let sha256 = file_type
-            .is_file()
-            .then(|| hell_testkit::sha256_file(&path))
-            .transpose()
-            .map_err(|error| format!("cannot hash candidate target manifest entry: {error}"))?;
-        if manifest
-            .insert(
-                relative.clone(),
-                PosixCandidateTargetManifestEntry {
-                    directory: file_type.is_dir(),
-                    bytes,
-                    sha256,
-                },
-            )
-            .is_some()
-        {
-            return Err("candidate target manifest contains a duplicate path".to_owned());
-        }
-        if topology
-            .insert(
-                relative,
-                PosixCandidateTargetTopologyEntry {
-                    directory: file_type.is_dir(),
-                    device: before.dev(),
-                    inode: before.ino(),
-                    links: before.nlink(),
-                    owner: before.uid(),
-                    group: before.gid(),
-                    mode: before.mode(),
-                    bytes,
-                },
-            )
-            .is_some()
-        {
-            return Err("candidate target topology contains a duplicate path".to_owned());
-        }
-        let directory_names = if file_type.is_dir() {
-            let mut entries = fs::read_dir(&path)
-                .map_err(|error| {
-                    format!("cannot enumerate candidate target manifest directory: {error}")
-                })?
-                .map(|entry| {
-                    entry
-                        .map(|entry| (entry.file_name(), entry.path()))
-                        .map_err(|error| {
-                            format!("cannot inspect candidate target manifest member: {error}")
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            let names = entries
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect::<BTreeSet<_>>();
-            pending.extend(entries.into_iter().rev().map(|(_, path)| path));
-            Some(names)
-        } else {
-            None
-        };
-        let after = fs::symlink_metadata(&path).map_err(|error| {
-            format!("cannot revalidate candidate target manifest entry: {error}")
-        })?;
-        if after.dev() != before.dev()
-            || after.ino() != before.ino()
-            || after.len() != before.len()
-            || after.nlink() != before.nlink()
-            || after.uid() != before.uid()
-            || after.gid() != before.gid()
-            || after.mode() != before.mode()
-            || after.file_type() != before.file_type()
-        {
-            return Err("candidate target changed while its manifest was captured".to_owned());
-        }
-        if let Some(directory_names) = directory_names {
-            let names_after = fs::read_dir(&path)
-                .map_err(|error| {
-                    format!("cannot re-enumerate candidate target manifest directory: {error}")
-                })?
-                .map(|entry| {
-                    entry.map(|entry| entry.file_name()).map_err(|error| {
-                        format!("cannot revalidate candidate target manifest member: {error}")
-                    })
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if names_after != directory_names {
-                return Err(
-                    "candidate target directory changed while its manifest was captured".to_owned(),
-                );
-            }
-        } else if hell_testkit::sha256_file(&path)
-            .map_err(|error| format!("cannot rehash candidate target manifest entry: {error}"))?
-            != sha256.expect("file manifest retains a digest")
-        {
-            return Err("candidate target file changed while its manifest was captured".to_owned());
-        }
+    } else if hell_testkit::sha256_file(path)
+        .map_err(|error| format!("cannot rehash candidate target manifest entry: {error}"))?
+        != sha256.expect("file manifest retains a digest")
+    {
+        return Err("candidate target file changed while its manifest was captured".to_owned());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_posix_candidate_target_links(
+    topology: &BTreeMap<PathBuf, PosixCandidateTargetTopologyEntry>,
+) -> Result<(), String> {
     let mut observed_links = BTreeMap::<(u64, u64), u64>::new();
     for entry in topology.values().filter(|entry| !entry.directory) {
         let observed = observed_links
@@ -13557,7 +15038,7 @@ fn posix_candidate_target_receipt(root: &Path) -> Result<PosixCandidateTargetRec
             return Err("candidate target contains a hard link outside its authority".to_owned());
         }
     }
-    Ok(PosixCandidateTargetReceipt { manifest, topology })
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -13589,6 +15070,12 @@ enum PosixCandidateTargetExportPhase {
 #[derive(Debug, Default)]
 struct PosixCandidateTargetExportReceipt {
     phase: PosixCandidateTargetExportPhase,
+}
+
+#[cfg(unix)]
+struct PosixCandidateTargetExportPaths {
+    replacement: PathBuf,
+    backup: PathBuf,
 }
 
 #[cfg(unix)]
@@ -13629,106 +15116,27 @@ fn export_posix_candidate_target_with_fault(
         return Err("staged candidate target root changed during candidate execution".to_owned());
     }
 
-    let source_manifest_before = posix_candidate_target_manifest(&protection.staged)?;
-    let replacement = workspace_target.with_file_name(format!(
-        "candidate-target-export-replacement-{}",
-        std::process::id()
-    ));
-    let backup = workspace_target.with_file_name(format!(
-        "candidate-target-export-backup-{}",
-        std::process::id()
-    ));
-    for reserved in [&replacement, &backup] {
-        match fs::symlink_metadata(reserved) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err("candidate target export sibling authority already exists".to_owned()),
-        }
-    }
-    if replacement.parent() != workspace_target.parent()
-        || backup.parent() != workspace_target.parent()
-    {
-        return Err("candidate target export siblings escape the hosted filesystem".to_owned());
-    }
-    let prepare_result = (|| {
-        let mut budget = PosixCandidateTargetBudget::default();
-        copy_posix_candidate_target_tree(&protection.staged, &replacement, &mut budget)?;
-        normalize_candidate_cache_export_replacement_with_adapter(
-            &adapter.sudo,
-            adapter,
-            &replacement,
-            workspace_target,
-            protection.trusted_owner,
-            protection.trusted_group,
-        )?;
-        let source_manifest_after = posix_candidate_target_manifest(&protection.staged)?;
-        let replacement_manifest = posix_candidate_target_manifest(&replacement)?;
-        if source_manifest_before != source_manifest_after
-            || source_manifest_after != replacement_manifest
-        {
-            return Err(
-                "candidate target replacement manifest differs from staged output".to_owned(),
-            );
-        }
-        Ok((replacement_manifest, posix_object_identity(&replacement)?))
-    })();
-    let (replacement_manifest, replacement_identity) = match prepare_result {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&replacement);
-            return Err(error);
-        }
-    };
+    let paths = posix_candidate_target_export_paths(workspace_target)?;
+    let (replacement_manifest, replacement_identity) = prepare_posix_candidate_target_replacement(
+        adapter,
+        protection,
+        workspace_target,
+        &paths.replacement,
+    )?;
     receipt.phase = PosixCandidateTargetExportPhase::ReplacementPrepared;
     let old_manifest = posix_candidate_target_manifest(workspace_target)?;
     let old_identity = posix_object_identity(workspace_target)?;
-    if let Err(error) = fs::rename(workspace_target, &backup) {
-        let cleanup = fs::remove_dir_all(&replacement);
-        cleanup.map_err(|cleanup_error| {
-            format!(
-                "cannot retain hosted candidate target backup ({error}) or clean replacement: {cleanup_error}"
-            )
-        })?;
-        return Err(format!(
-            "cannot retain hosted candidate target backup: {error}"
-        ));
-    }
-    receipt.phase = PosixCandidateTargetExportPhase::BackupRenamed;
-    let backup_validation = (|| {
-        if posix_object_identity(&backup)? != old_identity
-            || posix_candidate_target_manifest(&backup)? != old_manifest
-        {
-            return Err("hosted candidate target backup identity changed".to_owned());
-        }
-        Ok(())
-    })();
-    if let Err(error) = backup_validation {
-        let rollback = fs::rename(&backup, workspace_target);
-        let _ = fs::remove_dir_all(&replacement);
-        rollback.map_err(|error| {
-            format!("hosted candidate target backup validation and rollback failed: {error}")
-        })?;
-        return Err(error);
-    }
-    if fault == PosixCandidateTargetExportFault::AfterBackupRename {
-        fs::rename(&backup, workspace_target).map_err(|error| {
-            format!("cannot restore hosted candidate target after injected failure: {error}")
-        })?;
-        fs::remove_dir_all(&replacement).map_err(|error| {
-            format!("cannot remove replacement after injected export failure: {error}")
-        })?;
-        if posix_object_identity(workspace_target)? != old_identity
-            || posix_candidate_target_manifest(workspace_target)? != old_manifest
-        {
-            return Err(
-                "injected candidate target export rollback changed the old cache".to_owned(),
-            );
-        }
-        receipt.phase = PosixCandidateTargetExportPhase::InjectedRollbackComplete;
-        return Err("injected candidate target export failure after backup rename".to_owned());
-    }
-    if let Err(error) = fs::rename(&replacement, workspace_target) {
-        let rollback = fs::rename(&backup, workspace_target);
-        let _ = fs::remove_dir_all(&replacement);
+    retain_posix_candidate_target_backup(
+        workspace_target,
+        &paths,
+        &old_manifest,
+        &old_identity,
+        fault,
+        receipt,
+    )?;
+    if let Err(error) = fs::rename(&paths.replacement, workspace_target) {
+        let rollback = fs::rename(&paths.backup, workspace_target);
+        let _ = fs::remove_dir_all(&paths.replacement);
         rollback.map_err(|rollback_error| {
             format!(
                 "candidate target replacement failed ({error}) and rollback failed: {rollback_error}"
@@ -13749,9 +15157,9 @@ fn export_posix_candidate_target_with_fault(
     let committed_identity = match committed {
         Ok(identity) => identity,
         Err(error) => {
-            let displaced = fs::rename(workspace_target, &replacement);
-            let restored = displaced.and_then(|()| fs::rename(&backup, workspace_target));
-            let _ = fs::remove_dir_all(&replacement);
+            let displaced = fs::rename(workspace_target, &paths.replacement);
+            let restored = displaced.and_then(|()| fs::rename(&paths.backup, workspace_target));
+            let _ = fs::remove_dir_all(&paths.replacement);
             restored.map_err(|rollback_error| {
                 format!("candidate target commit validation failed ({error}) and rollback failed: {rollback_error}")
             })?;
@@ -13763,7 +15171,7 @@ fn export_posix_candidate_target_with_fault(
             return Err(error);
         }
     };
-    let cleanup = match fs::remove_dir_all(&backup) {
+    let cleanup = match fs::remove_dir_all(&paths.backup) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -13774,6 +15182,119 @@ fn export_posix_candidate_target_with_fault(
     cleanup?;
     receipt.phase = PosixCandidateTargetExportPhase::ReplacementCommitted;
     Ok(())
+}
+
+#[cfg(unix)]
+fn posix_candidate_target_export_paths(
+    workspace_target: &Path,
+) -> Result<PosixCandidateTargetExportPaths, String> {
+    let process = std::process::id();
+    let paths = PosixCandidateTargetExportPaths {
+        replacement: workspace_target
+            .with_file_name(format!("candidate-target-export-replacement-{process}")),
+        backup: workspace_target
+            .with_file_name(format!("candidate-target-export-backup-{process}")),
+    };
+    for reserved in [&paths.replacement, &paths.backup] {
+        match fs::symlink_metadata(reserved) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("candidate target export sibling authority already exists".to_owned()),
+        }
+    }
+    if paths.replacement.parent() != workspace_target.parent()
+        || paths.backup.parent() != workspace_target.parent()
+    {
+        return Err("candidate target export siblings escape the hosted filesystem".to_owned());
+    }
+    Ok(paths)
+}
+
+#[cfg(unix)]
+fn prepare_posix_candidate_target_replacement(
+    adapter: &PosixAdapterProtection,
+    protection: &PosixCandidateTargetProtection,
+    workspace_target: &Path,
+    replacement: &Path,
+) -> Result<
+    (
+        BTreeMap<PathBuf, PosixCandidateTargetManifestEntry>,
+        PosixObjectIdentity,
+    ),
+    String,
+> {
+    let source_manifest_before = posix_candidate_target_manifest(&protection.staged)?;
+    let prepared = (|| {
+        let mut budget = PosixCandidateTargetBudget::default();
+        copy_posix_candidate_target_tree(&protection.staged, replacement, &mut budget)?;
+        normalize_candidate_cache_export_replacement_with_adapter(
+            &adapter.sudo,
+            adapter,
+            replacement,
+            workspace_target,
+            protection.trusted_owner,
+            protection.trusted_group,
+        )?;
+        let source_manifest_after = posix_candidate_target_manifest(&protection.staged)?;
+        let replacement_manifest = posix_candidate_target_manifest(replacement)?;
+        if source_manifest_before != source_manifest_after
+            || source_manifest_after != replacement_manifest
+        {
+            return Err(
+                "candidate target replacement manifest differs from staged output".to_owned(),
+            );
+        }
+        Ok((replacement_manifest, posix_object_identity(replacement)?))
+    })();
+    prepared.inspect_err(|_| {
+        let _ = fs::remove_dir_all(replacement);
+    })
+}
+
+#[cfg(unix)]
+fn retain_posix_candidate_target_backup(
+    workspace_target: &Path,
+    paths: &PosixCandidateTargetExportPaths,
+    old_manifest: &BTreeMap<PathBuf, PosixCandidateTargetManifestEntry>,
+    old_identity: &PosixObjectIdentity,
+    fault: PosixCandidateTargetExportFault,
+    receipt: &mut PosixCandidateTargetExportReceipt,
+) -> Result<(), String> {
+    if let Err(error) = fs::rename(workspace_target, &paths.backup) {
+        fs::remove_dir_all(&paths.replacement).map_err(|cleanup_error| {
+            format!(
+                "cannot retain hosted candidate target backup ({error}) or clean replacement: {cleanup_error}"
+            )
+        })?;
+        return Err(format!(
+            "cannot retain hosted candidate target backup: {error}"
+        ));
+    }
+    receipt.phase = PosixCandidateTargetExportPhase::BackupRenamed;
+    if posix_object_identity(&paths.backup)? != *old_identity
+        || posix_candidate_target_manifest(&paths.backup)? != *old_manifest
+    {
+        fs::rename(&paths.backup, workspace_target).map_err(|error| {
+            format!("hosted candidate target backup validation and rollback failed: {error}")
+        })?;
+        let _ = fs::remove_dir_all(&paths.replacement);
+        return Err("hosted candidate target backup identity changed".to_owned());
+    }
+    if fault != PosixCandidateTargetExportFault::AfterBackupRename {
+        return Ok(());
+    }
+    fs::rename(&paths.backup, workspace_target).map_err(|error| {
+        format!("cannot restore hosted candidate target after injected failure: {error}")
+    })?;
+    fs::remove_dir_all(&paths.replacement).map_err(|error| {
+        format!("cannot remove replacement after injected export failure: {error}")
+    })?;
+    if posix_object_identity(workspace_target)? != *old_identity
+        || posix_candidate_target_manifest(workspace_target)? != *old_manifest
+    {
+        return Err("injected candidate target export rollback changed the old cache".to_owned());
+    }
+    receipt.phase = PosixCandidateTargetExportPhase::InjectedRollbackComplete;
+    Err("injected candidate target export failure after backup rename".to_owned())
 }
 
 #[cfg(unix)]
@@ -13950,60 +15471,66 @@ pub(crate) fn run_posix_candidate_target_verifier_remover(
 }
 
 #[cfg(unix)]
-fn run_posix_candidate_target_verifier_remover_with_policy(
+fn require_posix_verifier_removal_time(policy: PosixVerifierRemovalPolicy) -> Result<(), String> {
+    policy
+        .deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "candidate target verifier cleanup deadline expired".to_owned())
+        .map(|_| ())
+}
+
+#[cfg(unix)]
+fn parse_posix_verifier_identity(value: &OsStr, label: &str) -> Result<u64, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("candidate target verifier {label} is not UTF-8"))?;
+    let number = text
+        .parse::<u64>()
+        .map_err(|_| format!("candidate target verifier {label} is malformed"))?;
+    if text != number.to_string() {
+        return Err(format!("candidate target verifier {label} is noncanonical"));
+    }
+    Ok(number)
+}
+
+#[cfg(unix)]
+fn bind_posix_verifier_removal_root(
     arguments: &[OsString],
     policy: PosixVerifierRemovalPolicy,
-) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
+) -> Result<(PathBuf, PathBuf, PosixObjectIdentity), String> {
     let [root, parent_device, parent_inode, root_device, root_inode] = arguments else {
         return Err(
             "candidate target verifier remover requires root and exact parent/root identities"
                 .to_owned(),
         );
     };
-    let parse_identity = |value: &OsStr, label: &str| {
-        let text = value
-            .to_str()
-            .ok_or_else(|| format!("candidate target verifier {label} is not UTF-8"))?;
-        let number = text
-            .parse::<u64>()
-            .map_err(|_| format!("candidate target verifier {label} is malformed"))?;
-        if text != number.to_string() {
-            return Err(format!("candidate target verifier {label} is noncanonical"));
-        }
-        Ok(number)
-    };
-    let root = PathBuf::from(root);
-    let require_time = || {
-        policy
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| "candidate target verifier cleanup deadline expired".to_owned())
-            .map(|_| ())
-    };
-    require_time()?;
+    require_posix_verifier_removal_time(policy)?;
     #[cfg(target_os = "linux")]
     let platform = ReleasePlatform::LinuxX86_64;
     #[cfg(target_os = "macos")]
     let platform = ReleasePlatform::MacosAarch64;
+    let root = PathBuf::from(root);
     let parent = posix_adapter_installation_root(platform)?;
-    let expected_parent_device = parse_identity(parent_device, "parent device")?;
-    let expected_parent_inode = parse_identity(parent_inode, "parent inode")?;
-    let expected_root_device = parse_identity(root_device, "root device")?;
-    let expected_root_inode = parse_identity(root_inode, "root inode")?;
     let parent_identity = posix_object_identity(&parent)?;
     let root_metadata = fs::symlink_metadata(&root).map_err(|error| {
         format!("cannot inspect candidate target verifier removal root: {error}")
     })?;
     let root_identity = posix_object_identity_from_metadata(&root_metadata);
+    let expected = [
+        parse_posix_verifier_identity(parent_device, "parent device")?,
+        parse_posix_verifier_identity(parent_inode, "parent inode")?,
+        parse_posix_verifier_identity(root_device, "root device")?,
+        parse_posix_verifier_identity(root_inode, "root inode")?,
+    ];
     if root.parent() != Some(parent.as_path())
         || !posix_candidate_target_verifier_root_is_exact(platform, &root)
-        || parent_identity.device != expected_parent_device
-        || parent_identity.inode != expected_parent_inode
-        || root_identity.device != expected_root_device
-        || root_identity.inode != expected_root_inode
+        || [
+            parent_identity.device,
+            parent_identity.inode,
+            root_identity.device,
+            root_identity.inode,
+        ] != expected
         || root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
         || fs::canonicalize(&root).map_err(|error| {
@@ -14014,6 +15541,17 @@ fn run_posix_candidate_target_verifier_remover_with_policy(
             "candidate target verifier removal authority differs from its receipt".to_owned(),
         );
     }
+    Ok((root, parent, parent_identity))
+}
+
+#[cfg(unix)]
+fn run_posix_candidate_target_verifier_remover_with_policy(
+    arguments: &[OsString],
+    policy: PosixVerifierRemovalPolicy,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (root, parent, parent_identity) = bind_posix_verifier_removal_root(arguments, policy)?;
 
     let mut discovered = 1_usize;
     if discovered > policy.entry_limit {
@@ -14021,7 +15559,7 @@ fn run_posix_candidate_target_verifier_remover_with_policy(
     }
     let mut pending = vec![(root.clone(), false, 0_usize)];
     while let Some((path, visited, depth)) = pending.pop() {
-        require_time()?;
+        require_posix_verifier_removal_time(policy)?;
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             format!("cannot inspect candidate target verifier removal member: {error}")
         })?;
@@ -14043,7 +15581,7 @@ fn run_posix_candidate_target_verifier_remover_with_policy(
             })?;
             let mut children = Vec::new();
             for child in entries {
-                require_time()?;
+                require_posix_verifier_removal_time(policy)?;
                 discovered = discovered
                     .checked_add(1)
                     .filter(|entries| *entries <= policy.entry_limit)
@@ -14112,34 +15650,10 @@ fn open_posix_verifier_tree_for_cleanup(root: &Path) {
 
 #[cfg(unix)]
 pub(crate) fn verify_posix_candidate_target_remover_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
-
     #[cfg(target_os = "linux")]
     let platform = ReleasePlatform::LinuxX86_64;
     #[cfg(target_os = "macos")]
     let platform = ReleasePlatform::MacosAarch64;
-
-    fn allocate_root(platform: ReleasePlatform) -> Result<PathBuf, String> {
-        let parent = posix_adapter_installation_root(platform)?;
-        for _ in 0..16 {
-            let sequence =
-                POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let root = parent.join(format!(
-                "hell-candidate-target-verifier-{}-{sequence}",
-                std::process::id()
-            ));
-            match fs::create_dir(&root) {
-                Ok(()) => return Ok(root),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot create bounded candidate remover fixture: {error}"
-                    ));
-                }
-            }
-        }
-        Err("cannot allocate bounded candidate remover fixture".to_owned())
-    }
 
     let parent = posix_adapter_installation_root(platform)?;
     let fixture = fs::canonicalize(env::temp_dir())
@@ -14153,179 +15667,19 @@ pub(crate) fn verify_posix_candidate_target_remover_for_integration() -> Result<
         .map_err(|error| format!("cannot create remover verifier fixture: {error}"))?;
     let mut roots = Vec::new();
     let result = (|| {
-        let composite = combine_candidate_target_verifier_results(
-            Err("primary".to_owned()),
-            Err("cleanup".to_owned()),
-            Err("absence".to_owned()),
-            Err("fixture".to_owned()),
-        )
-        .expect_err("composite verifier failures must remain observable");
-        if composite
-            != "candidate target verifier: primary; candidate target verifier lifecycle cleanup: cleanup; candidate target verifier transient absence: absence; candidate target verifier fixture cleanup: fixture"
-        {
-            return Err("candidate remover composite error ordering changed".to_owned());
+        verify_candidate_remover_error_ordering()?;
+        for scenario in [
+            CandidateRemoverScenario::Escape,
+            CandidateRemoverScenario::RootSubstitution,
+            CandidateRemoverScenario::ParentSubstitution,
+            CandidateRemoverScenario::EntryBound,
+            CandidateRemoverScenario::DepthBound,
+            CandidateRemoverScenario::Deadline,
+        ] {
+            let root = allocate_posix_candidate_remover_root(platform)?;
+            roots.push(root.clone());
+            verify_candidate_remover_scenario(scenario, &parent, &fixture, &root)?;
         }
-
-        let external = fixture.join("external-sentinel");
-        fs::write(&external, b"external-sentinel\n")
-            .map_err(|error| format!("cannot create external remover sentinel: {error}"))?;
-        let escape_root = allocate_root(platform)?;
-        roots.push(escape_root.clone());
-        fs::create_dir(escape_root.join("nested"))
-            .map_err(|error| format!("cannot create remover escape fixture: {error}"))?;
-        symlink(&external, escape_root.join("nested/redirect"))
-            .map_err(|error| format!("cannot create remover symlink escape fixture: {error}"))?;
-        fs::hard_link(&external, escape_root.join("nested/peer"))
-            .map_err(|error| format!("cannot create remover hard-link fixture: {error}"))?;
-        #[cfg(target_os = "macos")]
-        {
-            let acl = CommandSpec::new("/bin/chmod", Duration::from_secs(30))
-                .arguments(["+a", "everyone allow write"])
-                .argument(escape_root.join("nested"))
-                .run()
-                .map_err(|error| format!("cannot seed remover ACL fixture: {error}"))?;
-            if !acl.status.success() || acl.timed_out {
-                return Err("macOS remover ACL fixture was not established".to_owned());
-            }
-        }
-        let escape_arguments = posix_verifier_removal_arguments(&parent, &escape_root)?;
-        run_posix_candidate_target_verifier_remover(&escape_arguments)?;
-        if escape_root.exists()
-            || fs::read(&external)
-                .map_err(|error| format!("cannot reread external remover sentinel: {error}"))?
-                != b"external-sentinel\n"
-            || fs::symlink_metadata(&external)
-                .map_err(|error| format!("cannot inspect external remover sentinel: {error}"))?
-                .nlink()
-                != 1
-        {
-            return Err(
-                "candidate remover escaped its root or removed a hard-link peer".to_owned(),
-            );
-        }
-
-        let substitution_root = allocate_root(platform)?;
-        roots.push(substitution_root.clone());
-        let substitution_arguments = posix_verifier_removal_arguments(&parent, &substitution_root)?;
-        let saved = fixture.join("saved-remover-root");
-        fs::rename(&substitution_root, &saved)
-            .map_err(|error| format!("cannot retain original remover root: {error}"))?;
-        fs::create_dir(&substitution_root)
-            .map_err(|error| format!("cannot substitute remover root: {error}"))?;
-        let substitution_error =
-            run_posix_candidate_target_verifier_remover(&substitution_arguments)
-                .expect_err("a substituted remover root must be rejected");
-        if substitution_error
-            != "candidate target verifier removal authority differs from its receipt"
-        {
-            return Err(format!(
-                "candidate remover root substitution reached the wrong phase: {substitution_error}"
-            ));
-        }
-        fs::remove_dir(&substitution_root)
-            .map_err(|error| format!("cannot remove substituted remover root: {error}"))?;
-        fs::rename(&saved, &substitution_root)
-            .map_err(|error| format!("cannot restore original remover root: {error}"))?;
-        run_posix_candidate_target_verifier_remover(&substitution_arguments)?;
-
-        let parent_receipt_root = allocate_root(platform)?;
-        roots.push(parent_receipt_root.clone());
-        let mut parent_receipt_arguments =
-            posix_verifier_removal_arguments(&parent, &parent_receipt_root)?;
-        let wrong_parent = posix_object_identity(&parent)?
-            .device
-            .checked_add(1)
-            .unwrap_or(0)
-            .to_string();
-        *parent_receipt_arguments
-            .get_mut(1)
-            .ok_or_else(|| "candidate remover parent receipt is absent".to_owned())? =
-            wrong_parent.into();
-        let parent_error = run_posix_candidate_target_verifier_remover(&parent_receipt_arguments)
-            .expect_err("a substituted remover parent receipt must be rejected");
-        if parent_error != "candidate target verifier removal authority differs from its receipt" {
-            return Err(format!(
-                "candidate remover parent substitution reached the wrong phase: {parent_error}"
-            ));
-        }
-        let parent_receipt_arguments =
-            posix_verifier_removal_arguments(&parent, &parent_receipt_root)?;
-        run_posix_candidate_target_verifier_remover(&parent_receipt_arguments)?;
-
-        let entry_root = allocate_root(platform)?;
-        roots.push(entry_root.clone());
-        for name in ["one", "two", "three"] {
-            fs::write(entry_root.join(name), b"bounded\n")
-                .map_err(|error| format!("cannot create remover entry-bound fixture: {error}"))?;
-        }
-        let entry_arguments = posix_verifier_removal_arguments(&parent, &entry_root)?;
-        let entry_error = run_posix_candidate_target_verifier_remover_with_policy(
-            &entry_arguments,
-            PosixVerifierRemovalPolicy {
-                entry_limit: 2,
-                depth_limit: 16,
-                deadline: posix_identity_query_deadline("entry-bound remover verifier")?,
-            },
-        )
-        .expect_err("an oversized remover fixture must be rejected before retention");
-        if entry_error != "candidate target verifier cleanup exceeds its entry bound"
-            || ["one", "two", "three"]
-                .iter()
-                .any(|name| !entry_root.join(name).exists())
-        {
-            return Err("candidate remover entry bound was not pre-allocation exact".to_owned());
-        }
-        run_posix_candidate_target_verifier_remover(&entry_arguments)?;
-
-        let depth_root = allocate_root(platform)?;
-        roots.push(depth_root.clone());
-        fs::write(depth_root.join("a-shallow"), b"shallow\n")
-            .map_err(|error| format!("cannot create remover shallow fixture: {error}"))?;
-        fs::create_dir_all(depth_root.join("z-deep/one/two"))
-            .map_err(|error| format!("cannot create remover depth fixture: {error}"))?;
-        fs::write(depth_root.join("z-deep/one/two/sentinel"), b"deep\n")
-            .map_err(|error| format!("cannot write remover depth fixture: {error}"))?;
-        let depth_arguments = posix_verifier_removal_arguments(&parent, &depth_root)?;
-        let depth_error = run_posix_candidate_target_verifier_remover_with_policy(
-            &depth_arguments,
-            PosixVerifierRemovalPolicy {
-                entry_limit: 32,
-                depth_limit: 2,
-                deadline: posix_identity_query_deadline("depth-bound remover verifier")?,
-            },
-        )
-        .expect_err("an over-deep remover fixture must be rejected");
-        if depth_error != "candidate target verifier cleanup exceeds its depth bound"
-            || depth_root.join("a-shallow").exists()
-            || !depth_root.join("z-deep/one/two/sentinel").exists()
-        {
-            return Err("candidate remover partial deletion receipt was not exact".to_owned());
-        }
-        run_posix_candidate_target_verifier_remover(&depth_arguments)?;
-
-        let deadline_root = allocate_root(platform)?;
-        roots.push(deadline_root.clone());
-        fs::write(deadline_root.join("sentinel"), b"deadline\n")
-            .map_err(|error| format!("cannot create remover deadline fixture: {error}"))?;
-        let deadline_arguments = posix_verifier_removal_arguments(&parent, &deadline_root)?;
-        let expired = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .ok_or_else(|| "cannot construct expired remover deadline".to_owned())?;
-        let deadline_error = run_posix_candidate_target_verifier_remover_with_policy(
-            &deadline_arguments,
-            PosixVerifierRemovalPolicy {
-                entry_limit: 16,
-                depth_limit: 16,
-                deadline: expired,
-            },
-        )
-        .expect_err("an expired remover deadline must reject before deletion");
-        if deadline_error != "candidate target verifier cleanup deadline expired"
-            || !deadline_root.join("sentinel").exists()
-        {
-            return Err("candidate remover deadline failure was not pre-deletion exact".to_owned());
-        }
-        run_posix_candidate_target_verifier_remover(&deadline_arguments)?;
         Ok(())
     })();
 
@@ -14337,6 +15691,254 @@ pub(crate) fn verify_posix_candidate_target_remover_for_integration() -> Result<
     let cleanup = fs::remove_dir_all(&fixture)
         .map_err(|error| format!("cannot remove candidate remover verifier fixture: {error}"));
     result.and(cleanup)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum CandidateRemoverScenario {
+    Escape,
+    RootSubstitution,
+    ParentSubstitution,
+    EntryBound,
+    DepthBound,
+    Deadline,
+}
+
+#[cfg(unix)]
+fn allocate_posix_candidate_remover_root(platform: ReleasePlatform) -> Result<PathBuf, String> {
+    let parent = posix_adapter_installation_root(platform)?;
+    for _ in 0..16 {
+        let sequence =
+            POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = parent.join(format!(
+            "hell-candidate-target-verifier-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot create bounded candidate remover fixture: {error}"
+                ));
+            }
+        }
+    }
+    Err("cannot allocate bounded candidate remover fixture".to_owned())
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_error_ordering() -> Result<(), String> {
+    let composite = combine_candidate_target_verifier_results(
+        Err("primary".to_owned()),
+        Err("cleanup".to_owned()),
+        Err("absence".to_owned()),
+        Err("fixture".to_owned()),
+    )
+    .expect_err("composite verifier failures must remain observable");
+    if composite
+        != "candidate target verifier: primary; candidate target verifier lifecycle cleanup: cleanup; candidate target verifier transient absence: absence; candidate target verifier fixture cleanup: fixture"
+    {
+        return Err("candidate remover composite error ordering changed".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_scenario(
+    scenario: CandidateRemoverScenario,
+    parent: &Path,
+    fixture: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    match scenario {
+        CandidateRemoverScenario::Escape => verify_candidate_remover_escape(parent, fixture, root),
+        CandidateRemoverScenario::RootSubstitution => {
+            verify_candidate_remover_root_substitution(parent, fixture, root)
+        }
+        CandidateRemoverScenario::ParentSubstitution => {
+            verify_candidate_remover_parent_substitution(parent, root)
+        }
+        CandidateRemoverScenario::EntryBound => verify_candidate_remover_entry_bound(parent, root),
+        CandidateRemoverScenario::DepthBound => verify_candidate_remover_depth_bound(parent, root),
+        CandidateRemoverScenario::Deadline => verify_candidate_remover_deadline(parent, root),
+    }
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_escape(
+    parent: &Path,
+    fixture: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    let external = fixture.join("external-sentinel");
+    fs::write(&external, b"external-sentinel\n")
+        .map_err(|error| format!("cannot create external remover sentinel: {error}"))?;
+    fs::create_dir(root.join("nested"))
+        .map_err(|error| format!("cannot create remover escape fixture: {error}"))?;
+    symlink(&external, root.join("nested/redirect"))
+        .map_err(|error| format!("cannot create remover symlink escape fixture: {error}"))?;
+    fs::hard_link(&external, root.join("nested/peer"))
+        .map_err(|error| format!("cannot create remover hard-link fixture: {error}"))?;
+    seed_macos_remover_acl(root)?;
+    run_posix_candidate_target_verifier_remover(&posix_verifier_removal_arguments(parent, root)?)?;
+    if root.exists()
+        || fs::read(&external)
+            .map_err(|error| format!("cannot reread external remover sentinel: {error}"))?
+            != b"external-sentinel\n"
+        || fs::symlink_metadata(&external)
+            .map_err(|error| format!("cannot inspect external remover sentinel: {error}"))?
+            .nlink()
+            != 1
+    {
+        return Err("candidate remover escaped its root or removed a hard-link peer".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn seed_macos_remover_acl(root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let acl = CommandSpec::new("/bin/chmod", Duration::from_secs(30))
+            .arguments(["+a", "everyone allow write"])
+            .argument(root.join("nested"))
+            .run()
+            .map_err(|error| format!("cannot seed remover ACL fixture: {error}"))?;
+        if !acl.status.success() || acl.timed_out {
+            return Err("macOS remover ACL fixture was not established".to_owned());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = root;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_root_substitution(
+    parent: &Path,
+    fixture: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    let arguments = posix_verifier_removal_arguments(parent, root)?;
+    let saved = fixture.join("saved-remover-root");
+    fs::rename(root, &saved)
+        .map_err(|error| format!("cannot retain original remover root: {error}"))?;
+    fs::create_dir(root).map_err(|error| format!("cannot substitute remover root: {error}"))?;
+    let error = run_posix_candidate_target_verifier_remover(&arguments)
+        .expect_err("a substituted remover root must be rejected");
+    if error != "candidate target verifier removal authority differs from its receipt" {
+        return Err(format!(
+            "candidate remover root substitution reached the wrong phase: {error}"
+        ));
+    }
+    fs::remove_dir(root)
+        .map_err(|error| format!("cannot remove substituted remover root: {error}"))?;
+    fs::rename(&saved, root)
+        .map_err(|error| format!("cannot restore original remover root: {error}"))?;
+    run_posix_candidate_target_verifier_remover(&arguments)
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_parent_substitution(parent: &Path, root: &Path) -> Result<(), String> {
+    let mut arguments = posix_verifier_removal_arguments(parent, root)?;
+    let wrong_parent = posix_object_identity(parent)?
+        .device
+        .checked_add(1)
+        .unwrap_or(0)
+        .to_string();
+    *arguments
+        .get_mut(1)
+        .ok_or_else(|| "candidate remover parent receipt is absent".to_owned())? =
+        wrong_parent.into();
+    let error = run_posix_candidate_target_verifier_remover(&arguments)
+        .expect_err("a substituted remover parent receipt must be rejected");
+    if error != "candidate target verifier removal authority differs from its receipt" {
+        return Err(format!(
+            "candidate remover parent substitution reached the wrong phase: {error}"
+        ));
+    }
+    run_posix_candidate_target_verifier_remover(&posix_verifier_removal_arguments(parent, root)?)
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_entry_bound(parent: &Path, root: &Path) -> Result<(), String> {
+    for name in ["one", "two", "three"] {
+        fs::write(root.join(name), b"bounded\n")
+            .map_err(|error| format!("cannot create remover entry-bound fixture: {error}"))?;
+    }
+    let arguments = posix_verifier_removal_arguments(parent, root)?;
+    let error = run_posix_candidate_target_verifier_remover_with_policy(
+        &arguments,
+        PosixVerifierRemovalPolicy {
+            entry_limit: 2,
+            depth_limit: 16,
+            deadline: posix_identity_query_deadline("entry-bound remover verifier")?,
+        },
+    )
+    .expect_err("an oversized remover fixture must be rejected before retention");
+    if error != "candidate target verifier cleanup exceeds its entry bound"
+        || ["one", "two", "three"]
+            .iter()
+            .any(|name| !root.join(name).exists())
+    {
+        return Err("candidate remover entry bound was not pre-allocation exact".to_owned());
+    }
+    run_posix_candidate_target_verifier_remover(&arguments)
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_depth_bound(parent: &Path, root: &Path) -> Result<(), String> {
+    fs::write(root.join("a-shallow"), b"shallow\n")
+        .map_err(|error| format!("cannot create remover shallow fixture: {error}"))?;
+    fs::create_dir_all(root.join("z-deep/one/two"))
+        .map_err(|error| format!("cannot create remover depth fixture: {error}"))?;
+    fs::write(root.join("z-deep/one/two/sentinel"), b"deep\n")
+        .map_err(|error| format!("cannot write remover depth fixture: {error}"))?;
+    let arguments = posix_verifier_removal_arguments(parent, root)?;
+    let error = run_posix_candidate_target_verifier_remover_with_policy(
+        &arguments,
+        PosixVerifierRemovalPolicy {
+            entry_limit: 32,
+            depth_limit: 2,
+            deadline: posix_identity_query_deadline("depth-bound remover verifier")?,
+        },
+    )
+    .expect_err("an over-deep remover fixture must be rejected");
+    if error != "candidate target verifier cleanup exceeds its depth bound"
+        || root.join("a-shallow").exists()
+        || !root.join("z-deep/one/two/sentinel").exists()
+    {
+        return Err("candidate remover partial deletion receipt was not exact".to_owned());
+    }
+    run_posix_candidate_target_verifier_remover(&arguments)
+}
+
+#[cfg(unix)]
+fn verify_candidate_remover_deadline(parent: &Path, root: &Path) -> Result<(), String> {
+    fs::write(root.join("sentinel"), b"deadline\n")
+        .map_err(|error| format!("cannot create remover deadline fixture: {error}"))?;
+    let arguments = posix_verifier_removal_arguments(parent, root)?;
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .ok_or_else(|| "cannot construct expired remover deadline".to_owned())?;
+    let error = run_posix_candidate_target_verifier_remover_with_policy(
+        &arguments,
+        PosixVerifierRemovalPolicy {
+            entry_limit: 16,
+            depth_limit: 16,
+            deadline: expired,
+        },
+    )
+    .expect_err("an expired remover deadline must reject before deletion");
+    if error != "candidate target verifier cleanup deadline expired"
+        || !root.join("sentinel").exists()
+    {
+        return Err("candidate remover deadline failure was not pre-deletion exact".to_owned());
+    }
+    run_posix_candidate_target_verifier_remover(&arguments)
 }
 
 #[cfg(unix)]
@@ -14903,6 +16505,7 @@ fn base_final_platform_inventory() -> BTreeSet<&'static str> {
         "conformance-evidence",
         "conformance-evidence-manifest.json",
         "conformance-observations",
+        "native-environment.json",
         "oracle-report.json",
         "package-report.json",
         "platform-report.json",
@@ -14933,6 +16536,7 @@ pub(crate) fn verify_windows_final_platform_inventory_for_integration() -> Resul
         "conformance-evidence",
         "conformance-evidence-manifest.json",
         "conformance-observations",
+        "native-environment.json",
         "oracle-report.json",
         "package-report.json",
         "platform-report.json",
@@ -15231,74 +16835,15 @@ struct PortablePlatformGateContext<'a> {
     windows_gate_topology: &'a mut WindowsPlatformGateTopology,
 }
 
-fn run_portable_platform_gates(context: PortablePlatformGateContext<'_>) -> Result<(), String> {
-    let PortablePlatformGateContext {
-        plan,
-        root,
-        output,
-        gates,
-        evidence,
-        retained,
-        oracle_identity,
-        oracle_source_sha256,
-        #[cfg(windows)]
-        platform,
-        #[cfg(windows)]
-        windows_release_binary,
-        #[cfg(windows)]
-        windows_gate_topology,
-    } = context;
-    crate::release_suite::release_dependency_attestation(
-        root,
-        &output.join("dependency-policy.json"),
-        &plan.resolution.candidate_sha,
-    )?;
-    suite_gate(
-        "portability",
-        root,
-        output,
-        crate::release_suite::release_portability,
-        gates,
-        evidence,
-    )?;
-    require_source_inventory(root, &plan.source_inventory_sha256)?;
-    command_gate(
-        "workspace-tests",
-        cargo(
-            root,
-            Duration::from_hours(1),
-            [
-                "test",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--locked",
-            ],
-        ),
-        output,
-        gates,
-        evidence,
-    )?;
-    #[cfg(windows)]
-    windows_gate_topology.workspace_tests_completed()?;
-    command_gate(
-        "release-build",
-        release_candidate_build(root),
-        output,
-        gates,
-        evidence,
-    )?;
-    #[cfg(windows)]
-    {
-        windows_gate_topology.release_build_completed()?;
-        *windows_release_binary = Some(capture_windows_release_binary_authority(
-            root,
-            platform,
-            "after release-build",
-            gates.get("release-build") == Some(&true),
-        )?);
-        windows_gate_topology.release_binary_receipt_captured()?;
-    }
+fn record_portable_oracle_gate(
+    output: &Path,
+    retained: &mut BTreeMap<String, Vec<u8>>,
+    oracle_identity: &hell_testkit::ExecutableIdentity,
+    oracle_source_sha256: &str,
+    gates: &mut BTreeMap<&'static str, bool>,
+    evidence: &mut BTreeMap<String, JsonValue>,
+    #[cfg(windows)] windows_release_binary: &Option<WindowsReleaseBinaryAuthority>,
+) -> Result<(), String> {
     write_json(
         &output.join("oracle-report.json"),
         &object([
@@ -15334,6 +16879,87 @@ fn run_portable_platform_gates(context: PortablePlatformGateContext<'_>) -> Resu
             gates.get("release-build") == Some(&true),
         )?;
     }
+    Ok(())
+}
+
+fn run_portable_platform_gates(context: PortablePlatformGateContext<'_>) -> Result<(), String> {
+    let PortablePlatformGateContext {
+        plan,
+        root,
+        output,
+        gates,
+        evidence,
+        retained,
+        oracle_identity,
+        oracle_source_sha256,
+        #[cfg(windows)]
+        platform,
+        #[cfg(windows)]
+        windows_release_binary,
+        #[cfg(windows)]
+        windows_gate_topology,
+    } = context;
+    crate::release_suite::release_dependency_attestation(
+        root,
+        &output.join("dependency-policy.json"),
+        &plan.resolution.candidate_sha,
+    )?;
+    suite_gate(
+        "portability",
+        root,
+        output,
+        crate::release_suite::release_portability,
+        gates,
+        evidence,
+    )?;
+    require_source_inventory(root, &plan.source_inventory_sha256)?;
+    command_gate(
+        "workspace-tests",
+        &cargo(
+            root,
+            Duration::from_hours(1),
+            [
+                "test",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--locked",
+            ],
+        ),
+        output,
+        gates,
+        evidence,
+    )?;
+    #[cfg(windows)]
+    windows_gate_topology.workspace_tests_completed()?;
+    command_gate(
+        "release-build",
+        &release_candidate_build(root),
+        output,
+        gates,
+        evidence,
+    )?;
+    #[cfg(windows)]
+    {
+        windows_gate_topology.release_build_completed()?;
+        *windows_release_binary = Some(capture_windows_release_binary_authority(
+            root,
+            platform,
+            "after release-build",
+            gates.get("release-build") == Some(&true),
+        )?);
+        windows_gate_topology.release_binary_receipt_captured()?;
+    }
+    record_portable_oracle_gate(
+        output,
+        retained,
+        oracle_identity,
+        oracle_source_sha256,
+        gates,
+        evidence,
+        #[cfg(windows)]
+        windows_release_binary,
+    )?;
     fs::remove_file(output.join("dependency-policy.json"))
         .map_err(|error| format!("cannot remove transient native dependency evidence: {error}"))?;
     #[cfg(windows)]
@@ -15359,24 +16985,189 @@ fn run_portable_platform_gates(context: PortablePlatformGateContext<'_>) -> Resu
     Ok(())
 }
 
-fn run_platform_gates(
+struct PlatformGateInput<'a> {
     platform: ReleasePlatform,
-    plan: &ReleasePlan,
-    conformance_plan: &crate::conformance::ConformancePlan,
-    root: &Path,
-    _oracle_source: &Path,
-    output: &Path,
-    gates: &mut BTreeMap<&'static str, bool>,
-    evidence: &mut BTreeMap<String, JsonValue>,
-    retained: &mut BTreeMap<String, Vec<u8>>,
-    prepared_oracle: hell_testkit::ExecutableIdentity,
-    oracle_source_sha256: &str,
-    #[cfg(unix)] dependency_policy: Option<(
-        &PosixDependencyPolicyProtection,
-        &PosixCargoDenyHomeProtection,
+    plan: &'a ReleasePlan,
+    conformance_plan: &'a crate::conformance::ConformancePlan,
+    root: &'a Path,
+    output: &'a Path,
+    gates: &'a mut BTreeMap<&'static str, bool>,
+    evidence: &'a mut BTreeMap<String, JsonValue>,
+    retained: &'a mut BTreeMap<String, Vec<u8>>,
+    prepared_oracle: &'a hell_testkit::ExecutableIdentity,
+    oracle_source_sha256: &'a str,
+    #[cfg(unix)]
+    dependency_policy: Option<(
+        &'a PosixDependencyPolicyProtection,
+        &'a PosixCargoDenyHomeProtection,
     )>,
-    #[cfg(windows)] windows_release_binary: &mut Option<WindowsReleaseBinaryAuthority>,
+    #[cfg(windows)]
+    windows_release_binary: &'a mut Option<WindowsReleaseBinaryAuthority>,
+}
+
+#[cfg(unix)]
+struct LinuxPlatformGateContext<'a> {
+    plan: &'a ReleasePlan,
+    root: &'a Path,
+    output: &'a Path,
+    gates: &'a mut BTreeMap<&'static str, bool>,
+    evidence: &'a mut BTreeMap<String, JsonValue>,
+    retained: &'a mut BTreeMap<String, Vec<u8>>,
+    prepared_oracle: &'a hell_testkit::ExecutableIdentity,
+    oracle_source_sha256: &'a str,
+    dependency_policy: Option<(
+        &'a PosixDependencyPolicyProtection,
+        &'a PosixCargoDenyHomeProtection,
+    )>,
+}
+
+#[cfg(unix)]
+fn run_linux_policy_and_build_gates(
+    context: &mut LinuxPlatformGateContext<'_>,
 ) -> Result<(), String> {
+    let (policy, cargo_deny_home) = context
+        .dependency_policy
+        .ok_or_else(|| "Linux dependency-policy authority is absent".to_owned())?;
+    policy.validate()?;
+    cargo_deny_home.metadata.validate()?;
+    let document = read_regular(&policy.path)?;
+    verify_dependency_policy_result(
+        &document,
+        context.root,
+        &context.plan.resolution.candidate_sha,
+        &cargo_deny_home.metadata.sha256,
+        &policy.cargo_deny_sha256,
+    )?;
+    if policy.cargo_deny_version != TRUSTED_CARGO_DENY_VERSION {
+        return Err("dependency-policy cargo-deny version drifted".to_owned());
+    }
+    context
+        .retained
+        .insert("dependency-policy.json".to_owned(), document);
+    in_process_gate(
+        "dependency-policy",
+        Ok("verified the trusted immutable all-category dependency-policy result".to_owned()),
+        context.gates,
+        context.evidence,
+    )?;
+    in_process_gate(
+        "conformance-policy",
+        crate::compatibility::release_conformance_policy(context.root),
+        context.gates,
+        context.evidence,
+    )?;
+    for (name, arguments) in [
+        ("case-catalog", &["case-catalog", "verify"][..]),
+        ("normalizer-catalog", &["normalizer-audit", "verify"][..]),
+        ("divergence-catalog", &["divergence-verify", "verify"][..]),
+    ] {
+        in_process_gate(
+            name,
+            crate::compatibility::release_gate(context.root, arguments),
+            context.gates,
+            context.evidence,
+        )?;
+    }
+    suite_gate(
+        "verify",
+        context.root,
+        context.output,
+        crate::release_suite::release_verify,
+        context.gates,
+        context.evidence,
+    )?;
+    for (name, command) in linux_rust_commands(context.root) {
+        if name == "release-build" {
+            require_source_inventory(context.root, &context.plan.source_inventory_sha256)?;
+        }
+        command_gate(
+            name,
+            &command,
+            context.output,
+            context.gates,
+            context.evidence,
+        )?;
+    }
+    suite_examples(
+        context.root,
+        context.output,
+        context.gates,
+        context.evidence,
+    )
+}
+
+#[cfg(unix)]
+fn record_linux_release_authorities(
+    context: &mut LinuxPlatformGateContext<'_>,
+) -> Result<(), String> {
+    in_process_gate(
+        "release-mutation-catalog",
+        crate::mutation::release_mutation_catalog(
+            context.root,
+            &context.output.join("mutation-report.json"),
+            &context.plan.resolution.candidate_sha,
+        ),
+        context.gates,
+        context.evidence,
+    )?;
+    context.retained.insert(
+        "mutation-report.json".to_owned(),
+        read_regular(&context.output.join("mutation-report.json"))?,
+    );
+    fs::remove_dir_all(context.output.join("mutation-results"))
+        .map_err(|error| format!("cannot remove transient mutation details: {error}"))?;
+    context.gates.insert("linux-release-oracle-digest", true);
+    context.evidence.insert(
+        "linux-release-oracle-digest".to_owned(),
+        object([
+            ("sha256", string(&context.prepared_oracle.sha256.hex())),
+            ("schemaVersion", number(1)),
+            ("state", string("passed")),
+        ]),
+    );
+    write_json(
+        &context.output.join("oracle-report.json"),
+        &object([
+            ("commit", string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff")),
+            (
+                "executableSha256",
+                string(&context.prepared_oracle.sha256.hex()),
+            ),
+            ("repository", string("chrisdone/hell")),
+            ("schemaVersion", number(2)),
+            ("sourceSha256", string(context.oracle_source_sha256)),
+            ("state", string("verified")),
+        ]),
+    )?;
+    context.retained.insert(
+        "oracle-report.json".to_owned(),
+        read_regular(&context.output.join("oracle-report.json"))?,
+    );
+    in_process_gate(
+        "divergence-prototypes",
+        crate::compatibility::release_divergence_prototype_catalog(context.root),
+        context.gates,
+        context.evidence,
+    )
+}
+
+fn run_platform_gates(input: PlatformGateInput<'_>) -> Result<(), String> {
+    let PlatformGateInput {
+        platform,
+        plan,
+        conformance_plan,
+        root,
+        output,
+        gates,
+        evidence,
+        retained,
+        prepared_oracle,
+        oracle_source_sha256,
+        #[cfg(unix)]
+        dependency_policy,
+        #[cfg(windows)]
+        windows_release_binary,
+    } = input;
     let oracle_identity = prepared_oracle.clone();
     require_executable_digest(
         &oracle_identity.path,
@@ -15387,107 +17178,19 @@ fn run_platform_gates(
     let mut windows_gate_topology = WindowsPlatformGateTopology::default();
     #[cfg(unix)]
     if platform == ReleasePlatform::LinuxX86_64 {
-        let (policy, cargo_deny_home) = dependency_policy
-            .ok_or_else(|| "Linux dependency-policy authority is absent".to_owned())?;
-        policy.validate()?;
-        cargo_deny_home.metadata.validate()?;
-        let policy_document = read_regular(&policy.path)?;
-        verify_dependency_policy_result(
-            &policy_document,
-            root,
-            &plan.resolution.candidate_sha,
-            &cargo_deny_home.metadata.sha256,
-            &policy.cargo_deny_sha256,
-        )?;
-        if policy.cargo_deny_version != TRUSTED_CARGO_DENY_VERSION {
-            return Err("dependency-policy cargo-deny version drifted".to_owned());
-        }
-        retained.insert("dependency-policy.json".to_owned(), policy_document);
-        in_process_gate(
-            "dependency-policy",
-            Ok("verified the trusted immutable all-category dependency-policy result".to_owned()),
-            gates,
-            evidence,
-        )?;
-        in_process_gate(
-            "conformance-policy",
-            crate::compatibility::release_conformance_policy(root),
-            gates,
-            evidence,
-        )?;
-        for (name, arguments) in [
-            ("case-catalog", &["case-catalog", "verify"][..]),
-            ("normalizer-catalog", &["normalizer-audit", "verify"][..]),
-            ("divergence-catalog", &["divergence-verify", "verify"][..]),
-        ] {
-            in_process_gate(
-                name,
-                crate::compatibility::release_gate(root, arguments),
-                gates,
-                evidence,
-            )?;
-        }
-        suite_gate(
-            "verify",
+        let mut context = LinuxPlatformGateContext {
+            plan,
             root,
             output,
-            crate::release_suite::release_verify,
             gates,
             evidence,
-        )?;
-        for (name, command) in linux_rust_commands(root) {
-            if name == "release-build" {
-                require_source_inventory(root, &plan.source_inventory_sha256)?;
-            }
-            command_gate(name, command, output, gates, evidence)?;
-        }
-        suite_examples(root, output, gates, evidence)?;
-        in_process_gate(
-            "release-mutation-catalog",
-            crate::mutation::release_mutation_catalog(
-                root,
-                &output.join("mutation-report.json"),
-                &plan.resolution.candidate_sha,
-            ),
-            gates,
-            evidence,
-        )?;
-        retained.insert(
-            "mutation-report.json".to_owned(),
-            read_regular(&output.join("mutation-report.json"))?,
-        );
-        fs::remove_dir_all(output.join("mutation-results"))
-            .map_err(|error| format!("cannot remove transient mutation details: {error}"))?;
-        gates.insert("linux-release-oracle-digest", true);
-        evidence.insert(
-            "linux-release-oracle-digest".to_owned(),
-            object([
-                ("sha256", string(&prepared_oracle.sha256.hex())),
-                ("schemaVersion", number(1)),
-                ("state", string("passed")),
-            ]),
-        );
-        write_json(
-            &output.join("oracle-report.json"),
-            &object([
-                ("commit", string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff")),
-                ("executableSha256", string(&oracle_identity.sha256.hex())),
-                ("repository", string("chrisdone/hell")),
-                ("schemaVersion", number(2)),
-                ("sourceSha256", string(oracle_source_sha256)),
-                ("state", string("verified")),
-            ]),
-        )?;
-        retained.insert(
-            "oracle-report.json".to_owned(),
-            read_regular(&output.join("oracle-report.json"))?,
-        );
-        in_process_gate(
-            "divergence-prototypes",
-            crate::compatibility::release_divergence_prototype_catalog(root),
-            gates,
-            evidence,
-        )?;
+            retained,
+            prepared_oracle,
+            oracle_source_sha256,
+            dependency_policy,
+        };
+        run_linux_policy_and_build_gates(&mut context)?;
+        record_linux_release_authorities(&mut context)?;
     }
     #[cfg(unix)]
     if platform == ReleasePlatform::MacosAarch64 {
@@ -15526,43 +17229,53 @@ fn run_platform_gates(
     if platform != ReleasePlatform::WindowsX86_64 {
         return Err("POSIX release gates require a POSIX trusted runner".to_owned());
     }
+    finish_platform_conformance(
+        ConformanceEvidenceContext {
+            platform,
+            plan,
+            conformance_plan,
+            output,
+            gates,
+            gate_evidence: evidence,
+            retained,
+            oracle: &oracle_identity,
+            oracle_source_sha256,
+            #[cfg(windows)]
+            windows_release_binary: windows_release_binary.as_ref(),
+        },
+        #[cfg(windows)]
+        &windows_gate_topology,
+    )
+}
+
+fn finish_platform_conformance(
+    context: ConformanceEvidenceContext<'_>,
+    #[cfg(windows)] windows_gate_topology: &WindowsPlatformGateTopology,
+) -> Result<(), String> {
     require_executable_digest(
-        &oracle_identity.path,
-        oracle_identity.sha256,
+        &context.oracle.path,
+        context.oracle.sha256,
         "retained oracle",
     )?;
     #[cfg(windows)]
     {
         windows_gate_topology.require_conformance_ready()?;
-        let authority = windows_release_binary.as_ref().ok_or_else(|| {
+        let release_build_passed = context.gates.get("release-build") == Some(&true);
+        let authority = context.windows_release_binary.ok_or_else(|| {
             "Windows release binary authority is absent before conformance".to_owned()
         })?;
         authority.validate(
             "before conformance evidence collection",
-            gates.get("release-build") == Some(&true),
+            release_build_passed,
         )?;
-    }
-    collect_conformance_evidence(
-        platform,
-        plan,
-        conformance_plan,
-        root,
-        output,
-        gates,
-        evidence,
-        retained,
-        &oracle_identity,
-        oracle_source_sha256,
-        #[cfg(windows)]
-        windows_release_binary.as_ref(),
-    )?;
-    #[cfg(windows)]
-    if let Some(authority) = windows_release_binary.as_ref() {
+        collect_conformance_evidence(context)?;
         authority.validate(
             "after conformance evidence collection",
-            gates.get("release-build") == Some(&true),
+            release_build_passed,
         )?;
     }
+    #[cfg(not(windows))]
+    collect_conformance_evidence(context)?;
     Ok(())
 }
 
@@ -15579,20 +17292,58 @@ fn require_executable_digest(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_conformance_evidence(
+struct ConformanceEvidenceContext<'a> {
     platform: ReleasePlatform,
-    plan: &ReleasePlan,
-    conformance_plan: &crate::conformance::ConformancePlan,
-    _root: &Path,
-    output: &Path,
-    gates: &mut BTreeMap<&'static str, bool>,
-    gate_evidence: &mut BTreeMap<String, JsonValue>,
-    retained: &mut BTreeMap<String, Vec<u8>>,
-    oracle: &hell_testkit::ExecutableIdentity,
+    plan: &'a ReleasePlan,
+    conformance_plan: &'a crate::conformance::ConformancePlan,
+    output: &'a Path,
+    gates: &'a mut BTreeMap<&'static str, bool>,
+    gate_evidence: &'a mut BTreeMap<String, JsonValue>,
+    retained: &'a mut BTreeMap<String, Vec<u8>>,
+    oracle: &'a hell_testkit::ExecutableIdentity,
+    oracle_source_sha256: &'a str,
+    #[cfg(windows)]
+    windows_release_binary: Option<&'a WindowsReleaseBinaryAuthority>,
+}
+
+struct BoundConformanceAuthority<'a> {
+    plan: &'a ReleasePlan,
+    conformance_plan: &'a crate::conformance::ConformancePlan,
+    platform: crate::conformance::ConformancePlatform,
+    assigned: Vec<(
+        crate::conformance::PlannedCell,
+        crate::conformance::PlannedObligation,
+    )>,
+    assigned_obligations: u64,
+    candidate: hell_testkit::ExecutableIdentity,
+    candidate_build_info_schema_version: u64,
+    candidate_compat_tracing: bool,
+    oracle: &'a hell_testkit::ExecutableIdentity,
+    oracle_binding: crate::conformance::OracleBinding,
+    committed_cases: BTreeMap<String, hell_testkit::DifferentialCase>,
+    workers: usize,
+}
+
+struct CollectedConformanceEvidence {
+    observations: BTreeMap<String, Vec<u8>>,
+    record_files: BTreeMap<String, Vec<u8>>,
+    record_members: Vec<crate::conformance::EvidenceMember>,
+    exploratory_members: Vec<crate::conformance::EvidenceMember>,
+    timing: hell_testkit::DifferentialBatchTiming,
+}
+
+type ConformanceRecordFiles = BTreeMap<String, Vec<u8>>;
+type ConformanceRecordMembers = Vec<crate::conformance::EvidenceMember>;
+type CommittedConformanceRecords = (ConformanceRecordFiles, ConformanceRecordMembers);
+
+fn bind_conformance_authority<'a>(
+    platform: ReleasePlatform,
+    plan: &'a ReleasePlan,
+    conformance_plan: &'a crate::conformance::ConformancePlan,
+    oracle: &'a hell_testkit::ExecutableIdentity,
     oracle_source_sha256: &str,
     #[cfg(windows)] windows_release_binary: Option<&WindowsReleaseBinaryAuthority>,
-) -> Result<(), String> {
+) -> Result<BoundConformanceAuthority<'a>, String> {
     let conformance_platform = crate::conformance::ConformancePlatform::parse(platform.id())?;
     let assigned = conformance_plan
         .cells
@@ -15600,7 +17351,7 @@ fn collect_conformance_evidence(
         .flat_map(|cell| {
             cell.obligations
                 .iter()
-                .map(move |obligation| (cell, obligation))
+                .map(move |obligation| (cell.clone(), obligation.clone()))
         })
         .filter(|(cell, obligation)| {
             matches!(
@@ -15616,6 +17367,47 @@ fn collect_conformance_evidence(
     {
         return Err("platform obligation assignment differs from trusted engine".to_owned());
     }
+    let candidate = bind_conformance_candidate(
+        platform,
+        #[cfg(windows)]
+        windows_release_binary,
+    )?;
+    let build_info = candidate
+        .build_info
+        .as_ref()
+        .ok_or_else(|| "verified candidate build info is missing".to_owned())?;
+    let build_info_schema_version = build_info.schema_version;
+    let compat_tracing = build_info.compat_tracing;
+    let mut committed_case_list = hell_testkit::committed_differential_cases();
+    bind_process_helper(&mut committed_case_list)?;
+    Ok(BoundConformanceAuthority {
+        plan,
+        conformance_plan,
+        platform: conformance_platform,
+        assigned,
+        assigned_obligations,
+        candidate,
+        candidate_build_info_schema_version: build_info_schema_version,
+        candidate_compat_tracing: compat_tracing,
+        oracle,
+        oracle_binding: crate::conformance::OracleBinding {
+            repository: "chrisdone/hell".to_owned(),
+            commit: "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff".to_owned(),
+            executable_sha256: oracle.sha256.hex(),
+            source_sha256: oracle_source_sha256.to_owned(),
+        },
+        committed_cases: committed_case_list
+            .into_iter()
+            .map(|case| (case.id.to_string(), case))
+            .collect(),
+        workers: hell_testkit::differential_worker_limit(),
+    })
+}
+
+fn bind_conformance_candidate(
+    platform: ReleasePlatform,
+    #[cfg(windows)] windows_release_binary: Option<&WindowsReleaseBinaryAuthority>,
+) -> Result<hell_testkit::ExecutableIdentity, String> {
     #[cfg(windows)]
     let candidate_path = windows_release_binary
         .ok_or_else(|| {
@@ -15640,72 +17432,78 @@ fn collect_conformance_evidence(
     .map_err(|error| format!("cannot bind conformance candidate executable: {error}"))?;
     hell_testkit::verify_compat_tracing_candidate_identity(&candidate)
         .map_err(|error| format!("cannot bind candidate compatibility tracing: {error}"))?;
-    let candidate_build_info = candidate
-        .build_info
-        .as_ref()
-        .ok_or_else(|| "verified candidate build info is missing".to_owned())?;
-    let oracle_binding = crate::conformance::OracleBinding {
-        repository: "chrisdone/hell".to_owned(),
-        commit: "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff".to_owned(),
-        executable_sha256: oracle.sha256.hex(),
-        source_sha256: oracle_source_sha256.to_owned(),
-    };
-    let mut committed_case_list = hell_testkit::committed_differential_cases();
-    bind_process_helper(&mut committed_case_list)?;
-    let committed_cases = committed_case_list
-        .into_iter()
-        .map(|case| (case.id.to_string(), case))
-        .collect::<BTreeMap<_, _>>();
-    let requested_case_ids = assigned
+    Ok(candidate)
+}
+
+fn collect_committed_conformance_evidence(
+    authority: &BoundConformanceAuthority<'_>,
+) -> Result<CollectedConformanceEvidence, String> {
+    let requested_ids = authority
+        .assigned
         .iter()
         .flat_map(|(_, obligation)| obligation.case_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let mut observations = BTreeMap::<String, Vec<u8>>::new();
-    let mut committed_observations = BTreeMap::<String, (String, String)>::new();
-    let requested_cases = requested_case_ids
+    let requested_cases = requested_ids
         .iter()
         .map(|case_id| {
-            committed_cases
+            authority
+                .committed_cases
                 .get(case_id)
                 .cloned()
                 .ok_or_else(|| format!("planned committed case {case_id:?} is unavailable"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let workers = hell_testkit::differential_worker_limit();
-    let committed_batch = hell_testkit::differential_batch_with_identities(
-        oracle,
-        &candidate,
+    let batch = hell_testkit::differential_batch_with_identities(
+        authority.oracle,
+        &authority.candidate,
         &requested_cases,
-        workers,
+        authority.workers,
     )
     .map_err(|error| format!("cannot collect committed differential batch: {error}"))?;
-    let mut differential_timing = committed_batch.timing;
-    for (case_id, report) in requested_case_ids.iter().zip(committed_batch.reports) {
+    let mut observations = BTreeMap::new();
+    let mut committed_observations = BTreeMap::new();
+    for (case_id, report) in requested_ids.iter().zip(batch.reports) {
         let oracle_digest = retain_observation(&report.oracle, &mut observations)?;
         let candidate_digest = retain_observation(&report.candidate, &mut observations)?;
         committed_observations.insert(case_id.clone(), (candidate_digest, oracle_digest));
     }
-    let mut record_files = BTreeMap::<String, Vec<u8>>::new();
-    let mut record_members = Vec::new();
-    for (cell, obligation) in &assigned {
+    let (record_files, record_members) =
+        build_committed_conformance_records(authority, &committed_observations)?;
+    Ok(CollectedConformanceEvidence {
+        observations,
+        record_files,
+        record_members,
+        exploratory_members: Vec::new(),
+        timing: batch.timing,
+    })
+}
+
+fn build_committed_conformance_records(
+    authority: &BoundConformanceAuthority<'_>,
+    observations: &BTreeMap<String, (String, String)>,
+) -> Result<CommittedConformanceRecords, String> {
+    let mut files = BTreeMap::new();
+    let mut members = Vec::new();
+    for (cell, obligation) in &authority.assigned {
         for case_id in &obligation.case_ids {
-            let case = committed_cases
+            let case = authority
+                .committed_cases
                 .get(case_id)
                 .ok_or_else(|| format!("planned committed case {case_id:?} is unavailable"))?;
-            let (candidate_observation_sha256, oracle_observation_sha256) = committed_observations
+            let (candidate_digest, oracle_digest) = observations
                 .get(case_id)
                 .ok_or_else(|| "committed observation was not collected".to_owned())?;
             let mut record = crate::conformance::EvidenceRecord {
                 record_id: String::new(),
-                release_plan_sha256: plan.plan_sha256.clone(),
-                conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
-                candidate_sha: plan.resolution.candidate_sha.clone(),
-                candidate_executable_sha256: candidate.sha256.hex(),
-                candidate_build_info_schema_version: candidate_build_info.schema_version,
-                candidate_compat_tracing: candidate_build_info.compat_tracing,
-                source_inventory_sha256: plan.source_inventory_sha256.clone(),
-                oracle: oracle_binding.clone(),
-                platform: conformance_platform,
+                release_plan_sha256: authority.plan.plan_sha256.clone(),
+                conformance_plan_sha256: authority.conformance_plan.plan_sha256.clone(),
+                candidate_sha: authority.plan.resolution.candidate_sha.clone(),
+                candidate_executable_sha256: authority.candidate.sha256.hex(),
+                candidate_build_info_schema_version: authority.candidate_build_info_schema_version,
+                candidate_compat_tracing: authority.candidate_compat_tracing,
+                source_inventory_sha256: authority.plan.source_inventory_sha256.clone(),
+                oracle: authority.oracle_binding.clone(),
+                platform: authority.platform,
                 profile: cell.key.profile,
                 target: crate::conformance::EvidenceTarget {
                     cell: cell.key.clone(),
@@ -15714,30 +17512,35 @@ fn collect_conformance_evidence(
                 },
                 descriptor_sha256: hell_testkit::case_descriptor_sha256(case).hex(),
                 case_source: crate::conformance::CaseSource::Committed,
-                candidate_observation_sha256: candidate_observation_sha256.clone(),
-                oracle_observation_sha256: oracle_observation_sha256.clone(),
+                candidate_observation_sha256: candidate_digest.clone(),
+                oracle_observation_sha256: oracle_digest.clone(),
                 requested_normalizers: obligation.allowed_normalizers.clone(),
             };
             record.record_id = record.canonical_id()?;
             let bytes = canonical_json_bytes(&record.json())?;
             let path = format!("conformance-evidence/{}.json", record.record_id);
-            record_members.push(crate::conformance::EvidenceMember {
+            members.push(crate::conformance::EvidenceMember {
                 id: Some(record.record_id.clone()),
                 path: path.clone(),
                 sha256: hell_testkit::sha256_bytes(&bytes).hex(),
             });
-            if record_files.insert(path, bytes).is_some() {
+            if files.insert(path, bytes).is_some() {
                 return Err("conformance evidence record identity is duplicated".to_owned());
             }
         }
     }
-    let mut exploratory_members = Vec::new();
-    let mut unclassified_mismatches = 0_u64;
+    Ok((files, members))
+}
+
+fn collect_exploratory_conformance_evidence(
+    authority: &BoundConformanceAuthority<'_>,
+    collected: &mut CollectedConformanceEvidence,
+) -> Result<u64, String> {
     let generated = hell_testkit::generated_typed_cases(
         crate::conformance::EXPLORATORY_GENERATOR_SEED,
         crate::conformance::EXPLORATORY_GENERATOR_COUNT,
     );
-    let generated_cases = generated
+    let cases = generated
         .iter()
         .map(|generated| hell_testkit::DifferentialCase {
             id: generated.id.clone(),
@@ -15745,56 +17548,117 @@ fn collect_conformance_evidence(
             ..hell_testkit::DifferentialCase::default()
         })
         .collect::<Vec<_>>();
-    let generated_batch = hell_testkit::differential_batch_with_identities(
-        oracle,
-        &candidate,
-        &generated_cases,
-        workers,
+    let batch = hell_testkit::differential_batch_with_identities(
+        authority.oracle,
+        &authority.candidate,
+        &cases,
+        authority.workers,
     )
     .map_err(|error| format!("cannot collect exploratory differential batch: {error}"))?;
-    add_differential_timing(&mut differential_timing, generated_batch.timing);
-    for (generated, report) in generated.iter().zip(generated_batch.reports) {
-        let oracle_observation_sha256 = retain_observation(&report.oracle, &mut observations)?;
-        let candidate_observation_sha256 =
-            retain_observation(&report.candidate, &mut observations)?;
-        if candidate_observation_sha256 != oracle_observation_sha256 {
-            unclassified_mismatches = unclassified_mismatches
+    add_differential_timing(&mut collected.timing, batch.timing);
+    let mut mismatches = 0_u64;
+    for (generated, report) in generated.iter().zip(batch.reports) {
+        let oracle_digest = retain_observation(&report.oracle, &mut collected.observations)?;
+        let candidate_digest = retain_observation(&report.candidate, &mut collected.observations)?;
+        if candidate_digest != oracle_digest {
+            mismatches = mismatches
                 .checked_add(1)
                 .ok_or_else(|| "unclassified mismatch count overflow".to_owned())?;
         }
         let record = crate::conformance::ExploratoryRecord {
             generated_case_id: generated.id.to_string(),
-            platform: conformance_platform,
+            platform: authority.platform,
             generator_version: crate::conformance::EXPLORATORY_GENERATOR_VERSION.to_owned(),
             seed: generated.seed,
             source_sha256: hell_testkit::sha256_bytes(generated.source.as_bytes()).hex(),
             ast_sha256: generated.ast_sha256.hex(),
-            release_plan_sha256: plan.plan_sha256.clone(),
-            conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
-            candidate_sha: plan.resolution.candidate_sha.clone(),
-            candidate_executable_sha256: candidate.sha256.hex(),
-            candidate_build_info_schema_version: candidate_build_info.schema_version,
-            candidate_compat_tracing: candidate_build_info.compat_tracing,
-            source_inventory_sha256: plan.source_inventory_sha256.clone(),
-            oracle: oracle_binding.clone(),
-            candidate_observation_sha256,
-            oracle_observation_sha256,
+            release_plan_sha256: authority.plan.plan_sha256.clone(),
+            conformance_plan_sha256: authority.conformance_plan.plan_sha256.clone(),
+            candidate_sha: authority.plan.resolution.candidate_sha.clone(),
+            candidate_executable_sha256: authority.candidate.sha256.hex(),
+            candidate_build_info_schema_version: authority.candidate_build_info_schema_version,
+            candidate_compat_tracing: authority.candidate_compat_tracing,
+            source_inventory_sha256: authority.plan.source_inventory_sha256.clone(),
+            oracle: authority.oracle_binding.clone(),
+            candidate_observation_sha256: candidate_digest,
+            oracle_observation_sha256: oracle_digest,
         };
         let id = record.canonical_id()?;
         let bytes = canonical_json_bytes(&record.json()?)?;
         let path = format!("conformance-evidence/{id}.json");
-        exploratory_members.push(crate::conformance::EvidenceMember {
-            id: Some(id),
-            path: path.clone(),
-            sha256: hell_testkit::sha256_bytes(&bytes).hex(),
-        });
-        if record_files.insert(path, bytes).is_some() {
+        collected
+            .exploratory_members
+            .push(crate::conformance::EvidenceMember {
+                id: Some(id),
+                path: path.clone(),
+                sha256: hell_testkit::sha256_bytes(&bytes).hex(),
+            });
+        if collected.record_files.insert(path, bytes).is_some() {
             return Err("exploratory evidence record identity is duplicated".to_owned());
         }
     }
-    require_executable_digest(&oracle.path, oracle.sha256, "retained oracle")?;
-    require_executable_digest(&candidate.path, candidate.sha256, "candidate executable")?;
-    let mut observation_members = observations
+    Ok(mismatches)
+}
+
+fn collect_conformance_evidence(context: ConformanceEvidenceContext<'_>) -> Result<(), String> {
+    let ConformanceEvidenceContext {
+        platform,
+        plan,
+        conformance_plan,
+        output,
+        gates,
+        gate_evidence,
+        retained,
+        oracle,
+        oracle_source_sha256,
+        #[cfg(windows)]
+        windows_release_binary,
+    } = context;
+    let authority = bind_conformance_authority(
+        platform,
+        plan,
+        conformance_plan,
+        oracle,
+        oracle_source_sha256,
+        #[cfg(windows)]
+        windows_release_binary,
+    )?;
+    let mut collected = collect_committed_conformance_evidence(&authority)?;
+    let unclassified_mismatches =
+        collect_exploratory_conformance_evidence(&authority, &mut collected)?;
+    require_executable_digest(
+        &authority.oracle.path,
+        authority.oracle.sha256,
+        "retained oracle",
+    )?;
+    require_executable_digest(
+        &authority.candidate.path,
+        authority.candidate.sha256,
+        "candidate executable",
+    )?;
+    let manifest = persist_conformance_evidence(&authority, &mut collected, output, retained)?;
+    gates.insert("conformance-evidence", true);
+    gate_evidence.insert(
+        "conformance-evidence".to_owned(),
+        conformance_evidence_gate_report(
+            &authority,
+            &manifest,
+            &collected.timing,
+            oracle_source_sha256,
+            unclassified_mismatches,
+        )?,
+    );
+    Ok(())
+}
+
+fn persist_conformance_evidence(
+    authority: &BoundConformanceAuthority<'_>,
+    collected: &mut CollectedConformanceEvidence,
+    output: &Path,
+    retained: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<crate::conformance::EvidenceManifest, String> {
+    let mut observation_members = collected
+        .observations
         .iter()
         .map(|(digest, bytes)| crate::conformance::EvidenceMember {
             id: None,
@@ -15802,27 +17666,31 @@ fn collect_conformance_evidence(
             sha256: hell_testkit::sha256_bytes(bytes).hex(),
         })
         .collect::<Vec<_>>();
-    record_members.sort_by(|left, right| left.path.cmp(&right.path));
-    exploratory_members.sort_by(|left, right| left.path.cmp(&right.path));
+    collected
+        .record_members
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    collected
+        .exploratory_members
+        .sort_by(|left, right| left.path.cmp(&right.path));
     observation_members.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest =
         crate::conformance::EvidenceManifest::new(crate::conformance::EvidenceManifestInput {
-            platform: conformance_platform,
-            candidate_sha: plan.resolution.candidate_sha.clone(),
-            candidate_executable_sha256: candidate.sha256.hex(),
-            release_plan_sha256: plan.plan_sha256.clone(),
-            conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
-            oracle: oracle_binding,
-            records: record_members,
-            exploratory_records: exploratory_members,
+            platform: authority.platform,
+            candidate_sha: authority.plan.resolution.candidate_sha.clone(),
+            candidate_executable_sha256: authority.candidate.sha256.hex(),
+            release_plan_sha256: authority.plan.plan_sha256.clone(),
+            conformance_plan_sha256: authority.conformance_plan.plan_sha256.clone(),
+            oracle: authority.oracle_binding.clone(),
+            records: std::mem::take(&mut collected.record_members),
+            exploratory_records: std::mem::take(&mut collected.exploratory_members),
             observations: observation_members,
-            assigned_obligations,
+            assigned_obligations: authority.assigned_obligations,
         })?;
-    for (path, bytes) in record_files {
+    for (path, bytes) in std::mem::take(&mut collected.record_files) {
         write_atomic(&output.join(&path), &bytes)?;
         retained.insert(path, bytes);
     }
-    for (digest, bytes) in observations {
+    for (digest, bytes) in std::mem::take(&mut collected.observations) {
         let path = format!("conformance-observations/{digest}.json");
         write_atomic(&output.join(&path), &bytes)?;
         retained.insert(path, bytes);
@@ -15836,76 +17704,90 @@ fn collect_conformance_evidence(
         "conformance-evidence-manifest.json".to_owned(),
         manifest_bytes,
     );
-    gates.insert("conformance-evidence", true);
-    gate_evidence.insert(
-        "conformance-evidence".to_owned(),
-        object([
-            ("assignedObligations", number(assigned_obligations)),
-            (
-                "candidateProcessSumMillis",
-                number(duration_millis(
-                    differential_timing.candidate_process_sum,
-                    "candidate process timing",
-                )?),
+    Ok(manifest)
+}
+
+fn conformance_evidence_gate_report(
+    authority: &BoundConformanceAuthority<'_>,
+    manifest: &crate::conformance::EvidenceManifest,
+    timing: &hell_testkit::DifferentialBatchTiming,
+    oracle_source_sha256: &str,
+    unclassified_mismatches: u64,
+) -> Result<JsonValue, String> {
+    Ok(object([
+        (
+            "assignedObligations",
+            number(authority.assigned_obligations),
+        ),
+        (
+            "candidateProcessSumMillis",
+            number(duration_millis(
+                timing.candidate_process_sum,
+                "candidate process timing",
+            )?),
+        ),
+        (
+            "candidateExecutableSha256",
+            string(&authority.candidate.sha256.hex()),
+        ),
+        (
+            "completedDifferentialCases",
+            number(
+                u64::try_from(timing.completed_count)
+                    .map_err(|_| "completed differential case count overflow")?,
             ),
-            ("candidateExecutableSha256", string(&candidate.sha256.hex())),
-            (
-                "completedDifferentialCases",
-                number(
-                    u64::try_from(differential_timing.completed_count)
-                        .map_err(|_| "completed differential case count overflow")?,
-                ),
+        ),
+        (
+            "differentialBatchWallMillis",
+            number(duration_millis(
+                timing.wall,
+                "differential batch wall timing",
+            )?),
+        ),
+        (
+            "differentialDriverOverheadSumMillis",
+            number(duration_millis(
+                timing.driver_overhead_sum,
+                "differential driver timing",
+            )?),
+        ),
+        (
+            "differentialWorkerCount",
+            number(
+                u64::try_from(timing.worker_count)
+                    .map_err(|_| "differential worker count overflow")?,
             ),
-            (
-                "differentialBatchWallMillis",
-                number(duration_millis(
-                    differential_timing.wall,
-                    "differential batch wall timing",
-                )?),
+        ),
+        (
+            "exploratoryRecords",
+            number(
+                u64::try_from(manifest.exploratory_records.len())
+                    .map_err(|_| "exploratory record count overflow")?,
             ),
-            (
-                "differentialDriverOverheadSumMillis",
-                number(duration_millis(
-                    differential_timing.driver_overhead_sum,
-                    "differential driver timing",
-                )?),
-            ),
-            (
-                "differentialWorkerCount",
-                number(
-                    u64::try_from(differential_timing.worker_count)
-                        .map_err(|_| "differential worker count overflow")?,
-                ),
-            ),
-            (
-                "exploratoryRecords",
-                number(
-                    u64::try_from(manifest.exploratory_records.len())
-                        .map_err(|_| "exploratory record count overflow")?,
-                ),
-            ),
-            ("manifestSha256", string(&manifest.manifest_sha256)),
-            (
-                "oracleCommit",
-                string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"),
-            ),
-            (
-                "oracleProcessSumMillis",
-                number(duration_millis(
-                    differential_timing.oracle_process_sum,
-                    "oracle process timing",
-                )?),
-            ),
-            ("oracleExecutableSha256", string(&oracle.sha256.hex())),
-            ("oracleRepository", string("chrisdone/hell")),
-            ("oracleSourceSha256", string(oracle_source_sha256)),
-            ("producedRecords", number(manifest.produced_records)),
-            ("schemaVersion", number(1)),
-            ("state", string("collected")),
-            ("unclassifiedMismatches", number(unclassified_mismatches)),
-        ]),
-    );
-    Ok(())
+        ),
+        ("manifestSha256", string(&manifest.manifest_sha256)),
+        (
+            "oracleCommit",
+            string("8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"),
+        ),
+        (
+            "oracleProcessSumMillis",
+            number(duration_millis(
+                timing.oracle_process_sum,
+                "oracle process timing",
+            )?),
+        ),
+        (
+            "oracleExecutableSha256",
+            string(&authority.oracle.sha256.hex()),
+        ),
+        ("oracleRepository", string("chrisdone/hell")),
+        ("oracleSourceSha256", string(oracle_source_sha256)),
+        ("producedRecords", number(manifest.produced_records)),
+        ("schemaVersion", number(1)),
+        ("state", string("collected")),
+        ("unclassifiedMismatches", number(unclassified_mismatches)),
+    ]))
 }
 
 fn add_differential_timing(
@@ -16150,7 +18032,7 @@ impl UnretainedOracle {
     fn native(identity: hell_testkit::ExecutableIdentity) -> Self {
         Self {
             #[cfg(unix)]
-            path: identity.path.clone(),
+            path: identity.path,
             #[cfg(unix)]
             sha256: identity.sha256,
             #[cfg(windows)]
@@ -16226,7 +18108,7 @@ fn acquire_linux_oracle(output: &Path) -> Result<PathBuf, String> {
 fn prepare_oracle(
     platform: ReleasePlatform,
     oracle_source: &Path,
-    _trusted_output: &Path,
+    trusted_output: &Path,
     archive_adapter: &crate::command::NativeArchiveAdapter,
     native_deadlines: Option<NativeOracleCommandDeadlines>,
 ) -> Result<UnretainedOracle, String> {
@@ -16234,7 +18116,7 @@ fn prepare_oracle(
         #[cfg(not(unix))]
         return Err("Linux oracle acquisition requires a POSIX trusted runner".to_owned());
         #[cfg(unix)]
-        let mut acquisition = LinuxOracleAcquisition::reserve(_trusted_output)?;
+        let mut acquisition = LinuxOracleAcquisition::reserve(trusted_output)?;
         #[cfg(unix)]
         let oracle = acquire_linux_oracle(acquisition.directory())?;
         #[cfg(unix)]
@@ -16250,7 +18132,7 @@ fn prepare_oracle(
         });
     }
     let build = archive_adapter.stack_build(oracle_source, Duration::from_hours(2));
-    let result = run_native_oracle_command(build, native_deadlines, "build native oracle")?;
+    let result = run_native_oracle_command(&build, native_deadlines, "build native oracle")?;
     if !result.status.success() || result.timed_out {
         return Err(native_oracle_command_failure(
             "native-oracle-build",
@@ -16258,7 +18140,7 @@ fn prepare_oracle(
         ));
     }
     let path = archive_adapter.stack_path(oracle_source);
-    let result = run_native_oracle_command(path, native_deadlines, "resolve native oracle")?;
+    let result = run_native_oracle_command(&path, native_deadlines, "resolve native oracle")?;
     if !result.status.success() || result.timed_out || result.stdout_truncated {
         return Err(native_oracle_command_failure("native-oracle-path", &result));
     }
@@ -16279,7 +18161,7 @@ fn prepare_oracle(
 }
 
 fn run_native_oracle_command(
-    command: CommandSpec,
+    command: &CommandSpec,
     deadlines: Option<NativeOracleCommandDeadlines>,
     phase: &str,
 ) -> Result<CommandResult, String> {
@@ -16507,7 +18389,7 @@ fn transient_path(root: &Path, name: &str) -> PathBuf {
 
 fn command_gate(
     name: &'static str,
-    command: CommandSpec,
+    command: &CommandSpec,
     output: &Path,
     gates: &mut BTreeMap<&'static str, bool>,
     evidence: &mut BTreeMap<String, JsonValue>,
@@ -16716,6 +18598,59 @@ pub(crate) fn run_repository_inventory_target_stderr_child(
 }
 
 #[cfg(any(unix, windows))]
+fn validate_platform_failure_report(
+    output: &Path,
+    report_path: &Path,
+    primary: &str,
+) -> Result<(), String> {
+    let report = fs::read_to_string(report_path)
+        .map_err(|error| format!("cannot read platform failure report: {error}"))?;
+    let report = parse_json(&report)?;
+    let report = report.object()?;
+    if json_member(report, "schemaVersion")?.number()? != 1
+        || json_member(report, "state")?.string()? != "failed"
+        || json_member(report, "failedGate")?.string()? != "deterministic-command-failure"
+        || json_member(report, "detail")?.string()? != primary
+    {
+        return Err("platform failure report terminal fields differ".to_owned());
+    }
+    let evidence = json_member(report, "evidence")?.object()?;
+    let receipt = json_member(evidence, "deterministic-command-failure")?.object()?;
+    let stdout = platform_failure_fixture_bytes(b"out-");
+    let stderr = platform_failure_fixture_bytes(b"err-");
+    if json_member(receipt, "schemaVersion")?.number()? != 2
+        || json_member(receipt, "statusCode")?.number()? != 23
+        || json_member(receipt, "timedOut")?.boolean()?
+        || json_member(receipt, "stdoutBytes")?.number()?
+            != u64::try_from(stdout.len()).unwrap_or(u64::MAX)
+        || json_member(receipt, "stderrBytes")?.number()?
+            != u64::try_from(stderr.len()).unwrap_or(u64::MAX)
+        || json_member(receipt, "stdoutSha256")?.string()?
+            != hell_testkit::sha256_bytes(&stdout).hex()
+        || json_member(receipt, "stderrSha256")?.string()?
+            != hell_testkit::sha256_bytes(&stderr).hex()
+        || [
+            "stdoutTruncated",
+            "stderrTruncated",
+            "stdoutDetailTruncated",
+            "stderrDetailTruncated",
+        ]
+        .into_iter()
+        .any(|field| json_member(receipt, field).and_then(JsonValue::boolean) != Ok(true))
+    {
+        return Err("platform failure report command receipt differs".to_owned());
+    }
+    let entries = fs::read_dir(output)
+        .map_err(|error| format!("cannot inspect platform failure output: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate platform failure output: {error}"))?;
+    if entries.len() != 1 || entries[0].path() != report_path {
+        return Err("platform failure report publication was not one atomic artifact".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
 pub(crate) fn verify_platform_command_failure_report_for_integration() -> Result<(), String> {
     let ordered = compose_platform_gate_cleanup(
         Err("primary gate failed".to_owned()),
@@ -16748,7 +18683,7 @@ pub(crate) fn verify_platform_command_failure_report_for_integration() -> Result
         let mut evidence = BTreeMap::new();
         let primary = command_gate(
             "deterministic-command-failure",
-            command(),
+            &command(),
             &output,
             &mut gates,
             &mut evidence,
@@ -16760,48 +18695,7 @@ pub(crate) fn verify_platform_command_failure_report_for_integration() -> Result
             );
         }
         let report_path = output.join("platform-failure-report.json");
-        let report = fs::read_to_string(&report_path)
-            .map_err(|error| format!("cannot read platform failure report: {error}"))?;
-        let report = parse_json(&report)?;
-        let report = report.object()?;
-        if json_member(report, "schemaVersion")?.number()? != 1
-            || json_member(report, "state")?.string()? != "failed"
-            || json_member(report, "failedGate")?.string()? != "deterministic-command-failure"
-            || json_member(report, "detail")?.string()? != primary
-        {
-            return Err("platform failure report terminal fields differ".to_owned());
-        }
-        let evidence = json_member(report, "evidence")?.object()?;
-        let command_receipt = json_member(evidence, "deterministic-command-failure")?.object()?;
-        let stdout = platform_failure_fixture_bytes(b"out-");
-        let stderr = platform_failure_fixture_bytes(b"err-");
-        if json_member(command_receipt, "schemaVersion")?.number()? != 2
-            || json_member(command_receipt, "statusCode")?.number()? != 23
-            || json_member(command_receipt, "timedOut")?.boolean()?
-            || json_member(command_receipt, "stdoutBytes")?.number()?
-                != u64::try_from(stdout.len()).unwrap_or(u64::MAX)
-            || json_member(command_receipt, "stderrBytes")?.number()?
-                != u64::try_from(stderr.len()).unwrap_or(u64::MAX)
-            || json_member(command_receipt, "stdoutSha256")?.string()?
-                != hell_testkit::sha256_bytes(&stdout).hex()
-            || json_member(command_receipt, "stderrSha256")?.string()?
-                != hell_testkit::sha256_bytes(&stderr).hex()
-            || !json_member(command_receipt, "stdoutTruncated")?.boolean()?
-            || !json_member(command_receipt, "stderrTruncated")?.boolean()?
-            || !json_member(command_receipt, "stdoutDetailTruncated")?.boolean()?
-            || !json_member(command_receipt, "stderrDetailTruncated")?.boolean()?
-        {
-            return Err("platform failure report command receipt differs".to_owned());
-        }
-        let entries = fs::read_dir(&output)
-            .map_err(|error| format!("cannot inspect platform failure output: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot enumerate platform failure output: {error}"))?;
-        if entries.len() != 1 || entries[0].path() != report_path {
-            return Err(
-                "platform failure report publication was not one atomic artifact".to_owned(),
-            );
-        }
+        validate_platform_failure_report(&output, &report_path, &primary)?;
 
         let blocked = root.join("blocked-output");
         fs::write(&blocked, b"not-a-directory\n")
@@ -16810,7 +18704,7 @@ pub(crate) fn verify_platform_command_failure_report_for_integration() -> Result
         let mut blocked_evidence = BTreeMap::new();
         let composed = command_gate(
             "deterministic-command-failure",
-            command(),
+            &command(),
             &blocked,
             &mut blocked_gates,
             &mut blocked_evidence,
@@ -16889,7 +18783,7 @@ fn tool_identities(
                 .current_directory(candidate_root),
         ),
     ] {
-        identities.insert(name.to_owned(), string(&tool_output(command, name)?));
+        identities.insert(name.to_owned(), string(&tool_output(&command, name)?));
     }
     if identities
         .get("stack")
@@ -16904,7 +18798,7 @@ fn tool_identities(
             identities.insert(
                 "llvm-ar".to_owned(),
                 string(&tool_output(
-                    identity.current_directory(candidate_root),
+                    &identity.current_directory(candidate_root),
                     "llvm-ar",
                 )?),
             );
@@ -16912,7 +18806,7 @@ fn tool_identities(
         identities.insert(
             "ghc".to_owned(),
             string(&tool_output(
-                archive_adapter.stack_ghc_version(oracle_source),
+                &archive_adapter.stack_ghc_version(oracle_source),
                 "ghc",
             )?),
         );
@@ -16920,7 +18814,7 @@ fn tool_identities(
     Ok(identities)
 }
 
-fn tool_output(command: CommandSpec, label: &str) -> Result<String, String> {
+fn tool_output(command: &CommandSpec, label: &str) -> Result<String, String> {
     let result = command
         .run()
         .map_err(|error| format!("cannot identify {label}: {error}"))?;
@@ -17043,15 +18937,40 @@ fn require_inventory_snapshot(
     Ok(())
 }
 
-fn validate_runner(platform: ReleasePlatform) -> Result<(String, String), String> {
-    let runner_os = env::var("RUNNER_OS").ok();
-    let runner_arch = env::var("RUNNER_ARCH").ok();
+fn validate_runner(
+    platform: ReleasePlatform,
+    environment: &ProcessEnvironment,
+) -> Result<(String, String), String> {
+    let runner_os =
+        optional_standard_environment_value(environment, StandardVariable::RunnerOs, "RUNNER_OS")?;
+    let runner_arch = optional_standard_environment_value(
+        environment,
+        StandardVariable::RunnerArchitecture,
+        "RUNNER_ARCH",
+    )?;
     validate_runner_identity(
         platform,
-        runner_os.as_deref(),
-        runner_arch.as_deref(),
+        (!runner_os.is_empty()).then_some(runner_os.as_str()),
+        (!runner_arch.is_empty()).then_some(runner_arch.as_str()),
         env::consts::OS,
         env::consts::ARCH,
+    )
+}
+
+fn optional_standard_environment_value(
+    environment: &ProcessEnvironment,
+    variable: StandardVariable,
+    name: &str,
+) -> Result<String, String> {
+    environment.value(variable).map_or_else(
+        || Ok(String::new()),
+        |value| {
+            value
+                .to_str()
+                .filter(|value| !value.is_empty() && !value.contains(['\0', '\r', '\n']))
+                .map(str::to_owned)
+                .ok_or_else(|| format!("standard {name} value is invalid or not UTF-8"))
+        },
     )
 }
 
@@ -17216,10 +19135,7 @@ mod tests {
     use std::path::Path;
 
     #[cfg(unix)]
-    #[test]
-    fn trusted_cargo_cache_seed_is_locked_and_manifest_scoped() {
-        use std::ffi::OsString;
-
+    fn assert_trusted_cargo_cache_commands() {
         let manifest = Path::new("/bound/candidate/Cargo.toml");
         assert_eq!(
             trusted_cargo_cache_seed_arguments(Path::new("/bound/candidate"), manifest).unwrap(),
@@ -17268,6 +19184,13 @@ mod tests {
                 "--offline".into(),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_trusted_cargo_deny_and_vendor_commands() {
+        use std::ffi::OsString;
+
+        let manifest = Path::new("/bound/candidate/Cargo.toml");
         let cargo_home = Path::new("/private/var/tmp/hell-cargo-seed-1-2");
         let authority_metadata = cargo_home.join("hell-cargo-deny-metadata.json");
         assert_eq!(
@@ -17359,7 +19282,10 @@ mod tests {
             )
             .is_err()
         );
+    }
 
+    #[cfg(unix)]
+    fn assert_staged_cargo_directory_source_configuration() {
         let home = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!(
@@ -17380,6 +19306,14 @@ mod tests {
         );
         assert!(configure_staged_cargo_home_directory_source(&home).is_err());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_cargo_cache_seed_is_locked_and_manifest_scoped() {
+        assert_trusted_cargo_cache_commands();
+        assert_trusted_cargo_deny_and_vendor_commands();
+        assert_staged_cargo_directory_source_configuration();
     }
 
     #[cfg(unix)]
@@ -17758,12 +19692,12 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         let source = include_str!("platform.rs");
         assert!(!source.contains(&["fn candidate_cargo_", "deny_arguments",].concat()));
         let start = source
-            .find("if platform == ReleasePlatform::LinuxX86_64 {\n        let (policy, cargo_deny_home)")
+            .find("fn run_linux_policy_and_build_gates(")
             .expect("Linux dependency-policy gate marker");
         let end = source[start..]
-            .find("in_process_gate(\n            \"conformance-policy\"")
+            .find("fn record_linux_release_authorities(")
             .map(|offset| start + offset)
-            .expect("Linux conformance gate marker");
+            .expect("Linux release-authority gate marker");
         let gate = &source[start..end];
         assert!(
             !gate.contains("CommandSpec::cargo_deny"),
@@ -18064,8 +19998,7 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
     }
 
     #[cfg(unix)]
-    #[test]
-    fn posix_adapter_authority_uses_fixed_platform_tools_and_exact_cleanup_scope() {
+    fn assert_posix_adapter_tool_authority() {
         assert_eq!(
             posix_adapter_tool_paths(ReleasePlatform::LinuxX86_64).unwrap(),
             PosixAdapterToolPaths {
@@ -18125,7 +20058,10 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             ["-RN", "/bound"]
         );
         assert!(posix_acl_removal_arguments(ReleasePlatform::LinuxX86_64, true, "/bound").is_err());
+    }
 
+    #[cfg(unix)]
+    fn assert_posix_adapter_cleanup_scope() {
         #[cfg(target_os = "linux")]
         let (current_platform, root) = (ReleasePlatform::LinuxX86_64, Path::new("/var/tmp"));
         #[cfg(target_os = "macos")]
@@ -18184,7 +20120,14 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             &stack_directory.join("stack"),
             "stack"
         ));
+    }
 
+    #[cfg(unix)]
+    fn assert_posix_source_and_rustup_cleanup_scope() {
+        #[cfg(target_os = "linux")]
+        let root = Path::new("/var/tmp");
+        #[cfg(target_os = "macos")]
+        let root = Path::new("/private/var/tmp");
         let sources = root.join("hell-rs-posix-sources-bound");
         let candidate = sources.join("candidate");
         let oracle = sources.join("oracle");
@@ -18253,6 +20196,14 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             &root.join("rustup-bound")
         ));
         assert!(!posix_rustup_cleanup_is_exact(root, &rustup.join("nested")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_adapter_authority_uses_fixed_platform_tools_and_exact_cleanup_scope() {
+        assert_posix_adapter_tool_authority();
+        assert_posix_adapter_cleanup_scope();
+        assert_posix_source_and_rustup_cleanup_scope();
     }
 
     #[cfg(unix)]
@@ -18457,9 +20408,139 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
     }
 
     #[cfg(unix)]
+    fn assert_cargo_deny_advisory_lock_post_state(
+        home: &Path,
+        advisory_root: &Path,
+        advisory_lock: &Path,
+        advisory_lock_authority: &std::fs::File,
+        owner: u32,
+        group: u32,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let candidate_groups =
+            posix_candidate_group_inventory(b"61001 20 701 100\n", 61_001).unwrap();
+        assert!(!candidate_groups.contains(&12_345));
+        std::fs::set_permissions(advisory_lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                home,
+                owner,
+                owner,
+                group,
+                advisory_lock_authority,
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
+        validate_posix_cargo_deny_home_post_state(
+            home,
+            owner,
+            owner,
+            group,
+            advisory_lock_authority,
+        )
+        .unwrap();
+        // cargo-deny opens this lock read+write+create; reopening must not truncate it.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(advisory_lock)
+            .unwrap();
+        let regenerated_lock = advisory_root.join("regenerated.lock");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&regenerated_lock)
+            .unwrap();
+        std::fs::remove_file(regenerated_lock).unwrap();
+        validate_posix_cargo_deny_home_post_state(
+            home,
+            owner,
+            owner,
+            group,
+            advisory_lock_authority,
+        )
+        .unwrap();
+
+        std::fs::set_permissions(advisory_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                home,
+                owner,
+                owner,
+                group,
+                advisory_lock_authority,
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(advisory_root, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        std::fs::remove_file(advisory_lock).unwrap();
+        std::fs::write(advisory_lock, b"replacement\n").unwrap();
+        std::fs::set_permissions(advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                home,
+                owner,
+                owner,
+                group,
+                advisory_lock_authority,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_cargo_deny_home_rejects_redirected_entries(
+        authority: &Path,
+        environment: &Path,
+        home: &Path,
+        owner: u32,
+        group: u32,
+        advisory_root: &Path,
+        advisory_lock_authority: &std::fs::File,
+    ) {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let wrong = environment.join("cargo-home");
+        std::fs::create_dir(&wrong).unwrap();
+        assert!(validate_posix_cargo_deny_home_root(&wrong).is_err());
+        let outside = authority.join("outside");
+        std::fs::write(&outside, b"outside\n").unwrap();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, home.join("redirect")).unwrap();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            validate_posix_cargo_deny_home_post_state(
+                home,
+                owner,
+                owner,
+                group,
+                advisory_lock_authority,
+            )
+            .is_err()
+        );
+        assert!(normalize_cargo_deny_cache_tree(home, owner, owner, group).is_err());
+
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(home.join("redirect")).unwrap();
+        std::fs::hard_link(&outside, home.join("hard-link")).unwrap();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(normalize_cargo_deny_cache_tree(home, owner, owner, group).is_err());
+
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(advisory_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(authority).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cargo_deny_home_normalizer_is_private_bounded_and_exactly_scoped() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let authority = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -18516,116 +20597,23 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
             assert_eq!(metadata.uid(), identity.uid());
             assert_eq!(metadata.gid(), identity.gid());
         }
-        let candidate_groups =
-            posix_candidate_group_inventory(b"61001 20 701 100\n", 61_001).unwrap();
-        assert!(!candidate_groups.contains(&12_345));
-        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o444)).unwrap();
-        assert!(
-            validate_posix_cargo_deny_home_post_state(
-                &home,
-                identity.uid(),
-                identity.uid(),
-                identity.gid(),
-                &advisory_lock_authority,
-            )
-            .is_err()
-        );
-        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
-        validate_posix_cargo_deny_home_post_state(
+        assert_cargo_deny_advisory_lock_post_state(
             &home,
-            identity.uid(),
+            &advisory_root,
+            &advisory_lock,
+            &advisory_lock_authority,
             identity.uid(),
             identity.gid(),
-            &advisory_lock_authority,
-        )
-        .unwrap();
-        // cargo-deny 0.20.2 opens db.lock through tame-index with
-        // read+write+create semantics, so both reopening the reserved lock and
-        // creating a replacement lock in the advisory root must succeed for
-        // the lock owner after the read-only transition.
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&advisory_lock)
-            .unwrap();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(advisory_root.join("regenerated.lock"))
-            .unwrap();
-        std::fs::remove_file(advisory_root.join("regenerated.lock")).unwrap();
-        validate_posix_cargo_deny_home_post_state(
+        );
+        assert_cargo_deny_home_rejects_redirected_entries(
+            &authority,
+            &environment,
             &home,
             identity.uid(),
-            identity.uid(),
             identity.gid(),
+            &advisory_root,
             &advisory_lock_authority,
-        )
-        .unwrap();
-
-        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(
-            validate_posix_cargo_deny_home_post_state(
-                &home,
-                identity.uid(),
-                identity.uid(),
-                identity.gid(),
-                &advisory_lock_authority,
-            )
-            .is_err()
         );
-        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o750)).unwrap();
-
-        std::fs::remove_file(&advisory_lock).unwrap();
-        std::fs::write(&advisory_lock, b"replacement\n").unwrap();
-        std::fs::set_permissions(&advisory_lock, std::fs::Permissions::from_mode(0o660)).unwrap();
-        assert!(
-            validate_posix_cargo_deny_home_post_state(
-                &home,
-                identity.uid(),
-                identity.uid(),
-                identity.gid(),
-                &advisory_lock_authority,
-            )
-            .is_err()
-        );
-
-        let wrong = environment.join("cargo-home");
-        std::fs::create_dir(&wrong).unwrap();
-        assert!(validate_posix_cargo_deny_home_root(&wrong).is_err());
-        let outside = authority.join("outside");
-        std::fs::write(&outside, b"outside\n").unwrap();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
-        symlink(&outside, home.join("redirect")).unwrap();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(
-            validate_posix_cargo_deny_home_post_state(
-                &home,
-                identity.uid(),
-                identity.uid(),
-                identity.gid(),
-                &advisory_lock_authority,
-            )
-            .is_err()
-        );
-        assert!(
-            normalize_cargo_deny_cache_tree(&home, identity.uid(), identity.uid(), identity.gid())
-                .is_err()
-        );
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_file(home.join("redirect")).unwrap();
-        std::fs::hard_link(&outside, home.join("hard-link")).unwrap();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(
-            normalize_cargo_deny_cache_tree(&home, identity.uid(), identity.uid(), identity.gid())
-                .is_err()
-        );
-
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&advisory_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&authority).unwrap();
     }
 
     #[cfg(unix)]

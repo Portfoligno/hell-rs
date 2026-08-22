@@ -1,0 +1,68 @@
+schema-version = 1
+policy-id = "hell-rs-rust-capabilities-v1"
+deny-broad-clippy-allow = true
+control-vector-manifest = "ci/control-vectors/v1/manifest.toml"
+
+[[capability]]
+id = "github-runtime-read"
+crate = "hell-ci"
+item = "github_runtime::GithubRuntime::from_process"
+methods = ["std::env::var", "std::env::var_os"]
+reason = "Read the closed set of standard GitHub runtime variables into typed values."
+
+[[capability]]
+id = "github-credential-read"
+crate = "hell-ci"
+item = "github_runtime::GithubCredential::from_process"
+methods = ["std::env::var"]
+reason = "Read the step-local standard GITHUB_TOKEN into a non-displayable credential."
+
+[[capability]]
+id = "child-environment"
+crate = "hell-ci"
+item = "process_environment::ChildEnvironment::apply"
+methods = ["std::process::Command::env", "std::process::Command::envs", "std::process::Command::env_clear"]
+reason = "Apply a typed allowlisted child environment to one native argv process."
+
+[[capability]]
+id = "executable-search-path-read"
+crate = "hell-ci"
+item = "process_environment::ExecutableSearchPath::from_process"
+methods = ["std::env::var_os"]
+reason = "Read the standard native executable search path for bounded resolution and post-restoration hashing."
+
+[[capability]]
+id = "standard-process-environment-read"
+crate = "hell-ci"
+item = "process_environment::ProcessEnvironment::from_process"
+methods = ["std::env::var_os"]
+reason = "Read the closed standard process environment needed for native resolution, trusted paths, outputs, and scrubbed child construction."
+
+[[capability]]
+id = "publisher-github-runtime-read"
+crate = "hell-release-publisher"
+item = "github_runtime::GithubRuntime::from_process"
+methods = ["std::env::var", "std::env::var_os"]
+reason = "Read the closed set of standard GitHub runtime variables in the minimal publisher."
+
+[[capability]]
+id = "host-process-environment-read"
+crate = "hell-host"
+item = "process_environment::ProcessEnvironment::from_process"
+methods = ["std::env::vars_os"]
+reason = "Read one typed native process environment snapshot for host command execution."
+
+[[capability]]
+id = "host-integration-process-construction"
+crate = "hell-host"
+item = "process_tree::IntegrationFixtureProcess::command"
+methods = ["std::process::Command::new"]
+reason = "Construct only the fixed native argv processes used to verify process-tree deadline and cleanup receipts."
+
+[[compile-time-environment]]
+name = "CARGO_BIN_EXE_hell-ci"
+scope = "external-tests"
+
+[[compile-time-environment]]
+name = "CARGO_MANIFEST_DIR"
+scope = "build-and-test-metadata"

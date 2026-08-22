@@ -93,7 +93,7 @@ struct Normalizer {
     implementation_sha256: String,
 }
 
-fn main() {
+pub fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let root = manifest
         .parent()

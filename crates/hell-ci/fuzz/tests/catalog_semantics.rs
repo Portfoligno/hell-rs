@@ -1,18 +1,14 @@
-#[path = "../../../hell-builtins/build.rs"]
-#[allow(dead_code)]
-mod production_catalog;
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static CATALOG_ADMISSION_PANICS: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_bounded_exact_catalog_admission(kind: &str, canonical: &str) {
-    assert!(production_catalog::fuzz_validate_catalog(kind, canonical).is_ok());
+    assert!(hell_builtins::fuzz_validate_catalog(kind, canonical).is_ok());
     for index in (0..canonical.len()).step_by(canonical.len().div_ceil(256)) {
         let mut bytes = canonical.as_bytes().to_vec();
         bytes[index] = 0;
         let mutated = String::from_utf8(bytes).unwrap();
-        assert!(production_catalog::fuzz_validate_catalog(kind, &mutated).is_err());
+        assert!(hell_builtins::fuzz_validate_catalog(kind, &mutated).is_err());
     }
 }
 
@@ -48,7 +44,7 @@ fn malformed_catalog_admission_returns_errors_without_invoking_a_panic_hook() {
             ("normalizer", "schema_version = 1\nbroken line\n"),
             ("divergence", "schema_version = 2\n[[]]\n"),
         ]
-        .map(|(kind, source)| production_catalog::fuzz_validate_catalog(kind, source))
+        .map(|(kind, source)| hell_builtins::fuzz_validate_catalog(kind, source))
     });
     let _ = std::panic::take_hook();
     std::panic::set_hook(prior_hook);
@@ -59,17 +55,17 @@ fn malformed_catalog_admission_returns_errors_without_invoking_a_panic_hook() {
 
 #[test]
 fn every_semantic_fuzz_target_has_an_accepted_canonical_seed() {
-    production_catalog::fuzz_validate_catalog(
+    hell_builtins::fuzz_validate_catalog(
         "requirement",
         include_str!("../corpus/requirement_toml/seed.toml"),
     )
     .unwrap();
-    production_catalog::fuzz_validate_catalog(
+    hell_builtins::fuzz_validate_catalog(
         "normalizer",
         include_str!("../corpus/normalizer_toml/seed.toml"),
     )
     .unwrap();
-    production_catalog::fuzz_validate_catalog(
+    hell_builtins::fuzz_validate_catalog(
         "divergence",
         include_str!("../corpus/divergence_toml/seed.toml"),
     )
@@ -82,8 +78,6 @@ fn every_semantic_fuzz_target_has_an_accepted_canonical_seed() {
         include_str!("../fixtures/semantic-trace-seed.hell"),
         "main = IO.print $ Alternative.optional (Maybe.Just 3 :: Maybe Int)\n"
     );
-    hell_testkit::parse_semantic_trace(include_bytes!(
-        "../corpus/semantic_trace/seed.json"
-    ))
-    .unwrap();
+    hell_testkit::parse_semantic_trace(include_bytes!("../corpus/semantic_trace/seed.json"))
+        .unwrap();
 }

@@ -1,12 +1,24 @@
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 fn hell() -> Command {
     Command::new(env!("CARGO_BIN_EXE_hell"))
 }
 
+fn run(command: &mut Command) -> Output {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .expect("supervise hell command");
+    assert!(!output.timed_out, "hell command exceeded its deadline");
+    Output {
+        status: output.status,
+        stdout: output.stdout.complete.expect("stdout capture is complete"),
+        stderr: output.stderr.complete.expect("stderr capture is complete"),
+    }
+}
+
 #[test]
 fn version_is_the_exact_language_baseline() {
-    let output = hell().arg("--version").output().unwrap();
+    let output = run(hell().arg("--version"));
     assert!(output.status.success());
     assert_eq!(output.stdout, b"2026-05-29\n");
     assert!(output.stderr.is_empty());
@@ -14,14 +26,14 @@ fn version_is_the_exact_language_baseline() {
 
 #[test]
 fn unknown_host_option_is_a_usage_error() {
-    let output = hell().arg("--not-a-host-option").output().unwrap();
+    let output = run(hell().arg("--not-a-host-option"));
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid option"));
 }
 
 #[test]
 fn help_and_no_arguments_match_the_upstream_entry_points() {
-    let help = hell().arg("--help").output().unwrap();
+    let help = run(hell().arg("--help"));
     assert!(help.status.success());
     assert_eq!(
         String::from_utf8(help.stdout).unwrap(),
@@ -38,7 +50,7 @@ fn help_and_no_arguments_match_the_upstream_entry_points() {
     );
     assert!(help.stderr.is_empty());
 
-    let no_arguments = hell().output().unwrap();
+    let no_arguments = run(&mut hell());
     assert!(no_arguments.status.success());
     assert_eq!(no_arguments.stdout, b"2026-05-29\n");
     assert!(no_arguments.stderr.is_empty());
@@ -46,7 +58,7 @@ fn help_and_no_arguments_match_the_upstream_entry_points() {
 
 #[test]
 fn build_info_records_compiler_and_runtime_policy() {
-    let output = hell().arg("--build-info").output().unwrap();
+    let output = run(hell().arg("--build-info"));
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("compiler policy CompilerConfig"));

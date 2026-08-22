@@ -11,11 +11,14 @@ members = [
     "crates/hell-http-host",
     "crates/hell-host",
     "crates/hell-platform",
+    "crates/hell-release-publisher",
+    "crates/hell-release-verifier",
     "crates/hell-runtime",
     "crates/hell-source",
     "crates/hell-syntax",
     "crates/hell-testkit",
     "crates/hell-types",
+    "crates/hell-workflow-auditor",
 ]
 
 [workspace.package]

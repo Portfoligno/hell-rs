@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -19,12 +20,20 @@ impl Fixture {
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_hell"))
-            .env_clear()
-            .arg(&self.0)
-            .args(arguments)
-            .output()
-            .expect("run Hell fixture")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hell"));
+        command.env_clear().arg(&self.0).args(arguments);
+        supervised_output(&mut command)
+    }
+}
+
+fn supervised_output(command: &mut Command) -> Output {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .expect("supervise Hell fixture");
+    assert!(!output.timed_out, "Hell fixture exceeded its deadline");
+    Output {
+        status: output.status,
+        stdout: output.stdout.complete.expect("stdout capture is complete"),
+        stderr: output.stderr.complete.expect("stderr capture is complete"),
     }
 }
 

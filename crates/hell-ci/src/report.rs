@@ -385,132 +385,13 @@ impl Report {
             "false"
         });
         if let Some(phase) = &self.active_phase {
-            json.push_str(",\n  \"activePhase\": {\"name\": ");
-            push_json_string(&mut json, &phase.name);
-            json.push_str(", \"elapsedMillis\": ");
-            json.push_str(&phase.elapsed.as_millis().to_string());
-            json.push_str(", \"remainingMillis\": ");
-            json.push_str(&phase.remaining.as_millis().to_string());
-            for (name, remaining) in [
-                ("executionRemainingMillis", phase.execution_remaining),
-                ("cleanupRemainingMillis", phase.cleanup_remaining),
-                ("reportRemainingMillis", phase.report_remaining),
-            ] {
-                if let Some(remaining) = remaining {
-                    json.push_str(", \"");
-                    json.push_str(name);
-                    json.push_str("\": ");
-                    json.push_str(&remaining.as_millis().to_string());
-                }
-            }
-            if let Some(attribution) = &phase.attribution {
-                json.push_str(", \"attribution\": {\"sequence\": ");
-                json.push_str(&attribution.sequence.to_string());
-                json.push_str(", \"transitionElapsedMillis\": ");
-                match attribution.transition_elapsed {
-                    Some(elapsed) => json.push_str(&elapsed.as_millis().to_string()),
-                    None => json.push_str("null"),
-                }
-                for (name, value) in [
-                    ("target", attribution.target.as_deref()),
-                    ("case", attribution.case.as_deref()),
-                    ("caseState", attribution.case_state.as_deref()),
-                    ("subphase", attribution.subphase.as_deref()),
-                ] {
-                    json.push_str(", \"");
-                    json.push_str(name);
-                    json.push_str("\": ");
-                    match value {
-                        Some(value) => push_json_string(&mut json, value),
-                        None => json.push_str("null"),
-                    }
-                }
-                json.push('}');
-            }
-            json.push('}');
+            push_active_phase(&mut json, phase);
         }
         if !self.authoritative {
             json.push_str(",\n  \"authoritative\": false");
         }
         json.push_str(",\n  \"steps\": [");
-        for (index, step) in self.steps.iter().enumerate() {
-            if index != 0 {
-                json.push(',');
-            }
-            json.push_str("\n    {\"name\": ");
-            push_json_string(&mut json, &step.name);
-            json.push_str(", \"status\": ");
-            push_json_string(
-                &mut json,
-                match step.status {
-                    StepStatus::Passed => "passed",
-                    StepStatus::Failed => "failed",
-                },
-            );
-            json.push_str(", \"durationMillis\": ");
-            json.push_str(&step.duration.as_millis().to_string());
-            if let Some(program) = &step.program {
-                json.push_str(", \"command\": {\"program\": ");
-                push_json_string(&mut json, program);
-                if let Some(invocation_name) = &step.invocation_name {
-                    json.push_str(", \"invocationName\": ");
-                    push_json_string(&mut json, invocation_name);
-                }
-                if let Some(identity) = &step.canonical_executable_identity {
-                    json.push_str(", \"canonicalExecutableIdentity\": ");
-                    push_json_string(&mut json, identity);
-                }
-                json.push_str(", \"arguments\": [");
-                for (argument_index, argument) in step.arguments.iter().enumerate() {
-                    if argument_index != 0 {
-                        json.push_str(", ");
-                    }
-                    push_json_string(&mut json, argument);
-                }
-                json.push_str("]}");
-            }
-            if let Some(detail) = &step.detail {
-                json.push_str(", \"detail\": ");
-                push_json_string(&mut json, detail);
-            }
-            if let Some(error) = &step.command_error {
-                json.push_str(", \"error\": {\"stage\": ");
-                push_json_string(&mut json, error.stage);
-                json.push_str(", \"phase\": ");
-                push_json_string(&mut json, error.phase);
-                json.push_str(", \"kind\": ");
-                push_json_string(&mut json, &error.kind);
-                json.push_str(", \"rawOsError\": ");
-                match error.raw_os_error {
-                    Some(code) => json.push_str(&code.to_string()),
-                    None => json.push_str("null"),
-                }
-                json.push_str(", \"message\": ");
-                push_json_string(&mut json, &error.message);
-                if let Some(child) = &error.completed_child {
-                    json.push_str(", \"completedChild\": {\"success\": ");
-                    json.push_str(if child.success { "true" } else { "false" });
-                    json.push_str(", \"exitCode\": ");
-                    match child.exit_code {
-                        Some(code) => json.push_str(&code.to_string()),
-                        None => json.push_str("null"),
-                    }
-                    json.push_str(", \"timedOut\": ");
-                    json.push_str(if child.timed_out { "true" } else { "false" });
-                    json.push_str(", \"stdoutBytes\": ");
-                    json.push_str(&child.stdout_bytes.to_string());
-                    json.push_str(", \"stdoutSha256\": ");
-                    push_json_string(&mut json, &child.stdout_sha256);
-                    json.push_str(", \"stderrBytes\": ");
-                    json.push_str(&child.stderr_bytes.to_string());
-                    json.push_str(", \"stderrSha256\": ");
-                    push_json_string(&mut json, &child.stderr_sha256);
-                    json.push('}');
-                }
-                json.push('}');
-            }
-            json.push('}');
-        }
+        push_steps(&mut json, &self.steps);
         json.push_str("\n  ],\n  \"evidence\": [");
         for (index, (name, value)) in self.evidence.iter().enumerate() {
             if index != 0 {
@@ -536,6 +417,153 @@ impl Report {
         json.push_str("]\n}\n");
         json
     }
+}
+
+fn push_active_phase(json: &mut String, phase: &ActivePhaseReport) {
+    json.push_str(",\n  \"activePhase\": {\"name\": ");
+    push_json_string(json, &phase.name);
+    json.push_str(", \"elapsedMillis\": ");
+    json.push_str(&phase.elapsed.as_millis().to_string());
+    json.push_str(", \"remainingMillis\": ");
+    json.push_str(&phase.remaining.as_millis().to_string());
+    for (name, remaining) in [
+        ("executionRemainingMillis", phase.execution_remaining),
+        ("cleanupRemainingMillis", phase.cleanup_remaining),
+        ("reportRemainingMillis", phase.report_remaining),
+    ] {
+        if let Some(remaining) = remaining {
+            json.push_str(", \"");
+            json.push_str(name);
+            json.push_str("\": ");
+            json.push_str(&remaining.as_millis().to_string());
+        }
+    }
+    if let Some(attribution) = &phase.attribution {
+        push_active_phase_attribution(json, attribution);
+    }
+    json.push('}');
+}
+
+fn push_active_phase_attribution(json: &mut String, attribution: &ActivePhaseAttribution) {
+    json.push_str(", \"attribution\": {\"sequence\": ");
+    json.push_str(&attribution.sequence.to_string());
+    json.push_str(", \"transitionElapsedMillis\": ");
+    match attribution.transition_elapsed {
+        Some(elapsed) => json.push_str(&elapsed.as_millis().to_string()),
+        None => json.push_str("null"),
+    }
+    for (name, value) in [
+        ("target", attribution.target.as_deref()),
+        ("case", attribution.case.as_deref()),
+        ("caseState", attribution.case_state.as_deref()),
+        ("subphase", attribution.subphase.as_deref()),
+    ] {
+        json.push_str(", \"");
+        json.push_str(name);
+        json.push_str("\": ");
+        match value {
+            Some(value) => push_json_string(json, value),
+            None => json.push_str("null"),
+        }
+    }
+    json.push('}');
+}
+
+fn push_steps(json: &mut String, steps: &[StepReport]) {
+    for (index, step) in steps.iter().enumerate() {
+        if index != 0 {
+            json.push(',');
+        }
+        push_step(json, step);
+    }
+}
+
+fn push_step(json: &mut String, step: &StepReport) {
+    json.push_str("\n    {\"name\": ");
+    push_json_string(json, &step.name);
+    json.push_str(", \"status\": ");
+    push_json_string(
+        json,
+        match step.status {
+            StepStatus::Passed => "passed",
+            StepStatus::Failed => "failed",
+        },
+    );
+    json.push_str(", \"durationMillis\": ");
+    json.push_str(&step.duration.as_millis().to_string());
+    if let Some(program) = &step.program {
+        push_step_command(json, step, program);
+    }
+    if let Some(detail) = &step.detail {
+        json.push_str(", \"detail\": ");
+        push_json_string(json, detail);
+    }
+    if let Some(error) = &step.command_error {
+        push_command_error(json, error);
+    }
+    json.push('}');
+}
+
+fn push_step_command(json: &mut String, step: &StepReport, program: &str) {
+    json.push_str(", \"command\": {\"program\": ");
+    push_json_string(json, program);
+    if let Some(invocation_name) = &step.invocation_name {
+        json.push_str(", \"invocationName\": ");
+        push_json_string(json, invocation_name);
+    }
+    if let Some(identity) = &step.canonical_executable_identity {
+        json.push_str(", \"canonicalExecutableIdentity\": ");
+        push_json_string(json, identity);
+    }
+    json.push_str(", \"arguments\": [");
+    for (index, argument) in step.arguments.iter().enumerate() {
+        if index != 0 {
+            json.push_str(", ");
+        }
+        push_json_string(json, argument);
+    }
+    json.push_str("]}");
+}
+
+fn push_command_error(json: &mut String, error: &CommandErrorReport) {
+    json.push_str(", \"error\": {\"stage\": ");
+    push_json_string(json, error.stage);
+    json.push_str(", \"phase\": ");
+    push_json_string(json, error.phase);
+    json.push_str(", \"kind\": ");
+    push_json_string(json, &error.kind);
+    json.push_str(", \"rawOsError\": ");
+    match error.raw_os_error {
+        Some(code) => json.push_str(&code.to_string()),
+        None => json.push_str("null"),
+    }
+    json.push_str(", \"message\": ");
+    push_json_string(json, &error.message);
+    if let Some(child) = &error.completed_child {
+        push_completed_command(json, child);
+    }
+    json.push('}');
+}
+
+fn push_completed_command(json: &mut String, child: &CompletedCommandReport) {
+    json.push_str(", \"completedChild\": {\"success\": ");
+    json.push_str(if child.success { "true" } else { "false" });
+    json.push_str(", \"exitCode\": ");
+    match child.exit_code {
+        Some(code) => json.push_str(&code.to_string()),
+        None => json.push_str("null"),
+    }
+    json.push_str(", \"timedOut\": ");
+    json.push_str(if child.timed_out { "true" } else { "false" });
+    json.push_str(", \"stdoutBytes\": ");
+    json.push_str(&child.stdout_bytes.to_string());
+    json.push_str(", \"stdoutSha256\": ");
+    push_json_string(json, &child.stdout_sha256);
+    json.push_str(", \"stderrBytes\": ");
+    json.push_str(&child.stderr_bytes.to_string());
+    json.push_str(", \"stderrSha256\": ");
+    push_json_string(json, &child.stderr_sha256);
+    json.push('}');
 }
 
 fn bounded_command_error_message(message: &str) -> String {

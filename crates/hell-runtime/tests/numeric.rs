@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hell_compiler::{CompilerSession, compile_source};
 use hell_runtime::{RuntimeContext, run_main};
@@ -172,7 +173,13 @@ fn run_equality_partition_test(mutant: Option<&str>) -> ExitStatus {
             .args(["--skip", "__hell_mutant", "--skip"])
             .arg(mutant);
     }
-    command.status().expect("nested numeric test runs")
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(30))
+        .expect("supervise nested numeric test");
+    assert!(
+        !output.timed_out,
+        "nested numeric test exceeded its deadline"
+    );
+    output.status
 }
 
 #[test]

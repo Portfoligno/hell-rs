@@ -8,9 +8,21 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::time::Duration;
 
 #[cfg(unix)]
 static CARGO_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+fn bounded_output(command: &mut Command, label: &str) -> hell_testkit::SupervisedOutput {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+    assert!(!output.timed_out, "{label}: command timed out");
+    assert!(!output.stdout.truncated, "{label}: stdout was truncated");
+    assert!(!output.stderr.truncated, "{label}: stderr was truncated");
+    output
+}
 
 #[cfg(unix)]
 fn compiled_helper() -> std::path::PathBuf {
@@ -36,21 +48,17 @@ fn require_probe_log_redirects_rejected(helper: &Path) {
     let log = hell_testkit::cargo_probe_log_path(helper);
     fs::write(&outside, b"outside\n").expect("Cargo probe outside fixture");
     fs::hard_link(&outside, &log).expect("Cargo probe hard-link fixture");
-    let status = Command::new(helper)
-        .arg("fetch")
-        .env("CARGO", helper)
-        .status()
-        .expect("hard-linked Cargo probe log rejection");
-    assert_eq!(status.code(), Some(1));
+    let mut command = Command::new(helper);
+    command.arg("fetch").env("CARGO", helper);
+    let output = bounded_output(&mut command, "hard-linked Cargo probe log rejection");
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(fs::read(&outside).unwrap(), b"outside\n");
     fs::remove_file(&log).unwrap();
     symlink(&outside, &log).expect("Cargo probe symlink fixture");
-    let status = Command::new(helper)
-        .arg("fetch")
-        .env("CARGO", helper)
-        .status()
-        .expect("redirected Cargo probe log rejection");
-    assert_eq!(status.code(), Some(1));
+    let mut command = Command::new(helper);
+    command.arg("fetch").env("CARGO", helper);
+    let output = bounded_output(&mut command, "redirected Cargo probe log rejection");
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(fs::read(&outside).unwrap(), b"outside\n");
     fs::remove_file(log).unwrap();
     fs::remove_file(outside).unwrap();
@@ -65,16 +73,19 @@ fn compiled_cargo_probe_handles_versions_and_records_exact_bounded_argv() {
     let helper = compiled_helper();
     remove_probe_log(&helper);
     for version_argument in ["--version", "-V", "-vV"] {
-        let output = Command::new(&helper)
-            .arg(version_argument)
-            .env("CARGO", &helper)
-            .output()
-            .expect("compiled Cargo probe version query");
+        let mut command = Command::new(&helper);
+        command.arg(version_argument).env("CARGO", &helper);
+        let output = bounded_output(&mut command, "compiled Cargo probe version query");
         assert!(output.status.success());
         assert!(
-            String::from_utf8(output.stdout)
-                .expect("Cargo probe version is UTF-8")
-                .starts_with("cargo 1.97.0 ")
+            String::from_utf8(
+                output
+                    .stdout
+                    .complete
+                    .expect("complete Cargo version output")
+            )
+            .expect("Cargo probe version is UTF-8")
+            .starts_with("cargo 1.97.0 ")
         );
     }
     assert!(!hell_testkit::cargo_probe_log_path(&helper).exists());
@@ -84,12 +95,10 @@ fn compiled_cargo_probe_handles_versions_and_records_exact_bounded_argv() {
         OsString::from("--frozen"),
         OsString::from_vec(b"non-utf8-\xff".to_vec()),
     ];
-    let status = Command::new(&helper)
-        .args(&exact_arguments)
-        .env("CARGO", &helper)
-        .status()
-        .expect("compiled Cargo probe invocation");
-    assert_eq!(status.code(), Some(42));
+    let mut command = Command::new(&helper);
+    command.args(&exact_arguments).env("CARGO", &helper);
+    let output = bounded_output(&mut command, "compiled Cargo probe invocation");
+    assert_eq!(output.status.code(), Some(42));
     assert_eq!(
         hell_testkit::read_cargo_probe_invocations(&helper).expect("bounded Cargo probe log"),
         [exact_arguments]
@@ -144,17 +153,16 @@ mod linux {
         let canonical = fs::canonicalize(&invocation).expect("canonical Cargo identity");
         let initial = fs::metadata(&canonical).expect("Cargo identity metadata");
         let initial_sha = hell_testkit::sha256_file(&canonical).expect("Cargo identity digest");
-        let metadata = Command::new(&invocation)
-            .args([
-                "metadata",
-                "--locked",
-                "--all-features",
-                "--format-version",
-                "1",
-            ])
-            .current_dir(root)
-            .output()
-            .expect("trusted Cargo metadata");
+        let mut command = Command::new(&invocation);
+        command.args([
+            "metadata",
+            "--locked",
+            "--all-features",
+            "--format-version",
+            "1",
+        ]);
+        command.current_dir(root);
+        let metadata = super::bounded_output(&mut command, "trusted Cargo metadata");
         assert!(metadata.status.success());
         assert_eq!(
             fs::canonicalize(&invocation).expect("revalidated Cargo invocation"),
@@ -167,19 +175,27 @@ mod linux {
             initial_sha,
             hell_testkit::sha256_file(&canonical).expect("revalidated Cargo digest")
         );
-        fs::write(path, metadata.stdout).expect("bound Cargo metadata fixture");
+        fs::write(
+            path,
+            metadata.stdout.complete.expect("complete Cargo metadata"),
+        )
+        .expect("bound Cargo metadata fixture");
     }
 
     fn require_pinned_cargo_deny_version(cargo_deny: &Path) {
-        let version = Command::new(cargo_deny)
-            .arg("--version")
-            .output()
-            .expect("pinned cargo-deny version");
+        let mut command = Command::new(cargo_deny);
+        command.arg("--version");
+        let version = super::bounded_output(&mut command, "pinned cargo-deny version");
         assert!(version.status.success());
         assert_eq!(
-            String::from_utf8(version.stdout)
-                .expect("cargo-deny version is UTF-8")
-                .trim(),
+            String::from_utf8(
+                version
+                    .stdout
+                    .complete
+                    .expect("complete cargo-deny version")
+            )
+            .expect("cargo-deny version is UTF-8")
+            .trim(),
             "cargo-deny 0.20.2"
         );
     }
@@ -215,18 +231,23 @@ mod linux {
         let initial_sha = hell_testkit::sha256_file(&cargo_deny).expect("pinned cargo-deny digest");
         require_pinned_cargo_deny_version(&cargo_deny);
 
-        let output = Command::new(&cargo_deny)
-            .args(["--metadata-path"])
-            .arg(&metadata_path)
-            .args(["--frozen", "--all-features", "check", "bans"])
-            .current_dir(&root)
-            .env("CARGO", &helper)
-            .output()
-            .expect("pinned cargo-deny check");
+        let mut command = Command::new(&cargo_deny);
+        command.args(["--metadata-path"]);
+        command.arg(&metadata_path);
+        command.args(["--frozen", "--all-features", "check", "bans"]);
+        command.current_dir(&root);
+        command.env("CARGO", &helper);
+        let output = super::bounded_output(&mut command, "pinned cargo-deny check");
         assert!(
             output.status.success(),
             "bound metadata must survive nonfatal fetches: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(
+                output
+                    .stderr
+                    .complete
+                    .as_deref()
+                    .expect("complete cargo-deny stderr")
+            )
         );
         let final_identity =
             fs::symlink_metadata(&cargo_deny).expect("revalidated cargo-deny path identity");

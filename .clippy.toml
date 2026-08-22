@@ -1,0 +1,7 @@
+disallowed-methods = [
+  { path = "std::env::vars", reason = "Enumerating the ambient process environment is outside the sealed runtime contract." },
+  { path = "std::env::set_var", reason = "Do not mutate the parent process environment; construct a typed child environment." },
+  { path = "std::env::remove_var", reason = "Do not mutate the parent process environment; construct a typed child environment." },
+  { path = "std::process::Command::output", reason = "Run subprocesses only through the bounded native-argv command supervisor." },
+  { path = "std::process::Command::status", reason = "Run subprocesses only through the bounded native-argv command supervisor." },
+]

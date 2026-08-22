@@ -144,7 +144,7 @@ pub(crate) fn string(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-pub(crate) fn boolean(value: &str) -> Result<bool, String> {
+pub fn boolean(value: &str) -> Result<bool, String> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
@@ -152,7 +152,7 @@ pub(crate) fn boolean(value: &str) -> Result<bool, String> {
     }
 }
 
-pub(crate) fn string_array(value: &str) -> Result<Vec<String>, String> {
+pub fn string_array(value: &str) -> Result<Vec<String>, String> {
     let inner = value
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
@@ -169,7 +169,7 @@ pub(crate) fn string_array(value: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
-pub(crate) fn boolean_array(value: &str) -> Result<Vec<bool>, String> {
+pub fn boolean_array(value: &str) -> Result<Vec<bool>, String> {
     let inner = value
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))

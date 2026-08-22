@@ -1,0 +1,89 @@
+[package]
+name = "hell-release-verifier-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.assurance]
+cargo-fuzz-version = "0.13.2"
+cargo-fuzz-toolchain = "nightly-2026-07-31"
+
+[dependencies]
+hell-release-verifier = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "independent_strict_json"
+path = "fuzz_targets/independent_strict_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_release_plan"
+path = "fuzz_targets/independent_release_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_conformance_plan"
+path = "fuzz_targets/independent_conformance_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_evidence"
+path = "fuzz_targets/independent_evidence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_ledger"
+path = "fuzz_targets/independent_ledger.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_exemption"
+path = "fuzz_targets/independent_exemption.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_gzip"
+path = "fuzz_targets/independent_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_gnu_tar"
+path = "fuzz_targets/independent_gnu_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_subjects"
+path = "fuzz_targets/independent_subjects.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "independent_publication_envelope"
+path = "fuzz_targets/independent_publication_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

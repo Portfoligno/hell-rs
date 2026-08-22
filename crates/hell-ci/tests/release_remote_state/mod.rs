@@ -9,36 +9,62 @@ use super::*;
 use crate::json::parse_json;
 use crate::release::schema::Resolution;
 
+const CANDIDATE_SHA: &str = "434c9104de69600ce4a85601dc2ac48a45aa8f8f";
+const WORKFLOW_SHA: &str = "550e4c3e094a75a4c362bd192ae5805837ac9741";
+const MOVED_CANDIDATE_SHA: &str = "33a9f0186b0cde1999e25afd6eb76e2603f95faa";
+const TAG_SHA: &str = "5e2e8f9e6f9cab30a0b2da50fad349896b4a5463";
+const TAG_COMMIT_SHA: &str = "a35bfdfc1d08c9f394762743fc43af8402022b5c";
+
+fn content_digest(label: &str) -> String {
+    hell_testkit::sha256_bytes(label.as_bytes()).hex()
+}
+
+fn content_id(label: &str) -> u64 {
+    let digest = content_digest(label);
+    let digits = std::mem::size_of::<u64>() * 2;
+    u64::from_str_radix(
+        digest
+            .get(..digits)
+            .expect("SHA-256 hex contains a u64 prefix"),
+        16,
+    )
+    .expect("SHA-256 prefix is hexadecimal")
+}
+
 fn plan() -> ReleasePlan {
     ReleasePlan {
         resolution: Resolution {
             repository: "o/r".into(),
-            repository_id: 1,
+            repository_id: content_id("remote-state repository identity"),
             default_branch: "main".into(),
             candidate_branch: "release/1.0.0".into(),
-            candidate_sha: "a".repeat(40),
+            candidate_sha: CANDIDATE_SHA.into(),
             actor: "actor".into(),
-            actor_id: 2,
-            run_id: 3,
+            actor_id: content_id("remote-state actor identity"),
+            run_id: content_id("remote-state run identity"),
             run_attempt: 1,
             workflow_ref: "o/r/.github/workflows/release.yml@refs/heads/main".into(),
-            workflow_sha: "b".repeat(40),
+            workflow_sha: WORKFLOW_SHA.into(),
         },
         version: "1.0.0".into(),
         tag: "v1.0.0".into(),
         prerelease: false,
-        source_date_epoch: 1,
+        source_date_epoch: 1_786_579_200,
         release_evaluation_instant: "2026-08-13T00:00:00Z".into(),
-        source_inventory_sha256: "1".repeat(64),
-        build_inputs_sha256: "2".repeat(64),
-        policy_sha256: "3".repeat(64),
-        trusted_conformance_inputs_sha256: "4".repeat(64),
-        conformance_plan_sha256: "5".repeat(64),
+        source_inventory_sha256: content_digest("remote-state source inventory"),
+        build_inputs_sha256: content_digest("remote-state build inputs"),
+        policy_sha256: content_digest("remote-state release policy"),
+        trusted_conformance_inputs_sha256: content_digest("remote-state conformance inputs"),
+        conformance_plan_sha256: content_digest("remote-state conformance plan"),
         conformance_standard: crate::conformance::RELEASE_STANDARD.into(),
-        changelog_sha256: "6".repeat(64),
+        changelog_sha256: content_digest("remote-state changelog"),
+        governance_declaration_sha256: content_digest("remote-state governance declaration"),
+        governance_profile_sha256: content_digest("remote-state governance profile"),
+        residual_assumption_set_sha256: content_digest("remote-state residual assumptions"),
+        external_inputs_sha256: content_digest("remote-state external inputs"),
         commit_author: "Author <author@example.com>".into(),
         commit_committer: "Committer <committer@example.com>".into(),
-        plan_sha256: "7".repeat(64),
+        plan_sha256: content_digest("remote-state release plan"),
     }
 }
 
@@ -106,24 +132,24 @@ fn remote_state_reports_stable_moved_tagged_and_failed_states() {
         "forbidden",
     ] {
         let candidate = if scenario == "moved" {
-            "c".repeat(40)
+            MOVED_CANDIDATE_SHA
         } else {
-            "a".repeat(40)
+            CANDIDATE_SHA
         };
         let branch = match scenario {
             "malformed" => response("200 OK", "{}"),
             "forbidden" => response("403 Forbidden", "{}"),
-            _ => response("200 OK", &branch_body(&candidate)),
+            _ => response("200 OK", &branch_body(candidate)),
         };
         let mut responses = vec![branch];
         match scenario {
-            "tagged" => responses.push(response("200 OK", &tag_body(&"d".repeat(40), "commit"))),
+            "tagged" => responses.push(response("200 OK", &tag_body(TAG_COMMIT_SHA, "commit"))),
             "annotated" => {
-                let tag_sha = "e".repeat(40);
-                responses.push(response("200 OK", &tag_body(&tag_sha, "tag")));
+                let tag_sha = TAG_SHA;
+                responses.push(response("200 OK", &tag_body(tag_sha, "tag")));
                 responses.push(response(
                     "200 OK",
-                    &annotated_tag_body(&tag_sha, &"d".repeat(40)),
+                    &annotated_tag_body(tag_sha, TAG_COMMIT_SHA),
                 ));
             }
             "malformed" | "forbidden" => {}
@@ -157,7 +183,7 @@ fn remote_state_report_is_create_new_and_does_not_contain_authorization() {
     let report = report_path("existing");
     fs::write(&report, b"sentinel\n").unwrap();
     let (client, server) = client_with_responses(vec![
-        response("200 OK", &branch_body(&"a".repeat(40))),
+        response("200 OK", &branch_body(CANDIDATE_SHA)),
         response("404 Not Found", "{}"),
     ]);
     let result = check_with_client(&plan(), &report, &client);

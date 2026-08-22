@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
     root: PathBuf,
@@ -33,15 +33,43 @@ fn hell_ci() -> Command {
     Command::new(env!("CARGO_BIN_EXE_hell-ci"))
 }
 
-fn stage(input: &Path, runner_temp: &Path) -> Output {
-    hell_ci()
+fn run(command: &mut Command, context: &str, timeout: Duration) -> hell_testkit::SupervisedOutput {
+    let output = hell_testkit::run_supervised_command(command, &[], timeout)
+        .unwrap_or_else(|error| panic!("{context} must execute: {error}"));
+    assert!(!output.timed_out, "{context} timed out");
+    assert!(
+        output
+            .phase_timings
+            .iter()
+            .any(|phase| phase.name == "quiescence-complete")
+    );
+    assert_eq!(
+        output.phase_timings.last().map(|phase| phase.name),
+        Some("stdin-joined")
+    );
+    output
+}
+
+fn captured(capture: &hell_testkit::BoundedCapture) -> &[u8] {
+    capture
+        .complete
+        .as_deref()
+        .expect("supervised output must fit the bounded complete capture")
+}
+
+fn stderr(output: &hell_testkit::SupervisedOutput) -> String {
+    String::from_utf8_lossy(captured(&output.stderr)).into_owned()
+}
+
+fn stage(input: &Path, runner_temp: &Path) -> hell_testkit::SupervisedOutput {
+    let mut command = hell_ci();
+    command
         .arg("release")
         .arg("stage-attestations")
         .arg("--input")
         .arg(input)
-        .env("RUNNER_TEMP", runner_temp)
-        .output()
-        .expect("stage-attestations must execute")
+        .env("RUNNER_TEMP", runner_temp);
+    run(&mut command, "stage-attestations", Duration::from_secs(30))
 }
 
 #[cfg(unix)]
@@ -65,12 +93,8 @@ fn attestation_registry_stages_two_distinct_exact_json_files() {
     .unwrap();
 
     let output = stage(&input, &runner_temp);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8(captured(&output.stdout).to_vec()).unwrap();
     assert_eq!(stdout, "staged exact GitHub attestation bundles\n");
     assert!(!stdout.contains(provenance.to_string_lossy().as_ref()));
     assert!(!stdout.contains(gate.to_string_lossy().as_ref()));
@@ -273,12 +297,19 @@ fn attestation_staging_rejects_platforms_without_unix_file_identity() {
     let output = stage(&input, &runner_temp);
     assert!(!output.status.success());
     assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
+        String::from_utf8(captured(&output.stderr).to_vec()).unwrap(),
         "attestation staging requires Unix file identity\n"
     );
 }
 
 fn release_plan(candidate_sha: &str) -> Vec<u8> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let input_digest = |relative_path: &str| {
+        let path = repository_root.join(relative_path);
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        hell_testkit::sha256_bytes(&bytes).hex()
+    };
     let without_digest = format!(
         concat!(
             "{{\"actor\":\"actor\",\"actorId\":2,",
@@ -291,11 +322,15 @@ fn release_plan(candidate_sha: &str) -> Vec<u8> {
             "\"conformanceStandard\":\"upstream-release-v1\",",
             "\"defaultBranch\":\"main\",",
             "\"expectedPlatforms\":[\"linux-x86_64\",\"macos-aarch64\",\"windows-x86_64\"],",
+            "\"externalInputsSha256\":\"{}\",",
+            "\"governanceDeclarationSha256\":\"{}\",",
+            "\"governanceProfileSha256\":\"{}\",",
             "\"policySha256\":\"{}\",\"prerelease\":false,",
             "\"releaseBinary\":\"hell\",",
             "\"releaseEvaluationInstant\":\"2026-08-13T00:00:00Z\",",
             "\"releasePackage\":\"hell-cli\",\"repository\":\"o/r\",",
-            "\"repositoryId\":1,\"runAttempt\":1,\"runId\":3,",
+            "\"repositoryId\":1,\"residualAssumptionSetSha256\":\"{}\",",
+            "\"runAttempt\":1,\"runId\":3,",
             "\"schemaVersion\":2,\"sourceDateEpoch\":1,",
             "\"sourceInventorySha256\":\"{}\",\"tag\":\"v1.0.0\",",
             "\"trustedConformanceInputsSha256\":\"{}\",",
@@ -307,7 +342,11 @@ fn release_plan(candidate_sha: &str) -> Vec<u8> {
         candidate_sha,
         "2".repeat(64),
         "3".repeat(64),
+        input_digest("ci/external-inputs.toml"),
+        input_digest("ci/governance-policy.toml"),
+        input_digest("ci/github-api.toml"),
         "4".repeat(64),
+        input_digest("spec/assurance-map.toml"),
         "5".repeat(64),
         "6".repeat(64),
         "b".repeat(40),
@@ -327,33 +366,54 @@ fn remote_state_requires_the_standard_token_name() {
     let fixture = Fixture::new("remote-token");
     let plan = fixture.path("release-plan.json");
     let report = fixture.path("remote-state.json");
+    let event = fixture.path("event.json");
     fs::write(&plan, release_plan(&"a".repeat(40))).unwrap();
-    let output = hell_ci()
+    fs::write(
+        &event,
+        b"{\"repository\":{\"full_name\":\"o/r\",\"id\":1}}\n",
+    )
+    .unwrap();
+    let mut command = hell_ci();
+    command
         .args(["release", "check-remote-state", "--plan"])
         .arg(&plan)
         .arg("--report")
         .arg(&report)
         .env("GITHUB_API_URL", "http://127.0.0.1:1")
-        .env_remove("GITHUB_TOKEN")
-        .output()
-        .expect("check-remote-state must execute");
+        .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+        .env("GITHUB_EVENT_PATH", event)
+        .env("GITHUB_REF_NAME", "release/1.0.0")
+        .env("GITHUB_REPOSITORY", "o/r")
+        .env("GITHUB_REPOSITORY_ID", "1")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .env("GITHUB_RUN_ID", "3")
+        .env(
+            "GITHUB_WORKFLOW_REF",
+            "o/r/.github/workflows/release.yml@refs/heads/main",
+        )
+        .env("GITHUB_WORKFLOW_SHA", "b".repeat(40))
+        .env("GITHUB_WORKSPACE", &fixture.root)
+        .env_remove("GITHUB_TOKEN");
+    let output = run(&mut command, "check-remote-state", Duration::from_secs(30));
     assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("GITHUB_TOKEN is required"));
+    let error = stderr(&output);
+    assert!(
+        error.contains("required standard GitHub variable GITHUB_TOKEN is missing or not UTF-8"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn stack_work_cleanup_precedes_exact_oracle_snapshot_validation() {
-    let output = hell_ci()
-        .arg("__verify-posix-source-stack-cleanup-order")
-        .output()
-        .expect("POSIX archive cleanup lifecycle verifier must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut command = hell_ci();
+    command.arg("__verify-posix-source-stack-cleanup-order");
+    let output = run(
+        &mut command,
+        "POSIX archive cleanup lifecycle verifier",
+        Duration::from_mins(10),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(target_os = "macos")]
@@ -361,12 +421,16 @@ fn stack_work_cleanup_precedes_exact_oracle_snapshot_validation() {
 fn staged_native_toolchain_accepts_real_ghc_without_inner_launcher_aliases() {
     let fixture = Fixture::new("staged-native-toolchain");
     let adapter = fixture.path("adapter");
-    let status = hell_ci()
+    let mut command = hell_ci();
+    command
         .arg("__verify-staged-native-toolchain")
-        .arg(&adapter)
-        .status()
-        .expect("staged native toolchain verification must execute");
-    assert!(status.success());
+        .arg(&adapter);
+    let output = run(
+        &mut command,
+        "staged native toolchain verification",
+        Duration::from_mins(10),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(target_os = "macos")]
@@ -374,69 +438,65 @@ fn staged_native_toolchain_accepts_real_ghc_without_inner_launcher_aliases() {
 fn sealed_native_archive_authority_rebinds_before_use_and_rejects_later_mutation() {
     let fixture = Fixture::new("native-archive-seal-rebinding");
     let adapter = fixture.path("adapter");
-    let output = hell_ci()
+    let mut command = hell_ci();
+    command
         .arg("__verify-native-archive-seal-rebinding")
-        .arg(&adapter)
-        .output()
-        .expect("native archive seal verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        .arg(&adapter);
+    let output = run(
+        &mut command,
+        "native archive seal verification",
+        Duration::from_mins(10),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn archive_adapter_transition_rejects_cleared_setgid_and_substitution() {
-    let output = hell_ci()
-        .arg("__verify-posix-archive-adapter-transition")
-        .output()
-        .expect("POSIX archive adapter transition verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut command = hell_ci();
+    command.arg("__verify-posix-archive-adapter-transition");
+    let output = run(
+        &mut command,
+        "POSIX archive adapter transition verification",
+        Duration::from_mins(10),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn native_archive_policy_preserves_commands_overlay_path_and_inventory() {
-    let output = hell_ci()
-        .arg("__verify-native-archive-policy")
-        .output()
-        .expect("native archive policy verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut command = hell_ci();
+    command.arg("__verify-native-archive-policy");
+    let output = run(
+        &mut command,
+        "native archive policy verification",
+        Duration::from_mins(10),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]
 fn nightly_workspace_partition_preserves_the_existing_total_deadline() {
-    let output = hell_ci()
-        .arg("__verify-nightly-workspace-partition")
-        .output()
-        .expect("nightly workspace partition verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut command = hell_ci();
+    command.arg("__verify-nightly-workspace-partition");
+    let output = run(
+        &mut command,
+        "nightly workspace partition verification",
+        Duration::from_secs(30),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_hell_testkit_diagnostics_preserve_exact_targets_and_aggregate_budget() {
-    let output = hell_ci()
-        .arg("__verify-windows-hell-testkit-diagnostics")
-        .output()
-        .expect("Windows hell-testkit diagnostic verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut command = hell_ci();
+    command.arg("__verify-windows-hell-testkit-diagnostics");
+    let output = run(
+        &mut command,
+        "Windows hell-testkit diagnostic verification",
+        Duration::from_mins(10),
     );
+    assert!(output.status.success(), "{}", stderr(&output));
 }

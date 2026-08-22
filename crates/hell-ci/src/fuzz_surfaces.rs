@@ -4,20 +4,43 @@ use std::collections::BTreeSet;
 
 const MAX_RETAINED_JSON_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) fn strict_json_record(bytes: &[u8]) -> Result<&str, String> {
+pub(crate) struct StrictJsonError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+pub(crate) fn strict_json_record_classified(bytes: &[u8]) -> Result<&str, StrictJsonError> {
     if bytes.len() > MAX_RETAINED_JSON_BYTES {
-        return Err("retained JSON record exceeds the bounded parser size".to_owned());
+        return Err(StrictJsonError {
+            code: "release.limit.json-bytes",
+            message: "retained JSON record exceeds the bounded parser size".to_owned(),
+        });
     }
-    let document = std::str::from_utf8(bytes)
-        .map_err(|_| "retained JSON record is not canonical UTF-8".to_owned())?;
+    let document = std::str::from_utf8(bytes).map_err(|_| StrictJsonError {
+        code: "release.json.invalid",
+        message: "retained JSON record is not canonical UTF-8".to_owned(),
+    })?;
     if document.as_bytes().contains(&0) {
-        return Err("retained JSON record contains NUL".to_owned());
+        return Err(StrictJsonError {
+            code: "release.json.invalid",
+            message: "retained JSON record contains NUL".to_owned(),
+        });
     }
-    let mut parser = StructuralJson { bytes, index: 0 };
-    parser.value(0)?;
+    let mut parser = StructuralJson {
+        bytes,
+        index: 0,
+        diagnostic_code: None,
+    };
+    parser.value(0).map_err(|message| StrictJsonError {
+        code: parser.diagnostic_code.unwrap_or("release.json.invalid"),
+        message,
+    })?;
     parser.whitespace();
     if parser.index != bytes.len() {
-        return Err("retained JSON record has trailing bytes".to_owned());
+        return Err(StrictJsonError {
+            code: "release.json.trailing-bytes",
+            message: "retained JSON record has trailing bytes".to_owned(),
+        });
     }
     Ok(document)
 }
@@ -25,6 +48,7 @@ pub(crate) fn strict_json_record(bytes: &[u8]) -> Result<&str, String> {
 struct StructuralJson<'a> {
     bytes: &'a [u8],
     index: usize,
+    diagnostic_code: Option<&'static str>,
 }
 
 impl StructuralJson<'_> {
@@ -56,6 +80,7 @@ impl StructuralJson<'_> {
             self.whitespace();
             let key = self.string()?;
             if !keys.insert(key) {
+                self.diagnostic_code = Some("release.json.duplicate-key");
                 return Err("retained JSON object repeats a key".to_owned());
             }
             self.whitespace();
@@ -126,6 +151,7 @@ impl StructuralJson<'_> {
         let start = self.index;
         if self.consume(b'0') {
             if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.diagnostic_code = Some("release.json.noncanonical-integer");
                 return Err("retained JSON integer has a leading zero".to_owned());
             }
         } else {

@@ -1,0 +1,120 @@
+schema-version = 1
+catalog-id = "release-assurance-v1"
+execution-strategy = "baseline-pass-mutant-fail"
+
+[[mutant]]
+id = "digest-binding-inverted"
+claim = "REL-DIGEST-BINDING"
+module = "release-agreement"
+source = "crates/hell-ci/src/release/decision.rs"
+symbol = "agree"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "matching_decisions_agree", "--", "--exact"]
+vectors = ["known-good"]
+
+[[mutant]]
+id = "drop-final-cell"
+claim = "REL-ADMISSION-LEDGER-COMPLETE"
+module = "ledger"
+source = "crates/hell-ci/src/conformance/ledger.rs"
+symbol = "ConformancePlan::validate"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "final_cell_omission_is_rejected", "--", "--exact"]
+vectors = ["missing-cell"]
+
+[[mutant]]
+id = "accept-duplicate-cell"
+claim = "REL-ADMISSION-LEDGER-COMPLETE"
+module = "ledger"
+source = "crates/hell-ci/src/conformance/ledger.rs"
+symbol = "ConformancePlan::validate"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "duplicate_cell_is_rejected", "--", "--exact"]
+vectors = ["duplicate-cell"]
+
+[[mutant]]
+id = "ignore-evidence-platform"
+claim = "REL-EVIDENCE-PLATFORM-BOUND"
+module = "ledger"
+source = "crates/hell-ci/src/conformance/evidence.rs"
+symbol = "validate_record_binding"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "relabeled_native_evidence_is_rejected", "--", "--exact"]
+vectors = ["linux-evidence-relabeled-as-windows"]
+
+[[mutant]]
+id = "compare-exemption-id-only"
+claim = "REL-EXEMPTION-EXACT"
+module = "exemption"
+source = "crates/hell-ci/src/conformance/ledger.rs"
+symbol = "validate_exemption"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "exemption_selector_is_exact", "--", "--exact"]
+vectors = ["exemption-with-mismatched-selector"]
+
+[[mutant]]
+id = "use-wall-clock-for-exemption"
+claim = "REL-EXEMPTION-PLAN-TIME"
+module = "exemption"
+source = "crates/hell-ci/src/conformance/ledger.rs"
+symbol = "validate_exemption"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "exemption_uses_plan_time", "--", "--exact"]
+vectors = ["exemption-uses-wall-clock-time"]
+
+[[mutant]]
+id = "allow-extra-archive-member"
+claim = "REL-ARCHIVE-EXACT"
+module = "archive"
+source = "crates/hell-ci/src/release/archive.rs"
+symbol = "validate_evidence_members"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "extra_evidence_archive_member_is_rejected", "--", "--exact"]
+vectors = ["extra-archive-member"]
+
+[[mutant]]
+id = "ignore-subject"
+claim = "REL-SUBJECTS-EXACT"
+module = "subjects"
+source = "crates/hell-ci/src/release/verify.rs"
+symbol = "validate_subject_inventory"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "assurance_primary_mutations", "omitted_subject_is_rejected", "--", "--exact"]
+vectors = ["subject-omitted-from-manifest"]
+
+[[mutant]]
+id = "grant-contents-write-to-attest"
+claim = "REL-PRIVILEGE-SPLIT"
+module = "workflow-permissions"
+source = "crates/hell-workflow-auditor/src/lib.rs"
+symbol = "validate_privilege_split"
+test-command = ["cargo", "test", "--locked", "-p", "hell-workflow-auditor", "--features", "mutation-testing", "--test", "semantic_audit", "attest_contents_write_permission_is_rejected", "--", "--exact"]
+vectors = ["workflow-attest-contents-write"]
+
+[[mutant]]
+id = "grant-id-token-write-to-publish"
+claim = "REL-PRIVILEGE-SPLIT"
+module = "workflow-permissions"
+source = "crates/hell-workflow-auditor/src/lib.rs"
+symbol = "validate_privilege_split"
+test-command = ["cargo", "test", "--locked", "-p", "hell-workflow-auditor", "--features", "mutation-testing", "--test", "semantic_audit", "publish_id_token_write_permission_is_rejected", "--", "--exact"]
+vectors = ["workflow-publish-id-token-write"]
+
+[[mutant]]
+id = "skip-shallow-envelope-verification"
+claim = "REL-ENVELOPE-BOUND"
+module = "publication-envelope"
+source = "crates/hell-release-publisher/src/lib.rs"
+symbol = "validate_shallow_publication_envelope"
+test-command = ["cargo", "test", "--locked", "-p", "hell-release-publisher", "--features", "mutation-testing", "--test", "provider_state_machine", "envelope_must_bind_the_exact_pre_publish_predecessor", "--", "--exact"]
+vectors = ["publisher-envelope-predecessor-mismatch"]
+
+[[mutant]]
+id = "unavailable-governance-is-matched"
+claim = "REL-GOVERNANCE-TRISTATE"
+module = "governance"
+source = "crates/hell-ci/src/release/governance.rs"
+symbol = "unavailable"
+test-command = ["cargo", "test", "--locked", "-p", "hell-ci", "--features", "mutation-testing", "--test", "governance_snapshots", "governance_snapshots_bind_runtime_plan_baseline_and_live_controls", "--", "--exact"]
+vectors = ["governance-ruleset-unavailable-residual"]
+
+[[mutant]]
+id = "accept-unknown-publisher-draft"
+claim = "REL-PUBLISH-STATE-CLOSED"
+module = "publisher-state"
+source = "crates/hell-release-publisher/src/lib.rs"
+symbol = "verify_assets"
+test-command = ["cargo", "test", "--locked", "-p", "hell-release-publisher", "--features", "mutation-testing", "--test", "provider_state_machine", "unexpected_draft_asset_is_rejected_without_overwrite", "--", "--exact"]
+vectors = ["publisher-unexpected-asset"]

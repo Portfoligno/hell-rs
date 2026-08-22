@@ -49,15 +49,29 @@ impl JsonValue {
 }
 
 pub(crate) fn parse_json(document: &str) -> Result<JsonValue, String> {
-    let document = crate::fuzz_surfaces::strict_json_record(document.as_bytes())?;
+    parse_json_classified(document).map_err(|error| error.message)
+}
+
+pub(crate) fn parse_json_classified(
+    document: &str,
+) -> Result<JsonValue, crate::fuzz_surfaces::StrictJsonError> {
+    let document = crate::fuzz_surfaces::strict_json_record_classified(document.as_bytes())?;
     let mut parser = JsonParser {
         bytes: document.as_bytes(),
         index: 0,
     };
-    let value = parser.value()?;
+    let value = parser
+        .value()
+        .map_err(|message| crate::fuzz_surfaces::StrictJsonError {
+            code: "release.json.invalid",
+            message,
+        })?;
     parser.whitespace();
     if parser.index != parser.bytes.len() {
-        return Err(format!("trailing JSON data at byte {}", parser.index));
+        return Err(crate::fuzz_surfaces::StrictJsonError {
+            code: "release.json.trailing-bytes",
+            message: format!("trailing JSON data at byte {}", parser.index),
+        });
     }
     Ok(value)
 }

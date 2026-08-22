@@ -1515,23 +1515,28 @@ fn timed_cancellation_wakes_a_partial_request_body_read() {
 #[test]
 fn blocked_body_test_detects_removed_process_stream_cancellation() {
     let executable = std::env::current_exe().expect("HTTP integration test executable exists");
-    let output = std::process::Command::new(executable)
-        .args([
-            "--exact",
-            "timed_cancellation_wakes_a_partial_request_body_read",
-            "--nocapture",
-            "--skip",
-            "__hell_mutant",
-            "--skip",
-            "process-stream-cancellation",
-        ])
-        .output()
-        .expect("activated HTTP cancellation test starts");
+    let mut command = std::process::Command::new(executable);
+    command.args([
+        "--exact",
+        "timed_cancellation_wakes_a_partial_request_body_read",
+        "--nocapture",
+        "--skip",
+        "__hell_mutant",
+        "--skip",
+        "process-stream-cancellation",
+    ]);
+    let output =
+        hell_testkit::run_supervised_command(&mut command, &[], std::time::Duration::from_secs(30))
+            .expect("supervise activated HTTP cancellation test");
+    assert!(
+        !output.timed_out,
+        "activated HTTP cancellation test exceeded its deadline"
+    );
     assert!(
         !output.status.success(),
         "activated process-stream cancellation mutant survived: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stdout.retained_bytes()),
+        String::from_utf8_lossy(&output.stderr.retained_bytes())
     );
 }
 

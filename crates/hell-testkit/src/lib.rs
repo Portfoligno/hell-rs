@@ -4272,6 +4272,10 @@ fn prepare_posix_writable_directory(
 ) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+    let construction_deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| std::io::Error::other("construction deadline overflowed"))?;
+
     let root = writable_roots
         .iter()
         .find(|root| path.starts_with(root.as_path()))
@@ -4308,15 +4312,17 @@ fn prepare_posix_writable_directory(
     let chmod = PosixFixedConstructionTool::bind(chmod_path)?;
 
     chgrp.revalidate()?;
-    let status = Command::new(launcher)
+    let mut command = Command::new(launcher);
+    command
         .args(["-n", "--"])
         .arg(&chgrp.path)
         .arg(candidate_group.to_string())
-        .arg(path)
-        .status()?;
-    if !status.success() {
-        return Err(std::io::Error::other("cannot bind candidate sandbox group"));
-    }
+        .arg(path);
+    run_posix_construction_command(
+        &mut command,
+        construction_deadline,
+        "cannot bind candidate sandbox group",
+    )?;
     let grouped = fs::symlink_metadata(path)?;
     if (grouped.dev(), grouped.ino(), grouped.uid()) != owner_identity
         || grouped.gid() != candidate_group
@@ -4332,12 +4338,12 @@ fn prepare_posix_writable_directory(
     command.args(["-n", "--"]).arg(&chmod.path).arg("2770");
     #[cfg(target_os = "linux")]
     command.arg("--");
-    let status = command.arg(path).status()?;
-    if !status.success() {
-        return Err(std::io::Error::other(
-            "cannot establish candidate sandbox permissions",
-        ));
-    }
+    command.arg(path);
+    run_posix_construction_command(
+        &mut command,
+        construction_deadline,
+        "cannot establish candidate sandbox permissions",
+    )?;
     let after = fs::symlink_metadata(path)?;
     if fs::canonicalize(path)? != path
         || after.file_type().is_symlink()
@@ -4350,6 +4356,28 @@ fn prepare_posix_writable_directory(
             std::io::ErrorKind::PermissionDenied,
             "candidate sandbox identity or permissions differ after construction",
         ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_posix_construction_command(
+    command: &mut Command,
+    completion_deadline: Instant,
+    failure: &'static str,
+) -> std::io::Result<()> {
+    let execution_deadline = completion_deadline
+        .checked_sub(Duration::from_secs(1))
+        .ok_or_else(|| std::io::Error::other("construction deadline lacks cleanup reserve"))?;
+    let output = without_candidate_launch_policy(|| {
+        run_supervised_command_until(command, &[], execution_deadline, completion_deadline, None)
+    })?;
+    if output.timed_out
+        || output.stdout.truncated
+        || output.stderr.truncated
+        || !output.status.success()
+    {
+        return Err(std::io::Error::other(failure));
     }
     Ok(())
 }
@@ -20813,15 +20841,17 @@ impl Iterator for DeterministicUtf8 {
 
 #[cfg(test)]
 mod authority_environment_tests {
-    #[cfg(unix)]
-    use super::configure_release_child_environment;
     use super::{
         Command, WINDOWS_ARGV_TOKEN_LIMIT, WINDOWS_ARGV_TOKEN_PREFIX,
         configure_evidence_native_environment, decode_windows_argv_units,
         encode_windows_argv_units, windows_program_requires_trusted_path,
     };
+    #[cfg(unix)]
+    use super::{configure_release_child_environment, run_supervised_command};
     use std::ffi::OsStr;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     #[test]
     fn windows_adapter_token_round_trips_adversarial_argv() {
@@ -20879,9 +20909,16 @@ mod authority_environment_tests {
         command.env("ACTIONS_RUNTIME_TOKEN", "secret");
         command.env("GITHUB_OUTPUT", "secret");
         configure_release_child_environment(&mut command);
-        let output = command.output().expect("spawn environment probe");
-        assert!(output.status.success());
-        let visible = String::from_utf8(output.stdout).expect("environment is UTF-8");
+        let output = run_supervised_command(&mut command, &[], Duration::from_secs(5))
+            .expect("spawn bounded environment probe");
+        assert!(!output.timed_out && output.status.success() && !output.stdout.truncated);
+        let visible = String::from_utf8(
+            output
+                .stdout
+                .complete
+                .expect("bounded environment probe retained complete output"),
+        )
+        .expect("environment is UTF-8");
         assert!(!visible.contains("GITHUB_TOKEN="));
         assert!(!visible.contains("ACTIONS_RUNTIME_TOKEN="));
         assert!(!visible.contains("GITHUB_OUTPUT="));

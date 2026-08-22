@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -32,16 +33,27 @@ fn run_source(label: &str, source: &str, environment: &[(&str, &str)]) -> Output
     for (name, value) in environment {
         command.env(name, value);
     }
-    command.output().expect("run hell")
+    supervised_output(&mut command)
 }
 
 fn check_source(label: &str, source: &str) -> Output {
     let fixture = Fixture::new(label, source);
-    Command::new(env!("CARGO_BIN_EXE_hell"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell"));
+    command
         .env_clear()
-        .args(["--check".as_ref(), fixture.0.as_os_str()])
-        .output()
-        .expect("check Hell source")
+        .args(["--check".as_ref(), fixture.0.as_os_str()]);
+    supervised_output(&mut command)
+}
+
+fn supervised_output(command: &mut Command) -> Output {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .expect("supervise Hell fixture");
+    assert!(!output.timed_out, "Hell fixture exceeded its deadline");
+    Output {
+        status: output.status,
+        stdout: output.stdout.complete.expect("stdout capture is complete"),
+        stderr: output.stderr.complete.expect("stderr capture is complete"),
+    }
 }
 
 fn assert_success(output: &Output, expected_stdout: &[u8]) {

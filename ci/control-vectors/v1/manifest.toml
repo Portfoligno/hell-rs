@@ -1,0 +1,111 @@
+schema-version = 1
+
+[[vector]]
+id = "publisher-conflicting-draft"
+surface = "publisher"
+expected = "reject"
+diagnostic = "publisher.state.unexpected-draft"
+
+[[vector]]
+id = "publisher-conflicting-tag"
+surface = "publisher"
+expected = "reject"
+diagnostic = "publisher.state.conflicting-tag"
+
+[[vector]]
+id = "publisher-unexpected-asset"
+surface = "publisher"
+expected = "reject"
+diagnostic = "publisher.state.unexpected-asset"
+
+[[vector]]
+id = "publisher-envelope-predecessor-mismatch"
+surface = "publisher"
+expected = "reject"
+diagnostic = "publisher.envelope.governance"
+
+[[vector]]
+id = "governance-ruleset-unavailable-residual"
+surface = "governance"
+expected = "residual-assumption"
+
+[[vector]]
+id = "summary-producer-failed"
+surface = "readiness-summary"
+expected = "producer-failed"
+
+[[vector]]
+id = "summary-verifier-skipped"
+surface = "readiness-summary"
+expected = "incomplete"
+
+[[vector]]
+id = "summary-forged-job-state"
+surface = "readiness-summary"
+expected = "blocked"
+diagnostic = "readiness.artifact.missing"
+
+[[vector]]
+id = "summary-missing-job-state"
+surface = "readiness-summary"
+expected = "blocked"
+diagnostic = "readiness.job-state.inventory"
+
+[[vector]]
+id = "summary-malformed-job-state"
+surface = "readiness-summary"
+expected = "blocked"
+diagnostic = "readiness.job-state.invalid"
+
+[[vector]]
+id = "summary-extra-job-state"
+surface = "readiness-summary"
+expected = "blocked"
+diagnostic = "readiness.job-state.inventory"
+
+[[vector]]
+id = "summary-missing-artifact"
+surface = "readiness-summary"
+expected = "blocked"
+diagnostic = "readiness.artifact.missing"
+
+[[vector]]
+id = "rust-capability-sealed-runtime-access"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/valid/sealed-runtime-access.rs"
+expected = "accept"
+
+[[vector]]
+id = "rust-capability-renamed-environment-access"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/invalid/renamed-environment-access.rs"
+expected = "reject"
+diagnostic = "capability.access.unapproved"
+
+[[vector]]
+id = "rust-capability-aliased-environment-access"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/invalid/aliased-environment-access.rs"
+expected = "reject"
+diagnostic = "capability.access.unapproved"
+
+[[vector]]
+id = "rust-capability-reexported-environment-access"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/invalid/reexported-environment-access.rs"
+expected = "reject"
+diagnostic = "capability.access.unapproved"
+
+[[vector]]
+id = "rust-capability-broad-lint-allow"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/invalid/broad-lint-allow.rs"
+expected = "reject"
+diagnostic = "capability.allow.forbidden"
+
+[[vector]]
+id = "rust-capability-unapproved-compile-time-environment"
+surface = "rust-capabilities"
+input = "ci/rust-capability-vectors/v1/invalid/unapproved-compile-time-environment.rs"
+expected = "reject"
+diagnostic = "capability.macro.unapproved"

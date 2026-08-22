@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -42,13 +43,32 @@ fn stack_package_source_cwd_is_separate_from_its_archive_write_authority() {
     command
         .arg("__verify-native-archive-adapter-cleanup")
         .arg(&fixture.root);
-    let output = command
-        .output()
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_mins(10))
         .expect("native Stack archive authority verifier must execute");
+    assert!(
+        !output.timed_out,
+        "native Stack archive authority verifier timed out"
+    );
+    assert!(
+        output
+            .phase_timings
+            .iter()
+            .any(|phase| phase.name == "quiescence-complete")
+    );
+    assert_eq!(
+        output.phase_timings.last().map(|phase| phase.name),
+        Some("stdin-joined")
+    );
     assert!(
         output.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(
+            output
+                .stderr
+                .complete
+                .as_deref()
+                .expect("stderr must fit the bounded complete capture")
+        )
     );
 }
 
@@ -57,9 +77,8 @@ fn stack_package_source_cwd_is_separate_from_its_archive_write_authority() {
 fn restricted_candidate_uses_only_the_sealed_archive_broker_capability() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
     command.arg("__verify-posix-candidate-target-authority");
-    let output =
-        hell_testkit::run_supervised_command(&mut command, &[], std::time::Duration::from_mins(10))
-            .expect("typed archive broker production verifier must execute");
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_mins(10))
+        .expect("typed archive broker production verifier must execute");
     assert!(
         output.status.success() && !output.timed_out,
         "typed archive broker production verifier failed: stdout={}, stderr={}",

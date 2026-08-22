@@ -1,3 +1,5 @@
 /target
+/crates/hell-release-verifier/fuzz/target
+/crates/hell-workflow-auditor/fuzz/target
 /crates/*/*.profraw
 /ci-out

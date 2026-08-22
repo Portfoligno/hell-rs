@@ -12,8 +12,8 @@ Tag pushes are excluded. The required branch-push workflows are:
 
 | Workflow | Jobs and required gate inventory |
 | --- | --- |
-| `CI` | `plan`; Linux `runner-identity`, `candidate-checkout`, `oracle-checkout`, `conformance-policy`, `conformance-plan-binding`, `case-catalog`, `normalizer-catalog`, `divergence-catalog`, `verify`, `format`, `clippy`, `workspace-tests`, `documentation`, `dependency-policy`, `release-examples`, `release-mutation-catalog`, `linux-release-oracle-digest`, `conformance-evidence`, `divergence-prototypes`, `release-build`, `archive-verification`, `package-smoke`; macOS and Windows `runner-identity`, `candidate-checkout`, `oracle-checkout`, `conformance-plan-binding`, `portability`, `workspace-tests`, `release-build`, `native-oracle-build`, `conformance-evidence`, `divergence-prototypes`, `archive-verification`, `package-smoke`; final `verify` reconstruction |
-| `Nightly` | Linux dependency attestation, pinned-oracle acquisition, extended oracle suite, generated-regression exploration, and divergence prototypes; five bounded fuzz targets and seed-corpus cleanliness; native macOS and Windows portability, dependency attestation, and pinned-source oracle shards |
+| `CI` | `plan`; Linux `runner-identity`, `native-environment-identity`, `candidate-checkout`, `oracle-checkout`, `conformance-policy`, `conformance-plan-binding`, `case-catalog`, `normalizer-catalog`, `divergence-catalog`, `verify`, `format`, `clippy`, `workspace-tests`, `documentation`, `dependency-policy`, `release-examples`, `release-mutation-catalog`, `linux-release-oracle-digest`, `conformance-evidence`, `divergence-prototypes`, `release-build`, `archive-verification`, `package-smoke`; macOS and Windows `runner-identity`, `native-environment-identity`, `candidate-checkout`, `oracle-checkout`, `conformance-plan-binding`, `portability`, `workspace-tests`, `release-build`, `native-oracle-build`, `conformance-evidence`, `divergence-prototypes`, `archive-verification`, `package-smoke`; strict `verify`; failure-terminal `summary` |
+| `Nightly` | Linux dependency attestation, pinned-oracle acquisition, extended oracle suite, generated-regression exploration, and divergence prototypes; the complete 36-target bounded primary, independent-verifier, and workflow-auditor fuzz matrix (31 release-boundary targets plus five retained semantic regressions); native macOS and Windows portability, dependency attestation, and pinned-source oracle shards |
 | `Exploratory mutation` | The complete release-required mutant catalog |
 | `Regression subject` | `typed_corpus` and `oracle_regressions` for every branch push |
 | `Regression corpus` | The same two tests when the committed corpus, testkit, CLI regression tests, or its workflow changes |
@@ -29,7 +29,44 @@ together first:
 
 ```text
 cargo build --locked --profile ci --package hell-ci --bin hell-ci --package hell-testkit --bin hell-test-helper
+cargo build --locked --profile ci --package hell-workflow-auditor --bin hell-workflow-auditor
+cargo build --locked --profile ci --package hell-release-verifier --bin hell-release-verifier --target-dir independent-target
 ```
+
+Check the typed protocol against all six exact workflow bytes, then audit the
+same workflows with the independently implemented parser and projection:
+
+```text
+target/ci/hell-ci protocol check --manifest ci/protocol/v1.toml --repository-root . --workflows .github/workflows --report ci-out/protocol-check.json
+target/ci/hell-workflow-auditor audit --workflows .github/workflows --protocol-projection ci/protocol/v1.audit.json --action-metadata ci/actions/metadata-v1.json --output ci-out/workflow-audit.json
+target/ci/hell-workflow-auditor verify-vectors --manifest ci/workflow-vectors/v1/manifest.toml --workflows .github/workflows --protocol-projection ci/protocol/v1.audit.json --action-metadata ci/actions/metadata-v1.json --output ci-out/workflow-vector-audit.json
+target/ci/hell-ci assurance check --map spec/assurance-map.toml --repository-root . --output ci-out/assurance-check.json
+target/ci/hell-ci assurance render --map spec/assurance-map.toml --output spec/generated/assurance-map.md
+```
+
+Given one genuine assembled release plan, conformance plan, bundle, all three
+authenticated native-platform inputs, and the canonical resolve →
+post-assembly → pre-attestation governance receipt chain, materialize the
+known-good release-protocol fixture and all 36 one-mutation invalid vectors
+into a fresh directory. The materializer crosses the independent process
+boundary to obtain the independent expected decision; it does not link the
+independent crate. Then run both decisive implementations over the exact same
+specification data:
+
+```text
+target/ci/hell-ci release materialize-protocol-vectors --plan release-input/plan/release-plan.json --conformance-plan release-input/plan/conformance-plan.json --bundle release-input/bundle --platform-input release-input/platforms --manifest ci/release-protocol/v1/manifest.toml --protocol-projection ci/release-protocol/v1/projection.json --governance-post-assembly release-input/governance/governance-post-assembly.json --governance-pre-attestation release-input/governance/governance-pre-attestation.json --independent-verifier independent-target/ci/hell-release-verifier --output ci-out/release-protocol-vectors
+target/ci/hell-ci release verify-vectors --manifest ci/release-protocol/v1/manifest.toml --vectors-root ci-out/release-protocol-vectors --protocol-projection ci/release-protocol/v1/projection.json --output ci-out/primary-vector-report.json
+independent-target/ci/hell-release-verifier verify-vectors --manifest ci/release-protocol/v1/manifest.toml --vectors-root ci-out/release-protocol-vectors --protocol-projection ci/release-protocol/v1/projection.json --output ci-out/independent-vector-report.json
+```
+
+The vector commands parse and execute the materialized plans, conformance
+plans, bundles, and expected outcomes. Catalog-only or decision-only checks are
+not release-protocol acceptance evidence. These inputs normally come from the
+manual release DAG. An offline machine without authentic artifacts from all
+three native runners can audit the committed manifest but cannot claim a
+genuine known-good materialization. The resolve receipt must remain the
+canonical `governance-resolve.json` sibling of the plan; copied or synthesized
+receipt identities are not accepted.
 
 Run the repository policy, compiler, test, documentation, dependency, example,
 release-build, mutation, and committed-regression gates with explicit argv:
@@ -43,7 +80,7 @@ cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ci-tool-
 cargo-deny --all-features check all
 target/ci/hell-ci examples --profile release --report ci-out/release-examples.json
 cargo build --release --locked --package hell-cli --bin hell
-target/ci/hell-ci mutation run --output ci-out/mutation/mutation-score.json
+target/ci/hell-ci mutation assurance --manifest compat/assurance-mutants.toml --repository-root . --output ci-out/mutation
 cargo test --locked --package hell-testkit --test typed_corpus
 cargo test --locked --package hell-cli --test oracle_regressions
 target/ci/hell-ci case-catalog verify
@@ -71,18 +108,18 @@ target/ci/hell-ci regression-import explore-generated --input ci-out --output ci
 target/ci/hell-ci divergence-prototype verify
 ```
 
-The fuzz job uses the pinned nightly toolchain and `cargo-fuzz` version:
+The fuzz job uses the pinned nightly toolchain and `cargo-fuzz` version. The
+Rust orchestrator first checks exact parity among the typed matrix, all Cargo
+fuzz bins, their production-seam source files, and nonempty corpora. The matrix
+contains the 31 release-boundary targets plus five retained semantic regression
+targets. It then performs each native argv invocation; workflow YAML contains
+one suite invocation:
 
 ```text
 rustup toolchain install nightly-2026-07-31 --profile minimal
 cargo +nightly-2026-07-31 install cargo-fuzz --version 0.13.2 --locked --force --target-dir ci-tool-cache/cargo-fuzz-target
-target/ci/hell-ci fuzz-corpus prepare --input crates/hell-ci/fuzz/corpus --output ci-out/fuzz-corpora --to ci-out/fuzz-artifacts
-cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz requirement_toml ci-out/fuzz-corpora/requirement_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/requirement_toml/
-cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_toml ci-out/fuzz-corpora/normalizer_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_toml/
-cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz divergence_toml ci-out/fuzz-corpora/divergence_toml -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/divergence_toml/
-cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz normalizer_replay ci-out/fuzz-corpora/normalizer_replay -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/normalizer_replay/
-cargo +nightly-2026-07-31 fuzz run --fuzz-dir crates/hell-ci/fuzz semantic_trace ci-out/fuzz-corpora/semantic_trace -- -runs=64 -timeout=10 -artifact_prefix=ci-out/fuzz-artifacts/semantic_trace/
-target/ci/hell-ci fuzz-corpus verify-clean --input crates/hell-ci/fuzz/corpus
+target/ci/hell-ci fuzz check --manifest ci/fuzz-targets.toml --repository-root . --output ci-out/fuzz-check.json
+target/ci/hell-ci fuzz smoke --manifest ci/fuzz-targets.toml --repository-root . --output ci-out/fuzz
 ```
 
 Use fresh output paths when repeating artifact-producing commands.
@@ -123,9 +160,9 @@ their bytes, then run the matching native platform command:
 
 ```text
 target/ci/hell-ci readiness plan --repository-root . --output ci-out/readiness-plan
-target/ci/hell-ci readiness platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan ci-out/readiness-plan/readiness-plan.json --conformance-plan ci-out/readiness-plan/conformance-plan.json --repository-root . --oracle-source ci-out/oracle-source --output ci-out/readiness-platforms/linux-x86_64
-target/ci/hell-ci readiness platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan ci-out/readiness-plan/readiness-plan.json --conformance-plan ci-out/readiness-plan/conformance-plan.json --repository-root . --oracle-source ci-out/oracle-source --output ci-out/readiness-platforms/macos-aarch64
-target\ci\hell-ci.exe readiness platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan ci-out\readiness-plan\readiness-plan.json --conformance-plan ci-out\readiness-plan\conformance-plan.json --repository-root . --oracle-source ci-out\oracle-source --output ci-out\readiness-platforms\windows-x86_64
+target/ci/hell-ci readiness platform --platform linux-x86_64 --plan ci-out/readiness-plan/readiness-plan.json --conformance-plan ci-out/readiness-plan/conformance-plan.json --repository-root . --oracle-source ci-out/oracle-source --output ci-out/readiness-platforms/linux-x86_64
+target/ci/hell-ci readiness platform --platform macos-aarch64 --plan ci-out/readiness-plan/readiness-plan.json --conformance-plan ci-out/readiness-plan/conformance-plan.json --repository-root . --oracle-source ci-out/oracle-source --output ci-out/readiness-platforms/macos-aarch64
+target\ci\hell-ci.exe readiness platform --platform windows-x86_64 --plan ci-out\readiness-plan\readiness-plan.json --conformance-plan ci-out\readiness-plan\conformance-plan.json --repository-root . --oracle-source ci-out\oracle-source --output ci-out\readiness-platforms\windows-x86_64
 target/ci/hell-ci readiness verify --plan ci-out/readiness-plan/readiness-plan.json --conformance-plan ci-out/readiness-plan/conformance-plan.json --input ci-out/readiness-platforms --output ci-out/readiness-result
 ```
 
@@ -154,7 +191,11 @@ GitHub checkout, cache, artifact upload/download, hosted-runner selection, and
 check presentation are transport and execution-plane services; they do not
 replace a technical gate or authorize a release.
 
-Only the manual Release workflow uses hosted write authority. Its five trusted
-API calls receive the standard step-local `GITHUB_TOKEN`; GitHub's two
-attestation actions and immutable Release publication cannot be reproduced as
-repository-only local gates and are intentionally outside this runbook.
+Only the manual Release workflow uses hosted OIDC or write authority. Deep
+verification is locally reproducible and runs in the read-only `final-verify`
+job through both verifier implementations. The `attest` job has OIDC and
+attestation permissions but no release-write permission. The minimal `publish`
+job has release-write permission but no OIDC or attestation permission. Their
+typed remote-state checks receive only the standard step-local `GITHUB_TOKEN`.
+GitHub's attestation and immutable-release operations remain outside this
+repository-only runbook.

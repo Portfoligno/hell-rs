@@ -14,8 +14,135 @@ cargo-fuzz-toolchain = "nightly-2026-07-31"
 [dependencies]
 libfuzzer-sys = "0.4"
 hell-builtins = { path = "../../hell-builtins" }
+hell-ci = { path = ".." }
 hell-digest = { path = "../../hell-digest" }
 hell-testkit = { path = "../../hell-testkit", features = ["compat-tracing"] }
+
+[[bin]]
+name = "strict_json"
+path = "fuzz_targets/strict_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_plan"
+path = "fuzz_targets/release_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conformance_plan"
+path = "fuzz_targets/conformance_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trusted_inputs"
+path = "fuzz_targets/trusted_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "platform_report"
+path = "fuzz_targets/platform_report.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evidence_manifest"
+path = "fuzz_targets/evidence_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evidence_repository"
+path = "fuzz_targets/evidence_repository.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "partition_reconstruction"
+path = "fuzz_targets/partition_reconstruction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_acceptance"
+path = "fuzz_targets/release_acceptance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subjects_manifest"
+path = "fuzz_targets/subjects_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_gate"
+path = "fuzz_targets/release_gate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "publication_envelope"
+path = "fuzz_targets/publication_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "governance_api_response"
+path = "fuzz_targets/governance_api_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "governance_profile"
+path = "fuzz_targets/governance_profile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_environment"
+path = "fuzz_targets/native_environment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip_framing"
+path = "fuzz_targets/gzip_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gnu_tar_subset"
+path = "fuzz_targets/gnu_tar_subset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_bundle_inventory"
+path = "fuzz_targets/release_bundle_inventory.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "requirement_toml"

@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
@@ -8,6 +7,7 @@ use std::time::Duration;
 
 use crate::command::CommandSpec;
 use crate::json::{JsonValue, canonical_json_bytes, json_member};
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 
 use super::manifest::{read_json, read_regular, write_atomic, write_json};
 use super::schema::{PLATFORMS, ReleasePlan, Resolution, number, object, string};
@@ -18,69 +18,67 @@ pub(crate) fn create(
     output: PathBuf,
     report: PathBuf,
 ) -> Result<String, String> {
+    let transaction = PlanTransaction {
+        resolution_path,
+        root,
+        output,
+        report,
+    };
+    create_plan(&transaction)
+}
+
+struct PlanTransaction {
+    resolution_path: PathBuf,
+    root: PathBuf,
+    output: PathBuf,
+    report: PathBuf,
+}
+
+struct TrustedPlanPolicy {
+    root: PathBuf,
+    policy_sha256: String,
+    governance: super::governance::DeclaredGovernanceBindings,
+    external_inputs_sha256: String,
+}
+
+fn create_plan(paths: &PlanTransaction) -> Result<String, String> {
+    let PlanTransaction {
+        resolution_path,
+        root,
+        output,
+        report,
+    } = paths;
     if output.exists() {
         return Err("release plan output already exists".to_owned());
     }
-    if report.starts_with(&output) {
+    if report.starts_with(output) {
         return Err(
             "release plan diagnostic report must remain outside the exact artifact".to_owned(),
         );
     }
-    let resolution = Resolution::parse(&read_json(&resolution_path)?)?;
-    let head = git_output(&root, [OsString::from("rev-parse"), OsString::from("HEAD")])?;
+    let resolution = Resolution::parse(&read_json(resolution_path)?)?;
+    let head = git_output(root, [OsString::from("rev-parse"), OsString::from("HEAD")])?;
     if head != resolution.candidate_sha {
         return Err("candidate checkout HEAD differs from resolved candidate SHA".to_owned());
     }
 
-    let trusted_root = env::var_os("GITHUB_WORKSPACE")
-        .map(PathBuf::from)
-        .map(|workspace| workspace.join("automation"))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
-    let trusted_policy_path = trusted_root.join("release-policy.toml");
-    let policy = read_regular(&trusted_policy_path)?;
-    let candidate_policy = read_regular(&root.join("release-policy.toml"))?;
-    if candidate_policy != policy {
-        return Err("candidate release policy differs from trusted automation policy".to_owned());
-    }
-    validate_policy(&policy, &resolution.repository)?;
-    let policy_sha256 = hell_testkit::sha256_bytes(&policy).hex();
-    let version = workspace_version(&root)?;
-    validate_release_crate(&root, &version)?;
+    let trusted = trusted_plan_policy(root, &resolution)?;
+    let version = workspace_version(root)?;
+    validate_release_crate(root, &version)?;
     let prerelease = semver_prerelease(&version)?;
     let tag = format!("v{version}");
     let changelog = changelog_section(&root.join("CHANGELOG.md"), &version)?;
     let changelog_sha256 = hell_testkit::sha256_bytes(changelog.as_bytes()).hex();
-    let identities = git_output(
-        &root,
-        [
-            OsString::from("show"),
-            OsString::from("-s"),
-            OsString::from("--format=%an <%ae>%n%cn <%ce>"),
-            OsString::from(&resolution.candidate_sha),
-        ],
-    )?;
-    let identity_lines = identities.lines().collect::<Vec<_>>();
-    if identity_lines.len() != 2 || identity_lines.iter().any(|line| line.trim().is_empty()) {
-        return Err("candidate author/committer identity is malformed".to_owned());
-    }
-    let source_date_epoch = git_output(
-        &root,
-        [
-            OsString::from("show"),
-            OsString::from("-s"),
-            OsString::from("--format=%ct"),
-            OsString::from(&resolution.candidate_sha),
-        ],
-    )?
-    .parse::<u64>()
-    .map_err(|_| "candidate commit timestamp is invalid".to_owned())?;
-    let inventory = source_inventory(&root)?;
+    let (commit_author, commit_committer, source_date_epoch) = commit_metadata(root, &resolution)?;
+    let inventory = source_inventory(root)?;
     let inventory_bytes = canonical_json_bytes(&inventory)?;
     let source_inventory_sha256 = hell_testkit::sha256_bytes(&inventory_bytes).hex();
     let trusted_inputs =
-        crate::conformance::build_trusted_inputs(&trusted_root, &root, &resolution.workflow_sha)?;
+        crate::conformance::build_trusted_inputs(&trusted.root, root, &resolution.workflow_sha)?;
     let exemptions = crate::conformance::parse_release_exemptions(&read_regular(
-        &trusted_root.join(".github/release/conformance-exemptions.toml"),
+        &trusted
+            .root
+            .join(".github/release/conformance-exemptions.toml"),
     )?)?;
     let release_evaluation_instant = super::github::GitHubClient::from_actions_environment()?
         .workflow_run_created_at(
@@ -98,6 +96,117 @@ pub(crate) fn create(
         &source_inventory_sha256,
         exemptions,
     )?;
+    let (build_inputs_bytes, build_inputs_sha256) = build_inputs(
+        &inventory,
+        &resolution,
+        &trusted.policy_sha256,
+        &source_inventory_sha256,
+    )?;
+    validate_remote_tag_and_release(&resolution, &tag)?;
+    let mut plan = ReleasePlan {
+        resolution,
+        version,
+        tag,
+        prerelease,
+        source_date_epoch,
+        release_evaluation_instant,
+        source_inventory_sha256,
+        build_inputs_sha256,
+        policy_sha256: trusted.policy_sha256,
+        governance_declaration_sha256: trusted.governance.declaration_sha256,
+        governance_profile_sha256: trusted.governance.profile_sha256,
+        residual_assumption_set_sha256: trusted.governance.residual_set_digest,
+        external_inputs_sha256: trusted.external_inputs_sha256,
+        trusted_conformance_inputs_sha256: trusted_inputs.aggregate_sha256.clone(),
+        conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
+        conformance_standard: crate::conformance::RELEASE_STANDARD.to_owned(),
+        changelog_sha256,
+        commit_author,
+        commit_committer,
+        plan_sha256: String::new(),
+    };
+    plan.plan_sha256 =
+        hell_testkit::sha256_bytes(&canonical_json_bytes(&plan.json_without_digest())?).hex();
+    persist_plan(
+        output,
+        report,
+        &plan,
+        &inventory_bytes,
+        &build_inputs_bytes,
+        &trusted_inputs.manifest,
+        &conformance_plan.json(),
+    )?;
+    append_outputs(&plan)?;
+    Ok(format!(
+        "planned {} at {}",
+        plan.tag, plan.resolution.candidate_sha
+    ))
+}
+
+fn trusted_plan_policy(
+    candidate_root: &Path,
+    resolution: &Resolution,
+) -> Result<TrustedPlanPolicy, String> {
+    let environment = ProcessEnvironment::from_process();
+    let root = environment
+        .value(StandardVariable::GithubWorkspace)
+        .map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+            |workspace| PathBuf::from(workspace).join("automation"),
+        );
+    let policy = read_regular(&root.join("release-policy.toml"))?;
+    if read_regular(&candidate_root.join("release-policy.toml"))? != policy {
+        return Err("candidate release policy differs from trusted automation policy".to_owned());
+    }
+    validate_policy(&policy, &resolution.repository)?;
+    Ok(TrustedPlanPolicy {
+        policy_sha256: hell_testkit::sha256_bytes(&policy).hex(),
+        governance: super::governance::declared_bindings(&root.join("ci/governance-policy.toml"))?,
+        external_inputs_sha256: super::native_environment::external_inputs_sha256(
+            &root.join("ci/external-inputs.toml"),
+        )?,
+        root,
+    })
+}
+
+fn commit_metadata(root: &Path, resolution: &Resolution) -> Result<(String, String, u64), String> {
+    let identities = git_output(
+        root,
+        [
+            OsString::from("show"),
+            OsString::from("-s"),
+            OsString::from("--format=%an <%ae>%n%cn <%ce>"),
+            OsString::from(&resolution.candidate_sha),
+        ],
+    )?;
+    let identity_lines = identities.lines().collect::<Vec<_>>();
+    if identity_lines.len() != 2 || identity_lines.iter().any(|line| line.trim().is_empty()) {
+        return Err("candidate author/committer identity is malformed".to_owned());
+    }
+    let epoch = git_output(
+        root,
+        [
+            OsString::from("show"),
+            OsString::from("-s"),
+            OsString::from("--format=%ct"),
+            OsString::from(&resolution.candidate_sha),
+        ],
+    )?
+    .parse::<u64>()
+    .map_err(|_| "candidate commit timestamp is invalid".to_owned())?;
+    Ok((
+        identity_lines[0].to_owned(),
+        identity_lines[1].to_owned(),
+        epoch,
+    ))
+}
+
+fn build_inputs(
+    inventory: &JsonValue,
+    resolution: &Resolution,
+    policy_sha256: &str,
+    source_inventory_sha256: &str,
+) -> Result<(Vec<u8>, String), String> {
     let runners = object([
         ("linux-x86_64", string("ubuntu-24.04")),
         ("macos-aarch64", string("macos-15")),
@@ -106,26 +215,25 @@ pub(crate) fn create(
     let pinned_inputs = object([
         (
             "cargoLockSha256",
-            string(inventory_digest(&inventory, "Cargo.lock")?),
+            string(inventory_digest(inventory, "Cargo.lock")?),
         ),
         (
             "releasePolicySha256",
-            string(inventory_digest(&inventory, "release-policy.toml")?),
+            string(inventory_digest(inventory, "release-policy.toml")?),
         ),
         (
             "rustToolchainSha256",
-            string(inventory_digest(&inventory, "rust-toolchain.toml")?),
+            string(inventory_digest(inventory, "rust-toolchain.toml")?),
         ),
         (
             "workflowSha256",
             string(inventory_digest(
-                &inventory,
+                inventory,
                 ".github/workflows/release.yml",
             )?),
         ),
     ]);
-
-    let build_inputs = object([
+    let value = object([
         ("automationSha", string(&resolution.workflow_sha)),
         ("candidateSha", string(&resolution.candidate_sha)),
         (
@@ -141,66 +249,52 @@ pub(crate) fn create(
                     .collect(),
             ),
         ),
-        ("policySha256", string(&policy_sha256)),
+        ("policySha256", string(policy_sha256)),
         ("pinnedInputs", pinned_inputs),
         ("runners", runners),
         ("schemaVersion", number(1)),
-        ("sourceInventorySha256", string(&source_inventory_sha256)),
+        ("sourceInventorySha256", string(source_inventory_sha256)),
         ("stackVersion", string("3.11.1")),
     ]);
-    let build_inputs_bytes = canonical_json_bytes(&build_inputs)?;
-    let build_inputs_sha256 = hell_testkit::sha256_bytes(&build_inputs_bytes).hex();
-    validate_remote_tag_and_release(&resolution, &tag)?;
-    let mut plan = ReleasePlan {
-        resolution,
-        version,
-        tag,
-        prerelease,
-        source_date_epoch,
-        release_evaluation_instant,
-        source_inventory_sha256,
-        build_inputs_sha256,
-        policy_sha256,
-        trusted_conformance_inputs_sha256: trusted_inputs.aggregate_sha256.clone(),
-        conformance_plan_sha256: conformance_plan.plan_sha256.clone(),
-        conformance_standard: crate::conformance::RELEASE_STANDARD.to_owned(),
-        changelog_sha256,
-        commit_author: identity_lines[0].to_owned(),
-        commit_committer: identity_lines[1].to_owned(),
-        plan_sha256: String::new(),
-    };
-    plan.plan_sha256 =
-        hell_testkit::sha256_bytes(&canonical_json_bytes(&plan.json_without_digest())?).hex();
-    fs::create_dir(&output)
+    let bytes = canonical_json_bytes(&value)?;
+    let digest = hell_testkit::sha256_bytes(&bytes).hex();
+    Ok((bytes, digest))
+}
+
+fn persist_plan(
+    output: &Path,
+    report: &Path,
+    plan: &ReleasePlan,
+    inventory_bytes: &[u8],
+    build_inputs_bytes: &[u8],
+    trusted_inputs: &JsonValue,
+    conformance_plan: &JsonValue,
+) -> Result<(), String> {
+    fs::create_dir(output)
         .map_err(|error| format!("cannot create exact release plan directory: {error}"))?;
     write_json(
         &output.join("release-resolution.json"),
         &plan.resolution.json(),
     )?;
-    write_atomic(&output.join("source-inventory.json"), &inventory_bytes)?;
-    write_atomic(&output.join("build-inputs.json"), &build_inputs_bytes)?;
+    write_atomic(&output.join("source-inventory.json"), inventory_bytes)?;
+    write_atomic(&output.join("build-inputs.json"), build_inputs_bytes)?;
     write_json(
         &output.join("trusted-conformance-inputs.json"),
-        &trusted_inputs.manifest,
+        trusted_inputs,
     )?;
-    write_json(
-        &output.join("conformance-plan.json"),
-        &conformance_plan.json(),
-    )?;
+    write_json(&output.join("conformance-plan.json"), conformance_plan)?;
     write_json(&output.join("release-plan.json"), &plan.json())?;
-    validate_written_plan_inventory(&output)?;
-    let report_value = object([
-        ("changelogSha256", string(&plan.changelog_sha256)),
-        ("planSha256", string(&plan.plan_sha256)),
-        ("schemaVersion", number(1)),
-        ("state", string("release-plan-admitted")),
-    ]);
-    write_json(&report, &report_value)?;
-    append_outputs(&plan)?;
-    Ok(format!(
-        "planned {} at {}",
-        plan.tag, plan.resolution.candidate_sha
-    ))
+    validate_written_plan_inventory(output)?;
+    write_json(
+        report,
+        &object([
+            ("changelogSha256", string(&plan.changelog_sha256)),
+            ("planSha256", string(&plan.plan_sha256)),
+            ("schemaVersion", number(1)),
+            ("state", string("release-plan-admitted")),
+        ]),
+    )?;
+    Ok(())
 }
 
 fn validate_written_plan_inventory(output: &Path) -> Result<(), String> {
@@ -273,16 +367,15 @@ fn validate_release_crate(root: &Path, version: &str) -> Result<(), String> {
         .map_err(|_| "hell-cli manifest is not UTF-8".to_owned())?
         .to_owned();
     let values = crate::strict_toml::assignments(&document)?;
-    if crate::strict_toml::boolean(
+    if !crate::strict_toml::boolean(
         values
             .get("package.version.workspace")
             .ok_or_else(|| "hell-cli must inherit workspace version".to_owned())?,
-    )? != true
-        || crate::strict_toml::string(
-            values
-                .get("bin.name")
-                .ok_or_else(|| "hell-cli must declare binary hell".to_owned())?,
-        )? != "hell"
+    )? || crate::strict_toml::string(
+        values
+            .get("bin.name")
+            .ok_or_else(|| "hell-cli must declare binary hell".to_owned())?,
+    )? != "hell"
     {
         return Err("hell-cli release binary/version contract is invalid".to_owned());
     }
@@ -305,7 +398,7 @@ fn validate_release_crate(root: &Path, version: &str) -> Result<(), String> {
                     manifest.display()
                 ));
             }
-        } else if assignments.get("package.version.workspace").is_none() {
+        } else if !assignments.contains_key("package.version.workspace") {
             return Err(format!(
                 "{} does not inherit workspace version",
                 manifest.display()
@@ -489,7 +582,7 @@ fn source_inventory_with_authority(
     root: &Path,
     authority: InventoryAuthority,
 ) -> Result<JsonValue, String> {
-    let result = CommandSpec::new("git", Duration::from_secs(60))
+    let result = CommandSpec::new("git", Duration::from_mins(1))
         .git_safe_directory(root)
         .arguments(["ls-files", "--stage", "-z"])
         .current_directory(root)
@@ -601,7 +694,7 @@ fn validate_policy(bytes: &[u8], repository: &str) -> Result<(), String> {
 }
 
 fn git_output<const N: usize>(root: &Path, arguments: [OsString; N]) -> Result<String, String> {
-    let result = CommandSpec::new("git", Duration::from_secs(60))
+    let result = CommandSpec::new("git", Duration::from_mins(1))
         .arguments(arguments)
         .current_directory(root)
         .run()
@@ -616,10 +709,11 @@ fn git_output<const N: usize>(root: &Path, arguments: [OsString; N]) -> Result<S
 }
 
 fn append_outputs(plan: &ReleasePlan) -> Result<(), String> {
-    let Some(path) = env::var_os("GITHUB_OUTPUT") else {
+    let environment = ProcessEnvironment::from_process();
+    let Some(path) = environment.value(StandardVariable::GithubOutput) else {
         return Ok(());
     };
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect GITHUB_OUTPUT: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("GITHUB_OUTPUT is not a regular file".to_owned());
@@ -648,13 +742,13 @@ mod tests {
 
     #[test]
     fn semver_derives_prerelease_state() {
-        assert_eq!(semver_prerelease("0.2.0").unwrap(), false);
-        assert_eq!(semver_prerelease("0.2.0-rc.1").unwrap(), true);
+        assert!(!semver_prerelease("0.2.0").unwrap());
+        assert!(semver_prerelease("0.2.0-rc.1").unwrap());
         assert!(semver_prerelease("01.2.0").is_err());
         assert!(semver_prerelease("1.2").is_err());
         assert!(semver_prerelease("1.0.0-01").is_err());
-        assert_eq!(semver_prerelease("1.0.0-alpha-beta.1").unwrap(), true);
-        assert_eq!(semver_prerelease("1.0.0+build-alpha").unwrap(), false);
+        assert!(semver_prerelease("1.0.0-alpha-beta.1").unwrap());
+        assert!(!semver_prerelease("1.0.0+build-alpha").unwrap());
         assert!(semver_prerelease("1.0.0-alpha..beta").is_err());
         assert!(semver_prerelease("1.0.0-alpha+one+two").is_err());
     }

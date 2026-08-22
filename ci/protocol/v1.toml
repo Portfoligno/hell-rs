@@ -1,0 +1,3549 @@
+schema-version = 1
+protocol-id = "hell-rs-ci-v1"
+release-admission-protocol = "release-admission-v1"
+merge-queue = false
+action-metadata = "ci/actions/metadata-v1.json"
+
+[readiness-summary]
+jobs = ["plan", "linux", "macos", "windows", "verify"]
+
+[readiness-summary.artifact.plan]
+artifact-id-output = "$output:plan.artifact.artifact-id"
+artifact-digest-output = "$output:plan.artifact.artifact-digest"
+input-path = "plan"
+
+[readiness-summary.artifact.linux]
+platform-id = "linux-x86_64"
+artifact-id-output = "$output:linux.artifact.artifact-id"
+artifact-digest-output = "$output:linux.artifact.artifact-digest"
+input-path = "platforms/linux-x86_64"
+
+[readiness-summary.artifact.macos]
+platform-id = "macos-aarch64"
+artifact-id-output = "$output:macos.artifact.artifact-id"
+artifact-digest-output = "$output:macos.artifact.artifact-digest"
+input-path = "platforms/macos-aarch64"
+
+[readiness-summary.artifact.windows]
+platform-id = "windows-x86_64"
+artifact-id-output = "$output:windows.artifact.artifact-id"
+artifact-digest-output = "$output:windows.artifact.artifact-digest"
+input-path = "platforms/windows-x86_64"
+
+[readiness-summary.artifact.verify]
+artifact-id-output = "$output:verify.artifact.artifact-id"
+artifact-digest-output = "$output:verify.artifact.artifact-digest"
+input-path = "verifier"
+
+[action.checkout]
+repository = "actions/checkout"
+ref = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+inputs = ["fetch-depth", "path", "persist-credentials", "ref", "repository"]
+outputs = []
+
+[action.cache-restore]
+repository = "actions/cache/restore"
+ref = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+inputs = ["fail-on-cache-miss", "key", "lookup-only", "path", "restore-keys"]
+outputs = ["cache-hit", "cache-matched-key"]
+
+[action.cache-save]
+repository = "actions/cache/save"
+ref = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+inputs = ["key", "path"]
+outputs = ["cache-id"]
+
+[action.upload-artifact]
+repository = "actions/upload-artifact"
+ref = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+inputs = ["compression-level", "if-no-files-found", "include-hidden-files", "name", "overwrite", "path", "retention-days"]
+outputs = ["artifact-digest", "artifact-id", "artifact-url"]
+
+[action.download-artifact]
+repository = "actions/download-artifact"
+ref = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+inputs = ["artifact-ids", "digest-mismatch", "github-token", "merge-multiple", "name", "path", "pattern", "repository", "run-id"]
+outputs = ["download-path"]
+
+[action.haskell-setup]
+repository = "haskell-actions/setup"
+ref = "6037f33647c3f17758a2356c80fc4a53d7e0685d"
+inputs = ["cabal-update", "cabal-version", "enable-stack", "ghc-version", "stack-no-global", "stack-version"]
+outputs = ["cabal-store", "ghc-exe", "ghc-version", "stack-root"]
+
+[action.attest]
+repository = "actions/attest"
+ref = "508db95dd578ae2727ebd6217d5ba78e4fbda05d"
+inputs = ["predicate-path", "predicate-type", "subject-checksums", "subject-path"]
+outputs = ["attestation-id", "attestation-url", "bundle-path"]
+
+[permission.read]
+actions = "read"
+contents = "read"
+id-token = "none"
+attestations = "none"
+artifact-metadata = "none"
+
+[permission.contents-read]
+actions = "none"
+contents = "read"
+id-token = "none"
+attestations = "none"
+artifact-metadata = "none"
+
+[permission.attest]
+actions = "read"
+contents = "read"
+id-token = "write"
+attestations = "write"
+artifact-metadata = "write"
+
+[permission.publish]
+actions = "read"
+contents = "write"
+id-token = "none"
+attestations = "none"
+artifact-metadata = "none"
+
+[workflow.ci]
+path = ".github/workflows/ci.yml"
+name = "CI"
+jobs = ["plan", "linux", "macos", "windows", "verify", "summary"]
+
+[workflow.ci.trigger]
+push-branches = true
+pull-request = true
+workflow-dispatch = false
+push-tags = false
+merge-group = "conditional"
+
+[workflow.ci.concurrency]
+group = "ci-${{ github.workflow }}-${{ github.ref }}"
+cancel-in-progress = true
+
+[workflow.nightly]
+path = ".github/workflows/nightly.yml"
+name = "Nightly"
+jobs = ["linux", "fuzz", "macos", "windows"]
+
+[workflow.nightly.trigger]
+push-branches = true
+pull-request = false
+workflow-dispatch = false
+push-tags = false
+merge-group = "never"
+
+[workflow.nightly.concurrency]
+group = "nightly-${{ github.workflow }}-${{ github.ref }}"
+cancel-in-progress = true
+
+[workflow.mutation]
+path = ".github/workflows/mutation.yml"
+name = "Exploratory mutation"
+jobs = ["mutation"]
+
+[workflow.mutation.trigger]
+push-branches = true
+pull-request = false
+workflow-dispatch = false
+push-tags = false
+merge-group = "never"
+
+[workflow.mutation.concurrency]
+group = "mutation-${{ github.workflow }}-${{ github.ref }}"
+cancel-in-progress = true
+
+[workflow.regression-corpus]
+path = ".github/workflows/regression-corpus.yml"
+name = "Regression corpus"
+jobs = ["validate"]
+
+[workflow.regression-corpus.trigger]
+push-branches = true
+pull-request = false
+workflow-dispatch = false
+push-tags = false
+merge-group = "never"
+paths = ["compat/regression-corpus.tsv", "crates/hell-testkit/**", "crates/hell-cli/tests/**", ".github/workflows/regression-corpus.yml"]
+
+[workflow.regression-corpus.concurrency]
+group = "${{ github.workflow }}-${{ github.ref }}"
+cancel-in-progress = true
+
+[workflow.regression-subject]
+path = ".github/workflows/regression-subject.yml"
+name = "Regression subject"
+jobs = ["validate"]
+
+[workflow.regression-subject.trigger]
+push-branches = true
+pull-request = false
+workflow-dispatch = false
+push-tags = false
+merge-group = "never"
+
+[workflow.regression-subject.concurrency]
+group = "${{ github.workflow }}-${{ github.ref }}"
+cancel-in-progress = true
+
+[workflow.release]
+path = ".github/workflows/release.yml"
+name = "Release"
+jobs = ["resolve", "linux", "macos", "windows", "assemble", "governance", "final-verify", "attest", "publish"]
+
+[workflow.release.trigger]
+push-branches = false
+pull-request = false
+workflow-dispatch = true
+push-tags = false
+merge-group = "never"
+
+[workflow.release.dispatch-input.candidate_branch]
+description = "Same-repository branch to resolve and release"
+required = true
+type = "string"
+
+[workflow.release.concurrency]
+group = "release-${{ github.repository }}"
+cancel-in-progress = false
+
+[job.ci.plan]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "read"
+artifact-output = "readiness-plan"
+command = "readiness-plan"
+
+[job.ci.linux]
+needs = ["plan"]
+runner = "ubuntu-24.04"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "readiness-linux"
+command = "readiness-linux"
+
+[job.ci.macos]
+needs = ["plan"]
+runner = "macos-15"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "readiness-macos"
+command = "readiness-macos"
+
+[job.ci.windows]
+needs = ["plan"]
+runner = "windows-2025"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "readiness-windows"
+command = "readiness-windows"
+
+[job.ci.verify]
+needs = ["plan", "linux", "macos", "windows"]
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "read"
+artifact-output = "readiness-verification"
+command = "readiness-verify"
+
+[job.ci.summary]
+needs = ["plan", "linux", "macos", "windows", "verify"]
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "read"
+artifact-output = "readiness-summary"
+command = "readiness-summarize"
+
+[job.nightly.linux]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 120
+permission = "contents-read"
+artifact-output = "nightly-linux"
+command = "nightly-linux-current"
+
+[job.nightly.fuzz]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 90
+permission = "contents-read"
+artifact-output = "fuzz-results"
+command = "fuzz-smoke"
+
+[job.nightly.macos]
+needs = []
+runner = "macos-15"
+timeout-minutes = 60
+permission = "contents-read"
+artifact-output = "nightly-macos"
+command = "nightly-macos"
+
+[job.nightly.windows]
+needs = []
+runner = "windows-2025"
+timeout-minutes = 60
+permission = "contents-read"
+artifact-output = "nightly-windows"
+command = "nightly-windows"
+
+[job.mutation.mutation]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 90
+permission = "contents-read"
+artifact-output = "mutation-report"
+command = "mutation-assurance"
+
+[job.regression-corpus.validate]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "contents-read"
+artifact-output = "none"
+command = "regression-corpus"
+
+[job.regression-subject.validate]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "contents-read"
+artifact-output = "none"
+command = "regression-subject"
+
+[job.release.resolve]
+needs = []
+runner = "ubuntu-24.04"
+timeout-minutes = 20
+permission = "read"
+artifact-output = "release-plan"
+command = "release-plan"
+
+[job.release.linux]
+needs = ["resolve"]
+runner = "ubuntu-24.04"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "release-linux"
+command = "release-linux"
+
+[job.release.macos]
+needs = ["resolve"]
+runner = "macos-15"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "release-macos"
+command = "release-macos"
+
+[job.release.windows]
+needs = ["resolve"]
+runner = "windows-2025"
+timeout-minutes = 180
+permission = "read"
+artifact-output = "release-windows"
+command = "release-windows"
+
+[job.release.assemble]
+needs = ["resolve", "linux", "macos", "windows"]
+runner = "ubuntu-24.04"
+timeout-minutes = 90
+permission = "read"
+artifact-output = "assembled-release"
+command = "release-assemble"
+
+[job.release.governance]
+needs = ["resolve", "linux", "macos", "windows", "assemble"]
+runner = "ubuntu-24.04"
+timeout-minutes = 90
+permission = "read"
+artifact-output = "release-governance"
+vector-artifact-output = "release-protocol-vectors"
+command = "release-governance-pre-attestation"
+
+[job.release.final-verify]
+needs = ["resolve", "assemble", "governance"]
+runner = "ubuntu-24.04"
+timeout-minutes = 60
+permission = "read"
+artifact-output = "verified-release"
+command = "release-final-verify"
+
+[job.release.attest]
+needs = ["resolve", "final-verify"]
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "attest"
+artifact-output = "attested-release"
+command = "release-stage-attestations"
+
+[job.release.publish]
+needs = ["resolve", "governance", "attest"]
+runner = "ubuntu-24.04"
+timeout-minutes = 30
+permission = "publish"
+artifact-output = "release-publication-reports"
+command = "release-publish"
+
+[platform.linux-x86_64]
+runner = "ubuntu-24.04"
+architecture = "x86_64"
+archive = "gnu-tar-v1-gzip-v1"
+gates = ["runner-identity", "native-environment-identity", "candidate-checkout", "oracle-checkout", "conformance-policy", "conformance-plan-binding", "case-catalog", "normalizer-catalog", "divergence-catalog", "verify", "format", "clippy", "workspace-tests", "documentation", "dependency-policy", "release-examples", "release-mutation-catalog", "linux-release-oracle-digest", "conformance-evidence", "divergence-prototypes", "release-build", "archive-verification", "package-smoke"]
+
+[platform.macos-aarch64]
+runner = "macos-15"
+architecture = "aarch64"
+archive = "gnu-tar-v1-gzip-v1"
+gates = ["runner-identity", "native-environment-identity", "candidate-checkout", "oracle-checkout", "conformance-plan-binding", "portability", "workspace-tests", "release-build", "native-oracle-build", "conformance-evidence", "divergence-prototypes", "archive-verification", "package-smoke"]
+
+[platform.windows-x86_64]
+runner = "windows-2025"
+architecture = "x86_64"
+archive = "gnu-tar-v1-gzip-v1"
+gates = ["runner-identity", "native-environment-identity", "candidate-checkout", "oracle-checkout", "conformance-plan-binding", "portability", "workspace-tests", "release-build", "native-oracle-build", "conformance-evidence", "divergence-prototypes", "archive-verification", "package-smoke"]
+
+[command.readiness-plan]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "plan", "--repository-root", "candidate", "--output", "readiness-plan"]
+credential = "none"
+
+[command.readiness-linux]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.readiness-macos]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "platform", "--platform", "macos-aarch64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.readiness-windows]
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.readiness-verify]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "verify", "--plan", "readiness-input/plan/readiness-plan.json", "--conformance-plan", "readiness-input/plan/conformance-plan.json", "--input", "readiness-input/platforms", "--output", "readiness-result"]
+credential = "none"
+
+[command.readiness-summarize]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "summarize", "--state-root", "readiness-state", "--input", "readiness-input", "--output", "readiness-summary"]
+credential = "none"
+
+[command.release-plan]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "plan", "--resolution", "release-state/resolution.json", "--repository-root", "candidate", "--output", "release-plan", "--report", "release-reports/plan.json"]
+credential = "github-token"
+
+[command.release-resolve]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "resolve", "--output", "release-state/resolution.json"]
+credential = "github-token"
+
+[command.release-linux]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.release-macos]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "platform", "--platform", "macos-aarch64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.release-windows]
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[command.release-assemble]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "assemble", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--input", "release-input/platforms", "--output", "release-bundle", "--report", "release-reports/assembly.json"]
+credential = "none"
+
+[command.release-materialize-protocol-vectors]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "materialize-protocol-vectors", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--bundle", "release-input/bundle", "--platform-input", "release-input/platforms", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--governance-post-assembly", "release-reports/governance-post-assembly.json", "--governance-pre-attestation", "release-reports/governance-pre-attestation.json", "--independent-verifier", "./independent-target/ci/hell-release-verifier", "--output", "release-protocol-vectors"]
+credential = "none"
+
+[command.release-check-remote-post-assembly]
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["check-remote-state", "--plan", "release-input/plan/release-plan.json", "--phase", "post-assembly", "--report", "release-reports/post-assembly-remote-state.json"]
+credential = "github-token"
+
+[command.release-governance-pre-attestation]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "governance-snapshot", "--policy", "automation/ci/governance-policy.toml", "--api-policy", "automation/ci/github-api.toml", "--plan", "release-input/plan/release-plan.json", "--baseline", "release-input/plan/governance-resolve.json", "--predecessor", "release-reports/governance-post-assembly.json", "--phase", "pre-attestation", "--output", "release-reports/governance-pre-attestation.json", "--report", "release-reports/governance-pre-attestation-report.json"]
+credential = "github-token"
+
+[command.release-final-verify]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "final-verify", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--bundle", "release-input/bundle", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--governance-post-assembly", "release-input/governance/governance-post-assembly.json", "--governance-pre-attestation", "release-input/governance/governance-pre-attestation.json", "--expected-artifact-digest", "$output:assemble.artifact.artifact-digest", "--independent-verifier", "./independent-target/ci/hell-release-verifier", "--output", "verified-release", "--report", "release-reports/final-verification.json"]
+credential = "none"
+
+[command.release-verify-vectors-primary]
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "verify-vectors", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--vectors-root", "release-input/protocol-vectors", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--output", "release-reports/primary-vector-report.json"]
+credential = "none"
+
+[command.release-verify-vectors-independent]
+executable = "./independent-target/ci/hell-release-verifier"
+arguments = ["verify-vectors", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--vectors-root", "release-input/protocol-vectors", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--output", "release-reports/independent-vector-report.json"]
+credential = "none"
+
+[command.release-stage-attestations]
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["stage-attestations", "--input", "verified-release", "--build-provenance-bundle", "$output:build-attestation.action.bundle-path", "--release-gate-bundle", "$output:release-gate-attestation.action.bundle-path", "--output", "attested-release"]
+credential = "none"
+
+[command.release-check-remote-pre-attestation]
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["check-remote-state", "--plan", "release-input/plan/release-plan.json", "--phase", "pre-attestation", "--report", "release-reports/pre-attestation-remote-state.json"]
+credential = "github-token"
+
+[command.release-publish]
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["publish", "--plan", "release-input/plan/release-plan.json", "--input", "attested-release", "--expected-artifact-id", "$output:attest.artifact.artifact-id", "--expected-artifact-digest", "$output:attest.artifact.artifact-digest", "--governance-baseline", "release-input/plan/governance-resolve.json", "--governance-receipt", "release-reports/governance-pre-publish.json", "--report", "release-reports/publication.json"]
+credential = "github-token"
+
+[command.nightly-linux]
+executable = "./target/ci/hell-ci"
+arguments = ["nightly", "--oracle", "ci-out/oracle/hell-linux-amd64", "--oracle-sha256", "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9", "--dependency-attestation", "ci-out/dependency-attestation.json", "--report", "ci-out/nightly-linux.json"]
+credential = "none"
+
+[command.nightly-linux-current]
+executable = "./target/ci/hell-ci"
+arguments = ["nightly", "--oracle", "ci-out/linux-release-oracle", "--oracle-sha256", "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9", "--dependency-attestation", "ci-out/dependency-policy.json", "--report", "ci-out/nightly-linux.json"]
+credential = "none"
+
+[command.fuzz-smoke]
+executable = "./target/ci/hell-ci"
+arguments = ["fuzz", "smoke", "--manifest", "ci/fuzz-targets.toml", "--repository-root", ".", "--output", "ci-out/fuzz-smoke.json"]
+credential = "none"
+
+[command.fuzz-current]
+executable = "./target/ci/hell-ci"
+arguments = ["fuzz-corpus", "prepare", "--input", "crates/hell-ci/fuzz/corpus", "--output", "ci-out/fuzz-corpora", "--to", "ci-out/fuzz-artifacts"]
+credential = "none"
+
+[command.nightly-macos]
+executable = "./target/ci/hell-ci"
+arguments = ["portability", "--report", "ci-out/nightly-macos.json"]
+credential = "none"
+
+[command.nightly-windows]
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["portability", "--report", "ci-out\\nightly-windows.json"]
+credential = "none"
+
+[command.mutation-assurance]
+executable = "./target/ci/hell-ci"
+arguments = ["mutation", "assurance", "--manifest", "compat/assurance-mutants.toml", "--repository-root", ".", "--output", "ci-out/mutation"]
+credential = "none"
+
+[command.assurance-render]
+executable = "./target/ci/hell-ci"
+arguments = ["assurance", "render", "--map", "spec/assurance-map.toml", "--output", "ci-out/assurance-map.md"]
+credential = "none"
+
+[command.assurance-check]
+executable = "./target/ci/hell-ci"
+arguments = ["assurance", "check", "--map", "spec/assurance-map.toml", "--repository-root", ".", "--output", "ci-out/assurance-check.json"]
+credential = "none"
+
+[command.mutation-run]
+executable = "./target/ci/hell-ci"
+arguments = ["mutation", "run", "--output", "ci-out/mutation/mutation-score.json"]
+credential = "none"
+
+[command.regression-corpus]
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
+credential = "none"
+
+[command.regression-subject]
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+credential = "none"
+
+[cache.cargo-downloads]
+paths = ["~/.cargo/registry/index", "~/.cargo/registry/cache", "~/.cargo/git/db"]
+key-inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml", "crates/**/Cargo.toml"]
+save-on-always = true
+
+[cache.primary-target]
+paths = ["target"]
+key-inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml", "crates/**/Cargo.toml", "**/build.rs", ".cargo/**", "crates/**/*.rs", "builtins/**", "compat/**", "fixtures/**", "baseline.toml", "deny.toml", "release-policy.toml", "ci/**", "spec/**", ".github/**"]
+save-on-always = true
+
+[cache.independent-verifier-target]
+paths = ["independent-target"]
+key-inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml", "crates/hell-release-verifier/Cargo.toml", "crates/hell-release-verifier/src/**", "ci/release-protocol/**", "compat/release-obligation-rules-v1.json", ".clippy.toml", "deny.toml"]
+save-on-always = true
+
+[cache.workflow-auditor-target]
+paths = ["workflow-auditor-target"]
+key-inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml", "crates/hell-workflow-auditor/Cargo.toml", "crates/hell-workflow-auditor/src/**", "ci/protocol/**", "ci/actions/**", ".github/workflows/**"]
+save-on-always = true
+
+[cache.publisher-target]
+paths = ["publisher-target"]
+key-inputs = ["rust-toolchain.toml", "Cargo.lock", "Cargo.toml", "crates/hell-release-publisher/Cargo.toml", "crates/hell-release-publisher/src/**", "ci/github-api.toml", "ci/governance-policy.toml"]
+save-on-always = true
+
+# BEGIN GENERATED PHYSICAL WORKFLOW MODEL
+
+[physical.workflow.ci]
+permission = "read"
+dispatch-inputs = []
+
+[physical.job.ci.plan]
+name = "Bind exact candidate readiness plan"
+outputs = ["artifact_id", "artifact_digest", "readiness_plan_digest", "conformance_plan_digest", "trusted_conformance_inputs_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s010", "s011", "s012", "s013", "s014", "s016", "s017", "s006", "s015", "s007", "s008", "s009"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+output.readiness_plan_digest = "${{ steps.plan.outputs.readiness_plan_digest }}"
+output.conformance_plan_digest = "${{ steps.plan.outputs.conformance_plan_digest }}"
+output.trusted_conformance_inputs_digest = "${{ steps.plan.outputs.trusted_conformance_inputs_digest }}"
+
+[physical.step.ci.plan.s000]
+name = "Check out exact candidate readiness driver"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.plan.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.plan.s002]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-plan-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.plan.s003]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-plan-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.step.ci.plan.s004]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.ci.plan.s005]
+name = "Build readiness driver and independent workflow auditor"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-workflow-auditor", "--bin", "hell-workflow-auditor"]
+credential = "none"
+
+[physical.step.ci.plan.s010]
+name = "Render the complete typed workflow protocol"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["protocol", "render", "--manifest", "candidate/ci/protocol/v1.toml", "--repository-root", "candidate", "--output", "ci-out/rendered-workflows"]
+credential = "none"
+
+[physical.step.ci.plan.s011]
+name = "Check exact live workflow protocol bytes"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["protocol", "check", "--manifest", "candidate/ci/protocol/v1.toml", "--repository-root", "candidate", "--workflows", "candidate/.github/workflows", "--report", "ci-out/protocol-check.json"]
+credential = "none"
+
+[physical.step.ci.plan.s012]
+name = "Audit live workflow semantics independently"
+kind = "run"
+executable = "./automation/target/ci/hell-workflow-auditor"
+arguments = ["audit", "--workflows", "candidate/.github/workflows", "--protocol-projection", "candidate/ci/protocol/v1.audit.json", "--action-metadata", "candidate/ci/actions/metadata-v1.json", "--output", "ci-out/workflow-audit.json"]
+credential = "none"
+
+[physical.step.ci.plan.s013]
+name = "Execute independent workflow protocol vectors"
+kind = "run"
+executable = "./automation/target/ci/hell-workflow-auditor"
+arguments = ["verify-vectors", "--manifest", "candidate/ci/workflow-vectors/v1/manifest.toml", "--workflows", "candidate/.github/workflows", "--protocol-projection", "candidate/ci/protocol/v1.audit.json", "--action-metadata", "candidate/ci/actions/metadata-v1.json", "--output", "ci-out/workflow-vector-audit.json"]
+credential = "none"
+
+[physical.step.ci.plan.s014]
+name = "Audit exact Rust environment and process capabilities"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["policy", "rust-capabilities", "--repository-root", "candidate", "--policy", "candidate/ci/rust-capabilities.toml", "--output", "ci-out/rust-capabilities.json"]
+credential = "none"
+
+[physical.step.ci.plan.s016]
+name = "Render the release assurance map"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["assurance", "render", "--map", "candidate/spec/assurance-map.toml", "--output", "ci-out/assurance-map.md"]
+credential = "none"
+
+[physical.step.ci.plan.s017]
+name = "Check release assurance bindings and documentation"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["assurance", "check", "--map", "spec/assurance-map.toml", "--repository-root", "candidate", "--output", "ci-out/assurance-check.json"]
+credential = "none"
+
+[physical.step.ci.plan.s006]
+name = "Create candidate-bound readiness and conformance plans"
+id = "plan"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "plan", "--repository-root", "candidate", "--output", "readiness-plan"]
+credential = "none"
+
+[physical.step.ci.plan.s015]
+name = "Retain workflow and capability control audits"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-control-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.plan.s007]
+name = "Upload exact readiness plan"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-plan-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "readiness-plan"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.plan.s008]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-plan-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.plan.s009]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-plan-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.job.ci.linux]
+name = "Technical readiness / Linux x86_64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015", "s016", "s017"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.ci.linux.s000]
+name = "Check out exact candidate readiness driver"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.linux.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.linux.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.linux.s003]
+name = "Download exact readiness plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.plan.outputs.artifact_id }}"
+with.path = "readiness-input"
+
+[physical.step.ci.linux.s004]
+name = "Install pinned Stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with.enable-stack = "true"
+with.stack-no-global = "true"
+with.stack-version = "3.11.1"
+
+[physical.step.ci.linux.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2"
+
+[physical.step.ci.linux.s006]
+name = "Restore cargo-deny compilation cache"
+id = "cargo-deny-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}"
+
+[physical.step.ci.linux.s007]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.linux.s008]
+name = "Restore candidate readiness-driver compilation cache"
+id = "automation-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.step.ci.linux.s009]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.ci.linux.s010]
+name = "Install pinned cargo-deny"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["install", "cargo-deny", "--locked", "--version", "0.20.2", "--force", "--target-dir", "../ci-tool-cache/cargo-deny-target"]
+credential = "none"
+
+[physical.step.ci.linux.s011]
+name = "Build readiness driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.ci.linux.s012]
+name = "Run Linux technical readiness gate"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.ci.linux.s013]
+name = "Upload exact Linux readiness result"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-linux-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.linux.s014]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2"
+
+[physical.step.ci.linux.s015]
+name = "Save cargo-deny compilation cache"
+if = "${{ always() && steps.cargo-deny-target-cache.outcome == 'success' && steps.cargo-deny-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}"
+
+[physical.step.ci.linux.s016]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.linux.s017]
+name = "Save candidate readiness-driver compilation cache"
+if = "${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.job.ci.macos]
+name = "Technical readiness / macOS aarch64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.ci.macos.s000]
+name = "Check out exact candidate readiness driver"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.macos.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.macos.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.macos.s003]
+name = "Download exact readiness plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.plan.outputs.artifact_id }}"
+with.path = "readiness-input"
+
+[physical.step.ci.macos.s004]
+name = "Install pinned Stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "ghc-version", "stack-version"]
+with.enable-stack = "true"
+with.ghc-version = "9.8.2"
+with.stack-version = "3.11.1"
+
+[physical.step.ci.macos.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.macos.s006]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.macos.s007]
+name = "Restore candidate readiness-driver compilation cache"
+id = "automation-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.step.ci.macos.s008]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.ci.macos.s009]
+name = "Expose pinned LLVM archiver"
+kind = "run"
+executable = "brew"
+arguments = ["link", "--force", "llvm@18"]
+credential = "none"
+
+[physical.step.ci.macos.s010]
+name = "Build readiness driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.ci.macos.s011]
+name = "Run macOS technical readiness gate"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "platform", "--platform", "macos-aarch64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.ci.macos.s012]
+name = "Upload exact macOS readiness result"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-macos-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.macos.s013]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.macos.s014]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.macos.s015]
+name = "Save candidate readiness-driver compilation cache"
+if = "${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.job.ci.windows]
+name = "Technical readiness / Windows x86_64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.ci.windows.s000]
+name = "Check out exact candidate readiness driver"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.windows.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.windows.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.windows.s003]
+name = "Download exact readiness plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.plan.outputs.artifact_id }}"
+with.path = "readiness-input"
+
+[physical.step.ci.windows.s004]
+name = "Install pinned Stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with.enable-stack = "true"
+with.stack-no-global = "true"
+with.stack-version = "3.11.1"
+
+[physical.step.ci.windows.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.windows.s006]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.windows.s007]
+name = "Restore candidate readiness-driver compilation cache"
+id = "automation-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.step.ci.windows.s008]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.ci.windows.s009]
+name = "Build readiness driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.ci.windows.s010]
+name = "Run Windows technical readiness gate"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.ci.windows.s011]
+name = "Upload exact Windows readiness result"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-windows-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.windows.s012]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.windows.s013]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml', 'candidate/**/build.rs', 'candidate/.cargo/**', 'candidate/crates/**/*.rs', 'candidate/builtins/**', 'candidate/compat/**', 'candidate/fixtures/**', 'candidate/baseline.toml', 'candidate/deny.toml', 'candidate/release-policy.toml', 'candidate/spec/**', 'candidate/.github/**') }}"
+
+[physical.step.ci.windows.s014]
+name = "Save candidate readiness-driver compilation cache"
+if = "${{ always() && steps.automation-target-cache.outcome == 'success' && steps.automation-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.job.ci.verify]
+name = "Blocker-zero technical release eligibility"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.ci.verify.s000]
+name = "Check out exact candidate readiness verifier"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.verify.s001]
+name = "Download exact readiness plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.plan.outputs.artifact_id }}"
+with.path = "readiness-input/plan"
+
+[physical.step.ci.verify.s002]
+name = "Download exact Linux result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.linux.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/linux-x86_64"
+
+[physical.step.ci.verify.s003]
+name = "Download exact macOS result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.macos.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/macos-aarch64"
+
+[physical.step.ci.verify.s004]
+name = "Download exact Windows result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.windows.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/windows-x86_64"
+
+[physical.step.ci.verify.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-verify-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.verify.s006]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-verify-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.step.ci.verify.s007]
+name = "Build readiness verifier"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.ci.verify.s008]
+name = "Reconstruct blocker-zero technical eligibility"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "verify", "--plan", "readiness-input/plan/readiness-plan.json", "--conformance-plan", "readiness-input/plan/conformance-plan.json", "--input", "readiness-input/platforms", "--output", "readiness-result"]
+credential = "none"
+
+[physical.step.ci.verify.s009]
+name = "Retain exact readiness decision"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-decision-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "readiness-result"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.verify.s010]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-verify-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.verify.s011]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-verify-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/builtins/**', 'automation/compat/**', 'automation/fixtures/**', 'automation/baseline.toml', 'automation/deny.toml', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.job.ci.summary]
+name = "Technical release readiness summary"
+if = "${{ !cancelled() }}"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015", "s016", "s017", "s018", "s019", "s020", "s021", "s022", "s023", "s024", "s025", "s026", "s027"]
+
+[physical.step.ci.summary.s000]
+name = "Check out exact candidate readiness summary driver"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.ci.summary.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-summary-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.summary.s002]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-summary-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/ci/**', 'automation/compat/**', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.step.ci.summary.s003]
+name = "Build readiness summary driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.ci.summary.s004]
+name = "Record successful plan job"
+if = "${{ needs.plan.result == 'success' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "plan", "--state", "success", "--artifact-id", "$output:plan.artifact.artifact-id", "--artifact-digest", "$output:plan.artifact.artifact-digest", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s005]
+name = "Record failed plan job"
+if = "${{ needs.plan.result == 'failure' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "plan", "--state", "failure", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s006]
+name = "Record skipped plan job"
+if = "${{ needs.plan.result == 'skipped' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "plan", "--state", "skipped", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s007]
+name = "Record successful Linux job"
+if = "${{ needs.linux.result == 'success' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "linux", "--state", "success", "--artifact-id", "$output:linux.artifact.artifact-id", "--artifact-digest", "$output:linux.artifact.artifact-digest", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s008]
+name = "Record failed Linux job"
+if = "${{ needs.linux.result == 'failure' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "linux", "--state", "failure", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s009]
+name = "Record skipped Linux job"
+if = "${{ needs.linux.result == 'skipped' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "linux", "--state", "skipped", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s010]
+name = "Record successful macOS job"
+if = "${{ needs.macos.result == 'success' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "macos", "--state", "success", "--artifact-id", "$output:macos.artifact.artifact-id", "--artifact-digest", "$output:macos.artifact.artifact-digest", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s011]
+name = "Record failed macOS job"
+if = "${{ needs.macos.result == 'failure' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "macos", "--state", "failure", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s012]
+name = "Record skipped macOS job"
+if = "${{ needs.macos.result == 'skipped' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "macos", "--state", "skipped", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s013]
+name = "Record successful Windows job"
+if = "${{ needs.windows.result == 'success' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "windows", "--state", "success", "--artifact-id", "$output:windows.artifact.artifact-id", "--artifact-digest", "$output:windows.artifact.artifact-digest", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s014]
+name = "Record failed Windows job"
+if = "${{ needs.windows.result == 'failure' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "windows", "--state", "failure", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s015]
+name = "Record skipped Windows job"
+if = "${{ needs.windows.result == 'skipped' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "windows", "--state", "skipped", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s016]
+name = "Record successful verifier job"
+if = "${{ needs.verify.result == 'success' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "verify", "--state", "success", "--artifact-id", "$output:verify.artifact.artifact-id", "--artifact-digest", "$output:verify.artifact.artifact-digest", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s017]
+name = "Record failed verifier job"
+if = "${{ needs.verify.result == 'failure' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "verify", "--state", "failure", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s018]
+name = "Record skipped verifier job"
+if = "${{ needs.verify.result == 'skipped' }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "record-job-state", "--job", "verify", "--state", "skipped", "--output", "readiness-state"]
+credential = "none"
+
+[physical.step.ci.summary.s019]
+name = "Download exact readiness plan when available"
+if = "${{ needs.plan.outputs.artifact_id != '' }}"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.plan.outputs.artifact_id }}"
+with.path = "readiness-input/plan"
+
+[physical.step.ci.summary.s020]
+name = "Download exact Linux result when available"
+if = "${{ needs.linux.outputs.artifact_id != '' }}"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.linux.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/linux-x86_64"
+
+[physical.step.ci.summary.s021]
+name = "Download exact macOS result when available"
+if = "${{ needs.macos.outputs.artifact_id != '' }}"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.macos.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/macos-aarch64"
+
+[physical.step.ci.summary.s022]
+name = "Download exact Windows result when available"
+if = "${{ needs.windows.outputs.artifact_id != '' }}"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.windows.outputs.artifact_id }}"
+with.path = "readiness-input/platforms/windows-x86_64"
+
+[physical.step.ci.summary.s023]
+name = "Download exact verifier result when available"
+if = "${{ needs.verify.outputs.artifact_id != '' }}"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.verify.outputs.artifact_id }}"
+with.path = "readiness-input/verifier"
+
+[physical.step.ci.summary.s024]
+name = "Derive failure-terminal readiness decision"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["readiness", "summarize", "--state-root", "readiness-state", "--input", "readiness-input", "--output", "readiness-summary"]
+credential = "none"
+
+[physical.step.ci.summary.s025]
+name = "Retain failure-terminal readiness summary"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "readiness-summary-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "readiness-summary"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.ci.summary.s026]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "readiness-summary-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml') }}"
+
+[physical.step.ci.summary.s027]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "readiness-summary-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/**/build.rs', 'automation/.cargo/**', 'automation/crates/**/*.rs', 'automation/ci/**', 'automation/compat/**', 'automation/release-policy.toml', 'automation/spec/**', 'automation/.github/**') }}"
+
+[physical.workflow.mutation]
+permission = "contents-read"
+dispatch-inputs = []
+
+[physical.job.mutation.mutation]
+name = "Release-relevant advisory mutation catalog"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009"]
+
+[physical.step.mutation.mutation.s000]
+name = "Check out exact pushed source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.mutation.mutation.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "mutation-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.mutation.mutation.s002]
+name = "Restore mutation compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.mutation.mutation.s003]
+name = "Build mutation driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.mutation.mutation.s004]
+name = "Render release assurance map"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["assurance", "render", "--map", "spec/assurance-map.toml", "--output", "ci-out/assurance-map.md"]
+credential = "none"
+
+[physical.step.mutation.mutation.s005]
+name = "Check release assurance map"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["assurance", "check", "--map", "spec/assurance-map.toml", "--repository-root", ".", "--output", "ci-out/assurance-check.json"]
+credential = "none"
+
+[physical.step.mutation.mutation.s006]
+name = "Execute source-bound release assurance mutants"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["mutation", "assurance", "--manifest", "compat/assurance-mutants.toml", "--repository-root", ".", "--output", "ci-out/mutation"]
+credential = "none"
+
+[physical.step.mutation.mutation.s007]
+name = "Upload advisory mutation evidence"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "mutation-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out/mutation\nci-out/assurance-check.json\nci-out/assurance-map.md\n"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.mutation.mutation.s008]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "mutation-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.mutation.mutation.s009]
+name = "Save mutation compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.workflow.nightly]
+permission = "contents-read"
+dispatch-inputs = []
+
+[physical.job.nightly.linux]
+name = "Extended verification / Linux"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013"]
+
+[physical.step.nightly.linux.s000]
+name = "Check out exact source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.linux.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-linux-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.linux.s002]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-linux-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.linux.s003]
+name = "Install pinned cargo-deny"
+kind = "run"
+executable = "cargo"
+arguments = ["install", "cargo-deny", "--locked", "--version", "0.20.2", "--force", "--target-dir", "ci-tool-cache/cargo-deny-target"]
+credential = "none"
+
+[physical.step.nightly.linux.s004]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.nightly.linux.s005]
+name = "Build debug candidate"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--package", "hell-cli", "--bin", "hell", "--features", "compat-tracing"]
+credential = "none"
+
+[physical.step.nightly.linux.s006]
+name = "Record dependency policy"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["dependency-attestation", "--output", "ci-out/dependency-policy.json", "--report", "ci-out/dependency-policy-report.json"]
+credential = "none"
+
+[physical.step.nightly.linux.s007]
+name = "Acquire pinned Linux oracle"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["oracle-acquire", "acquire", "--artifact", "ci-out/linux-release-oracle", "--provider-response", "ci-out/linux-release-provider.json", "--receipt", "ci-out/linux-release-oracle-receipt.json"]
+credential = "none"
+
+[physical.step.nightly.linux.s008]
+name = "Run extended Linux oracle suite"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["nightly", "--oracle", "ci-out/linux-release-oracle", "--oracle-sha256", "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9", "--dependency-attestation", "ci-out/dependency-policy.json", "--report", "ci-out/nightly-linux.json"]
+credential = "none"
+
+[physical.step.nightly.linux.s009]
+name = "Expand generated regression corpus candidates"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["regression-import", "explore-generated", "--input", "ci-out", "--output", "ci-out/regression-exploration"]
+credential = "none"
+
+[physical.step.nightly.linux.s010]
+name = "Verify retained divergence prototype catalog"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["divergence-prototype", "verify"]
+credential = "none"
+
+[physical.step.nightly.linux.s011]
+name = "Upload nightly bounded compatibility evidence"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "nightly-linux-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out"
+with.if-no-files-found = "ignore"
+with.retention-days = "30"
+
+[physical.step.nightly.linux.s012]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-linux-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.linux.s013]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-linux-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.job.nightly.fuzz]
+name = "Broad parser and evidence fuzzing"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+
+[physical.step.nightly.fuzz.s000]
+name = "Check out exact source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.fuzz.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-fuzz-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'crates/hell-ci/fuzz/Cargo.lock', 'crates/hell-release-verifier/fuzz/Cargo.lock', 'crates/hell-workflow-auditor/fuzz/Cargo.lock') }}-cargo-fuzz-0.13.2"
+
+[physical.step.nightly.fuzz.s002]
+name = "Restore cargo-fuzz compilation cache"
+id = "cargo-fuzz-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-fuzz-target"
+with.key = "nightly-fuzz-${{ runner.os }}-${{ runner.arch }}-cargo-fuzz-target-0.13.2-${{ hashFiles('rust-toolchain.toml') }}"
+
+[physical.step.nightly.fuzz.s003]
+name = "Restore fuzz compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "crates/hell-ci/fuzz/target\ncrates/hell-release-verifier/fuzz/target\ncrates/hell-workflow-auditor/fuzz/target\n"
+with.key = "nightly-fuzz-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'crates/hell-ci/fuzz/**', 'crates/hell-release-verifier/fuzz/**', 'crates/hell-workflow-auditor/fuzz/**', 'ci/fuzz-targets.toml', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.fuzz.s004]
+name = "Restore CI driver compilation cache"
+id = "driver-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-fuzz-driver-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.fuzz.s005]
+name = "Install pinned nightly toolchain"
+kind = "run"
+executable = "rustup"
+arguments = ["toolchain", "install", "nightly-2026-07-31", "--profile", "minimal"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s006]
+name = "Install pinned cargo-fuzz"
+kind = "run"
+executable = "cargo"
+arguments = ["+nightly-2026-07-31", "install", "cargo-fuzz", "--version", "0.13.2", "--locked", "--force", "--target-dir", "ci-tool-cache/cargo-fuzz-target"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s007]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s008]
+name = "Run complete bounded fuzz matrix"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["fuzz", "smoke", "--manifest", "ci/fuzz-targets.toml", "--repository-root", ".", "--output", "ci-out/fuzz-smoke.json"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s009]
+name = "Retain bounded fuzz report"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "fuzz-smoke-report-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out/fuzz-smoke.json"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.nightly.fuzz.s010]
+name = "Retain evolving fuzz corpora"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "fuzz-corpora-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out/fuzz-corpora"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.nightly.fuzz.s011]
+name = "Retain fuzz crash artifacts"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "fuzz-crashes-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out/fuzz-artifacts"
+with.if-no-files-found = "ignore"
+with.retention-days = "90"
+
+[physical.step.nightly.fuzz.s012]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-fuzz-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'crates/hell-ci/fuzz/Cargo.lock', 'crates/hell-release-verifier/fuzz/Cargo.lock', 'crates/hell-workflow-auditor/fuzz/Cargo.lock') }}-cargo-fuzz-0.13.2"
+
+[physical.step.nightly.fuzz.s013]
+name = "Save cargo-fuzz compilation cache"
+if = "${{ always() && steps.cargo-fuzz-target-cache.outcome == 'success' && steps.cargo-fuzz-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-fuzz-target"
+with.key = "nightly-fuzz-${{ runner.os }}-${{ runner.arch }}-cargo-fuzz-target-0.13.2-${{ hashFiles('rust-toolchain.toml') }}"
+
+[physical.step.nightly.fuzz.s014]
+name = "Save fuzz compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "crates/hell-ci/fuzz/target\ncrates/hell-release-verifier/fuzz/target\ncrates/hell-workflow-auditor/fuzz/target\n"
+with.key = "nightly-fuzz-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'crates/hell-ci/fuzz/**', 'crates/hell-release-verifier/fuzz/**', 'crates/hell-workflow-auditor/fuzz/**', 'ci/fuzz-targets.toml', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.fuzz.s015]
+name = "Save CI driver compilation cache"
+if = "${{ always() && steps.driver-target-cache.outcome == 'success' && steps.driver-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-fuzz-driver-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.job.nightly.macos]
+name = "Extended portability / macOS"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+
+[physical.step.nightly.macos.s000]
+name = "Check out exact source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.macos.s001]
+name = "Check out pinned upstream source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.macos.s002]
+name = "Install pinned Stack"
+id = "setup-stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "ghc-version", "stack-version"]
+with.enable-stack = "true"
+with.ghc-version = "9.8.2"
+with.stack-version = "3.11.1"
+
+[physical.step.nightly.macos.s003]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-macos-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.macos.s004]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-macos-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.macos.s005]
+name = "Restore Stack cache"
+id = "stack-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "${{ steps.setup-stack.outputs.stack-root }}"
+with.key = "nightly-macos-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-ghc-9.8.2-llvm-18.1.8-oracle-8e952cf9de4ab25d7716982a9ca234f9bdcf1bff-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**', 'crates/hell-ci/src/command.rs') }}"
+
+[physical.step.nightly.macos.s006]
+name = "Expose pinned LLVM archiver"
+kind = "run"
+executable = "brew"
+arguments = ["link", "--force", "llvm@18"]
+credential = "none"
+
+[physical.step.nightly.macos.s007]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.nightly.macos.s008]
+name = "Build release candidate"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--release", "--locked", "--package", "hell-cli", "--bin", "hell", "--features", "compat-tracing"]
+credential = "none"
+
+[physical.step.nightly.macos.s009]
+name = "Run extended macOS portability"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["portability", "--report", "ci-out/nightly-macos.json"]
+credential = "none"
+
+[physical.step.nightly.macos.s010]
+name = "Record dependency policy"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["dependency-attestation", "--output", "ci-out/dependency-policy.json", "--report", "ci-out/dependency-policy-report.json"]
+credential = "none"
+
+[physical.step.nightly.macos.s011]
+name = "Build pinned oracle and run macOS drift shard"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["native-oracle-shard", "--source", "oracle-source", "--platform", "macos-arm64", "--dependency-attestation", "ci-out/dependency-policy.json", "--report", "ci-out/macos-oracle.json"]
+credential = "none"
+
+[physical.step.nightly.macos.s012]
+name = "Upload nightly report"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "nightly-macos-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out"
+with.if-no-files-found = "ignore"
+with.retention-days = "30"
+
+[physical.step.nightly.macos.s013]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-macos-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.macos.s014]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-macos-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.macos.s015]
+name = "Save Stack cache"
+if = "${{ always() && steps.stack-cache.outcome == 'success' && steps.stack-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "${{ steps.setup-stack.outputs.stack-root }}"
+with.key = "nightly-macos-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-ghc-9.8.2-llvm-18.1.8-oracle-8e952cf9de4ab25d7716982a9ca234f9bdcf1bff-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**', 'crates/hell-ci/src/command.rs') }}"
+
+[physical.job.nightly.windows]
+name = "Extended portability / Windows"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014"]
+
+[physical.step.nightly.windows.s000]
+name = "Check out exact source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.windows.s001]
+name = "Check out pinned upstream source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.nightly.windows.s002]
+name = "Install pinned Stack"
+id = "setup-stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with.enable-stack = "true"
+with.stack-no-global = "true"
+with.stack-version = "3.11.1"
+
+[physical.step.nightly.windows.s003]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-windows-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.windows.s004]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-windows-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.windows.s005]
+name = "Restore Stack cache"
+id = "stack-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "${{ steps.setup-stack.outputs.stack-root }}\noracle-source/.stack-work\n"
+with.key = "nightly-windows-stack-3.11.1-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
+
+[physical.step.nightly.windows.s006]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.nightly.windows.s007]
+name = "Build release candidate"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--release", "--locked", "--package", "hell-cli", "--bin", "hell", "--features", "compat-tracing"]
+credential = "none"
+
+[physical.step.nightly.windows.s008]
+name = "Run extended Windows portability"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["portability", "--report", "ci-out\\nightly-windows.json"]
+credential = "none"
+
+[physical.step.nightly.windows.s009]
+name = "Record dependency policy"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["dependency-attestation", "--output", "ci-out\\dependency-policy.json", "--report", "ci-out\\dependency-policy-report.json"]
+credential = "none"
+
+[physical.step.nightly.windows.s010]
+name = "Build pinned oracle and run Windows drift shard"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["native-oracle-shard", "--source", "oracle-source", "--platform", "windows-amd64", "--dependency-attestation", "ci-out\\dependency-policy.json", "--report", "ci-out\\windows-oracle.json"]
+credential = "none"
+
+[physical.step.nightly.windows.s011]
+name = "Upload nightly report"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "nightly-windows-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "ci-out"
+with.if-no-files-found = "ignore"
+with.retention-days = "30"
+
+[physical.step.nightly.windows.s012]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "nightly-windows-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.nightly.windows.s013]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "nightly-windows-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.windows.s014]
+name = "Save Stack cache"
+if = "${{ always() && steps.stack-cache.outcome == 'success' && steps.stack-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "${{ steps.setup-stack.outputs.stack-root }}\noracle-source/.stack-work\n"
+with.key = "nightly-windows-stack-3.11.1-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
+
+[physical.workflow.regression-corpus]
+permission = "contents-read"
+dispatch-inputs = []
+
+[physical.job.regression-corpus.validate]
+name = "Validate committed regression corpus"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006"]
+
+[physical.step.regression-corpus.validate.s000]
+name = "Check out exact pushed source"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.regression-corpus.validate.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "regression-corpus-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.regression-corpus.validate.s002]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "regression-corpus-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.regression-corpus.validate.s003]
+name = "Validate typed corpus tests"
+kind = "run"
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s004]
+name = "Validate CLI oracle regressions"
+kind = "run"
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s005]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "regression-corpus-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.regression-corpus.validate.s006]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "regression-corpus-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.workflow.regression-subject]
+permission = "contents-read"
+dispatch-inputs = []
+
+[physical.job.regression-subject.validate]
+name = "Revalidate exact pushed subject"
+outputs = []
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006"]
+
+[physical.step.regression-subject.validate.s000]
+name = "Check out exact pushed subject"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.sha }}"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.regression-subject.validate.s001]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "regression-subject-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.regression-subject.validate.s002]
+name = "Restore compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.regression-subject.validate.s003]
+name = "Run typed corpus tests"
+kind = "run"
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s004]
+name = "Run CLI oracle regressions"
+kind = "run"
+executable = "cargo"
+arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s005]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "regression-subject-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}"
+
+[physical.step.regression-subject.validate.s006]
+name = "Save compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "target"
+with.key = "regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.workflow.release]
+run-name = "Release candidate ${{ inputs.candidate_branch }} by @${{ github.actor }}"
+permission = "read"
+dispatch-inputs = ["candidate_branch"]
+
+[physical.workflow.release.dispatch-input.candidate_branch]
+description = "Same-repository branch to resolve and release"
+required = true
+type = "string"
+
+[physical.job.release.resolve]
+name = "Resolve and plan"
+outputs = ["candidate_sha", "version", "tag", "plan_digest", "build_inputs_digest", "conformance_plan_digest", "trusted_conformance_inputs_digest", "plan_artifact_id", "plan_artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s009", "s007", "s008"]
+output.candidate_sha = "${{ steps.resolve.outputs.candidate_sha }}"
+output.version = "${{ steps.plan.outputs.version }}"
+output.tag = "${{ steps.plan.outputs.tag }}"
+output.plan_digest = "${{ steps.plan.outputs.plan_digest }}"
+output.build_inputs_digest = "${{ steps.plan.outputs.build_inputs_digest }}"
+output.conformance_plan_digest = "${{ steps.plan.outputs.conformance_plan_digest }}"
+output.trusted_conformance_inputs_digest = "${{ steps.plan.outputs.trusted_conformance_inputs_digest }}"
+output.plan_artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.plan_artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.resolve.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.resolve.s001]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-resolve-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}"
+
+[physical.step.release.resolve.s002]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.release.resolve.s003]
+name = "Build trusted release driver and minimal publisher"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-release-publisher", "--bin", "hell-release-publisher"]
+credential = "none"
+
+[physical.step.release.resolve.s004]
+name = "Resolve candidate branch"
+id = "resolve"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "resolve", "--output", "release-state/resolution.json"]
+credential = "github-token"
+
+[physical.step.release.resolve.s005]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ steps.resolve.outputs.candidate_sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.resolve.s006]
+name = "Create canonical release and conformance plans"
+id = "plan"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "plan", "--resolution", "release-state/resolution.json", "--repository-root", "candidate", "--output", "release-plan", "--report", "release-reports/plan.json"]
+credential = "github-token"
+
+[physical.step.release.resolve.s009]
+name = "Record the plan-bound governance baseline"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "governance-snapshot", "--policy", "automation/ci/governance-policy.toml", "--api-policy", "automation/ci/github-api.toml", "--plan", "release-plan/release-plan.json", "--phase", "resolve", "--output", "release-plan/governance-resolve.json", "--report", "release-reports/governance-resolve.json"]
+credential = "github-token"
+
+[physical.step.release.resolve.s007]
+name = "Upload exact release plan"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-plan-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-plan"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.resolve.s008]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-resolve-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}"
+
+[physical.job.release.linux]
+name = "Release gate / Linux x86_64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.linux.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.linux.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ needs.resolve.outputs.candidate_sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.linux.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.linux.s003]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input"
+
+[physical.step.release.linux.s004]
+name = "Install pinned Stack"
+id = "setup-stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with.enable-stack = "true"
+with.stack-no-global = "true"
+with.stack-version = "3.11.1"
+
+[physical.step.release.linux.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2"
+
+[physical.step.release.linux.s006]
+name = "Restore cargo-deny compilation cache"
+id = "cargo-deny-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "release-linux-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2"
+
+[physical.step.release.linux.s007]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.linux.s008]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.release.linux.s009]
+name = "Install pinned cargo-deny"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["install", "cargo-deny", "--locked", "--version", "0.20.2", "--force", "--target-dir", "../ci-tool-cache/cargo-deny-target"]
+credential = "none"
+
+[physical.step.release.linux.s010]
+name = "Build trusted release driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.release.linux.s011]
+name = "Run Linux release gate, collect conformance evidence, and package"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.release.linux.s012]
+name = "Upload exact Linux result"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-linux-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.linux.s013]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2"
+
+[physical.step.release.linux.s014]
+name = "Save cargo-deny compilation cache"
+if = "${{ always() && steps.cargo-deny-target-cache.outcome == 'success' && steps.cargo-deny-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "release-linux-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2"
+
+[physical.step.release.linux.s015]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.job.release.macos]
+name = "Release gate / macOS aarch64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.macos.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.macos.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ needs.resolve.outputs.candidate_sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.macos.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.macos.s003]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input"
+
+[physical.step.release.macos.s004]
+name = "Install pinned Stack"
+id = "setup-stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "ghc-version", "stack-version"]
+with.enable-stack = "true"
+with.ghc-version = "9.8.2"
+with.stack-version = "3.11.1"
+
+[physical.step.release.macos.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.macos.s006]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-macos-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.macos.s007]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.release.macos.s008]
+name = "Expose pinned LLVM archiver"
+kind = "run"
+executable = "brew"
+arguments = ["link", "--force", "llvm@18"]
+credential = "none"
+
+[physical.step.release.macos.s009]
+name = "Build trusted release driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.release.macos.s010]
+name = "Run macOS release gate, collect conformance evidence, and package"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "platform", "--platform", "macos-aarch64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.release.macos.s011]
+name = "Upload exact macOS result"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-macos-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.macos.s012]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.macos.s013]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-macos-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.job.release.windows]
+name = "Release gate / Windows x86_64"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.windows.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.windows.s001]
+name = "Check out exact candidate"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ needs.resolve.outputs.candidate_sha }}"
+with.path = "candidate"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.windows.s002]
+name = "Check out pinned upstream oracle source"
+kind = "action"
+action = "checkout"
+with-order = ["repository", "ref", "path", "fetch-depth", "persist-credentials"]
+with.repository = "chrisdone/hell"
+with.ref = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+with.path = "oracle-source"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.windows.s003]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input"
+
+[physical.step.release.windows.s004]
+name = "Install pinned Stack"
+id = "setup-stack"
+kind = "action"
+action = "haskell-setup"
+with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with.enable-stack = "true"
+with.stack-no-global = "true"
+with.stack-version = "3.11.1"
+
+[physical.step.release.windows.s005]
+name = "Restore Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-windows-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.windows.s006]
+name = "Restore candidate compilation cache"
+id = "target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-windows-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.windows.s007]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.release.windows.s008]
+name = "Build trusted release driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-testkit", "--bin", "hell-test-helper"]
+credential = "none"
+
+[physical.step.release.windows.s009]
+name = "Run Windows release gate, collect conformance evidence, and package"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+credential = "none"
+
+[physical.step.release.windows.s010]
+name = "Upload exact Windows result"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-windows-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.windows.s011]
+name = "Save Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-windows-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.windows.s012]
+name = "Save candidate compilation cache"
+if = "${{ always() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "candidate-target"
+with.key = "release-windows-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.job.release.assemble]
+name = "Assemble exact release bundle"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s007", "s009", "s011", "s012", "s013", "s015"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.assemble.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.assemble.s001]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input/plan"
+
+[physical.step.release.assemble.s002]
+name = "Download exact Linux result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.linux.outputs.artifact_id }}"
+with.path = "release-input/platforms/linux-x86_64"
+
+[physical.step.release.assemble.s003]
+name = "Download exact macOS result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.macos.outputs.artifact_id }}"
+with.path = "release-input/platforms/macos-aarch64"
+
+[physical.step.release.assemble.s004]
+name = "Download exact Windows result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.windows.outputs.artifact_id }}"
+with.path = "release-input/platforms/windows-x86_64"
+
+[physical.step.release.assemble.s005]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-assemble-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}"
+
+[physical.step.release.assemble.s007]
+name = "Build trusted release driver"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.release.assemble.s009]
+name = "Assemble, derive, and verify exact release set"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "assemble", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--input", "release-input/platforms", "--output", "release-bundle", "--report", "release-reports/assembly.json"]
+credential = "none"
+
+[physical.step.release.assemble.s011]
+name = "Recheck remote state after assembly"
+kind = "run"
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["check-remote-state", "--plan", "release-input/plan/release-plan.json", "--phase", "post-assembly", "--report", "release-reports/post-assembly-remote-state.json"]
+credential = "github-token"
+
+[physical.step.release.assemble.s012]
+name = "Retain release assembly diagnostics"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-conformance-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-reports"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.assemble.s013]
+name = "Upload exact release bundle"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-bundle-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-bundle"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.assemble.s015]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-assemble-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/release-policy.toml', 'automation/compat/builtin-registry.json', 'automation/compat/requirements/2026-05-29.toml', 'automation/compat/claim-rules.toml', 'automation/compat/corpus-obligations.toml', 'automation/compat/normalizers.toml', 'automation/compat/divergences.toml', 'automation/compat/expected-mismatches.toml', 'automation/.github/release/conformance-exemptions.toml') }}"
+
+[physical.job.release.governance]
+name = "Recheck plan-bound release governance"
+outputs = ["artifact_id", "artifact_digest", "vector_artifact_id", "vector_artifact_digest"]
+steps = ["s000", "s001", "s009", "s010", "s011", "s012", "s002", "s013", "s003", "s004", "s014", "s005", "s006", "s015", "s007", "s016", "s008", "s017"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+output.vector_artifact_id = "${{ steps.upload-vectors.outputs.artifact-id }}"
+output.vector_artifact_digest = "${{ steps.upload-vectors.outputs.artifact-digest }}"
+
+[physical.step.release.governance.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.governance.s001]
+name = "Download exact release plan and governance baseline"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input/plan"
+
+[physical.step.release.governance.s009]
+name = "Download exact assembled release bundle"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.assemble.outputs.artifact_id }}"
+with.path = "release-input/bundle"
+
+[physical.step.release.governance.s010]
+name = "Download exact Linux result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.linux.outputs.artifact_id }}"
+with.path = "release-input/platforms/linux-x86_64"
+
+[physical.step.release.governance.s011]
+name = "Download exact macOS result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.macos.outputs.artifact_id }}"
+with.path = "release-input/platforms/macos-aarch64"
+
+[physical.step.release.governance.s012]
+name = "Download exact Windows result"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.windows.outputs.artifact_id }}"
+with.path = "release-input/platforms/windows-x86_64"
+
+[physical.step.release.governance.s002]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-governance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/ci/governance-policy.toml', 'automation/ci/github-api.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.governance.s013]
+name = "Restore independent verifier compilation cache"
+id = "independent-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "independent-target"
+with.key = "release-governance-independent-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/ci/release-protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/.clippy.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.governance.s003]
+name = "Resolve pinned Rust toolchain"
+working-directory = "automation"
+kind = "run"
+executable = "rustup"
+arguments = ["show", "active-toolchain"]
+credential = "none"
+
+[physical.step.release.governance.s004]
+name = "Build trusted governance observer and protocol materializer"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.release.governance.s014]
+name = "Build independent release verifier for protocol qualification"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-release-verifier", "--bin", "hell-release-verifier", "--target-dir", "../independent-target"]
+credential = "none"
+
+[physical.step.release.governance.s005]
+name = "Recheck governance after assembly"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "governance-snapshot", "--policy", "automation/ci/governance-policy.toml", "--api-policy", "automation/ci/github-api.toml", "--plan", "release-input/plan/release-plan.json", "--baseline", "release-input/plan/governance-resolve.json", "--phase", "post-assembly", "--output", "release-reports/governance-post-assembly.json", "--report", "release-reports/governance-post-assembly-report.json"]
+credential = "github-token"
+
+[physical.step.release.governance.s006]
+name = "Recheck governance before attestation"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "governance-snapshot", "--policy", "automation/ci/governance-policy.toml", "--api-policy", "automation/ci/github-api.toml", "--plan", "release-input/plan/release-plan.json", "--baseline", "release-input/plan/governance-resolve.json", "--predecessor", "release-reports/governance-post-assembly.json", "--phase", "pre-attestation", "--output", "release-reports/governance-pre-attestation.json", "--report", "release-reports/governance-pre-attestation-report.json"]
+credential = "github-token"
+
+[physical.step.release.governance.s015]
+name = "Materialize the authority-bearing release protocol corpus"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "materialize-protocol-vectors", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--bundle", "release-input/bundle", "--platform-input", "release-input/platforms", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--governance-post-assembly", "release-reports/governance-post-assembly.json", "--governance-pre-attestation", "release-reports/governance-pre-attestation.json", "--independent-verifier", "./independent-target/ci/hell-release-verifier", "--output", "release-protocol-vectors"]
+credential = "none"
+
+[physical.step.release.governance.s007]
+name = "Upload exact governance receipt chain"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-governance-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-reports"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.governance.s016]
+name = "Upload exact release protocol corpus"
+id = "upload-vectors"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-protocol-vectors-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-protocol-vectors"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.governance.s008]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-governance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/ci/governance-policy.toml', 'automation/ci/github-api.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.governance.s017]
+name = "Save independent verifier compilation cache"
+if = "${{ always() && steps.independent-target-cache.outcome == 'success' && steps.independent-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "independent-target"
+with.key = "release-governance-independent-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/ci/release-protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/.clippy.toml', 'automation/deny.toml') }}"
+
+[physical.job.release.final-verify]
+name = "Independently verify exact release authority"
+outputs = ["artifact_id", "artifact_digest", "assembled_artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s017", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015", "s016"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+output.assembled_artifact_digest = "${{ needs.assemble.outputs.artifact_digest }}"
+
+[physical.step.release.final-verify.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.final-verify.s001]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input/plan"
+
+[physical.step.release.final-verify.s002]
+name = "Download exact assembled release bundle"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.assemble.outputs.artifact_id }}"
+with.path = "release-input/bundle"
+
+[physical.step.release.final-verify.s003]
+name = "Download exact release protocol corpus"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.governance.outputs.vector_artifact_id }}"
+with.path = "release-input/protocol-vectors"
+
+[physical.step.release.final-verify.s004]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-final-verify-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/ci/release-protocol/**', 'automation/ci/protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/deny.toml') }}"
+
+[physical.step.release.final-verify.s005]
+name = "Restore primary verifier compilation cache"
+id = "primary-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "release-final-verify-primary-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/ci/**', 'automation/compat/**', 'automation/release-policy.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.final-verify.s006]
+name = "Restore independent verifier compilation cache"
+id = "independent-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "independent-target"
+with.key = "release-final-verify-independent-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/ci/release-protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/.clippy.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.final-verify.s007]
+name = "Build trusted primary verifier"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.release.final-verify.s008]
+name = "Build independent release verifier"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-release-verifier", "--bin", "hell-release-verifier", "--target-dir", "../independent-target"]
+credential = "none"
+
+[physical.step.release.final-verify.s009]
+name = "Execute the primary release protocol corpus"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "verify-vectors", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--vectors-root", "release-input/protocol-vectors", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--output", "release-reports/primary-vector-report.json"]
+credential = "none"
+
+[physical.step.release.final-verify.s010]
+name = "Execute the independent release protocol corpus"
+kind = "run"
+executable = "./independent-target/ci/hell-release-verifier"
+arguments = ["verify-vectors", "--manifest", "automation/ci/release-protocol/v1/manifest.toml", "--vectors-root", "release-input/protocol-vectors", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--output", "release-reports/independent-vector-report.json"]
+credential = "none"
+
+[physical.step.release.final-verify.s017]
+name = "Download exact governance receipt chain"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.governance.outputs.artifact_id }}"
+with.path = "release-input/governance"
+
+[physical.step.release.final-verify.s011]
+name = "Run dual deep verification and exact agreement"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "final-verify", "--plan", "release-input/plan/release-plan.json", "--conformance-plan", "release-input/plan/conformance-plan.json", "--bundle", "release-input/bundle", "--protocol-projection", "automation/ci/release-protocol/v1/projection.json", "--governance-post-assembly", "release-input/governance/governance-post-assembly.json", "--governance-pre-attestation", "release-input/governance/governance-pre-attestation.json", "--expected-artifact-digest", "$output:assemble.artifact.artifact-digest", "--independent-verifier", "./independent-target/ci/hell-release-verifier", "--output", "verified-release", "--report", "release-reports/final-verification.json"]
+credential = "none"
+
+[physical.step.release.final-verify.s012]
+name = "Retain final-verification diagnostics"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-final-verification-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-reports"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
+[physical.step.release.final-verify.s013]
+name = "Upload exact verified release set"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "verified-release-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "verified-release"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.final-verify.s014]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-final-verify-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'automation/ci/release-protocol/**', 'automation/ci/protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/deny.toml') }}"
+
+[physical.step.release.final-verify.s015]
+name = "Save primary verifier compilation cache"
+if = "${{ always() && steps.primary-target-cache.outcome == 'success' && steps.primary-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "automation/target"
+with.key = "release-final-verify-primary-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/ci/**', 'automation/compat/**', 'automation/release-policy.toml', 'automation/deny.toml') }}"
+
+[physical.step.release.final-verify.s016]
+name = "Save independent verifier compilation cache"
+if = "${{ always() && steps.independent-target-cache.outcome == 'success' && steps.independent-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "independent-target"
+with.key = "release-final-verify-independent-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/ci/release-protocol/**', 'automation/compat/release-obligation-rules-v1.json', 'automation/.clippy.toml', 'automation/deny.toml') }}"
+
+[physical.job.release.attest]
+name = "Attest exact verified release subjects"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
+
+[physical.step.release.attest.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.attest.s001]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input/plan"
+
+[physical.step.release.attest.s002]
+name = "Download exact verified release set"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.final-verify.outputs.artifact_id }}"
+with.path = "verified-release"
+
+[physical.step.release.attest.s003]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-attest-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-publisher/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/crates/hell-release-publisher/src/**', 'automation/ci/**', 'automation/deny.toml') }}"
+
+[physical.step.release.attest.s004]
+name = "Build trusted shallow verifier and attestation stager"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-release-verifier", "--bin", "hell-release-verifier", "--package", "hell-release-publisher", "--bin", "hell-release-publisher"]
+credential = "none"
+
+[physical.step.release.attest.s005]
+name = "Shallow-verify publication envelope and subject set"
+kind = "run"
+executable = "./automation/target/ci/hell-release-verifier"
+arguments = ["verify-envelope", "--envelope", "verified-release/publication-envelope.json", "--subject-root", "verified-release", "--expected-artifact-digest", "$output:final-verify.artifact.assembled-artifact-digest", "--output", "release-reports/attest-envelope.json"]
+credential = "none"
+
+[physical.step.release.attest.s006]
+name = "Recheck remote state before attestation"
+kind = "run"
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["check-remote-state", "--plan", "release-input/plan/release-plan.json", "--phase", "pre-attestation", "--report", "release-reports/pre-attestation-remote-state.json"]
+credential = "github-token"
+
+[physical.step.release.attest.s007]
+name = "Attest release subjects with build provenance"
+id = "build-attestation"
+kind = "action"
+action = "attest"
+with-order = ["subject-checksums"]
+with.subject-checksums = "verified-release/SUBJECTS.sha256"
+
+[physical.step.release.attest.s008]
+name = "Attest release subjects with the release-gate predicate"
+id = "release-gate-attestation"
+kind = "action"
+action = "attest"
+with-order = ["subject-checksums", "predicate-type", "predicate-path"]
+with.subject-checksums = "verified-release/SUBJECTS.sha256"
+with.predicate-type = "https://github.com/Portfoligno/hell-rs/attestations/release-gate/v2"
+with.predicate-path = "verified-release/release-gate.json"
+
+[physical.step.release.attest.s009]
+name = "Stage exact attestation bundles"
+kind = "run"
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["stage-attestations", "--input", "verified-release", "--build-provenance-bundle", "$output:build-attestation.action.bundle-path", "--release-gate-bundle", "$output:release-gate-attestation.action.bundle-path", "--output", "attested-release"]
+credential = "none"
+
+[physical.step.release.attest.s010]
+name = "Upload exact attested release set"
+id = "upload"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "attested-release-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "attested-release"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.attest.s011]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-attest-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-release-verifier/Cargo.toml', 'automation/crates/hell-release-publisher/Cargo.toml', 'automation/crates/hell-release-verifier/src/**', 'automation/crates/hell-release-publisher/src/**', 'automation/ci/**', 'automation/deny.toml') }}"
+
+[physical.job.release.publish]
+name = "Publish exact immutable release"
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s009", "s002", "s003", "s004", "s007", "s005", "s008", "s006"]
+output.artifact_id = "${{ steps.upload-reports.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload-reports.outputs.artifact-digest }}"
+
+[physical.step.release.publish.s000]
+name = "Check out trusted release automation"
+kind = "action"
+action = "checkout"
+with-order = ["ref", "path", "fetch-depth", "persist-credentials"]
+with.ref = "${{ github.workflow_sha }}"
+with.path = "automation"
+with.fetch-depth = "1"
+with.persist-credentials = "false"
+
+[physical.step.release.publish.s001]
+name = "Download exact release plan"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.resolve.outputs.plan_artifact_id }}"
+with.path = "release-input/plan"
+
+[physical.step.release.publish.s009]
+name = "Download exact governance receipt chain"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.governance.outputs.artifact_id }}"
+with.path = "release-input/governance"
+
+[physical.step.release.publish.s002]
+name = "Download exact attested release set"
+kind = "action"
+action = "download-artifact"
+with-order = ["digest-mismatch", "artifact-ids", "path"]
+with.digest-mismatch = "error"
+with.artifact-ids = "${{ needs.attest.outputs.artifact_id }}"
+with.path = "attested-release"
+
+[physical.step.release.publish.s003]
+name = "Restore trusted Cargo downloads"
+id = "cargo-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-publish-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/crates/hell-release-publisher/Cargo.toml', 'automation/crates/hell-release-publisher/src/**', 'automation/ci/**', 'automation/deny.toml') }}"
+
+[physical.step.release.publish.s004]
+name = "Build trusted governance observer and minimal publisher"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci", "--package", "hell-release-publisher", "--bin", "hell-release-publisher"]
+credential = "none"
+
+[physical.step.release.publish.s007]
+name = "Recheck governance before publication"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["release", "governance-snapshot", "--policy", "automation/ci/governance-policy.toml", "--api-policy", "automation/ci/github-api.toml", "--plan", "release-input/plan/release-plan.json", "--baseline", "release-input/plan/governance-resolve.json", "--predecessor", "release-input/governance/governance-pre-attestation.json", "--phase", "pre-publish", "--output", "release-reports/governance-pre-publish.json", "--report", "release-reports/governance-pre-publish-report.json"]
+credential = "github-token"
+
+[physical.step.release.publish.s005]
+name = "Publish exact immutable release"
+kind = "run"
+executable = "./automation/target/ci/hell-release-publisher"
+arguments = ["publish", "--plan", "release-input/plan/release-plan.json", "--input", "attested-release", "--expected-artifact-id", "$output:attest.artifact.artifact-id", "--expected-artifact-digest", "$output:attest.artifact.artifact-digest", "--governance-baseline", "release-input/plan/governance-resolve.json", "--governance-receipt", "release-reports/governance-pre-publish.json", "--report", "release-reports/publication.json"]
+credential = "github-token"
+
+[physical.step.release.publish.s008]
+name = "Retain publication and governance reports"
+id = "upload-reports"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "release-publication-reports-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "release-reports"
+with.if-no-files-found = "error"
+with.retention-days = "90"
+
+[physical.step.release.publish.s006]
+name = "Save trusted Cargo downloads"
+if = "${{ always() && steps.cargo-cache.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
+with.key = "release-publish-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/hell-ci/Cargo.toml', 'automation/crates/hell-ci/src/**', 'automation/crates/hell-release-publisher/Cargo.toml', 'automation/crates/hell-release-publisher/src/**', 'automation/ci/**', 'automation/deny.toml') }}"
+# END GENERATED PHYSICAL WORKFLOW MODEL

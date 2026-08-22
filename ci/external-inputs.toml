@@ -1,0 +1,57 @@
+schema-version = 1
+lock-id = "hell-rs-external-inputs-v1"
+
+[[input]]
+id = "upstream-oracle-source"
+kind = "git-commit"
+repository = "chrisdone/hell"
+commit = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff"
+acquisition-phase = "native-platform"
+
+[[input]]
+id = "linux-release-oracle"
+kind = "https-file"
+sha256 = "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9"
+maximum-compressed-bytes = 67108864
+maximum-expanded-bytes = 67108864
+media-type = "application/octet-stream"
+timeout-seconds = 300
+expected-filename = "hell-linux-amd64"
+platform = "linux-x86_64"
+acquisition-phase = "native-platform"
+cache-permitted = true
+
+[[input]]
+id = "stack"
+kind = "tool-version"
+version = "3.11.1"
+acquisition-phase = "native-platform"
+
+[[input]]
+id = "ghc"
+kind = "tool-version"
+version = "9.8.2"
+platforms = ["macos-aarch64", "windows-x86_64"]
+acquisition-phase = "native-platform"
+
+[[input]]
+id = "llvm"
+kind = "tool-version"
+version = "18.1.8"
+platforms = ["macos-aarch64"]
+acquisition-phase = "native-platform"
+
+[[input]]
+id = "cargo-deny"
+kind = "cargo-package"
+package = "cargo-deny"
+version = "0.20.2"
+acquisition-phase = "native-platform"
+
+[[input]]
+id = "cargo-fuzz"
+kind = "cargo-package"
+package = "cargo-fuzz"
+version = "0.13.2"
+toolchain = "nightly-2026-07-31"
+acquisition-phase = "fuzz"

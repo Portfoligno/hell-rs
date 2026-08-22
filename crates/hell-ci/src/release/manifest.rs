@@ -1,8 +1,12 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::json::{JsonValue, canonical_json_bytes, parse_json};
+
+const MAX_RELEASE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn read_json(path: &Path) -> Result<JsonValue, String> {
     let bytes = read_regular(path)?;
@@ -50,7 +54,6 @@ pub(crate) fn read_regular(path: &Path) -> Result<Vec<u8>, String> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    const MAX_RELEASE_FILE_BYTES: u64 = 256 * 1024 * 1024;
     if metadata.len() > MAX_RELEASE_FILE_BYTES {
         return Err(format!(
             "{} exceeds the release file size limit",
@@ -82,7 +85,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = options
         .open(&temporary)
         .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
-    use std::io::Write as _;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
@@ -92,7 +94,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 pub(crate) fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
@@ -110,7 +111,6 @@ pub(crate) fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), String> 
     let mut file = options
         .open(&temporary)
         .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
-    use std::io::Write as _;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(&temporary);

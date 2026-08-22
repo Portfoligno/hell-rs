@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -114,12 +115,18 @@ fn logical_leaf_alias_is_revalidated_and_executed_without_canonical_substitution
         fs::canonicalize(&invocation).unwrap().file_name()
     );
 
-    let output = Command::new(invocation)
-        .arg("__posix-logical-invocation-child")
-        .output()
-        .unwrap();
+    let mut command = Command::new(invocation);
+    command.arg("__posix-logical-invocation-child");
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(30))
+        .expect("run revalidated logical process invocation");
+    assert!(!output.timed_out);
+    assert!(!output.stdout.truncated);
+    assert!(!output.stderr.truncated);
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"pkill\n");
+    assert_eq!(
+        output.stdout.complete.as_deref(),
+        Some(b"pkill\n".as_slice())
+    );
 }
 
 #[test]

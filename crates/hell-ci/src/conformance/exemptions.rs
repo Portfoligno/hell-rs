@@ -7,6 +7,15 @@ use super::{
 };
 
 pub(crate) fn parse_release_exemptions(bytes: &[u8]) -> Result<Vec<PlannedExemption>, String> {
+    let blocks = parse_exemption_blocks(bytes)?;
+    let mut ids = BTreeSet::new();
+    blocks
+        .into_iter()
+        .map(|fields| parse_exemption(fields, &mut ids))
+        .collect()
+}
+
+fn parse_exemption_blocks(bytes: &[u8]) -> Result<Vec<BTreeMap<String, String>>, String> {
     if !bytes.ends_with(b"\n") {
         return Err("release exemption catalog lacks one trailing newline".to_owned());
     }
@@ -53,62 +62,62 @@ pub(crate) fn parse_release_exemptions(bytes: &[u8]) -> Result<Vec<PlannedExempt
         blocks.push(block);
     }
 
-    let mut ids = BTreeSet::new();
-    blocks
+    Ok(blocks)
+}
+
+fn parse_exemption(
+    mut fields: BTreeMap<String, String>,
+    ids: &mut BTreeSet<String>,
+) -> Result<PlannedExemption, String> {
+    let kind = take(&mut fields, "kind")?;
+    let kind = match kind.as_str() {
+        "known-divergence" => ExemptionKind::KnownDivergence,
+        "evidence-gap" => ExemptionKind::EvidenceGap,
+        _ => return Err(format!("unknown release exemption kind {kind:?}")),
+    };
+    let expected_mismatch_sha256 = fields.remove("expected_mismatch_sha256");
+    if matches!(kind, ExemptionKind::KnownDivergence) != expected_mismatch_sha256.is_some() {
+        return Err("release exemption mismatch digest contradicts its kind".to_owned());
+    }
+    let id = take(&mut fields, "id")?;
+    if !ids.insert(id.clone()) {
+        return Err(format!("duplicate release exemption ID {id}"));
+    }
+    let dimension = take(&mut fields, "dimension")?;
+    let dimension = CompatibilityDimension::ALL
         .into_iter()
-        .map(|mut fields| {
-            let kind = take(&mut fields, "kind")?;
-            let kind = match kind.as_str() {
-                "known-divergence" => ExemptionKind::KnownDivergence,
-                "evidence-gap" => ExemptionKind::EvidenceGap,
-                _ => return Err(format!("unknown release exemption kind {kind:?}")),
-            };
-            let expected_mismatch_sha256 = fields.remove("expected_mismatch_sha256");
-            if matches!(kind, ExemptionKind::KnownDivergence) != expected_mismatch_sha256.is_some()
-            {
-                return Err("release exemption mismatch digest contradicts its kind".to_owned());
-            }
-            let id = take(&mut fields, "id")?;
-            if !ids.insert(id.clone()) {
-                return Err(format!("duplicate release exemption ID {id}"));
-            }
-            let dimension = take(&mut fields, "dimension")?;
-            let dimension = CompatibilityDimension::ALL
-                .into_iter()
-                .find(|value| value.as_str() == dimension)
-                .ok_or_else(|| "release exemption dimension is unknown".to_owned())?;
-            let standard = take(&mut fields, "standard")?;
-            if standard != RELEASE_STANDARD {
-                return Err("release exemption standard differs".to_owned());
-            }
-            let exemption = PlannedExemption {
-                id,
-                kind,
-                candidate_sha: take(&mut fields, "candidate_sha")?,
-                standard,
-                baseline: take(&mut fields, "baseline")?,
-                cell: CellKey::new(
-                    take(&mut fields, "builtin")?,
-                    dimension,
-                    ProfileId::parse(&take(&mut fields, "profile")?)?,
-                    ConformancePlatform::parse(&take(&mut fields, "platform")?)?,
-                )?,
-                obligation_id: take(&mut fields, "obligation_id")?,
-                expected_mismatch_sha256,
-                issue: take(&mut fields, "issue")?,
-                rationale: take(&mut fields, "rationale")?,
-                review_group: take(&mut fields, "review_group")?,
-                expires_on: take(&mut fields, "expires_on")?,
-            };
-            if !fields.is_empty() {
-                return Err(format!(
-                    "unknown release exemption fields: {:?}",
-                    fields.keys().collect::<Vec<_>>()
-                ));
-            }
-            Ok(exemption)
-        })
-        .collect()
+        .find(|value| value.as_str() == dimension)
+        .ok_or_else(|| "release exemption dimension is unknown".to_owned())?;
+    let standard = take(&mut fields, "standard")?;
+    if standard != RELEASE_STANDARD {
+        return Err("release exemption standard differs".to_owned());
+    }
+    let exemption = PlannedExemption {
+        id,
+        kind,
+        candidate_sha: take(&mut fields, "candidate_sha")?,
+        standard,
+        baseline: take(&mut fields, "baseline")?,
+        cell: CellKey::new(
+            take(&mut fields, "builtin")?,
+            dimension,
+            ProfileId::parse(&take(&mut fields, "profile")?)?,
+            ConformancePlatform::parse(&take(&mut fields, "platform")?)?,
+        )?,
+        obligation_id: take(&mut fields, "obligation_id")?,
+        expected_mismatch_sha256,
+        issue: take(&mut fields, "issue")?,
+        rationale: take(&mut fields, "rationale")?,
+        review_group: take(&mut fields, "review_group")?,
+        expires_on: take(&mut fields, "expires_on")?,
+    };
+    if !fields.is_empty() {
+        return Err(format!(
+            "unknown release exemption fields: {:?}",
+            fields.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(exemption)
 }
 
 fn take(fields: &mut BTreeMap<String, String>, key: &str) -> Result<String, String> {

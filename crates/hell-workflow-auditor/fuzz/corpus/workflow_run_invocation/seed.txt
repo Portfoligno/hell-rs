@@ -1,0 +1,1 @@
+{"invocation":"cargo check --locked","schemaVersion":1}

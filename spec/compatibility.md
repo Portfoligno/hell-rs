@@ -113,9 +113,9 @@ producer-supplied count is trusted.
 
 The authoritative machine-readable artifacts are `conformance-plan.json`, the
 content-addressed `conformance-evidence.tar.gz`, `conformance-report.json`, and
-`conformance-acceptance.json`. Assembly and the publisher independently derive
-the same partition from the plan and raw evidence without executing candidate
-code in the privileged job.
+`conformance-acceptance.json`. Assembly and both read-only verifier
+implementations derive the same partition from the plan and raw evidence
+without executing candidate code in a privileged job.
 
 Release notes may say every required cell was verified only when there are no
 exemptions. Otherwise they disclose the exact exemption count and the report
@@ -123,3 +123,18 @@ retains every exemption ID, cell, issue, rationale, and expiry. Excluded,
 not-applicable, and exempted cells are never described or counted as verified.
 The workflow trust boundary and publication procedure are specified in
 [`release-assurance.md`](release-assurance.md).
+
+## Independent release reconstruction
+
+Release admission is specified by
+[`release-admission-protocol-v1.md`](release-admission-protocol-v1.md). The
+primary verifier and `hell-release-verifier` independently enumerate cells,
+consume evidence, evaluate exact dispositions and exemptions, derive the
+ledger, and bind the final subject set. They share declarative obligation rules
+and adversarial vectors as specification data, but no decisive Rust parser,
+model, archive, canonicalization, ledger, exemption, or admission code.
+
+Counts and producer-authored acceptance fields are consistency observations
+only. Missing, duplicate, unused, contradictory, relabeled, or replayed
+authority fails in both implementations. A release proceeds only when both
+decisions are admitted and every authoritative semantic field agrees exactly.

@@ -1,0 +1,19 @@
+[package]
+name = "hell-workflow-auditor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+mutation-testing = []
+
+[[bin]]
+name = "hell-workflow-auditor"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0.149"
+
+[lints]
+workspace = true

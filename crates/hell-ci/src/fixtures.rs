@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::command::{CommandResult, CommandSpec};
 use crate::policy::normalized_relative_path;
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 use crate::report::Report;
 
 const FIXTURE_DIRECTORY: &str = "fixtures/upstream-2026-05-29";
@@ -133,7 +133,6 @@ pub fn validate_inventory(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn run_examples(
     root: &Path,
     profile: &str,
@@ -144,137 +143,159 @@ pub fn run_examples(
     let fixture_root = root.join(FIXTURE_DIRECTORY);
     let cases = load_cases(&fixture_root)?;
     let executable_name = if cfg!(windows) { "hell.exe" } else { "hell" };
-    let executable = std::env::var_os("CARGO_TARGET_DIR")
+    let process_environment = ProcessEnvironment::from_process();
+    let executable = process_environment
+        .value(StandardVariable::CargoTargetDir)
         .map_or_else(|| root.join("target"), PathBuf::from)
         .join(profile)
         .join(executable_name);
     let executable = fs::canonicalize(&executable)
         .map_err(|error| format!("cannot locate {}: {error}", executable.display()))?;
-    let mut detailed_failures = 0;
-
+    let mut execution = ExampleExecution {
+        detailed_failures: 0,
+        executable: &executable,
+        failures_directory,
+        fixture_root: &fixture_root,
+        report,
+    };
     for case in cases {
+        execution.run(&case)?;
+    }
+    if execution.detailed_failures > FAILURE_LIMIT {
+        execution.report.failures.push(format!(
+            "fixture failure detail cap reached; {} failures were not captured",
+            execution.detailed_failures - FAILURE_LIMIT
+        ));
+    }
+    Ok(())
+}
+
+struct ExampleExecution<'a> {
+    detailed_failures: usize,
+    executable: &'a Path,
+    failures_directory: &'a Path,
+    fixture_root: &'a Path,
+    report: &'a mut Report,
+}
+
+impl ExampleExecution<'_> {
+    fn run(&mut self, case: &Case) -> Result<(), String> {
         let sandbox = Sandbox::create(&case.id)?;
         let source_name = case
             .path
             .file_name()
             .ok_or_else(|| format!("case {} source has no filename", case.id))?;
         let source = sandbox.path.join(source_name);
-        fs::copy(fixture_root.join(&case.path), &source)
+        fs::copy(self.fixture_root.join(&case.path), &source)
             .map_err(|error| format!("cannot stage case {}: {error}", case.id))?;
         let initial_filesystem = snapshot_filesystem(&sandbox.path)?;
-        let check = CommandSpec::new(executable.as_os_str(), case.check_timeout)
+        let check = CommandSpec::new(self.executable.as_os_str(), case.check_timeout)
             .argument("--check")
             .argument(source.as_os_str())
             .current_directory(&sandbox.path);
         let result = run_and_record(
-            report,
-            format!("example-{}-check", case.id),
+            self.report,
+            &format!("example-{}-check", case.id),
             &check,
-            failures_directory,
+            self.failures_directory,
             &case.id,
-            &mut detailed_failures,
+            &mut self.detailed_failures,
         )?;
         if result.status.success()
             && !result.timed_out
             && case.run_kind == RunKind::Exact
             && platform_selected(&case.platforms)
         {
-            let run = CommandSpec::new(executable.as_os_str(), case.run_timeout)
-                .argument(source.as_os_str())
-                .current_directory(&sandbox.path);
-            let result = run_and_record(
-                report,
-                format!("example-{}-exact", case.id),
-                &run,
-                failures_directory,
-                &case.id,
-                &mut detailed_failures,
-            )?;
-            let expected_stdout = expected_bytes(&fixture_root, case.stdout_path.as_deref())?;
-            let expected_stderr = expected_bytes(&fixture_root, case.stderr_path.as_deref())?;
-            if result.status.success()
-                && !result.timed_out
-                && (result.stdout != expected_stdout || result.stderr != expected_stderr)
-            {
-                let detail = format!("example {} exact output mismatch", case.id);
-                report.check(
-                    format!("example-{}-observation", case.id),
-                    Duration::ZERO,
-                    Err(detail),
-                );
-                if detailed_failures < FAILURE_LIMIT {
-                    write_capture(
-                        failures_directory,
-                        &case.id,
-                        "actual.stdout",
-                        &result.stdout,
-                    )?;
-                    write_capture(
-                        failures_directory,
-                        &case.id,
-                        "actual.stderr",
-                        &result.stderr,
-                    )?;
-                    write_capture(
-                        failures_directory,
-                        &case.id,
-                        "expected.stdout",
-                        &expected_stdout,
-                    )?;
-                    write_capture(
-                        failures_directory,
-                        &case.id,
-                        "expected.stderr",
-                        &expected_stderr,
-                    )?;
-                }
-                detailed_failures += 1;
-            }
+            self.run_exact(case, &sandbox, &source)?;
         }
         let final_filesystem = snapshot_filesystem(&sandbox.path)?;
         if initial_filesystem != final_filesystem {
-            let detail = format!("example {} changed its sandbox filesystem", case.id);
-            report.check(
-                format!("example-{}-filesystem", case.id),
-                Duration::ZERO,
-                Err(detail),
-            );
-            if detailed_failures < FAILURE_LIMIT {
-                write_capture(
-                    failures_directory,
-                    &case.id,
-                    "filesystem.before",
-                    format!("{initial_filesystem:#?}\n").as_bytes(),
-                )?;
-                write_capture(
-                    failures_directory,
-                    &case.id,
-                    "filesystem.after",
-                    format!("{final_filesystem:#?}\n").as_bytes(),
-                )?;
-            }
-            detailed_failures += 1;
+            self.record_filesystem_change(case, &initial_filesystem, &final_filesystem)?;
         }
+        Ok(())
     }
-    if detailed_failures > FAILURE_LIMIT {
-        report.failures.push(format!(
-            "fixture failure detail cap reached; {} failures were not captured",
-            detailed_failures - FAILURE_LIMIT
-        ));
+
+    fn run_exact(&mut self, case: &Case, sandbox: &Sandbox, source: &Path) -> Result<(), String> {
+        let command = CommandSpec::new(self.executable.as_os_str(), case.run_timeout)
+            .argument(source.as_os_str())
+            .current_directory(&sandbox.path);
+        let result = run_and_record(
+            self.report,
+            &format!("example-{}-exact", case.id),
+            &command,
+            self.failures_directory,
+            &case.id,
+            &mut self.detailed_failures,
+        )?;
+        let expected_stdout = expected_bytes(self.fixture_root, case.stdout_path.as_deref())?;
+        let expected_stderr = expected_bytes(self.fixture_root, case.stderr_path.as_deref())?;
+        if result.status.success()
+            && !result.timed_out
+            && (result.stdout != expected_stdout || result.stderr != expected_stderr)
+        {
+            self.report.check(
+                format!("example-{}-observation", case.id),
+                Duration::ZERO,
+                Err(format!("example {} exact output mismatch", case.id)),
+            );
+            if self.detailed_failures < FAILURE_LIMIT {
+                for (suffix, bytes) in [
+                    ("actual.stdout", result.stdout.as_slice()),
+                    ("actual.stderr", result.stderr.as_slice()),
+                    ("expected.stdout", expected_stdout.as_slice()),
+                    ("expected.stderr", expected_stderr.as_slice()),
+                ] {
+                    write_capture(self.failures_directory, &case.id, suffix, bytes)?;
+                }
+            }
+            self.detailed_failures += 1;
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn record_filesystem_change(
+        &mut self,
+        case: &Case,
+        before: &BTreeMap<PathBuf, Vec<u8>>,
+        after: &BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<(), String> {
+        self.report.check(
+            format!("example-{}-filesystem", case.id),
+            Duration::ZERO,
+            Err(format!(
+                "example {} changed its sandbox filesystem",
+                case.id
+            )),
+        );
+        if self.detailed_failures < FAILURE_LIMIT {
+            write_capture(
+                self.failures_directory,
+                &case.id,
+                "filesystem.before",
+                format!("{before:#?}\n").as_bytes(),
+            )?;
+            write_capture(
+                self.failures_directory,
+                &case.id,
+                "filesystem.after",
+                format!("{after:#?}\n").as_bytes(),
+            )?;
+        }
+        self.detailed_failures += 1;
+        Ok(())
+    }
 }
 
 fn run_and_record(
     report: &mut Report,
-    name: String,
+    name: &str,
     command: &CommandSpec,
     failures_directory: &Path,
     case_id: &str,
     failure_count: &mut usize,
 ) -> Result<CommandResult, String> {
     let result = report
-        .run_command(name.as_str(), command)
+        .run_command(name, command)
         .map_err(|error| format!("cannot run {name}: {error}"))?;
     if (!result.status.success() || result.timed_out) && *failure_count < FAILURE_LIMIT {
         write_capture(failures_directory, case_id, "stdout", &result.stdout)?;
@@ -418,12 +439,12 @@ fn collect_hell_files(directory: &Path) -> Result<BTreeSet<PathBuf>, String> {
 }
 
 fn tracked_fixture_files(root: &Path) -> Result<BTreeSet<PathBuf>, String> {
-    let output = Command::new("git")
-        .args(["ls-files", "-z", "--", FIXTURE_DIRECTORY])
-        .current_dir(root)
-        .output()
+    let output = CommandSpec::new("git", Duration::from_secs(30))
+        .arguments(["ls-files", "-z", "--", FIXTURE_DIRECTORY])
+        .current_directory(root)
+        .run()
         .map_err(|error| format!("cannot discover tracked fixtures: {error}"))?;
-    if !output.status.success() {
+    if output.timed_out || !output.status.success() {
         return Err(format!(
             "cannot discover tracked fixtures: {}",
             String::from_utf8_lossy(&output.stderr)

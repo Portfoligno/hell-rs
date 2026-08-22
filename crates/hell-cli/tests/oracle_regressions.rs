@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -31,16 +32,23 @@ fn hell() -> Command {
 
 fn run_source(label: &str, source: &str) -> Output {
     let fixture = Fixture::new(label, source);
-    hell().arg(&fixture.0).output().expect("run hell")
+    supervised_output(hell().arg(&fixture.0))
 }
 
 fn check_source(label: &str, source: &str) -> Output {
     let fixture = Fixture::new(label, source);
-    hell()
-        .arg("--check")
-        .arg(&fixture.0)
-        .output()
-        .expect("check Hell source")
+    supervised_output(hell().arg("--check").arg(&fixture.0))
+}
+
+fn supervised_output(command: &mut Command) -> Output {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .expect("supervise Hell fixture");
+    assert!(!output.timed_out, "Hell fixture exceeded its deadline");
+    Output {
+        status: output.status,
+        stdout: output.stdout.complete.expect("stdout capture is complete"),
+        stderr: output.stderr.complete.expect("stderr capture is complete"),
+    }
 }
 
 fn assert_success(output: &Output, expected_stdout: &[u8]) {
@@ -65,7 +73,7 @@ fn assert_diagnostic(output: &Output, code: &str) {
 
 #[test]
 fn pinned_version_and_hello_world_match_the_oracle() {
-    let version = hell().arg("--version").output().expect("run --version");
+    let version = supervised_output(hell().arg("--version"));
     assert_success(&version, b"2026-05-29\n");
 
     assert_success(

@@ -1,14 +1,16 @@
+#[cfg(test)]
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::github_runtime::{GithubCredential, GithubRuntime};
 use crate::json::{JsonValue, json_member, parse_json, require_exact_json_keys};
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) struct GitHubClient {
     api: HttpEndpoint,
-    token: String,
+    credential: GithubCredential,
     agent: ureq::Agent,
 }
 
@@ -27,7 +29,8 @@ impl GitHubClient {
                 authority: address.to_string(),
                 base_path: Vec::new(),
             },
-            token: "test-token".to_owned(),
+            credential: GithubCredential::from_value(OsString::from("test-token"))
+                .expect("valid test credential"),
             agent: ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .build()
@@ -35,29 +38,39 @@ impl GitHubClient {
         }
     }
     pub(crate) fn from_actions_environment() -> Result<Self, String> {
-        Self::from_actions_values(
-            std::env::var_os("GITHUB_API_URL"),
-            std::env::var_os("GITHUB_TOKEN"),
-        )
+        let runtime = GithubRuntime::from_process()?;
+        let credential = GithubCredential::from_process()?;
+        Self::from_runtime(&runtime, credential)
     }
 
+    #[cfg(test)]
     fn from_actions_values(api: Option<OsString>, token: Option<OsString>) -> Result<Self, String> {
         let api = required_environment_value(api, "GITHUB_API_URL")?;
-        let token = required_environment_value(token, "GITHUB_TOKEN")?;
+        let credential = GithubCredential::from_value(
+            token.ok_or_else(|| "GITHUB_TOKEN is required".to_owned())?,
+        )?;
+        Self::new(&api, credential)
+    }
+
+    fn from_runtime(runtime: &GithubRuntime, credential: GithubCredential) -> Result<Self, String> {
+        Self::new(&runtime.api_url, credential)
+    }
+
+    fn new(api: &str, credential: GithubCredential) -> Result<Self, String> {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .build();
         Ok(Self {
-            api: HttpEndpoint::parse(&api)?,
-            token,
+            api: HttpEndpoint::parse(api)?,
+            credential,
             agent: config.into(),
         })
     }
 
     pub(crate) fn branch_head(&self, repository: &str, branch: &str) -> Result<String, String> {
         let mut segments = repository.split('/').map(str::to_owned).collect::<Vec<_>>();
-        if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+        if segments.len() != 2 || segments.iter().any(String::is_empty) {
             return Err("repository full name is invalid".to_owned());
         }
         segments.extend([
@@ -192,8 +205,8 @@ impl GitHubClient {
                     )?;
                     let object = json_member(tag, "object")?.object()?;
                     require_exact_json_keys(object, &["sha", "type", "url"])?;
-                    sha = json_member(object, "sha")?.string()?.to_owned();
-                    kind = json_member(object, "type")?.string()?.to_owned();
+                    json_member(object, "sha")?.string()?.clone_into(&mut sha);
+                    json_member(object, "type")?.string()?.clone_into(&mut kind);
                 }
                 _ => return Err("tag does not resolve to a commit".to_owned()),
             }
@@ -205,7 +218,7 @@ impl GitHubClient {
         let segments = repository_segments(repository, ["immutable-releases"])?;
         let (_, body) = self.request("GET", &segments, None, None, &[200])?;
         let value = parse_json(&body)?;
-        Ok(json_member(value.object()?, "enabled")?.boolean()?)
+        json_member(value.object()?, "enabled")?.boolean()
     }
 
     pub(crate) fn create_draft(&self, repository: &str, body: &str) -> Result<JsonValue, String> {
@@ -302,36 +315,38 @@ impl GitHubClient {
         body: Option<&[u8]>,
         accepted: &[u16],
     ) -> Result<(u16, String), String> {
-        let token = format!("Bearer {}", self.token);
-        let send = |request: ureq::RequestBuilder<ureq::typestate::WithoutBody>| {
-            request
-                .header("Authorization", &token)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2026-03-10")
-                .header("User-Agent", "hell-ci")
-                .call()
-        };
-        let send_body = |request: ureq::RequestBuilder<ureq::typestate::WithBody>, bytes: &[u8]| {
-            let request = request
-                .header("Authorization", &token)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2026-03-10")
-                .header("User-Agent", "hell-ci");
-            let request = if let Some(value) = content_type {
-                request.header("Content-Type", value)
-            } else {
+        let mut response = self.credential.with_bearer_header(|authorization| {
+            let send = |request: ureq::RequestBuilder<ureq::typestate::WithoutBody>| {
                 request
+                    .header("Authorization", authorization)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2026-03-10")
+                    .header("User-Agent", "hell-ci")
+                    .call()
             };
-            request.send(bytes)
-        };
-        let mut response = match (method, body) {
-            ("GET", None) => send(self.agent.get(url)),
-            ("DELETE", None) => send(self.agent.delete(url)),
-            ("POST", Some(bytes)) => send_body(self.agent.post(url), bytes),
-            ("PATCH", Some(bytes)) => send_body(self.agent.patch(url), bytes),
-            _ => return Err("unsupported GitHub API method/body combination".to_owned()),
-        }
-        .map_err(|error| format!("GitHub API request failed: {error}"))?;
+            let send_body = |request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+                             bytes: &[u8]| {
+                let request = request
+                    .header("Authorization", authorization)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2026-03-10")
+                    .header("User-Agent", "hell-ci");
+                let request = if let Some(value) = content_type {
+                    request.header("Content-Type", value)
+                } else {
+                    request
+                };
+                request.send(bytes)
+            };
+            match (method, body) {
+                ("GET", None) => send(self.agent.get(url)),
+                ("DELETE", None) => send(self.agent.delete(url)),
+                ("POST", Some(bytes)) => send_body(self.agent.post(url), bytes),
+                ("PATCH", Some(bytes)) => send_body(self.agent.patch(url), bytes),
+                _ => return Err("unsupported GitHub API method/body combination".to_owned()),
+            }
+            .map_err(|error| format!("GitHub API request failed: {error}"))
+        })?;
         let status = response.status().as_u16();
         if !accepted.contains(&status) {
             return Err(format!("GitHub API returned {status}"));
@@ -346,6 +361,7 @@ impl GitHubClient {
     }
 }
 
+#[cfg(test)]
 fn required_environment_value(value: Option<OsString>, name: &str) -> Result<String, String> {
     let value = value.ok_or_else(|| format!("{name} is required"))?;
     let value = value
@@ -362,7 +378,7 @@ fn repository_segments<const N: usize>(
     suffix: [&str; N],
 ) -> Result<Vec<String>, String> {
     let mut segments = repository.split('/').map(str::to_owned).collect::<Vec<_>>();
-    if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+    if segments.len() != 2 || segments.iter().any(String::is_empty) {
         return Err("repository full name is invalid".to_owned());
     }
     segments.extend(suffix.into_iter().map(str::to_owned));

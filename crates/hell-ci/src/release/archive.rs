@@ -56,13 +56,13 @@ pub(crate) fn create(input: &ArchiveInput<'_>) -> Result<String, String> {
         for entry in entries {
             match entry {
                 ArchiveEntry::Directory(path) => {
-                    append_directory(&mut builder, &path, input.source_date_epoch)?
+                    append_directory(&mut builder, &path, input.source_date_epoch)?;
                 }
                 ArchiveEntry::File(path, source, mode) => {
-                    append_file(&mut builder, &path, &source, mode, input.source_date_epoch)?
+                    append_file(&mut builder, &path, &source, mode, input.source_date_epoch)?;
                 }
                 ArchiveEntry::Bytes(path, bytes, mode) => {
-                    append_bytes(&mut builder, &path, bytes, mode, input.source_date_epoch)?
+                    append_bytes(&mut builder, &path, bytes, mode, input.source_date_epoch)?;
                 }
             }
         }
@@ -91,30 +91,10 @@ pub(crate) fn verify(
     version: &str,
     epoch: u64,
 ) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect release archive: {error}"))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_PACKAGE_COMPRESSED_BYTES
-    {
-        return Err("release archive is not a bounded regular file".to_owned());
-    }
-    let bytes = read_regular(path)?;
-    if bytes.len() < 18 || bytes[..10] != [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255] {
-        return Err("release gzip header is not canonical".to_owned());
-    }
-    verify_single_gzip_member(&bytes, MAX_PACKAGE_UNCOMPRESSED_BYTES)?;
+    let bytes = bounded_package_bytes(path)?;
     let mut archive = Archive::new(GzDecoder::new(bytes.as_slice()));
     let prefix = format!("hell-v{version}-{}/", platform.id());
-    let expected = BTreeSet::from([
-        prefix.trim_end_matches('/').to_owned(),
-        format!("{}LICENSE", prefix),
-        format!("{}NOTICE", prefix),
-        format!("{}README.md", prefix),
-        format!("{}CONFORMANCE.md", prefix),
-        format!("{}bin", prefix),
-        format!("{}bin/{}", prefix, platform.executable()),
-    ]);
+    let expected = package_entry_inventory(&prefix, platform);
     let mut observed = BTreeSet::new();
     let mut payloads = BTreeMap::new();
     let mut total_payload = 0_u64;
@@ -211,6 +191,35 @@ pub(crate) fn verify(
         return Err("release archive bytes are not in the canonical serialization".to_owned());
     }
     Ok(())
+}
+
+fn package_entry_inventory(prefix: &str, platform: ReleasePlatform) -> BTreeSet<String> {
+    BTreeSet::from([
+        prefix.trim_end_matches('/').to_owned(),
+        format!("{prefix}LICENSE"),
+        format!("{prefix}NOTICE"),
+        format!("{prefix}README.md"),
+        format!("{prefix}CONFORMANCE.md"),
+        format!("{prefix}bin"),
+        format!("{prefix}bin/{}", platform.executable()),
+    ])
+}
+
+fn bounded_package_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect release archive: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PACKAGE_COMPRESSED_BYTES
+    {
+        return Err("release archive is not a bounded regular file".to_owned());
+    }
+    let bytes = read_regular(path)?;
+    if bytes.len() < 18 || bytes[..10] != [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255] {
+        return Err("release gzip header is not canonical".to_owned());
+    }
+    verify_single_gzip_member(&bytes, MAX_PACKAGE_UNCOMPRESSED_BYTES)?;
+    Ok(bytes)
 }
 
 fn canonical_archive_bytes(
@@ -393,19 +402,7 @@ pub(crate) fn create_evidence(
 /// entry is written to disk before its type, path, metadata, and size are
 /// accepted.
 pub(crate) fn read_evidence(path: &Path, epoch: u64) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect conformance evidence archive: {error}"))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_EVIDENCE_COMPRESSED_BYTES
-    {
-        return Err("conformance evidence archive is not a bounded regular file".to_owned());
-    }
-    let bytes = read_regular(path)?;
-    if bytes.len() < 18 || bytes[..10] != [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255] {
-        return Err("conformance evidence gzip header is not canonical".to_owned());
-    }
-    verify_single_gzip_member(&bytes, MAX_EVIDENCE_ARCHIVE_BYTES)?;
+    let bytes = bounded_evidence_bytes(path)?;
     let mut archive = Archive::new(GzDecoder::new(bytes.as_slice()));
     let mut observed = BTreeSet::new();
     let mut members = BTreeMap::new();
@@ -450,28 +447,7 @@ pub(crate) fn read_evidence(path: &Path, epoch: u64) -> Result<BTreeMap<String, 
         if total > MAX_EVIDENCE_ARCHIVE_BYTES {
             return Err("conformance evidence archive exceeds its uncompressed bound".to_owned());
         }
-        if entry.header().uid().map_err(|_| "invalid evidence UID")? != 0
-            || entry.header().gid().map_err(|_| "invalid evidence GID")? != 0
-            || entry
-                .header()
-                .mtime()
-                .map_err(|_| "invalid evidence mtime")?
-                != epoch
-            || entry.header().mode().map_err(|_| "invalid evidence mode")?
-                != if kind.is_dir() { 0o755 } else { 0o644 }
-            || entry
-                .header()
-                .username()
-                .map_err(|_| "invalid evidence username")?
-                .is_some_and(|value| !value.is_empty())
-            || entry
-                .header()
-                .groupname()
-                .map_err(|_| "invalid evidence group name")?
-                .is_some_and(|value| !value.is_empty())
-        {
-            return Err("conformance evidence archive metadata is not canonical".to_owned());
-        }
+        validate_evidence_header(entry.header(), kind, epoch)?;
         if kind.is_dir() {
             if !EVIDENCE_DIRECTORIES.contains(&name.as_str()) {
                 return Err("conformance evidence archive has an unexpected directory".to_owned());
@@ -500,6 +476,264 @@ pub(crate) fn read_evidence(path: &Path, epoch: u64) -> Result<BTreeMap<String, 
     Ok(members)
 }
 
+fn bounded_evidence_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect conformance evidence archive: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_EVIDENCE_COMPRESSED_BYTES
+    {
+        return Err("conformance evidence archive is not a bounded regular file".to_owned());
+    }
+    let bytes = read_regular(path)?;
+    if bytes.len() < 18 || bytes[..10] != [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255] {
+        return Err("conformance evidence gzip header is not canonical".to_owned());
+    }
+    verify_single_gzip_member(&bytes, MAX_EVIDENCE_ARCHIVE_BYTES)?;
+    Ok(bytes)
+}
+
+fn validate_evidence_header(header: &Header, kind: EntryType, epoch: u64) -> Result<(), String> {
+    if header.uid().map_err(|_| "invalid evidence UID")? != 0
+        || header.gid().map_err(|_| "invalid evidence GID")? != 0
+        || header.mtime().map_err(|_| "invalid evidence mtime")? != epoch
+        || header.mode().map_err(|_| "invalid evidence mode")?
+            != if kind.is_dir() { 0o755 } else { 0o644 }
+        || header
+            .username()
+            .map_err(|_| "invalid evidence username")?
+            .is_some_and(|value| !value.is_empty())
+        || header
+            .groupname()
+            .map_err(|_| "invalid evidence group name")?
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err("conformance evidence archive metadata is not canonical".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn evidence_diagnostic(path: &Path, epoch: u64) -> Option<&'static str> {
+    let bytes = read_regular(path).ok()?;
+    classify_evidence_transport(&bytes, epoch).err()
+}
+
+fn classify_evidence_transport(bytes: &[u8], epoch: u64) -> Result<(), &'static str> {
+    const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255];
+    if bytes.len() < GZIP_HEADER.len().saturating_add(8)
+        || bytes[..GZIP_HEADER.len()] != GZIP_HEADER
+    {
+        return Err("release.archive.gzip-header");
+    }
+    let trailer_start = bytes
+        .len()
+        .checked_sub(8)
+        .ok_or("release.archive.gzip-header")?;
+    let expanded_size = u32::from_le_bytes(
+        bytes[trailer_start + 4..]
+            .try_into()
+            .map_err(|_| "release.archive.gzip-header")?,
+    );
+    if u64::from(expanded_size) > MAX_EVIDENCE_ARCHIVE_BYTES {
+        return Err("release.limit.archive-expanded");
+    }
+    let mut decoder = Decompress::new(false);
+    let mut input = &bytes[GZIP_HEADER.len()..trailer_start];
+    let capacity = usize::try_from(expanded_size).map_err(|_| "release.limit.archive-expanded")?;
+    let mut expanded = Vec::with_capacity(capacity);
+    let mut scratch = [0_u8; 16 * 1024];
+    loop {
+        let before_input = decoder.total_in();
+        let before_output = decoder.total_out();
+        let status = decoder
+            .decompress(input, &mut scratch, FlushDecompress::None)
+            .map_err(|_| "release.archive.gzip-stream")?;
+        let consumed = usize::try_from(decoder.total_in() - before_input)
+            .map_err(|_| "release.archive.gzip-stream")?;
+        let produced = usize::try_from(decoder.total_out() - before_output)
+            .map_err(|_| "release.limit.archive-expanded")?;
+        expanded.extend_from_slice(&scratch[..produced]);
+        if u64::try_from(expanded.len()).map_err(|_| "release.limit.archive-expanded")?
+            > MAX_EVIDENCE_ARCHIVE_BYTES
+        {
+            return Err("release.limit.archive-expanded");
+        }
+        input = input.get(consumed..).ok_or("release.archive.gzip-stream")?;
+        match status {
+            Status::StreamEnd if input.is_empty() => break,
+            Status::StreamEnd => return Err("release.archive.trailing-gzip-member"),
+            Status::BufError if consumed == 0 && produced == 0 => {
+                return Err("release.archive.gzip-stream");
+            }
+            Status::Ok | Status::BufError => {}
+        }
+    }
+    if expanded.len() != capacity {
+        return Err("release.archive.gzip-stream");
+    }
+    classify_evidence_tar(&expanded, epoch)
+}
+
+fn classify_evidence_tar(bytes: &[u8], epoch: u64) -> Result<(), &'static str> {
+    const TAR_BLOCK: usize = 512;
+    if bytes.len() < TAR_BLOCK.saturating_mul(2) || !bytes.len().is_multiple_of(TAR_BLOCK) {
+        return Err("release.archive.tar-framing");
+    }
+    let required = BTreeSet::from([
+        "conformance-plan.json",
+        "platform-manifests/linux-x86_64.json",
+        "platform-manifests/macos-aarch64.json",
+        "platform-manifests/windows-x86_64.json",
+        "source-inventory.json",
+        "trusted-conformance-inputs.json",
+    ]);
+    let mut offset = 0_usize;
+    let mut paths = BTreeSet::new();
+    let mut ended = false;
+    while let Some(header) = bytes.get(offset..offset.saturating_add(TAR_BLOCK)) {
+        if header.iter().all(|byte| *byte == 0) {
+            let tail = bytes.get(offset..).ok_or("release.archive.tar-framing")?;
+            if tail.len() < TAR_BLOCK.saturating_mul(2) || tail.iter().any(|byte| *byte != 0) {
+                return Err("release.archive.tar-framing");
+            }
+            ended = true;
+            break;
+        }
+        validate_tar_checksum(header)?;
+        if &header[257..263] != b"ustar\0"
+            || &header[263..265] != b"00"
+            || header[329..345]
+                .iter()
+                .any(|byte| !matches!(byte, 0 | b'0' | b' '))
+            || header[500..512].iter().any(|byte| *byte != 0)
+        {
+            return Err("release.archive.tar-header");
+        }
+        let path_end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        let path = std::str::from_utf8(&header[..path_end]).map_err(|_| "release.archive.path")?;
+        if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
+            return Err("release.archive.absolute-path");
+        }
+        if path.split('/').any(|component| component == "..") {
+            return Err("release.archive.path-traversal");
+        }
+        if !paths.insert(path.to_owned()) {
+            return Err("release.archive.duplicate-member");
+        }
+        let kind = header[156];
+        if !matches!(kind, 0 | b'0' | b'5') {
+            return Err("release.archive.unsupported-type");
+        }
+        let mtime = tar_octal(&header[136..148]).ok_or("release.archive.tar-header")?;
+        if mtime != epoch {
+            return Err("release.archive.tar-header");
+        }
+        if kind != b'5'
+            && !required.contains(path)
+            && !path.strip_prefix("records/").is_some_and(|tail| {
+                record_archive_name(tail, "ev-") || record_archive_name(tail, "gx-")
+            })
+            && !path
+                .strip_prefix("observations/")
+                .is_some_and(observation_archive_name)
+        {
+            return Err("release.archive.extra-member");
+        }
+        let size = tar_octal(&header[124..136]).ok_or("release.archive.tar-header")?;
+        let padded = size
+            .checked_add(u64::try_from(TAR_BLOCK - 1).map_err(|_| "release.archive.tar-framing")?)
+            .ok_or("release.archive.tar-framing")?
+            / u64::try_from(TAR_BLOCK).map_err(|_| "release.archive.tar-framing")?
+            * u64::try_from(TAR_BLOCK).map_err(|_| "release.archive.tar-framing")?;
+        let payload_start = offset
+            .checked_add(TAR_BLOCK)
+            .ok_or("release.archive.tar-framing")?;
+        let payload_end = usize::try_from(padded)
+            .ok()
+            .and_then(|padded| payload_start.checked_add(padded))
+            .ok_or("release.archive.tar-framing")?;
+        let exact_end = usize::try_from(size)
+            .ok()
+            .and_then(|size| payload_start.checked_add(size))
+            .ok_or("release.archive.tar-framing")?;
+        if bytes
+            .get(exact_end..payload_end)
+            .ok_or("release.archive.tar-framing")?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err("release.archive.tar-framing");
+        }
+        offset = payload_end;
+    }
+    if !ended {
+        return Err("release.archive.tar-framing");
+    }
+    Ok(())
+}
+
+fn validate_tar_checksum(header: &[u8]) -> Result<(), &'static str> {
+    let stated = tar_octal(&header[148..156]).ok_or("release.archive.tar-checksum")?;
+    let observed = header
+        .iter()
+        .enumerate()
+        .try_fold(0_u64, |sum, (index, byte)| {
+            sum.checked_add(u64::from(if (148..156).contains(&index) {
+                b' '
+            } else {
+                *byte
+            }))
+        })
+        .ok_or("release.archive.tar-checksum")?;
+    if stated != observed {
+        return Err("release.archive.tar-checksum");
+    }
+    Ok(())
+}
+
+pub(crate) fn fuzz_verify_gzip(bytes: &[u8]) -> Result<(), String> {
+    const HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255];
+    if bytes.len() < HEADER.len().saturating_add(8) || bytes[..HEADER.len()] != HEADER {
+        return Err("release gzip header is not canonical".to_owned());
+    }
+    verify_single_gzip_member(bytes, MAX_EVIDENCE_ARCHIVE_BYTES)?;
+    let mut decoder = GzDecoder::new(bytes);
+    let mut expanded = Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_EVIDENCE_ARCHIVE_BYTES.saturating_add(1))
+        .read_to_end(&mut expanded)
+        .map_err(|error| format!("release gzip trailer or checksum is invalid: {error}"))?;
+    if u64::try_from(expanded.len()).unwrap_or(u64::MAX) > MAX_EVIDENCE_ARCHIVE_BYTES {
+        return Err("release gzip expanded output exceeds its bound".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn fuzz_verify_tar(bytes: &[u8], epoch: u64) -> Result<(), String> {
+    classify_evidence_tar(bytes, epoch).map_err(str::to_owned)
+}
+
+fn tar_octal(bytes: &[u8]) -> Option<u64> {
+    let mut value = 0_u64;
+    let mut digits = 0_usize;
+    let mut terminated = false;
+    for byte in bytes {
+        match *byte {
+            b'0'..=b'7' if !terminated => {
+                value = value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))?;
+                digits = digits.checked_add(1)?;
+            }
+            0 | b' ' => terminated = true,
+            _ => return None,
+        }
+    }
+    (digits != 0).then_some(value)
+}
+
 fn validate_evidence_members(members: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
     let required = BTreeSet::from([
         "conformance-plan.json",
@@ -524,7 +758,10 @@ fn validate_evidence_members(members: &BTreeMap<String, Vec<u8>>) -> Result<(), 
             || name
                 .strip_prefix("observations/")
                 .is_some_and(observation_archive_name);
-        if !allowed || !name.ends_with(".json") || !bytes.ends_with(b"\n") {
+        if (!allowed && !crate::mutation::active("allow-extra-archive-member"))
+            || Path::new(name).extension().and_then(|value| value.to_str()) != Some("json")
+            || !bytes.ends_with(b"\n")
+        {
             return Err(format!("invalid conformance evidence member {name:?}"));
         }
         let size = u64::try_from(bytes.len())
@@ -540,6 +777,25 @@ fn validate_evidence_members(members: &BTreeMap<String, Vec<u8>>) -> Result<(), 
         return Err("conformance evidence members exceed the archive bound".to_owned());
     }
     Ok(())
+}
+
+pub(crate) fn assurance_extra_evidence_archive_member() -> Result<(), String> {
+    let mut members = [
+        "conformance-plan.json",
+        "platform-manifests/linux-x86_64.json",
+        "platform-manifests/macos-aarch64.json",
+        "platform-manifests/windows-x86_64.json",
+        "source-inventory.json",
+        "trusted-conformance-inputs.json",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), b"{}\n".to_vec()))
+    .collect::<BTreeMap<_, _>>();
+    members.insert(
+        "unexpected-authority.json".to_owned(),
+        b"{\"state\":\"unexpected\"}\n".to_vec(),
+    );
+    validate_evidence_members(&members)
 }
 
 fn record_archive_name(tail: &str, prefix: &str) -> bool {

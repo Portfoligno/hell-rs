@@ -1,20 +1,25 @@
-#![allow(clippy::pedantic, clippy::nursery)]
-
+pub mod assurance;
+mod capability_policy;
 mod command;
 mod compatibility;
 mod conformance;
 mod fixtures;
+pub mod fuzz;
 mod fuzz_surfaces;
+mod github_runtime;
 mod identity;
 mod json;
-mod mutation;
+pub mod mutation;
 mod oracle_acquire;
 mod policy;
+pub mod process_environment;
+mod protocol;
 mod readiness;
 mod regression;
 mod release;
 mod release_suite;
 mod report;
+mod repository;
 mod strict_toml;
 
 #[cfg(unix)]
@@ -69,7 +74,6 @@ fn usage() -> &'static str {
     "usage: hell-ci policy --report PATH\n       hell-ci verify --report PATH\n       hell-ci portability --report PATH\n       hell-ci dependency-attestation --output PATH --report PATH\n       hell-ci nightly --oracle PATH --oracle-sha256 HEX --dependency-attestation PATH --report PATH\n       hell-ci native-oracle-shard --source PATH --platform ID --dependency-attestation PATH --report PATH\n       hell-ci native-differential-benchmark --oracle PATH --candidate PATH --sample-count 32..256 --report PATH\n       hell-ci examples --profile ci|release --report PATH\n       hell-ci conformance audit --candidate-root PATH --output PATH\n       hell-ci readiness plan|platform|verify [options]\n       hell-ci release resolve|plan|platform|assemble|verify-bundle|check-remote-state|stage-attestations|publish [options]"
 }
 
-#[allow(clippy::too_many_lines)]
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, String> {
     let mut arguments = arguments.into_iter();
     let command = arguments
@@ -77,444 +81,398 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
         .ok_or_else(|| usage().to_owned())?
         .into_string()
         .map_err(|_| "subcommand must be UTF-8".to_owned())?;
-    let mut report = None;
-    let mut profile = None;
-    let mut format = None;
-    let mut oracle = None;
-    let mut oracle_sha256 = None;
-    let mut candidate = None;
-    let mut sample_count = None;
-    let mut source = None;
-    let mut platform = None;
-    let mut input = None;
-    let mut output = None;
-    let mut dependency_attestation = None;
-    let mut proposal = None;
-    let mut expect_source = None;
-    let mut expect_epoch = None;
-    let mut expect_proposal = None;
-    let mut github_dispatch_inputs = false;
-    let mut explain = false;
-    let mut only = None;
-    let mut group_by = None;
-    while let Some(flag) = arguments.next() {
-        let flag = flag
-            .into_string()
-            .map_err(|_| "option name must be UTF-8".to_owned())?;
-        match flag.as_str() {
-            "--github-dispatch-inputs" => {
-                if github_dispatch_inputs {
-                    return Err("--github-dispatch-inputs was provided more than once".to_owned());
-                }
-                github_dispatch_inputs = true;
-            }
-            "--explain" => {
-                if explain {
-                    return Err("--explain was provided more than once".to_owned());
-                }
-                explain = true;
-            }
-            "--report" => {
-                if report.is_some() {
-                    return Err("--report was provided more than once".to_owned());
-                }
-                report = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--report requires PATH".to_owned())?,
-                ));
-            }
-            "--profile" => {
-                if profile.is_some() {
-                    return Err("--profile was provided more than once".to_owned());
-                }
-                profile = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--profile requires ci or release".to_owned())?
-                        .into_string()
-                        .map_err(|_| "profile must be UTF-8".to_owned())?,
-                );
-            }
-            "--format" => {
-                if format.is_some() {
-                    return Err("--format was provided more than once".to_owned());
-                }
-                format = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--format requires csv, json, or html".to_owned())?
-                        .into_string()
-                        .map_err(|_| "format must be UTF-8".to_owned())?,
-                );
-            }
-            "--only" => {
-                if only.is_some() {
-                    return Err("--only was provided more than once".to_owned());
-                }
-                only = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--only requires ambiguous".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--only must be UTF-8".to_owned())?,
-                );
-            }
-            "--group-by" => {
-                if group_by.is_some() {
-                    return Err("--group-by was provided more than once".to_owned());
-                }
-                group_by = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--group-by requires assurance-equivalence".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--group-by must be UTF-8".to_owned())?,
-                );
-            }
-            "--oracle" => {
-                if oracle.is_some() {
-                    return Err("--oracle was provided more than once".to_owned());
-                }
-                oracle = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--oracle requires PATH".to_owned())?,
-                ));
-            }
-            "--oracle-sha256" => {
-                if oracle_sha256.is_some() {
-                    return Err("--oracle-sha256 was provided more than once".to_owned());
-                }
-                let digest = arguments
-                    .next()
-                    .ok_or_else(|| "--oracle-sha256 requires HEX".to_owned())?
-                    .into_string()
-                    .map_err(|_| "--oracle-sha256 must be UTF-8".to_owned())?;
-                oracle_sha256 = Some(Digest::from_hex(&digest).map_err(str::to_owned)?);
-            }
-            "--candidate" => {
-                if candidate.is_some() {
-                    return Err("--candidate was provided more than once".to_owned());
-                }
-                candidate = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--candidate requires PATH".to_owned())?,
-                ));
-            }
-            "--sample-count" => {
-                if sample_count.is_some() {
-                    return Err("--sample-count was provided more than once".to_owned());
-                }
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "--sample-count requires an integer".to_owned())?
-                    .into_string()
-                    .map_err(|_| "--sample-count must be UTF-8".to_owned())?;
-                let parsed = value.parse::<usize>().map_err(|_| {
-                    "--sample-count must be a canonical positive integer".to_owned()
-                })?;
-                if value != parsed.to_string() {
-                    return Err("--sample-count must be a canonical positive integer".to_owned());
-                }
-                sample_count = Some(parsed);
-            }
-            "--source" => {
-                if source.is_some() {
-                    return Err("--source was provided more than once".to_owned());
-                }
-                source = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--source requires PATH".to_owned())?,
-                ));
-            }
-            "--platform" => {
-                if platform.is_some() {
-                    return Err("--platform was provided more than once".to_owned());
-                }
-                platform = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--platform requires ID".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--platform must be UTF-8".to_owned())?,
-                );
-            }
-            "--input" => {
-                if input.is_some() {
-                    return Err("--input was provided more than once".to_owned());
-                }
-                input = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--input requires PATH".to_owned())?,
-                ));
-            }
-            "--output" => {
-                if output.is_some() {
-                    return Err("--output was provided more than once".to_owned());
-                }
-                output = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--output requires PATH".to_owned())?,
-                ));
-            }
+    InvocationOptions::parse(arguments)?.into_invocation(&command)
+}
+
+#[derive(Default)]
+struct InvocationOptions {
+    report: Option<PathBuf>,
+    profile: Option<String>,
+    format: Option<String>,
+    oracle: Option<PathBuf>,
+    oracle_sha256: Option<Digest>,
+    candidate: Option<PathBuf>,
+    sample_count: Option<usize>,
+    source: Option<PathBuf>,
+    platform: Option<String>,
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    dependency_attestation: Option<PathBuf>,
+    proposal: Option<PathBuf>,
+    expect_source: Option<String>,
+    expect_epoch: Option<String>,
+    expect_proposal: Option<String>,
+    github_dispatch_inputs: bool,
+    explain: bool,
+    only: Option<String>,
+    group_by: Option<String>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InvocationOption {
+    Profile,
+    Format,
+    Oracle,
+    OracleSha256,
+    Candidate,
+    SampleCount,
+    Source,
+    Platform,
+    Input,
+    Output,
+    DependencyAttestation,
+    Proposal,
+    ExpectSource,
+    ExpectEpoch,
+    ExpectProposal,
+    Explain,
+}
+
+impl InvocationOptions {
+    fn parse(mut arguments: impl Iterator<Item = OsString>) -> Result<Self, String> {
+        let mut options = Self::default();
+        while let Some(flag) = arguments.next() {
+            let flag = flag
+                .into_string()
+                .map_err(|_| "option name must be UTF-8".to_owned())?;
+            options.parse_option(&flag, &mut arguments)?;
+        }
+        if options.github_dispatch_inputs || options.only.is_some() || options.group_by.is_some() {
+            return Err("retired promotion options are not supported".to_owned());
+        }
+        Ok(options)
+    }
+
+    fn parse_option(
+        &mut self,
+        flag: &str,
+        arguments: &mut impl Iterator<Item = OsString>,
+    ) -> Result<(), String> {
+        match flag {
+            "--github-dispatch-inputs" => set_flag(&mut self.github_dispatch_inputs, flag),
+            "--explain" => set_flag(&mut self.explain, flag),
+            "--report" => set_path(&mut self.report, arguments, flag, "PATH"),
+            "--oracle" => set_path(&mut self.oracle, arguments, flag, "PATH"),
+            "--candidate" => set_path(&mut self.candidate, arguments, flag, "PATH"),
+            "--source" => set_path(&mut self.source, arguments, flag, "PATH"),
+            "--input" => set_path(&mut self.input, arguments, flag, "PATH"),
+            "--output" => set_path(&mut self.output, arguments, flag, "PATH"),
+            "--proposal" => set_path(&mut self.proposal, arguments, flag, "PATH"),
             "--dependency-attestation" => {
-                if dependency_attestation.is_some() {
-                    return Err("--dependency-attestation was provided more than once".to_owned());
-                }
-                dependency_attestation =
-                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
-                        "--dependency-attestation requires PATH".to_owned()
-                    })?));
+                set_path(&mut self.dependency_attestation, arguments, flag, "PATH")
             }
-            "--proposal" => {
-                if proposal.is_some() {
-                    return Err("--proposal was provided more than once".to_owned());
-                }
-                proposal = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--proposal requires PATH".to_owned())?,
-                ));
-            }
-            "--expect-source" => {
-                if expect_source.is_some() {
-                    return Err("--expect-source was provided more than once".to_owned());
-                }
-                expect_source = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expect-source requires SHA".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--expect-source must be UTF-8".to_owned())?,
-                );
-            }
-            "--expect-epoch" => {
-                if expect_epoch.is_some() {
-                    return Err("--expect-epoch was provided more than once".to_owned());
-                }
-                expect_epoch = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expect-epoch requires SHA-256".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--expect-epoch must be UTF-8".to_owned())?,
-                );
-            }
-            "--expect-proposal" => {
-                if expect_proposal.is_some() {
-                    return Err("--expect-proposal was provided more than once".to_owned());
-                }
-                expect_proposal = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expect-proposal requires SHA-256".to_owned())?
-                        .into_string()
-                        .map_err(|_| "--expect-proposal must be UTF-8".to_owned())?,
-                );
-            }
-            _ => return Err(format!("unknown option {flag}\n{}", usage())),
+            "--profile" => set_string(
+                &mut self.profile,
+                arguments,
+                flag,
+                "ci or release",
+                "profile",
+            ),
+            "--format" => set_string(
+                &mut self.format,
+                arguments,
+                flag,
+                "csv, json, or html",
+                "format",
+            ),
+            "--only" => set_string(&mut self.only, arguments, flag, "ambiguous", "--only"),
+            "--group-by" => set_string(
+                &mut self.group_by,
+                arguments,
+                flag,
+                "assurance-equivalence",
+                "--group-by",
+            ),
+            "--platform" => set_string(&mut self.platform, arguments, flag, "ID", "--platform"),
+            "--expect-source" => set_string(
+                &mut self.expect_source,
+                arguments,
+                flag,
+                "SHA",
+                "--expect-source",
+            ),
+            "--expect-epoch" => set_string(
+                &mut self.expect_epoch,
+                arguments,
+                flag,
+                "SHA-256",
+                "--expect-epoch",
+            ),
+            "--expect-proposal" => set_string(
+                &mut self.expect_proposal,
+                arguments,
+                flag,
+                "SHA-256",
+                "--expect-proposal",
+            ),
+            "--oracle-sha256" => self.parse_oracle_digest(arguments),
+            "--sample-count" => self.parse_sample_count(arguments),
+            _ => Err(format!("unknown option {flag}\n{}", usage())),
         }
     }
-    if github_dispatch_inputs || only.is_some() || group_by.is_some() {
-        return Err("retired promotion options are not supported".to_owned());
+
+    fn parse_oracle_digest(
+        &mut self,
+        arguments: &mut impl Iterator<Item = OsString>,
+    ) -> Result<(), String> {
+        require_absent(self.oracle_sha256.as_ref(), "--oracle-sha256")?;
+        let value = next_string(arguments, "--oracle-sha256", "HEX", "--oracle-sha256")?;
+        self.oracle_sha256 = Some(Digest::from_hex(&value).map_err(str::to_owned)?);
+        Ok(())
     }
-    let report = report.ok_or_else(|| "--report is required".to_owned())?;
-    let benchmark_options_absent = candidate.is_none() && sample_count.is_none();
-    match command.as_str() {
-        "policy"
-            if profile.is_none()
-                && format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::Policy { report })
+
+    fn parse_sample_count(
+        &mut self,
+        arguments: &mut impl Iterator<Item = OsString>,
+    ) -> Result<(), String> {
+        require_absent(self.sample_count.as_ref(), "--sample-count")?;
+        let value = next_string(arguments, "--sample-count", "an integer", "--sample-count")?;
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| "--sample-count must be a canonical positive integer".to_owned())?;
+        if value != parsed.to_string() {
+            return Err("--sample-count must be a canonical positive integer".to_owned());
         }
-        "verify"
-            if profile.is_none()
-                && format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::Verify { report })
+        self.sample_count = Some(parsed);
+        Ok(())
+    }
+
+    fn into_invocation(mut self, command: &str) -> Result<Invocation, String> {
+        let report = self
+            .report
+            .take()
+            .ok_or_else(|| "--report is required".to_owned())?;
+        match command {
+            "policy" if self.only_allows(&[]) => Ok(Invocation::Policy { report }),
+            "verify" if self.only_allows(&[]) => Ok(Invocation::Verify { report }),
+            "portability" if self.only_allows(&[]) => Ok(Invocation::Portability { report }),
+            "dependency-attestation" if self.only_allows(&[InvocationOption::Output]) => {
+                self.dependency_attestation_invocation(report)
+            }
+            "nightly"
+                if self.only_allows(&[
+                    InvocationOption::Oracle,
+                    InvocationOption::OracleSha256,
+                    InvocationOption::DependencyAttestation,
+                ]) =>
+            {
+                self.nightly_invocation(report)
+            }
+            "native-oracle-shard"
+                if self.only_allows(&[
+                    InvocationOption::Source,
+                    InvocationOption::Platform,
+                    InvocationOption::DependencyAttestation,
+                ]) =>
+            {
+                self.native_oracle_shard_invocation(report)
+            }
+            "native-differential-benchmark"
+                if self.only_allows(&[
+                    InvocationOption::Oracle,
+                    InvocationOption::Candidate,
+                    InvocationOption::SampleCount,
+                ]) =>
+            {
+                self.native_benchmark_invocation(report)
+            }
+            "examples" if self.only_allows(&[InvocationOption::Profile]) => {
+                self.examples_invocation(report)
+            }
+            _ => Err(format!("invalid subcommand options\n{}", usage())),
         }
-        "portability"
-            if profile.is_none()
-                && format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::Portability { report })
+    }
+
+    fn only_allows(&self, allowed: &[InvocationOption]) -> bool {
+        const ALL: [InvocationOption; 16] = [
+            InvocationOption::Profile,
+            InvocationOption::Format,
+            InvocationOption::Oracle,
+            InvocationOption::OracleSha256,
+            InvocationOption::Candidate,
+            InvocationOption::SampleCount,
+            InvocationOption::Source,
+            InvocationOption::Platform,
+            InvocationOption::Input,
+            InvocationOption::Output,
+            InvocationOption::DependencyAttestation,
+            InvocationOption::Proposal,
+            InvocationOption::ExpectSource,
+            InvocationOption::ExpectEpoch,
+            InvocationOption::ExpectProposal,
+            InvocationOption::Explain,
+        ];
+        ALL.into_iter()
+            .all(|option| allowed.contains(&option) || !self.is_present(option))
+    }
+
+    fn is_present(&self, option: InvocationOption) -> bool {
+        match option {
+            InvocationOption::Profile => self.profile.is_some(),
+            InvocationOption::Format => self.format.is_some(),
+            InvocationOption::Oracle => self.oracle.is_some(),
+            InvocationOption::OracleSha256 => self.oracle_sha256.is_some(),
+            InvocationOption::Candidate => self.candidate.is_some(),
+            InvocationOption::SampleCount => self.sample_count.is_some(),
+            InvocationOption::Source => self.source.is_some(),
+            InvocationOption::Platform => self.platform.is_some(),
+            InvocationOption::Input => self.input.is_some(),
+            InvocationOption::Output => self.output.is_some(),
+            InvocationOption::DependencyAttestation => self.dependency_attestation.is_some(),
+            InvocationOption::Proposal => self.proposal.is_some(),
+            InvocationOption::ExpectSource => self.expect_source.is_some(),
+            InvocationOption::ExpectEpoch => self.expect_epoch.is_some(),
+            InvocationOption::ExpectProposal => self.expect_proposal.is_some(),
+            InvocationOption::Explain => self.explain,
         }
-        "dependency-attestation"
-            if profile.is_none()
-                && format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::DependencyAttestation {
-                report,
-                output: output
-                    .ok_or_else(|| "dependency-attestation requires --output PATH".to_owned())?,
-            })
-        }
-        "nightly"
-            if profile.is_none()
-                && format.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::Nightly {
-                report,
-                oracle: oracle.ok_or_else(|| "nightly requires --oracle PATH".to_owned())?,
-                oracle_sha256: oracle_sha256
-                    .ok_or_else(|| "nightly requires --oracle-sha256 HEX".to_owned())?,
-                dependency_attestation: dependency_attestation
-                    .ok_or_else(|| "nightly requires --dependency-attestation PATH".to_owned())?,
-            })
-        }
-        "native-oracle-shard"
-            if profile.is_none()
-                && format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && input.is_none()
-                && output.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::NativeOracleShard {
-                report,
-                source: source.ok_or_else(|| "native-oracle-shard requires --source".to_owned())?,
-                platform: platform
-                    .ok_or_else(|| "native-oracle-shard requires --platform".to_owned())?,
-                dependency_attestation: dependency_attestation.ok_or_else(|| {
-                    "native-oracle-shard requires --dependency-attestation PATH".to_owned()
-                })?,
-            })
-        }
-        "native-differential-benchmark"
-            if profile.is_none()
-                && format.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && !explain =>
-        {
-            Ok(Invocation::NativeDifferentialBenchmark {
-                report,
-                oracle: oracle.ok_or_else(|| {
-                    "native-differential-benchmark requires --oracle PATH".to_owned()
-                })?,
-                candidate: candidate.ok_or_else(|| {
-                    "native-differential-benchmark requires --candidate PATH".to_owned()
-                })?,
-                sample_count: sample_count.ok_or_else(|| {
-                    "native-differential-benchmark requires --sample-count".to_owned()
-                })?,
-            })
-        }
-        "examples"
-            if format.is_none()
-                && oracle.is_none()
-                && oracle_sha256.is_none()
-                && source.is_none()
-                && platform.is_none()
-                && input.is_none()
-                && output.is_none()
-                && dependency_attestation.is_none()
-                && proposal.is_none()
-                && expect_source.is_none()
-                && expect_epoch.is_none()
-                && expect_proposal.is_none()
-                && benchmark_options_absent
-                && !explain =>
-        {
-            Ok(Invocation::Examples {
-                profile: match profile.as_deref() {
-                    Some("ci" | "release") => profile.expect("profile was matched"),
-                    Some(value) => return Err(format!("invalid profile {value}\n{}", usage())),
-                    None => return Err("examples requires --profile".to_owned()),
-                },
-                report,
-            })
-        }
-        _ => Err(format!("invalid subcommand options\n{}", usage())),
+    }
+
+    fn dependency_attestation_invocation(self, report: PathBuf) -> Result<Invocation, String> {
+        Ok(Invocation::DependencyAttestation {
+            report,
+            output: self
+                .output
+                .ok_or_else(|| "dependency-attestation requires --output PATH".to_owned())?,
+        })
+    }
+
+    fn nightly_invocation(self, report: PathBuf) -> Result<Invocation, String> {
+        Ok(Invocation::Nightly {
+            report,
+            oracle: self
+                .oracle
+                .ok_or_else(|| "nightly requires --oracle PATH".to_owned())?,
+            oracle_sha256: self
+                .oracle_sha256
+                .ok_or_else(|| "nightly requires --oracle-sha256 HEX".to_owned())?,
+            dependency_attestation: self
+                .dependency_attestation
+                .ok_or_else(|| "nightly requires --dependency-attestation PATH".to_owned())?,
+        })
+    }
+
+    fn native_oracle_shard_invocation(self, report: PathBuf) -> Result<Invocation, String> {
+        Ok(Invocation::NativeOracleShard {
+            report,
+            source: self
+                .source
+                .ok_or_else(|| "native-oracle-shard requires --source".to_owned())?,
+            platform: self
+                .platform
+                .ok_or_else(|| "native-oracle-shard requires --platform".to_owned())?,
+            dependency_attestation: self.dependency_attestation.ok_or_else(|| {
+                "native-oracle-shard requires --dependency-attestation PATH".to_owned()
+            })?,
+        })
+    }
+
+    fn native_benchmark_invocation(self, report: PathBuf) -> Result<Invocation, String> {
+        Ok(Invocation::NativeDifferentialBenchmark {
+            report,
+            oracle: self
+                .oracle
+                .ok_or_else(|| "native-differential-benchmark requires --oracle PATH".to_owned())?,
+            candidate: self.candidate.ok_or_else(|| {
+                "native-differential-benchmark requires --candidate PATH".to_owned()
+            })?,
+            sample_count: self.sample_count.ok_or_else(|| {
+                "native-differential-benchmark requires --sample-count".to_owned()
+            })?,
+        })
+    }
+
+    fn examples_invocation(self, report: PathBuf) -> Result<Invocation, String> {
+        let profile = match self.profile.as_deref() {
+            Some("ci" | "release") => self.profile.expect("profile was matched"),
+            Some(value) => return Err(format!("invalid profile {value}\n{}", usage())),
+            None => return Err("examples requires --profile".to_owned()),
+        };
+        Ok(Invocation::Examples { profile, report })
     }
 }
 
-fn main() -> ExitCode {
+fn set_flag(slot: &mut bool, flag: &str) -> Result<(), String> {
+    if *slot {
+        return Err(format!("{flag} was provided more than once"));
+    }
+    *slot = true;
+    Ok(())
+}
+
+fn set_path(
+    slot: &mut Option<PathBuf>,
+    arguments: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+    requirement: &str,
+) -> Result<(), String> {
+    require_absent(slot.as_ref(), flag)?;
+    *slot = Some(PathBuf::from(
+        arguments
+            .next()
+            .ok_or_else(|| format!("{flag} requires {requirement}"))?,
+    ));
+    Ok(())
+}
+
+fn set_string(
+    slot: &mut Option<String>,
+    arguments: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+    requirement: &str,
+    utf_label: &str,
+) -> Result<(), String> {
+    require_absent(slot.as_ref(), flag)?;
+    *slot = Some(next_string(arguments, flag, requirement, utf_label)?);
+    Ok(())
+}
+
+fn next_string(
+    arguments: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+    requirement: &str,
+    utf_label: &str,
+) -> Result<String, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{flag} requires {requirement}"))?
+        .into_string()
+        .map_err(|_| format!("{utf_label} must be UTF-8"))
+}
+
+fn require_absent<T>(slot: Option<&T>, flag: &str) -> Result<(), String> {
+    if slot.is_some() {
+        Err(format!("{flag} was provided more than once"))
+    } else {
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn main() -> ExitCode {
     let mut process_arguments = std::env::args_os();
+    #[cfg(unix)]
     let invoked = process_arguments.next();
     #[cfg(not(unix))]
-    let _ = invoked;
+    process_arguments.next();
     let arguments = process_arguments.collect::<Vec<_>>();
+    #[cfg(unix)]
+    return dispatch_initial(arguments, invoked.as_deref());
+    #[cfg(not(unix))]
+    dispatch_initial(arguments)
+}
+
+fn dispatch_initial(arguments: Vec<OsString>, #[cfg(unix)] invoked: Option<&OsStr>) -> ExitCode {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-final-verification-transaction")
+    {
+        return match release::verify_transaction_for_integration(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(any(unix, windows))]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-command-supervisor-v1")
     {
@@ -576,6 +534,16 @@ fn main() -> ExitCode {
             }
         };
     }
+    #[cfg(unix)]
+    return dispatch_supervisor_verifications(arguments, invoked);
+    #[cfg(not(unix))]
+    dispatch_supervisor_verifications(arguments)
+}
+
+fn dispatch_supervisor_verifications(
+    arguments: Vec<OsString>,
+    #[cfg(unix)] invoked: Option<&OsStr>,
+) -> ExitCode {
     #[cfg(any(unix, windows))]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__nightly-supervisor-owned-grandchild")
@@ -627,7 +595,7 @@ fn main() -> ExitCode {
         };
     }
     #[cfg(unix)]
-    if native_archive_adapter_dispatch(invoked.as_deref()) {
+    if native_archive_adapter_dispatch(invoked) {
         return command::run_native_archive_adapter(&arguments);
     }
     if arguments.first().and_then(|value| value.to_str())
@@ -661,6 +629,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_portability_children(arguments)
+}
+
+fn dispatch_portability_children(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__portability-supervision-fixture")
@@ -739,6 +711,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_posix_transition_verifications(arguments)
+}
+
+fn dispatch_posix_transition_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-posix-archive-adapter-transition")
@@ -837,6 +813,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_posix_authority_verifications(arguments)
+}
+
+fn dispatch_posix_authority_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-posix-identity-query-deadline")
@@ -885,6 +865,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_posix_candidate_verifications(arguments)
+}
+
+fn dispatch_posix_candidate_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-posix-candidate-driver-receipt")
@@ -964,6 +948,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_tool_resolution_verifications(arguments)
+}
+
+fn dispatch_tool_resolution_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__verify-cargo-multicall-argv") {
         if arguments.len() != 1 {
@@ -1035,6 +1023,10 @@ fn main() -> ExitCode {
         println!("member.o");
         return ExitCode::SUCCESS;
     }
+    dispatch_macos_archive_verifications(arguments)
+}
+
+fn dispatch_macos_archive_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(target_os = "macos")]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-macos-native-archiver-acquisition")
@@ -1103,6 +1095,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_native_archive_ghc_verifications(arguments)
+}
+
+fn dispatch_native_archive_ghc_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-native-archive-ghc-configure-probe")
@@ -1135,6 +1131,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_archive_policy_verifications(arguments)
+}
+
+fn dispatch_archive_policy_verifications(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__verify-native-archive-policy")
     {
@@ -1223,6 +1223,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_platform_children(arguments)
+}
+
+fn dispatch_platform_children(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(windows)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-windows-hell-testkit-diagnostics")
@@ -1292,6 +1296,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_platform_normalizers(arguments)
+}
+
+fn dispatch_platform_normalizers(arguments: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__release-normalize-cargo-deny-home")
@@ -1385,6 +1393,10 @@ fn main() -> ExitCode {
     {
         return command::run_windows_write_restricted_child(&arguments[1..]);
     }
+    dispatch_public_cli(arguments)
+}
+
+fn dispatch_public_cli(arguments: Vec<OsString>) -> ExitCode {
     let root = match std::env::current_dir() {
         Ok(root) => root,
         Err(error) => {
@@ -1401,6 +1413,30 @@ fn main() -> ExitCode {
     if mutation::recognizes(&arguments) {
         return mutation::run_cli(&root, &arguments);
     }
+    if assurance::recognizes(&arguments) {
+        return match assurance::run(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if fuzz::recognizes(&arguments) {
+        return match fuzz::run_cli(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if conformance::recognizes(&arguments) {
         return match conformance::run_cli(&arguments) {
             Ok(message) => {
@@ -1413,8 +1449,60 @@ fn main() -> ExitCode {
             }
         };
     }
+    dispatch_release_cli(arguments, &root)
+}
+
+fn dispatch_release_cli(arguments: Vec<OsString>, root: &Path) -> ExitCode {
     if readiness::recognizes(&arguments) {
         return match readiness::run(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if protocol::recognizes(&arguments) {
+        return match protocol::run(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if repository::recognizes(&arguments) {
+        return match repository::run(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if capability_policy::recognizes(&arguments) {
+        return match capability_policy::run(&arguments) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if release::native_environment::recognizes(&arguments) {
+        return match release::native_environment::run(&arguments) {
             Ok(message) => {
                 println!("{message}");
                 ExitCode::SUCCESS
@@ -1456,7 +1544,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    run(&invocation, &root)
+    run(&invocation, root)
 }
 
 #[cfg(unix)]
@@ -1468,7 +1556,6 @@ fn native_archive_adapter_dispatch(invoked: Option<&OsStr>) -> bool {
         .is_some_and(|name| name == "ar")
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(invocation: &Invocation, root: &Path) -> ExitCode {
     let (suite_name, report_path) = match invocation {
         Invocation::Policy { report } => ("policy", report),

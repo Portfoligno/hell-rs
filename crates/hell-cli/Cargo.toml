@@ -22,5 +22,8 @@ hell-core = { version = "0.1.0", path = "../hell-core" }
 hell-platform = { version = "0.1.0", path = "../hell-platform" }
 hell-runtime = { version = "0.1.0", path = "../hell-runtime" }
 
+[dev-dependencies]
+hell-testkit = { version = "0.1.0", path = "../hell-testkit" }
+
 [lints]
 workspace = true

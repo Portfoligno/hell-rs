@@ -172,7 +172,9 @@ fn validate_control_path(relative: &str) -> Result<(), String> {
 }
 
 fn text_control(relative: &str) -> bool {
-    relative.ends_with(".toml") || relative.ends_with(".json")
+    Path::new(relative)
+        .extension()
+        .is_some_and(|extension| extension == "toml" || extension == "json")
 }
 
 pub(crate) fn parse_trusted_inputs(value: &JsonValue) -> Result<TrustedConformanceInputs, String> {

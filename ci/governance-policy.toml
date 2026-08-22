@@ -1,0 +1,132 @@
+schema-version = 1
+profile-id = "hell-rs-release-governance-v1"
+repository-owner = "Portfoligno"
+repository-name = "hell-rs"
+repository-id-source = "trusted-resolution"
+require-numeric-repository-id = true
+default-branch = "main"
+workflow-control-ref = "default-branch"
+merge-queue = false
+immutable-releases = "required"
+full-sha-actions = "required"
+default-workflow-token = "read"
+workflows-may-approve-pull-requests = false
+candidate-head-stability = "required"
+tag-absence-before-publication = "required"
+
+[observation]
+allowed-statuses = ["observed", "unavailable", "not-applicable"]
+allowed-evaluations = ["matched", "mismatched", "residual-assumption", "not-applicable"]
+unavailable-is-match = false
+
+[[control]]
+id = "repository-identity"
+endpoint = "trusted-resolution"
+treatment = "block-on-unavailable-or-mismatch"
+phases = ["resolve", "post-assembly", "pre-attestation", "pre-publish"]
+
+[[control]]
+id = "default-branch"
+endpoint = "repository"
+treatment = "block-on-mismatch"
+residual-assumption = "default-branch-api-unavailable"
+
+[[control]]
+id = "workflow-token-permissions"
+endpoint = "repository-workflow-permissions"
+treatment = "block-on-mismatch"
+residual-assumption = "workflow-permissions-api-unavailable"
+
+[[control]]
+id = "allowed-actions"
+endpoint = "repository-actions-permissions"
+treatment = "block-on-mismatch"
+residual-assumption = "actions-policy-api-unavailable"
+
+[[control]]
+id = "branch-and-ruleset-protection"
+endpoint = "repository-rulesets"
+treatment = "disclose-residual"
+residual-assumption = "ruleset-api-unavailable"
+
+[[control]]
+id = "tag-protection"
+endpoint = "repository-rulesets"
+treatment = "disclose-residual"
+residual-assumption = "tag-rules-api-unavailable"
+
+[[control]]
+id = "immutable-releases"
+endpoint = "repository-immutable-releases"
+treatment = "disclose-residual"
+residual-assumption = "immutable-release-api-unavailable"
+
+[[control]]
+id = "merge-queue"
+endpoint = "repository-rulesets"
+treatment = "not-applicable-when-disabled"
+residual-assumption = "merge-queue-api-unavailable"
+
+[[control]]
+id = "candidate-head"
+endpoint = "branch-ref"
+treatment = "block-on-mismatch"
+phases = ["resolve", "post-assembly", "pre-attestation", "pre-publish"]
+
+[[control]]
+id = "release-tag"
+endpoint = "tag-ref"
+treatment = "block-on-mismatch"
+phases = ["resolve", "post-assembly", "pre-attestation", "pre-publish"]
+
+[[residual-assumption]]
+id = "default-branch-api-unavailable"
+statement = "The workflow token cannot observe the repository default branch."
+
+[[residual-assumption]]
+id = "workflow-permissions-api-unavailable"
+statement = "The workflow token cannot observe effective default workflow permissions."
+
+[[residual-assumption]]
+id = "actions-policy-api-unavailable"
+statement = "The workflow token cannot observe the effective repository or organization Actions policy."
+
+[[residual-assumption]]
+id = "ruleset-api-unavailable"
+statement = "The workflow token cannot observe the effective branch and ruleset policy."
+
+[[residual-assumption]]
+id = "tag-rules-api-unavailable"
+statement = "The workflow token cannot observe the effective tag protection policy."
+
+[[residual-assumption]]
+id = "immutable-release-api-unavailable"
+statement = "The workflow token cannot observe immutable-release configuration."
+
+[[residual-assumption]]
+id = "merge-queue-api-unavailable"
+statement = "The workflow token cannot observe whether merge queue is required."
+
+[[residual-assumption]]
+id = "shared-rust-toolchain"
+statement = "Both verifier implementations use the pinned Rust compiler and workspace lockfile."
+
+[[residual-assumption]]
+id = "shared-normative-specification"
+statement = "Both verifier implementations interpret the same reviewed normative protocol and declarative rules."
+
+[[residual-assumption]]
+id = "github-job-isolation"
+statement = "GitHub enforces the declared job permission and isolation boundaries."
+
+[[residual-assumption]]
+id = "github-release-api-availability"
+statement = "GitHub returns authentic bounded repository, tag, and release state to the typed client."
+
+[[residual-assumption]]
+id = "github-required-check-is-summary"
+statement = "Repository governance requires the failure-terminal readiness summary check."
+
+[[residual-assumption]]
+id = "github-hosted-runner-operation"
+statement = "GitHub operates the native hosted runner represented by the bound environment receipt."

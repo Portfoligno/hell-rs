@@ -8,6 +8,10 @@ publish = false
 [features]
 mutation-testing = []
 
+[lib]
+name = "hell_ci"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hell-ci"
 path = "src/main.rs"
@@ -24,6 +28,7 @@ hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 hell-testkit = { version = "0.1.0", path = "../hell-testkit" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
+syn = { version = "2.0.106", features = ["full", "visit"] }
 tar = "0.4.44"
 ureq = { version = "3.1.2", default-features = false, features = ["rustls"] }
 
@@ -37,6 +42,9 @@ getrandom = "=0.2.17"
 widestring = "=1.2.1"
 same-file = "=1.0.6"
 windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[dev-dependencies]
+serde_json = "1.0.145"
 
 [lints]
 workspace = true

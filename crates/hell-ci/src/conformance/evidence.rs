@@ -830,103 +830,14 @@ impl EvidenceRepository {
         let mut repository = Self::default();
         let mut consumed = BTreeSet::new();
         for manifest in manifests {
-            manifest.validate_against(trusted)?;
-            let declared_observations = manifest
-                .observations
-                .iter()
-                .map(|member| member.sha256.clone())
-                .collect::<BTreeSet<_>>();
-            let mut referenced_observations = BTreeSet::new();
-            let mut platform_exploratory = Vec::new();
-            let manifest_path = format!("platform-manifests/{}.json", manifest.platform.as_str());
-            let manifest_bytes = members
-                .get(&manifest_path)
-                .ok_or_else(|| "platform evidence manifest is missing from archive".to_owned())?;
-            if canonical_json_bytes(&manifest.json())? != *manifest_bytes
-                || hell_testkit::sha256_bytes(&canonical_json_bytes(
-                    &manifest.json_without_digest(),
-                )?)
-                .hex()
-                    != manifest.manifest_sha256
-            {
-                return Err("platform evidence manifest bytes or digest differ".to_owned());
-            }
-            if manifest.assigned_obligations != assigned_obligation_count(plan, manifest.platform)?
-            {
-                return Err("evidence manifest assigned-obligation count is forged".to_owned());
-            }
-            for member in &manifest.records {
-                let bytes = consume_archive_member(member, members, &mut consumed, false)?;
-                let value = parse_canonical_json(bytes)?;
-                let record = EvidenceRecord::parse(&value)?;
-                if record.record_id != member.id.as_deref().unwrap_or_default()
-                    || record.platform != manifest.platform
-                {
-                    return Err("evidence record identity differs from its manifest".to_owned());
-                }
-                for digest in [
-                    record.candidate_observation_sha256.clone(),
-                    record.oracle_observation_sha256.clone(),
-                ] {
-                    if !declared_observations.contains(&digest) {
-                        return Err(
-                            "evidence record references an observation outside its platform manifest"
-                                .to_owned(),
-                        );
-                    }
-                    referenced_observations.insert(digest);
-                }
-                repository.records.push(record);
-            }
-            for member in &manifest.exploratory_records {
-                let bytes = consume_archive_member(member, members, &mut consumed, false)?;
-                let value = parse_canonical_json(bytes)?;
-                let record = ExploratoryRecord::parse(&value)?;
-                if record.canonical_id()? != member.id.as_deref().unwrap_or_default()
-                    || record.platform != manifest.platform
-                {
-                    return Err("exploratory record identity differs from its manifest".to_owned());
-                }
-                for digest in [
-                    record.candidate_observation_sha256.clone(),
-                    record.oracle_observation_sha256.clone(),
-                ] {
-                    if !declared_observations.contains(&digest) {
-                        return Err(
-                            "exploratory record references an observation outside its platform manifest"
-                                .to_owned(),
-                        );
-                    }
-                    referenced_observations.insert(digest);
-                }
-                platform_exploratory.push(record.clone());
-                repository.exploratory_records.push(record);
-            }
-            validate_exact_exploratory_schedule(manifest.platform, &platform_exploratory)?;
-            if referenced_observations != declared_observations {
-                return Err(
-                    "platform manifest contains a locally unreferenced observation".to_owned(),
-                );
-            }
-            for member in &manifest.observations {
-                let bytes = consume_archive_member(member, members, &mut consumed, true)?;
-                let observation = Observation::parse_canonical(bytes.clone())?;
-                if observation.sha256 != member.sha256 {
-                    return Err(
-                        "observation identity is duplicated or differs from manifest".to_owned(),
-                    );
-                }
-                match repository.observations.entry(observation.sha256.clone()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(observation);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() == &observation => {}
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err("observation digest has contradictory bytes".to_owned());
-                    }
-                }
-            }
+            ingest_evidence_manifest(
+                &mut repository,
+                &mut consumed,
+                manifest,
+                members,
+                trusted,
+                plan,
+            )?;
         }
         let evidence_members = members
             .keys()
@@ -941,6 +852,167 @@ impl EvidenceRepository {
         EvidenceIndex::build(&repository)?;
         Ok(repository)
     }
+}
+
+fn ingest_evidence_manifest(
+    repository: &mut EvidenceRepository,
+    consumed: &mut BTreeSet<String>,
+    manifest: &EvidenceManifest,
+    members: &BTreeMap<String, Vec<u8>>,
+    trusted: &TrustedEvidenceBindings,
+    plan: &super::ConformancePlan,
+) -> Result<(), String> {
+    manifest.validate_against(trusted)?;
+    validate_evidence_manifest_bytes(manifest, members, plan)?;
+    let declared = manifest
+        .observations
+        .iter()
+        .map(|member| member.sha256.clone())
+        .collect::<BTreeSet<_>>();
+    let mut referenced = BTreeSet::new();
+    ingest_evidence_records(
+        repository,
+        consumed,
+        manifest,
+        members,
+        &declared,
+        &mut referenced,
+    )?;
+    let exploratory = ingest_exploratory_records(
+        repository,
+        consumed,
+        manifest,
+        members,
+        &declared,
+        &mut referenced,
+    )?;
+    validate_exact_exploratory_schedule(manifest.platform, &exploratory)?;
+    if referenced != declared {
+        return Err("platform manifest contains a locally unreferenced observation".to_owned());
+    }
+    ingest_observations(repository, consumed, manifest, members)
+}
+
+fn validate_evidence_manifest_bytes(
+    manifest: &EvidenceManifest,
+    members: &BTreeMap<String, Vec<u8>>,
+    plan: &super::ConformancePlan,
+) -> Result<(), String> {
+    let path = format!("platform-manifests/{}.json", manifest.platform.as_str());
+    let bytes = members
+        .get(&path)
+        .ok_or_else(|| "platform evidence manifest is missing from archive".to_owned())?;
+    if canonical_json_bytes(&manifest.json())? != *bytes
+        || hell_testkit::sha256_bytes(&canonical_json_bytes(&manifest.json_without_digest())?).hex()
+            != manifest.manifest_sha256
+    {
+        return Err("platform evidence manifest bytes or digest differ".to_owned());
+    }
+    if manifest.assigned_obligations != assigned_obligation_count(plan, manifest.platform)? {
+        return Err("evidence manifest assigned-obligation count is forged".to_owned());
+    }
+    Ok(())
+}
+
+fn ingest_evidence_records(
+    repository: &mut EvidenceRepository,
+    consumed: &mut BTreeSet<String>,
+    manifest: &EvidenceManifest,
+    members: &BTreeMap<String, Vec<u8>>,
+    declared: &BTreeSet<String>,
+    referenced: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for member in &manifest.records {
+        let bytes = consume_archive_member(member, members, consumed, false)?;
+        let record = EvidenceRecord::parse(&parse_canonical_json(bytes)?)?;
+        if record.record_id != member.id.as_deref().unwrap_or_default()
+            || record.platform != manifest.platform
+        {
+            return Err("evidence record identity differs from its manifest".to_owned());
+        }
+        retain_referenced_observations(
+            declared,
+            referenced,
+            &record.candidate_observation_sha256,
+            &record.oracle_observation_sha256,
+            "evidence record",
+        )?;
+        repository.records.push(record);
+    }
+    Ok(())
+}
+
+fn ingest_exploratory_records(
+    repository: &mut EvidenceRepository,
+    consumed: &mut BTreeSet<String>,
+    manifest: &EvidenceManifest,
+    members: &BTreeMap<String, Vec<u8>>,
+    declared: &BTreeSet<String>,
+    referenced: &mut BTreeSet<String>,
+) -> Result<Vec<ExploratoryRecord>, String> {
+    let mut platform_records = Vec::new();
+    for member in &manifest.exploratory_records {
+        let bytes = consume_archive_member(member, members, consumed, false)?;
+        let record = ExploratoryRecord::parse(&parse_canonical_json(bytes)?)?;
+        if record.canonical_id()? != member.id.as_deref().unwrap_or_default()
+            || record.platform != manifest.platform
+        {
+            return Err("exploratory record identity differs from its manifest".to_owned());
+        }
+        retain_referenced_observations(
+            declared,
+            referenced,
+            &record.candidate_observation_sha256,
+            &record.oracle_observation_sha256,
+            "exploratory record",
+        )?;
+        platform_records.push(record.clone());
+        repository.exploratory_records.push(record);
+    }
+    Ok(platform_records)
+}
+
+fn retain_referenced_observations(
+    declared: &BTreeSet<String>,
+    referenced: &mut BTreeSet<String>,
+    candidate: &str,
+    oracle: &str,
+    label: &str,
+) -> Result<(), String> {
+    for digest in [candidate, oracle] {
+        if !declared.contains(digest) {
+            return Err(format!(
+                "{label} references an observation outside its platform manifest"
+            ));
+        }
+        referenced.insert(digest.to_owned());
+    }
+    Ok(())
+}
+
+fn ingest_observations(
+    repository: &mut EvidenceRepository,
+    consumed: &mut BTreeSet<String>,
+    manifest: &EvidenceManifest,
+    members: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    for member in &manifest.observations {
+        let bytes = consume_archive_member(member, members, consumed, true)?;
+        let observation = Observation::parse_canonical(bytes.clone())?;
+        if observation.sha256 != member.sha256 {
+            return Err("observation identity is duplicated or differs from manifest".to_owned());
+        }
+        match repository.observations.entry(observation.sha256.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(observation);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &observation => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err("observation digest has contradictory bytes".to_owned());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_exact_exploratory_schedule(
@@ -1057,7 +1129,9 @@ fn canonical_member_path(path: &str) -> bool {
     matches!(prefix, "records" | "observations")
         && !tail.is_empty()
         && !tail.contains(['/', '\\'])
-        && tail.ends_with(".json")
+        && std::path::Path::new(tail)
+            .extension()
+            .is_some_and(|extension| extension == "json")
         && !tail.starts_with('.')
 }
 
@@ -1578,6 +1652,94 @@ fn validate_record_binding(
     }
 }
 
+pub(crate) fn assurance_relabeled_native_evidence() -> Result<(), String> {
+    let plan = super::build_release_conformance_plan(
+        hell_builtins::UPSTREAM_COMMIT,
+        hell_builtins::UPSTREAM_COMMIT,
+        "2026-08-13T00:00:00Z",
+        &hell_testkit::sha256_bytes(b"assurance trusted inputs").hex(),
+        &hell_testkit::sha256_bytes(b"assurance source inventory").hex(),
+        Vec::new(),
+    )?;
+    let executable_digests = ConformancePlatform::ALL
+        .into_iter()
+        .map(|platform| {
+            (
+                platform,
+                hell_testkit::sha256_bytes(platform.as_str().as_bytes()).hex(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let oracle_bindings = ConformancePlatform::ALL
+        .into_iter()
+        .map(|platform| {
+            (
+                platform,
+                OracleBinding {
+                    repository: "chrisdone/hell".to_owned(),
+                    commit: hell_builtins::UPSTREAM_COMMIT.to_owned(),
+                    executable_sha256: hell_testkit::sha256_bytes(
+                        format!("{} oracle executable", platform.as_str()).as_bytes(),
+                    )
+                    .hex(),
+                    source_sha256: hell_testkit::sha256_bytes(
+                        format!("{} oracle source", platform.as_str()).as_bytes(),
+                    )
+                    .hex(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let trusted = TrustedEvidenceBindings::from_platform_identities(
+        hell_testkit::sha256_bytes(b"assurance release plan").hex(),
+        &plan,
+        executable_digests,
+        oracle_bindings,
+    )?;
+    let cell = plan
+        .cells
+        .iter()
+        .find(|cell| {
+            cell.key.platform == ConformancePlatform::LinuxX86_64
+                && matches!(cell.scope, super::ScopeDisposition::Required { .. })
+                && !cell.obligations.is_empty()
+        })
+        .ok_or_else(|| "release plan has no required Linux assurance cell".to_owned())?;
+    let mut obligation = cell.obligations[0].clone();
+    let case_id = "assurance-platform-binding".to_owned();
+    let descriptor_sha256 = hell_testkit::sha256_bytes(case_id.as_bytes()).hex();
+    obligation.case_ids = vec![case_id.clone()];
+    obligation.case_descriptor_sha256 =
+        BTreeMap::from([(case_id.clone(), descriptor_sha256.clone())]);
+    let relabeled_platform = ConformancePlatform::MacosAarch64;
+    let record = EvidenceRecord {
+        record_id: "assurance-platform-binding".to_owned(),
+        release_plan_sha256: trusted.release_plan_sha256.clone(),
+        conformance_plan_sha256: trusted.conformance_plan_sha256.clone(),
+        candidate_sha: trusted.candidate_sha.clone(),
+        candidate_executable_sha256: trusted.candidate_executable_sha256[&cell.key.platform]
+            .clone(),
+        candidate_build_info_schema_version: 2,
+        candidate_compat_tracing: true,
+        source_inventory_sha256: trusted.source_inventory_sha256.clone(),
+        oracle: trusted.oracle[&relabeled_platform].clone(),
+        platform: relabeled_platform,
+        profile: cell.key.profile,
+        target: EvidenceTarget {
+            cell: cell.key.clone(),
+            obligation_id: obligation.id.clone(),
+            case_id,
+        },
+        descriptor_sha256,
+        case_source: CaseSource::Committed,
+        candidate_observation_sha256: hell_testkit::sha256_bytes(b"candidate observation").hex(),
+        oracle_observation_sha256: hell_testkit::sha256_bytes(b"oracle observation").hex(),
+        requested_normalizers: obligation.allowed_normalizers.clone(),
+    };
+    validate_record_binding(&record, cell, &obligation, &trusted)
+        .map_err(|code| format!("{code:?}"))
+}
+
 #[derive(Debug)]
 enum Comparison {
     Exact,
@@ -1693,8 +1855,8 @@ fn replay_normalizers(
 }
 
 fn encode_base64_bytes(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = chunk[0];
         let second = chunk.get(1).copied().unwrap_or(0);
@@ -2128,86 +2290,60 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn trusted_normalizer_is_replayed_on_both_raw_observations() {
-        let observation = |raw_stderr: &[u8], sandbox: &str, script: &str| {
-            Observation::parse_canonical(
-                canonical_json_bytes(&object([
-                    ("diagnostic", string("None")),
-                    (
-                        "exit",
-                        object([("kind", string("code")), ("value", number(0))]),
-                    ),
-                    ("filesystem", string("[]")),
-                    ("mode", string("Run")),
-                    (
-                        "normalizerContext",
-                        object([
-                            ("executable", string("/bin/hell")),
-                            ("sandbox", string(sandbox)),
-                            ("script", string(script)),
-                        ]),
-                    ),
-                    (
-                        "rawStderr",
-                        object([
-                            ("encoding", string("base64")),
-                            ("value", string(&encode_base64(raw_stderr))),
-                        ]),
-                    ),
-                    ("resourceAudit", string("None")),
-                    ("schemaVersion", number(4)),
-                    ("semanticTrace", JsonValue::Array(Vec::new())),
-                    (
-                        "stderr",
-                        object([
-                            ("encoding", string("base64")),
-                            (
-                                "value",
-                                string(&encode_base64(b"<SANDBOX>/main.hell:1:1: error[H0200]")),
-                            ),
-                        ]),
-                    ),
-                    ("statusSuccess", JsonValue::Bool(true)),
-                    (
-                        "stdout",
-                        object([("encoding", string("base64")), ("value", string(""))]),
-                    ),
-                    ("termination", string("exited")),
-                ]))
-                .unwrap(),
-            )
-            .unwrap()
-        };
-        let candidate = observation(
-            br"C:\work\one\main.hell:1:1: error[H0200]",
-            r"C:\work\one",
-            r"C:\work\one\main.hell",
-        );
-        let oracle = observation(
-            b"/tmp/two/main.hell:1:1: error[H0200]",
-            "/tmp/two",
-            "/tmp/two/main.hell",
-        );
-        let case = hell_testkit::DifferentialCase {
-            normalization: hell_testkit::OutputNormalization {
-                stderr_replacements: Vec::new(),
-                normalize_path_separators: true,
-            },
-            ..hell_testkit::DifferentialCase::default()
-        };
-        assert!(matches!(
-            compare_observations(
-                &candidate,
-                &oracle,
-                &["diagnostic-path-separator-v1".to_owned()],
-                Some(&case),
-            )
+    fn diagnostic_observation(raw_stderr: &[u8], sandbox: &str, script: &str) -> Observation {
+        Observation::parse_canonical(
+            canonical_json_bytes(&object([
+                ("diagnostic", string("None")),
+                (
+                    "exit",
+                    object([("kind", string("code")), ("value", number(0))]),
+                ),
+                ("filesystem", string("[]")),
+                ("mode", string("Run")),
+                (
+                    "normalizerContext",
+                    object([
+                        ("executable", string("/bin/hell")),
+                        ("sandbox", string(sandbox)),
+                        ("script", string(script)),
+                    ]),
+                ),
+                (
+                    "rawStderr",
+                    object([
+                        ("encoding", string("base64")),
+                        ("value", string(&encode_base64(raw_stderr))),
+                    ]),
+                ),
+                ("resourceAudit", string("None")),
+                ("schemaVersion", number(4)),
+                ("semanticTrace", JsonValue::Array(Vec::new())),
+                (
+                    "stderr",
+                    object([
+                        ("encoding", string("base64")),
+                        (
+                            "value",
+                            string(&encode_base64(b"<SANDBOX>/main.hell:1:1: error[H0200]")),
+                        ),
+                    ]),
+                ),
+                ("statusSuccess", JsonValue::Bool(true)),
+                (
+                    "stdout",
+                    object([("encoding", string("base64")), ("value", string(""))]),
+                ),
+                ("termination", string("exited")),
+            ]))
             .unwrap(),
-            Comparison::Normalized
-        ));
+        )
+        .unwrap()
+    }
 
-        let (plan, trusted) = plan_and_trusted();
+    fn assert_normalizer_closure_is_bound(
+        plan: &super::super::ConformancePlan,
+        trusted: &TrustedEvidenceBindings,
+    ) {
         let cell = plan
             .cells
             .iter()
@@ -2244,9 +2380,43 @@ mod tests {
             requested_normalizers: Vec::new(),
         };
         assert_eq!(
-            validate_record_binding(&record, cell, &obligation, &trusted),
+            validate_record_binding(&record, cell, &obligation, trusted),
             Err(InvalidEvidenceCode::NormalizerClosure)
         );
+    }
+
+    #[test]
+    fn trusted_normalizer_is_replayed_on_both_raw_observations() {
+        let candidate = diagnostic_observation(
+            br"C:\work\one\main.hell:1:1: error[H0200]",
+            r"C:\work\one",
+            r"C:\work\one\main.hell",
+        );
+        let oracle = diagnostic_observation(
+            b"/tmp/two/main.hell:1:1: error[H0200]",
+            "/tmp/two",
+            "/tmp/two/main.hell",
+        );
+        let case = hell_testkit::DifferentialCase {
+            normalization: hell_testkit::OutputNormalization {
+                stderr_replacements: Vec::new(),
+                normalize_path_separators: true,
+            },
+            ..hell_testkit::DifferentialCase::default()
+        };
+        assert!(matches!(
+            compare_observations(
+                &candidate,
+                &oracle,
+                &["diagnostic-path-separator-v1".to_owned()],
+                Some(&case),
+            )
+            .unwrap(),
+            Comparison::Normalized
+        ));
+
+        let (plan, trusted) = plan_and_trusted();
+        assert_normalizer_closure_is_bound(&plan, &trusted);
     }
 
     #[test]
@@ -2531,18 +2701,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn record_cannot_borrow_an_observation_from_another_platform_manifest() {
-        let (plan, trusted) = plan_and_trusted();
-        let cell = plan
-            .cells
-            .iter()
-            .find(|cell| {
-                cell.key.platform == ConformancePlatform::LinuxX86_64
-                    && matches!(cell.scope, super::super::ScopeDisposition::Required { .. })
-            })
-            .unwrap();
-        let obligation = &cell.obligations[0];
+    fn empty_observation_fixture() -> (Vec<u8>, Observation) {
         let observation_bytes = canonical_json_bytes(&object([
             ("diagnostic", string("None")),
             (
@@ -2572,6 +2731,22 @@ mod tests {
         ]))
         .unwrap();
         let observation = Observation::parse_canonical(observation_bytes.clone()).unwrap();
+        (observation_bytes, observation)
+    }
+
+    #[test]
+    fn record_cannot_borrow_an_observation_from_another_platform_manifest() {
+        let (plan, trusted) = plan_and_trusted();
+        let cell = plan
+            .cells
+            .iter()
+            .find(|cell| {
+                cell.key.platform == ConformancePlatform::LinuxX86_64
+                    && matches!(cell.scope, super::super::ScopeDisposition::Required { .. })
+            })
+            .unwrap();
+        let obligation = &cell.obligations[0];
+        let (observation_bytes, observation) = empty_observation_fixture();
         let mut record = EvidenceRecord {
             record_id: String::new(),
             release_plan_sha256: trusted.release_plan_sha256.clone(),

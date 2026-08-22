@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
@@ -7,19 +6,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::command::CommandSpec;
+use crate::github_runtime::GithubRuntime;
 use crate::json::{JsonValue, json_member, parse_json, require_exact_json_keys};
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 
 use super::github::GitHubClient;
 use super::manifest::{read_regular, write_digest_sibling, write_json};
 use super::schema::{Resolution, require_sha};
 
 pub(crate) fn resolve(output: PathBuf) -> Result<String, String> {
-    let event_name = required_env("GITHUB_EVENT_NAME")?;
-    if event_name != "workflow_dispatch" {
+    let transaction = ResolutionTransaction(output);
+    let output = &transaction.0;
+    let runtime = GithubRuntime::from_process()?;
+    if runtime.event_name != "workflow_dispatch" {
         return Err("release resolver accepts only workflow_dispatch".to_owned());
     }
-    let event_path = PathBuf::from(required_env_os("GITHUB_EVENT_PATH")?);
-    let event_bytes = read_regular(&event_path)?;
+    let event_bytes = read_regular(&runtime.event_path)?;
     let event_text =
         std::str::from_utf8(&event_bytes).map_err(|_| "GitHub event is not UTF-8".to_owned())?;
     let event = parse_json(event_text)?;
@@ -30,22 +32,22 @@ pub(crate) fn resolve(output: PathBuf) -> Result<String, String> {
     require_exact_json_keys(inputs, &["candidate_branch"])?;
 
     let default_branch = text(repository, "default_branch")?;
-    if required_env("GITHUB_REF_NAME")? != default_branch {
+    if runtime.ref_name != default_branch {
         return Err(
             "release workflow is not running from the repository default branch".to_owned(),
         );
     }
-    let workflow_sha = required_env("GITHUB_WORKFLOW_SHA")?;
+    let workflow_sha = runtime.workflow_sha.clone();
     require_sha(&workflow_sha, "workflow SHA")?;
     let repository_name = text(repository, "full_name")?;
     let expected_workflow_ref =
         format!("{repository_name}/.github/workflows/release.yml@refs/heads/{default_branch}");
-    if required_env("GITHUB_WORKFLOW_REF")? != expected_workflow_ref {
+    if runtime.workflow_ref != expected_workflow_ref {
         return Err(
             "GITHUB_WORKFLOW_REF is not the trusted default-branch release workflow".to_owned(),
         );
     }
-    let automation = PathBuf::from(required_env_os("GITHUB_WORKSPACE")?).join("automation");
+    let automation = runtime.workspace.join("automation");
     let checkout_head = git_output(&automation, ["rev-parse", "HEAD"])?;
     if checkout_head != workflow_sha {
         return Err("trusted automation checkout does not equal GITHUB_WORKFLOW_SHA".to_owned());
@@ -53,7 +55,9 @@ pub(crate) fn resolve(output: PathBuf) -> Result<String, String> {
 
     let candidate_branch = text(inputs, "candidate_branch")?;
     validate_branch_name(&candidate_branch)?;
-    if required_env("GITHUB_REPOSITORY")? != repository_name {
+    if runtime.repository.full_name != repository_name
+        || runtime.repository.numeric_id != json_member(repository, "id")?.number()?
+    {
         return Err("event repository differs from GITHUB_REPOSITORY".to_owned());
     }
     let client = GitHubClient::from_actions_environment()?;
@@ -68,19 +72,21 @@ pub(crate) fn resolve(output: PathBuf) -> Result<String, String> {
         candidate_sha,
         actor: text(sender, "login")?,
         actor_id: json_member(sender, "id")?.number()?,
-        run_id: parse_env_u64("GITHUB_RUN_ID")?,
-        run_attempt: parse_env_u64("GITHUB_RUN_ATTEMPT")?,
-        workflow_ref: required_env("GITHUB_WORKFLOW_REF")?,
+        run_id: runtime.run_id,
+        run_attempt: runtime.run_attempt,
+        workflow_ref: runtime.workflow_ref,
         workflow_sha,
     };
-    let bytes = write_json(&output, &resolution.json())?;
-    write_digest_sibling(&output, &bytes)?;
+    let bytes = write_json(output, &resolution.json())?;
+    write_digest_sibling(output, &bytes)?;
     write_outputs(&resolution)?;
     Ok(format!(
         "resolved {} to {}",
         resolution.candidate_branch, resolution.candidate_sha
     ))
 }
+
+struct ResolutionTransaction(PathBuf);
 
 fn validate_branch_name(branch: &str) -> Result<(), String> {
     if branch.is_empty()
@@ -91,7 +97,7 @@ fn validate_branch_name(branch: &str) -> Result<(), String> {
             .split('/')
             .any(|component| component.is_empty() || component == "." || component == "..")
         || branch.ends_with('.')
-        || branch.ends_with(".lock")
+        || branch.strip_suffix(".lock").is_some()
         || branch.contains("..")
         || branch.contains("@{")
         || branch.bytes().any(|byte| {
@@ -133,26 +139,12 @@ fn text(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<String, Strin
     Ok(json_member(object, key)?.string()?.to_owned())
 }
 
-fn required_env(name: &str) -> Result<String, String> {
-    env::var(name)
-        .map_err(|_| format!("required environment variable {name} is missing or not UTF-8"))
-}
-
-fn required_env_os(name: &str) -> Result<OsString, String> {
-    env::var_os(name).ok_or_else(|| format!("required environment variable {name} is missing"))
-}
-
-fn parse_env_u64(name: &str) -> Result<u64, String> {
-    required_env(name)?
-        .parse()
-        .map_err(|_| format!("{name} is not an unsigned integer"))
-}
-
 fn write_outputs(resolution: &Resolution) -> Result<(), String> {
-    let Some(path) = env::var_os("GITHUB_OUTPUT") else {
+    let environment = ProcessEnvironment::from_process();
+    let Some(path) = environment.value(StandardVariable::GithubOutput) else {
         return Ok(());
     };
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect GITHUB_OUTPUT: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("GITHUB_OUTPUT is not a regular file".to_owned());

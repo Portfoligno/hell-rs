@@ -1,0 +1,65 @@
+schema-version = 1
+api-version = "2022-11-28"
+accept = "application/vnd.github+json"
+user-agent = "hell-rs-release-control/1"
+connect-timeout-seconds = 15
+request-timeout-seconds = 60
+maximum-redirects = 0
+maximum-retries = 2
+retry-idempotent-reads-only = true
+
+[[endpoint]]
+id = "repository"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}"]
+maximum-response-bytes = 1048576
+not-found = "mismatch"
+
+[[endpoint]]
+id = "branch-ref"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "git", "ref", "heads", "{encoded-ref}"]
+maximum-response-bytes = 1048576
+not-found = "mismatch"
+
+[[endpoint]]
+id = "tag-ref"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "git", "ref", "tags", "{encoded-tag}"]
+maximum-response-bytes = 1048576
+not-found = "matched-absence"
+
+[[endpoint]]
+id = "release-by-tag"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "releases", "tags", "{encoded-tag}"]
+maximum-response-bytes = 4194304
+not-found = "matched-absence"
+
+[[endpoint]]
+id = "repository-actions-permissions"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "actions", "permissions"]
+maximum-response-bytes = 1048576
+not-found = "unavailable"
+
+[[endpoint]]
+id = "repository-workflow-permissions"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "actions", "permissions", "workflow"]
+maximum-response-bytes = 1048576
+not-found = "unavailable"
+
+[[endpoint]]
+id = "repository-immutable-releases"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}"]
+maximum-response-bytes = 1048576
+not-found = "unavailable"
+
+[[endpoint]]
+id = "repository-rulesets"
+method = "GET"
+path-segments = ["repos", "{owner}", "{repository}", "rulesets"]
+maximum-response-bytes = 4194304
+not-found = "unavailable"

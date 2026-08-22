@@ -2,6 +2,17 @@
 
 use std::sync::OnceLock;
 
+/// The strict catalog parser shared by build-time generation and retained fuzzing.
+///
+/// The implementation is included from the build authority so the library seam
+/// cannot drift from the parser that gates generated assurance data.
+#[doc(hidden)]
+pub mod catalog_validation {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"));
+}
+
+pub use catalog_validation::fuzz_validate_catalog;
+
 pub mod assurance_catalogs {
     include!(concat!(env!("OUT_DIR"), "/assurance_catalogs.rs"));
 }

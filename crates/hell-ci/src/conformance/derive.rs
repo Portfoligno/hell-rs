@@ -343,6 +343,106 @@ mod tests {
         }
     }
 
+    fn raw_presentation_semantic() -> hell_testkit::SemanticObservation {
+        let builtin = hell_builtins::lookup("Text.all").unwrap().id;
+        hell_testkit::SemanticObservation {
+            typed_result_sha256: Some(hell_testkit::sha256_bytes(
+                b"{\"type\":\"Bool\",\"value\":true}",
+            )),
+            typed_result_builtin: Some(builtin),
+            typed_result_canonical: Some("{\"type\":\"Bool\",\"value\":true}".into()),
+            causal_event_order: vec![
+                (1, "parsed-builtin".into()),
+                (2, "resolved-builtin".into()),
+                (3, "specialized-builtin".into()),
+                (4, "entered-adapter".into()),
+                (5, "typed-result".into()),
+                (6, "presentation-field".into()),
+                (7, "obligation-event".into()),
+            ],
+            coverage: vec![
+                hell_testkit::CoverageEvent::ParsedBuiltin(builtin),
+                hell_testkit::CoverageEvent::ResolvedBuiltin(builtin),
+                hell_testkit::CoverageEvent::SpecializedBuiltin(builtin),
+                hell_testkit::CoverageEvent::EnteredAdapter(builtin),
+                hell_testkit::CoverageEvent::PresentedField(builtin, "rendered-output".into()),
+            ],
+            obligation_trace: vec![hell_testkit::ObligationTraceEvent {
+                builtin,
+                instance_target: None,
+                instance_premises: Vec::new(),
+                owner_task: None,
+                sequence: 1,
+                parent_sequence: None,
+                outcome: "value".into(),
+                nested_adapters: 0,
+                materialized_before: 0,
+                materialized_after: 0,
+                callbacks: Vec::new(),
+                comparators: Vec::new(),
+            }],
+            ..hell_testkit::SemanticObservation::default()
+        }
+    }
+
+    fn raw_presentation_observation(
+        case: &hell_testkit::DifferentialCase,
+        context: &str,
+    ) -> Observation {
+        let observation = hell_testkit::Observation {
+            case_id: case.id.clone(),
+            identity: hell_testkit::ExecutableIdentity {
+                path: "hell".into(),
+                sha256: hell_testkit::sha256_bytes(b"hell"),
+                reported_version: "test".into(),
+                build_info: None,
+                role: hell_testkit::ExecutableRole::Candidate,
+                assurance_epoch_sha256: None,
+                acquisition_receipt_id: None,
+                acquisition_receipt_sha256: None,
+                acquisition_attestation_sha256: None,
+            },
+            environment_profile: hell_testkit::EnvironmentProfile::Explicit,
+            process_helper_sha256: None,
+            mode: hell_testkit::DifferentialMode::Run,
+            status: hell_testkit::ProcessStatus {
+                success: true,
+                code: Some(0),
+            },
+            stdout: hell_testkit::BoundedCapture::from_bytes(b"True\n".to_vec()),
+            stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
+            raw_stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
+            claim_input_stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
+            normalizer_sandbox: context.into(),
+            normalizer_script: std::path::Path::new(context).join("case.hell"),
+            timed_out: false,
+            diagnostic: None,
+            filesystem: Vec::new(),
+            harness_normalizers: Vec::new(),
+            claim_normalizers: Vec::new(),
+            semantic: Some(raw_presentation_semantic()),
+            resource_audit: Some(hell_testkit::ResourceAudit::default()),
+        };
+        let bytes = hell_testkit::canonical_conformance_observation_json(&observation).unwrap();
+        let value = crate::json::parse_json(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(bytes, crate::json::canonical_json_bytes(&value).unwrap());
+        let document = crate::json::json_member(value.object().unwrap(), "semanticTrace")
+            .unwrap()
+            .array()
+            .unwrap()[0]
+            .string()
+            .unwrap();
+        hell_testkit::validate_conformance_semantic_obligation(
+            document,
+            case,
+            "Text.all",
+            CompatibilityDimension::Presentation,
+            "raw-observation",
+        )
+        .unwrap();
+        Observation::parse_canonical(bytes).unwrap()
+    }
+
     fn raw_presentation_evidence(
         plan: &ConformancePlan,
         trusted: &TrustedEvidenceBindings,
@@ -350,127 +450,8 @@ mod tests {
         oracle_context: &str,
     ) -> EvidenceRepository {
         let case = raw_observation_case();
-        let observation = |context: &str| {
-            let semantic = hell_testkit::SemanticObservation {
-                typed_result_sha256: Some(hell_testkit::sha256_bytes(
-                    b"{\"type\":\"Bool\",\"value\":true}",
-                )),
-                typed_result_builtin: hell_builtins::lookup("Text.all").map(|spec| spec.id),
-                typed_result_canonical: Some("{\"type\":\"Bool\",\"value\":true}".into()),
-                causal_event_order: vec![
-                    (1, "parsed-builtin".into()),
-                    (2, "resolved-builtin".into()),
-                    (3, "specialized-builtin".into()),
-                    (4, "entered-adapter".into()),
-                    (5, "typed-result".into()),
-                    (6, "presentation-field".into()),
-                    (7, "obligation-event".into()),
-                ],
-                coverage: vec![
-                    hell_testkit::CoverageEvent::ParsedBuiltin(
-                        hell_builtins::lookup("Text.all").unwrap().id,
-                    ),
-                    hell_testkit::CoverageEvent::ResolvedBuiltin(
-                        hell_builtins::lookup("Text.all").unwrap().id,
-                    ),
-                    hell_testkit::CoverageEvent::SpecializedBuiltin(
-                        hell_builtins::lookup("Text.all").unwrap().id,
-                    ),
-                    hell_testkit::CoverageEvent::EnteredAdapter(
-                        hell_builtins::lookup("Text.all").unwrap().id,
-                    ),
-                    hell_testkit::CoverageEvent::PresentedField(
-                        hell_builtins::lookup("Text.all").unwrap().id,
-                        "rendered-output".into(),
-                    ),
-                ],
-                obligation_trace: vec![hell_testkit::ObligationTraceEvent {
-                    builtin: hell_builtins::lookup("Text.all").unwrap().id,
-                    instance_target: None,
-                    instance_premises: Vec::new(),
-                    owner_task: None,
-                    sequence: 1,
-                    parent_sequence: None,
-                    outcome: "value".into(),
-                    nested_adapters: 0,
-                    materialized_before: 0,
-                    materialized_after: 0,
-                    callbacks: Vec::new(),
-                    comparators: Vec::new(),
-                }],
-                ..hell_testkit::SemanticObservation::default()
-            };
-            let observation = hell_testkit::Observation {
-                case_id: case.id.clone(),
-                identity: hell_testkit::ExecutableIdentity {
-                    path: "hell".into(),
-                    sha256: hell_testkit::sha256_bytes(b"hell"),
-                    reported_version: "test".into(),
-                    build_info: None,
-                    role: hell_testkit::ExecutableRole::Candidate,
-                    assurance_epoch_sha256: None,
-                    acquisition_receipt_id: None,
-                    acquisition_receipt_sha256: None,
-                    acquisition_attestation_sha256: None,
-                },
-                environment_profile: hell_testkit::EnvironmentProfile::Explicit,
-                process_helper_sha256: None,
-                mode: hell_testkit::DifferentialMode::Run,
-                status: hell_testkit::ProcessStatus {
-                    success: true,
-                    code: Some(0),
-                },
-                stdout: hell_testkit::BoundedCapture::from_bytes(b"True\n".to_vec()),
-                stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
-                raw_stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
-                claim_input_stderr: hell_testkit::BoundedCapture::from_bytes(Vec::new()),
-                normalizer_sandbox: context.into(),
-                normalizer_script: std::path::Path::new(context).join("case.hell"),
-                timed_out: false,
-                diagnostic: None,
-                filesystem: Vec::new(),
-                harness_normalizers: Vec::new(),
-                claim_normalizers: Vec::new(),
-                semantic: Some(semantic),
-                resource_audit: Some(hell_testkit::ResourceAudit::default()),
-            };
-            let bytes = hell_testkit::canonical_conformance_observation_json(&observation).unwrap();
-            let value = crate::json::parse_json(std::str::from_utf8(&bytes).unwrap()).unwrap();
-            let canonical = crate::json::canonical_json_bytes(&value).unwrap();
-            if bytes != canonical {
-                let index = bytes
-                    .iter()
-                    .zip(&canonical)
-                    .position(|(left, right)| left != right)
-                    .unwrap_or(bytes.len().min(canonical.len()));
-                panic!(
-                    "testkit observation is noncanonical at {index}: produced={:?} expected={:?}",
-                    String::from_utf8_lossy(
-                        &bytes[index.saturating_sub(80)..bytes.len().min(index + 160)]
-                    ),
-                    String::from_utf8_lossy(
-                        &canonical[index.saturating_sub(80)..canonical.len().min(index + 160)]
-                    ),
-                );
-            }
-            let document = crate::json::json_member(value.object().unwrap(), "semanticTrace")
-                .unwrap()
-                .array()
-                .unwrap()[0]
-                .string()
-                .unwrap();
-            hell_testkit::validate_conformance_semantic_obligation(
-                document,
-                &case,
-                "Text.all",
-                CompatibilityDimension::Presentation,
-                "raw-observation",
-            )
-            .unwrap();
-            Observation::parse_canonical(bytes).unwrap()
-        };
-        let candidate = observation(candidate_context);
-        let oracle = observation(oracle_context);
+        let candidate = raw_presentation_observation(&case, candidate_context);
+        let oracle = raw_presentation_observation(&case, oracle_context);
         let mut record = EvidenceRecord {
             record_id: String::new(),
             release_plan_sha256: trusted.release_plan_sha256.clone(),

@@ -2,7 +2,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 #[cfg(unix)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(any(unix, windows))]
@@ -28,6 +28,8 @@ use hell_testkit::{
     run_supervised_command_with_bound_program_until, sha256_file,
 };
 
+use crate::process_environment::{ChildEnvironment, ProcessEnvironment, StandardVariable};
+
 #[cfg(unix)]
 static CARGO_MULTICALL_VERIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +52,105 @@ pub struct CommandSpec {
     native_archiver: Option<BoundNativeArchiver>,
     #[cfg(target_os = "macos")]
     native_archiver_deadlines: Option<(Instant, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeStdio {
+    Inherit,
+    Null,
+    Piped,
+}
+
+pub(crate) struct NativeProcessSpec {
+    arguments: Vec<OsString>,
+    program: OsString,
+    stderr: NativeStdio,
+    stdin: NativeStdio,
+    stdout: NativeStdio,
+}
+
+impl NativeProcessSpec {
+    pub(crate) fn new(program: impl Into<OsString>) -> Self {
+        Self {
+            arguments: Vec::new(),
+            program: program.into(),
+            stderr: NativeStdio::Inherit,
+            stdin: NativeStdio::Inherit,
+            stdout: NativeStdio::Inherit,
+        }
+    }
+
+    pub(crate) fn argument(mut self, argument: impl Into<OsString>) -> Self {
+        self.arguments.push(argument.into());
+        self
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn arguments<I, S>(mut self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.arguments.extend(arguments.into_iter().map(Into::into));
+        self
+    }
+
+    pub(crate) fn stdin(mut self, stdin: NativeStdio) -> Self {
+        self.stdin = stdin;
+        self
+    }
+
+    pub(crate) fn stdout(mut self, stdout: NativeStdio) -> Self {
+        self.stdout = stdout;
+        self
+    }
+
+    pub(crate) fn stderr(mut self, stderr: NativeStdio) -> Self {
+        self.stderr = stderr;
+        self
+    }
+
+    pub(crate) fn spawn(self) -> Result<std::process::Child, String> {
+        self.construct()?.spawn().map_err(|error| error.to_string())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn output(self) -> Result<std::process::Output, String> {
+        self.construct()?
+            .output()
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn status(self) -> Result<ExitStatus, String> {
+        self.construct()?
+            .status()
+            .map_err(|error| error.to_string())
+    }
+
+    fn construct(self) -> Result<Command, String> {
+        let mut command = Command::new(self.program);
+        command.args(self.arguments);
+        command.stdin(native_stdio(self.stdin));
+        command.stdout(native_stdio(self.stdout));
+        command.stderr(native_stdio(self.stderr));
+        let environment = ChildEnvironment::new(
+            ProcessEnvironment::from_process()
+                .release_child_entries()
+                .into_iter()
+                .collect(),
+        )?;
+        environment.apply(&mut command);
+        Ok(command)
+    }
+}
+
+fn native_stdio(value: NativeStdio) -> std::process::Stdio {
+    match value {
+        NativeStdio::Inherit => std::process::Stdio::inherit(),
+        NativeStdio::Null => std::process::Stdio::null(),
+        NativeStdio::Piped => std::process::Stdio::piped(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,7 +263,7 @@ impl WindowsBoundFileIdentity {
         Self::bind_until(
             path,
             Instant::now()
-                .checked_add(Duration::from_secs(30 * 60))
+                .checked_add(Duration::from_mins(30))
                 .unwrap_or_else(Instant::now),
         )
     }
@@ -1064,7 +1165,7 @@ pub enum ProcessScope {
 }
 
 pub(crate) struct NativeArchiveAdapter {
-    _directory: Option<AdapterDirectory>,
+    directory: Option<AdapterDirectory>,
     bound_toolchain: Option<Arc<BoundNativeToolchain>>,
     llvm_ar: Option<BoundNativeArchiver>,
     llvm_ar_version: Option<String>,
@@ -1466,6 +1567,213 @@ impl BoundNativeToolchainInventory {
     }
 }
 
+#[cfg(unix)]
+struct BoundNativeManifestTraversal {
+    root: PathBuf,
+    require_frozen: bool,
+    deadline: Option<Instant>,
+    hash_files: bool,
+    entry_limit: usize,
+    depth_limit: usize,
+    pending: Vec<PathBuf>,
+    entries: Vec<BoundNativeManifestEntry>,
+    acl_paths: Vec<PathBuf>,
+    bytes: u64,
+}
+
+#[cfg(unix)]
+impl BoundNativeManifestTraversal {
+    fn new(
+        root: &Path,
+        require_frozen: bool,
+        deadline: Option<Instant>,
+        hash_files: bool,
+        entry_limit: usize,
+        depth_limit: usize,
+    ) -> Result<Self, String> {
+        let root_metadata = fs::symlink_metadata(root)
+            .map_err(|error| format!("cannot inspect native toolchain manifest: {error}"))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err("native toolchain manifest root is not an exact directory".to_owned());
+        }
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|error| format!("cannot canonicalize native toolchain manifest: {error}"))?;
+        Ok(Self {
+            root: canonical_root,
+            require_frozen,
+            deadline,
+            hash_files,
+            entry_limit,
+            depth_limit,
+            pending: vec![PathBuf::new()],
+            entries: Vec::new(),
+            acl_paths: Vec::new(),
+            bytes: 0,
+        })
+    }
+
+    fn bind(mut self) -> Result<BoundNativeManifest, String> {
+        while let Some(relative) = self.pending.pop() {
+            self.bind_entry(relative)?;
+        }
+        require_native_acl_free_until(
+            self.acl_paths.iter().map(PathBuf::as_path),
+            "staged native toolchain manifest",
+            self.deadline,
+        )?;
+        self.entries
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        Ok(BoundNativeManifest {
+            root: self.root,
+            entries: self.entries,
+        })
+    }
+
+    fn bind_entry(&mut self, relative: PathBuf) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        require_optional_native_deadline(self.deadline, "native toolchain inventory")?;
+        if self.entries.len() >= self.entry_limit {
+            return Err("native toolchain exceeds the entry-count policy".to_owned());
+        }
+        if relative.components().count() > self.depth_limit {
+            return Err("native toolchain exceeds the depth policy".to_owned());
+        }
+        let path = self.root.join(&relative);
+        let before = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot bind native toolchain member: {error}"))?;
+        let mode = before.mode() & 0o7777;
+        let kind = self.bind_entry_kind(&relative, &path, &before, mode)?;
+        let after = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot revalidate native toolchain member: {error}"))?;
+        if !same_native_metadata(&before, &after) {
+            return Err("native toolchain member changed while it was bound".to_owned());
+        }
+        self.entries.push(BoundNativeManifestEntry {
+            relative,
+            device: after.dev(),
+            inode: after.ino(),
+            uid: after.uid(),
+            gid: after.gid(),
+            mode,
+            modified_seconds: after.mtime(),
+            modified_nanoseconds: after.mtime_nsec(),
+            changed_seconds: after.ctime(),
+            changed_nanoseconds: after.ctime_nsec(),
+            kind,
+        });
+        Ok(())
+    }
+
+    fn bind_entry_kind(
+        &mut self,
+        relative: &Path,
+        path: &Path,
+        before: &fs::Metadata,
+        mode: u32,
+    ) -> Result<BoundNativeManifestEntryKind, String> {
+        if before.file_type().is_symlink() {
+            self.bind_symlink(path)
+        } else if before.is_dir() {
+            self.bind_directory(relative, path, mode)
+        } else if before.is_file() {
+            self.bind_file(path, before, mode)
+        } else {
+            Err("native toolchain contains a special file".to_owned())
+        }
+    }
+
+    fn bind_symlink(&self, path: &Path) -> Result<BoundNativeManifestEntryKind, String> {
+        let target = fs::read_link(path)
+            .map_err(|error| format!("cannot read native toolchain symlink: {error}"))?;
+        let resolved = fs::canonicalize(path)
+            .map_err(|error| format!("cannot resolve native toolchain symlink: {error}"))?;
+        if !resolved.starts_with(&self.root) {
+            return Err("native toolchain symlink escapes its distribution root".to_owned());
+        }
+        Ok(BoundNativeManifestEntryKind::Symlink { target })
+    }
+
+    fn bind_directory(
+        &mut self,
+        relative: &Path,
+        path: &Path,
+        mode: u32,
+    ) -> Result<BoundNativeManifestEntryKind, String> {
+        if self.require_frozen && mode != 0o555 {
+            return Err("staged toolchain directory is not frozen".to_owned());
+        }
+        if self.require_frozen {
+            self.acl_paths.push(path.to_path_buf());
+        }
+        let mut children = Vec::new();
+        for child in fs::read_dir(path)
+            .map_err(|error| format!("cannot enumerate native toolchain manifest: {error}"))?
+        {
+            require_optional_native_deadline(self.deadline, "native toolchain enumeration")?;
+            if self
+                .entries
+                .len()
+                .saturating_add(self.pending.len())
+                .saturating_add(children.len())
+                >= self.entry_limit
+            {
+                return Err("native toolchain exceeds the entry-count policy".to_owned());
+            }
+            children.push(
+                child.map_err(|error| {
+                    format!("cannot enumerate native toolchain manifest: {error}")
+                })?,
+            );
+        }
+        children.sort_by_key(fs::DirEntry::file_name);
+        for child in children.into_iter().rev() {
+            self.pending.push(relative.join(child.file_name()));
+        }
+        Ok(BoundNativeManifestEntryKind::Directory)
+    }
+
+    fn bind_file(
+        &mut self,
+        path: &Path,
+        before: &fs::Metadata,
+        mode: u32,
+    ) -> Result<BoundNativeManifestEntryKind, String> {
+        if self.require_frozen && mode != 0o444 && mode != 0o555 {
+            return Err("staged toolchain file is not frozen".to_owned());
+        }
+        if self.require_frozen {
+            self.acl_paths.push(path.to_path_buf());
+        }
+        let sha256 = if self.hash_files {
+            match self.deadline {
+                Some(deadline) => sha256_file_until(path, deadline)?,
+                None => sha256_file(path)
+                    .map_err(|error| format!("cannot hash native toolchain member: {error}"))?,
+            }
+        } else {
+            Digest::default()
+        };
+        let after = fs::symlink_metadata(path).map_err(|error| {
+            format!("cannot revalidate hashed native toolchain member: {error}")
+        })?;
+        if !same_native_metadata(before, &after) {
+            return Err("native toolchain member changed while it was bound".to_owned());
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(after.len())
+            .ok_or_else(|| "native toolchain byte count overflowed".to_owned())?;
+        if self.bytes > NATIVE_GHC_BYTE_LIMIT {
+            return Err("native toolchain exceeds the byte-count policy".to_owned());
+        }
+        Ok(BoundNativeManifestEntryKind::File {
+            size: after.len(),
+            sha256,
+        })
+    }
+}
+
 impl BoundNativeManifest {
     #[cfg(unix)]
     fn bind(root: &Path, require_frozen: bool) -> Result<Self, String> {
@@ -1512,134 +1820,15 @@ impl BoundNativeManifest {
         entry_limit: usize,
         depth_limit: usize,
     ) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let root_metadata = fs::symlink_metadata(root)
-            .map_err(|error| format!("cannot inspect native toolchain manifest: {error}"))?;
-        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-            return Err("native toolchain manifest root is not an exact directory".to_owned());
-        }
-        let canonical_root = fs::canonicalize(root)
-            .map_err(|error| format!("cannot canonicalize native toolchain manifest: {error}"))?;
-        let mut pending = vec![PathBuf::new()];
-        let mut entries = Vec::new();
-        let mut acl_paths = Vec::new();
-        let mut bytes = 0u64;
-        while let Some(relative) = pending.pop() {
-            require_optional_native_deadline(deadline, "native toolchain inventory")?;
-            if entries.len() >= entry_limit {
-                return Err("native toolchain exceeds the entry-count policy".to_owned());
-            }
-            if relative.components().count() > depth_limit {
-                return Err("native toolchain exceeds the depth policy".to_owned());
-            }
-            let path = canonical_root.join(&relative);
-            let before = fs::symlink_metadata(&path)
-                .map_err(|error| format!("cannot bind native toolchain member: {error}"))?;
-            let mode = before.mode() & 0o7777;
-            let kind = if before.file_type().is_symlink() {
-                let target = fs::read_link(&path)
-                    .map_err(|error| format!("cannot read native toolchain symlink: {error}"))?;
-                let resolved = fs::canonicalize(&path)
-                    .map_err(|error| format!("cannot resolve native toolchain symlink: {error}"))?;
-                if !resolved.starts_with(&canonical_root) {
-                    return Err("native toolchain symlink escapes its distribution root".to_owned());
-                }
-                BoundNativeManifestEntryKind::Symlink { target }
-            } else if before.is_dir() {
-                if require_frozen && mode != 0o555 {
-                    return Err("staged toolchain directory is not frozen".to_owned());
-                }
-                if require_frozen {
-                    acl_paths.push(path.clone());
-                }
-                let mut children = Vec::new();
-                for child in fs::read_dir(&path).map_err(|error| {
-                    format!("cannot enumerate native toolchain manifest: {error}")
-                })? {
-                    require_optional_native_deadline(deadline, "native toolchain enumeration")?;
-                    if entries
-                        .len()
-                        .saturating_add(pending.len())
-                        .saturating_add(children.len())
-                        >= entry_limit
-                    {
-                        return Err("native toolchain exceeds the entry-count policy".to_owned());
-                    }
-                    children.push(child.map_err(|error| {
-                        format!("cannot enumerate native toolchain manifest: {error}")
-                    })?);
-                }
-                children.sort_by_key(fs::DirEntry::file_name);
-                for child in children.into_iter().rev() {
-                    pending.push(relative.join(child.file_name()));
-                }
-                BoundNativeManifestEntryKind::Directory
-            } else if before.is_file() {
-                if require_frozen && mode != 0o444 && mode != 0o555 {
-                    return Err("staged toolchain file is not frozen".to_owned());
-                }
-                if require_frozen {
-                    acl_paths.push(path.clone());
-                }
-                let sha256 = if hash_files {
-                    match deadline {
-                        Some(deadline) => sha256_file_until(&path, deadline)?,
-                        None => sha256_file(&path).map_err(|error| {
-                            format!("cannot hash native toolchain member: {error}")
-                        })?,
-                    }
-                } else {
-                    Digest::default()
-                };
-                let after = fs::symlink_metadata(&path).map_err(|error| {
-                    format!("cannot revalidate hashed native toolchain member: {error}")
-                })?;
-                if !same_native_metadata(&before, &after) {
-                    return Err("native toolchain member changed while it was bound".to_owned());
-                }
-                bytes = bytes
-                    .checked_add(after.len())
-                    .ok_or_else(|| "native toolchain byte count overflowed".to_owned())?;
-                if bytes > NATIVE_GHC_BYTE_LIMIT {
-                    return Err("native toolchain exceeds the byte-count policy".to_owned());
-                }
-                BoundNativeManifestEntryKind::File {
-                    size: after.len(),
-                    sha256,
-                }
-            } else {
-                return Err("native toolchain contains a special file".to_owned());
-            };
-            let after = fs::symlink_metadata(&path)
-                .map_err(|error| format!("cannot revalidate native toolchain member: {error}"))?;
-            if !same_native_metadata(&before, &after) {
-                return Err("native toolchain member changed while it was bound".to_owned());
-            }
-            entries.push(BoundNativeManifestEntry {
-                relative,
-                device: after.dev(),
-                inode: after.ino(),
-                uid: after.uid(),
-                gid: after.gid(),
-                mode,
-                modified_seconds: after.mtime(),
-                modified_nanoseconds: after.mtime_nsec(),
-                changed_seconds: after.ctime(),
-                changed_nanoseconds: after.ctime_nsec(),
-                kind,
-            });
-        }
-        require_native_acl_free_until(
-            acl_paths.iter().map(PathBuf::as_path),
-            "staged native toolchain manifest",
+        BoundNativeManifestTraversal::new(
+            root,
+            require_frozen,
             deadline,
-        )?;
-        entries.sort_by(|left, right| left.relative.cmp(&right.relative));
-        Ok(Self {
-            root: canonical_root,
-            entries,
-        })
+            hash_files,
+            entry_limit,
+            depth_limit,
+        )?
+        .bind()
     }
 
     #[cfg(unix)]
@@ -1761,8 +1950,11 @@ impl BoundSealedNativeManifest {
             let path = self.root.join(&entry.relative);
             revalidate_native_manifest_entry(&path, entry, true)?;
             match (&entry.kind, guard) {
-                (BoundNativeManifestEntryKind::Directory, Some(guard))
-                | (BoundNativeManifestEntryKind::File { .. }, Some(guard)) => {
+                (
+                    BoundNativeManifestEntryKind::Directory
+                    | BoundNativeManifestEntryKind::File { .. },
+                    Some(guard),
+                ) => {
                     let metadata = guard.metadata().map_err(|error| {
                         format!("cannot inspect sealed LLVM retained handle: {error}")
                     })?;
@@ -1828,8 +2020,11 @@ impl BoundSealedNativeManifest {
                 &expected.kind,
                 self.guards.get(index).and_then(Option::as_ref),
             ) {
-                (BoundNativeManifestEntryKind::Directory, Some(guard))
-                | (BoundNativeManifestEntryKind::File { .. }, Some(guard)) => {
+                (
+                    BoundNativeManifestEntryKind::Directory
+                    | BoundNativeManifestEntryKind::File { .. },
+                    Some(guard),
+                ) => {
                     let metadata = guard.metadata().map_err(|error| {
                         format!("cannot inspect {label} retained member handle: {error}")
                     })?;
@@ -1942,7 +2137,7 @@ where
             return Err("native toolchain ACL audit exceeded its absolute deadline".to_owned());
         }
         let audit = run_with_optional_native_deadline(
-            CommandSpec::new(ls.invocation_path(), timeout)
+            &CommandSpec::new(ls.invocation_path(), timeout)
                 .arguments(["-lde"])
                 .arguments(batch.iter().copied().map(Path::as_os_str))
                 .environment("LC_ALL", "C"),
@@ -2049,7 +2244,7 @@ where
             .min(Duration::from_secs(30))
     });
     let result = run_with_optional_native_deadline(
-        CommandSpec::new(chmod.invocation_path(), timeout).arguments(arguments),
+        &CommandSpec::new(chmod.invocation_path(), timeout).arguments(arguments),
         deadline,
     )
     .map_err(|error| format!("cannot {action}: {error}"))?;
@@ -2061,7 +2256,7 @@ where
 
 #[cfg(target_os = "macos")]
 fn run_with_optional_native_deadline(
-    command: CommandSpec,
+    command: &CommandSpec,
     deadline: Option<Instant>,
 ) -> Result<CommandResult, CommandRunError> {
     match deadline {
@@ -2087,7 +2282,6 @@ fn strip_staged_native_acls(_root: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_staged_native_acl_policy_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2103,41 +2297,8 @@ pub(crate) fn verify_staged_native_acl_policy_for_integration() -> Result<(), St
     let destination_parent = root.join("destination-parent");
     let destination = destination_parent.join("staged");
     let result = (|| {
-        fs::create_dir(&source)
-            .map_err(|error| format!("cannot create ACL verifier source: {error}"))?;
-        fs::create_dir(source.join("nested"))
-            .map_err(|error| format!("cannot create ACL verifier source child: {error}"))?;
-        fs::write(source.join("nested/payload"), b"staged-native-acl-probe\n")
-            .map_err(|error| format!("cannot write ACL verifier payload: {error}"))?;
-        fs::write(
-            source.join("nested/alternate"),
-            b"alternate-native-payload\n",
-        )
-        .map_err(|error| format!("cannot write ACL verifier alternate payload: {error}"))?;
-        symlink("nested/payload", source.join("payload-link"))
-            .map_err(|error| format!("cannot create ACL verifier symlink: {error}"))?;
-        if BoundNativeManifest::bind_internal_with_limits(&source, false, None, false, 2, 128)
-            .is_ok()
-        {
-            return Err("bounded source inventory accepted an oversize tree".to_owned());
-        }
-        if BoundNativeManifest::bind_internal_with_limits(&source, false, None, false, 32, 1)
-            .is_ok()
-        {
-            return Err("bounded source inventory accepted an over-depth tree".to_owned());
-        }
-        if BoundNativeManifest::bind_internal_with_limits(
-            &source,
-            false,
-            Some(Instant::now()),
-            false,
-            32,
-            128,
-        )
-        .is_ok()
-        {
-            return Err("expired source inventory performed late enumeration".to_owned());
-        }
+        create_native_acl_source_fixture(&source)?;
+        verify_native_acl_inventory_limits(&source)?;
         let base_transaction = StagedNativeToolchainTransaction::new()?;
         let (phase_sender, phase_receiver) = std::sync::mpsc::sync_channel(32);
         let transaction = StagedNativeToolchainTransaction::with_deadlines_and_progress(
@@ -2145,149 +2306,13 @@ pub(crate) fn verify_staged_native_acl_policy_for_integration() -> Result<(), St
             base_transaction.completion_deadline,
             Some(phase_sender),
         )?;
-        let source_receipt = BoundNativeManifest::bind_source_inventory_until(&source, None)?;
-        let payload_relative = Path::new("nested").join("payload");
-        let payload_receipt = source_receipt
-            .entries
-            .iter()
-            .find(|entry| entry.relative == payload_relative)
-            .ok_or_else(|| "ACL verifier source payload receipt is absent".to_owned())?;
-        let payload_size = usize::try_from(
-            fs::symlink_metadata(source.join(&payload_relative))
-                .map_err(|error| format!("cannot inspect ACL verifier payload: {error}"))?
-                .len(),
-        )
-        .map_err(|_| "ACL verifier payload size does not fit memory".to_owned())?;
-        fs::write(source.join(&payload_relative), vec![b'x'; payload_size])
-            .map_err(|error| format!("cannot mutate ACL verifier source payload: {error}"))?;
-        if revalidate_native_manifest_entry(&source.join(&payload_relative), payload_receipt, false)
-            .is_ok()
-        {
-            return Err("source content mutation retained its copy authority".to_owned());
-        }
-        fs::write(source.join(&payload_relative), b"staged-native-acl-probe\n")
-            .map_err(|error| format!("cannot restore ACL verifier source payload: {error}"))?;
-
-        let symlink_receipt = BoundNativeManifest::bind_source_inventory_until(&source, None)?;
-        let link_relative = Path::new("payload-link");
-        let link_receipt = symlink_receipt
-            .entries
-            .iter()
-            .find(|entry| entry.relative == link_relative)
-            .ok_or_else(|| "ACL verifier source symlink receipt is absent".to_owned())?;
-        fs::remove_file(source.join(link_relative))
-            .and_then(|()| symlink("nested/alternate", source.join(link_relative)))
-            .map_err(|error| format!("cannot retarget ACL verifier source symlink: {error}"))?;
-        if revalidate_native_manifest_entry(&source.join(link_relative), link_receipt, false)
-            .is_ok()
-        {
-            return Err("source symlink retarget retained its copy authority".to_owned());
-        }
-        fs::remove_file(source.join(link_relative))
-            .and_then(|()| symlink("nested/payload", source.join(link_relative)))
-            .map_err(|error| format!("cannot restore ACL verifier source symlink: {error}"))?;
-
-        let executable_a = source.join("executable-a");
-        let executable_b = source.join("executable-b");
-        fs::write(&executable_a, b"executable-a\n")
-            .and_then(|()| fs::write(&executable_b, b"executable-b\n"))
-            .map_err(|error| format!("cannot create query authority fixture: {error}"))?;
-        fs::set_permissions(&executable_a, fs::Permissions::from_mode(0o555))
-            .and_then(|()| fs::set_permissions(&executable_b, fs::Permissions::from_mode(0o555)))
-            .map_err(|error| format!("cannot freeze query authority fixture: {error}"))?;
-        let executable_alias = source.join("executable-alias");
-        symlink("executable-a", &executable_alias)
-            .map_err(|error| format!("cannot bind query authority fixture: {error}"))?;
-        let executable_receipt = BoundNativeFile::bind(&executable_alias, 0o555)?;
-        fs::remove_file(&executable_alias)
-            .and_then(|()| symlink("executable-b", &executable_alias))
-            .map_err(|error| format!("cannot retarget query authority fixture: {error}"))?;
-        if executable_receipt
-            .revalidate_until(
-                "query authority retarget fixture",
-                transaction.execution_deadline,
-            )
-            .is_ok()
-        {
-            return Err("query executable retarget retained its spawn authority".to_owned());
-        }
-        fs::create_dir(&destination_parent)
-            .map_err(|error| format!("cannot create ACL verifier destination: {error}"))?;
-        run_fixed_macos_chmod(
-            [
-                OsStr::new("+a"),
-                OsStr::new("everyone allow write,file_inherit,directory_inherit"),
-                destination_parent.as_os_str(),
-            ],
-            "seed the inherited staged-toolchain ACL",
-        )?;
-
-        let manifest = copy_and_freeze_native_directory(&source, &destination, Some(&transaction))?;
-        let expected_copy_passes = StagedNativeManifestPassCounts {
-            source_inventory: 1,
-            source_postflight: 1,
-            staged_final: 1,
-            query_preflight: 0,
-            query_postflight: 0,
-        };
-        transaction.require_manifest_passes(expected_copy_passes)?;
-        let receipts = phase_receiver.try_iter().collect::<Vec<_>>();
-        for phase in [
-            "source-inventory",
-            "freeze-and-acl",
-            "source-postflight",
-            "staged-final-manifest",
-        ] {
-            if !receipts.iter().any(|receipt| {
-                matches!(receipt, StagedNativeToolchainProgress::Phase(observed) if observed == phase)
-            }) {
-                return Err(format!("staged copy omitted typed {phase} boundary"));
-            }
-        }
-        if !receipts.iter().any(|receipt| {
-            matches!(receipt, StagedNativeToolchainProgress::ManifestPasses(observed) if *observed == expected_copy_passes)
-        }) {
-            return Err("staged copy omitted its exact typed manifest-pass receipt".to_owned());
-        }
-        let staged_link = fs::read_link(destination.join("payload-link"))
-            .map_err(|error| format!("cannot read staged transaction symlink: {error}"))?;
-        if staged_link
-            != fs::canonicalize(&destination)
-                .map_err(|error| format!("cannot canonicalize staged transaction: {error}"))?
-                .join("nested")
-                .join("payload")
-        {
-            return Err("staged transaction symlink target was not relocated exactly".to_owned());
-        }
-        let expired = Instant::now();
-        let expired_transaction = StagedNativeToolchainTransaction {
-            execution_deadline: expired,
-            completion_deadline: expired,
-            phase_sender: None,
-            manifest_passes: Cell::new(StagedNativeManifestPassCounts::default()),
-        };
-        let late_destination = destination_parent.join("late-staged");
-        if copy_and_freeze_native_directory(&source, &late_destination, Some(&expired_transaction))
-            .is_ok()
-            || late_destination.exists()
-        {
-            return Err("expired staging transaction launched late copy work".to_owned());
-        }
-        let payload = destination.join("nested/payload");
-        run_fixed_macos_chmod(
-            [
-                OsStr::new("+a"),
-                OsStr::new("everyone allow write"),
-                payload.as_os_str(),
-            ],
-            "seed the retained-manifest ACL mutation",
-        )?;
-        if require_native_acl_free([payload.as_path()], "ACL mutation probe").is_ok() {
-            return Err("macOS did not retain the staged ACL mutation probe".to_owned());
-        }
-        if manifest.revalidate("staged ACL mutation probe").is_ok() {
-            return Err("retained staged-toolchain ACL mutation was not rejected".to_owned());
-        }
+        verify_native_acl_source_mutations(&source)?;
+        verify_native_acl_executable_retarget(&source, &transaction)?;
+        prepare_native_acl_destination(&destination_parent)?;
+        let manifest =
+            verify_native_acl_staged_copy(&source, &destination, &transaction, &phase_receiver)?;
+        verify_expired_native_acl_copy(&source, &destination_parent)?;
+        verify_retained_native_acl_mutation(&destination, &manifest)?;
         Ok(())
     })();
     make_native_tree_removable(&destination);
@@ -2297,6 +2322,229 @@ pub(crate) fn verify_staged_native_acl_policy_for_integration() -> Result<(), St
     );
     let _ = fs::remove_dir_all(&root);
     result
+}
+
+#[cfg(target_os = "macos")]
+fn create_native_acl_source_fixture(source: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    fs::create_dir(source)
+        .map_err(|error| format!("cannot create ACL verifier source: {error}"))?;
+    fs::create_dir(source.join("nested"))
+        .map_err(|error| format!("cannot create ACL verifier source child: {error}"))?;
+    fs::write(source.join("nested/payload"), b"staged-native-acl-probe\n")
+        .map_err(|error| format!("cannot write ACL verifier payload: {error}"))?;
+    fs::write(
+        source.join("nested/alternate"),
+        b"alternate-native-payload\n",
+    )
+    .map_err(|error| format!("cannot write ACL verifier alternate payload: {error}"))?;
+    symlink("nested/payload", source.join("payload-link"))
+        .map_err(|error| format!("cannot create ACL verifier symlink: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_acl_inventory_limits(source: &Path) -> Result<(), String> {
+    if BoundNativeManifest::bind_internal_with_limits(source, false, None, false, 2, 128).is_ok() {
+        return Err("bounded source inventory accepted an oversize tree".to_owned());
+    }
+    if BoundNativeManifest::bind_internal_with_limits(source, false, None, false, 32, 1).is_ok() {
+        return Err("bounded source inventory accepted an over-depth tree".to_owned());
+    }
+    if BoundNativeManifest::bind_internal_with_limits(
+        source,
+        false,
+        Some(Instant::now()),
+        false,
+        32,
+        128,
+    )
+    .is_ok()
+    {
+        return Err("expired source inventory performed late enumeration".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_acl_source_mutations(source: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let source_receipt = BoundNativeManifest::bind_source_inventory_until(source, None)?;
+    let payload_relative = Path::new("nested").join("payload");
+    let payload_receipt = source_receipt
+        .entries
+        .iter()
+        .find(|entry| entry.relative == payload_relative)
+        .ok_or_else(|| "ACL verifier source payload receipt is absent".to_owned())?;
+    let payload_size = usize::try_from(
+        fs::symlink_metadata(source.join(&payload_relative))
+            .map_err(|error| format!("cannot inspect ACL verifier payload: {error}"))?
+            .len(),
+    )
+    .map_err(|_| "ACL verifier payload size does not fit memory".to_owned())?;
+    fs::write(source.join(&payload_relative), vec![b'x'; payload_size])
+        .map_err(|error| format!("cannot mutate ACL verifier source payload: {error}"))?;
+    if revalidate_native_manifest_entry(&source.join(&payload_relative), payload_receipt, false)
+        .is_ok()
+    {
+        return Err("source content mutation retained its copy authority".to_owned());
+    }
+    fs::write(source.join(&payload_relative), b"staged-native-acl-probe\n")
+        .map_err(|error| format!("cannot restore ACL verifier source payload: {error}"))?;
+
+    let symlink_receipt = BoundNativeManifest::bind_source_inventory_until(source, None)?;
+    let link_relative = Path::new("payload-link");
+    let link_receipt = symlink_receipt
+        .entries
+        .iter()
+        .find(|entry| entry.relative == link_relative)
+        .ok_or_else(|| "ACL verifier source symlink receipt is absent".to_owned())?;
+    fs::remove_file(source.join(link_relative))
+        .and_then(|()| symlink("nested/alternate", source.join(link_relative)))
+        .map_err(|error| format!("cannot retarget ACL verifier source symlink: {error}"))?;
+    if revalidate_native_manifest_entry(&source.join(link_relative), link_receipt, false).is_ok() {
+        return Err("source symlink retarget retained its copy authority".to_owned());
+    }
+    fs::remove_file(source.join(link_relative))
+        .and_then(|()| symlink("nested/payload", source.join(link_relative)))
+        .map_err(|error| format!("cannot restore ACL verifier source symlink: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_acl_executable_retarget(
+    source: &Path,
+    transaction: &StagedNativeToolchainTransaction,
+) -> Result<(), String> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let executable_a = source.join("executable-a");
+    let executable_b = source.join("executable-b");
+    fs::write(&executable_a, b"executable-a\n")
+        .and_then(|()| fs::write(&executable_b, b"executable-b\n"))
+        .map_err(|error| format!("cannot create query authority fixture: {error}"))?;
+    fs::set_permissions(&executable_a, fs::Permissions::from_mode(0o555))
+        .and_then(|()| fs::set_permissions(&executable_b, fs::Permissions::from_mode(0o555)))
+        .map_err(|error| format!("cannot freeze query authority fixture: {error}"))?;
+    let executable_alias = source.join("executable-alias");
+    symlink("executable-a", &executable_alias)
+        .map_err(|error| format!("cannot bind query authority fixture: {error}"))?;
+    let executable_receipt = BoundNativeFile::bind(&executable_alias, 0o555)?;
+    fs::remove_file(&executable_alias)
+        .and_then(|()| symlink("executable-b", &executable_alias))
+        .map_err(|error| format!("cannot retarget query authority fixture: {error}"))?;
+    if executable_receipt
+        .revalidate_until(
+            "query authority retarget fixture",
+            transaction.execution_deadline,
+        )
+        .is_ok()
+    {
+        return Err("query executable retarget retained its spawn authority".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_native_acl_destination(destination_parent: &Path) -> Result<(), String> {
+    fs::create_dir(destination_parent)
+        .map_err(|error| format!("cannot create ACL verifier destination: {error}"))?;
+    run_fixed_macos_chmod(
+        [
+            OsStr::new("+a"),
+            OsStr::new("everyone allow write,file_inherit,directory_inherit"),
+            destination_parent.as_os_str(),
+        ],
+        "seed the inherited staged-toolchain ACL",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_acl_staged_copy(
+    source: &Path,
+    destination: &Path,
+    transaction: &StagedNativeToolchainTransaction,
+    phase_receiver: &std::sync::mpsc::Receiver<StagedNativeToolchainProgress>,
+) -> Result<BoundNativeManifest, String> {
+    let manifest = copy_and_freeze_native_directory(source, destination, Some(transaction))?;
+    let expected_copy_passes = StagedNativeManifestPassCounts {
+        source_inventory: 1,
+        source_postflight: 1,
+        staged_final: 1,
+        query_preflight: 0,
+        query_postflight: 0,
+    };
+    transaction.require_manifest_passes(expected_copy_passes)?;
+    let receipts = phase_receiver.try_iter().collect::<Vec<_>>();
+    for phase in [
+        "source-inventory",
+        "freeze-and-acl",
+        "source-postflight",
+        "staged-final-manifest",
+    ] {
+        if !receipts.iter().any(|receipt| {
+            matches!(receipt, StagedNativeToolchainProgress::Phase(observed) if observed == phase)
+        }) {
+            return Err(format!("staged copy omitted typed {phase} boundary"));
+        }
+    }
+    if !receipts.iter().any(|receipt| {
+        matches!(receipt, StagedNativeToolchainProgress::ManifestPasses(observed) if *observed == expected_copy_passes)
+    }) {
+        return Err("staged copy omitted its exact typed manifest-pass receipt".to_owned());
+    }
+    let staged_link = fs::read_link(destination.join("payload-link"))
+        .map_err(|error| format!("cannot read staged transaction symlink: {error}"))?;
+    let expected_link = fs::canonicalize(destination)
+        .map_err(|error| format!("cannot canonicalize staged transaction: {error}"))?
+        .join("nested")
+        .join("payload");
+    if staged_link != expected_link {
+        return Err("staged transaction symlink target was not relocated exactly".to_owned());
+    }
+    Ok(manifest)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_expired_native_acl_copy(source: &Path, destination_parent: &Path) -> Result<(), String> {
+    let expired = Instant::now();
+    let expired_transaction = StagedNativeToolchainTransaction {
+        execution_deadline: expired,
+        completion_deadline: expired,
+        phase_sender: None,
+        manifest_passes: Cell::new(StagedNativeManifestPassCounts::default()),
+    };
+    let late_destination = destination_parent.join("late-staged");
+    if copy_and_freeze_native_directory(source, &late_destination, Some(&expired_transaction))
+        .is_ok()
+        || late_destination.exists()
+    {
+        return Err("expired staging transaction launched late copy work".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_retained_native_acl_mutation(
+    destination: &Path,
+    manifest: &BoundNativeManifest,
+) -> Result<(), String> {
+    let payload = destination.join("nested/payload");
+    run_fixed_macos_chmod(
+        [
+            OsStr::new("+a"),
+            OsStr::new("everyone allow write"),
+            payload.as_os_str(),
+        ],
+        "seed the retained-manifest ACL mutation",
+    )?;
+    if require_native_acl_free([payload.as_path()], "ACL mutation probe").is_ok() {
+        return Err("macOS did not retain the staged ACL mutation probe".to_owned());
+    }
+    if manifest.revalidate("staged ACL mutation probe").is_ok() {
+        return Err("retained staged-toolchain ACL mutation was not rejected".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2574,7 +2822,7 @@ impl BoundNativeArchiver {
     pub(crate) fn bind_existing_for_publisher(path: &Path) -> Result<Self, String> {
         Self::bind_existing_with_owner_authority(
             path,
-            NativeArchiverOwnerAuthority::TrustedPublisher {
+            &NativeArchiverOwnerAuthority::TrustedPublisher {
                 uid: nix::unistd::geteuid().as_raw(),
             },
         )
@@ -2583,7 +2831,7 @@ impl BoundNativeArchiver {
     #[cfg(target_os = "macos")]
     fn bind_existing_with_owner_authority(
         path: &Path,
-        owner_authority: NativeArchiverOwnerAuthority,
+        owner_authority: &NativeArchiverOwnerAuthority,
     ) -> Result<Self, String> {
         let transaction = NativeArchiverTransaction::new()?;
         Self::bind_existing_with_owner_authority_and_transaction(path, owner_authority, transaction)
@@ -2592,7 +2840,7 @@ impl BoundNativeArchiver {
     #[cfg(target_os = "macos")]
     fn bind_existing_with_owner_authority_and_transaction(
         path: &Path,
-        owner_authority: NativeArchiverOwnerAuthority,
+        owner_authority: &NativeArchiverOwnerAuthority,
         transaction: NativeArchiverTransaction,
     ) -> Result<Self, String> {
         let distribution = path
@@ -2605,7 +2853,7 @@ impl BoundNativeArchiver {
             distribution,
             &otool,
             &transaction,
-            &owner_authority,
+            owner_authority,
         )?;
         Self::bind(
             path,
@@ -2646,19 +2894,18 @@ impl BoundNativeArchiver {
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| "staged LLVM archiver has no distribution root".to_owned())?;
-        let (execution_deadline, completion_deadline) = match deadlines {
-            Some(deadlines) => deadlines,
-            None => {
-                let execution_deadline = Instant::now()
-                    .checked_add(Duration::from_secs(30))
-                    .ok_or_else(|| "native archiver binding deadline overflowed".to_owned())?;
-                (
-                    execution_deadline,
-                    execution_deadline
-                        .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
-                        .unwrap_or(execution_deadline),
-                )
-            }
+        let (execution_deadline, completion_deadline) = if let Some(deadlines) = deadlines {
+            deadlines
+        } else {
+            let execution_deadline = Instant::now()
+                .checked_add(Duration::from_secs(30))
+                .ok_or_else(|| "native archiver binding deadline overflowed".to_owned())?;
+            (
+                execution_deadline,
+                execution_deadline
+                    .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
+                    .unwrap_or(execution_deadline),
+            )
         };
         let distribution =
             BoundNativeManifest::bind_until(distribution_root, true, Some(execution_deadline))?;
@@ -2847,106 +3094,17 @@ impl BoundNativeArchiverDependency {
         transaction: NativeArchiverTransaction,
         owner_authority: &NativeArchiverOwnerAuthority,
     ) -> Result<Self, String> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::unix::fs::MetadataExt as _;
 
-        transaction.require_execution("Mach-O dependency binding")?;
-        let canonical = fs::canonicalize(path)
-            .map_err(|error| format!("cannot canonicalize Mach-O dependency: {error}"))?;
-        let guard = Arc::new(
-            fs::File::open(&canonical)
-                .map_err(|error| format!("cannot open Mach-O dependency: {error}"))?,
-        );
-        let metadata = guard
-            .metadata()
-            .map_err(|error| format!("cannot inspect Mach-O dependency: {error}"))?;
-        let mode = metadata.mode() & 0o7777;
-        if !metadata.is_file()
-            || !owner_authority.admits_owner(metadata.uid())
-            || !owner_authority.permits_file_mode(metadata.uid(), metadata.gid(), mode)
-            || mode & 0o6000 != 0
-            || metadata.len() == 0
-        {
-            return Err("Mach-O dependency does not satisfy the source predicate".to_owned());
-        }
-        let mut ancestor_paths = BTreeMap::<PathBuf, ()>::new();
-        for terminal in [path, canonical.as_path()] {
-            let parent = terminal
-                .parent()
-                .ok_or_else(|| "Mach-O dependency has no parent authority".to_owned())?;
-            let mut current = PathBuf::new();
-            for component in parent.components() {
-                current.push(component.as_os_str());
-                ancestor_paths.insert(current.clone(), ());
-            }
-        }
-        if fs::symlink_metadata(path)
-            .map_err(|error| format!("cannot inspect Mach-O dependency logical leaf: {error}"))?
-            .file_type()
-            .is_symlink()
-        {
-            ancestor_paths.insert(path.to_owned(), ());
-        }
+        let (canonical, guard, metadata, mode) =
+            bind_native_archiver_dependency_leaf(path, transaction, owner_authority)?;
         let mut ancestors = Vec::new();
-        for path in ancestor_paths.into_keys() {
-            transaction.require_execution("Mach-O dependency ancestor binding")?;
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| format!("cannot inspect Mach-O dependency ancestor: {error}"))?;
-            let symlink_target = if metadata.file_type().is_symlink() {
-                Some(fs::read_link(&path).map_err(|error| {
-                    format!("cannot read Mach-O dependency ancestor symlink: {error}")
-                })?)
-            } else {
-                None
-            };
-            let guard = if symlink_target.is_some() {
-                None
-            } else {
-                Some(Arc::new(
-                    fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(nix::libc::O_NOFOLLOW)
-                        .open(&path)
-                        .map_err(|error| {
-                            format!("cannot open Mach-O dependency ancestor: {error}")
-                        })?,
-                ))
-            };
-            let handle = match &guard {
-                Some(guard) => guard.metadata().map_err(|error| {
-                    format!("cannot inspect Mach-O dependency ancestor handle: {error}")
-                })?,
-                None => metadata.clone(),
-            };
-            let ancestor_mode = metadata.mode() & 0o7777;
-            if (!metadata.file_type().is_symlink() && !handle.is_dir())
-                || metadata.dev() != handle.dev()
-                || metadata.ino() != handle.ino()
-                || (symlink_target.is_none()
-                    && (!owner_authority.admits_owner(metadata.uid())
-                        || !owner_authority.permits_ancestor_mode(
-                            metadata.uid(),
-                            metadata.gid(),
-                            ancestor_mode,
-                            metadata.is_dir(),
-                        )))
-            {
-                return Err(format!(
-                    "Mach-O dependency ancestor does not satisfy the authority predicate: path={},uid={},gid={},mode=0o{ancestor_mode:04o},authority={owner_authority:?}",
-                    path.display(),
-                    metadata.uid(),
-                    metadata.gid(),
-                ));
-            }
-            ancestors.push(BoundNativeArchiverAncestor {
-                guard,
-                path,
-                symlink_target,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-                mode: ancestor_mode,
-            });
+        for ancestor_path in native_archiver_dependency_ancestor_paths(path, &canonical)? {
+            ancestors.push(bind_native_archiver_dependency_ancestor(
+                ancestor_path,
+                transaction,
+                owner_authority,
+            )?);
         }
         require_native_archiver_acl_free(
             ancestors
@@ -3076,6 +3234,130 @@ impl BoundNativeArchiverDependency {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn bind_native_archiver_dependency_leaf(
+    path: &Path,
+    transaction: NativeArchiverTransaction,
+    owner_authority: &NativeArchiverOwnerAuthority,
+) -> Result<(PathBuf, Arc<fs::File>, fs::Metadata, u32), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    transaction.require_execution("Mach-O dependency binding")?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("cannot canonicalize Mach-O dependency: {error}"))?;
+    let guard = Arc::new(
+        fs::File::open(&canonical)
+            .map_err(|error| format!("cannot open Mach-O dependency: {error}"))?,
+    );
+    let metadata = guard
+        .metadata()
+        .map_err(|error| format!("cannot inspect Mach-O dependency: {error}"))?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_file()
+        || !owner_authority.admits_owner(metadata.uid())
+        || !owner_authority.permits_file_mode(metadata.uid(), metadata.gid(), mode)
+        || mode & 0o6000 != 0
+        || metadata.len() == 0
+    {
+        return Err("Mach-O dependency does not satisfy the source predicate".to_owned());
+    }
+    Ok((canonical, guard, metadata, mode))
+}
+
+#[cfg(target_os = "macos")]
+fn native_archiver_dependency_ancestor_paths(
+    path: &Path,
+    canonical: &Path,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut ancestor_paths = BTreeSet::new();
+    for terminal in [path, canonical] {
+        let parent = terminal
+            .parent()
+            .ok_or_else(|| "Mach-O dependency has no parent authority".to_owned())?;
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            ancestor_paths.insert(current.clone());
+        }
+    }
+    if fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect Mach-O dependency logical leaf: {error}"))?
+        .file_type()
+        .is_symlink()
+    {
+        ancestor_paths.insert(path.to_owned());
+    }
+    Ok(ancestor_paths)
+}
+
+#[cfg(target_os = "macos")]
+fn bind_native_archiver_dependency_ancestor(
+    path: PathBuf,
+    transaction: NativeArchiverTransaction,
+    owner_authority: &NativeArchiverOwnerAuthority,
+) -> Result<BoundNativeArchiverAncestor, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    transaction.require_execution("Mach-O dependency ancestor binding")?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect Mach-O dependency ancestor: {error}"))?;
+    let symlink_target =
+        if metadata.file_type().is_symlink() {
+            Some(fs::read_link(&path).map_err(|error| {
+                format!("cannot read Mach-O dependency ancestor symlink: {error}")
+            })?)
+        } else {
+            None
+        };
+    let guard = if symlink_target.is_some() {
+        None
+    } else {
+        Some(Arc::new(
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|error| format!("cannot open Mach-O dependency ancestor: {error}"))?,
+        ))
+    };
+    let handle = match &guard {
+        Some(guard) => guard.metadata().map_err(|error| {
+            format!("cannot inspect Mach-O dependency ancestor handle: {error}")
+        })?,
+        None => metadata.clone(),
+    };
+    let mode = metadata.mode() & 0o7777;
+    if (!metadata.file_type().is_symlink() && !handle.is_dir())
+        || metadata.dev() != handle.dev()
+        || metadata.ino() != handle.ino()
+        || (symlink_target.is_none()
+            && (!owner_authority.admits_owner(metadata.uid())
+                || !owner_authority.permits_ancestor_mode(
+                    metadata.uid(),
+                    metadata.gid(),
+                    mode,
+                    metadata.is_dir(),
+                )))
+    {
+        return Err(format!(
+            "Mach-O dependency ancestor does not satisfy the authority predicate: path={},uid={},gid={},mode=0o{mode:04o},authority={owner_authority:?}",
+            path.display(),
+            metadata.uid(),
+            metadata.gid(),
+        ));
+    }
+    Ok(BoundNativeArchiverAncestor {
+        guard,
+        path,
+        symlink_target,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode,
+    })
+}
+
 pub(crate) struct NativeStackProvenance {
     pub(crate) source: PathBuf,
     pub(crate) source_commit: &'static str,
@@ -3191,9 +3473,8 @@ fn make_native_tree_removable(root: &Path) {
         _ => return,
     }
     let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
-    let children = match fs::read_dir(root) {
-        Ok(children) => children,
-        Err(_) => return,
+    let Ok(children) = fs::read_dir(root) else {
+        return;
     };
     for child in children.flatten() {
         make_native_tree_removable(&child.path());
@@ -3209,21 +3490,21 @@ const NATIVE_GHC_ENTRY_LIMIT: usize = 250_000;
 const NATIVE_GHC_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 const NATIVE_GHC_DEPTH_LIMIT: usize = 128;
 #[cfg(target_os = "macos")]
-const STAGED_NATIVE_TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const STAGED_NATIVE_TOOLCHAIN_TIMEOUT: Duration = Duration::from_mins(20);
 #[cfg(target_os = "macos")]
-const STAGED_NATIVE_TOOLCHAIN_CLEANUP_RESERVE: Duration = Duration::from_secs(2 * 60);
+const STAGED_NATIVE_TOOLCHAIN_CLEANUP_RESERVE: Duration = Duration::from_mins(2);
 #[cfg(target_os = "macos")]
 const NATIVE_ARCHIVER_EXECUTION_BUDGET: Duration = Duration::from_secs(90);
 #[cfg(target_os = "macos")]
-const NATIVE_ARCHIVER_COMPLETION_BUDGET: Duration = Duration::from_secs(2 * 60);
+const NATIVE_ARCHIVER_COMPLETION_BUDGET: Duration = Duration::from_mins(2);
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeArchiveAdapterConstructionEnvelope {
-    execution_deadline: Instant,
-    completion_deadline: Instant,
-    archiver_execution_deadline: Instant,
-    archiver_completion_deadline: Instant,
+    execution: Instant,
+    completion: Instant,
+    archiver_execution: Instant,
+    archiver_completion: Instant,
 }
 
 #[cfg(target_os = "macos")]
@@ -3267,30 +3548,27 @@ impl NativeArchiveAdapterConstructionEnvelope {
             return Err("native archive adapter construction deadlines are not ordered".to_owned());
         }
         Ok(Self {
-            execution_deadline,
-            completion_deadline,
-            archiver_execution_deadline,
-            archiver_completion_deadline,
+            execution: execution_deadline,
+            completion: completion_deadline,
+            archiver_execution: archiver_execution_deadline,
+            archiver_completion: archiver_completion_deadline,
         })
     }
 
     fn archiver_transaction(self) -> Result<NativeArchiverTransaction, String> {
-        if Instant::now() >= self.archiver_execution_deadline
-            || self.archiver_execution_deadline >= self.archiver_completion_deadline
+        if Instant::now() >= self.archiver_execution
+            || self.archiver_execution >= self.archiver_completion
         {
             return Err("native archiver sub-deadlines are not ordered".to_owned());
         }
         Ok(NativeArchiverTransaction {
-            execution_deadline: self.archiver_execution_deadline,
-            completion_deadline: self.archiver_completion_deadline,
+            execution_deadline: self.archiver_execution,
+            completion_deadline: self.archiver_completion,
         })
     }
 
     fn toolchain_transaction(self) -> Result<StagedNativeToolchainTransaction, String> {
-        StagedNativeToolchainTransaction::with_deadlines(
-            self.execution_deadline,
-            self.completion_deadline,
-        )
+        StagedNativeToolchainTransaction::with_deadlines(self.execution, self.completion)
     }
 }
 
@@ -4022,7 +4300,42 @@ fn create_adapter_directory_with_probe(
     base: &Path,
     probe: AdapterDirectoryCreationProbe,
 ) -> Result<AdapterDirectory, String> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let (canonical_base, parent, parent_guard, cleanup_deadline) =
+        bind_adapter_directory_parent(base)?;
+    for _ in 0..16 {
+        let sequence = ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = canonical_base.join(format!(
+            "hell-ci-archive-adapter-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => {
+                return initialize_created_adapter_directory(
+                    path,
+                    &parent,
+                    &parent_guard,
+                    cleanup_deadline,
+                    probe,
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!("cannot create macOS archive adapter: {error}"));
+            }
+        }
+    }
+    Err("cannot allocate a collision-free macOS archive adapter directory".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn bind_adapter_directory_parent(
+    base: &Path,
+) -> Result<(PathBuf, BoundNativeDirectory, fs::File, Instant), String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let cleanup_transaction = StagedNativeToolchainTransaction::cleanup_only()?;
     let canonical_base = fs::canonicalize(base)
@@ -4054,210 +4367,183 @@ fn create_adapter_directory_with_probe(
     {
         return Err("retained native adapter parent identity changed".to_owned());
     }
-    for _ in 0..16 {
-        let sequence = ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = canonical_base.join(format!(
-            "hell-ci-archive-adapter-{}-{sequence}",
-            std::process::id()
-        ));
+    Ok((
+        canonical_base,
+        parent,
+        parent_guard,
+        cleanup_transaction.completion_deadline,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn initialize_created_adapter_directory(
+    path: PathBuf,
+    parent: &BoundNativeDirectory,
+    parent_guard: &fs::File,
+    cleanup_deadline: Instant,
+    probe: AdapterDirectoryCreationProbe,
+) -> Result<AdapterDirectory, String> {
+    let created =
+        retain_created_adapter_root(&path, parent, parent_guard, cleanup_deadline, probe)?;
+    validate_created_adapter_root(&path, &created, parent, cleanup_deadline, probe)?;
+    let cleanup_root =
+        BoundNativeCleanupRoot::bind(&path, cleanup_deadline).or_else(|primary| {
+            adapter_directory_creation_failure(
+                primary,
+                cleanup_created_adapter_root(&path, &created, parent, cleanup_deadline),
+            )
+        })?;
+    if let Err(primary) = created.require_promoted(&cleanup_root, parent, cleanup_deadline) {
+        return adapter_directory_creation_failure(
+            primary,
+            cleanup_created_adapter_root(&path, &created, parent, cleanup_deadline),
+        );
+    }
+    Ok(AdapterDirectory {
+        path,
+        cleanup_root: Some(cleanup_root),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn retain_created_adapter_root(
+    path: &Path,
+    parent: &BoundNativeDirectory,
+    parent_guard: &fs::File,
+    cleanup_deadline: Instant,
+    probe: AdapterDirectoryCreationProbe,
+) -> Result<BoundCreatedAdapterRoot, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("cannot retain newly created native adapter root: {error}"))
+        .or_else(|primary| {
+            adapter_directory_creation_failure(
+                primary,
+                cleanup_unbound_created_adapter_root(path, parent, cleanup_deadline),
+            )
+        })?;
+    if matches!(probe, AdapterDirectoryCreationProbe::FailParentClone) {
+        return adapter_directory_creation_failure(
+            "injected created adapter parent clone failure".to_owned(),
+            cleanup_unbound_created_adapter_root(path, parent, cleanup_deadline),
+        );
+    }
+    let created_parent_guard = parent_guard
+        .try_clone()
+        .map_err(|error| format!("cannot retain created adapter parent handle: {error}"))
+        .or_else(|primary| {
+            adapter_directory_creation_failure(
+                primary,
+                cleanup_unbound_created_adapter_root(path, parent, cleanup_deadline),
+            )
+        })?;
+    if matches!(probe, AdapterDirectoryCreationProbe::FailRootMetadata) {
+        return adapter_directory_creation_failure(
+            "injected created adapter handle metadata failure".to_owned(),
+            cleanup_unbound_created_adapter_root(path, parent, cleanup_deadline),
+        );
+    }
+    let metadata = guard
+        .metadata()
+        .map_err(|error| format!("cannot inspect retained native adapter root: {error}"))
+        .or_else(|primary| {
+            adapter_directory_creation_failure(
+                primary,
+                cleanup_unbound_created_adapter_root(path, parent, cleanup_deadline),
+            )
+        })?;
+    Ok(BoundCreatedAdapterRoot {
+        path: path.to_owned(),
+        guard,
+        parent_guard: created_parent_guard,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode() & 0o7777,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn validate_created_adapter_root(
+    path: &Path,
+    created: &BoundCreatedAdapterRoot,
+    parent: &BoundNativeDirectory,
+    cleanup_deadline: Instant,
+    probe: AdapterDirectoryCreationProbe,
+) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    if matches!(probe, AdapterDirectoryCreationProbe::FailPathMetadata) {
+        return adapter_directory_creation_failure(
+            "injected created adapter path metadata failure".to_owned(),
+            cleanup_created_adapter_root(path, created, parent, cleanup_deadline),
+        );
+    }
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect newly created native adapter root: {error}"))
+        .or_else(|primary| {
+            adapter_directory_creation_failure(
+                primary,
+                cleanup_created_adapter_root(path, created, parent, cleanup_deadline),
+            )
+        })?;
+    let metadata = created
+        .guard
+        .metadata()
+        .map_err(|error| format!("cannot inspect retained native adapter root: {error}"))?;
+    if !metadata.is_dir()
+        || path_metadata.file_type().is_symlink()
+        || !path_metadata.is_dir()
+        || path_metadata.dev() != metadata.dev()
+        || path_metadata.ino() != metadata.ino()
+    {
+        return adapter_directory_creation_failure(
+            "newly created native adapter root is not an exact directory".to_owned(),
+            cleanup_created_adapter_root(path, created, parent, cleanup_deadline),
+        );
+    }
+    if matches!(probe, AdapterDirectoryCreationProbe::SubstituteAfterCreate) {
+        fs::remove_dir(path)
+            .map_err(|error| format!("cannot remove adapter substitution probe root: {error}"))?;
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-        match builder.create(&path) {
-            Ok(()) => {
-                let guard = match fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-                    .open(&path)
-                {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        return adapter_directory_creation_failure(
-                            format!("cannot retain newly created native adapter root: {error}"),
-                            cleanup_unbound_created_adapter_root(
-                                &path,
-                                &parent,
-                                cleanup_transaction.completion_deadline,
-                            ),
-                        );
-                    }
-                };
-                let created_parent_guard =
-                    if matches!(probe, AdapterDirectoryCreationProbe::FailParentClone) {
-                        return adapter_directory_creation_failure(
-                            "injected created adapter parent clone failure".to_owned(),
-                            cleanup_unbound_created_adapter_root(
-                                &path,
-                                &parent,
-                                cleanup_transaction.completion_deadline,
-                            ),
-                        );
-                    } else {
-                        match parent_guard.try_clone() {
-                            Ok(parent_guard) => parent_guard,
-                            Err(error) => {
-                                return adapter_directory_creation_failure(
-                                    format!("cannot retain created adapter parent handle: {error}"),
-                                    cleanup_unbound_created_adapter_root(
-                                        &path,
-                                        &parent,
-                                        cleanup_transaction.completion_deadline,
-                                    ),
-                                );
-                            }
-                        }
-                    };
-                let metadata = if matches!(probe, AdapterDirectoryCreationProbe::FailRootMetadata) {
-                    return adapter_directory_creation_failure(
-                        "injected created adapter handle metadata failure".to_owned(),
-                        cleanup_unbound_created_adapter_root(
-                            &path,
-                            &parent,
-                            cleanup_transaction.completion_deadline,
-                        ),
-                    );
-                } else {
-                    match guard.metadata() {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            return adapter_directory_creation_failure(
-                                format!("cannot inspect retained native adapter root: {error}"),
-                                cleanup_unbound_created_adapter_root(
-                                    &path,
-                                    &parent,
-                                    cleanup_transaction.completion_deadline,
-                                ),
-                            );
-                        }
-                    }
-                };
-                let created = BoundCreatedAdapterRoot {
-                    path: path.clone(),
-                    guard,
-                    parent_guard: created_parent_guard,
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                    uid: metadata.uid(),
-                    gid: metadata.gid(),
-                    mode: metadata.mode() & 0o7777,
-                };
-                let path_metadata =
-                    if matches!(probe, AdapterDirectoryCreationProbe::FailPathMetadata) {
-                        return adapter_directory_creation_failure(
-                            "injected created adapter path metadata failure".to_owned(),
-                            cleanup_created_adapter_root(
-                                &path,
-                                &created,
-                                &parent,
-                                cleanup_transaction.completion_deadline,
-                            ),
-                        );
-                    } else {
-                        match fs::symlink_metadata(&path) {
-                            Ok(metadata) => metadata,
-                            Err(error) => {
-                                return adapter_directory_creation_failure(
-                                    format!(
-                                        "cannot inspect newly created native adapter root: {error}"
-                                    ),
-                                    cleanup_created_adapter_root(
-                                        &path,
-                                        &created,
-                                        &parent,
-                                        cleanup_transaction.completion_deadline,
-                                    ),
-                                );
-                            }
-                        }
-                    };
-                if !metadata.is_dir()
-                    || path_metadata.file_type().is_symlink()
-                    || !path_metadata.is_dir()
-                    || path_metadata.dev() != metadata.dev()
-                    || path_metadata.ino() != metadata.ino()
-                {
-                    return adapter_directory_creation_failure(
-                        "newly created native adapter root is not an exact directory".to_owned(),
-                        cleanup_created_adapter_root(
-                            &path,
-                            &created,
-                            &parent,
-                            cleanup_transaction.completion_deadline,
-                        ),
-                    );
-                }
-                if matches!(probe, AdapterDirectoryCreationProbe::SubstituteAfterCreate) {
-                    fs::remove_dir(&path).map_err(|error| {
-                        format!("cannot remove adapter substitution probe root: {error}")
-                    })?;
-                    builder.create(&path).map_err(|error| {
-                        format!("cannot install adapter substitution directory: {error}")
-                    })?;
-                    fs::write(path.join("collision"), b"collision\n").map_err(|error| {
-                        format!("cannot install adapter substitution marker: {error}")
-                    })?;
-                }
-                if matches!(probe, AdapterDirectoryCreationProbe::FailAfterCreate) {
-                    return adapter_directory_creation_failure(
-                        "injected native adapter initialization failure".to_owned(),
-                        cleanup_created_adapter_root(
-                            &path,
-                            &created,
-                            &parent,
-                            cleanup_transaction.completion_deadline,
-                        ),
-                    );
-                }
-                let cleanup_root = match BoundNativeCleanupRoot::bind(
-                    &path,
-                    cleanup_transaction.completion_deadline,
-                ) {
-                    Ok(cleanup_root) => cleanup_root,
-                    Err(primary) => {
-                        return adapter_directory_creation_failure(
-                            primary,
-                            cleanup_created_adapter_root(
-                                &path,
-                                &created,
-                                &parent,
-                                cleanup_transaction.completion_deadline,
-                            ),
-                        );
-                    }
-                };
-                if let Err(primary) = created.require_promoted(
-                    &cleanup_root,
-                    &parent,
-                    cleanup_transaction.completion_deadline,
-                ) {
-                    return adapter_directory_creation_failure(
-                        primary,
-                        cleanup_created_adapter_root(
-                            &path,
-                            &created,
-                            &parent,
-                            cleanup_transaction.completion_deadline,
-                        ),
-                    );
-                }
-                return Ok(AdapterDirectory {
-                    path,
-                    cleanup_root: Some(cleanup_root),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!("cannot create macOS archive adapter: {error}"));
-            }
-        }
+        builder
+            .create(path)
+            .map_err(|error| format!("cannot install adapter substitution directory: {error}"))?;
+        fs::write(path.join("collision"), b"collision\n")
+            .map_err(|error| format!("cannot install adapter substitution marker: {error}"))?;
     }
-    Err("cannot allocate a collision-free macOS archive adapter directory".to_owned())
+    if matches!(probe, AdapterDirectoryCreationProbe::FailAfterCreate) {
+        return adapter_directory_creation_failure(
+            "injected native adapter initialization failure".to_owned(),
+            cleanup_created_adapter_root(path, created, parent, cleanup_deadline),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 pub(crate) fn verify_native_archive_adapter_cleanup_for_integration(
     base: &Path,
 ) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let (base, base_guard, expected_base) = bind_adapter_cleanup_base(base)?;
+    let mut scope = create_adapter_directory(&base)?;
+    let scope_path = scope.path().to_owned();
+    let primary = verify_native_archive_adapter_cleanup_scope(&scope_path);
+    let cleanup = scope.close();
+    let parent_attestation =
+        attest_adapter_cleanup_parent(&base, &base_guard, &expected_base, &scope_path);
+    combine_adapter_cleanup_results(primary, cleanup, parent_attestation)
+}
+
+#[cfg(unix)]
+fn bind_adapter_cleanup_base(base: &Path) -> Result<(PathBuf, fs::File, fs::Metadata), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let base = fs::canonicalize(base)
         .map_err(|error| format!("cannot canonicalize adapter cleanup verifier base: {error}"))?;
@@ -4277,189 +4563,214 @@ pub(crate) fn verify_native_archive_adapter_cleanup_for_integration(
     {
         return Err("adapter cleanup verifier base is not an empty exact directory".to_owned());
     }
+    Ok((base, base_guard, expected_base))
+}
 
-    let mut scope = create_adapter_directory(&base)?;
-    let scope_path = scope.path().to_owned();
-    let primary = (|| {
-        verify_native_archive_stack_package_authority_for_integration(&scope_path)?;
-        let mut partial = create_adapter_directory(&scope_path)?;
-        let partial_path = partial.path().to_owned();
-        fs::write(partial_path.join("member.o"), b"partial\n")
-            .map_err(|error| format!("cannot write partial adapter fixture: {error}"))?;
-        partial.close()?;
-        if fs::symlink_metadata(&partial_path).is_ok() {
-            return Err("explicit adapter close left partial setup behind".to_owned());
-        }
+#[cfg(unix)]
+fn verify_native_archive_adapter_cleanup_scope(scope_path: &Path) -> Result<(), String> {
+    verify_native_archive_stack_package_authority_for_integration(scope_path)?;
+    let mut partial = create_adapter_directory(scope_path)?;
+    let partial_path = partial.path().to_owned();
+    fs::write(partial_path.join("member.o"), b"partial\n")
+        .map_err(|error| format!("cannot write partial adapter fixture: {error}"))?;
+    partial.close()?;
+    if fs::symlink_metadata(&partial_path).is_ok() {
+        return Err("explicit adapter close left partial setup behind".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        verify_partial_adapter_receipt_cleanup(scope_path)?;
+        verify_failed_adapter_initialization_cleanup(scope_path)?;
+        verify_substituted_adapter_cleanup(scope_path)?;
+        verify_expired_adapter_cleanup(scope_path)?;
+    }
+    Ok(())
+}
 
-        #[cfg(target_os = "macos")]
-        {
-            for (probe, expected) in [
-                (
-                    AdapterDirectoryCreationProbe::FailParentClone,
-                    "injected created adapter parent clone failure",
-                ),
-                (
-                    AdapterDirectoryCreationProbe::FailRootMetadata,
-                    "injected created adapter handle metadata failure",
-                ),
-                (
-                    AdapterDirectoryCreationProbe::FailPathMetadata,
-                    "injected created adapter path metadata failure",
-                ),
-            ] {
-                let failure = match create_adapter_directory_with_probe(&scope_path, probe) {
-                    Err(error) => error,
-                    Ok(mut unexpected) => {
-                        unexpected.close()?;
-                        return Err(
-                            "partial adapter receipt initialization unexpectedly succeeded"
-                                .to_owned(),
-                        );
-                    }
-                };
-                if failure != expected
-                    || fs::read_dir(&scope_path)
-                        .map_err(|error| {
-                            format!("cannot inspect partial adapter receipt scope: {error}")
-                        })?
-                        .next()
-                        .is_some()
-                {
-                    return Err(
-                        "partial adapter receipt failure did not clean its exact root".to_owned(),
-                    );
-                }
-            }
-
-            let failure = match create_adapter_directory_with_probe(
-                &scope_path,
-                AdapterDirectoryCreationProbe::FailAfterCreate,
-            ) {
-                Err(error) => error,
-                Ok(mut unexpected) => {
-                    unexpected.close()?;
-                    return Err("injected adapter initialization unexpectedly succeeded".to_owned());
-                }
-            };
-            if failure != "injected native adapter initialization failure"
-                || fs::read_dir(&scope_path)
-                    .map_err(|error| format!("cannot inspect post-failure adapter scope: {error}"))?
-                    .next()
-                    .is_some()
-            {
-                return Err("pre-receipt adapter cleanup did not attest exact absence".to_owned());
-            }
-
-            let substitution = match create_adapter_directory_with_probe(
-                &scope_path,
-                AdapterDirectoryCreationProbe::SubstituteAfterCreate,
-            ) {
-                Err(error) => error,
-                Ok(mut unexpected) => {
-                    unexpected.close()?;
-                    return Err(
-                        "substituted adapter initialization unexpectedly succeeded".to_owned()
-                    );
-                }
-            };
-            let cleanup = substitution
-                .strip_prefix(
-                    "created adapter root changed during receipt promotion; created adapter cleanup also failed: ",
-                )
-                .filter(|cleanup| !cleanup.is_empty())
-                .ok_or_else(|| {
-                    "pre-receipt adapter failure did not preserve primary-before-cleanup ordering"
-                        .to_owned()
-                })?;
-            if !cleanup.contains("identity changed") {
+#[cfg(target_os = "macos")]
+fn verify_partial_adapter_receipt_cleanup(scope_path: &Path) -> Result<(), String> {
+    for (probe, expected) in [
+        (
+            AdapterDirectoryCreationProbe::FailParentClone,
+            "injected created adapter parent clone failure",
+        ),
+        (
+            AdapterDirectoryCreationProbe::FailRootMetadata,
+            "injected created adapter handle metadata failure",
+        ),
+        (
+            AdapterDirectoryCreationProbe::FailPathMetadata,
+            "injected created adapter path metadata failure",
+        ),
+    ] {
+        let failure = match create_adapter_directory_with_probe(scope_path, probe) {
+            Err(error) => error,
+            Ok(mut unexpected) => {
+                unexpected.close()?;
                 return Err(
-                    "pre-receipt adapter substitution returned an unrelated failure".to_owned(),
+                    "partial adapter receipt initialization unexpectedly succeeded".to_owned(),
                 );
             }
-            let collision = fs::read_dir(&scope_path)
-                .map_err(|error| format!("cannot enumerate adapter collision probe: {error}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("cannot inspect adapter collision probe: {error}"))?;
-            if collision.len() != 1
-                || !collision[0]
-                    .file_type()
-                    .map_err(|error| format!("cannot type adapter collision probe: {error}"))?
-                    .is_dir()
-                || fs::read(collision[0].path().join("collision"))
-                    .map_err(|error| format!("cannot read adapter collision probe: {error}"))?
-                    != b"collision\n"
-            {
-                return Err("pre-receipt adapter cleanup deleted its substitution".to_owned());
-            }
-
-            let mut expired = create_adapter_directory(&scope_path)?;
-            let expired_path = expired.path().to_owned();
-            fs::write(expired_path.join("member.o"), b"expired\n")
-                .map_err(|error| format!("cannot write expired adapter fixture: {error}"))?;
-            let before = fs::symlink_metadata(&expired_path)
-                .map_err(|error| format!("cannot bind expired adapter fixture: {error}"))?;
-            let composite = native_archive_adapter_constructor_failure::<()>(
-                "partial adapter setup failed".to_owned(),
-                expired.close_until(Instant::now()),
-            )
-            .expect_err("expired adapter cleanup must preserve the primary failure");
-            let cleanup = composite
-                .strip_prefix(
-                    "partial adapter setup failed; native archive adapter constructor cleanup also failed: ",
-                )
-                .filter(|cleanup| !cleanup.is_empty())
-                .ok_or_else(|| {
-                    "adapter cleanup composite did not preserve primary-before-cleanup ordering"
-                        .to_owned()
-                })?;
-            if !cleanup.contains("deadline expired") {
-                return Err("expired adapter cleanup returned an unrelated failure".to_owned());
-            }
-            let after = fs::symlink_metadata(&expired_path)
-                .map_err(|error| format!("expired adapter cleanup mutated its root: {error}"))?;
-            if after.file_type().is_symlink()
-                || !after.is_dir()
-                || after.dev() != before.dev()
-                || after.ino() != before.ino()
-                || after.uid() != before.uid()
-                || after.gid() != before.gid()
-                || after.mode() & 0o7777 != before.mode() & 0o7777
-            {
-                return Err("expired adapter cleanup changed its exact root".to_owned());
-            }
-            drop(expired);
-            if fs::symlink_metadata(&expired_path).is_err() {
-                return Err("macOS AdapterDirectory Drop retried failed cleanup".to_owned());
-            }
-        }
-        Ok(())
-    })();
-
-    let cleanup = scope.close();
-    let parent_attestation = (|| {
-        if fs::symlink_metadata(&scope_path).is_ok() {
-            return Err("adapter cleanup verifier scope remains after close".to_owned());
-        }
-        let retained = base_guard
-            .metadata()
-            .map_err(|error| format!("cannot revalidate retained verifier base: {error}"))?;
-        let current = fs::symlink_metadata(&base)
-            .map_err(|error| format!("cannot revalidate adapter cleanup verifier base: {error}"))?;
-        if current.file_type().is_symlink()
-            || !current.is_dir()
-            || current.dev() != expected_base.dev()
-            || current.ino() != expected_base.ino()
-            || current.uid() != expected_base.uid()
-            || current.gid() != expected_base.gid()
-            || current.mode() & 0o7777 != expected_base.mode() & 0o7777
-            || retained.dev() != expected_base.dev()
-            || retained.ino() != expected_base.ino()
+        };
+        if failure != expected
+            || fs::read_dir(scope_path)
+                .map_err(|error| format!("cannot inspect partial adapter receipt scope: {error}"))?
+                .next()
+                .is_some()
         {
-            return Err("adapter cleanup changed its retained parent authority".to_owned());
+            return Err("partial adapter receipt failure did not clean its exact root".to_owned());
         }
-        Ok(())
-    })();
+    }
+    Ok(())
+}
 
+#[cfg(target_os = "macos")]
+fn verify_failed_adapter_initialization_cleanup(scope_path: &Path) -> Result<(), String> {
+    let failure = match create_adapter_directory_with_probe(
+        scope_path,
+        AdapterDirectoryCreationProbe::FailAfterCreate,
+    ) {
+        Err(error) => error,
+        Ok(mut unexpected) => {
+            unexpected.close()?;
+            return Err("injected adapter initialization unexpectedly succeeded".to_owned());
+        }
+    };
+    if failure != "injected native adapter initialization failure"
+        || fs::read_dir(scope_path)
+            .map_err(|error| format!("cannot inspect post-failure adapter scope: {error}"))?
+            .next()
+            .is_some()
+    {
+        return Err("pre-receipt adapter cleanup did not attest exact absence".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_substituted_adapter_cleanup(scope_path: &Path) -> Result<(), String> {
+    let substitution = match create_adapter_directory_with_probe(
+        scope_path,
+        AdapterDirectoryCreationProbe::SubstituteAfterCreate,
+    ) {
+        Err(error) => error,
+        Ok(mut unexpected) => {
+            unexpected.close()?;
+            return Err("substituted adapter initialization unexpectedly succeeded".to_owned());
+        }
+    };
+    let cleanup = substitution
+        .strip_prefix(
+            "created adapter root changed during receipt promotion; created adapter cleanup also failed: ",
+        )
+        .filter(|cleanup| !cleanup.is_empty())
+        .ok_or_else(|| {
+            "pre-receipt adapter failure did not preserve primary-before-cleanup ordering".to_owned()
+        })?;
+    if !cleanup.contains("identity changed") {
+        return Err("pre-receipt adapter substitution returned an unrelated failure".to_owned());
+    }
+    let collision = fs::read_dir(scope_path)
+        .map_err(|error| format!("cannot enumerate adapter collision probe: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot inspect adapter collision probe: {error}"))?;
+    if collision.len() != 1
+        || !collision[0]
+            .file_type()
+            .map_err(|error| format!("cannot type adapter collision probe: {error}"))?
+            .is_dir()
+        || fs::read(collision[0].path().join("collision"))
+            .map_err(|error| format!("cannot read adapter collision probe: {error}"))?
+            != b"collision\n"
+    {
+        return Err("pre-receipt adapter cleanup deleted its substitution".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_expired_adapter_cleanup(scope_path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut expired = create_adapter_directory(scope_path)?;
+    let expired_path = expired.path().to_owned();
+    fs::write(expired_path.join("member.o"), b"expired\n")
+        .map_err(|error| format!("cannot write expired adapter fixture: {error}"))?;
+    let before = fs::symlink_metadata(&expired_path)
+        .map_err(|error| format!("cannot bind expired adapter fixture: {error}"))?;
+    let composite = native_archive_adapter_constructor_failure::<()>(
+        "partial adapter setup failed".to_owned(),
+        expired.close_until(Instant::now()),
+    )
+    .expect_err("expired adapter cleanup must preserve the primary failure");
+    let cleanup = composite
+        .strip_prefix(
+            "partial adapter setup failed; native archive adapter constructor cleanup also failed: ",
+        )
+        .filter(|cleanup| !cleanup.is_empty())
+        .ok_or_else(|| {
+            "adapter cleanup composite did not preserve primary-before-cleanup ordering".to_owned()
+        })?;
+    if !cleanup.contains("deadline expired") {
+        return Err("expired adapter cleanup returned an unrelated failure".to_owned());
+    }
+    let after = fs::symlink_metadata(&expired_path)
+        .map_err(|error| format!("expired adapter cleanup mutated its root: {error}"))?;
+    if after.file_type().is_symlink()
+        || !after.is_dir()
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.uid() != before.uid()
+        || after.gid() != before.gid()
+        || after.mode() & 0o7777 != before.mode() & 0o7777
+    {
+        return Err("expired adapter cleanup changed its exact root".to_owned());
+    }
+    drop(expired);
+    if fs::symlink_metadata(&expired_path).is_err() {
+        return Err("macOS AdapterDirectory Drop retried failed cleanup".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn attest_adapter_cleanup_parent(
+    base: &Path,
+    base_guard: &fs::File,
+    expected_base: &fs::Metadata,
+    scope_path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if fs::symlink_metadata(scope_path).is_ok() {
+        return Err("adapter cleanup verifier scope remains after close".to_owned());
+    }
+    let retained = base_guard
+        .metadata()
+        .map_err(|error| format!("cannot revalidate retained verifier base: {error}"))?;
+    let current = fs::symlink_metadata(base)
+        .map_err(|error| format!("cannot revalidate adapter cleanup verifier base: {error}"))?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || current.dev() != expected_base.dev()
+        || current.ino() != expected_base.ino()
+        || current.uid() != expected_base.uid()
+        || current.gid() != expected_base.gid()
+        || current.mode() & 0o7777 != expected_base.mode() & 0o7777
+        || retained.dev() != expected_base.dev()
+        || retained.ino() != expected_base.ino()
+    {
+        return Err("adapter cleanup changed its retained parent authority".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn combine_adapter_cleanup_results(
+    primary: Result<(), String>,
+    cleanup: Result<(), String>,
+    parent_attestation: Result<(), String>,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     if let Err(error) = primary {
         failures.push(format!("primary: {error}"));
@@ -4483,8 +4794,6 @@ fn copy_and_freeze_native_directory(
     destination_root: &Path,
     transaction: Option<&StagedNativeToolchainTransaction>,
 ) -> Result<BoundNativeManifest, String> {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-
     let source_root = fs::canonicalize(source_root)
         .map_err(|error| format!("cannot canonicalize native toolchain source: {error}"))?;
     let deadline = transaction.map(|transaction| transaction.execution_deadline);
@@ -4498,94 +4807,18 @@ fn copy_and_freeze_native_directory(
     }
     fs::create_dir(destination_root)
         .map_err(|error| format!("cannot create staged native toolchain: {error}"))?;
-
-    let mut directories = vec![destination_root.to_owned()];
-    let mut symlinks = Vec::new();
-    let mut bytes = 0u64;
-    for entry in source_manifest
-        .entries
-        .iter_mut()
-        .filter(|entry| !entry.relative.as_os_str().is_empty())
-    {
-        if let Some(transaction) = transaction {
-            transaction.require_remaining("payload copy")?;
-        }
-        let source = source_root.join(&entry.relative);
-        let destination = destination_root.join(&entry.relative);
-        revalidate_native_manifest_entry(&source, entry, false)?;
-        match entry.kind.clone() {
-            BoundNativeManifestEntryKind::Directory => {
-                fs::create_dir(&destination).map_err(|error| {
-                    format!("cannot create staged toolchain directory: {error}")
-                })?;
-                directories.push(destination.clone());
-            }
-            BoundNativeManifestEntryKind::File { size, .. } => {
-                let (copied, copied_sha256) =
-                    copy_native_file_with_receipt(&source, &destination, entry, transaction)?;
-                bytes = bytes
-                    .checked_add(copied)
-                    .ok_or_else(|| "native toolchain byte count overflowed".to_owned())?;
-                if bytes > NATIVE_GHC_BYTE_LIMIT {
-                    return Err("native toolchain exceeds the byte-count policy".to_owned());
-                }
-                revalidate_native_manifest_entry(&source, entry, false)?;
-                if copied != size {
-                    return Err("native toolchain member changed while it was copied".to_owned());
-                }
-                entry.kind = BoundNativeManifestEntryKind::File {
-                    size,
-                    sha256: copied_sha256,
-                };
-            }
-            BoundNativeManifestEntryKind::Symlink { .. } => {
-                let canonical = fs::canonicalize(&source)
-                    .map_err(|error| format!("cannot resolve native toolchain symlink: {error}"))?;
-                let relative = canonical.strip_prefix(&source_root).map_err(|_| {
-                    "native toolchain symlink escapes its distribution root".to_owned()
-                })?;
-                let destination_parent = destination_root
-                    .parent()
-                    .ok_or_else(|| "staged toolchain destination has no parent".to_owned())?;
-                let destination_leaf = destination_root
-                    .file_name()
-                    .ok_or_else(|| "staged toolchain destination has no leaf".to_owned())?;
-                let staged_target = fs::canonicalize(destination_parent)
-                    .map_err(|error| {
-                        format!("cannot canonicalize staged toolchain parent: {error}")
-                    })?
-                    .join(destination_leaf)
-                    .join(relative);
-                symlink(&staged_target, &destination).map_err(|error| {
-                    format!("cannot relocate native toolchain symlink: {error}")
-                })?;
-                symlinks.push((destination, staged_target));
-            }
-        }
-    }
+    let (directories, symlinks) = copy_native_manifest_entries(
+        &source_root,
+        destination_root,
+        transaction,
+        &mut source_manifest,
+    )?;
 
     if let Some(transaction) = transaction {
         transaction.phase("freeze-and-acl")?;
     }
-    strip_staged_native_acls_until(destination_root, deadline)?;
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for directory in directories {
-        require_optional_native_deadline(deadline, "native toolchain directory freeze")?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555))
-            .map_err(|error| format!("cannot freeze staged toolchain directory: {error}"))?;
-    }
-    let canonical_destination = fs::canonicalize(destination_root)
-        .map_err(|error| format!("cannot canonicalize staged toolchain root: {error}"))?;
-    for (link, expected_target) in symlinks {
-        require_optional_native_deadline(deadline, "native toolchain symlink validation")?;
-        let observed = fs::canonicalize(&link)
-            .map_err(|error| format!("cannot validate staged toolchain symlink: {error}"))?;
-        let expected = fs::canonicalize(&expected_target)
-            .map_err(|error| format!("cannot validate staged toolchain target: {error}"))?;
-        if observed != expected || !observed.starts_with(&canonical_destination) {
-            return Err("staged toolchain symlink differs from policy".to_owned());
-        }
-    }
+    let canonical_destination =
+        freeze_native_copy(destination_root, directories, symlinks, deadline)?;
     if let Some(transaction) = transaction {
         transaction.phase("source-postflight")?;
     }
@@ -4608,6 +4841,116 @@ fn copy_and_freeze_native_directory(
     }
     require_staged_manifest_content(&source_manifest, &staged_manifest, deadline)?;
     Ok(staged_manifest)
+}
+
+#[cfg(target_os = "macos")]
+type NativeCopyTopology = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
+
+#[cfg(target_os = "macos")]
+fn copy_native_manifest_entries(
+    source_root: &Path,
+    destination_root: &Path,
+    transaction: Option<&StagedNativeToolchainTransaction>,
+    source_manifest: &mut BoundNativeManifest,
+) -> Result<NativeCopyTopology, String> {
+    use std::os::unix::fs::symlink;
+
+    let mut directories = vec![destination_root.to_owned()];
+    let mut symlinks = Vec::new();
+    let mut bytes = 0u64;
+    for entry in source_manifest
+        .entries
+        .iter_mut()
+        .filter(|entry| !entry.relative.as_os_str().is_empty())
+    {
+        if let Some(transaction) = transaction {
+            transaction.require_remaining("payload copy")?;
+        }
+        let source = source_root.join(&entry.relative);
+        let destination = destination_root.join(&entry.relative);
+        revalidate_native_manifest_entry(&source, entry, false)?;
+        match entry.kind.clone() {
+            BoundNativeManifestEntryKind::Directory => {
+                fs::create_dir(&destination).map_err(|error| {
+                    format!("cannot create staged toolchain directory: {error}")
+                })?;
+                directories.push(destination);
+            }
+            BoundNativeManifestEntryKind::File { size, .. } => {
+                let (copied, copied_sha256) =
+                    copy_native_file_with_receipt(&source, &destination, entry, transaction)?;
+                bytes = bytes
+                    .checked_add(copied)
+                    .ok_or_else(|| "native toolchain byte count overflowed".to_owned())?;
+                if bytes > NATIVE_GHC_BYTE_LIMIT {
+                    return Err("native toolchain exceeds the byte-count policy".to_owned());
+                }
+                revalidate_native_manifest_entry(&source, entry, false)?;
+                if copied != size {
+                    return Err("native toolchain member changed while it was copied".to_owned());
+                }
+                entry.kind = BoundNativeManifestEntryKind::File {
+                    size,
+                    sha256: copied_sha256,
+                };
+            }
+            BoundNativeManifestEntryKind::Symlink { .. } => {
+                let canonical = fs::canonicalize(&source)
+                    .map_err(|error| format!("cannot resolve native toolchain symlink: {error}"))?;
+                let relative = canonical.strip_prefix(source_root).map_err(|_| {
+                    "native toolchain symlink escapes its distribution root".to_owned()
+                })?;
+                let destination_parent = destination_root
+                    .parent()
+                    .ok_or_else(|| "staged toolchain destination has no parent".to_owned())?;
+                let destination_leaf = destination_root
+                    .file_name()
+                    .ok_or_else(|| "staged toolchain destination has no leaf".to_owned())?;
+                let staged_target = fs::canonicalize(destination_parent)
+                    .map_err(|error| {
+                        format!("cannot canonicalize staged toolchain parent: {error}")
+                    })?
+                    .join(destination_leaf)
+                    .join(relative);
+                symlink(&staged_target, &destination).map_err(|error| {
+                    format!("cannot relocate native toolchain symlink: {error}")
+                })?;
+                symlinks.push((destination, staged_target));
+            }
+        }
+    }
+    Ok((directories, symlinks))
+}
+
+#[cfg(target_os = "macos")]
+fn freeze_native_copy(
+    destination_root: &Path,
+    mut directories: Vec<PathBuf>,
+    symlinks: Vec<(PathBuf, PathBuf)>,
+    deadline: Option<Instant>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    strip_staged_native_acls_until(destination_root, deadline)?;
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        require_optional_native_deadline(deadline, "native toolchain directory freeze")?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555))
+            .map_err(|error| format!("cannot freeze staged toolchain directory: {error}"))?;
+    }
+    let canonical_destination = fs::canonicalize(destination_root)
+        .map_err(|error| format!("cannot canonicalize staged toolchain root: {error}"))?;
+    for (link, expected_target) in symlinks {
+        require_optional_native_deadline(deadline, "native toolchain symlink validation")?;
+        let observed = fs::canonicalize(&link)
+            .map_err(|error| format!("cannot validate staged toolchain symlink: {error}"))?;
+        let expected = fs::canonicalize(&expected_target)
+            .map_err(|error| format!("cannot validate staged toolchain target: {error}"))?;
+        if observed != expected || !observed.starts_with(&canonical_destination) {
+            return Err("staged toolchain symlink differs from policy".to_owned());
+        }
+    }
+    Ok(canonical_destination)
 }
 
 #[cfg(target_os = "macos")]
@@ -4673,8 +5016,10 @@ fn require_staged_manifest_content(
         };
         if source.relative != staged.relative || !kind_matches {
             return Err(format!(
-                "staged native toolchain content differs from its source at {:?}: source={:?}, staged={:?}",
-                source.relative, source.kind, staged.kind
+                "staged native toolchain content differs from its source at {}: source={:?}, staged={:?}",
+                source.relative.display(),
+                source.kind,
+                staged.kind
             ));
         }
     }
@@ -4842,14 +5187,10 @@ fn installed_native_ghc_payload(source_root: &Path) -> Result<PathBuf, String> {
             .map_err(|error| format!("cannot identify installed native GHC: {error}"))?;
         if !matches!(
             magic,
-            [0xfe, 0xed, 0xfa, 0xce]
-                | [0xce, 0xfa, 0xed, 0xfe]
-                | [0xfe, 0xed, 0xfa, 0xcf]
-                | [0xcf, 0xfa, 0xed, 0xfe]
-                | [0xca, 0xfe, 0xba, 0xbe]
-                | [0xbe, 0xba, 0xfe, 0xca]
-                | [0xca, 0xfe, 0xba, 0xbf]
-                | [0xbf, 0xba, 0xfe, 0xca]
+            [0xfe, 0xed, 0xfa, 0xce | 0xcf]
+                | [0xce | 0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe | 0xbf]
+                | [0xbe | 0xbf, 0xba, 0xfe, 0xca]
         ) {
             return Err("installed native GHC is not a Mach-O executable".to_owned());
         }
@@ -4884,9 +5225,51 @@ fn stage_native_toolchain(
     adapter_root: &Path,
     transaction: &StagedNativeToolchainTransaction,
 ) -> Result<BoundNativeToolchain, String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
     transaction.phase("acquisition")?;
+    let (source_root, source_payload) = resolve_installed_native_ghc_source()?;
+    let toolchain_root = adapter_root.join(".toolchain");
+    fs::create_dir(&toolchain_root)
+        .map_err(|error| format!("cannot create staged toolchain authority: {error}"))?;
+    let (ghc_distribution, staged_bin, staged_ghc) =
+        stage_native_ghc(&toolchain_root, &source_payload, transaction)?;
+    let (stack_distribution, stack_bin, staged_stack) =
+        stage_native_stack(&toolchain_root, transaction)?;
+    freeze_native_toolchain_root(&toolchain_root, transaction.execution_deadline)?;
+
+    let mut toolchain = BoundNativeToolchain {
+        adapter_authorities: bind_native_adapter_authorities(adapter_root)?,
+        ghc_distribution,
+        ghc_bin: BoundNativeDirectory::bind(&staged_bin, 0o555)?,
+        ghc: BoundNativeFile::bind(&staged_ghc, 0o555)?,
+        ghc_provenance: None,
+        stack_distribution,
+        stack_bin: BoundNativeDirectory::bind(&stack_bin, 0o555)?,
+        stack: BoundNativeFile::bind(&staged_stack, 0o555)?,
+    };
+    toolchain.ghc_provenance = Some(prepare_staged_native_ghc_provenance(
+        &toolchain,
+        &source_root,
+        transaction,
+    )?);
+    transaction.phase("final-manifest")?;
+    toolchain.revalidate_ghc_query_authority(transaction.execution_deadline)?;
+    toolchain
+        .ghc_provenance
+        .as_ref()
+        .ok_or_else(|| "staged GHC provenance was not retained".to_owned())?
+        .revalidate(&toolchain.ghc_distribution.root)?;
+    transaction.require_manifest_passes(StagedNativeManifestPassCounts {
+        source_inventory: 1,
+        source_postflight: 1,
+        staged_final: 1,
+        query_preflight: 1,
+        query_postflight: 1,
+    })?;
+    Ok(toolchain)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_installed_native_ghc_source() -> Result<(PathBuf, PathBuf), String> {
     let ghc = resolve_standard_path_executable(OsStr::new("ghc"))?;
     let source_ghc = ghc.canonical_identity();
     let source_bin = source_ghc
@@ -4905,14 +5288,19 @@ fn stage_native_toolchain(
         return Err("pinned GHC entry point differs from the resolved standard GHC".to_owned());
     }
     let source_payload = installed_native_ghc_payload(source_root)?;
+    Ok((source_root.to_owned(), source_payload))
+}
 
-    let toolchain = adapter_root.join(".toolchain");
-    fs::create_dir(&toolchain)
-        .map_err(|error| format!("cannot create staged toolchain authority: {error}"))?;
-    let staged_root = toolchain.join("system-ghc-9.8.2");
+#[cfg(target_os = "macos")]
+fn stage_native_ghc(
+    toolchain_root: &Path,
+    source_payload: &Path,
+    transaction: &StagedNativeToolchainTransaction,
+) -> Result<(BoundNativeManifest, PathBuf, PathBuf), String> {
+    let staged_root = toolchain_root.join("system-ghc-9.8.2");
     transaction.phase("payload-copy")?;
     let ghc_distribution =
-        copy_and_freeze_native_directory(&source_payload, &staged_root, Some(transaction))?;
+        copy_and_freeze_native_directory(source_payload, &staged_root, Some(transaction))?;
     transaction.phase("staged-inventory")?;
     let staged_root = fs::canonicalize(&staged_root)
         .map_err(|error| format!("cannot canonicalize frozen staged GHC root: {error}"))?;
@@ -4923,6 +5311,15 @@ fn stage_native_toolchain(
     if staged_ghc_canonical.parent() != Some(staged_bin.as_path()) {
         return Err("staged GHC entry point escapes its bound bin authority".to_owned());
     }
+    Ok((ghc_distribution, staged_bin, staged_ghc))
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_stack(
+    toolchain_root: &Path,
+    transaction: &StagedNativeToolchainTransaction,
+) -> Result<(BoundNativeManifest, PathBuf, PathBuf), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     transaction.phase("stack-staging")?;
     let stack = resolve_standard_path_executable(OsStr::new("stack"))?;
@@ -4941,7 +5338,7 @@ fn stage_native_toolchain(
         stack_metadata.mode(),
         stack_metadata.len(),
     );
-    let stack_root = toolchain.join("system-tools");
+    let stack_root = toolchain_root.join("system-tools");
     let stack_bin = stack_root.join("bin");
     fs::create_dir_all(&stack_bin)
         .map_err(|error| format!("cannot create staged Stack directory: {error}"))?;
@@ -5000,44 +5397,18 @@ fn stage_native_toolchain(
         fs::Permissions::from_mode(0o555),
     )
     .map_err(|error| format!("cannot freeze staged Stack root: {error}"))?;
-    strip_staged_native_acls_until(&toolchain, Some(transaction.execution_deadline))?;
-    fs::set_permissions(&toolchain, fs::Permissions::from_mode(0o555))
-        .map_err(|error| format!("cannot freeze staged toolchain authority: {error}"))?;
+    let stack_distribution =
+        BoundNativeManifest::bind_until(&stack_root, true, Some(transaction.execution_deadline))?;
+    Ok((stack_distribution, stack_bin, staged_stack))
+}
 
-    let mut toolchain = BoundNativeToolchain {
-        adapter_authorities: bind_native_adapter_authorities(adapter_root)?,
-        ghc_distribution,
-        ghc_bin: BoundNativeDirectory::bind(&staged_bin, 0o555)?,
-        ghc: BoundNativeFile::bind(&staged_ghc, 0o555)?,
-        ghc_provenance: None,
-        stack_distribution: BoundNativeManifest::bind_until(
-            &stack_root,
-            true,
-            Some(transaction.execution_deadline),
-        )?,
-        stack_bin: BoundNativeDirectory::bind(&stack_bin, 0o555)?,
-        stack: BoundNativeFile::bind(&staged_stack, 0o555)?,
-    };
-    toolchain.ghc_provenance = Some(prepare_staged_native_ghc_provenance(
-        &toolchain,
-        source_root,
-        transaction,
-    )?);
-    transaction.phase("final-manifest")?;
-    toolchain.revalidate_ghc_query_authority(transaction.execution_deadline)?;
-    toolchain
-        .ghc_provenance
-        .as_ref()
-        .ok_or_else(|| "staged GHC provenance was not retained".to_owned())?
-        .revalidate(&toolchain.ghc_distribution.root)?;
-    transaction.require_manifest_passes(StagedNativeManifestPassCounts {
-        source_inventory: 1,
-        source_postflight: 1,
-        staged_final: 1,
-        query_preflight: 1,
-        query_postflight: 1,
-    })?;
-    Ok(toolchain)
+#[cfg(target_os = "macos")]
+fn freeze_native_toolchain_root(root: &Path, deadline: Instant) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    strip_staged_native_acls_until(root, Some(deadline))?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot freeze staged toolchain authority: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -5398,7 +5769,10 @@ fn accepted_llvm_ar_version(output: &str) -> bool {
 fn acquire_native_archiver_source(
     transaction: &NativeArchiverTransaction,
 ) -> Result<AcquiredNativeArchiverSource, String> {
-    let path = std::env::var_os("PATH")
+    let environment = ProcessEnvironment::from_process();
+    let path = environment
+        .value(StandardVariable::Path)
+        .map(OsStr::to_owned)
         .ok_or_else(|| "native-archiver-source discover predicate PATH-absent failed".to_owned())?;
     acquire_native_archiver_source_from(std::env::split_paths(&path), transaction)
 }
@@ -5485,6 +5859,262 @@ fn acquire_native_archiver_candidate(
 }
 
 #[cfg(target_os = "macos")]
+enum PendingNativeArchiverLoad {
+    Staged(PathBuf, PathBuf, Vec<PathBuf>),
+    External(PathBuf, Vec<PathBuf>),
+}
+
+#[cfg(target_os = "macos")]
+type InspectedNativeArchiverLoad = (PathBuf, PathBuf, Vec<PathBuf>, MachOInspection);
+
+#[cfg(target_os = "macos")]
+struct NativeArchiverLoadAcquisition<'a> {
+    prefix: PathBuf,
+    executable_directory: PathBuf,
+    otool: &'a ResolvedStandardExecutable,
+    transaction: &'a NativeArchiverTransaction,
+    owner_authority: &'a NativeArchiverOwnerAuthority,
+    pending: Vec<PendingNativeArchiverLoad>,
+    staged: BTreeMap<PathBuf, AcquiredNativeArchiverFile>,
+    staged_visited: BTreeSet<(PathBuf, Vec<PathBuf>)>,
+    external: BTreeMap<PathBuf, BoundNativeArchiverDependency>,
+    external_visited: BTreeSet<(PathBuf, Vec<PathBuf>)>,
+    edges: BTreeMap<(PathBuf, String), NativeArchiverLoadTarget>,
+    bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> NativeArchiverLoadAcquisition<'a> {
+    const FILE_LIMIT: usize = 128;
+    const BYTE_LIMIT: u64 = 512 * 1024 * 1024;
+    const CONTEXT_LIMIT: usize = 512;
+
+    fn new(
+        logical: &Path,
+        prefix: &Path,
+        otool: &'a ResolvedStandardExecutable,
+        transaction: &'a NativeArchiverTransaction,
+        owner_authority: &'a NativeArchiverOwnerAuthority,
+    ) -> Result<Self, String> {
+        let canonical_prefix = fs::canonicalize(prefix)
+            .map_err(|error| format!("cannot canonicalize LLVM distribution prefix: {error}"))?;
+        let executable = fs::canonicalize(logical)
+            .map_err(|error| format!("cannot canonicalize LLVM archiver: {error}"))?;
+        let executable_relative = executable
+            .strip_prefix(&canonical_prefix)
+            .map_err(|_| "LLVM archiver escapes its distribution prefix".to_owned())?
+            .to_owned();
+        let executable_directory = executable
+            .parent()
+            .ok_or_else(|| "LLVM archiver has no parent directory".to_owned())?
+            .to_owned();
+        Ok(Self {
+            prefix: canonical_prefix,
+            executable_directory,
+            otool,
+            transaction,
+            owner_authority,
+            pending: vec![PendingNativeArchiverLoad::Staged(
+                executable_relative,
+                logical.to_owned(),
+                Vec::new(),
+            )],
+            staged: BTreeMap::new(),
+            staged_visited: BTreeSet::new(),
+            external: BTreeMap::new(),
+            external_visited: BTreeSet::new(),
+            edges: BTreeMap::new(),
+            bytes: 0,
+        })
+    }
+
+    fn acquire(
+        mut self,
+    ) -> Result<
+        (
+            Vec<AcquiredNativeArchiverFile>,
+            NativeArchiverLoadGraph,
+            Vec<BoundNativeArchiverDependency>,
+        ),
+        String,
+    > {
+        while let Some(next) = self.pending.pop() {
+            self.transaction
+                .require_execution("Mach-O closure inventory")?;
+            if self
+                .staged_visited
+                .len()
+                .saturating_add(self.external_visited.len())
+                >= Self::CONTEXT_LIMIT
+            {
+                return Err(
+                    "native archiver load graph exceeds the context-count policy".to_owned(),
+                );
+            }
+            let Some((source_key, source_path, inherited_rpaths, inspection)) =
+                self.inspect_pending(next)?
+            else {
+                continue;
+            };
+            self.record_loads(&source_key, &source_path, &inherited_rpaths, inspection)?;
+        }
+        Ok((
+            self.staged.into_values().collect(),
+            finish_native_archiver_load_graph(self.edges),
+            self.external.into_values().collect(),
+        ))
+    }
+
+    fn inspect_pending(
+        &mut self,
+        next: PendingNativeArchiverLoad,
+    ) -> Result<Option<InspectedNativeArchiverLoad>, String> {
+        match next {
+            PendingNativeArchiverLoad::Staged(relative, source_path, inherited_rpaths) => {
+                if !self
+                    .staged_visited
+                    .insert((relative.clone(), inherited_rpaths.clone()))
+                {
+                    return Ok(None);
+                }
+                let canonical = self.bind_staged_source(&relative, &source_path)?;
+                let inspection =
+                    inspect_macho_file(&canonical, self.otool, Some(*self.transaction))?;
+                Ok(Some((relative, canonical, inherited_rpaths, inspection)))
+            }
+            PendingNativeArchiverLoad::External(source_path, inherited_rpaths) => {
+                if !self
+                    .external_visited
+                    .insert((source_path.clone(), inherited_rpaths.clone()))
+                {
+                    return Ok(None);
+                }
+                let dependency = self.external.get(&source_path).ok_or_else(|| {
+                    "native archiver external dependency receipt is absent".to_owned()
+                })?;
+                dependency.revalidate_until(*self.transaction)?;
+                let inspection =
+                    inspect_macho_file(&source_path, self.otool, Some(*self.transaction))?;
+                Ok(Some((
+                    source_path.clone(),
+                    source_path,
+                    inherited_rpaths,
+                    inspection,
+                )))
+            }
+        }
+    }
+
+    fn bind_staged_source(
+        &mut self,
+        relative: &Path,
+        source_path: &Path,
+    ) -> Result<PathBuf, String> {
+        if let Some(source) = self.staged.get(relative) {
+            return Ok(source.source.canonical.clone());
+        }
+        self.require_file_capacity()?;
+        let source = read_native_archiver_source_file(
+            source_path,
+            relative,
+            self.transaction,
+            self.owner_authority,
+        )?;
+        self.record_bytes(source.source.size)?;
+        let canonical = source.source.canonical.clone();
+        self.staged.insert(relative.to_owned(), source);
+        Ok(canonical)
+    }
+
+    fn record_loads(
+        &mut self,
+        source_key: &Path,
+        source_path: &Path,
+        inherited_rpaths: &[PathBuf],
+        inspection: MachOInspection,
+    ) -> Result<(), String> {
+        let active_rpaths = resolve_macho_rpath_roots(
+            source_path,
+            &self.executable_directory,
+            &inspection.rpaths,
+            inherited_rpaths,
+        )?;
+        for load_name in inspection.load_names {
+            let resolved = resolve_macho_load_name(
+                &load_name,
+                source_path,
+                &self.executable_directory,
+                &active_rpaths,
+            )?;
+            let target = self.resolve_target(resolved, &active_rpaths)?;
+            record_native_archiver_load_edge(
+                &mut self.edges,
+                source_key.to_owned(),
+                load_name,
+                target,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn resolve_target(
+        &mut self,
+        resolved: ResolvedMachOLoad,
+        active_rpaths: &[PathBuf],
+    ) -> Result<NativeArchiverLoadTarget, String> {
+        if let Some(system) = normalized_native_system_library(&resolved)? {
+            return Ok(NativeArchiverLoadTarget::System(system));
+        }
+        if resolved.canonical.starts_with(&self.prefix) {
+            let target_relative =
+                normalized_staged_load_path(&resolved.logical, &self.prefix, &resolved.canonical)?;
+            self.pending.push(PendingNativeArchiverLoad::Staged(
+                target_relative.clone(),
+                resolved.canonical,
+                active_rpaths.to_vec(),
+            ));
+            return Ok(NativeArchiverLoadTarget::Staged(target_relative));
+        }
+        let canonical = resolved.canonical;
+        if !self.external.contains_key(&canonical) {
+            self.require_file_capacity()?;
+            let dependency = BoundNativeArchiverDependency::bind_until(
+                &resolved.logical,
+                *self.transaction,
+                self.owner_authority,
+            )?;
+            self.record_bytes(dependency.size)?;
+            self.external.insert(canonical.clone(), dependency);
+        }
+        self.pending.push(PendingNativeArchiverLoad::External(
+            canonical.clone(),
+            active_rpaths.to_vec(),
+        ));
+        Ok(NativeArchiverLoadTarget::External(canonical))
+    }
+
+    fn require_file_capacity(&self) -> Result<(), String> {
+        if self.staged.len().saturating_add(self.external.len()) >= Self::FILE_LIMIT {
+            Err("native archiver load closure exceeds the file-count policy".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_bytes(&mut self, bytes: u64) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "native archiver load closure byte count overflowed".to_owned())?;
+        if self.bytes > Self::BYTE_LIMIT {
+            Err("native archiver load closure exceeds the byte-count policy".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn acquire_native_archiver_load_graph(
     logical: &Path,
     prefix: &Path,
@@ -5499,164 +6129,8 @@ fn acquire_native_archiver_load_graph(
     ),
     String,
 > {
-    enum PendingLoad {
-        Staged(PathBuf, PathBuf, Vec<PathBuf>),
-        External(PathBuf, Vec<PathBuf>),
-    }
-
-    const FILE_LIMIT: usize = 128;
-    const BYTE_LIMIT: u64 = 512 * 1024 * 1024;
-    const CONTEXT_LIMIT: usize = 512;
-
-    let canonical_prefix = fs::canonicalize(prefix)
-        .map_err(|error| format!("cannot canonicalize LLVM distribution prefix: {error}"))?;
-    let executable = fs::canonicalize(logical)
-        .map_err(|error| format!("cannot canonicalize LLVM archiver: {error}"))?;
-    let executable_relative = executable
-        .strip_prefix(&canonical_prefix)
-        .map_err(|_| "LLVM archiver escapes its distribution prefix".to_owned())?
-        .to_owned();
-    let executable_directory = executable
-        .parent()
-        .ok_or_else(|| "LLVM archiver has no parent directory".to_owned())?
-        .to_owned();
-    let mut pending = vec![PendingLoad::Staged(
-        executable_relative,
-        logical.to_owned(),
-        Vec::new(),
-    )];
-    let mut staged = BTreeMap::<PathBuf, AcquiredNativeArchiverFile>::new();
-    let mut staged_visited = BTreeMap::<(PathBuf, Vec<PathBuf>), ()>::new();
-    let mut external = BTreeMap::<PathBuf, BoundNativeArchiverDependency>::new();
-    let mut external_visited = BTreeMap::<(PathBuf, Vec<PathBuf>), ()>::new();
-    let mut edges = BTreeMap::new();
-    let mut bytes = 0u64;
-    while let Some(next) = pending.pop() {
-        transaction.require_execution("Mach-O closure inventory")?;
-        if staged_visited.len().saturating_add(external_visited.len()) >= CONTEXT_LIMIT {
-            return Err("native archiver load graph exceeds the context-count policy".to_owned());
-        }
-        let (source_key, source_path, inherited_rpaths, inspection) = match next {
-            PendingLoad::Staged(relative, source_path, inherited_rpaths) => {
-                if staged_visited
-                    .insert((relative.clone(), inherited_rpaths.clone()), ())
-                    .is_some()
-                {
-                    continue;
-                }
-                let canonical = if let Some(source) = staged.get(&relative) {
-                    source.source.canonical.clone()
-                } else {
-                    if staged.len().saturating_add(external.len()) >= FILE_LIMIT {
-                        return Err(
-                            "native archiver load closure exceeds the file-count policy".to_owned()
-                        );
-                    }
-                    let source = read_native_archiver_source_file(
-                        &source_path,
-                        &relative,
-                        transaction,
-                        owner_authority,
-                    )?;
-                    bytes = bytes.checked_add(source.source.size).ok_or_else(|| {
-                        "native archiver load closure byte count overflowed".to_owned()
-                    })?;
-                    if bytes > BYTE_LIMIT {
-                        return Err(
-                            "native archiver load closure exceeds the byte-count policy".to_owned()
-                        );
-                    }
-                    let canonical = source.source.canonical.clone();
-                    staged.insert(relative.clone(), source);
-                    canonical
-                };
-                let inspection = inspect_macho_file(&canonical, otool, Some(*transaction))?;
-                (relative, canonical, inherited_rpaths, inspection)
-            }
-            PendingLoad::External(source_path, inherited_rpaths) => {
-                if external_visited
-                    .insert((source_path.clone(), inherited_rpaths.clone()), ())
-                    .is_some()
-                {
-                    continue;
-                }
-                let dependency = external.get(&source_path).ok_or_else(|| {
-                    "native archiver external dependency receipt is absent".to_owned()
-                })?;
-                dependency.revalidate_until(*transaction)?;
-                let inspection = inspect_macho_file(&source_path, otool, Some(*transaction))?;
-                (
-                    source_path.clone(),
-                    source_path,
-                    inherited_rpaths,
-                    inspection,
-                )
-            }
-        };
-        let active_rpaths = resolve_macho_rpath_roots(
-            &source_path,
-            &executable_directory,
-            &inspection.rpaths,
-            &inherited_rpaths,
-        )?;
-        for load_name in inspection.load_names {
-            let resolved = resolve_macho_load_name(
-                &load_name,
-                &source_path,
-                &executable_directory,
-                &active_rpaths,
-            )?;
-            let target = if let Some(system) = normalized_native_system_library(&resolved)? {
-                NativeArchiverLoadTarget::System(system)
-            } else if resolved.canonical.starts_with(&canonical_prefix) {
-                let target_relative = normalized_staged_load_path(
-                    &resolved.logical,
-                    &canonical_prefix,
-                    &resolved.canonical,
-                )?;
-                pending.push(PendingLoad::Staged(
-                    target_relative.clone(),
-                    resolved.canonical,
-                    active_rpaths.clone(),
-                ));
-                NativeArchiverLoadTarget::Staged(target_relative)
-            } else {
-                let canonical = resolved.canonical;
-                if !external.contains_key(&canonical) {
-                    if staged.len().saturating_add(external.len()) >= FILE_LIMIT {
-                        return Err(
-                            "native archiver load closure exceeds the file-count policy".to_owned()
-                        );
-                    }
-                    let dependency = BoundNativeArchiverDependency::bind_until(
-                        &resolved.logical,
-                        *transaction,
-                        owner_authority,
-                    )?;
-                    bytes = bytes.checked_add(dependency.size).ok_or_else(|| {
-                        "native archiver load closure byte count overflowed".to_owned()
-                    })?;
-                    if bytes > BYTE_LIMIT {
-                        return Err(
-                            "native archiver load closure exceeds the byte-count policy".to_owned()
-                        );
-                    }
-                    external.insert(canonical.clone(), dependency);
-                }
-                pending.push(PendingLoad::External(
-                    canonical.clone(),
-                    active_rpaths.clone(),
-                ));
-                NativeArchiverLoadTarget::External(canonical)
-            };
-            record_native_archiver_load_edge(&mut edges, source_key.clone(), load_name, target)?;
-        }
-    }
-    Ok((
-        staged.into_values().collect(),
-        finish_native_archiver_load_graph(edges),
-        external.into_values().collect(),
-    ))
+    NativeArchiverLoadAcquisition::new(logical, prefix, otool, transaction, owner_authority)?
+        .acquire()
 }
 
 #[cfg(target_os = "macos")]
@@ -5713,7 +6187,7 @@ fn read_native_archiver_source_file(
         .map_err(|_| "native-archiver-source open predicate source-size failed".to_owned())?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut opened = &*source.guard;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         transaction.require_execution("opened source copy")?;
         let read = opened.read(&mut buffer).map_err(|error| {
@@ -5760,14 +6234,14 @@ fn inspect_macho_file(
 fn parse_macho_load_commands(commands: &str) -> Result<MachOInspection, String> {
     const LOAD_NAME_LIMIT: usize = 256;
     const RPATH_LIMIT: usize = 64;
-
-    let mut load_names = Vec::new();
-    let mut rpaths = Vec::new();
     enum ExpectedMachOValue {
         None,
         LoadName,
         Rpath,
     }
+
+    let mut load_names = Vec::new();
+    let mut rpaths = Vec::new();
     let mut expected = ExpectedMachOValue::None;
     for line in commands.lines() {
         let line = line.trim();
@@ -5997,6 +6471,198 @@ fn normalized_native_system_library(
 }
 
 #[cfg(target_os = "macos")]
+struct NativeArchiverLoadInspection<'a> {
+    executable_directory: &'a Path,
+    distribution: &'a Path,
+    otool: &'a ResolvedStandardExecutable,
+    external_dependencies: &'a [BoundNativeArchiverDependency],
+    transaction: Option<NativeArchiverTransaction>,
+    deadline: Option<Instant>,
+    pending: Vec<(PathBuf, Vec<PathBuf>)>,
+    visited: BTreeSet<(PathBuf, Vec<PathBuf>)>,
+    edges: BTreeMap<(PathBuf, String), NativeArchiverLoadTarget>,
+    external_pending: Vec<(PathBuf, Vec<PathBuf>)>,
+    external_visited: BTreeSet<(PathBuf, Vec<PathBuf>)>,
+}
+
+#[cfg(target_os = "macos")]
+enum NativeArchiverInspectionSource {
+    Staged,
+    External,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeArchiverLoadInspection<'_> {
+    const CONTEXT_LIMIT: usize = 512;
+
+    fn inspect(mut self) -> Result<NativeArchiverLoadGraph, String> {
+        loop {
+            while let Some((relative, inherited_rpaths)) = self.pending.pop() {
+                self.inspect_staged(&relative, &inherited_rpaths)?;
+            }
+            while let Some((source_path, inherited_rpaths)) = self.external_pending.pop() {
+                self.inspect_external(&source_path, &inherited_rpaths)?;
+            }
+            if self.pending.is_empty() {
+                break;
+            }
+        }
+        Ok(finish_native_archiver_load_graph(self.edges))
+    }
+
+    fn require_context_capacity(&self) -> Result<(), String> {
+        if self
+            .visited
+            .len()
+            .saturating_add(self.external_visited.len())
+            >= Self::CONTEXT_LIMIT
+        {
+            Err("native archiver load graph exceeds the context-count policy".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn inspect_staged(
+        &mut self,
+        relative: &Path,
+        inherited_rpaths: &[PathBuf],
+    ) -> Result<(), String> {
+        self.require_context_capacity()?;
+        if !self
+            .visited
+            .insert((relative.to_owned(), inherited_rpaths.to_vec()))
+        {
+            return Ok(());
+        }
+        let path = self.distribution.join(relative);
+        require_optional_native_deadline(self.deadline, "staged LLVM load graph inspection")?;
+        let inspection = inspect_macho_file(&path, self.otool, self.transaction)?;
+        let active_rpaths = resolve_macho_rpath_roots(
+            &path,
+            self.executable_directory,
+            &inspection.rpaths,
+            inherited_rpaths,
+        )?;
+        for load_name in inspection.load_names {
+            let resolved = resolve_macho_load_name(
+                &load_name,
+                &path,
+                self.executable_directory,
+                &active_rpaths,
+            )?;
+            let target = self.resolve_target(
+                &resolved,
+                &active_rpaths,
+                &NativeArchiverInspectionSource::Staged,
+            )?;
+            record_native_archiver_load_edge(
+                &mut self.edges,
+                relative.to_owned(),
+                load_name,
+                target,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn inspect_external(
+        &mut self,
+        source_path: &Path,
+        inherited_rpaths: &[PathBuf],
+    ) -> Result<(), String> {
+        self.require_context_capacity()?;
+        require_optional_native_deadline(self.deadline, "external LLVM load graph inspection")?;
+        if !self
+            .external_visited
+            .insert((source_path.to_owned(), inherited_rpaths.to_vec()))
+        {
+            return Ok(());
+        }
+        let dependency = self
+            .external_dependencies
+            .iter()
+            .find(|dependency| dependency.canonical == source_path)
+            .ok_or_else(|| "external LLVM dependency receipt is absent".to_owned())?;
+        self.revalidate_dependency(dependency)?;
+        let inspection = inspect_macho_file(source_path, self.otool, self.transaction)?;
+        let active_rpaths = resolve_macho_rpath_roots(
+            source_path,
+            self.executable_directory,
+            &inspection.rpaths,
+            inherited_rpaths,
+        )?;
+        for load_name in inspection.load_names {
+            let resolved = resolve_macho_load_name(
+                &load_name,
+                source_path,
+                self.executable_directory,
+                &active_rpaths,
+            )?;
+            let target = self.resolve_target(
+                &resolved,
+                &active_rpaths,
+                &NativeArchiverInspectionSource::External,
+            )?;
+            record_native_archiver_load_edge(
+                &mut self.edges,
+                source_path.to_owned(),
+                load_name,
+                target,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn resolve_target(
+        &mut self,
+        resolved: &ResolvedMachOLoad,
+        active_rpaths: &[PathBuf],
+        source: &NativeArchiverInspectionSource,
+    ) -> Result<NativeArchiverLoadTarget, String> {
+        if let Some(system) = normalized_native_system_library(resolved)? {
+            return Ok(NativeArchiverLoadTarget::System(system));
+        }
+        if resolved.canonical.starts_with(self.distribution) {
+            let target_relative = normalized_staged_load_path(
+                &resolved.logical,
+                self.distribution,
+                &resolved.canonical,
+            )?;
+            self.pending
+                .push((target_relative.clone(), active_rpaths.to_vec()));
+            return Ok(NativeArchiverLoadTarget::Staged(target_relative));
+        }
+        let target = self
+            .external_dependencies
+            .iter()
+            .find(|dependency| dependency.canonical == resolved.canonical)
+            .ok_or_else(|| match source {
+                NativeArchiverInspectionSource::Staged => {
+                    "staged LLVM archiver resolved an unbound external dependency".to_owned()
+                }
+                NativeArchiverInspectionSource::External => {
+                    "external LLVM dependency resolved an unbound load edge".to_owned()
+                }
+            })?;
+        self.revalidate_dependency(target)?;
+        self.external_pending
+            .push((target.canonical.clone(), active_rpaths.to_vec()));
+        Ok(NativeArchiverLoadTarget::External(target.canonical.clone()))
+    }
+
+    fn revalidate_dependency(
+        &self,
+        dependency: &BoundNativeArchiverDependency,
+    ) -> Result<(), String> {
+        match self.transaction {
+            Some(transaction) => dependency.revalidate_until(transaction),
+            None => dependency.revalidate(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn inspect_native_archiver_load_graph(
     executable: &Path,
     distribution: &Path,
@@ -6004,8 +6670,6 @@ fn inspect_native_archiver_load_graph(
     external_dependencies: &[BoundNativeArchiverDependency],
     deadlines: Option<(Instant, Instant)>,
 ) -> Result<NativeArchiverLoadGraph, String> {
-    const CONTEXT_LIMIT: usize = 512;
-
     let transaction =
         deadlines.map(
             |(execution_deadline, completion_deadline)| NativeArchiverTransaction {
@@ -6016,146 +6680,20 @@ fn inspect_native_archiver_load_graph(
     let executable_directory = executable
         .parent()
         .ok_or_else(|| "staged LLVM archiver has no parent directory".to_owned())?;
-    let mut pending = vec![(Path::new("bin").join("llvm-ar"), Vec::<PathBuf>::new())];
-    let mut visited = BTreeMap::<(PathBuf, Vec<PathBuf>), ()>::new();
-    let mut edges = BTreeMap::new();
-    let mut external_pending = Vec::<(PathBuf, Vec<PathBuf>)>::new();
-    let mut external_visited = BTreeMap::<(PathBuf, Vec<PathBuf>), ()>::new();
-    loop {
-        while let Some((relative, inherited_rpaths)) = pending.pop() {
-            if visited.len().saturating_add(external_visited.len()) >= CONTEXT_LIMIT {
-                return Err(
-                    "native archiver load graph exceeds the context-count policy".to_owned(),
-                );
-            }
-            if visited
-                .insert((relative.clone(), inherited_rpaths.clone()), ())
-                .is_some()
-            {
-                continue;
-            }
-            let path = distribution.join(&relative);
-            require_optional_native_deadline(
-                deadlines.map(|(execution_deadline, _)| execution_deadline),
-                "staged LLVM load graph inspection",
-            )?;
-            let inspection = inspect_macho_file(&path, otool, transaction)?;
-            let active_rpaths = resolve_macho_rpath_roots(
-                &path,
-                executable_directory,
-                &inspection.rpaths,
-                &inherited_rpaths,
-            )?;
-            for load_name in inspection.load_names {
-                let resolved = resolve_macho_load_name(
-                    &load_name,
-                    &path,
-                    executable_directory,
-                    &active_rpaths,
-                )?;
-                let target = if let Some(system) = normalized_native_system_library(&resolved)? {
-                    NativeArchiverLoadTarget::System(system)
-                } else if resolved.canonical.starts_with(distribution) {
-                    let target_relative = normalized_staged_load_path(
-                        &resolved.logical,
-                        distribution,
-                        &resolved.canonical,
-                    )?;
-                    pending.push((target_relative.clone(), active_rpaths.clone()));
-                    NativeArchiverLoadTarget::Staged(target_relative)
-                } else {
-                    let dependency = external_dependencies
-                        .iter()
-                        .find(|dependency| dependency.canonical == resolved.canonical)
-                        .ok_or_else(|| {
-                            "staged LLVM archiver resolved an unbound external dependency"
-                                .to_owned()
-                        })?;
-                    match transaction {
-                        Some(transaction) => dependency.revalidate_until(transaction)?,
-                        None => dependency.revalidate()?,
-                    }
-                    external_pending.push((dependency.canonical.clone(), active_rpaths.clone()));
-                    NativeArchiverLoadTarget::External(dependency.canonical.clone())
-                };
-                record_native_archiver_load_edge(&mut edges, relative.clone(), load_name, target)?;
-            }
-        }
-        while let Some((source_path, inherited_rpaths)) = external_pending.pop() {
-            if visited.len().saturating_add(external_visited.len()) >= CONTEXT_LIMIT {
-                return Err(
-                    "native archiver load graph exceeds the context-count policy".to_owned(),
-                );
-            }
-            require_optional_native_deadline(
-                deadlines.map(|(execution_deadline, _)| execution_deadline),
-                "external LLVM load graph inspection",
-            )?;
-            if external_visited
-                .insert((source_path.clone(), inherited_rpaths.clone()), ())
-                .is_some()
-            {
-                continue;
-            }
-            let dependency = external_dependencies
-                .iter()
-                .find(|dependency| dependency.canonical == source_path)
-                .ok_or_else(|| "external LLVM dependency receipt is absent".to_owned())?;
-            match transaction {
-                Some(transaction) => dependency.revalidate_until(transaction)?,
-                None => dependency.revalidate()?,
-            }
-            let inspection = inspect_macho_file(&source_path, otool, transaction)?;
-            let active_rpaths = resolve_macho_rpath_roots(
-                &source_path,
-                executable_directory,
-                &inspection.rpaths,
-                &inherited_rpaths,
-            )?;
-            for load_name in inspection.load_names {
-                let resolved = resolve_macho_load_name(
-                    &load_name,
-                    &source_path,
-                    executable_directory,
-                    &active_rpaths,
-                )?;
-                let target = if let Some(system) = normalized_native_system_library(&resolved)? {
-                    NativeArchiverLoadTarget::System(system)
-                } else if resolved.canonical.starts_with(distribution) {
-                    let target_relative = normalized_staged_load_path(
-                        &resolved.logical,
-                        distribution,
-                        &resolved.canonical,
-                    )?;
-                    pending.push((target_relative.clone(), active_rpaths.clone()));
-                    NativeArchiverLoadTarget::Staged(target_relative)
-                } else {
-                    let target = external_dependencies
-                        .iter()
-                        .find(|dependency| dependency.canonical == resolved.canonical)
-                        .ok_or_else(|| {
-                            "external LLVM dependency resolved an unbound load edge".to_owned()
-                        })?;
-                    match transaction {
-                        Some(transaction) => target.revalidate_until(transaction)?,
-                        None => target.revalidate()?,
-                    }
-                    external_pending.push((target.canonical.clone(), active_rpaths.clone()));
-                    NativeArchiverLoadTarget::External(target.canonical.clone())
-                };
-                record_native_archiver_load_edge(
-                    &mut edges,
-                    source_path.clone(),
-                    load_name,
-                    target,
-                )?;
-            }
-        }
-        if pending.is_empty() {
-            break;
-        }
+    NativeArchiverLoadInspection {
+        executable_directory,
+        distribution,
+        otool,
+        external_dependencies,
+        transaction,
+        deadline: deadlines.map(|(execution_deadline, _)| execution_deadline),
+        pending: vec![(Path::new("bin").join("llvm-ar"), Vec::new())],
+        visited: BTreeSet::new(),
+        edges: BTreeMap::new(),
+        external_pending: Vec::new(),
+        external_visited: BTreeSet::new(),
     }
-    Ok(finish_native_archiver_load_graph(edges))
+    .inspect()
 }
 
 #[cfg(target_os = "macos")]
@@ -6211,8 +6749,8 @@ fn install_staged_native_archive_adapter(
     let distribution = authority.join("llvm");
     fs::create_dir(&distribution)
         .map_err(|error| format!("cannot create staged LLVM prefix: {error}"))?;
-    let mut directories = BTreeMap::<PathBuf, ()>::new();
-    directories.insert(distribution.clone(), ());
+    let mut directories = BTreeSet::<PathBuf>::new();
+    directories.insert(distribution.clone());
     for file in &source.files {
         transaction.require_execution("closure staging")?;
         file.source.revalidate_until(*transaction)?;
@@ -6226,11 +6764,11 @@ fn install_staged_native_archive_adapter(
         let mut current = distribution.clone();
         for component in relative_parent.components() {
             current.push(component.as_os_str());
-            if !directories.contains_key(&current) {
+            if !directories.contains(&current) {
                 fs::create_dir(&current).map_err(|error| {
                     format!("cannot create staged LLVM prefix directory: {error}")
                 })?;
-                directories.insert(current.clone(), ());
+                directories.insert(current.clone());
             }
         }
         let executable = file.relative == Path::new("bin").join("llvm-ar");
@@ -6254,7 +6792,7 @@ fn install_staged_native_archive_adapter(
     }
     let staged = distribution.join("bin").join("llvm-ar");
     strip_staged_native_acls_until(&authority, Some(transaction.execution_deadline))?;
-    let mut directories = directories.into_keys().collect::<Vec<_>>();
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in directories {
         transaction.require_execution("closure freeze")?;
@@ -6356,7 +6894,7 @@ impl NativeArchiveAdapter {
     ) -> Result<Self, String> {
         if !enabled {
             return Ok(Self {
-                _directory: None,
+                directory: None,
                 bound_toolchain: None,
                 llvm_ar: None,
                 llvm_ar_version: None,
@@ -6389,7 +6927,7 @@ impl NativeArchiveAdapter {
     ) -> Result<Self, String> {
         if !enabled {
             return Ok(Self {
-                _directory: None,
+                directory: None,
                 bound_toolchain: None,
                 llvm_ar: None,
                 llvm_ar_version: None,
@@ -6412,129 +6950,21 @@ impl NativeArchiveAdapter {
             let archiver_transaction = envelope.archiver_transaction()?;
             let source_archiver = acquire_native_archiver_source(&archiver_transaction)?;
             let mut directory = Some(create_adapter_directory(base)?);
-            let result = (|| {
-                let adapter_root = directory
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "native archive adapter directory was consumed early".to_owned()
-                    })?
-                    .path();
-                prepare_adapter_work_directory(adapter_root)?;
-                let temporary_directory = adapter_root.join(".stack-work/tmp");
-                let executable = match confined_launcher {
-                    Some(path) => fs::canonicalize(path).map_err(|error| {
-                        format!("cannot bind confined archive adapter: {error}")
-                    })?,
-                    None => std::env::current_exe()
-                        .map_err(|error| format!("cannot locate CI driver executable: {error}"))?,
-                };
-                let bound_llvm_ar = install_staged_native_archive_adapter(
-                    adapter_root,
-                    &executable,
-                    &source_archiver,
-                    &archiver_transaction,
-                )?;
-                let version = archiver_transaction
-                    .run(bound_llvm_ar.command(Duration::from_secs(30), ["--version"]))
-                    .map_err(|error| format!("cannot identify staged LLVM archiver: {error}"))?;
-                require_complete_native_archiver_stdout("native-archiver-identity", &version)?;
-                let version = std::str::from_utf8(&version.stdout)
-                    .map_err(|_| "staged LLVM archiver identity is not UTF-8".to_owned())?;
-                if !accepted_llvm_ar_version(version) {
-                    return Err(
-                        "staged LLVM archiver version differs from native CI policy".to_owned()
-                    );
-                }
-                let llvm_ar_version = version.trim().to_owned();
-                let work = adapter_root.join(".stack-work");
-                fs::write(work.join("member.o"), b"native-archive-adapter\n")
-                    .map_err(|error| format!("cannot write archiver probe member: {error}"))?;
-                let inner = archiver_transaction
-                    .run(
-                        bound_llvm_ar
-                            .command(Duration::from_secs(30), ["qcls", "inner.a", "member.o"])
-                            .current_directory(&work),
-                    )
-                    .map_err(|error| format!("cannot build archiver probe input: {error}"))?;
-                if !inner.status.success() || inner.timed_out {
-                    return Err(command_result_failure(
-                        "native-archiver-inner-probe",
-                        &inner,
-                    ));
-                }
-                fs::write(work.join("response.rsp"), b"inner.a\n")
-                    .map_err(|error| format!("cannot write archiver response probe: {error}"))?;
-                let probe = archiver_transaction
-                    .run(
-                        bound_llvm_ar
-                            .command(Duration::from_secs(30), ["qL", "outer.a", "@response.rsp"])
-                            .current_directory(&work),
-                    )
-                    .map_err(|error| format!("cannot probe LLVM archiver: {error}"))?;
-                if !probe.status.success() || probe.timed_out {
-                    return Err(command_result_failure(
-                        "native-archiver-response-probe",
-                        &probe,
-                    ));
-                }
-                let table = archiver_transaction
-                    .run(
-                        bound_llvm_ar
-                            .command(Duration::from_secs(30), ["t", "outer.a"])
-                            .current_directory(&work),
-                    )
-                    .map_err(|error| {
-                        format!("cannot inspect archiver flattening probe: {error}")
-                    })?;
-                if !table.status.success() || table.timed_out {
-                    return Err(command_result_failure(
-                        "native-archiver-table-probe",
-                        &table,
-                    ));
-                }
-                if table.stdout != b"member.o\n" {
-                    return Err(
-                        "LLVM archiver did not flatten the nested archive exactly".to_owned()
-                    );
-                }
-                clean_native_archive_probe(&work)?;
-                let toolchain_transaction = envelope.toolchain_transaction()?;
-                let bound_toolchain = Arc::new(stage_native_toolchain(
-                    adapter_root,
-                    &toolchain_transaction,
-                )?);
-                let path = native_archive_path(
-                    adapter_root,
-                    &bound_toolchain.stack_bin.path,
-                    &bound_toolchain.ghc_bin.path,
-                )?;
-                let stack_yaml = write_native_stack_overlay(
-                    adapter_root,
-                    source,
-                    &bound_toolchain.ghc_bin.path,
-                )?;
-                bound_llvm_ar
-                    .revalidate_until(envelope.execution_deadline, envelope.completion_deadline)?;
-                let adapter = Self {
-                    _directory: directory.take(),
-                    bound_toolchain: Some(bound_toolchain),
-                    llvm_ar: Some(bound_llvm_ar),
-                    llvm_ar_version: Some(llvm_ar_version),
-                    path: Some(path),
-                    stack_yaml: Some(stack_yaml),
-                    temporary_directory: Some(temporary_directory),
-                    input_broker: None,
-                };
-                Ok(adapter)
-            })();
+            let result = construct_macos_native_archive_adapter(
+                &mut directory,
+                source,
+                confined_launcher,
+                envelope,
+                archiver_transaction,
+                &source_archiver,
+            );
             match result {
                 Ok(adapter) => Ok(adapter),
                 Err(primary) => native_archive_adapter_constructor_failure(
                     primary,
-                    directory
-                        .as_mut()
-                        .map(|directory| directory.close_until(envelope.completion_deadline))
-                        .unwrap_or(Ok(())),
+                    directory.as_mut().map_or(Ok(()), |directory| {
+                        directory.close_until(envelope.completion)
+                    }),
                 ),
             }
         }
@@ -6542,7 +6972,7 @@ impl NativeArchiveAdapter {
 
     #[cfg(unix)]
     pub(crate) fn directory_path(&self) -> Option<&Path> {
-        self._directory.as_ref().map(AdapterDirectory::path)
+        self.directory.as_ref().map(AdapterDirectory::path)
     }
 
     pub(crate) fn close(mut self) -> Result<(), String> {
@@ -6552,10 +6982,10 @@ impl NativeArchiveAdapter {
                 "active native archive input broker requires deadline-bound cleanup".to_owned(),
             );
         }
-        if let Some(directory) = self._directory.as_mut() {
+        if let Some(directory) = self.directory.as_mut() {
             directory.close()?;
         }
-        self._directory = None;
+        self.directory = None;
         Ok(())
     }
 
@@ -6565,10 +6995,10 @@ impl NativeArchiveAdapter {
             broker.close_until(completion_deadline)?;
         }
         self.input_broker = None;
-        if let Some(directory) = self._directory.as_mut() {
+        if let Some(directory) = self.directory.as_mut() {
             directory.close_until(completion_deadline)?;
         }
-        self._directory = None;
+        self.directory = None;
         Ok(())
     }
 
@@ -6592,7 +7022,7 @@ impl NativeArchiveAdapter {
             rebound.retain_sealed_adapter_authority(trusted_group)?;
             self.bound_toolchain = Some(Arc::new(rebound));
             let adapter_root = self
-                ._directory
+                .directory
                 .as_ref()
                 .ok_or_else(|| "native archive adapter directory is absent".to_owned())?
                 .path();
@@ -6745,6 +7175,140 @@ impl NativeArchiveAdapter {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn construct_macos_native_archive_adapter(
+    directory: &mut Option<AdapterDirectory>,
+    source: &Path,
+    confined_launcher: Option<&Path>,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    archiver_transaction: NativeArchiverTransaction,
+    source_archiver: &AcquiredNativeArchiverSource,
+) -> Result<NativeArchiveAdapter, String> {
+    let adapter_root = directory
+        .as_ref()
+        .ok_or_else(|| "native archive adapter directory was consumed early".to_owned())?
+        .path();
+    prepare_adapter_work_directory(adapter_root)?;
+    let temporary_directory = adapter_root.join(".stack-work/tmp");
+    let executable = resolve_native_archive_adapter_executable(confined_launcher)?;
+    let bound_llvm_ar = install_staged_native_archive_adapter(
+        adapter_root,
+        &executable,
+        source_archiver,
+        &archiver_transaction,
+    )?;
+    let llvm_ar_version = identify_staged_native_archiver(&bound_llvm_ar, archiver_transaction)?;
+    probe_staged_native_archiver(adapter_root, &bound_llvm_ar, archiver_transaction)?;
+    let toolchain_transaction = envelope.toolchain_transaction()?;
+    let bound_toolchain = Arc::new(stage_native_toolchain(
+        adapter_root,
+        &toolchain_transaction,
+    )?);
+    let path = native_archive_path(
+        adapter_root,
+        &bound_toolchain.stack_bin.path,
+        &bound_toolchain.ghc_bin.path,
+    )?;
+    let stack_yaml =
+        write_native_stack_overlay(adapter_root, source, &bound_toolchain.ghc_bin.path)?;
+    bound_llvm_ar.revalidate_until(envelope.execution, envelope.completion)?;
+    Ok(NativeArchiveAdapter {
+        directory: directory.take(),
+        bound_toolchain: Some(bound_toolchain),
+        llvm_ar: Some(bound_llvm_ar),
+        llvm_ar_version: Some(llvm_ar_version),
+        path: Some(path),
+        stack_yaml: Some(stack_yaml),
+        temporary_directory: Some(temporary_directory),
+        input_broker: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_native_archive_adapter_executable(
+    confined_launcher: Option<&Path>,
+) -> Result<PathBuf, String> {
+    match confined_launcher {
+        Some(path) => fs::canonicalize(path)
+            .map_err(|error| format!("cannot bind confined archive adapter: {error}")),
+        None => std::env::current_exe()
+            .map_err(|error| format!("cannot locate CI driver executable: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn identify_staged_native_archiver(
+    archiver: &BoundNativeArchiver,
+    transaction: NativeArchiverTransaction,
+) -> Result<String, String> {
+    let version = transaction
+        .run(archiver.command(Duration::from_secs(30), ["--version"]))
+        .map_err(|error| format!("cannot identify staged LLVM archiver: {error}"))?;
+    require_complete_native_archiver_stdout("native-archiver-identity", &version)?;
+    let version = std::str::from_utf8(&version.stdout)
+        .map_err(|_| "staged LLVM archiver identity is not UTF-8".to_owned())?;
+    if !accepted_llvm_ar_version(version) {
+        return Err("staged LLVM archiver version differs from native CI policy".to_owned());
+    }
+    Ok(version.trim().to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn probe_staged_native_archiver(
+    adapter_root: &Path,
+    archiver: &BoundNativeArchiver,
+    transaction: NativeArchiverTransaction,
+) -> Result<(), String> {
+    let work = adapter_root.join(".stack-work");
+    fs::write(work.join("member.o"), b"native-archive-adapter\n")
+        .map_err(|error| format!("cannot write archiver probe member: {error}"))?;
+    let inner = transaction
+        .run(
+            archiver
+                .command(Duration::from_secs(30), ["qcls", "inner.a", "member.o"])
+                .current_directory(&work),
+        )
+        .map_err(|error| format!("cannot build archiver probe input: {error}"))?;
+    if !inner.status.success() || inner.timed_out {
+        return Err(command_result_failure(
+            "native-archiver-inner-probe",
+            &inner,
+        ));
+    }
+    fs::write(work.join("response.rsp"), b"inner.a\n")
+        .map_err(|error| format!("cannot write archiver response probe: {error}"))?;
+    let probe = transaction
+        .run(
+            archiver
+                .command(Duration::from_secs(30), ["qL", "outer.a", "@response.rsp"])
+                .current_directory(&work),
+        )
+        .map_err(|error| format!("cannot probe LLVM archiver: {error}"))?;
+    if !probe.status.success() || probe.timed_out {
+        return Err(command_result_failure(
+            "native-archiver-response-probe",
+            &probe,
+        ));
+    }
+    let table = transaction
+        .run(
+            archiver
+                .command(Duration::from_secs(30), ["t", "outer.a"])
+                .current_directory(&work),
+        )
+        .map_err(|error| format!("cannot inspect archiver flattening probe: {error}"))?;
+    if !table.status.success() || table.timed_out {
+        return Err(command_result_failure(
+            "native-archiver-table-probe",
+            &table,
+        ));
+    }
+    if table.stdout != b"member.o\n" {
+        return Err("LLVM archiver did not flatten the nested archive exactly".to_owned());
+    }
+    clean_native_archive_probe(&work)
+}
+
 pub(crate) const PINNED_ORACLE_SOURCE_COMMIT: &str = "8e952cf9de4ab25d7716982a9ca234f9bdcf1bff";
 
 #[cfg(unix)]
@@ -6806,10 +7370,12 @@ fn verify_native_archive_identity_policy() -> Result<(), String> {
         stderr_truncated: false,
         stderr_bytes: 0,
         stderr_sha256: sha256_bytes(&[]),
-        cleanup_id: None,
-        termination_forced: false,
-        termination_reaped: false,
-        candidate_quiescence_complete: false,
+        termination: CommandTerminationResult {
+            cleanup_id: None,
+            forced: false,
+            reaped: false,
+            candidate_quiescence_complete: false,
+        },
     };
     let truncated_error =
         require_complete_native_archiver_stdout("truncated-identity-verifier", &truncated)
@@ -6874,10 +7440,10 @@ const NATIVE_ARCHIVER_VERIFIER_DETAIL_LIMIT: usize = 512;
 
 #[cfg(target_os = "macos")]
 struct NativeArchiverVerifierEnvelope {
-    primary_deadline: Instant,
-    command_completion_deadline: Instant,
-    adapter_cleanup_deadline: Instant,
-    root_cleanup_deadline: Instant,
+    primary: Instant,
+    command_completion: Instant,
+    adapter_cleanup: Instant,
+    root_cleanup: Instant,
 }
 
 #[cfg(target_os = "macos")]
@@ -6885,7 +7451,7 @@ impl NativeArchiverVerifierEnvelope {
     fn new() -> Result<Self, String> {
         let started = Instant::now();
         let primary_deadline = started
-            .checked_add(Duration::from_secs(5 * 60))
+            .checked_add(Duration::from_mins(5))
             .ok_or_else(|| "native archiver verifier primary deadline overflowed".to_owned())?;
         let command_completion_deadline = primary_deadline
             .checked_add(Duration::from_secs(30))
@@ -6894,13 +7460,13 @@ impl NativeArchiverVerifierEnvelope {
             .checked_add(Duration::from_secs(30))
             .ok_or_else(|| "native archiver verifier adapter cleanup overflowed".to_owned())?;
         let root_cleanup_deadline = adapter_cleanup_deadline
-            .checked_add(Duration::from_secs(60))
+            .checked_add(Duration::from_mins(1))
             .ok_or_else(|| "native archiver verifier root cleanup overflowed".to_owned())?;
         Ok(Self {
-            primary_deadline,
-            command_completion_deadline,
-            adapter_cleanup_deadline,
-            root_cleanup_deadline,
+            primary: primary_deadline,
+            command_completion: command_completion_deadline,
+            adapter_cleanup: adapter_cleanup_deadline,
+            root_cleanup: root_cleanup_deadline,
         })
     }
 
@@ -6908,12 +7474,12 @@ impl NativeArchiverVerifierEnvelope {
         let started = Instant::now();
         let execution_deadline = started
             .checked_add(NATIVE_ARCHIVER_EXECUTION_BUDGET)
-            .unwrap_or(self.primary_deadline)
-            .min(self.primary_deadline);
+            .unwrap_or(self.primary)
+            .min(self.primary);
         let completion_deadline = started
             .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
-            .unwrap_or(self.command_completion_deadline)
-            .min(self.command_completion_deadline);
+            .unwrap_or(self.command_completion)
+            .min(self.command_completion);
         if started >= execution_deadline || execution_deadline >= completion_deadline {
             return Err(format!(
                 "native archiver verifier envelope expired before {phase}"
@@ -7070,8 +7636,6 @@ fn verify_native_archiver_graph_receipts(
 pub(crate) fn verify_macos_native_archiver_acquisition_for_integration(
     receipt_path: &Path,
 ) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let envelope = NativeArchiverVerifierEnvelope::new()?;
     let mut evidence = NativeArchiverVerifierEvidence::create(
         receipt_path,
@@ -7083,247 +7647,295 @@ pub(crate) fn verify_macos_native_archiver_acquisition_for_integration(
         })?;
     let root = verifier_root.path().to_owned();
     let launcher = root.join("confined-launcher");
-    let mut launcher_receipt = None;
-    let mut directory = None;
-    let result = (|| {
-        run_native_archiver_verifier_phase(&mut evidence, "root-setup", || {
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("cannot open native archiver verifier root: {error}"))
-        })?;
-        let acquisition_transaction = envelope.transaction("Homebrew source acquisition")?;
-        let acquired = run_native_archiver_verifier_phase(
-            &mut evidence,
-            "homebrew-source-acquisition",
-            || acquire_native_archiver_source(&acquisition_transaction),
-        )?;
-        run_native_archiver_verifier_phase(&mut evidence, "confined-launcher-staging", || {
-            let current_executable = std::env::current_exe()
-                .map_err(|error| format!("cannot locate confined verifier launcher: {error}"))?;
-            fs::copy(&current_executable, &launcher)
-                .map_err(|error| format!("cannot stage confined verifier launcher: {error}"))?;
-            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o555))
-                .map_err(|error| format!("cannot freeze confined verifier launcher: {error}"))?;
-            launcher_receipt = Some(BoundNativeCleanupFile::bind(
-                &launcher,
-                acquisition_transaction.execution_deadline,
-            )?);
-            Ok(())
-        })?;
-        let (positive_directory, staged) =
-            run_native_archiver_verifier_phase(&mut evidence, "positive-closure-staging", || {
-                directory = Some(create_adapter_directory(&root)?);
-                let retained = directory.as_ref().ok_or_else(|| {
-                    "native archiver verifier directory was not retained".to_owned()
-                })?;
-                let path = retained.path().to_owned();
-                let stage_transaction = envelope.transaction("positive closure staging")?;
-                prepare_adapter_work_directory(&path)?;
-                let staged = install_staged_native_archive_adapter(
-                    &path,
-                    &launcher,
-                    &acquired,
-                    &stage_transaction,
-                )?;
-                Ok((path, staged))
-            })?;
-        let validation_transaction = envelope.transaction("positive graph validation")?;
-        run_native_archiver_verifier_phase(&mut evidence, "positive-graph-validation", || {
-            staged.revalidate_until(
-                validation_transaction.execution_deadline,
-                validation_transaction.completion_deadline,
-            )
-        })?;
-        run_native_archiver_verifier_phase(&mut evidence, "positive-graph-receipts", || {
-            let staged_members = staged
-                .distribution
-                .entries
-                .iter()
-                .map(|entry| entry.relative.clone())
-                .collect::<Vec<_>>();
-            let external_members = staged
-                .external_dependencies
-                .iter()
-                .map(|dependency| dependency.canonical.clone())
-                .collect::<Vec<_>>();
-            verify_native_archiver_graph_receipts(
-                &staged.load_graph,
-                &acquired.source_prefix,
-                &staged_members,
-                &external_members,
-            )
-        })?;
-        let identity_transaction = envelope.transaction("staged identity execution")?;
-        run_native_archiver_verifier_phase(&mut evidence, "staged-identity-execution", || {
-            let identity = identity_transaction
-                .run(staged.command(Duration::from_secs(30), ["--version"]))
-                .map_err(|error| format!("cannot execute staged archiver identity: {error}"))?;
-            require_complete_native_archiver_stdout("native-archiver-staged-execution", &identity)?;
-            let version = std::str::from_utf8(&identity.stdout)
-                .map_err(|_| "staged archiver verifier identity is not UTF-8".to_owned())?;
-            if !accepted_llvm_ar_version(version) {
-                return Err("staged archiver verifier identity differs from policy".to_owned());
-            }
-            Ok(())
-        })?;
-        let restricted_transaction = envelope.transaction("restricted staged identity")?;
-        run_native_archiver_verifier_phase(&mut evidence, "restricted-staged-execution", || {
-            verify_restricted_native_archiver_launch(&positive_directory, &restricted_transaction)
-        })?;
-        let work = positive_directory.join(".stack-work");
-        run_native_archiver_verifier_phase(&mut evidence, "archive-input", || {
-            fs::write(work.join("member.o"), b"native-archive-adapter\n")
-                .map_err(|error| format!("cannot write staged archiver verifier member: {error}"))
-        })?;
-        let inner_transaction = envelope.transaction("inner archive execution")?;
-        run_native_archiver_verifier_phase(&mut evidence, "archive-inner", || {
-            let inner = inner_transaction
-                .run(
-                    staged
-                        .command(Duration::from_secs(30), ["qcls", "inner.a", "member.o"])
-                        .current_directory(&work),
-                )
-                .map_err(|error| format!("cannot run staged archiver inner probe: {error}"))?;
-            if inner.timed_out || !inner.status.success() {
-                return Err(command_result_failure("staged-archiver-inner", &inner));
-            }
-            Ok(())
-        })?;
-        fs::write(work.join("response.rsp"), b"inner.a\n")
-            .map_err(|error| format!("cannot write staged archiver verifier response: {error}"))?;
-        let response_transaction = envelope.transaction("response archive execution")?;
-        run_native_archiver_verifier_phase(&mut evidence, "archive-response", || {
-            let response = response_transaction
-                .run(
-                    staged
-                        .command(Duration::from_secs(30), ["qL", "outer.a", "@response.rsp"])
-                        .current_directory(&work),
-                )
-                .map_err(|error| format!("cannot run staged archiver response probe: {error}"))?;
-            if response.timed_out || !response.status.success() {
-                return Err(command_result_failure(
-                    "staged-archiver-response",
-                    &response,
-                ));
-            }
-            Ok(())
-        })?;
-        let table_transaction = envelope.transaction("archive table execution")?;
-        run_native_archiver_verifier_phase(&mut evidence, "archive-table", || {
-            let table = table_transaction
-                .run(
-                    staged
-                        .command(Duration::from_secs(30), ["t", "outer.a"])
-                        .current_directory(&work),
-                )
-                .map_err(|error| {
-                    format!("cannot inspect staged archiver verifier table: {error}")
-                })?;
-            if table.timed_out || !table.status.success() || table.stdout != b"member.o\n" {
-                return Err(command_result_failure("staged-archiver-table", &table));
-            }
-            Ok(())
-        })?;
-        run_native_archiver_verifier_phase(&mut evidence, "validation-pass-receipt", || {
-            let passes = staged.validation_passes.counts();
-            if passes
-                != (NativeArchiverValidationPassCounts {
-                    full_closure: 1,
-                    load_graph: 1,
-                    spawn_preflight: 4,
-                })
-            {
-                return Err(format!(
-                    "staged archiver validation pass receipt differs from policy: {passes:?}"
-                ));
-            }
-            Ok(())
-        })?;
+    let mut state = NativeArchiverAcquisitionVerifierState::default();
+    let result = run_native_archiver_acquisition_verifier(
+        &mut evidence,
+        &envelope,
+        &root,
+        &launcher,
+        &mut state,
+    );
+    finish_native_archiver_acquisition_verifier(
+        &mut evidence,
+        &envelope,
+        &mut verifier_root,
+        &mut state,
+        result,
+    )
+}
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct NativeArchiverAcquisitionVerifierState {
+    launcher_receipt: Option<BoundNativeCleanupFile>,
+    directory: Option<AdapterDirectory>,
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_archiver_acquisition_verifier(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    root: &Path,
+    launcher: &Path,
+    state: &mut NativeArchiverAcquisitionVerifierState,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    run_native_archiver_verifier_phase(evidence, "root-setup", || {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("cannot open native archiver verifier root: {error}"))
+    })?;
+    let acquisition_transaction = envelope.transaction("Homebrew source acquisition")?;
+    let acquired =
+        run_native_archiver_verifier_phase(evidence, "homebrew-source-acquisition", || {
+            acquire_native_archiver_source(&acquisition_transaction)
+        })?;
+    stage_native_archiver_verifier_launcher(evidence, launcher, acquisition_transaction, state)?;
+    let (positive_directory, staged) = stage_positive_native_archiver_closure(
+        evidence, envelope, root, launcher, &acquired, state,
+    )?;
+    verify_positive_native_archiver_closure(
+        evidence,
+        envelope,
+        &positive_directory,
+        &acquired,
+        &staged,
+    )?;
+    verify_staged_native_archive_operations(evidence, envelope, &positive_directory, &staged)?;
+    run_native_archiver_verifier_phase(evidence, "validation-pass-receipt", || {
+        let passes = staged.validation_passes.counts();
+        if passes
+            != (NativeArchiverValidationPassCounts {
+                full_closure: 1,
+                load_graph: 1,
+                spawn_preflight: 4,
+            })
+        {
+            return Err(format!(
+                "staged archiver validation pass receipt differs from policy: {passes:?}"
+            ));
+        }
         Ok(())
-    })();
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_archiver_verifier_launcher(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    launcher: &Path,
+    transaction: NativeArchiverTransaction,
+    state: &mut NativeArchiverAcquisitionVerifierState,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    run_native_archiver_verifier_phase(evidence, "confined-launcher-staging", || {
+        let current_executable = std::env::current_exe()
+            .map_err(|error| format!("cannot locate confined verifier launcher: {error}"))?;
+        fs::copy(&current_executable, launcher)
+            .map_err(|error| format!("cannot stage confined verifier launcher: {error}"))?;
+        fs::set_permissions(launcher, fs::Permissions::from_mode(0o555))
+            .map_err(|error| format!("cannot freeze confined verifier launcher: {error}"))?;
+        state.launcher_receipt = Some(BoundNativeCleanupFile::bind(
+            launcher,
+            transaction.execution_deadline,
+        )?);
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stage_positive_native_archiver_closure(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    root: &Path,
+    launcher: &Path,
+    acquired: &AcquiredNativeArchiverSource,
+    state: &mut NativeArchiverAcquisitionVerifierState,
+) -> Result<(PathBuf, BoundNativeArchiver), String> {
+    run_native_archiver_verifier_phase(evidence, "positive-closure-staging", || {
+        state.directory = Some(create_adapter_directory(root)?);
+        let retained = state
+            .directory
+            .as_ref()
+            .ok_or_else(|| "native archiver verifier directory was not retained".to_owned())?;
+        let path = retained.path().to_owned();
+        let stage_transaction = envelope.transaction("positive closure staging")?;
+        prepare_adapter_work_directory(&path)?;
+        let staged =
+            install_staged_native_archive_adapter(&path, launcher, acquired, &stage_transaction)?;
+        Ok((path, staged))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_positive_native_archiver_closure(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    directory: &Path,
+    acquired: &AcquiredNativeArchiverSource,
+    staged: &BoundNativeArchiver,
+) -> Result<(), String> {
+    let validation_transaction = envelope.transaction("positive graph validation")?;
+    run_native_archiver_verifier_phase(evidence, "positive-graph-validation", || {
+        staged.revalidate_until(
+            validation_transaction.execution_deadline,
+            validation_transaction.completion_deadline,
+        )
+    })?;
+    run_native_archiver_verifier_phase(evidence, "positive-graph-receipts", || {
+        let staged_members = staged
+            .distribution
+            .entries
+            .iter()
+            .map(|entry| entry.relative.clone())
+            .collect::<Vec<_>>();
+        let external_members = staged
+            .external_dependencies
+            .iter()
+            .map(|dependency| dependency.canonical.clone())
+            .collect::<Vec<_>>();
+        verify_native_archiver_graph_receipts(
+            &staged.load_graph,
+            &acquired.source_prefix,
+            &staged_members,
+            &external_members,
+        )
+    })?;
+    let identity_transaction = envelope.transaction("staged identity execution")?;
+    run_native_archiver_verifier_phase(evidence, "staged-identity-execution", || {
+        let identity = identity_transaction
+            .run(staged.command(Duration::from_secs(30), ["--version"]))
+            .map_err(|error| format!("cannot execute staged archiver identity: {error}"))?;
+        require_complete_native_archiver_stdout("native-archiver-staged-execution", &identity)?;
+        let version = std::str::from_utf8(&identity.stdout)
+            .map_err(|_| "staged archiver verifier identity is not UTF-8".to_owned())?;
+        if !accepted_llvm_ar_version(version) {
+            return Err("staged archiver verifier identity differs from policy".to_owned());
+        }
+        Ok(())
+    })?;
+    let restricted_transaction = envelope.transaction("restricted staged identity")?;
+    run_native_archiver_verifier_phase(evidence, "restricted-staged-execution", || {
+        verify_restricted_native_archiver_launch(directory, &restricted_transaction)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_staged_native_archive_operations(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    directory: &Path,
+    staged: &BoundNativeArchiver,
+) -> Result<(), String> {
+    let work = directory.join(".stack-work");
+    run_native_archiver_verifier_phase(evidence, "archive-input", || {
+        fs::write(work.join("member.o"), b"native-archive-adapter\n")
+            .map_err(|error| format!("cannot write staged archiver verifier member: {error}"))
+    })?;
+    run_staged_archiver_probe(
+        evidence,
+        envelope.transaction("inner archive execution")?,
+        "archive-inner",
+        staged
+            .command(Duration::from_secs(30), ["qcls", "inner.a", "member.o"])
+            .current_directory(&work),
+        "cannot run staged archiver inner probe",
+        "staged-archiver-inner",
+        None,
+    )?;
+    fs::write(work.join("response.rsp"), b"inner.a\n")
+        .map_err(|error| format!("cannot write staged archiver verifier response: {error}"))?;
+    run_staged_archiver_probe(
+        evidence,
+        envelope.transaction("response archive execution")?,
+        "archive-response",
+        staged
+            .command(Duration::from_secs(30), ["qL", "outer.a", "@response.rsp"])
+            .current_directory(&work),
+        "cannot run staged archiver response probe",
+        "staged-archiver-response",
+        None,
+    )?;
+    run_staged_archiver_probe(
+        evidence,
+        envelope.transaction("archive table execution")?,
+        "archive-table",
+        staged
+            .command(Duration::from_secs(30), ["t", "outer.a"])
+            .current_directory(&work),
+        "cannot inspect staged archiver verifier table",
+        "staged-archiver-table",
+        Some(b"member.o\n"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_staged_archiver_probe(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    transaction: NativeArchiverTransaction,
+    phase: &str,
+    command: CommandSpec,
+    launch_error: &str,
+    failure_role: &str,
+    expected_stdout: Option<&[u8]>,
+) -> Result<(), String> {
+    run_native_archiver_verifier_phase(evidence, phase, || {
+        let result = transaction
+            .run(command)
+            .map_err(|error| format!("{launch_error}: {error}"))?;
+        if result.timed_out
+            || !result.status.success()
+            || expected_stdout.is_some_and(|expected| result.stdout != expected)
+        {
+            return Err(command_result_failure(failure_role, &result));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn finish_native_archiver_acquisition_verifier(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    verifier_root: &mut AdapterDirectory,
+    state: &mut NativeArchiverAcquisitionVerifierState,
+    result: Result<(), String>,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     if let Err(error) = result {
         failures.push(error);
     }
-    let adapter_cleanup = directory.as_mut().map_or(Ok(()), |directory| {
-        directory.close_until(envelope.adapter_cleanup_deadline)
+    let adapter_cleanup = state.directory.as_mut().map_or(Ok(()), |directory| {
+        directory.close_until(envelope.adapter_cleanup)
     });
-    let adapter_cleanup_detail = match &adapter_cleanup {
-        Ok(()) => "completed".to_owned(),
-        Err(error) => error.clone(),
-    };
-    if let Err(error) = evidence.record(
+    record_native_archiver_cleanup_result(
+        evidence,
+        &mut failures,
         "cleanup-adapter",
-        if adapter_cleanup.is_ok() {
-            "passed"
-        } else {
-            "failed"
-        },
         "adapter-directory",
-        if adapter_cleanup.is_ok() {
-            "absent"
-        } else {
-            "retained"
-        },
-        &adapter_cleanup_detail,
-    ) {
-        failures.push(error);
-    }
-    if let Err(error) = adapter_cleanup {
-        failures.push(format!("adapter-directory cleanup: {error}"));
-    }
-    let launcher_cleanup = launcher_receipt.as_ref().map_or(Ok(()), |receipt| {
-        receipt.remove_until(envelope.root_cleanup_deadline)
+        "adapter-directory cleanup",
+        adapter_cleanup,
+    );
+    let launcher_cleanup = state.launcher_receipt.as_ref().map_or(Ok(()), |receipt| {
+        receipt.remove_until(envelope.root_cleanup)
     });
-    let launcher_cleanup_detail = match &launcher_cleanup {
-        Ok(()) => "completed".to_owned(),
-        Err(error) => error.clone(),
-    };
-    if let Err(error) = evidence.record(
+    record_native_archiver_cleanup_result(
+        evidence,
+        &mut failures,
         "cleanup-launcher",
-        if launcher_cleanup.is_ok() {
-            "passed"
-        } else {
-            "failed"
-        },
         "confined-launcher",
-        if launcher_cleanup.is_ok() {
-            "absent"
-        } else {
-            "retained"
-        },
-        &launcher_cleanup_detail,
-    ) {
-        failures.push(error);
-    }
-    if let Err(error) = launcher_cleanup {
-        failures.push(format!("confined-launcher cleanup: {error}"));
-    }
-    let root_cleanup = verifier_root.close_until(envelope.root_cleanup_deadline);
-    let root_cleanup_detail = match &root_cleanup {
-        Ok(()) => "completed".to_owned(),
-        Err(error) => error.clone(),
-    };
-    if let Err(error) = evidence.record(
+        "confined-launcher cleanup",
+        launcher_cleanup,
+    );
+    let root_cleanup = verifier_root.close_until(envelope.root_cleanup);
+    record_native_archiver_cleanup_result(
+        evidence,
+        &mut failures,
         "cleanup-root",
-        if root_cleanup.is_ok() {
-            "passed"
-        } else {
-            "failed"
-        },
         "verifier-root",
-        if root_cleanup.is_ok() {
-            "absent"
-        } else {
-            "retained"
-        },
-        &root_cleanup_detail,
-    ) {
-        failures.push(error);
-    }
-    if let Err(error) = root_cleanup {
-        failures.push(format!("verifier-root cleanup: {error}"));
-    }
+        "verifier-root cleanup",
+        root_cleanup,
+    );
     let terminal_state = if failures.is_empty() {
         "passed"
     } else {
@@ -7355,11 +7967,36 @@ pub(crate) fn verify_macos_native_archiver_acquisition_for_integration(
 }
 
 #[cfg(target_os = "macos")]
+fn record_native_archiver_cleanup_result(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    failures: &mut Vec<String>,
+    phase: &str,
+    authority: &str,
+    failure_label: &str,
+    cleanup: Result<(), String>,
+) {
+    let passed = cleanup.is_ok();
+    let detail = cleanup
+        .as_ref()
+        .map_or_else(Clone::clone, |()| "completed".to_owned());
+    if let Err(error) = evidence.record(
+        phase,
+        if passed { "passed" } else { "failed" },
+        authority,
+        if passed { "absent" } else { "retained" },
+        &detail,
+    ) {
+        failures.push(error);
+    }
+    if let Err(error) = cleanup {
+        failures.push(format!("{failure_label}: {error}"));
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn verify_macos_native_archiver_topology_for_integration(
     receipt_path: &Path,
 ) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let envelope = NativeArchiverVerifierEnvelope::new()?;
     let mut evidence = NativeArchiverVerifierEvidence::create(
         receipt_path,
@@ -7370,124 +8007,151 @@ pub(crate) fn verify_macos_native_archiver_topology_for_integration(
             create_adapter_directory(Path::new("/private/tmp"))
         })?;
     let root = directory.path().to_owned();
-    let result = (|| {
-        run_native_archiver_verifier_phase(&mut evidence, "system-only-topology", || {
-            let system = PathBuf::from("/usr/lib/libSystem.B.dylib");
-            let graph = NativeArchiverLoadGraph {
-                edges: vec![NativeArchiverLoadEdge {
-                    source: PathBuf::from("bin/llvm-ar"),
-                    load_name: system.to_string_lossy().into_owned(),
-                    target: NativeArchiverLoadTarget::System(system),
-                }],
-            };
-            verify_native_archiver_graph_receipts(
-                &graph,
-                &root.join("synthetic-prefix"),
-                &[PathBuf::from("bin/llvm-ar")],
-                &[],
-            )
-        })?;
-        let work = root.join(".stack-work");
-        run_native_archiver_verifier_phase(&mut evidence, "synthetic-work-setup", || {
-            prepare_adapter_work_directory(&root)
-        })?;
-        let escape = work.join("tmp").join("escape");
-        let prefix = escape.join("prefix");
-        let bin = prefix.join("bin");
-        let outside = escape.join("outside");
-        run_native_archiver_verifier_phase(&mut evidence, "load-command-parser", || {
-            let parsed = parse_macho_load_commands(
-                "cmd LC_ID_DYLIB\nname @rpath/self.dylib (offset 24)\ncmd LC_RPATH\npath first (offset 12)\ncmd LC_RPATH\npath second (offset 12)\ncmd LC_LOAD_DYLIB\nname @rpath/load.dylib (offset 24)\n",
-            )?;
-            if parsed.load_names != ["@rpath/load.dylib"]
-                || parsed.rpaths != ["first", "second"]
-                || parse_macho_load_commands("cmd LC_LOAD_DYLIB\ncmd LC_RPATH\n").is_ok()
-                || parse_macho_load_commands("cmd LC_RPATH\n").is_ok()
-            {
-                return Err("Mach-O load-command parser differs from exact policy".to_owned());
-            }
-            Ok(())
-        })?;
-        run_native_archiver_verifier_phase(&mut evidence, "ordered-rpath-and-escape", || {
-            fs::create_dir_all(&bin)
-                .and_then(|()| fs::create_dir_all(&outside))
-                .map_err(|error| format!("cannot create loader escape fixture: {error}"))?;
-            let fixture_archiver = bin.join("llvm-ar");
-            let escaped_library = outside.join("libescape.dylib");
-            fs::write(&fixture_archiver, b"fixture\n")
-                .and_then(|()| fs::write(&escaped_library, b"fixture\n"))
-                .map_err(|error| format!("cannot write loader escape fixture: {error}"))?;
-            let first = escape.join("first");
-            let second = escape.join("second");
-            fs::create_dir(&first)
-                .and_then(|()| fs::create_dir(&second))
-                .and_then(|()| fs::write(first.join("ordered.dylib"), b"first\n"))
-                .and_then(|()| fs::write(second.join("ordered.dylib"), b"second\n"))
-                .map_err(|error| format!("cannot create ordered run-path fixture: {error}"))?;
-            let ordered = resolve_macho_load_name(
-                "@rpath/ordered.dylib",
-                &fixture_archiver,
-                &bin,
-                &[first.clone(), second],
-            )?;
-            if ordered.canonical
-                != fs::canonicalize(first.join("ordered.dylib")).map_err(|error| {
-                    format!("cannot canonicalize ordered run-path fixture: {error}")
-                })?
-            {
-                return Err(
-                    "Mach-O run-path resolution did not preserve first-existing order".to_owned(),
-                );
-            }
-            let escape_rpaths = resolve_macho_rpath_roots(
-                &fixture_archiver,
-                &bin,
-                &["@loader_path/../../outside".to_owned()],
-                &[],
-            )?;
-            let resolved = resolve_macho_load_name(
-                "@rpath/libescape.dylib",
-                &fixture_archiver,
-                &bin,
-                &escape_rpaths,
-            )?;
-            let canonical_prefix = fs::canonicalize(&prefix)
-                .map_err(|error| format!("cannot canonicalize loader escape prefix: {error}"))?;
-            if normalized_staged_load_path(
-                &resolved.logical,
-                &canonical_prefix,
-                &resolved.canonical,
-            )
-            .is_ok()
-            {
-                return Err("loader-relative escape satisfied staged boundary policy".to_owned());
-            }
-            Ok(())
-        })?;
-        run_native_archiver_verifier_phase(&mut evidence, "same-size-leaf-mutation", || {
-            let leaf = work.join("tmp/mutation/bin/dependency");
-            create_native_archiver_dependency_fixture(&leaf, b"original-bytes\n")?;
-            let transaction = envelope.transaction("synthetic dependency mutation")?;
-            let authority = NativeArchiverOwnerAuthority::TrustedPublisher {
-                uid: nix::unistd::geteuid().as_raw(),
-            };
-            let dependency =
-                BoundNativeArchiverDependency::bind_until(&leaf, transaction, &authority)?;
-            fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755))
-                .and_then(|()| fs::write(&leaf, b"mutated!-bytes\n"))
-                .map_err(|error| format!("cannot mutate synthetic dependency: {error}"))?;
-            if dependency.revalidate_full_until(transaction).is_ok() {
-                return Err("same-size synthetic dependency mutation satisfied receipt".to_owned());
-            }
-            Ok(())
-        })?;
-        Ok(())
-    })();
+    let result = run_macos_native_archiver_topology_verifier(&mut evidence, &envelope, &root);
+    finish_macos_native_archiver_topology_verifier(&mut evidence, &envelope, &mut directory, result)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_native_archiver_topology_verifier(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    root: &Path,
+) -> Result<(), String> {
+    run_native_archiver_verifier_phase(evidence, "system-only-topology", || {
+        let system = PathBuf::from("/usr/lib/libSystem.B.dylib");
+        let graph = NativeArchiverLoadGraph {
+            edges: vec![NativeArchiverLoadEdge {
+                source: PathBuf::from("bin/llvm-ar"),
+                load_name: system.to_string_lossy().into_owned(),
+                target: NativeArchiverLoadTarget::System(system),
+            }],
+        };
+        verify_native_archiver_graph_receipts(
+            &graph,
+            &root.join("synthetic-prefix"),
+            &[PathBuf::from("bin/llvm-ar")],
+            &[],
+        )
+    })?;
+    let work = root.join(".stack-work");
+    run_native_archiver_verifier_phase(evidence, "synthetic-work-setup", || {
+        prepare_adapter_work_directory(root)
+    })?;
+    run_native_archiver_verifier_phase(evidence, "load-command-parser", || {
+        verify_native_archiver_load_command_parser()
+    })?;
+    run_native_archiver_verifier_phase(evidence, "ordered-rpath-and-escape", || {
+        verify_native_archiver_ordered_rpath_escape(&work)
+    })?;
+    run_native_archiver_verifier_phase(evidence, "same-size-leaf-mutation", || {
+        verify_native_archiver_same_size_mutation(&work, envelope)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_load_command_parser() -> Result<(), String> {
+    let parsed = parse_macho_load_commands(
+        "cmd LC_ID_DYLIB\nname @rpath/self.dylib (offset 24)\ncmd LC_RPATH\npath first (offset 12)\ncmd LC_RPATH\npath second (offset 12)\ncmd LC_LOAD_DYLIB\nname @rpath/load.dylib (offset 24)\n",
+    )?;
+    if parsed.load_names != ["@rpath/load.dylib"]
+        || parsed.rpaths != ["first", "second"]
+        || parse_macho_load_commands("cmd LC_LOAD_DYLIB\ncmd LC_RPATH\n").is_ok()
+        || parse_macho_load_commands("cmd LC_RPATH\n").is_ok()
+    {
+        return Err("Mach-O load-command parser differs from exact policy".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_ordered_rpath_escape(work: &Path) -> Result<(), String> {
+    let escape = work.join("tmp/escape");
+    let prefix = escape.join("prefix");
+    let bin = prefix.join("bin");
+    let outside = escape.join("outside");
+    fs::create_dir_all(&bin)
+        .and_then(|()| fs::create_dir_all(&outside))
+        .map_err(|error| format!("cannot create loader escape fixture: {error}"))?;
+    let fixture_archiver = bin.join("llvm-ar");
+    let escaped_library = outside.join("libescape.dylib");
+    fs::write(&fixture_archiver, b"fixture\n")
+        .and_then(|()| fs::write(&escaped_library, b"fixture\n"))
+        .map_err(|error| format!("cannot write loader escape fixture: {error}"))?;
+    let first = escape.join("first");
+    let second = escape.join("second");
+    fs::create_dir(&first)
+        .and_then(|()| fs::create_dir(&second))
+        .and_then(|()| fs::write(first.join("ordered.dylib"), b"first\n"))
+        .and_then(|()| fs::write(second.join("ordered.dylib"), b"second\n"))
+        .map_err(|error| format!("cannot create ordered run-path fixture: {error}"))?;
+    let ordered = resolve_macho_load_name(
+        "@rpath/ordered.dylib",
+        &fixture_archiver,
+        &bin,
+        &[first.clone(), second],
+    )?;
+    let expected_ordered = fs::canonicalize(first.join("ordered.dylib"))
+        .map_err(|error| format!("cannot canonicalize ordered run-path fixture: {error}"))?;
+    if ordered.canonical != expected_ordered {
+        return Err("Mach-O run-path resolution did not preserve first-existing order".to_owned());
+    }
+    let escape_rpaths = resolve_macho_rpath_roots(
+        &fixture_archiver,
+        &bin,
+        &["@loader_path/../../outside".to_owned()],
+        &[],
+    )?;
+    let resolved = resolve_macho_load_name(
+        "@rpath/libescape.dylib",
+        &fixture_archiver,
+        &bin,
+        &escape_rpaths,
+    )?;
+    let canonical_prefix = fs::canonicalize(&prefix)
+        .map_err(|error| format!("cannot canonicalize loader escape prefix: {error}"))?;
+    if normalized_staged_load_path(&resolved.logical, &canonical_prefix, &resolved.canonical)
+        .is_ok()
+    {
+        return Err("loader-relative escape satisfied staged boundary policy".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_same_size_mutation(
+    work: &Path,
+    envelope: &NativeArchiverVerifierEnvelope,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let leaf = work.join("tmp/mutation/bin/dependency");
+    create_native_archiver_dependency_fixture(&leaf, b"original-bytes\n")?;
+    let transaction = envelope.transaction("synthetic dependency mutation")?;
+    let authority = NativeArchiverOwnerAuthority::TrustedPublisher {
+        uid: nix::unistd::geteuid().as_raw(),
+    };
+    let dependency = BoundNativeArchiverDependency::bind_until(&leaf, transaction, &authority)?;
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755))
+        .and_then(|()| fs::write(&leaf, b"mutated!-bytes\n"))
+        .map_err(|error| format!("cannot mutate synthetic dependency: {error}"))?;
+    if dependency.revalidate_full_until(transaction).is_ok() {
+        return Err("same-size synthetic dependency mutation satisfied receipt".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_native_archiver_topology_verifier(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    directory: &mut AdapterDirectory,
+    result: Result<(), String>,
+) -> Result<(), String> {
     let mut failures = result.err().into_iter().collect::<Vec<_>>();
-    let cleanup = directory.close_until(envelope.root_cleanup_deadline);
+    let cleanup = directory.close_until(envelope.root_cleanup);
     let cleanup_detail = cleanup
         .as_ref()
-        .map_or_else(|error| error.clone(), |()| "completed".to_owned());
+        .map_or_else(Clone::clone, |()| "completed".to_owned());
     if let Err(error) = evidence.record(
         "cleanup-root",
         if cleanup.is_ok() { "passed" } else { "failed" },
@@ -7529,8 +8193,6 @@ pub(crate) fn verify_macos_native_archiver_topology_for_integration(
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_macos_native_archiver_dependency_receipt_for_integration() -> Result<(), String>
 {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-
     let mut directory = create_adapter_directory(Path::new("/private/tmp"))?;
     let root = directory.path().to_owned();
     let started = Instant::now();
@@ -7538,148 +8200,20 @@ pub(crate) fn verify_macos_native_archiver_dependency_receipt_for_integration() 
         execution_deadline: started
             .checked_add(Duration::from_secs(45))
             .ok_or_else(|| "native archiver dependency verifier deadline overflowed".to_owned())?,
-        completion_deadline: started
-            .checked_add(Duration::from_secs(60))
-            .ok_or_else(|| {
-                "native archiver dependency verifier completion deadline overflowed".to_owned()
-            })?,
+        completion_deadline: started.checked_add(Duration::from_mins(1)).ok_or_else(|| {
+            "native archiver dependency verifier completion deadline overflowed".to_owned()
+        })?,
     };
     let authority = NativeArchiverOwnerAuthority::TrustedPublisher {
         uid: nix::unistd::geteuid().as_raw(),
     };
     let result = (|| {
-        let sibling_parent = root.join("sibling-parent");
-        let sibling_leaf = sibling_parent.join("bin/dependency");
-        create_native_archiver_dependency_fixture(&sibling_leaf, b"sibling-receipt\n")?;
-        let sibling =
-            BoundNativeArchiverDependency::bind_until(&sibling_leaf, transaction, &authority)?;
-        let unrelated = sibling_parent.join("unrelated");
-        fs::create_dir(&unrelated)
-            .map_err(|error| format!("cannot create dependency sibling churn: {error}"))?;
-        sibling
-            .revalidate_full_until(transaction)
-            .map_err(|error| {
-                format!("unrelated dependency sibling invalidated its authority: {error}")
-            })?;
-        fs::remove_dir(&unrelated)
-            .map_err(|error| format!("cannot remove dependency sibling churn: {error}"))?;
-        sibling
-            .revalidate_full_until(transaction)
-            .map_err(|error| {
-                format!("removed dependency sibling invalidated its authority: {error}")
-            })?;
-
-        let intermediate = root.join("intermediate-parent/bound");
-        let intermediate_leaf = intermediate.join("dependency");
-        create_native_archiver_dependency_fixture(&intermediate_leaf, b"intermediate\n")?;
-        let intermediate_receipt =
-            BoundNativeArchiverDependency::bind_until(&intermediate_leaf, transaction, &authority)?;
-        let displaced = intermediate.with_file_name("displaced");
-        fs::rename(&intermediate, &displaced)
-            .map_err(|error| format!("cannot displace dependency ancestor: {error}"))?;
-        fs::create_dir(&intermediate)
-            .map_err(|error| format!("cannot replace dependency ancestor: {error}"))?;
-        fs::hard_link(displaced.join("dependency"), &intermediate_leaf).map_err(|error| {
-            format!("cannot retain dependency leaf across substitution: {error}")
-        })?;
-        let intermediate_error = intermediate_receipt
-            .revalidate_full_until(transaction)
-            .expect_err("a replaced dependency ancestor must fail");
-        if !matches!(
-            intermediate_error.as_str(),
-            "Mach-O dependency identity changed before use"
-                | "Mach-O dependency ancestor identity changed before use"
-        ) {
-            return Err(format!(
-                "dependency ancestor substitution diagnostic differs: {intermediate_error}"
-            ));
-        }
-
-        let symlink_parent = root.join("symlink-parent");
-        let first_target = symlink_parent.join("first");
-        let second_target = symlink_parent.join("second");
-        let first_leaf = first_target.join("dependency");
-        create_native_archiver_dependency_fixture(&first_leaf, b"symlink-target\n")?;
-        fs::create_dir(&second_target)
-            .map_err(|error| format!("cannot create alternate dependency target: {error}"))?;
-        fs::hard_link(&first_leaf, second_target.join("dependency")).map_err(|error| {
-            format!("cannot retain dependency across symlink retarget: {error}")
-        })?;
-        let alias = symlink_parent.join("alias");
-        symlink(&first_target, &alias)
-            .map_err(|error| format!("cannot create dependency ancestor symlink: {error}"))?;
-        let alias_leaf = alias.join("dependency");
-        let symlink_receipt =
-            BoundNativeArchiverDependency::bind_until(&alias_leaf, transaction, &authority)?;
-        fs::remove_file(&alias)
-            .map_err(|error| format!("cannot remove dependency ancestor symlink: {error}"))?;
-        symlink(&second_target, &alias)
-            .map_err(|error| format!("cannot retarget dependency ancestor symlink: {error}"))?;
-        if symlink_receipt.revalidate_full_until(transaction).is_ok() {
-            return Err("retargeted dependency ancestor retained its authority".to_owned());
-        }
-
-        let mode_parent = root.join("mode-parent");
-        let mode_leaf = mode_parent.join("dependency");
-        create_native_archiver_dependency_fixture(&mode_leaf, b"mode-receipt\n")?;
-        let mode_receipt =
-            BoundNativeArchiverDependency::bind_until(&mode_leaf, transaction, &authority)?;
-        fs::set_permissions(&mode_parent, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("cannot mutate dependency ancestor mode: {error}"))?;
-        let mode_error = mode_receipt
-            .revalidate_full_until(transaction)
-            .expect_err("a dependency ancestor mode mutation must fail");
-        if mode_error != "Mach-O dependency ancestor identity changed before use" {
-            return Err(format!(
-                "dependency ancestor mode diagnostic differs: {mode_error}"
-            ));
-        }
-
-        let acl_parent = root.join("acl-parent");
-        let acl_leaf = acl_parent.join("dependency");
-        create_native_archiver_dependency_fixture(&acl_leaf, b"acl-receipt\n")?;
-        let acl_receipt =
-            BoundNativeArchiverDependency::bind_until(&acl_leaf, transaction, &authority)?;
-        run_fixed_macos_chmod(
-            [
-                OsStr::new("+a"),
-                OsStr::new("everyone allow write"),
-                acl_parent.as_os_str(),
-            ],
-            "seed the dependency ancestor ACL mutation",
-        )?;
-        let acl_error = acl_receipt
-            .revalidate_full_until(transaction)
-            .expect_err("a dependency ancestor ACL mutation must fail");
-        if acl_error != "Mach-O dependency authority retains a macOS access-control list" {
-            return Err(format!(
-                "dependency ancestor ACL diagnostic differs: {acl_error}"
-            ));
-        }
-
-        let leaf_parent = root.join("leaf-parent");
-        let leaf = leaf_parent.join("dependency");
-        create_native_archiver_dependency_fixture(&leaf, b"first-leaf\n")?;
-        let leaf_receipt =
-            BoundNativeArchiverDependency::bind_until(&leaf, transaction, &authority)?;
-        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot open dependency leaf for mutation: {error}"))?;
-        fs::write(&leaf, b"other-leaf\n")
-            .map_err(|error| format!("cannot mutate dependency leaf bytes: {error}"))?;
-        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o555))
-            .map_err(|error| format!("cannot refreeze mutated dependency leaf: {error}"))?;
-        let leaf_error = leaf_receipt
-            .revalidate_full_until(transaction)
-            .expect_err("a dependency leaf byte mutation must fail");
-        if !matches!(
-            leaf_error.as_str(),
-            "Mach-O dependency identity changed before use"
-                | "Mach-O dependency content changed before use"
-        ) {
-            return Err(format!(
-                "dependency leaf mutation diagnostic differs: {leaf_error}"
-            ));
-        }
+        verify_dependency_sibling_churn(&root, transaction, &authority)?;
+        verify_dependency_ancestor_substitution(&root, transaction, &authority)?;
+        verify_dependency_symlink_retarget(&root, transaction, &authority)?;
+        verify_dependency_mode_mutation(&root, transaction, &authority)?;
+        verify_dependency_acl_mutation(&root, transaction, &authority)?;
+        verify_dependency_leaf_mutation(&root, transaction, &authority)?;
         Ok(())
     })();
     let cleanup = directory.close_until(transaction.completion_deadline);
@@ -7691,6 +8225,185 @@ pub(crate) fn verify_macos_native_archiver_dependency_receipt_for_integration() 
             "{primary}; native archiver dependency verifier cleanup also failed: {cleanup}"
         )),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_sibling_churn(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    let sibling_parent = root.join("sibling-parent");
+    let sibling_leaf = sibling_parent.join("bin/dependency");
+    create_native_archiver_dependency_fixture(&sibling_leaf, b"sibling-receipt\n")?;
+    let sibling = BoundNativeArchiverDependency::bind_until(&sibling_leaf, transaction, authority)?;
+    let unrelated = sibling_parent.join("unrelated");
+    fs::create_dir(&unrelated)
+        .map_err(|error| format!("cannot create dependency sibling churn: {error}"))?;
+    sibling
+        .revalidate_full_until(transaction)
+        .map_err(|error| {
+            format!("unrelated dependency sibling invalidated its authority: {error}")
+        })?;
+    fs::remove_dir(&unrelated)
+        .map_err(|error| format!("cannot remove dependency sibling churn: {error}"))?;
+    sibling
+        .revalidate_full_until(transaction)
+        .map_err(|error| format!("removed dependency sibling invalidated its authority: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_ancestor_substitution(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    let intermediate = root.join("intermediate-parent/bound");
+    let intermediate_leaf = intermediate.join("dependency");
+    create_native_archiver_dependency_fixture(&intermediate_leaf, b"intermediate\n")?;
+    let receipt =
+        BoundNativeArchiverDependency::bind_until(&intermediate_leaf, transaction, authority)?;
+    let displaced = intermediate.with_file_name("displaced");
+    fs::rename(&intermediate, &displaced)
+        .map_err(|error| format!("cannot displace dependency ancestor: {error}"))?;
+    fs::create_dir(&intermediate)
+        .map_err(|error| format!("cannot replace dependency ancestor: {error}"))?;
+    fs::hard_link(displaced.join("dependency"), &intermediate_leaf)
+        .map_err(|error| format!("cannot retain dependency leaf across substitution: {error}"))?;
+    let error = receipt
+        .revalidate_full_until(transaction)
+        .expect_err("a replaced dependency ancestor must fail");
+    if !matches!(
+        error.as_str(),
+        "Mach-O dependency identity changed before use"
+            | "Mach-O dependency ancestor identity changed before use"
+    ) {
+        return Err(format!(
+            "dependency ancestor substitution diagnostic differs: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_symlink_retarget(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let parent = root.join("symlink-parent");
+    let first_target = parent.join("first");
+    let second_target = parent.join("second");
+    let first_leaf = first_target.join("dependency");
+    create_native_archiver_dependency_fixture(&first_leaf, b"symlink-target\n")?;
+    fs::create_dir(&second_target)
+        .map_err(|error| format!("cannot create alternate dependency target: {error}"))?;
+    fs::hard_link(&first_leaf, second_target.join("dependency"))
+        .map_err(|error| format!("cannot retain dependency across symlink retarget: {error}"))?;
+    let alias = parent.join("alias");
+    symlink(&first_target, &alias)
+        .map_err(|error| format!("cannot create dependency ancestor symlink: {error}"))?;
+    let receipt = BoundNativeArchiverDependency::bind_until(
+        &alias.join("dependency"),
+        transaction,
+        authority,
+    )?;
+    fs::remove_file(&alias)
+        .map_err(|error| format!("cannot remove dependency ancestor symlink: {error}"))?;
+    symlink(&second_target, &alias)
+        .map_err(|error| format!("cannot retarget dependency ancestor symlink: {error}"))?;
+    if receipt.revalidate_full_until(transaction).is_ok() {
+        return Err("retargeted dependency ancestor retained its authority".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_mode_mutation(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = root.join("mode-parent");
+    let leaf = parent.join("dependency");
+    create_native_archiver_dependency_fixture(&leaf, b"mode-receipt\n")?;
+    let receipt = BoundNativeArchiverDependency::bind_until(&leaf, transaction, authority)?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot mutate dependency ancestor mode: {error}"))?;
+    let error = receipt
+        .revalidate_full_until(transaction)
+        .expect_err("a dependency ancestor mode mutation must fail");
+    if error != "Mach-O dependency ancestor identity changed before use" {
+        return Err(format!(
+            "dependency ancestor mode diagnostic differs: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_acl_mutation(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    let parent = root.join("acl-parent");
+    let leaf = parent.join("dependency");
+    create_native_archiver_dependency_fixture(&leaf, b"acl-receipt\n")?;
+    let receipt = BoundNativeArchiverDependency::bind_until(&leaf, transaction, authority)?;
+    run_fixed_macos_chmod(
+        [
+            OsStr::new("+a"),
+            OsStr::new("everyone allow write"),
+            parent.as_os_str(),
+        ],
+        "seed the dependency ancestor ACL mutation",
+    )?;
+    let error = receipt
+        .revalidate_full_until(transaction)
+        .expect_err("a dependency ancestor ACL mutation must fail");
+    if error != "Mach-O dependency authority retains a macOS access-control list" {
+        return Err(format!(
+            "dependency ancestor ACL diagnostic differs: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dependency_leaf_mutation(
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+    authority: &NativeArchiverOwnerAuthority,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let leaf = root.join("leaf-parent/dependency");
+    create_native_archiver_dependency_fixture(&leaf, b"first-leaf\n")?;
+    let receipt = BoundNativeArchiverDependency::bind_until(&leaf, transaction, authority)?;
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot open dependency leaf for mutation: {error}"))?;
+    fs::write(&leaf, b"other-leaf\n")
+        .map_err(|error| format!("cannot mutate dependency leaf bytes: {error}"))?;
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot refreeze mutated dependency leaf: {error}"))?;
+    let error = receipt
+        .revalidate_full_until(transaction)
+        .expect_err("a dependency leaf byte mutation must fail");
+    if !matches!(
+        error.as_str(),
+        "Mach-O dependency identity changed before use"
+            | "Mach-O dependency content changed before use"
+    ) {
+        return Err(format!(
+            "dependency leaf mutation diagnostic differs: {error}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -7710,29 +8423,23 @@ fn create_native_archiver_dependency_fixture(path: &Path, bytes: &[u8]) -> Resul
 
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_macos_native_archiver_receipt_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let mut source_directory = create_adapter_directory(Path::new("/private/tmp"))?;
     let mut directory = create_adapter_directory(Path::new("/private/tmp"))?;
     let source_root = source_directory.path().to_owned();
     let root = directory.path().to_owned();
     let started = Instant::now();
     let construction_envelope = NativeArchiveAdapterConstructionEnvelope {
-        execution_deadline: started
-            .checked_add(Duration::from_secs(60))
-            .ok_or_else(|| {
-                "native archiver construction verifier deadline overflowed".to_owned()
-            })?,
-        completion_deadline: started
-            .checked_add(Duration::from_secs(3 * 60))
-            .ok_or_else(|| {
-                "native archiver construction verifier cleanup deadline overflowed".to_owned()
-            })?,
-        archiver_execution_deadline: started
+        execution: started.checked_add(Duration::from_mins(1)).ok_or_else(|| {
+            "native archiver construction verifier deadline overflowed".to_owned()
+        })?,
+        completion: started.checked_add(Duration::from_mins(3)).ok_or_else(|| {
+            "native archiver construction verifier cleanup deadline overflowed".to_owned()
+        })?,
+        archiver_execution: started
             .checked_add(Duration::from_secs(45))
             .ok_or_else(|| "native archiver receipt deadline overflowed".to_owned())?,
-        archiver_completion_deadline: started
-            .checked_add(Duration::from_secs(60))
+        archiver_completion: started
+            .checked_add(Duration::from_mins(1))
             .ok_or_else(|| "native archiver receipt completion deadline overflowed".to_owned())?,
     };
     let transaction = NativeArchiverTransaction {
@@ -7740,477 +8447,595 @@ pub(crate) fn verify_macos_native_archiver_receipt_for_integration() -> Result<(
             .checked_add(Duration::from_secs(45))
             .ok_or_else(|| "native archiver receipt deadline overflowed".to_owned())?,
         completion_deadline: started
-            .checked_add(Duration::from_secs(60))
+            .checked_add(Duration::from_mins(1))
             .ok_or_else(|| "native archiver receipt completion deadline overflowed".to_owned())?,
     };
     let mut brokers = Vec::<NativeArchiveInputBroker>::new();
     let result = (|| {
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot open native archiver receipt root: {error}"))?;
-        prepare_adapter_work_directory(&root)?;
-        let source_prefix = source_root.join("llvm-source");
-        let source_bin = source_prefix.join("bin");
-        fs::create_dir_all(&source_bin)
-            .map_err(|error| format!("cannot create native archiver receipt source: {error}"))?;
-        let source_archiver = source_bin.join("llvm-ar");
-        let current_executable = std::env::current_exe()
-            .map_err(|error| format!("cannot locate native archiver receipt program: {error}"))?;
-        fs::copy(&current_executable, &source_archiver)
-            .map_err(|error| format!("cannot copy native archiver receipt program: {error}"))?;
-        fs::set_permissions(&source_archiver, fs::Permissions::from_mode(0o555))
-            .and_then(|()| fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o555)))
-            .and_then(|()| fs::set_permissions(&source_prefix, fs::Permissions::from_mode(0o555)))
-            .map_err(|error| format!("cannot freeze native archiver receipt source: {error}"))?;
-        strip_staged_native_acls_until(&source_prefix, Some(transaction.execution_deadline))?;
-        let otool = resolve_absolute_standard_executable(Path::new("/usr/bin/otool"))?;
-        let (files, load_graph, external_dependencies) = acquire_native_archiver_load_graph(
-            &source_archiver,
-            &source_prefix,
-            &otool,
-            &transaction,
-            &NativeArchiverOwnerAuthority::TrustedPublisher {
-                uid: nix::unistd::geteuid().as_raw(),
-            },
-        )?;
-        let acquired = AcquiredNativeArchiverSource {
-            source_prefix: fs::canonicalize(&source_prefix).map_err(|error| {
-                format!("cannot canonicalize native archiver receipt source: {error}")
-            })?,
-            files,
-            load_graph,
-            external_dependencies,
-            otool,
-        };
-        let staged = install_staged_native_archive_adapter(
-            &root,
-            &current_executable,
-            &acquired,
-            &transaction,
-        )?;
-        if staged.validation_passes.counts()
-            != (NativeArchiverValidationPassCounts {
-                full_closure: 1,
-                load_graph: 1,
-                spawn_preflight: 0,
-            })
-        {
-            return Err("initial native archiver pass receipt differs from policy".to_owned());
-        }
-        let stale_archiver_transaction = NativeArchiverTransaction {
-            execution_deadline: Instant::now(),
-            completion_deadline: transaction.completion_deadline,
-        };
-        let stale_error = staged
-            .revalidate_until(
-                stale_archiver_transaction.execution_deadline,
-                stale_archiver_transaction.completion_deadline,
-            )
-            .expect_err("stale archiver acquisition deadline must reject revalidation");
-        if !stale_error.contains(
-            "staged native toolchain absolute deadline expired before staged LLVM archiver revalidation",
-        ) {
-            return Err(format!(
-                "stale archiver deadline diagnostic differs: {stale_error}"
-            ));
-        }
-        let archiver_subtransaction = construction_envelope.archiver_transaction()?;
-        if archiver_subtransaction.execution_deadline > construction_envelope.execution_deadline
-            || archiver_subtransaction.completion_deadline
-                > construction_envelope.completion_deadline
-        {
-            return Err("native archiver sub-budget escaped its construction envelope".to_owned());
-        }
-        let toolchain_subtransaction = construction_envelope.toolchain_transaction()?;
-        if toolchain_subtransaction.execution_deadline != construction_envelope.execution_deadline
-            || toolchain_subtransaction.completion_deadline
-                != construction_envelope.completion_deadline
-        {
-            return Err(
-                "native toolchain sub-budget differs from its construction envelope".to_owned(),
-            );
-        }
-        staged.revalidate_until(
-            construction_envelope.execution_deadline,
-            construction_envelope.completion_deadline,
-        )?;
-        if staged.validation_passes.counts()
-            != (NativeArchiverValidationPassCounts {
-                full_closure: 1,
-                load_graph: 1,
-                spawn_preflight: 0,
-            })
-        {
-            return Err("final native archiver receipt rescanned its sealed closure".to_owned());
-        }
+        let staged = stage_native_archiver_receipt_fixture(&source_root, &root, transaction)?;
+        verify_native_archiver_receipt_deadlines(&staged, transaction, construction_envelope)?;
         let staging_root = root.join(".authority/inputs");
         let work = root.join(".stack-work");
-        brokers.push(NativeArchiveInputBroker::start(
+        verify_native_archiver_broker_authorizations(
+            &root,
             &staging_root,
-            nix::unistd::geteuid().as_raw(),
-            staged.clone(),
-            construction_envelope.execution_deadline,
-        )?);
-        let broker = brokers
-            .last_mut()
-            .ok_or_else(|| "native archiver verifier broker owner is absent".to_owned())?;
-        let trusted_group = nix::unistd::getegid().as_raw();
-        let authority_root = root.join(".authority");
-        for directory in [&root, &authority_root, &staging_root] {
-            std::os::unix::fs::chown(directory, None, Some(trusted_group)).map_err(|error| {
-                format!("cannot bind brokered archiver verifier group: {error}")
-            })?;
-        }
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o2755))
-            .and_then(|()| fs::set_permissions(&authority_root, fs::Permissions::from_mode(0o555)))
-            .and_then(|()| fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o2710)))
-            .map_err(|error| format!("cannot seal brokered archiver verifier: {error}"))?;
-        let capability = NativeArchiveInputBrokerCapability::bind(
-            &root,
-            construction_envelope.execution_deadline,
-        )
-        .map_err(|error| format!("cannot bind brokered archiver verifier: {error}"))?;
-        for expected_authorizations in 1..=3 {
-            let arguments = vec![OsString::from("__native-archiver-receipt-child")];
-            let authorized = capability
-                .authorize_archiver(&arguments, &work, construction_envelope.execution_deadline)
-                .map_err(|error| format!("cannot authorize brokered archiver verifier: {error}"))?;
-            let result = transaction
-                .run(authorized.command(arguments, &work))
-                .map_err(|error| format!("cannot run broker-authorized archiver: {error}"))?;
-            if result.timed_out
-                || !result.status.success()
-                || result.stdout != b"member.o\n"
-                || broker.authorization_count() != expected_authorizations
-                || staged.validation_passes.counts()
-                    != (NativeArchiverValidationPassCounts {
-                        full_closure: 1,
-                        load_graph: 1,
-                        spawn_preflight: expected_authorizations,
-                    })
-            {
-                return Err(
-                    "brokered archiver authorization rescanned or did not execute exactly"
-                        .to_owned(),
-                );
-            }
-        }
-        let authorizations_before_expiry = broker.authorization_count();
-        if capability
-            .authorize_archiver(
-                &[OsString::from("__native-archiver-receipt-child")],
-                &work,
-                Instant::now(),
-            )
-            .is_ok()
-            || broker.authorization_count() != authorizations_before_expiry
-        {
-            return Err("expired brokered archiver request reached authority binding".to_owned());
-        }
-        broker.close_until(construction_envelope.completion_deadline)?;
-
-        let before_mid_authorization_expiry = staged.validation_passes.counts();
-        brokers.push(
-            NativeArchiveInputBroker::start_with_expired_authorization_for_integration(
-                &staging_root,
-                nix::unistd::geteuid().as_raw(),
-                staged.clone(),
-                construction_envelope.completion_deadline,
-            )?,
-        );
-        let expiring_broker = brokers
-            .last_mut()
-            .ok_or_else(|| "expiring archiver verifier broker owner is absent".to_owned())?;
-        let expiring_capability = NativeArchiveInputBrokerCapability::bind(
-            &root,
-            construction_envelope.completion_deadline,
-        )
-        .map_err(|error| format!("cannot bind expiring archiver verifier: {error}"))?;
-        let mid_authorization_error = match expiring_capability.authorize_archiver(
-            &[OsString::from("__native-archiver-receipt-child")],
             &work,
-            construction_envelope.completion_deadline,
-        ) {
-            Ok(_) => {
-                return Err(
-                    "an authorization expiring after request receipt unexpectedly succeeded"
-                        .to_owned(),
-                );
-            }
-            Err(error) => error,
-        };
-        if !mid_authorization_error
-            .to_string()
-            .contains("closed during authorization state")
-            || expiring_broker.authorization_count() != 0
-            || staged.validation_passes.counts() != before_mid_authorization_expiry
-        {
-            return Err(format!(
-                "mid-authorization expiry performed late authority work: {mid_authorization_error}"
-            ));
-        }
-        expiring_broker.close_until(construction_envelope.completion_deadline)?;
-
-        let before_drip_expiry = staged.validation_passes.counts();
-        brokers.push(
-            NativeArchiveInputBroker::start_with_drip_expiry_for_integration(
-                &staging_root,
-                nix::unistd::geteuid().as_raw(),
-                staged.clone(),
-                construction_envelope.completion_deadline,
-            )?,
-        );
-        let drip_broker = brokers
-            .last_mut()
-            .ok_or_else(|| "drip-expiry broker owner is absent".to_owned())?;
-        let mut drip_stream = std::os::unix::net::UnixStream::connect(&drip_broker.socket)
-            .map_err(|error| format!("cannot connect drip-expiry verifier: {error}"))?;
-        configure_native_archive_broker_stream(
-            &drip_stream,
-            construction_envelope.completion_deadline,
+            &staged,
+            transaction,
+            construction_envelope,
+            &mut brokers,
         )?;
-        drip_stream
-            .write_all(NATIVE_ARCHIVE_AUTH_BROKER_MAGIC)
-            .map_err(|error| format!("cannot write drip-expiry verifier magic: {error}"))?;
-        let mut readiness = [0_u8; 1];
-        read_native_archive_broker_exact_until(
-            &mut drip_stream,
-            &mut readiness,
-            construction_envelope.completion_deadline,
-            "drip-expiry readiness",
-            false,
-        )?;
-        if readiness != [NATIVE_ARCHIVE_AUTH_BROKER_READY] {
-            return Err("drip-expiry broker readiness differs".to_owned());
-        }
-        let remaining_millis = u64::try_from(
-            construction_envelope
-                .completion_deadline
-                .saturating_duration_since(Instant::now())
-                .min(NATIVE_ARCHIVE_AUTHORIZATION_BUDGET)
-                .as_millis(),
-        )
-        .map_err(|_| "drip-expiry authorization cutoff overflowed".to_owned())?;
-        drip_stream
-            .write_all(&remaining_millis.to_le_bytes())
-            .map_err(|error| format!("cannot write drip-expiry cutoff: {error}"))?;
-        write_native_archive_broker_u32(&mut drip_stream, 1)?;
-        write_native_archive_broker_u32(&mut drip_stream, 2)?;
-        drip_stream
-            .write_all(b"x")
-            .map_err(|error| format!("cannot write drip-expiry argument prefix: {error}"))?;
-        let mut state = [0_u8; 1];
-        let drip_error = read_native_archive_broker_exact_until(
-            &mut drip_stream,
-            &mut state,
-            construction_envelope.completion_deadline,
-            "drip-expiry authorization state",
-            false,
-        )
-        .expect_err("a drip-fed authorization crossing its cutoff must close without a response");
-        if !drip_error.contains("closed during drip-expiry authorization state")
-            || drip_broker.authorization_count() != 0
-            || staged.validation_passes.counts() != before_drip_expiry
-        {
-            return Err(format!(
-                "drip-fed authorization expiry performed late authority work: {drip_error}"
-            ));
-        }
-        drip_broker.close_until(construction_envelope.completion_deadline)?;
 
-        let before_magic_expiry = staged.validation_passes.counts();
-        brokers.push(
-            NativeArchiveInputBroker::start_with_magic_drip_expiry_for_integration(
-                &staging_root,
-                nix::unistd::geteuid().as_raw(),
-                staged.clone(),
-                construction_envelope.completion_deadline,
-            )?,
-        );
-        let magic_broker = brokers
-            .last_mut()
-            .ok_or_else(|| "magic-expiry broker owner is absent".to_owned())?;
-        let mut magic_stream = std::os::unix::net::UnixStream::connect(&magic_broker.socket)
-            .map_err(|error| format!("cannot connect magic-expiry verifier: {error}"))?;
-        configure_native_archive_broker_stream(
-            &magic_stream,
-            construction_envelope.completion_deadline,
-        )?;
-        magic_stream
-            .write_all(&NATIVE_ARCHIVE_AUTH_BROKER_MAGIC[..1])
-            .map_err(|error| format!("cannot write magic-expiry prefix: {error}"))?;
-        let mut readiness = [0_u8; 1];
-        let magic_error = read_native_archive_broker_exact_until(
-            &mut magic_stream,
-            &mut readiness,
-            construction_envelope.completion_deadline,
-            "magic-expiry readiness",
-            false,
-        )
-        .expect_err("a drip-fed broker magic crossing its cutoff must close without readiness");
-        if !magic_error.contains("closed during magic-expiry readiness")
-            || magic_broker.authorization_count() != 0
-            || staged.validation_passes.counts() != before_magic_expiry
-        {
-            return Err(format!(
-                "drip-fed broker magic expiry performed late authority work: {magic_error}"
-            ));
-        }
-        magic_broker.close_until(construction_envelope.completion_deadline)?;
-
-        let before_input_expiry = staged.validation_passes.counts();
-        brokers.push(
-            NativeArchiveInputBroker::start_with_input_drip_expiry_for_integration(
-                &staging_root,
-                nix::unistd::geteuid().as_raw(),
-            )?,
-        );
-        let input_broker = brokers
-            .last_mut()
-            .ok_or_else(|| "input-expiry broker owner is absent".to_owned())?;
-        let mut input_stream = std::os::unix::net::UnixStream::connect(&input_broker.socket)
-            .map_err(|error| format!("cannot connect input-expiry verifier: {error}"))?;
-        configure_native_archive_broker_stream(
-            &input_stream,
-            construction_envelope.completion_deadline,
-        )?;
-        input_stream
-            .write_all(NATIVE_ARCHIVE_INPUT_BROKER_MAGIC)
-            .map_err(|error| format!("cannot write input-expiry magic: {error}"))?;
-        write_native_archive_broker_u32(&mut input_stream, 1)?;
-        write_native_archive_broker_u32(&mut input_stream, 2)?;
-        input_stream
-            .write_all(b"x")
-            .map_err(|error| format!("cannot write input-expiry path prefix: {error}"))?;
-        let mut state = [0_u8; 1];
-        let input_error = read_native_archive_broker_exact_until(
-            &mut input_stream,
-            &mut state,
-            construction_envelope.completion_deadline,
-            "input-expiry response state",
-            false,
-        )
-        .expect_err("a drip-fed input request crossing its cutoff must close without a response");
-        if !input_error.contains("closed during input-expiry response state")
-            || input_broker.authorization_count() != 0
-            || staged.validation_passes.counts() != before_input_expiry
-            || staging_root.join("request-0").exists()
-            || staging_root.join("request-0/member-0").exists()
-        {
-            return Err(format!(
-                "drip-fed input expiry performed late copy or authority work: {input_error}"
-            ));
-        }
-        input_broker.close_until(construction_envelope.completion_deadline)?;
-        if fs::read_dir(&staging_root)
-            .map_err(|error| format!("cannot inspect input-expiry cleanup: {error}"))?
-            .next()
-            .is_some()
-        {
-            return Err("drip-fed input expiry staging remains after cleanup".to_owned());
-        }
-
-        let before_expired = staged.validation_passes.counts();
-        let expired = NativeArchiverTransaction {
-            execution_deadline: Instant::now(),
-            completion_deadline: transaction.completion_deadline,
-        };
-        if expired
-            .run(staged.command(Duration::from_secs(5), ["__native-archiver-receipt-child"]))
-            .is_ok()
-            || staged.validation_passes.counts() != before_expired
-        {
-            return Err("expired native archiver receipt reached preflight or spawn".to_owned());
-        }
-
-        fs::set_permissions(&staged.distribution.root, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot open native archiver receipt prefix: {error}"))?;
-        fs::write(staged.distribution.root.join("unexpected"), b"unexpected\n")
-            .map_err(|error| format!("cannot mutate native archiver receipt prefix: {error}"))?;
-        if transaction
-            .run(staged.command(Duration::from_secs(5), ["__native-archiver-receipt-child"]))
-            .is_ok()
-            || staged.validation_passes.counts() != before_expired
-        {
-            return Err("mutated native archiver closure reached spawn".to_owned());
-        }
-        brokers.push(NativeArchiveInputBroker::start_for_integration(
+        verify_mid_authorization_expiry(
+            &root,
             &staging_root,
-            nix::unistd::geteuid().as_raw(),
-            1,
-            1,
-        )?);
-        let finalizer_probe: Result<(), String> =
-            Err("injected native archiver verifier failure after broker start".to_owned());
-        match finalizer_probe {
-            Err(error)
-                if error == "injected native archiver verifier failure after broker start" => {}
-            Err(error) => {
-                return Err(format!(
-                    "native archiver verifier finalizer injection differs: {error}"
-                ));
-            }
-            Ok(()) => {
-                return Err(
-                    "native archiver verifier finalizer injection unexpectedly succeeded"
-                        .to_owned(),
-                );
-            }
-        }
-        let ordered_failure = compose_native_archiver_verifier_completion(
-            Err("injected verifier primary".to_owned()),
-            Err("injected broker cleanup".to_owned()),
-            Err("injected directory cleanup".to_owned()),
-        )
-        .expect_err("verifier failure composition must retain every cause");
-        if ordered_failure
-            != "injected verifier primary; native archiver broker cleanup failed: injected broker cleanup; native archiver receipt cleanup failed: injected directory cleanup"
-        {
-            return Err(format!(
-                "native archiver verifier failure order differs: {ordered_failure}"
-            ));
-        }
+            &work,
+            &staged,
+            construction_envelope,
+            &mut brokers,
+        )?;
+
+        verify_native_archiver_drip_expiry(
+            &staging_root,
+            &staged,
+            construction_envelope,
+            &mut brokers,
+        )?;
+
+        verify_native_archiver_magic_expiry(
+            &staging_root,
+            &staged,
+            construction_envelope,
+            &mut brokers,
+        )?;
+
+        verify_native_archiver_input_expiry(
+            &staging_root,
+            &staged,
+            construction_envelope,
+            &mut brokers,
+        )?;
+
+        verify_expired_and_mutated_native_archiver_receipt(&staged, transaction)?;
+        verify_native_archiver_finalizer_contract(&staging_root, &mut brokers)?;
         Ok(())
     })();
-    let mut broker_cleanup_failures = Vec::new();
+    let broker_cleanup = cleanup_native_archiver_verifier_brokers(
+        &root,
+        &mut brokers,
+        construction_envelope.completion,
+    );
+    let cleanup = cleanup_native_archiver_verifier_directories(
+        &mut directory,
+        &mut source_directory,
+        construction_envelope.completion,
+    );
+    compose_native_archiver_verifier_completion(result, broker_cleanup, cleanup)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_expired_and_mutated_native_archiver_receipt(
+    staged: &BoundNativeArchiver,
+    transaction: NativeArchiverTransaction,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let before = staged.validation_passes.counts();
+    let expired = NativeArchiverTransaction {
+        execution_deadline: Instant::now(),
+        completion_deadline: transaction.completion_deadline,
+    };
+    if expired
+        .run(staged.command(Duration::from_secs(5), ["__native-archiver-receipt-child"]))
+        .is_ok()
+        || staged.validation_passes.counts() != before
+    {
+        return Err("expired native archiver receipt reached preflight or spawn".to_owned());
+    }
+    fs::set_permissions(&staged.distribution.root, fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot open native archiver receipt prefix: {error}"))?;
+    fs::write(staged.distribution.root.join("unexpected"), b"unexpected\n")
+        .map_err(|error| format!("cannot mutate native archiver receipt prefix: {error}"))?;
+    if transaction
+        .run(staged.command(Duration::from_secs(5), ["__native-archiver-receipt-child"]))
+        .is_ok()
+        || staged.validation_passes.counts() != before
+    {
+        return Err("mutated native archiver closure reached spawn".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_finalizer_contract(
+    staging_root: &Path,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    brokers.push(NativeArchiveInputBroker::start_for_integration(
+        staging_root,
+        nix::unistd::geteuid().as_raw(),
+        1,
+        1,
+    )?);
+    let finalizer_probe: Result<(), String> =
+        Err("injected native archiver verifier failure after broker start".to_owned());
+    match finalizer_probe {
+        Err(error) if error == "injected native archiver verifier failure after broker start" => {}
+        Err(error) => {
+            return Err(format!(
+                "native archiver verifier finalizer injection differs: {error}"
+            ));
+        }
+        Ok(()) => {
+            return Err(
+                "native archiver verifier finalizer injection unexpectedly succeeded".to_owned(),
+            );
+        }
+    }
+    let ordered_failure = compose_native_archiver_verifier_completion(
+        Err("injected verifier primary".to_owned()),
+        Err("injected broker cleanup".to_owned()),
+        Err("injected directory cleanup".to_owned()),
+    )
+    .expect_err("verifier failure composition must retain every cause");
+    if ordered_failure
+        != "injected verifier primary; native archiver broker cleanup failed: injected broker cleanup; native archiver receipt cleanup failed: injected directory cleanup"
+    {
+        return Err(format!(
+            "native archiver verifier failure order differs: {ordered_failure}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_native_archiver_verifier_brokers(
+    root: &Path,
+    brokers: &mut [NativeArchiveInputBroker],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
     for broker in brokers.iter_mut().rev() {
-        if let Err(error) = broker.close_until(construction_envelope.completion_deadline) {
-            broker_cleanup_failures.push(error);
+        if let Err(error) = broker.close_until(deadline) {
+            failures.push(error);
         }
         if broker.socket_root.exists() || broker.socket.exists() || broker.capability.exists() {
-            broker_cleanup_failures
+            failures
                 .push("native archiver verifier broker authority remains after cleanup".to_owned());
         }
     }
-    let verifier_staging = root.join(".authority/inputs");
-    match fs::read_dir(&verifier_staging) {
+    match fs::read_dir(root.join(".authority/inputs")) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                broker_cleanup_failures
-                    .push("native archiver verifier staging remains after cleanup".to_owned());
+                failures.push("native archiver verifier staging remains after cleanup".to_owned());
             }
         }
-        Err(error) => broker_cleanup_failures.push(format!(
+        Err(error) => failures.push(format!(
             "cannot attest native archiver verifier staging cleanup: {error}"
         )),
     }
-    let broker_cleanup = if broker_cleanup_failures.is_empty() {
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(broker_cleanup_failures.join("; "))
-    };
-    let mut cleanup_failures = Vec::new();
-    if let Err(error) = directory.close_until(construction_envelope.completion_deadline) {
-        cleanup_failures.push(error);
+        Err(failures.join("; "))
     }
-    if let Err(error) = source_directory.close_until(construction_envelope.completion_deadline) {
-        cleanup_failures.push(error);
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_native_archiver_verifier_directories(
+    directory: &mut AdapterDirectory,
+    source_directory: &mut AdapterDirectory,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = directory.close_until(deadline) {
+        failures.push(error);
     }
-    let cleanup = if cleanup_failures.is_empty() {
+    if let Err(error) = source_directory.close_until(deadline) {
+        failures.push(error);
+    }
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(cleanup_failures.join("; "))
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_mid_authorization_expiry(
+    root: &Path,
+    staging_root: &Path,
+    work: &Path,
+    staged: &BoundNativeArchiver,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    let before = staged.validation_passes.counts();
+    brokers.push(
+        NativeArchiveInputBroker::start_with_expired_authorization_for_integration(
+            staging_root,
+            nix::unistd::geteuid().as_raw(),
+            staged.clone(),
+            envelope.completion,
+        )?,
+    );
+    let broker = brokers
+        .last_mut()
+        .ok_or_else(|| "expiring archiver verifier broker owner is absent".to_owned())?;
+    let capability = NativeArchiveInputBrokerCapability::bind(root, envelope.completion)
+        .map_err(|error| format!("cannot bind expiring archiver verifier: {error}"))?;
+    let Err(error) = capability.authorize_archiver(
+        &[OsString::from("__native-archiver-receipt-child")],
+        work,
+        envelope.completion,
+    ) else {
+        return Err(
+            "an authorization expiring after request receipt unexpectedly succeeded".to_owned(),
+        );
     };
-    compose_native_archiver_verifier_completion(result, broker_cleanup, cleanup)
+    if !error
+        .to_string()
+        .contains("closed during authorization state")
+        || broker.authorization_count() != 0
+        || staged.validation_passes.counts() != before
+    {
+        return Err(format!(
+            "mid-authorization expiry performed late authority work: {error}"
+        ));
+    }
+    broker.close_until(envelope.completion)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_drip_expiry(
+    staging_root: &Path,
+    staged: &BoundNativeArchiver,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    let before = staged.validation_passes.counts();
+    brokers.push(
+        NativeArchiveInputBroker::start_with_drip_expiry_for_integration(
+            staging_root,
+            nix::unistd::geteuid().as_raw(),
+            staged.clone(),
+            envelope.completion,
+        )?,
+    );
+    let broker = brokers
+        .last_mut()
+        .ok_or_else(|| "drip-expiry broker owner is absent".to_owned())?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
+        .map_err(|error| format!("cannot connect drip-expiry verifier: {error}"))?;
+    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    stream
+        .write_all(NATIVE_ARCHIVE_AUTH_BROKER_MAGIC)
+        .map_err(|error| format!("cannot write drip-expiry verifier magic: {error}"))?;
+    let mut readiness = [0_u8; 1];
+    read_native_archive_broker_exact_until(
+        &mut stream,
+        &mut readiness,
+        envelope.completion,
+        "drip-expiry readiness",
+        false,
+    )?;
+    if readiness != [NATIVE_ARCHIVE_AUTH_BROKER_READY] {
+        return Err("drip-expiry broker readiness differs".to_owned());
+    }
+    let remaining_millis = u64::try_from(
+        envelope
+            .completion
+            .saturating_duration_since(Instant::now())
+            .min(NATIVE_ARCHIVE_AUTHORIZATION_BUDGET)
+            .as_millis(),
+    )
+    .map_err(|_| "drip-expiry authorization cutoff overflowed".to_owned())?;
+    stream
+        .write_all(&remaining_millis.to_le_bytes())
+        .map_err(|error| format!("cannot write drip-expiry cutoff: {error}"))?;
+    write_native_archive_broker_u32(&mut stream, 1)?;
+    write_native_archive_broker_u32(&mut stream, 2)?;
+    stream
+        .write_all(b"x")
+        .map_err(|error| format!("cannot write drip-expiry argument prefix: {error}"))?;
+    let mut state = [0_u8; 1];
+    let error = read_native_archive_broker_exact_until(
+        &mut stream,
+        &mut state,
+        envelope.completion,
+        "drip-expiry authorization state",
+        false,
+    )
+    .expect_err("a drip-fed authorization crossing its cutoff must close without a response");
+    if !error.contains("closed during drip-expiry authorization state")
+        || broker.authorization_count() != 0
+        || staged.validation_passes.counts() != before
+    {
+        return Err(format!(
+            "drip-fed authorization expiry performed late authority work: {error}"
+        ));
+    }
+    broker.close_until(envelope.completion)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_magic_expiry(
+    staging_root: &Path,
+    staged: &BoundNativeArchiver,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    let before = staged.validation_passes.counts();
+    brokers.push(
+        NativeArchiveInputBroker::start_with_magic_drip_expiry_for_integration(
+            staging_root,
+            nix::unistd::geteuid().as_raw(),
+            staged.clone(),
+            envelope.completion,
+        )?,
+    );
+    let broker = brokers
+        .last_mut()
+        .ok_or_else(|| "magic-expiry broker owner is absent".to_owned())?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
+        .map_err(|error| format!("cannot connect magic-expiry verifier: {error}"))?;
+    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    stream
+        .write_all(&NATIVE_ARCHIVE_AUTH_BROKER_MAGIC[..1])
+        .map_err(|error| format!("cannot write magic-expiry prefix: {error}"))?;
+    let mut readiness = [0_u8; 1];
+    let error = read_native_archive_broker_exact_until(
+        &mut stream,
+        &mut readiness,
+        envelope.completion,
+        "magic-expiry readiness",
+        false,
+    )
+    .expect_err("a drip-fed broker magic crossing its cutoff must close without readiness");
+    if !error.contains("closed during magic-expiry readiness")
+        || broker.authorization_count() != 0
+        || staged.validation_passes.counts() != before
+    {
+        return Err(format!(
+            "drip-fed broker magic expiry performed late authority work: {error}"
+        ));
+    }
+    broker.close_until(envelope.completion)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_input_expiry(
+    staging_root: &Path,
+    staged: &BoundNativeArchiver,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    let before = staged.validation_passes.counts();
+    brokers.push(
+        NativeArchiveInputBroker::start_with_input_drip_expiry_for_integration(
+            staging_root,
+            nix::unistd::geteuid().as_raw(),
+        )?,
+    );
+    let broker = brokers
+        .last_mut()
+        .ok_or_else(|| "input-expiry broker owner is absent".to_owned())?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
+        .map_err(|error| format!("cannot connect input-expiry verifier: {error}"))?;
+    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    stream
+        .write_all(NATIVE_ARCHIVE_INPUT_BROKER_MAGIC)
+        .map_err(|error| format!("cannot write input-expiry magic: {error}"))?;
+    write_native_archive_broker_u32(&mut stream, 1)?;
+    write_native_archive_broker_u32(&mut stream, 2)?;
+    stream
+        .write_all(b"x")
+        .map_err(|error| format!("cannot write input-expiry path prefix: {error}"))?;
+    let mut state = [0_u8; 1];
+    let error = read_native_archive_broker_exact_until(
+        &mut stream,
+        &mut state,
+        envelope.completion,
+        "input-expiry response state",
+        false,
+    )
+    .expect_err("a drip-fed input request crossing its cutoff must close without a response");
+    if !error.contains("closed during input-expiry response state")
+        || broker.authorization_count() != 0
+        || staged.validation_passes.counts() != before
+        || staging_root.join("request-0").exists()
+        || staging_root.join("request-0/member-0").exists()
+    {
+        return Err(format!(
+            "drip-fed input expiry performed late copy or authority work: {error}"
+        ));
+    }
+    broker.close_until(envelope.completion)?;
+    if fs::read_dir(staging_root)
+        .map_err(|error| format!("cannot inspect input-expiry cleanup: {error}"))?
+        .next()
+        .is_some()
+    {
+        return Err("drip-fed input expiry staging remains after cleanup".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_receipt_deadlines(
+    staged: &BoundNativeArchiver,
+    transaction: NativeArchiverTransaction,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+) -> Result<(), String> {
+    let stale = NativeArchiverTransaction {
+        execution_deadline: Instant::now(),
+        completion_deadline: transaction.completion_deadline,
+    };
+    let stale_error = staged
+        .revalidate_until(stale.execution_deadline, stale.completion_deadline)
+        .expect_err("stale archiver acquisition deadline must reject revalidation");
+    if !stale_error.contains(
+        "staged native toolchain absolute deadline expired before staged LLVM archiver revalidation",
+    ) {
+        return Err(format!(
+            "stale archiver deadline diagnostic differs: {stale_error}"
+        ));
+    }
+    let archiver = envelope.archiver_transaction()?;
+    if archiver.execution_deadline > envelope.execution
+        || archiver.completion_deadline > envelope.completion
+    {
+        return Err("native archiver sub-budget escaped its construction envelope".to_owned());
+    }
+    let toolchain = envelope.toolchain_transaction()?;
+    if toolchain.execution_deadline != envelope.execution
+        || toolchain.completion_deadline != envelope.completion
+    {
+        return Err(
+            "native toolchain sub-budget differs from its construction envelope".to_owned(),
+        );
+    }
+    staged.revalidate_until(envelope.execution, envelope.completion)?;
+    if staged.validation_passes.counts()
+        != (NativeArchiverValidationPassCounts {
+            full_closure: 1,
+            load_graph: 1,
+            spawn_preflight: 0,
+        })
+    {
+        return Err("final native archiver receipt rescanned its sealed closure".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archiver_broker_authorizations(
+    root: &Path,
+    staging_root: &Path,
+    work: &Path,
+    staged: &BoundNativeArchiver,
+    transaction: NativeArchiverTransaction,
+    envelope: NativeArchiveAdapterConstructionEnvelope,
+    brokers: &mut Vec<NativeArchiveInputBroker>,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    brokers.push(NativeArchiveInputBroker::start(
+        staging_root,
+        nix::unistd::geteuid().as_raw(),
+        staged.clone(),
+        envelope.execution,
+    )?);
+    let broker = brokers
+        .last_mut()
+        .ok_or_else(|| "native archiver verifier broker owner is absent".to_owned())?;
+    let trusted_group = nix::unistd::getegid().as_raw();
+    let authority_root = root.join(".authority");
+    for directory in [root, authority_root.as_path(), staging_root] {
+        std::os::unix::fs::chown(directory, None, Some(trusted_group))
+            .map_err(|error| format!("cannot bind brokered archiver verifier group: {error}"))?;
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o2755))
+        .and_then(|()| fs::set_permissions(&authority_root, fs::Permissions::from_mode(0o555)))
+        .and_then(|()| fs::set_permissions(staging_root, fs::Permissions::from_mode(0o2710)))
+        .map_err(|error| format!("cannot seal brokered archiver verifier: {error}"))?;
+    let capability = NativeArchiveInputBrokerCapability::bind(root, envelope.execution)
+        .map_err(|error| format!("cannot bind brokered archiver verifier: {error}"))?;
+    for expected_authorizations in 1..=3 {
+        let arguments = vec![OsString::from("__native-archiver-receipt-child")];
+        let authorized = capability
+            .authorize_archiver(&arguments, work, envelope.execution)
+            .map_err(|error| format!("cannot authorize brokered archiver verifier: {error}"))?;
+        let result = transaction
+            .run(authorized.command(arguments, work))
+            .map_err(|error| format!("cannot run broker-authorized archiver: {error}"))?;
+        if result.timed_out
+            || !result.status.success()
+            || result.stdout != b"member.o\n"
+            || broker.authorization_count() != expected_authorizations
+            || staged.validation_passes.counts()
+                != (NativeArchiverValidationPassCounts {
+                    full_closure: 1,
+                    load_graph: 1,
+                    spawn_preflight: expected_authorizations,
+                })
+        {
+            return Err(
+                "brokered archiver authorization rescanned or did not execute exactly".to_owned(),
+            );
+        }
+    }
+    let before_expiry = broker.authorization_count();
+    if capability
+        .authorize_archiver(
+            &[OsString::from("__native-archiver-receipt-child")],
+            work,
+            Instant::now(),
+        )
+        .is_ok()
+        || broker.authorization_count() != before_expiry
+    {
+        return Err("expired brokered archiver request reached authority binding".to_owned());
+    }
+    broker.close_until(envelope.completion)
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_archiver_receipt_fixture(
+    source_root: &Path,
+    root: &Path,
+    transaction: NativeArchiverTransaction,
+) -> Result<BoundNativeArchiver, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot open native archiver receipt root: {error}"))?;
+    prepare_adapter_work_directory(root)?;
+    let source_prefix = source_root.join("llvm-source");
+    let source_bin = source_prefix.join("bin");
+    fs::create_dir_all(&source_bin)
+        .map_err(|error| format!("cannot create native archiver receipt source: {error}"))?;
+    let source_archiver = source_bin.join("llvm-ar");
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("cannot locate native archiver receipt program: {error}"))?;
+    fs::copy(&current_executable, &source_archiver)
+        .map_err(|error| format!("cannot copy native archiver receipt program: {error}"))?;
+    fs::set_permissions(&source_archiver, fs::Permissions::from_mode(0o555))
+        .and_then(|()| fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o555)))
+        .and_then(|()| fs::set_permissions(&source_prefix, fs::Permissions::from_mode(0o555)))
+        .map_err(|error| format!("cannot freeze native archiver receipt source: {error}"))?;
+    strip_staged_native_acls_until(&source_prefix, Some(transaction.execution_deadline))?;
+    let otool = resolve_absolute_standard_executable(Path::new("/usr/bin/otool"))?;
+    let (files, load_graph, external_dependencies) = acquire_native_archiver_load_graph(
+        &source_archiver,
+        &source_prefix,
+        &otool,
+        &transaction,
+        &NativeArchiverOwnerAuthority::TrustedPublisher {
+            uid: nix::unistd::geteuid().as_raw(),
+        },
+    )?;
+    let acquired = AcquiredNativeArchiverSource {
+        source_prefix: fs::canonicalize(&source_prefix).map_err(|error| {
+            format!("cannot canonicalize native archiver receipt source: {error}")
+        })?,
+        files,
+        load_graph,
+        external_dependencies,
+        otool,
+    };
+    let staged =
+        install_staged_native_archive_adapter(root, &current_executable, &acquired, &transaction)?;
+    if staged.validation_passes.counts()
+        != (NativeArchiverValidationPassCounts {
+            full_closure: 1,
+            load_graph: 1,
+            spawn_preflight: 0,
+        })
+    {
+        return Err("initial native archiver pass receipt differs from policy".to_owned());
+    }
+    Ok(staged)
 }
 
 #[cfg(target_os = "macos")]
@@ -8438,12 +9263,17 @@ pub struct CommandResult {
     pub stderr_bytes: u64,
     pub stdout_sha256: Digest,
     pub stderr_sha256: Digest,
-    pub cleanup_id: Option<u64>,
-    pub termination_forced: bool,
-    pub termination_reaped: bool,
-    pub candidate_quiescence_complete: bool,
+    pub termination: CommandTerminationResult,
     #[cfg(windows)]
     pub windows_launch_control: Option<hell_testkit::WindowsLaunchControlReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandTerminationResult {
+    pub cleanup_id: Option<u64>,
+    pub forced: bool,
+    pub reaped: bool,
+    pub candidate_quiescence_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8581,7 +9411,6 @@ impl CommandSpec {
         Self::cargo_from_resolution(timeout, resolve_cargo_executable())
     }
 
-    #[cfg(windows)]
     pub(crate) fn trusted_absolute(program: PathBuf, timeout: Duration) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(&program)
             .map_err(|error| format!("cannot inspect trusted Windows executable: {error}"))?;
@@ -8637,6 +9466,21 @@ impl CommandSpec {
         spec
     }
 
+    #[cfg(unix)]
+    pub(crate) fn trusted_standard(
+        timeout: Duration,
+        resolved: &ResolvedStandardExecutable,
+    ) -> Result<Self, String> {
+        let invocation_name = resolved
+            .invocation_path()
+            .file_name()
+            .ok_or_else(|| "standard executable has no invocation name".to_owned())?;
+        let mut spec = Self::new(resolved.invocation_path().as_os_str().to_owned(), timeout);
+        spec.canonical_executable_identity = Some(resolved.canonical_identity().to_owned());
+        spec.invocation_name = Some(invocation_name.to_owned());
+        Ok(spec)
+    }
+
     #[cfg(test)]
     pub(crate) fn cargo_resolution_failure(timeout: Duration, error: &str) -> Self {
         Self::cargo_from_resolution(timeout, Err(error.to_owned()))
@@ -8678,10 +9522,7 @@ impl CommandSpec {
     }
 
     pub fn release_candidate_environment(mut self) -> Self {
-        self.environment = hell_testkit::RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
-            .iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
-            .collect();
+        self.environment = ProcessEnvironment::from_process().release_child_entries();
         self.clear_environment = true;
         self
     }
@@ -8769,6 +9610,16 @@ impl CommandSpec {
     ) -> Result<CommandResult, CommandRunError> {
         let started = Instant::now();
         let live_relay = progress.is_some();
+        self.validate_run_authority(deadlines)?;
+        let mut command = self.construct_command()?;
+        let result = self.execute_command(&mut command, deadlines, progress, started)?;
+        relay_command_output(result, live_relay)
+    }
+
+    fn validate_run_authority(
+        &self,
+        deadlines: Option<(Instant, Instant)>,
+    ) -> Result<(), CommandRunError> {
         if let Some((execution_deadline, completion_deadline)) = deadlines
             && (execution_deadline > completion_deadline || Instant::now() >= execution_deadline)
         {
@@ -8821,6 +9672,10 @@ impl CommandSpec {
             revalidate_resolved_cargo(Path::new(&self.program), expected)
                 .map_err(|error| CommandRunError::new(CommandRunPhase::ProgramResolution, error))?;
         }
+        Ok(())
+    }
+
+    fn construct_command(&self) -> Result<Command, CommandRunError> {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
         if let Some(invocation_name) = &self.invocation_name {
@@ -8857,7 +9712,16 @@ impl CommandSpec {
         }
 
         debug_assert_eq!(self.process_scope, ProcessScope::IsolatedTree);
+        Ok(command)
+    }
 
+    fn execute_command(
+        &self,
+        command: &mut Command,
+        deadlines: Option<(Instant, Instant)>,
+        progress: Option<SupervisedProgressObserver>,
+        started: Instant,
+    ) -> Result<CommandResult, CommandRunError> {
         let output = if let Some(expected) = &self.canonical_executable_identity {
             let identity =
                 BoundProgramInvocation::new(PathBuf::from(&self.program), expected.clone())
@@ -8866,7 +9730,7 @@ impl CommandSpec {
                     })?;
             if let Some((execution_deadline, completion_deadline)) = deadlines {
                 run_supervised_command_with_bound_program_until(
-                    &mut command,
+                    command,
                     &[],
                     execution_deadline,
                     completion_deadline,
@@ -8874,23 +9738,18 @@ impl CommandSpec {
                     progress,
                 )
             } else {
-                run_supervised_command_with_bound_program(
-                    &mut command,
-                    &[],
-                    self.timeout,
-                    &identity,
-                )
+                run_supervised_command_with_bound_program(command, &[], self.timeout, &identity)
             }
         } else if let Some((execution_deadline, completion_deadline)) = deadlines {
             run_supervised_command_until(
-                &mut command,
+                command,
                 &[],
                 execution_deadline,
                 completion_deadline,
                 progress,
             )
         } else {
-            run_supervised_command(&mut command, &[], self.timeout)
+            run_supervised_command(command, &[], self.timeout)
         }
         .map_err(|error| CommandRunError::new(CommandRunPhase::SupervisedExecution, error))?;
         let stdout = output.stdout.retained_bytes();
@@ -8907,29 +9766,38 @@ impl CommandSpec {
             stderr_bytes: output.stderr.total_bytes,
             stdout_sha256: output.stdout.sha256,
             stderr_sha256: output.stderr.sha256,
-            cleanup_id: output.termination.map(|report| report.cleanup_id),
-            termination_forced: output.termination.is_some_and(|report| report.forced),
-            termination_reaped: output.termination.is_some_and(|report| report.reaped),
-            candidate_quiescence_complete: output.candidate_quiescence_complete,
+            termination: CommandTerminationResult {
+                cleanup_id: output.termination.map(|report| report.cleanup_id),
+                forced: output.termination.is_some_and(|report| report.forced),
+                reaped: output.termination.is_some_and(|report| report.reaped),
+                candidate_quiescence_complete: output.candidate_quiescence_complete,
+            },
             #[cfg(windows)]
             windows_launch_control: output.windows_launch_control,
         };
-        if !live_relay && let Err(error) = std::io::stdout().write_all(&result.stdout) {
-            return Err(CommandRunError::after_completion(
-                CommandRunPhase::StdoutRelay,
-                error,
-                result,
-            ));
-        }
-        if !live_relay && let Err(error) = std::io::stderr().write_all(&result.stderr) {
-            return Err(CommandRunError::after_completion(
-                CommandRunPhase::StderrRelay,
-                error,
-                result,
-            ));
-        }
         Ok(result)
     }
+}
+
+fn relay_command_output(
+    result: CommandResult,
+    live_relay: bool,
+) -> Result<CommandResult, CommandRunError> {
+    if !live_relay && let Err(error) = std::io::stdout().write_all(&result.stdout) {
+        return Err(CommandRunError::after_completion(
+            CommandRunPhase::StdoutRelay,
+            error,
+            result,
+        ));
+    }
+    if !live_relay && let Err(error) = std::io::stderr().write_all(&result.stderr) {
+        return Err(CommandRunError::after_completion(
+            CommandRunPhase::StderrRelay,
+            error,
+            result,
+        ));
+    }
+    Ok(result)
 }
 
 fn is_sensitive_environment(name: &OsString) -> bool {
@@ -8942,19 +9810,24 @@ fn is_sensitive_environment(name: &OsString) -> bool {
 pub(crate) fn resolve_standard_path_executable(
     name: &OsStr,
 ) -> Result<ResolvedStandardExecutable, String> {
-    let path = std::env::var_os("PATH").ok_or_else(|| {
-        format!(
-            "cannot resolve {} without standard PATH",
-            name.to_string_lossy()
-        )
-    })?;
+    let path = ProcessEnvironment::from_process()
+        .value(StandardVariable::Path)
+        .map(OsStr::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "cannot resolve {} without standard PATH",
+                name.to_string_lossy()
+            )
+        })?;
     let search = std::env::split_paths(&path).collect::<Vec<_>>();
     resolve_standard_path_executable_from(name, &search)
 }
 
 #[cfg(unix)]
 pub(crate) fn resolve_standard_cargo_executable() -> Result<ResolvedCargoExecutable, String> {
-    let path = std::env::var_os("PATH")
+    let path = ProcessEnvironment::from_process()
+        .value(StandardVariable::Path)
+        .map(OsStr::to_owned)
         .ok_or_else(|| "cannot resolve standard Cargo without standard PATH".to_owned())?;
     let search = std::env::split_paths(&path).collect::<Vec<_>>();
     resolve_standard_cargo_executable_from(&search)
@@ -9070,14 +9943,19 @@ fn resolved_standard_candidate(path: &Path) -> Option<ResolvedStandardExecutable
 }
 
 pub(crate) fn resolve_cargo_executable() -> Result<ResolvedCargoExecutable, String> {
-    let configured = std::env::var_os("CARGO");
-    let search = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+    let environment = ProcessEnvironment::from_process();
+    let configured = environment
+        .value(StandardVariable::Cargo)
+        .map(OsStr::to_owned);
+    let search = environment
+        .value(StandardVariable::Path)
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
         .unwrap_or_default();
     let extensions = if cfg!(windows) {
-        std::env::var_os("PATHEXT")
-            .map(|value| windows_executable_extensions(&value))
-            .unwrap_or_else(|| vec![OsString::from(".COM"), OsString::from(".EXE")])
+        environment.value(StandardVariable::PathExt).map_or_else(
+            || vec![OsString::from(".COM"), OsString::from(".EXE")],
+            windows_executable_extensions,
+        )
     } else {
         Vec::new()
     };
@@ -9099,11 +9977,14 @@ fn resolve_windows_named_executable(name: &str) -> Result<ResolvedCargoExecutabl
     {
         return Err("Windows tool name is not one canonical component".to_owned());
     }
-    let search = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+    let environment = ProcessEnvironment::from_process();
+    let search = environment
+        .value(StandardVariable::Path)
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
         .ok_or_else(|| "standard PATH is unavailable".to_owned())?;
-    let extensions = std::env::var_os("PATHEXT")
-        .map(|value| windows_executable_extensions(&value))
+    let extensions = environment
+        .value(StandardVariable::PathExt)
+        .map(windows_executable_extensions)
         .unwrap_or_else(|| vec![OsString::from(".COM"), OsString::from(".EXE")]);
     let mut resolved =
         resolve_cargo_from(Some(OsStr::new(name)), &search, &extensions, false, true)?;
@@ -9265,26 +10146,50 @@ struct WindowsToolClassificationDiagnostic {
     source_file_identity: String,
     rustup_file_identity: String,
     selected_file_identity: String,
-    source_same_file_rustup: bool,
-    source_same_file_selected: bool,
-    source_direct: bool,
-    rustup_direct: bool,
-    canonical_paths_distinct: bool,
-    canonical_parent_same: bool,
-    invocation_parent_same: bool,
+    file_relationship: WindowsToolFileRelationship,
+    spelling_relationship: WindowsToolSpellingRelationship,
+    path_relationship: WindowsToolPathRelationship,
     source_size: u64,
     rustup_size: u64,
     selected_size: u64,
-    size_equal: bool,
+    content_relationship: WindowsToolContentRelationship,
     source_sha256: String,
     rustup_sha256: String,
     selected_sha256: String,
-    sha256_equal: bool,
     source_pe: Result<WindowsPeImageIdentity, String>,
     rustup_pe: Result<WindowsPeImageIdentity, String>,
-    pe_identity_equal: Option<bool>,
     copied_proxy_result: Result<bool, String>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsToolFileRelationship {
+    source_same_file_rustup: bool,
+    source_same_file_selected: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsToolSpellingRelationship {
+    source_direct: bool,
+    rustup_direct: bool,
     selected_canonical_exact: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsToolPathRelationship {
+    canonical_paths_distinct: bool,
+    canonical_parent_same: bool,
+    invocation_parent_same: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsToolContentRelationship {
+    size_equal: bool,
+    identical_sha256: bool,
+    matching_pe_identity: Option<bool>,
 }
 
 #[cfg(windows)]
@@ -9311,30 +10216,44 @@ impl WindowsToolClassificationDiagnostic {
             source_file_identity: format!("{:?}", source.file),
             rustup_file_identity: format!("{:?}", rustup.file),
             selected_file_identity: format!("{:?}", selected.file),
-            source_same_file_rustup: source.file.same_file(&rustup.file),
-            source_same_file_selected: source.file.same_file(&selected.file),
-            source_direct: windows_direct_spelling_matches(&source.invocation, &source.canonical),
-            rustup_direct: windows_direct_spelling_matches(&rustup.invocation, &rustup.canonical),
-            canonical_paths_distinct: source.canonical != rustup.canonical,
-            canonical_parent_same: source.canonical.parent() == rustup.canonical.parent(),
-            invocation_parent_same: source.invocation.parent() == rustup.invocation.parent(),
+            file_relationship: WindowsToolFileRelationship {
+                source_same_file_rustup: source.file.same_file(&rustup.file),
+                source_same_file_selected: source.file.same_file(&selected.file),
+            },
+            spelling_relationship: WindowsToolSpellingRelationship {
+                source_direct: windows_direct_spelling_matches(
+                    &source.invocation,
+                    &source.canonical,
+                ),
+                rustup_direct: windows_direct_spelling_matches(
+                    &rustup.invocation,
+                    &rustup.canonical,
+                ),
+                selected_canonical_exact: source.canonical == selected.canonical,
+            },
+            path_relationship: WindowsToolPathRelationship {
+                canonical_paths_distinct: source.canonical != rustup.canonical,
+                canonical_parent_same: source.canonical.parent() == rustup.canonical.parent(),
+                invocation_parent_same: source.invocation.parent() == rustup.invocation.parent(),
+            },
             source_size: source.file.size(),
             rustup_size: rustup.file.size(),
             selected_size: selected.file.size(),
-            size_equal: source.file.size() == rustup.file.size(),
+            content_relationship: WindowsToolContentRelationship {
+                size_equal: source.file.size() == rustup.file.size(),
+                identical_sha256: source.file.sha256() == rustup.file.sha256(),
+                matching_pe_identity: source_pe
+                    .as_ref()
+                    .ok()
+                    .zip(rustup_pe.as_ref().ok())
+                    .map(|(source, rustup)| source == rustup),
+            },
             source_sha256: source.file.sha256().hex(),
             rustup_sha256: rustup.file.sha256().hex(),
             selected_sha256: selected.file.sha256().hex(),
-            sha256_equal: source.file.sha256() == rustup.file.sha256(),
-            pe_identity_equal: source_pe
-                .as_ref()
-                .ok()
-                .zip(rustup_pe.as_ref().ok())
-                .map(|(source, rustup)| source == rustup),
             source_pe,
             rustup_pe,
             copied_proxy_result,
-            selected_canonical_exact: source.canonical == selected.canonical,
         }
     }
 }
@@ -9344,46 +10263,54 @@ impl std::fmt::Display for WindowsToolClassificationDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "sourceInvocation={:?}; sourceCanonical={:?}; rustupInvocation={:?}; rustupCanonical={:?}; selectedInvocation={:?}; selectedCanonical={:?}; sourceRevalidation={:?}; rustupRevalidation={:?}; selectedRevalidation={:?}; sourceFileIdentity={}; rustupFileIdentity={}; selectedFileIdentity={}; sourceSameFileRustup={}; sourceSameFileSelected={}; sourceDirect={}; rustupDirect={}; canonicalPathsDistinct={}; canonicalParentSame={}; invocationParentSame={}; sourceSize={}; rustupSize={}; selectedSize={}; sizeEqual={}; sourceSha256={}; rustupSha256={}; selectedSha256={}; sha256Equal={}; sourcePe={:?}; rustupPe={:?}; peIdentityEqual={:?}; copiedProxyResult={:?}; selectedCanonicalExact={}",
-            self.source_invocation,
-            self.source_canonical,
-            self.rustup_invocation,
-            self.rustup_canonical,
-            self.selected_invocation,
-            self.selected_canonical,
+            "sourceInvocation={}; sourceCanonical={}; rustupInvocation={}; rustupCanonical={}; selectedInvocation={}; selectedCanonical={}; sourceRevalidation={:?}; rustupRevalidation={:?}; selectedRevalidation={:?}; sourceFileIdentity={}; rustupFileIdentity={}; selectedFileIdentity={}; sourceSameFileRustup={}; sourceSameFileSelected={}; sourceDirect={}; rustupDirect={}; canonicalPathsDistinct={}; canonicalParentSame={}; invocationParentSame={}; sourceSize={}; rustupSize={}; selectedSize={}; sizeEqual={}; sourceSha256={}; rustupSha256={}; selectedSha256={}; sha256Equal={}; sourcePe={:?}; rustupPe={:?}; peIdentityEqual={:?}; copiedProxyResult={:?}; selectedCanonicalExact={}",
+            quoted_diagnostic_path(&self.source_invocation),
+            quoted_diagnostic_path(&self.source_canonical),
+            quoted_diagnostic_path(&self.rustup_invocation),
+            quoted_diagnostic_path(&self.rustup_canonical),
+            quoted_diagnostic_path(&self.selected_invocation),
+            quoted_diagnostic_path(&self.selected_canonical),
             self.source_revalidation,
             self.rustup_revalidation,
             self.selected_revalidation,
             self.source_file_identity,
             self.rustup_file_identity,
             self.selected_file_identity,
-            self.source_same_file_rustup,
-            self.source_same_file_selected,
-            self.source_direct,
-            self.rustup_direct,
-            self.canonical_paths_distinct,
-            self.canonical_parent_same,
-            self.invocation_parent_same,
+            self.file_relationship.source_same_file_rustup,
+            self.file_relationship.source_same_file_selected,
+            self.spelling_relationship.source_direct,
+            self.spelling_relationship.rustup_direct,
+            self.path_relationship.canonical_paths_distinct,
+            self.path_relationship.canonical_parent_same,
+            self.path_relationship.invocation_parent_same,
             self.source_size,
             self.rustup_size,
             self.selected_size,
-            self.size_equal,
+            self.content_relationship.size_equal,
             self.source_sha256,
             self.rustup_sha256,
             self.selected_sha256,
-            self.sha256_equal,
+            self.content_relationship.identical_sha256,
             self.source_pe,
             self.rustup_pe,
-            self.pe_identity_equal,
+            self.content_relationship.matching_pe_identity,
             self.copied_proxy_result,
-            self.selected_canonical_exact,
+            self.spelling_relationship.selected_canonical_exact,
         )
     }
 }
 
 #[cfg(any(windows, test))]
+fn quoted_diagnostic_path(path: &Path) -> String {
+    format!("{:?}", path.to_string_lossy())
+}
+
+#[cfg(any(windows, test))]
 fn windows_pe_image_identity(path: &Path) -> Result<WindowsPeImageIdentity, String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
+
+    const PE_HEADER_BYTES: usize = 24 + 72;
+    const PE_HEADER_BYTES_U64: u64 = 24 + 72;
 
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot open Windows PE image: {error}"))?;
@@ -9402,13 +10329,12 @@ fn windows_pe_image_identity(path: &Path) -> Result<WindowsPeImageIdentity, Stri
             .try_into()
             .map_err(|_| "Windows DOS header has no PE offset".to_owned())?,
     ));
-    const PE_HEADER_BYTES: u64 = 24 + 72;
-    if pe_offset < 64 || pe_offset > length.saturating_sub(PE_HEADER_BYTES) {
+    if pe_offset < 64 || pe_offset > length.saturating_sub(PE_HEADER_BYTES_U64) {
         return Err("Windows executable PE header offset is invalid".to_owned());
     }
     file.seek(SeekFrom::Start(pe_offset))
         .map_err(|error| format!("cannot seek to Windows PE header: {error}"))?;
-    let mut header = [0_u8; PE_HEADER_BYTES as usize];
+    let mut header = [0_u8; PE_HEADER_BYTES];
     file.read_exact(&mut header)
         .map_err(|error| format!("cannot read Windows PE header: {error}"))?;
     if &header[..4] != b"PE\0\0" {
@@ -9631,20 +10557,21 @@ fn windows_parent_prelaunch_diagnostic(target_arguments: &[OsString]) -> String 
     let program = target_arguments
         .first()
         .map_or_else(|| OsStr::new("<absent>"), OsString::as_os_str);
-    let imports = windows_pe_imports(Path::new(program))
-        .map(|imports| format!("{imports:?}"))
-        .unwrap_or_else(|error| format!("<unavailable:{error}>"));
-    let system_root = std::env::var_os("SystemRoot").map_or_else(
-        || "<absent>".to_owned(),
-        |value| bounded_windows_prelaunch_value(&value),
+    let imports = windows_pe_imports(Path::new(program)).map_or_else(
+        |error| format!("<unavailable:{error}>"),
+        |imports| format!("{imports:?}"),
     );
-    let path = std::env::var_os("PATH").map_or_else(
-        || "<absent>".to_owned(),
-        |value| bounded_windows_prelaunch_value(&value),
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
+        .map_or_else(|| "<absent>".to_owned(), bounded_windows_prelaunch_value);
+    let path = environment
+        .value(StandardVariable::Path)
+        .map_or_else(|| "<absent>".to_owned(), bounded_windows_prelaunch_value);
+    let cwd = std::env::current_dir().map_or_else(
+        |error| format!("<unavailable:{error}>"),
+        |value| bounded_windows_prelaunch_value(value.as_os_str()),
     );
-    let cwd = std::env::current_dir()
-        .map(|value| bounded_windows_prelaunch_value(value.as_os_str()))
-        .unwrap_or_else(|error| format!("<unavailable:{error}>"));
     format!(
         "restricted Windows target prelaunch evidence: program={},graphicalBinding=inherited-default,imports={imports},SystemRoot={system_root},PATH={path},cwd={cwd}",
         bounded_windows_prelaunch_value(program),
@@ -9691,15 +10618,15 @@ fn windows_case_only_direct_spelling_units(invocation: &[u16], canonical: &[u16]
 
     fn has_dot_component(path: &[u16]) -> bool {
         path.split(|unit| is_separator(*unit))
-            .any(|component| component == [b'.' as u16] || component == [b'.' as u16; 2])
+            .any(|component| component == [u16::from(b'.')] || component == [u16::from(b'.'); 2])
     }
 
     fn case_only_unit_matches(left: u16, right: u16) -> bool {
         if is_separator(left) || is_separator(right) {
             return left == right;
         }
-        if left <= u16::from(u8::MAX) && right <= u16::from(u8::MAX) {
-            return (left as u8).eq_ignore_ascii_case(&(right as u8));
+        if let (Ok(left), Ok(right)) = (u8::try_from(left), u8::try_from(right)) {
+            return left.eq_ignore_ascii_case(&right);
         }
         left == right
     }
@@ -10468,6 +11395,8 @@ fn native_archive_configure_probe(
 
 #[cfg(unix)]
 fn archive_adapter_directory(invoked: &OsStr) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let invoked = Path::new(invoked);
     let invoked_parent = invoked
         .parent()
@@ -10478,7 +11407,9 @@ fn archive_adapter_directory(invoked: &OsStr) -> std::io::Result<PathBuf> {
 
     let current_executable = fs::canonicalize(std::env::current_exe()?)?;
     let current_metadata = fs::symlink_metadata(&current_executable)?;
-    let path = std::env::var_os("PATH")
+    let path = ProcessEnvironment::from_process()
+        .value(StandardVariable::Path)
+        .map(OsStr::to_owned)
         .ok_or_else(|| std::io::Error::other("archive adapter PATH is missing"))?;
     let current_directory = std::env::current_dir()?;
     for entry in std::env::split_paths(&path) {
@@ -10491,7 +11422,6 @@ fn archive_adapter_directory(invoked: &OsStr) -> std::io::Result<PathBuf> {
         let Ok(metadata) = fs::metadata(&candidate) else {
             continue;
         };
-        use std::os::unix::fs::MetadataExt as _;
         if metadata.dev() == current_metadata.dev() && metadata.ino() == current_metadata.ino() {
             return fs::canonicalize(entry);
         }
@@ -10548,11 +11478,18 @@ struct NativeArchiveInputBrokerLimits {
     request_roots: usize,
     staged_entries: usize,
     staged_bytes: u64,
-    append_after_metadata_for_integration: bool,
-    expire_authorization_after_request_for_integration: bool,
-    expire_authorization_during_argument_read_for_integration: bool,
-    expire_during_magic_read_for_integration: bool,
-    expire_input_during_path_read_for_integration: bool,
+    integration_fault: NativeArchiveInputBrokerFault,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeArchiveInputBrokerFault {
+    None,
+    AppendAfterMetadata,
+    ExpireAuthorizationAfterRequest,
+    ExpireAuthorizationDuringArgumentRead,
+    ExpireDuringMagicRead,
+    ExpireInputDuringPathRead,
 }
 
 #[cfg(target_os = "macos")]
@@ -10588,11 +11525,7 @@ impl NativeArchiveInputBrokerLimits {
         request_roots: NATIVE_ARCHIVE_INPUT_REQUEST_ROOT_LIMIT,
         staged_entries: NATIVE_ARCHIVE_MEMBER_LIMIT,
         staged_bytes: NATIVE_ARCHIVE_INPUT_STAGE_BYTE_LIMIT,
-        append_after_metadata_for_integration: false,
-        expire_authorization_after_request_for_integration: false,
-        expire_authorization_during_argument_read_for_integration: false,
-        expire_during_magic_read_for_integration: false,
-        expire_input_during_path_read_for_integration: false,
+        integration_fault: NativeArchiveInputBrokerFault::None,
     };
 }
 
@@ -10623,7 +11556,7 @@ impl NativeArchiveInputBroker {
             staging_root,
             candidate_uid,
             NativeArchiveInputBrokerLimits {
-                expire_authorization_after_request_for_integration: true,
+                integration_fault: NativeArchiveInputBrokerFault::ExpireAuthorizationAfterRequest,
                 ..NativeArchiveInputBrokerLimits::PRODUCTION
             },
             Some(archiver),
@@ -10641,7 +11574,8 @@ impl NativeArchiveInputBroker {
             staging_root,
             candidate_uid,
             NativeArchiveInputBrokerLimits {
-                expire_authorization_during_argument_read_for_integration: true,
+                integration_fault:
+                    NativeArchiveInputBrokerFault::ExpireAuthorizationDuringArgumentRead,
                 ..NativeArchiveInputBrokerLimits::PRODUCTION
             },
             Some(archiver),
@@ -10659,7 +11593,7 @@ impl NativeArchiveInputBroker {
             staging_root,
             candidate_uid,
             NativeArchiveInputBrokerLimits {
-                expire_during_magic_read_for_integration: true,
+                integration_fault: NativeArchiveInputBrokerFault::ExpireDuringMagicRead,
                 ..NativeArchiveInputBrokerLimits::PRODUCTION
             },
             Some(archiver),
@@ -10675,7 +11609,7 @@ impl NativeArchiveInputBroker {
             staging_root,
             candidate_uid,
             NativeArchiveInputBrokerLimits {
-                expire_input_during_path_read_for_integration: true,
+                integration_fault: NativeArchiveInputBrokerFault::ExpireInputDuringPathRead,
                 ..NativeArchiveInputBrokerLimits::PRODUCTION
             },
             None,
@@ -10699,11 +11633,7 @@ impl NativeArchiveInputBroker {
                 request_roots: request_root_limit,
                 staged_entries: NATIVE_ARCHIVE_MEMBER_LIMIT,
                 staged_bytes: staged_byte_limit,
-                append_after_metadata_for_integration: true,
-                expire_authorization_after_request_for_integration: false,
-                expire_authorization_during_argument_read_for_integration: false,
-                expire_during_magic_read_for_integration: false,
-                expire_input_during_path_read_for_integration: false,
+                integration_fault: NativeArchiveInputBrokerFault::AppendAfterMetadata,
             },
             None,
             None,
@@ -10777,18 +11707,16 @@ impl NativeArchiveInputBroker {
         let thread = std::thread::Builder::new()
             .name("native-archive-input-broker".to_owned())
             .spawn(move || {
-                let result = run_native_archive_input_broker(
-                    listener,
-                    NativeArchiveInputBrokerWorker {
-                        staging_root: worker_root,
-                        candidate_uid,
-                        limits,
-                        archiver,
-                        authorization_deadline,
-                        authorizations: worker_authorizations,
-                        stop: worker_stop,
-                    },
-                );
+                let worker = NativeArchiveInputBrokerWorker {
+                    staging_root: worker_root,
+                    candidate_uid,
+                    limits,
+                    archiver,
+                    authorization_deadline,
+                    authorizations: worker_authorizations,
+                    stop: worker_stop,
+                };
+                let result = run_native_archive_input_broker(&listener, &worker);
                 let _ = completion_sender.send(result);
             });
         let thread = match thread {
@@ -10938,8 +11866,8 @@ fn remove_native_archive_broker_socket(socket_root: &Path, socket: &Path) -> Res
 
 #[cfg(target_os = "macos")]
 fn run_native_archive_input_broker(
-    listener: std::os::unix::net::UnixListener,
-    worker: NativeArchiveInputBrokerWorker,
+    listener: &std::os::unix::net::UnixListener,
+    worker: &NativeArchiveInputBrokerWorker,
 ) -> Result<(), String> {
     let mut accounting = NativeArchiveInputBrokerAccounting::default();
     loop {
@@ -10965,7 +11893,7 @@ fn run_native_archive_input_broker(
             &mut magic,
             request_deadline,
             "request magic",
-            worker.limits.expire_during_magic_read_for_integration,
+            worker.limits.integration_fault == NativeArchiveInputBrokerFault::ExpireDuringMagicRead,
         )
         .and_then(|()| {
             if magic == *NATIVE_ARCHIVE_INPUT_BROKER_MAGIC {
@@ -10990,12 +11918,10 @@ fn run_native_archive_input_broker(
                         "native archive broker parent authorization deadline is absent".to_owned()
                     })?,
                     NativeArchiveAuthorizationIntegrationFaults {
-                        expire_after_request: worker
-                            .limits
-                            .expire_authorization_after_request_for_integration,
-                        expire_during_argument_read: worker
-                            .limits
-                            .expire_authorization_during_argument_read_for_integration,
+                        expire_after_request: worker.limits.integration_fault
+                            == NativeArchiveInputBrokerFault::ExpireAuthorizationAfterRequest,
+                        expire_during_argument_read: worker.limits.integration_fault
+                            == NativeArchiveInputBrokerFault::ExpireAuthorizationDuringArgumentRead,
                     },
                 )
             } else {
@@ -11008,8 +11934,10 @@ fn run_native_archive_input_broker(
             .ok_or_else(|| "native archive input request sequence overflowed".to_owned())?;
         if let Err(error) = response {
             if magic == *NATIVE_ARCHIVE_AUTH_BROKER_MAGIC
-                || worker.limits.expire_during_magic_read_for_integration
-                || worker.limits.expire_input_during_path_read_for_integration
+                || worker.limits.integration_fault
+                    == NativeArchiveInputBrokerFault::ExpireDuringMagicRead
+                || worker.limits.integration_fault
+                    == NativeArchiveInputBrokerFault::ExpireInputDuringPathRead
             {
                 continue;
             }
@@ -11110,72 +12038,100 @@ fn stage_native_archive_input_request(
 }
 
 #[cfg(target_os = "macos")]
-fn stage_native_archive_input_request_inner(
-    stream: &mut std::os::unix::net::UnixStream,
-    staging_root: &Path,
+struct NativeArchiveInputStaging<'a> {
+    stream: &'a mut std::os::unix::net::UnixStream,
+    staging_root: &'a Path,
     candidate_uid: u32,
-    accounting: &mut NativeArchiveInputBrokerAccounting,
+    accounting: &'a mut NativeArchiveInputBrokerAccounting,
     limits: NativeArchiveInputBrokerLimits,
     deadline: Instant,
-    request_root: &Path,
-) -> Result<(), String> {
-    use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    request_root: &'a Path,
+}
 
-    let count = read_native_archive_broker_u32_until(stream, deadline, "input request count")?;
-    if count == 0 {
-        return Err("native archive input request does not contain members".to_owned());
+#[cfg(target_os = "macos")]
+impl NativeArchiveInputStaging<'_> {
+    fn stage(mut self) -> Result<(), String> {
+        let count = read_native_archive_broker_u32_until(
+            self.stream,
+            self.deadline,
+            "input request count",
+        )?;
+        self.admit_request_root(count)?;
+        let mut staged = Vec::with_capacity(count);
+        for position in 0..count {
+            staged.push(self.stage_member(position)?);
+        }
+        self.write_response(staged)
     }
-    if count > limits.staged_entries {
-        return Err("native archive input request exceeds its member bound".to_owned());
-    }
-    let admitted_request_roots = accounting
-        .request_roots
-        .checked_add(1)
-        .ok_or_else(|| "native archive input request root count overflowed".to_owned())?;
-    if admitted_request_roots > limits.request_roots {
-        return Err("native archive input request root count exceeds its bound".to_owned());
-    }
-    accounting.request_roots = admitted_request_roots;
-    if let Err(error) = fs::create_dir(request_root) {
-        accounting.request_roots = accounting
+
+    fn admit_request_root(&mut self, count: usize) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if count == 0 {
+            return Err("native archive input request does not contain members".to_owned());
+        }
+        if count > self.limits.staged_entries {
+            return Err("native archive input request exceeds its member bound".to_owned());
+        }
+        let admitted = self
+            .accounting
             .request_roots
-            .checked_sub(1)
-            .ok_or_else(|| "native archive input request root rollback underflowed".to_owned())?;
-        return Err(format!(
-            "cannot create native archive input request root: {error}"
-        ));
+            .checked_add(1)
+            .ok_or_else(|| "native archive input request root count overflowed".to_owned())?;
+        if admitted > self.limits.request_roots {
+            return Err("native archive input request root count exceeds its bound".to_owned());
+        }
+        self.accounting.request_roots = admitted;
+        if let Err(error) = fs::create_dir(self.request_root) {
+            self.accounting.request_roots = self
+                .accounting
+                .request_roots
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    "native archive input request root rollback underflowed".to_owned()
+                })?;
+            return Err(format!(
+                "cannot create native archive input request root: {error}"
+            ));
+        }
+        fs::set_permissions(self.request_root, fs::Permissions::from_mode(0o2750))
+            .map_err(|error| format!("cannot confine native archive input request root: {error}"))
     }
-    fs::set_permissions(request_root, fs::Permissions::from_mode(0o2750))
-        .map_err(|error| format!("cannot confine native archive input request root: {error}"))?;
-    let mut staged = Vec::with_capacity(count);
-    for position in 0..count {
-        require_native_archive_deadline(deadline, "trusted archive input staging")
+
+    fn stage_member(&mut self, position: usize) -> Result<PathBuf, String> {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        require_native_archive_deadline(self.deadline, "trusted archive input staging")
             .map_err(|error| error.to_string())?;
-        accounting.staged_entries = accounting
+        self.accounting.staged_entries = self
+            .accounting
             .staged_entries
             .checked_add(1)
             .ok_or_else(|| "native archive staged entry count overflowed".to_owned())?;
-        if accounting.staged_entries > limits.staged_entries {
+        if self.accounting.staged_entries > self.limits.staged_entries {
             return Err("native archive staged entry count exceeds its bound".to_owned());
         }
-        let path_len = read_native_archive_broker_u32_until(stream, deadline, "input path length")?;
+        let path_len =
+            read_native_archive_broker_u32_until(self.stream, self.deadline, "input path length")?;
         if path_len == 0 || path_len > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
             return Err("native archive input path length is outside its bound".to_owned());
         }
         let mut path = vec![0_u8; path_len];
         read_native_archive_broker_exact_until(
-            stream,
+            self.stream,
             &mut path,
-            deadline,
+            self.deadline,
             "input path",
-            limits.expire_input_during_path_read_for_integration && position == 0,
+            self.limits.integration_fault
+                == NativeArchiveInputBrokerFault::ExpireInputDuringPathRead
+                && position == 0,
         )?;
         let mut expected_sha256 = [0_u8; 32];
         read_native_archive_broker_exact_until(
-            stream,
+            self.stream,
             &mut expected_sha256,
-            deadline,
+            self.deadline,
             "input digest",
             false,
         )?;
@@ -11183,7 +12139,7 @@ fn stage_native_archive_input_request_inner(
         let name = source
             .file_name()
             .ok_or_else(|| "native archive input name is absent".to_owned())?;
-        let member_root = request_root.join(format!("member-{position}"));
+        let member_root = self.request_root.join(format!("member-{position}"));
         fs::create_dir(&member_root)
             .map_err(|error| format!("cannot create native archive member root: {error}"))?;
         fs::set_permissions(&member_root, fs::Permissions::from_mode(0o2750))
@@ -11197,14 +12153,15 @@ fn stage_native_archive_input_request_inner(
         if !metadata.is_file() {
             return Err("retained native archive input is not regular".to_owned());
         }
-        if metadata.uid() != candidate_uid {
+        if metadata.uid() != self.candidate_uid {
             return Err("native archive input is not owned by the candidate principal".to_owned());
         }
-        accounting.staged_bytes = accounting
+        self.accounting.staged_bytes = self
+            .accounting
             .staged_bytes
             .checked_add(metadata.len())
             .ok_or_else(|| "native archive staged byte count overflowed".to_owned())?;
-        if accounting.staged_bytes > limits.staged_bytes {
+        if self.accounting.staged_bytes > self.limits.staged_bytes {
             return Err("native archive staged byte count exceeds its bound".to_owned());
         }
         let mut output = fs::OpenOptions::new()
@@ -11213,82 +12170,148 @@ fn stage_native_archive_input_request_inner(
             .mode(0o440)
             .open(&destination)
             .map_err(|error| format!("cannot create trusted native archive input: {error}"))?;
-        if limits.append_after_metadata_for_integration
+        self.inject_copy_growth(&source, name)?;
+        copy_native_archive_input(
+            &mut input,
+            &mut output,
+            &destination,
+            &metadata,
+            expected_sha256,
+            self.deadline,
+        )?;
+        destination
+            .strip_prefix(self.staging_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| "trusted native archive input escaped staging root".to_owned())
+    }
+
+    fn inject_copy_growth(&self, source: &Path, name: &OsStr) -> Result<(), String> {
+        if self.limits.integration_fault == NativeArchiveInputBrokerFault::AppendAfterMetadata
             && name == OsStr::new("append-during-copy.o")
         {
             let mut mutation = fs::OpenOptions::new()
                 .append(true)
-                .open(&source)
+                .open(source)
                 .map_err(|error| format!("cannot inject native archive input growth: {error}"))?;
             mutation
                 .write_all(b"x")
                 .and_then(|()| mutation.sync_all())
                 .map_err(|error| format!("cannot inject native archive input growth: {error}"))?;
         }
-        let mut digest = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        let buffer_len = u64::try_from(buffer.len())
-            .map_err(|_| "native archive copy buffer length does not fit u64".to_owned())?;
-        while copied < metadata.len() {
-            require_native_archive_deadline(deadline, "trusted archive input copy")
-                .map_err(|error| error.to_string())?;
-            let remaining = usize::try_from((metadata.len() - copied).min(buffer_len))
-                .map_err(|_| "native archive copy remainder does not fit usize".to_owned())?;
-            let read = input
-                .read(&mut buffer[..remaining])
-                .map_err(|error| format!("cannot read native archive input: {error}"))?;
-            if read == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..read])
-                .map_err(|error| format!("cannot write trusted native archive input: {error}"))?;
-            digest.update(&buffer[..read]);
-            copied = copied
-                .checked_add(
-                    u64::try_from(read)
-                        .map_err(|_| "native archive copy length does not fit u64".to_owned())?,
-                )
-                .ok_or_else(|| "native archive copy length overflowed".to_owned())?;
-        }
-        let mut growth = [0_u8; 1];
-        let grew = input
-            .read(&mut growth)
-            .map_err(|error| format!("cannot probe native archive input growth: {error}"))?
-            != 0;
-        output
-            .sync_all()
-            .map_err(|error| format!("cannot sync trusted native archive input: {error}"))?;
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o440))
-            .map_err(|error| format!("cannot freeze trusted native archive input: {error}"))?;
-        if copied != metadata.len() || grew || digest.finish() != Digest(expected_sha256) {
-            return Err("native archive input changed while it was staged".to_owned());
-        }
-        staged.push(
-            destination
-                .strip_prefix(staging_root)
-                .map_err(|_| "trusted native archive input escaped staging root".to_owned())?
-                .to_path_buf(),
-        );
+        Ok(())
     }
-    write_native_archive_broker_exact_until(stream, &[0], deadline, "input response state")?;
-    write_native_archive_broker_u32_until(stream, staged.len(), deadline, "input response count")?;
-    for path in staged {
+
+    fn write_response(&mut self, staged: Vec<PathBuf>) -> Result<(), String> {
         use std::os::unix::ffi::OsStrExt as _;
-        let path = path.as_os_str().as_bytes();
-        if path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
-            return Err("trusted native archive input path exceeds its bound".to_owned());
-        }
-        write_native_archive_broker_u32_until(
-            stream,
-            path.len(),
-            deadline,
-            "input response path length",
+
+        write_native_archive_broker_exact_until(
+            self.stream,
+            &[0],
+            self.deadline,
+            "input response state",
         )?;
-        write_native_archive_broker_exact_until(stream, path, deadline, "input response path")?;
+        write_native_archive_broker_u32_until(
+            self.stream,
+            staged.len(),
+            self.deadline,
+            "input response count",
+        )?;
+        for path in staged {
+            let path = path.as_os_str().as_bytes();
+            if path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
+                return Err("trusted native archive input path exceeds its bound".to_owned());
+            }
+            write_native_archive_broker_u32_until(
+                self.stream,
+                path.len(),
+                self.deadline,
+                "input response path length",
+            )?;
+            write_native_archive_broker_exact_until(
+                self.stream,
+                path,
+                self.deadline,
+                "input response path",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_native_archive_input(
+    input: &mut fs::File,
+    output: &mut fs::File,
+    destination: &Path,
+    metadata: &fs::Metadata,
+    expected_sha256: [u8; 32],
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let buffer_len = u64::try_from(buffer.len())
+        .map_err(|_| "native archive copy buffer length does not fit u64".to_owned())?;
+    while copied < metadata.len() {
+        require_native_archive_deadline(deadline, "trusted archive input copy")
+            .map_err(|error| error.to_string())?;
+        let remaining = usize::try_from((metadata.len() - copied).min(buffer_len))
+            .map_err(|_| "native archive copy remainder does not fit usize".to_owned())?;
+        let read = input
+            .read(&mut buffer[..remaining])
+            .map_err(|error| format!("cannot read native archive input: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("cannot write trusted native archive input: {error}"))?;
+        digest.update(&buffer[..read]);
+        copied = copied
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| "native archive copy length does not fit u64".to_owned())?,
+            )
+            .ok_or_else(|| "native archive copy length overflowed".to_owned())?;
+    }
+    let mut growth = [0_u8; 1];
+    let grew = input
+        .read(&mut growth)
+        .map_err(|error| format!("cannot probe native archive input growth: {error}"))?
+        != 0;
+    output
+        .sync_all()
+        .map_err(|error| format!("cannot sync trusted native archive input: {error}"))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o440))
+        .map_err(|error| format!("cannot freeze trusted native archive input: {error}"))?;
+    if copied != metadata.len() || grew || digest.finish() != Digest(expected_sha256) {
+        return Err("native archive input changed while it was staged".to_owned());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_archive_input_request_inner(
+    stream: &mut std::os::unix::net::UnixStream,
+    staging_root: &Path,
+    candidate_uid: u32,
+    accounting: &mut NativeArchiveInputBrokerAccounting,
+    limits: NativeArchiveInputBrokerLimits,
+    deadline: Instant,
+    request_root: &Path,
+) -> Result<(), String> {
+    NativeArchiveInputStaging {
+        stream,
+        staging_root,
+        candidate_uid,
+        accounting,
+        limits,
+        deadline,
+        request_root,
+    }
+    .stage()
 }
 
 #[cfg(target_os = "macos")]
@@ -12113,7 +13136,29 @@ impl NativeArchiveInputBrokerCapability {
         current_directory: &Path,
         deadline: Instant,
     ) -> std::io::Result<NativeArchiveAuthorizedProgram> {
-        use std::os::unix::ffi::OsStrExt as _;
+        let mut stream = self.connect_authorization_broker(deadline)?;
+        let expected_request = write_native_archive_authorization_request(
+            &mut stream,
+            arguments,
+            current_directory,
+            deadline,
+        )?;
+        read_native_archive_authorization_state(&mut stream, deadline)?;
+        let receipt = read_native_archive_authorized_program(
+            &mut stream,
+            &self.authority_root.path.join("llvm/bin/llvm-ar"),
+            expected_request,
+            deadline,
+        )?;
+        receipt.revalidate(deadline)?;
+        self.revalidate(deadline)?;
+        Ok(receipt)
+    }
+
+    fn connect_authorization_broker(
+        &self,
+        deadline: Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
         use std::os::unix::net::UnixStream;
 
         self.revalidate(deadline)?;
@@ -12143,186 +13188,178 @@ impl NativeArchiveInputBrokerCapability {
                 "native archive broker readiness differs",
             ));
         }
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .min(NATIVE_ARCHIVE_AUTHORIZATION_BUDGET);
-        let remaining_millis = u64::try_from(remaining.as_millis())
-            .map_err(|_| std::io::Error::other("native archive authorization cutoff overflowed"))?;
-        if remaining_millis == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "native archive authorization deadline expired before request",
-            ));
-        }
-        let expected_request =
-            native_archive_authorization_digest(arguments, current_directory, remaining_millis)
-                .map_err(std::io::Error::other)?;
-        write_native_archive_broker_exact_until(
-            &mut stream,
-            &remaining_millis.to_le_bytes(),
-            deadline,
-            "authorization cutoff",
-        )
-        .map_err(std::io::Error::other)?;
-        write_native_archive_broker_u32_until(
-            &mut stream,
-            arguments.len(),
-            deadline,
-            "authorization argument count",
-        )
-        .map_err(std::io::Error::other)?;
-        for argument in arguments {
-            let bytes = argument.as_os_str().as_bytes();
-            write_native_archive_broker_u32_until(
-                &mut stream,
-                bytes.len(),
-                deadline,
-                "authorization argument length",
-            )
-            .map_err(std::io::Error::other)?;
-            write_native_archive_broker_exact_until(
-                &mut stream,
-                bytes,
-                deadline,
-                "authorization argument",
-            )
-            .map_err(std::io::Error::other)?;
-        }
-        let directory = current_directory.as_os_str().as_bytes();
-        write_native_archive_broker_u32_until(
-            &mut stream,
-            directory.len(),
-            deadline,
-            "authorization directory length",
-        )
-        .map_err(std::io::Error::other)?;
-        write_native_archive_broker_exact_until(
-            &mut stream,
-            directory,
-            deadline,
-            "authorization directory",
-        )
-        .map_err(std::io::Error::other)?;
-        let mut state = [0_u8; 1];
-        read_native_archive_broker_exact_until(
-            &mut stream,
-            &mut state,
-            deadline,
-            "authorization state",
-            false,
-        )
-        .map_err(std::io::Error::other)?;
-        if state[0] == 1 {
-            let detail_len = read_native_archive_broker_u32_until(
-                &mut stream,
-                deadline,
-                "authorization error length",
-            )
-            .map_err(std::io::Error::other)?;
-            if detail_len > 4096 {
-                return Err(std::io::Error::other(
-                    "native archive authorization error exceeds its bound",
-                ));
-            }
-            let mut detail = vec![0_u8; detail_len];
-            read_native_archive_broker_exact_until(
-                &mut stream,
-                &mut detail,
-                deadline,
-                "authorization error",
-                false,
-            )
-            .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::other(format!(
-                "native archive authorization rejected: {}",
-                String::from_utf8_lossy(&detail)
-            )));
-        }
-        if state != [0] {
-            return Err(std::io::Error::other(
-                "native archive authorization state is invalid",
-            ));
-        }
-        let mut request = [0_u8; 32];
-        let mut sha256 = [0_u8; 32];
-        read_native_archive_broker_exact_until(
-            &mut stream,
-            &mut request,
-            deadline,
-            "authorization request digest",
-            false,
-        )
-        .and_then(|()| {
-            read_native_archive_broker_exact_until(
-                &mut stream,
-                &mut sha256,
-                deadline,
-                "authorization program digest",
-                false,
-            )
-        })
-        .map_err(std::io::Error::other)?;
-        if Digest(request) != expected_request {
-            return Err(std::io::Error::other(
-                "native archive authorization request receipt differs",
-            ));
-        }
-        let device = read_native_archive_broker_u64_until(
-            &mut stream,
-            deadline,
-            "authorization device receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let inode = read_native_archive_broker_u64_until(
-            &mut stream,
-            deadline,
-            "authorization inode receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let uid = read_native_archive_broker_u32_until(
-            &mut stream,
-            deadline,
-            "authorization uid receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let gid = read_native_archive_broker_u32_until(
-            &mut stream,
-            deadline,
-            "authorization gid receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let mode = read_native_archive_broker_u32_until(
-            &mut stream,
-            deadline,
-            "authorization mode receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let size = read_native_archive_broker_u64_until(
-            &mut stream,
-            deadline,
-            "authorization size receipt",
-        )
-        .map_err(std::io::Error::other)?;
-        let receipt = NativeArchiveAuthorizedProgram {
-            path: self.authority_root.path.join("llvm/bin/llvm-ar"),
-            device,
-            inode,
-            uid: u32::try_from(uid).map_err(|_| {
-                std::io::Error::other("native archive authorization uid does not fit u32")
-            })?,
-            gid: u32::try_from(gid).map_err(|_| {
-                std::io::Error::other("native archive authorization gid does not fit u32")
-            })?,
-            mode: u32::try_from(mode).map_err(|_| {
-                std::io::Error::other("native archive authorization mode does not fit u32")
-            })?,
-            size,
-            sha256: Digest(sha256),
-        };
-        receipt.revalidate(deadline)?;
-        self.revalidate(deadline)?;
-        Ok(receipt)
+        Ok(stream)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_archive_authorization_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    arguments: &[OsString],
+    current_directory: &Path,
+    deadline: Instant,
+) -> std::io::Result<Digest> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(NATIVE_ARCHIVE_AUTHORIZATION_BUDGET);
+    let remaining_millis = u64::try_from(remaining.as_millis())
+        .map_err(|_| std::io::Error::other("native archive authorization cutoff overflowed"))?;
+    if remaining_millis == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native archive authorization deadline expired before request",
+        ));
+    }
+    let expected_request =
+        native_archive_authorization_digest(arguments, current_directory, remaining_millis)
+            .map_err(std::io::Error::other)?;
+    write_native_archive_broker_exact_until(
+        stream,
+        &remaining_millis.to_le_bytes(),
+        deadline,
+        "authorization cutoff",
+    )
+    .map_err(std::io::Error::other)?;
+    write_native_archive_broker_u32_until(
+        stream,
+        arguments.len(),
+        deadline,
+        "authorization argument count",
+    )
+    .map_err(std::io::Error::other)?;
+    for argument in arguments {
+        let bytes = argument.as_os_str().as_bytes();
+        write_native_archive_broker_u32_until(
+            stream,
+            bytes.len(),
+            deadline,
+            "authorization argument length",
+        )
+        .map_err(std::io::Error::other)?;
+        write_native_archive_broker_exact_until(stream, bytes, deadline, "authorization argument")
+            .map_err(std::io::Error::other)?;
+    }
+    let directory = current_directory.as_os_str().as_bytes();
+    write_native_archive_broker_u32_until(
+        stream,
+        directory.len(),
+        deadline,
+        "authorization directory length",
+    )
+    .map_err(std::io::Error::other)?;
+    write_native_archive_broker_exact_until(stream, directory, deadline, "authorization directory")
+        .map_err(std::io::Error::other)?;
+    Ok(expected_request)
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_archive_authorization_state(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut state = [0_u8; 1];
+    read_native_archive_broker_exact_until(
+        stream,
+        &mut state,
+        deadline,
+        "authorization state",
+        false,
+    )
+    .map_err(std::io::Error::other)?;
+    if state[0] == 1 {
+        let detail_len =
+            read_native_archive_broker_u32_until(stream, deadline, "authorization error length")
+                .map_err(std::io::Error::other)?;
+        if detail_len > 4096 {
+            return Err(std::io::Error::other(
+                "native archive authorization error exceeds its bound",
+            ));
+        }
+        let mut detail = vec![0_u8; detail_len];
+        read_native_archive_broker_exact_until(
+            stream,
+            &mut detail,
+            deadline,
+            "authorization error",
+            false,
+        )
+        .map_err(std::io::Error::other)?;
+        return Err(std::io::Error::other(format!(
+            "native archive authorization rejected: {}",
+            String::from_utf8_lossy(&detail)
+        )));
+    }
+    if state != [0] {
+        return Err(std::io::Error::other(
+            "native archive authorization state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_archive_authorized_program(
+    stream: &mut std::os::unix::net::UnixStream,
+    path: &Path,
+    expected_request: Digest,
+    deadline: Instant,
+) -> std::io::Result<NativeArchiveAuthorizedProgram> {
+    let mut request = [0_u8; 32];
+    let mut sha256 = [0_u8; 32];
+    read_native_archive_broker_exact_until(
+        stream,
+        &mut request,
+        deadline,
+        "authorization request digest",
+        false,
+    )
+    .and_then(|()| {
+        read_native_archive_broker_exact_until(
+            stream,
+            &mut sha256,
+            deadline,
+            "authorization program digest",
+            false,
+        )
+    })
+    .map_err(std::io::Error::other)?;
+    if Digest(request) != expected_request {
+        return Err(std::io::Error::other(
+            "native archive authorization request receipt differs",
+        ));
+    }
+    let device =
+        read_native_archive_broker_u64_until(stream, deadline, "authorization device receipt")
+            .map_err(std::io::Error::other)?;
+    let inode =
+        read_native_archive_broker_u64_until(stream, deadline, "authorization inode receipt")
+            .map_err(std::io::Error::other)?;
+    let uid = read_native_archive_broker_u32_until(stream, deadline, "authorization uid receipt")
+        .map_err(std::io::Error::other)?;
+    let gid = read_native_archive_broker_u32_until(stream, deadline, "authorization gid receipt")
+        .map_err(std::io::Error::other)?;
+    let mode = read_native_archive_broker_u32_until(stream, deadline, "authorization mode receipt")
+        .map_err(std::io::Error::other)?;
+    let size = read_native_archive_broker_u64_until(stream, deadline, "authorization size receipt")
+        .map_err(std::io::Error::other)?;
+    Ok(NativeArchiveAuthorizedProgram {
+        path: path.to_owned(),
+        device,
+        inode,
+        uid: u32::try_from(uid).map_err(|_| {
+            std::io::Error::other("native archive authorization uid does not fit u32")
+        })?,
+        gid: u32::try_from(gid).map_err(|_| {
+            std::io::Error::other("native archive authorization gid does not fit u32")
+        })?,
+        mode: u32::try_from(mode).map_err(|_| {
+            std::io::Error::other("native archive authorization mode does not fit u32")
+        })?,
+        size,
+        sha256: Digest(sha256),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -12451,7 +13488,7 @@ fn sha256_retained_native_archive_file(
         std::io::Error::other(format!("cannot rewind retained {label}: {error}"))
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         require_native_archive_deadline(deadline, label)?;
         let read = retained.read(&mut buffer).map_err(|error| {
@@ -12661,7 +13698,6 @@ impl NativeArchiveInvocation {
         adapter_root: &Path,
         deadline: Instant,
     ) -> std::io::Result<()> {
-        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
         use std::os::unix::net::UnixStream;
 
         let broker = NativeArchiveInputBrokerCapability::bind(adapter_root, deadline)?;
@@ -12688,133 +13724,22 @@ impl NativeArchiveInvocation {
             ))
         })?;
         broker.revalidate(deadline)?;
-        write_native_archive_broker_exact_until(
+        write_native_archive_input_request(&mut stream, &flattened, authority, deadline)?;
+        read_native_archive_input_response_state(&mut stream, deadline)?;
+        let (staged_paths, staged_receipts) = read_staged_native_archive_inputs(
             &mut stream,
-            NATIVE_ARCHIVE_INPUT_BROKER_MAGIC,
+            &broker,
+            &flattened,
+            authority,
             deadline,
-            "input request magic",
-        )
-        .map_err(std::io::Error::other)?;
-        write_native_archive_broker_u32_until(
-            &mut stream,
-            flattened.len(),
-            deadline,
-            "input request count",
-        )
-        .map_err(std::io::Error::other)?;
-        for input_index in &flattened {
-            let input = authority.inputs.get(*input_index).ok_or_else(|| {
-                std::io::Error::other("native archive input receipt index is invalid")
-            })?;
-            let path = input.path.as_os_str().as_bytes();
-            if path.is_empty() || path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
-                return Err(std::io::Error::other(
-                    "native archive input path length is outside its bound",
-                ));
-            }
-            write_native_archive_broker_u32_until(
-                &mut stream,
-                path.len(),
-                deadline,
-                "input request path length",
-            )
-            .map_err(std::io::Error::other)?;
-            write_native_archive_broker_exact_until(
-                &mut stream,
-                path,
-                deadline,
-                "input request path",
-            )
-            .map_err(std::io::Error::other)?;
-            write_native_archive_broker_exact_until(
-                &mut stream,
-                &input.sha256.0,
-                deadline,
-                "input request digest",
-            )
-            .map_err(std::io::Error::other)?;
-        }
-        let mut state = [0_u8; 1];
-        read_native_archive_broker_exact_until(
-            &mut stream,
-            &mut state,
-            deadline,
-            "input response state",
-            false,
-        )
-        .map_err(std::io::Error::other)?;
-        if state[0] == 1 {
-            let detail_len =
-                read_native_archive_broker_u32_until(&mut stream, deadline, "input error length")
-                    .map_err(std::io::Error::other)?;
-            if detail_len > 4096 {
-                return Err(std::io::Error::other(
-                    "native archive input broker error exceeds its bound",
-                ));
-            }
-            let mut detail = vec![0_u8; detail_len];
-            read_native_archive_broker_exact_until(
-                &mut stream,
-                &mut detail,
-                deadline,
-                "input error detail",
-                false,
-            )
-            .map_err(std::io::Error::other)?;
-            return Err(std::io::Error::other(format!(
-                "native archive input broker rejected staging: {}",
-                String::from_utf8_lossy(&detail)
-            )));
-        }
-        if state[0] != 0 {
-            return Err(std::io::Error::other(
-                "native archive input broker state is invalid",
-            ));
-        }
-        let staged_count =
-            read_native_archive_broker_u32_until(&mut stream, deadline, "input response count")
-                .map_err(std::io::Error::other)?;
-        if staged_count != flattened.len() {
-            return Err(std::io::Error::other(
-                "native archive input broker response count differs",
-            ));
-        }
-        let mut staged_paths = Vec::with_capacity(staged_count);
-        let mut staged_receipts = Vec::with_capacity(staged_count);
-        for input_index in &flattened {
-            let path_len = read_native_archive_broker_u32_until(
-                &mut stream,
-                deadline,
-                "input response path length",
-            )
-            .map_err(std::io::Error::other)?;
-            if path_len == 0 || path_len > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
-                return Err(std::io::Error::other(
-                    "trusted native archive input path length is outside its bound",
-                ));
-            }
-            let mut path = vec![0_u8; path_len];
-            read_native_archive_broker_exact_until(
-                &mut stream,
-                &mut path,
-                deadline,
-                "input response path",
-                false,
-            )
-            .map_err(std::io::Error::other)?;
-            let relative = PathBuf::from(OsString::from_vec(path));
-            let receipt = broker.bind_staged_input(&relative, deadline)?;
-            let expected = authority.inputs.get(*input_index).ok_or_else(|| {
-                std::io::Error::other("native archive input receipt index is invalid")
-            })?;
-            if receipt.sha256 != expected.sha256 || receipt.size != expected.size {
-                return Err(std::io::Error::other(
-                    "trusted archive input differs from its candidate receipt",
-                ));
-            }
-            staged_paths.push(receipt.path.as_os_str().to_owned());
-            staged_receipts.push(receipt);
-        }
+        )?;
+        authority.inputs.extend(staged_receipts);
+        self.replace_staged_input_arguments(&staged_paths)?;
+        self.input_groups.clear();
+        Ok(())
+    }
+
+    fn replace_staged_input_arguments(&mut self, staged_paths: &[OsString]) -> std::io::Result<()> {
         let mut replacements = BTreeMap::<usize, Vec<OsString>>::new();
         let mut staged_position = 0_usize;
         for group in &self.input_groups {
@@ -12848,11 +13773,156 @@ impl NativeArchiveInvocation {
                 "native archive staged argv topology differs",
             ));
         }
-        authority.inputs.extend(staged_receipts);
         self.arguments = staged_arguments;
-        self.input_groups.clear();
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_archive_input_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    flattened: &[usize],
+    authority: &NativeArchiveWorkAuthority,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    write_native_archive_broker_exact_until(
+        stream,
+        NATIVE_ARCHIVE_INPUT_BROKER_MAGIC,
+        deadline,
+        "input request magic",
+    )
+    .map_err(std::io::Error::other)?;
+    write_native_archive_broker_u32_until(stream, flattened.len(), deadline, "input request count")
+        .map_err(std::io::Error::other)?;
+    for input_index in flattened {
+        let input = authority.inputs.get(*input_index).ok_or_else(|| {
+            std::io::Error::other("native archive input receipt index is invalid")
+        })?;
+        let path = input.path.as_os_str().as_bytes();
+        if path.is_empty() || path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
+            return Err(std::io::Error::other(
+                "native archive input path length is outside its bound",
+            ));
+        }
+        write_native_archive_broker_u32_until(
+            stream,
+            path.len(),
+            deadline,
+            "input request path length",
+        )
+        .map_err(std::io::Error::other)?;
+        write_native_archive_broker_exact_until(stream, path, deadline, "input request path")
+            .map_err(std::io::Error::other)?;
+        write_native_archive_broker_exact_until(
+            stream,
+            &input.sha256.0,
+            deadline,
+            "input request digest",
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_archive_input_response_state(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut state = [0_u8; 1];
+    read_native_archive_broker_exact_until(
+        stream,
+        &mut state,
+        deadline,
+        "input response state",
+        false,
+    )
+    .map_err(std::io::Error::other)?;
+    if state[0] == 1 {
+        let detail_len =
+            read_native_archive_broker_u32_until(stream, deadline, "input error length")
+                .map_err(std::io::Error::other)?;
+        if detail_len > 4096 {
+            return Err(std::io::Error::other(
+                "native archive input broker error exceeds its bound",
+            ));
+        }
+        let mut detail = vec![0_u8; detail_len];
+        read_native_archive_broker_exact_until(
+            stream,
+            &mut detail,
+            deadline,
+            "input error detail",
+            false,
+        )
+        .map_err(std::io::Error::other)?;
+        return Err(std::io::Error::other(format!(
+            "native archive input broker rejected staging: {}",
+            String::from_utf8_lossy(&detail)
+        )));
+    }
+    if state[0] != 0 {
+        return Err(std::io::Error::other(
+            "native archive input broker state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_staged_native_archive_inputs(
+    stream: &mut std::os::unix::net::UnixStream,
+    broker: &NativeArchiveInputBrokerCapability,
+    flattened: &[usize],
+    authority: &NativeArchiveWorkAuthority,
+    deadline: Instant,
+) -> std::io::Result<(Vec<OsString>, Vec<NativeArchiveFileReceipt>)> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let staged_count =
+        read_native_archive_broker_u32_until(stream, deadline, "input response count")
+            .map_err(std::io::Error::other)?;
+    if staged_count != flattened.len() {
+        return Err(std::io::Error::other(
+            "native archive input broker response count differs",
+        ));
+    }
+    let mut staged_paths = Vec::with_capacity(staged_count);
+    let mut staged_receipts = Vec::with_capacity(staged_count);
+    for input_index in flattened {
+        let path_len =
+            read_native_archive_broker_u32_until(stream, deadline, "input response path length")
+                .map_err(std::io::Error::other)?;
+        if path_len == 0 || path_len > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
+            return Err(std::io::Error::other(
+                "trusted native archive input path length is outside its bound",
+            ));
+        }
+        let mut path = vec![0_u8; path_len];
+        read_native_archive_broker_exact_until(
+            stream,
+            &mut path,
+            deadline,
+            "input response path",
+            false,
+        )
+        .map_err(std::io::Error::other)?;
+        let receipt =
+            broker.bind_staged_input(&PathBuf::from(OsString::from_vec(path)), deadline)?;
+        let expected = authority.inputs.get(*input_index).ok_or_else(|| {
+            std::io::Error::other("native archive input receipt index is invalid")
+        })?;
+        if receipt.sha256 != expected.sha256 || receipt.size != expected.size {
+            return Err(std::io::Error::other(
+                "trusted archive input differs from its candidate receipt",
+            ));
+        }
+        staged_paths.push(receipt.path.as_os_str().to_owned());
+        staged_receipts.push(receipt);
+    }
+    Ok((staged_paths, staged_receipts))
 }
 
 #[cfg(unix)]
@@ -12896,7 +13966,9 @@ pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process
                 arguments,
                 &directory,
                 &current_directory,
-                std::env::var_os("TMPDIR").as_deref().map(Path::new),
+                ProcessEnvironment::from_process()
+                    .value(StandardVariable::TmpDir)
+                    .map(Path::new),
                 execution_deadline,
             )?
         };
@@ -12970,7 +14042,9 @@ fn normalize_native_archive_arguments(
     adapter_root: &Path,
     current_directory: &Path,
 ) -> std::io::Result<Vec<OsString>> {
-    let temporary_directory = std::env::var_os("TMPDIR").map(PathBuf::from);
+    let temporary_directory = ProcessEnvironment::from_process()
+        .value(StandardVariable::TmpDir)
+        .map(PathBuf::from);
     normalize_native_archive_arguments_with_temporary_directory(
         arguments,
         adapter_root,
@@ -13017,6 +14091,42 @@ fn bind_native_archive_invocation(
         native_archive_configure_probe(arguments, current_directory).transpose()?;
     let is_configure_probe = configure_probe.is_some();
     let arguments = configure_probe.as_deref().unwrap_or(arguments);
+    let target_index = native_archive_target_index(arguments)?;
+    let target = arguments
+        .get(target_index)
+        .ok_or_else(|| std::io::Error::other("archive adapter target is missing"))?;
+    let (target_path, mut authority) = bind_native_archive_target_authority(
+        target,
+        adapter_root,
+        current_directory,
+        temporary_directory,
+        is_configure_probe,
+        deadline,
+    )?;
+    validate_native_archive_target_boundary(&target_path, &mut authority)?;
+    let mut input_groups = Vec::new();
+    validate_native_archive_arguments(
+        &arguments[target_index + 1..],
+        target_index + 1,
+        current_directory,
+        &mut authority,
+        &mut input_groups,
+        deadline,
+    )?;
+    let mut normalized = arguments.to_vec();
+    if let Some(replacement) = normalized_native_archive_operation(first, &target_path)? {
+        normalized[0] = replacement.into();
+    }
+    authority.revalidate_before_launch(deadline)?;
+    Ok(NativeArchiveInvocation {
+        arguments: normalized,
+        authority: Some(authority),
+        input_groups,
+    })
+}
+
+#[cfg(unix)]
+fn native_archive_target_index(arguments: &[OsString]) -> std::io::Result<usize> {
     let mut target_index = 1;
     let (mut saw_symbol_table, mut saw_create_quietly) = (false, false);
     while let Some(argument) = arguments.get(target_index) {
@@ -13040,9 +14150,18 @@ fn bind_native_archive_invocation(
         }
         break;
     }
-    let Some(target) = arguments.get(target_index) else {
-        return Err(std::io::Error::other("archive adapter target is missing"));
-    };
+    Ok(target_index)
+}
+
+#[cfg(unix)]
+fn bind_native_archive_target_authority(
+    target: &OsStr,
+    adapter_root: &Path,
+    current_directory: &Path,
+    temporary_directory: Option<&Path>,
+    is_configure_probe: bool,
+    deadline: Instant,
+) -> std::io::Result<(PathBuf, NativeArchiveWorkAuthority)> {
     if target.to_str().is_some_and(|value| value.starts_with('-')) {
         return Err(std::io::Error::other(
             "archive adapter target is an unsupported option",
@@ -13054,7 +14173,7 @@ fn bind_native_archive_invocation(
     } else {
         current_directory.join(target)
     };
-    let mut authority = if is_configure_probe {
+    let authority = if is_configure_probe {
         let current = fs::canonicalize(current_directory).map_err(|error| {
             std::io::Error::other(format!(
                 "cannot bind configure archive current directory: {error}"
@@ -13070,12 +14189,20 @@ fn bind_native_archive_invocation(
             deadline,
         )?
     };
-    if fs::symlink_metadata(&target_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    Ok((target_path, authority))
+}
+
+#[cfg(unix)]
+fn validate_native_archive_target_boundary(
+    target_path: &Path,
+    authority: &mut NativeArchiveWorkAuthority,
+) -> std::io::Result<()> {
+    if fs::symlink_metadata(target_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::other(
             "archive adapter target may not be a symbolic link",
         ));
     }
-    let canonical_target = match fs::canonicalize(&target_path) {
+    let canonical_target = match fs::canonicalize(target_path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let parent = target_path
@@ -13100,55 +14227,39 @@ fn bind_native_archive_invocation(
             "archive adapter target escapes its bound work directory",
         ));
     }
-    let mut input_groups = Vec::new();
-    validate_native_archive_arguments(
-        &arguments[target_index + 1..],
-        target_index + 1,
-        current_directory,
-        &mut authority,
-        &mut input_groups,
-        deadline,
-    )?;
-    let replacement = match first.to_str() {
-        Some("r") | Some("-r") => {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalized_native_archive_operation(
+    first: &OsStr,
+    target_path: &Path,
+) -> std::io::Result<Option<&'static str>> {
+    match first.to_str() {
+        Some("r" | "-r") => {
             if target_path.exists() {
                 return Err(std::io::Error::other(
                     "replace-to-append conversion requires a fresh archive target",
                 ));
             }
-            Some(if first == "r" { "qL" } else { "-qL" })
+            Ok(Some(if first == "r" { "qL" } else { "-qL" }))
         }
-        Some("q") => Some("qL"),
-        Some("-q") => Some("-qL"),
-        Some("qc") => Some("qLc"),
-        Some("-qc") => Some("-qLc"),
-        Some("qcls") => Some("qclsL"),
-        Some("-qcls") => Some("-qclsL"),
-        Some("clqs") => Some("qclsL"),
-        Some("-clqs") => Some("-qclsL"),
-        Some("qL" | "-qL" | "qLc" | "-qLc" | "qcL" | "-qcL" | "qclsL" | "-qclsL") => None,
-        Some("t") | Some("-t") => None,
-        Some(value) => {
-            return Err(std::io::Error::other(format!(
-                "archive adapter received unsupported operation {value:?}"
-            )));
+        Some("q") => Ok(Some("qL")),
+        Some("-q") => Ok(Some("-qL")),
+        Some("qc") => Ok(Some("qLc")),
+        Some("-qc") => Ok(Some("-qLc")),
+        Some("qcls" | "clqs") => Ok(Some("qclsL")),
+        Some("-qcls" | "-clqs") => Ok(Some("-qclsL")),
+        Some("qL" | "-qL" | "qLc" | "-qLc" | "qcL" | "-qcL" | "qclsL" | "-qclsL" | "t" | "-t") => {
+            Ok(None)
         }
-        None => {
-            return Err(std::io::Error::other(
-                "archive adapter operation must be UTF-8",
-            ));
-        }
-    };
-    let mut normalized = arguments.to_vec();
-    if let Some(replacement) = replacement {
-        normalized[0] = replacement.into();
+        Some(value) => Err(std::io::Error::other(format!(
+            "archive adapter received unsupported operation {value:?}"
+        ))),
+        None => Err(std::io::Error::other(
+            "archive adapter operation must be UTF-8",
+        )),
     }
-    authority.revalidate_before_launch(deadline)?;
-    Ok(NativeArchiveInvocation {
-        arguments: normalized,
-        authority: Some(authority),
-        input_groups,
-    })
 }
 
 #[cfg(unix)]
@@ -13409,14 +14520,14 @@ pub(crate) fn run_posix_release_child(arguments: &[OsString]) -> std::process::E
 pub(crate) fn verify_native_archive_broker_descendant_launcher(
     arguments: &[OsString],
 ) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let [adapter_root, fake_broker, writable_root] = arguments else {
         return Err(
             "native archive broker descendant launcher requires adapter, fake endpoint, and writable root"
                 .to_owned(),
         );
     };
-    use std::os::unix::fs::PermissionsExt as _;
-
     let source = Path::new(writable_root).join("broker-budget-input.o");
     let growing = Path::new(writable_root).join("append-during-copy.o");
     let oversize = Path::new(writable_root).join("broker-oversize-input.o");
@@ -13467,6 +14578,8 @@ pub(crate) fn verify_native_archive_broker_descendant_launcher(
 pub(crate) fn verify_native_archive_broker_descendant_consumer(
     arguments: &[OsString],
 ) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let [adapter_root, fake_broker, source, growing, oversize] = arguments else {
         return Err(
             "native archive broker descendant consumer requires adapter, typed decoy, and input paths"
@@ -13478,7 +14591,6 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
         .ok_or_else(|| "broker descendant deadline overflowed".to_owned())?;
     let capability = NativeArchiveInputBrokerCapability::bind(Path::new(adapter_root), deadline)
         .map_err(|error| format!("cannot bind descendant broker capability: {error}"))?;
-    use std::os::unix::fs::MetadataExt as _;
     let decoy = fs::symlink_metadata(fake_broker)
         .map_err(|error| format!("cannot bind typed decoy broker receipt: {error}"))?;
     if capability.socket == Path::new(fake_broker)
@@ -13959,11 +15071,9 @@ const WINDOWS_SUPPORTED_LAUNCH_CANARY: [(&str, [&str; 4]); 1] =
 // invalid launchability predicate.
 
 #[cfg(any(windows, test))]
-fn windows_restricted_graphical_binding_contract(
-    binding: WindowsRestrictedGraphicalBinding,
-) -> std::io::Result<()> {
+fn windows_restricted_graphical_binding_contract(binding: WindowsRestrictedGraphicalBinding) {
     match binding {
-        WindowsRestrictedGraphicalBinding::InheritedDefault => Ok(()),
+        WindowsRestrictedGraphicalBinding::InheritedDefault => {}
     }
 }
 
@@ -14244,9 +15354,10 @@ fn windows_restricted_child(
     };
     firehazard::set_information_job_object(&job, limits)?;
 
-    windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING)?;
+    windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING);
     windows_restricted_stdio_contract(&WINDOWS_RESTRICTED_STDIO_HANDLES)?;
-    let system_root = std::env::var_os("SystemRoot")
+    let system_root = ProcessEnvironment::from_process()
+        .value(StandardVariable::SystemRoot)
         .map(PathBuf::from)
         .ok_or_else(|| std::io::Error::other("SystemRoot is absent"))?
         .join("System32");
@@ -14410,387 +15521,54 @@ fn verify_native_archive_stack_package_authority_for_integration(
 ) -> Result<(), String> {
     let mut directory = create_adapter_directory(base)?;
     let result = (|| {
-        prepare_adapter_work_directory(directory.path())?;
-        let temporary = directory.path().join(".stack-work/tmp");
-        let package = temporary.join("stack-deadbeef/Only-0.1");
-        let source = package.join("src/deeper");
-        let write = package.join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build");
-        fs::create_dir_all(&source)
-            .map_err(|error| format!("cannot create Stack source-cwd fixture: {error}"))?;
-        fs::create_dir_all(&write)
-            .map_err(|error| format!("cannot create Stack write-authority fixture: {error}"))?;
-        fs::write(write.join("member.o"), b"object\n")
-            .map_err(|error| format!("cannot write Stack member fixture: {error}"))?;
-        let relative_member =
-            Path::new("../..").join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build/member.o");
-        use std::os::unix::ffi::OsStrExt as _;
-        let mut response = relative_member.as_os_str().as_bytes().to_vec();
-        response.push(b'\n');
-        fs::write(source.join("objects.rsp"), response)
-            .map_err(|error| format!("cannot write Stack response fixture: {error}"))?;
-        let relative_target =
-            Path::new("../..").join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build/archive.a");
-        let arguments = [
-            OsString::from("q"),
-            relative_target.clone().into_os_string(),
-            OsString::from("@objects.rsp"),
-        ];
-        let normalized = normalize_native_archive_arguments_with_temporary_directory(
+        let fixture = prepare_stack_package_authority_fixture(directory.path())?;
+        let temporary = fixture.temporary;
+        let source = fixture.source;
+        let write = fixture.write;
+        let relative_member = fixture.relative_member;
+        let relative_target = fixture.relative_target;
+        let arguments = fixture.arguments;
+
+        verify_stack_package_escape_rejections(
+            directory.path(),
+            &temporary,
+            &source,
+            &relative_member,
+            &relative_target,
+        )?;
+        verify_expired_stack_package_authority(
+            directory.path(),
+            &temporary,
+            &source,
+            &relative_target,
             &arguments,
-            directory.path(),
-            &source,
-            Some(&temporary),
-        )
-        .map_err(|error| format!("cannot bind real Stack package topology: {error}"))?;
-        if normalized
-            != [
-                OsString::from("qL"),
-                relative_target.clone().into_os_string(),
-                OsString::from("@objects.rsp"),
-            ]
-        {
-            return Err("real Stack package archive normalization differs".to_owned());
-        }
-        let authority = native_archive_work_authority(
-            directory.path(),
-            &source,
-            &source.join(&relative_target),
-            Some(&temporary),
-        )
-        .map_err(|error| format!("cannot retain real Stack package topology: {error}"))?;
-        if authority.read_root
-            != fs::canonicalize(&package)
-                .map_err(|error| format!("cannot canonicalize Stack package fixture: {error}"))?
-            || authority.write_root
-                != fs::canonicalize(package.join(".stack-work")).map_err(|error| {
-                    format!("cannot canonicalize Stack write-authority fixture: {error}")
-                })?
-        {
-            return Err("Stack package read/write authorities were not separated".to_owned());
-        }
+        )?;
 
-        let outside = temporary.join("stack-deadbeef/outside");
-        fs::create_dir(&outside)
-            .map_err(|error| format!("cannot create Stack escape fixture: {error}"))?;
-        let target_escape = normalize_native_archive_arguments_with_temporary_directory(
-            &[
-                OsString::from("q"),
-                outside.join("archive.a").into_os_string(),
-                relative_member.clone().into_os_string(),
-            ],
+        let mutation = verify_stack_package_in_place_mutations(
             directory.path(),
+            &temporary,
             &source,
-            Some(&temporary),
-        )
-        .expect_err("a Stack archive target outside the package write authority must fail");
-        if target_escape.to_string() != "archive adapter target escapes its bound work directory" {
-            return Err(format!(
-                "Stack target escape diagnostic differs: {target_escape}"
-            ));
-        }
-
-        let other_package = temporary.join("stack-deadbeef/StateVar-1.2.2");
-        fs::create_dir(&other_package)
-            .map_err(|error| format!("cannot create cross-package fixture: {error}"))?;
-        fs::write(other_package.join("member.o"), b"cross-package\n")
-            .map_err(|error| format!("cannot write cross-package fixture: {error}"))?;
-        let cross_package_member = Path::new("../../..")
-            .join("StateVar-1.2.2")
-            .join("member.o");
-        let member_escape = normalize_native_archive_arguments_with_temporary_directory(
-            &[
-                OsString::from("q"),
-                relative_target.clone().into_os_string(),
-                cross_package_member.into_os_string(),
-            ],
-            directory.path(),
-            &source,
-            Some(&temporary),
-        )
-        .expect_err("a member from another Stack package must fail");
-        if member_escape.to_string() != "archive member escapes its bound work directory" {
-            return Err(format!(
-                "Stack cross-package member diagnostic differs: {member_escape}"
-            ));
-        }
-
-        let deadline_error = match bind_native_archive_invocation(
+            &write,
             &arguments,
-            directory.path(),
-            &source,
-            Some(&temporary),
-            Instant::now(),
-        ) {
-            Err(error) => error,
-            Ok(_) => return Err("an expired Stack archive authority was accepted".to_owned()),
-        };
-        if deadline_error.kind() != std::io::ErrorKind::TimedOut
-            || fs::symlink_metadata(source.join(&relative_target)).is_ok()
-        {
-            return Err("expired Stack archive binding did not fail without a target".to_owned());
-        }
-
-        let receipt_deadline = Instant::now()
-            .checked_add(NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
-            .ok_or_else(|| "Stack receipt mutation deadline overflowed".to_owned())?;
-        let response_path = source.join("objects.rsp");
-        let member_path = write.join("member.o");
-        let response_bytes = fs::read(&response_path)
-            .map_err(|error| format!("cannot retain Stack response fixture bytes: {error}"))?;
-        let member_bytes = fs::read(&member_path)
-            .map_err(|error| format!("cannot retain Stack member fixture bytes: {error}"))?;
-        let response_receipt = bind_native_archive_invocation(
-            &arguments,
-            directory.path(),
-            &source,
-            Some(&temporary),
-            receipt_deadline,
-        )
-        .map_err(|error| format!("cannot retain same-size Stack response fixture: {error}"))?;
-        let mut changed_response = response_bytes.clone();
-        let response_byte = changed_response
-            .iter_mut()
-            .find(|byte| byte.is_ascii_alphanumeric())
-            .ok_or_else(|| "Stack response fixture has no mutable byte".to_owned())?;
-        *response_byte = if *response_byte == b'z' { b'y' } else { b'z' };
-        fs::write(&response_path, &changed_response)
-            .map_err(|error| format!("cannot mutate Stack response fixture in place: {error}"))?;
-        let response_mutation = response_receipt
-            .revalidate_before_launch(receipt_deadline)
-            .expect_err("a same-size in-place response mutation must fail before launch");
-        if response_mutation.to_string() != "archive response file identity changed" {
-            return Err(format!(
-                "same-size Stack response mutation diagnostic differs: {response_mutation}"
-            ));
-        }
-        fs::write(&response_path, &response_bytes)
-            .map_err(|error| format!("cannot restore Stack response fixture: {error}"))?;
-
-        let member_receipt = bind_native_archive_invocation(
-            &arguments,
-            directory.path(),
-            &source,
-            Some(&temporary),
-            receipt_deadline,
-        )
-        .map_err(|error| format!("cannot retain same-size Stack member fixture: {error}"))?;
-        let canonical_member_path = fs::canonicalize(&member_path).map_err(|error| {
-            format!("cannot canonicalize Stack member mutation fixture: {error}")
-        })?;
-        let bound_member = member_receipt.authority.as_ref().and_then(|authority| {
-            authority
-                .inputs
-                .iter()
-                .find(|input| input.label == "archive member")
-        });
-        if bound_member.is_none_or(|input| input.path != canonical_member_path) {
-            return Err(format!(
-                "Stack member mutation fixture bound a different input: expected={} observed={}",
-                canonical_member_path.display(),
-                bound_member.map_or_else(
-                    || "<absent>".to_owned(),
-                    |input| input.path.display().to_string()
-                )
-            ));
-        }
-        let mut changed_member = member_bytes.clone();
-        let member_byte = changed_member
-            .first_mut()
-            .ok_or_else(|| "Stack member fixture is empty".to_owned())?;
-        *member_byte ^= 1;
-        fs::write(&member_path, &changed_member)
-            .map_err(|error| format!("cannot mutate Stack member fixture in place: {error}"))?;
-        let member_mutation = member_receipt
-            .revalidate_before_launch(receipt_deadline)
-            .expect_err("a same-size in-place member mutation must fail before launch");
-        if member_mutation.to_string() != "archive member identity changed" {
-            return Err(format!(
-                "same-size Stack member mutation diagnostic differs: {member_mutation}"
-            ));
-        }
-        fs::write(&member_path, &member_bytes)
-            .map_err(|error| format!("cannot restore Stack member fixture: {error}"))?;
+        )?;
 
         #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let broker_root = directory.path().join(".authority/inputs");
-            fs::create_dir_all(&broker_root)
-                .map_err(|error| format!("cannot create Stack input broker fixture: {error}"))?;
-            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o2755))
-                .map_err(|error| format!("cannot seal Stack adapter fixture: {error}"))?;
-            fs::set_permissions(
-                directory.path().join(".authority"),
-                fs::Permissions::from_mode(0o555),
-            )
-            .map_err(|error| format!("cannot seal Stack authority fixture: {error}"))?;
-            fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o2710))
-                .map_err(|error| format!("cannot confine Stack input broker fixture: {error}"))?;
-            use std::os::unix::fs::MetadataExt as _;
-            let candidate_uid = fs::metadata(&member_path)
-                .map_err(|error| format!("cannot inspect Stack broker member: {error}"))?
-                .uid();
-            let mut broker = NativeArchiveInputBroker::start_with_limits(
-                &broker_root,
-                candidate_uid,
-                NativeArchiveInputBrokerLimits::PRODUCTION,
-                None,
-                None,
-            )?;
-            let mut staged = bind_native_archive_invocation(
-                &arguments,
-                directory.path(),
-                &source,
-                Some(&temporary),
-                receipt_deadline,
-            )
-            .map_err(|error| format!("cannot bind trusted Stack input fixture: {error}"))?;
-            staged
-                .stage_inputs_with_broker(directory.path(), receipt_deadline)
-                .map_err(|error| format!("cannot stage trusted Stack input fixture: {error}"))?;
-            let canonical_member = fs::canonicalize(&member_path)
-                .map_err(|error| format!("cannot canonicalize Stack member fixture: {error}"))?;
-            if staged.arguments.iter().any(|argument| {
-                argument == OsStr::new("@objects.rsp") || Path::new(argument) == canonical_member
-            }) {
-                return Err(
-                    "trusted Stack input staging retained a candidate response/member path"
-                        .to_owned(),
-                );
-            }
-            if staged.arguments.len() != 3
-                || staged.arguments[0] != OsStr::new("qL")
-                || Path::new(&staged.arguments[1]) != relative_target
-                || !Path::new(&staged.arguments[2]).is_absolute()
-            {
-                return Err(format!(
-                    "trusted Stack input staging changed flag or argv order: {:?}",
-                    staged.arguments
-                ));
-            }
-            let executed = CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
-                .arguments(staged.arguments.clone())
-                .current_directory(&source)
-                .run()
-                .map_err(|error| {
-                    format!("cannot execute transformed Stack archive argv: {error}")
-                })?;
-            if !executed.status.success() || executed.timed_out {
-                return Err(format!(
-                    "transformed Stack archive argv failed: status={:?}; stderr={}",
-                    executed.status.code(),
-                    String::from_utf8_lossy(&executed.stderr)
-                ));
-            }
-            staged
-                .revalidate_after_launch(receipt_deadline)
-                .map_err(|error| format!("transformed Stack archive receipt failed: {error}"))?;
-            let archive_path = source.join(&relative_target);
-            let listed = CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
-                .argument("t")
-                .argument(&archive_path)
-                .current_directory(&source)
-                .run()
-                .map_err(|error| format!("cannot inspect transformed Stack archive: {error}"))?;
-            if !listed.status.success()
-                || listed.timed_out
-                || String::from_utf8_lossy(&listed.stdout)
-                    .lines()
-                    .collect::<Vec<_>>()
-                    != ["member.o"]
-            {
-                return Err(format!(
-                    "transformed Stack archive contents differ: status={:?}; stdout={}; stderr={}",
-                    listed.status.code(),
-                    String::from_utf8_lossy(&listed.stdout),
-                    String::from_utf8_lossy(&listed.stderr)
-                ));
-            }
-            let request_roots_before =
-                count_native_archive_request_roots(&broker_root, receipt_deadline)?;
-            let mut identity = bind_native_archive_invocation(
-                &[OsString::from("t"), relative_target.as_os_str().to_owned()],
-                directory.path(),
-                &source,
-                Some(&temporary),
-                receipt_deadline,
-            )
-            .map_err(|error| format!("cannot bind Stack archive identity query: {error}"))?;
-            identity
-                .stage_inputs_with_broker(directory.path(), receipt_deadline)
-                .map_err(|error| format!("cannot stage Stack archive identity query: {error}"))?;
-            let request_roots_after =
-                count_native_archive_request_roots(&broker_root, receipt_deadline)?;
-            if request_roots_after != request_roots_before {
-                return Err(
-                    "member-free Stack archive query connected to the staging broker".to_owned(),
-                );
-            }
-            fs::write(&response_path, &changed_response)
-                .map_err(|error| format!("cannot mutate staged Stack response source: {error}"))?;
-            fs::write(&member_path, &changed_member)
-                .map_err(|error| format!("cannot mutate staged Stack member source: {error}"))?;
-            if staged.revalidate_before_launch(receipt_deadline).is_ok() {
-                return Err(
-                    "trusted Stack input staging accepted a post-stage candidate mutation"
-                        .to_owned(),
-                );
-            }
-            fs::write(&response_path, &response_bytes)
-                .map_err(|error| format!("cannot restore staged Stack response source: {error}"))?;
-            fs::write(&member_path, &member_bytes)
-                .map_err(|error| format!("cannot restore staged Stack member source: {error}"))?;
-            broker.close_until(receipt_deadline)?;
-        }
-
-        let invocation = bind_native_archive_invocation(
-            &arguments,
+        verify_staged_stack_package_inputs(
             directory.path(),
+            &temporary,
             &source,
-            Some(&temporary),
-            receipt_deadline,
-        )
-        .map_err(|error| format!("cannot retain Stack mutation fixture: {error}"))?;
-        fs::remove_file(&response_path)
-            .map_err(|error| format!("cannot replace Stack response fixture: {error}"))?;
-        fs::write(&response_path, b"replacement\n")
-            .map_err(|error| format!("cannot install Stack response substitution: {error}"))?;
-        let substitution = invocation
-            .revalidate_before_launch(receipt_deadline)
-            .expect_err("a replaced Stack response receipt must fail before launch");
-        if substitution.to_string() != "archive response file identity changed" {
-            return Err(format!(
-                "Stack response substitution diagnostic differs: {substitution}"
-            ));
-        }
-
-        use std::os::unix::fs::symlink;
-        let redirected_package = temporary.join("stack-cafebabe/StateVar-1.2.2");
-        let redirected_source = redirected_package.join("src");
-        let redirected_write = directory.path().join("redirected-write");
-        fs::create_dir_all(&redirected_source)
-            .map_err(|error| format!("cannot create redirected Stack source: {error}"))?;
-        fs::create_dir(&redirected_write)
-            .map_err(|error| format!("cannot create redirected Stack write root: {error}"))?;
-        symlink(&redirected_write, redirected_package.join(".stack-work"))
-            .map_err(|error| format!("cannot redirect Stack write authority: {error}"))?;
-        let redirected = normalize_native_archive_arguments_with_temporary_directory(
-            &[
-                OsString::from("q"),
-                OsString::from("../.stack-work/archive.a"),
-            ],
+            &relative_target,
+            &arguments,
+            &mutation,
+        )?;
+        verify_stack_response_substitution(
             directory.path(),
-            &redirected_source,
-            Some(&temporary),
-        )
-        .expect_err("a redirected Stack write authority must fail before launch");
-        if redirected.to_string() != "Stack package archive write authority is redirected" {
-            return Err(format!(
-                "redirected Stack write-authority diagnostic differs: {redirected}"
-            ));
-        }
-        Ok(())
+            &temporary,
+            &source,
+            &arguments,
+            &mutation,
+        )?;
+        verify_redirected_stack_write_authority(directory.path(), &temporary)
     })();
     let cleanup = directory.close();
     match (result, cleanup) {
@@ -14801,6 +15579,601 @@ fn verify_native_archive_stack_package_authority_for_integration(
             "{primary}; Stack archive authority verifier cleanup also failed: {cleanup}"
         )),
     }
+}
+
+#[cfg(unix)]
+struct StackPackageAuthorityFixture {
+    temporary: PathBuf,
+    source: PathBuf,
+    write: PathBuf,
+    relative_member: PathBuf,
+    relative_target: PathBuf,
+    arguments: [OsString; 3],
+}
+
+#[cfg(unix)]
+fn prepare_stack_package_authority_fixture(
+    adapter_root: &Path,
+) -> Result<StackPackageAuthorityFixture, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    prepare_adapter_work_directory(adapter_root)?;
+    let temporary = adapter_root.join(".stack-work/tmp");
+    let package = temporary.join("stack-deadbeef/Only-0.1");
+    let source = package.join("src/deeper");
+    let write = package.join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build");
+    fs::create_dir_all(&source)
+        .map_err(|error| format!("cannot create Stack source-cwd fixture: {error}"))?;
+    fs::create_dir_all(&write)
+        .map_err(|error| format!("cannot create Stack write-authority fixture: {error}"))?;
+    fs::write(write.join("member.o"), b"object\n")
+        .map_err(|error| format!("cannot write Stack member fixture: {error}"))?;
+    let relative_member =
+        Path::new("../..").join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build/member.o");
+    let mut response = relative_member.as_os_str().as_bytes().to_vec();
+    response.push(b'\n');
+    fs::write(source.join("objects.rsp"), response)
+        .map_err(|error| format!("cannot write Stack response fixture: {error}"))?;
+    let relative_target =
+        Path::new("../..").join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build/archive.a");
+    let arguments = [
+        OsString::from("q"),
+        relative_target.clone().into_os_string(),
+        OsString::from("@objects.rsp"),
+    ];
+    verify_stack_package_authority(
+        adapter_root,
+        &temporary,
+        &package,
+        &source,
+        &relative_target,
+        &arguments,
+    )?;
+    Ok(StackPackageAuthorityFixture {
+        temporary,
+        source,
+        write,
+        relative_member,
+        relative_target,
+        arguments,
+    })
+}
+
+#[cfg(unix)]
+fn verify_stack_package_authority(
+    adapter_root: &Path,
+    temporary: &Path,
+    package: &Path,
+    source: &Path,
+    relative_target: &Path,
+    arguments: &[OsString],
+) -> Result<(), String> {
+    let normalized = normalize_native_archive_arguments_with_temporary_directory(
+        arguments,
+        adapter_root,
+        source,
+        Some(temporary),
+    )
+    .map_err(|error| format!("cannot bind real Stack package topology: {error}"))?;
+    if normalized
+        != [
+            OsString::from("qL"),
+            relative_target.to_owned().into_os_string(),
+            OsString::from("@objects.rsp"),
+        ]
+    {
+        return Err("real Stack package archive normalization differs".to_owned());
+    }
+    let authority = native_archive_work_authority(
+        adapter_root,
+        source,
+        &source.join(relative_target),
+        Some(temporary),
+    )
+    .map_err(|error| format!("cannot retain real Stack package topology: {error}"))?;
+    if authority.read_root
+        != fs::canonicalize(package)
+            .map_err(|error| format!("cannot canonicalize Stack package fixture: {error}"))?
+        || authority.write_root
+            != fs::canonicalize(package.join(".stack-work")).map_err(|error| {
+                format!("cannot canonicalize Stack write-authority fixture: {error}")
+            })?
+    {
+        return Err("Stack package read/write authorities were not separated".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_stack_package_escape_rejections(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    relative_member: &Path,
+    relative_target: &Path,
+) -> Result<(), String> {
+    let outside = temporary.join("stack-deadbeef/outside");
+    fs::create_dir(&outside)
+        .map_err(|error| format!("cannot create Stack escape fixture: {error}"))?;
+    let target_escape = normalize_native_archive_arguments_with_temporary_directory(
+        &[
+            OsString::from("q"),
+            outside.join("archive.a").into_os_string(),
+            relative_member.to_owned().into_os_string(),
+        ],
+        adapter_root,
+        source,
+        Some(temporary),
+    )
+    .expect_err("a Stack archive target outside the package write authority must fail");
+    if target_escape.to_string() != "archive adapter target escapes its bound work directory" {
+        return Err(format!(
+            "Stack target escape diagnostic differs: {target_escape}"
+        ));
+    }
+    let other_package = temporary.join("stack-deadbeef/StateVar-1.2.2");
+    fs::create_dir(&other_package)
+        .map_err(|error| format!("cannot create cross-package fixture: {error}"))?;
+    fs::write(other_package.join("member.o"), b"cross-package\n")
+        .map_err(|error| format!("cannot write cross-package fixture: {error}"))?;
+    let cross_package_member = Path::new("../../..")
+        .join("StateVar-1.2.2")
+        .join("member.o");
+    let member_escape = normalize_native_archive_arguments_with_temporary_directory(
+        &[
+            OsString::from("q"),
+            relative_target.to_owned().into_os_string(),
+            cross_package_member.into_os_string(),
+        ],
+        adapter_root,
+        source,
+        Some(temporary),
+    )
+    .expect_err("a member from another Stack package must fail");
+    if member_escape.to_string() != "archive member escapes its bound work directory" {
+        return Err(format!(
+            "Stack cross-package member diagnostic differs: {member_escape}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_expired_stack_package_authority(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    relative_target: &Path,
+    arguments: &[OsString],
+) -> Result<(), String> {
+    let Err(deadline_error) = bind_native_archive_invocation(
+        arguments,
+        adapter_root,
+        source,
+        Some(temporary),
+        Instant::now(),
+    ) else {
+        return Err("an expired Stack archive authority was accepted".to_owned());
+    };
+    if deadline_error.kind() != std::io::ErrorKind::TimedOut
+        || fs::symlink_metadata(source.join(relative_target)).is_ok()
+    {
+        return Err("expired Stack archive binding did not fail without a target".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct StackPackageMutationFixture {
+    deadline: Instant,
+    response_path: PathBuf,
+    member_path: PathBuf,
+    response_bytes: Vec<u8>,
+    member_bytes: Vec<u8>,
+    changed_response: Vec<u8>,
+    changed_member: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn bind_stack_package_invocation(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    arguments: &[OsString],
+    deadline: Instant,
+) -> Result<NativeArchiveInvocation, std::io::Error> {
+    bind_native_archive_invocation(arguments, adapter_root, source, Some(temporary), deadline)
+}
+
+#[cfg(unix)]
+fn verify_stack_package_in_place_mutations(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    write: &Path,
+    arguments: &[OsString],
+) -> Result<StackPackageMutationFixture, String> {
+    let deadline = Instant::now()
+        .checked_add(NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
+        .ok_or_else(|| "Stack receipt mutation deadline overflowed".to_owned())?;
+    let response_path = source.join("objects.rsp");
+    let member_path = write.join("member.o");
+    let response_bytes = fs::read(&response_path)
+        .map_err(|error| format!("cannot retain Stack response fixture bytes: {error}"))?;
+    let member_bytes = fs::read(&member_path)
+        .map_err(|error| format!("cannot retain Stack member fixture bytes: {error}"))?;
+    let changed_response = verify_stack_response_in_place_mutation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        deadline,
+        &response_path,
+        &response_bytes,
+    )?;
+    let changed_member = verify_stack_member_in_place_mutation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        deadline,
+        &member_path,
+        &member_bytes,
+    )?;
+    Ok(StackPackageMutationFixture {
+        deadline,
+        response_path,
+        member_path,
+        response_bytes,
+        member_bytes,
+        changed_response,
+        changed_member,
+    })
+}
+
+#[cfg(unix)]
+fn verify_stack_response_in_place_mutation(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    arguments: &[OsString],
+    deadline: Instant,
+    response_path: &Path,
+    response_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let receipt =
+        bind_stack_package_invocation(adapter_root, temporary, source, arguments, deadline)
+            .map_err(|error| format!("cannot retain same-size Stack response fixture: {error}"))?;
+    let mut changed = response_bytes.to_vec();
+    let response_byte = changed
+        .iter_mut()
+        .find(|byte| byte.is_ascii_alphanumeric())
+        .ok_or_else(|| "Stack response fixture has no mutable byte".to_owned())?;
+    *response_byte = if *response_byte == b'z' { b'y' } else { b'z' };
+    fs::write(response_path, &changed)
+        .map_err(|error| format!("cannot mutate Stack response fixture in place: {error}"))?;
+    let mutation = receipt
+        .revalidate_before_launch(deadline)
+        .expect_err("a same-size in-place response mutation must fail before launch");
+    if mutation.to_string() != "archive response file identity changed" {
+        return Err(format!(
+            "same-size Stack response mutation diagnostic differs: {mutation}"
+        ));
+    }
+    fs::write(response_path, response_bytes)
+        .map_err(|error| format!("cannot restore Stack response fixture: {error}"))?;
+    Ok(changed)
+}
+
+#[cfg(unix)]
+fn verify_stack_member_in_place_mutation(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    arguments: &[OsString],
+    deadline: Instant,
+    member_path: &Path,
+    member_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let receipt =
+        bind_stack_package_invocation(adapter_root, temporary, source, arguments, deadline)
+            .map_err(|error| format!("cannot retain same-size Stack member fixture: {error}"))?;
+    let canonical_member = fs::canonicalize(member_path)
+        .map_err(|error| format!("cannot canonicalize Stack member mutation fixture: {error}"))?;
+    let bound_member = receipt.authority.as_ref().and_then(|authority| {
+        authority
+            .inputs
+            .iter()
+            .find(|input| input.label == "archive member")
+    });
+    if bound_member.is_none_or(|input| input.path != canonical_member) {
+        return Err(format!(
+            "Stack member mutation fixture bound a different input: expected={} observed={}",
+            canonical_member.display(),
+            bound_member.map_or_else(
+                || "<absent>".to_owned(),
+                |input| input.path.display().to_string()
+            )
+        ));
+    }
+    let mut changed = member_bytes.to_vec();
+    let member_byte = changed
+        .first_mut()
+        .ok_or_else(|| "Stack member fixture is empty".to_owned())?;
+    *member_byte ^= 1;
+    fs::write(member_path, &changed)
+        .map_err(|error| format!("cannot mutate Stack member fixture in place: {error}"))?;
+    let mutation = receipt
+        .revalidate_before_launch(deadline)
+        .expect_err("a same-size in-place member mutation must fail before launch");
+    if mutation.to_string() != "archive member identity changed" {
+        return Err(format!(
+            "same-size Stack member mutation diagnostic differs: {mutation}"
+        ));
+    }
+    fs::write(member_path, member_bytes)
+        .map_err(|error| format!("cannot restore Stack member fixture: {error}"))?;
+    Ok(changed)
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_staged_stack_package_inputs(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    relative_target: &Path,
+    arguments: &[OsString],
+    mutation: &StackPackageMutationFixture,
+) -> Result<(), String> {
+    let (broker_root, mut broker) =
+        start_stack_package_input_broker(adapter_root, &mutation.member_path)?;
+    let mut staged = bind_stack_package_invocation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        mutation.deadline,
+    )
+    .map_err(|error| format!("cannot bind trusted Stack input fixture: {error}"))?;
+    staged
+        .stage_inputs_with_broker(adapter_root, mutation.deadline)
+        .map_err(|error| format!("cannot stage trusted Stack input fixture: {error}"))?;
+    require_staged_stack_package_arguments(&staged, &mutation.member_path, relative_target)?;
+    execute_staged_stack_archive(source, relative_target, &staged, mutation.deadline)?;
+    verify_member_free_stack_query_does_not_stage(
+        adapter_root,
+        temporary,
+        source,
+        relative_target,
+        &broker_root,
+        mutation.deadline,
+    )?;
+    verify_staged_stack_candidate_mutation(&staged, mutation)?;
+    broker.close_until(mutation.deadline)
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn start_stack_package_input_broker(
+    adapter_root: &Path,
+    member_path: &Path,
+) -> Result<(PathBuf, NativeArchiveInputBroker), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let broker_root = adapter_root.join(".authority/inputs");
+    fs::create_dir_all(&broker_root)
+        .map_err(|error| format!("cannot create Stack input broker fixture: {error}"))?;
+    fs::set_permissions(adapter_root, fs::Permissions::from_mode(0o2755))
+        .map_err(|error| format!("cannot seal Stack adapter fixture: {error}"))?;
+    fs::set_permissions(
+        adapter_root.join(".authority"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .map_err(|error| format!("cannot seal Stack authority fixture: {error}"))?;
+    fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o2710))
+        .map_err(|error| format!("cannot confine Stack input broker fixture: {error}"))?;
+    let candidate_uid = fs::metadata(member_path)
+        .map_err(|error| format!("cannot inspect Stack broker member: {error}"))?
+        .uid();
+    let broker = NativeArchiveInputBroker::start_with_limits(
+        &broker_root,
+        candidate_uid,
+        NativeArchiveInputBrokerLimits::PRODUCTION,
+        None,
+        None,
+    )?;
+    Ok((broker_root, broker))
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn require_staged_stack_package_arguments(
+    staged: &NativeArchiveInvocation,
+    member_path: &Path,
+    relative_target: &Path,
+) -> Result<(), String> {
+    let canonical_member = fs::canonicalize(member_path)
+        .map_err(|error| format!("cannot canonicalize Stack member fixture: {error}"))?;
+    if staged.arguments.iter().any(|argument| {
+        argument == OsStr::new("@objects.rsp") || Path::new(argument) == canonical_member
+    }) {
+        return Err(
+            "trusted Stack input staging retained a candidate response/member path".to_owned(),
+        );
+    }
+    if staged.arguments.len() != 3
+        || staged.arguments[0] != OsStr::new("qL")
+        || Path::new(&staged.arguments[1]) != relative_target
+        || !Path::new(&staged.arguments[2]).is_absolute()
+    {
+        return Err(format!(
+            "trusted Stack input staging changed flag or argv order: {:?}",
+            staged.arguments
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn execute_staged_stack_archive(
+    source: &Path,
+    relative_target: &Path,
+    staged: &NativeArchiveInvocation,
+    deadline: Instant,
+) -> Result<(), String> {
+    let executed = CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
+        .arguments(staged.arguments.clone())
+        .current_directory(source)
+        .run()
+        .map_err(|error| format!("cannot execute transformed Stack archive argv: {error}"))?;
+    if !executed.status.success() || executed.timed_out {
+        return Err(format!(
+            "transformed Stack archive argv failed: status={:?}; stderr={}",
+            executed.status.code(),
+            String::from_utf8_lossy(&executed.stderr)
+        ));
+    }
+    staged
+        .revalidate_after_launch(deadline)
+        .map_err(|error| format!("transformed Stack archive receipt failed: {error}"))?;
+    let listed = CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
+        .argument("t")
+        .argument(source.join(relative_target))
+        .current_directory(source)
+        .run()
+        .map_err(|error| format!("cannot inspect transformed Stack archive: {error}"))?;
+    if !listed.status.success()
+        || listed.timed_out
+        || String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .collect::<Vec<_>>()
+            != ["member.o"]
+    {
+        return Err(format!(
+            "transformed Stack archive contents differ: status={:?}; stdout={}; stderr={}",
+            listed.status.code(),
+            String::from_utf8_lossy(&listed.stdout),
+            String::from_utf8_lossy(&listed.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_member_free_stack_query_does_not_stage(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    relative_target: &Path,
+    broker_root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let before = count_native_archive_request_roots(broker_root, deadline)?;
+    let mut identity = bind_stack_package_invocation(
+        adapter_root,
+        temporary,
+        source,
+        &[OsString::from("t"), relative_target.as_os_str().to_owned()],
+        deadline,
+    )
+    .map_err(|error| format!("cannot bind Stack archive identity query: {error}"))?;
+    identity
+        .stage_inputs_with_broker(adapter_root, deadline)
+        .map_err(|error| format!("cannot stage Stack archive identity query: {error}"))?;
+    if count_native_archive_request_roots(broker_root, deadline)? != before {
+        return Err("member-free Stack archive query connected to the staging broker".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_staged_stack_candidate_mutation(
+    staged: &NativeArchiveInvocation,
+    mutation: &StackPackageMutationFixture,
+) -> Result<(), String> {
+    fs::write(&mutation.response_path, &mutation.changed_response)
+        .map_err(|error| format!("cannot mutate staged Stack response source: {error}"))?;
+    fs::write(&mutation.member_path, &mutation.changed_member)
+        .map_err(|error| format!("cannot mutate staged Stack member source: {error}"))?;
+    if staged.revalidate_before_launch(mutation.deadline).is_ok() {
+        return Err(
+            "trusted Stack input staging accepted a post-stage candidate mutation".to_owned(),
+        );
+    }
+    fs::write(&mutation.response_path, &mutation.response_bytes)
+        .map_err(|error| format!("cannot restore staged Stack response source: {error}"))?;
+    fs::write(&mutation.member_path, &mutation.member_bytes)
+        .map_err(|error| format!("cannot restore staged Stack member source: {error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_stack_response_substitution(
+    adapter_root: &Path,
+    temporary: &Path,
+    source: &Path,
+    arguments: &[OsString],
+    mutation: &StackPackageMutationFixture,
+) -> Result<(), String> {
+    let invocation = bind_stack_package_invocation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        mutation.deadline,
+    )
+    .map_err(|error| format!("cannot retain Stack mutation fixture: {error}"))?;
+    fs::remove_file(&mutation.response_path)
+        .map_err(|error| format!("cannot replace Stack response fixture: {error}"))?;
+    fs::write(&mutation.response_path, b"replacement\n")
+        .map_err(|error| format!("cannot install Stack response substitution: {error}"))?;
+    let substitution = invocation
+        .revalidate_before_launch(mutation.deadline)
+        .expect_err("a replaced Stack response receipt must fail before launch");
+    if substitution.to_string() != "archive response file identity changed" {
+        return Err(format!(
+            "Stack response substitution diagnostic differs: {substitution}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_redirected_stack_write_authority(
+    adapter_root: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let redirected_package = temporary.join("stack-cafebabe/StateVar-1.2.2");
+    let redirected_source = redirected_package.join("src");
+    let redirected_write = adapter_root.join("redirected-write");
+    fs::create_dir_all(&redirected_source)
+        .map_err(|error| format!("cannot create redirected Stack source: {error}"))?;
+    fs::create_dir(&redirected_write)
+        .map_err(|error| format!("cannot create redirected Stack write root: {error}"))?;
+    symlink(&redirected_write, redirected_package.join(".stack-work"))
+        .map_err(|error| format!("cannot redirect Stack write authority: {error}"))?;
+    let redirected = normalize_native_archive_arguments_with_temporary_directory(
+        &[
+            OsString::from("q"),
+            OsString::from("../.stack-work/archive.a"),
+        ],
+        adapter_root,
+        &redirected_source,
+        Some(temporary),
+    )
+    .expect_err("a redirected Stack write authority must fail before launch");
+    if redirected.to_string() != "Stack package archive write authority is redirected" {
+        return Err(format!(
+            "redirected Stack write-authority diagnostic differs: {redirected}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -14815,12 +16188,11 @@ fn verify_native_archive_ghc_configure_broker_for_integration(
 ) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    if Instant::now() >= execution_deadline
-        || execution_deadline >= command_completion_deadline
-        || command_completion_deadline >= cleanup_deadline
-    {
-        return Err("GHC configure execution, command-completion, and broker-cleanup deadlines are not ordered".to_owned());
-    }
+    require_ghc_configure_broker_deadlines(
+        execution_deadline,
+        command_completion_deadline,
+        cleanup_deadline,
+    )?;
     let authority_root = adapter_root.join(".authority");
     let staging_root = authority_root.join("inputs");
     fs::create_dir(&authority_root)
@@ -14840,85 +16212,14 @@ fn verify_native_archive_ghc_configure_broker_for_integration(
         None,
         None,
     )?;
-    let primary = (|| {
-        let mut invocation = bind_native_archive_invocation(
-            arguments,
-            adapter_root,
-            configure_root,
-            Some(configure_root),
-            execution_deadline,
-        )
-        .map_err(|error| format!("cannot bind sealed GHC configure probe: {error}"))?;
-        let original = invocation
-            .authority
-            .as_ref()
-            .and_then(|authority| authority.inputs.first())
-            .map(|receipt| (receipt.sha256, receipt.size))
-            .ok_or_else(|| "sealed GHC configure member receipt is absent".to_owned())?;
-        invocation
-            .stage_inputs_with_broker(adapter_root, execution_deadline)
-            .map_err(|error| format!("cannot stage sealed GHC configure member: {error}"))?;
-        let staged_member = Path::new(&invocation.arguments[2]);
-        let staged_receipt = invocation
-            .authority
-            .as_ref()
-            .and_then(|authority| authority.inputs.last())
-            .ok_or_else(|| "trusted GHC configure member receipt is absent".to_owned())?;
-        if invocation.arguments[0] != OsStr::new("qclsL")
-            || invocation.arguments[1] != OsStr::new("conftest.a")
-            || !staged_member.is_absolute()
-            || !staged_member.starts_with(&staging_root)
-            || (staged_receipt.sha256, staged_receipt.size) != original
-        {
-            return Err("sealed GHC configure probe argv or receipt differs".to_owned());
-        }
-        let executed = run_ghc_configure_archiver_until(
-            CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
-                .arguments(invocation.arguments.clone())
-                .current_directory(configure_root),
-            execution_deadline,
-            command_completion_deadline,
-            "execute sealed GHC configure probe",
-        )?;
-        if !executed.status.success() || executed.timed_out {
-            return Err(format!(
-                "sealed GHC configure probe failed: status={:?}; stderr={}",
-                executed.status.code(),
-                String::from_utf8_lossy(&executed.stderr)
-            ));
-        }
-        invocation
-            .revalidate_after_launch(execution_deadline)
-            .map_err(|error| format!("sealed GHC configure postflight failed: {error}"))?;
-        let listed = run_ghc_configure_archiver_until(
-            CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
-                .arguments(["t", "conftest.a"])
-                .current_directory(configure_root),
-            execution_deadline,
-            command_completion_deadline,
-            "inspect sealed GHC configure archive",
-        )?;
-        if !listed.status.success()
-            || listed.timed_out
-            || String::from_utf8_lossy(&listed.stdout)
-                .lines()
-                .collect::<Vec<_>>()
-                != ["__.SYMDEF SORTED", "conftest.o"]
-        {
-            return Err(format!(
-                "sealed GHC configure archive contents differ: status={:?}; stdout={}; stderr={}",
-                listed.status.code(),
-                String::from_utf8_lossy(&listed.stdout),
-                String::from_utf8_lossy(&listed.stderr)
-            ));
-        }
-        verify_ghc_configure_hung_archiver_cleanup(
-            configure_root,
-            execution_deadline,
-            command_completion_deadline,
-        )?;
-        Ok(())
-    })();
+    let primary = verify_sealed_ghc_configure_broker_probe(
+        adapter_root,
+        configure_root,
+        arguments,
+        &staging_root,
+        execution_deadline,
+        command_completion_deadline,
+    );
     let broker_cleanup = broker.close_until(cleanup_deadline);
     let authority_cleanup = if broker.closed {
         fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700))
@@ -14928,6 +16229,163 @@ fn verify_native_archive_ghc_configure_broker_for_integration(
     } else {
         Err("GHC configure broker retains its sealed authority".to_owned())
     };
+    finish_ghc_configure_broker_probe(primary, broker_cleanup, authority_cleanup)
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn require_ghc_configure_broker_deadlines(
+    execution_deadline: Instant,
+    command_completion_deadline: Instant,
+    cleanup_deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= execution_deadline
+        || execution_deadline >= command_completion_deadline
+        || command_completion_deadline >= cleanup_deadline
+    {
+        return Err("GHC configure execution, command-completion, and broker-cleanup deadlines are not ordered".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_sealed_ghc_configure_broker_probe(
+    adapter_root: &Path,
+    configure_root: &Path,
+    arguments: &[OsString],
+    staging_root: &Path,
+    execution_deadline: Instant,
+    command_completion_deadline: Instant,
+) -> Result<(), String> {
+    let mut invocation = bind_native_archive_invocation(
+        arguments,
+        adapter_root,
+        configure_root,
+        Some(configure_root),
+        execution_deadline,
+    )
+    .map_err(|error| format!("cannot bind sealed GHC configure probe: {error}"))?;
+    let original = invocation
+        .authority
+        .as_ref()
+        .and_then(|authority| authority.inputs.first())
+        .map(|receipt| (receipt.sha256, receipt.size))
+        .ok_or_else(|| "sealed GHC configure member receipt is absent".to_owned())?;
+    invocation
+        .stage_inputs_with_broker(adapter_root, execution_deadline)
+        .map_err(|error| format!("cannot stage sealed GHC configure member: {error}"))?;
+    require_staged_ghc_configure_invocation(&invocation, staging_root, original)?;
+    execute_staged_ghc_configure_invocation(
+        configure_root,
+        &invocation,
+        execution_deadline,
+        command_completion_deadline,
+    )?;
+    invocation
+        .revalidate_after_launch(execution_deadline)
+        .map_err(|error| format!("sealed GHC configure postflight failed: {error}"))?;
+    verify_staged_ghc_configure_archive(
+        configure_root,
+        execution_deadline,
+        command_completion_deadline,
+    )?;
+    verify_ghc_configure_hung_archiver_cleanup(
+        configure_root,
+        execution_deadline,
+        command_completion_deadline,
+    )
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn require_staged_ghc_configure_invocation(
+    invocation: &NativeArchiveInvocation,
+    staging_root: &Path,
+    original: (Digest, u64),
+) -> Result<(), String> {
+    let staged_member = Path::new(&invocation.arguments[2]);
+    let staged_receipt = invocation
+        .authority
+        .as_ref()
+        .and_then(|authority| authority.inputs.last())
+        .ok_or_else(|| "trusted GHC configure member receipt is absent".to_owned())?;
+    if invocation.arguments[0] != OsStr::new("qclsL")
+        || invocation.arguments[1] != OsStr::new("conftest.a")
+        || !staged_member.is_absolute()
+        || !staged_member.starts_with(staging_root)
+        || (staged_receipt.sha256, staged_receipt.size) != original
+    {
+        return Err("sealed GHC configure probe argv or receipt differs".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn execute_staged_ghc_configure_invocation(
+    configure_root: &Path,
+    invocation: &NativeArchiveInvocation,
+    execution_deadline: Instant,
+    command_completion_deadline: Instant,
+) -> Result<(), String> {
+    let executed = run_ghc_configure_archiver_until(
+        &CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
+            .arguments(invocation.arguments.clone())
+            .current_directory(configure_root),
+        execution_deadline,
+        command_completion_deadline,
+        "execute sealed GHC configure probe",
+    )?;
+    if !executed.status.success() || executed.timed_out {
+        return Err(format!(
+            "sealed GHC configure probe failed: status={:?}; stderr={}",
+            executed.status.code(),
+            String::from_utf8_lossy(&executed.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_staged_ghc_configure_archive(
+    configure_root: &Path,
+    execution_deadline: Instant,
+    command_completion_deadline: Instant,
+) -> Result<(), String> {
+    let listed = run_ghc_configure_archiver_until(
+        &CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
+            .arguments(["t", "conftest.a"])
+            .current_directory(configure_root),
+        execution_deadline,
+        command_completion_deadline,
+        "inspect sealed GHC configure archive",
+    )?;
+    if !listed.status.success()
+        || listed.timed_out
+        || String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .collect::<Vec<_>>()
+            != ["__.SYMDEF SORTED", "conftest.o"]
+    {
+        return Err(format!(
+            "sealed GHC configure archive contents differ: status={:?}; stdout={}; stderr={}",
+            listed.status.code(),
+            String::from_utf8_lossy(&listed.stdout),
+            String::from_utf8_lossy(&listed.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn finish_ghc_configure_broker_probe(
+    primary: Result<(), String>,
+    broker_cleanup: Result<(), String>,
+    authority_cleanup: Result<(), String>,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     if let Err(error) = primary {
         failures.push(error);
@@ -14970,7 +16428,7 @@ fn verify_ghc_configure_hung_archiver_cleanup(
     )
     .map_err(|error| format!("cannot bind hung GHC configure fixture: {error}"))?;
     let result = run_ghc_configure_archiver_until(
-        CommandSpec::new(executable, NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
+        &CommandSpec::new(executable, NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
             .arguments([
                 "__native-archive-ghc-configure-hung-child",
                 receipt_path
@@ -15005,7 +16463,7 @@ fn verify_ghc_configure_hung_archiver_cleanup(
 #[cfg(unix)]
 #[cfg(target_os = "macos")]
 fn run_ghc_configure_archiver_until(
-    command: CommandSpec,
+    command: &CommandSpec,
     execution_deadline: Instant,
     command_completion_deadline: Instant,
     phase: &str,
@@ -15059,169 +16517,8 @@ pub(crate) fn verify_native_archive_ghc_configure_probe_for_integration(
     }
     fs::create_dir(&fixture)
         .map_err(|error| format!("cannot create GHC configure probe fixture: {error}"))?;
-    let primary = (|| {
-        let configure_root = fixture.join("configure-root");
-        fs::create_dir(fixture.join(".stack-work"))
-            .and_then(|()| fs::create_dir(&configure_root))
-            .map_err(|error| format!("cannot create GHC configure probe root: {error}"))?;
-        let configure = configure_root.join("configure");
-        let member = configure_root.join("conftest.o");
-        let target = configure_root.join("conftest.a");
-        fs::write(&configure, b"configure marker\n")
-            .map_err(|error| format!("cannot write GHC configure marker: {error}"))?;
-        fs::write(&member, b"object marker\n")
-            .map_err(|error| format!("cannot write GHC configure member: {error}"))?;
-        let cleanup_deadline = Instant::now()
-            .checked_add(NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
-            .ok_or_else(|| "GHC configure probe deadline overflowed".to_owned())?;
-        let command_completion_deadline = cleanup_deadline
-            .checked_sub(NATIVE_ARCHIVE_ADAPTER_CLEANUP_RESERVE)
-            .ok_or_else(|| "GHC configure probe cleanup reserve underflowed".to_owned())?;
-        let execution_deadline = command_completion_deadline
-            .checked_sub(NATIVE_ARCHIVE_ADAPTER_CLEANUP_RESERVE)
-            .ok_or_else(|| {
-                "GHC configure probe command-completion reserve underflowed".to_owned()
-            })?;
-        let arguments = [
-            OsString::from("clqs"),
-            OsString::from("conftest.a"),
-            OsString::from("conftest.o"),
-        ];
-        let invocation = bind_native_archive_invocation(
-            &arguments,
-            &fixture,
-            &configure_root,
-            Some(&configure_root),
-            execution_deadline,
-        )
-        .map_err(|error| format!("cannot bind exact GHC configure probe: {error}"))?;
-        if invocation.arguments
-            != [
-                OsString::from("qclsL"),
-                OsString::from("conftest.a"),
-                OsString::from("conftest.o"),
-            ]
-            || invocation.input_groups.len() != 1
-            || invocation.input_groups[0].argument_index != 2
-            || invocation.input_groups[0].input_indices != [0]
-        {
-            return Err("GHC configure probe normalized argv topology differs".to_owned());
-        }
-        let authority = invocation
-            .authority
-            .as_ref()
-            .ok_or_else(|| "GHC configure probe retained authority is absent".to_owned())?;
-        let canonical_root = fs::canonicalize(&configure_root)
-            .map_err(|error| format!("cannot bind GHC configure root: {error}"))?;
-        let canonical_member = fs::canonicalize(&member)
-            .map_err(|error| format!("cannot bind GHC configure member: {error}"))?;
-        let pending_target = canonical_root.join("conftest.a");
-        if authority.read_root != canonical_root
-            || authority.write_root != canonical_root
-            || authority.inputs.len() != 1
-            || authority.inputs[0].label != "archive member"
-            || authority.inputs[0].path != canonical_member
-            || !authority.targets.is_empty()
-            || authority.pending_targets != [pending_target]
-        {
-            return Err("GHC configure probe retained path authority differs".to_owned());
-        }
-        invocation
-            .revalidate_before_launch(execution_deadline)
-            .map_err(|error| format!("GHC configure probe receipt failed: {error}"))?;
-
-        #[cfg(target_os = "macos")]
-        verify_native_archive_ghc_configure_broker_for_integration(
-            &fixture,
-            &configure_root,
-            &arguments,
-            execution_deadline,
-            command_completion_deadline,
-            cleanup_deadline,
-        )?;
-
-        #[cfg(target_os = "macos")]
-        {
-            let expired_target = configure_root.join("expired.a");
-            let expired = run_ghc_configure_archiver_until(
-                CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
-                    .arguments(["q", "expired.a", "conftest.o"])
-                    .current_directory(&configure_root),
-                Instant::now(),
-                command_completion_deadline,
-                "execute expired GHC configure probe",
-            )
-            .expect_err("expired GHC configure execution must fail before launch");
-            if !expired.contains("deadline expired before launch") || expired_target.exists() {
-                return Err("expired GHC configure probe launched late archiver work".to_owned());
-            }
-        }
-
-        if !target.exists() {
-            fs::write(&target, b"existing archive\n")
-                .map_err(|error| format!("cannot create existing GHC probe target: {error}"))?;
-        }
-        let existing = match bind_native_archive_invocation(
-            &arguments,
-            &fixture,
-            &configure_root,
-            Some(&configure_root),
-            execution_deadline,
-        ) {
-            Ok(_) => return Err("an existing GHC configure target was accepted".to_owned()),
-            Err(error) => error.to_string(),
-        };
-        if existing != "GHC configure archive probe target already exists" {
-            return Err(format!(
-                "existing GHC probe target diagnostic differs: {existing}"
-            ));
-        }
-        fs::remove_file(&target)
-            .map_err(|error| format!("cannot remove existing GHC probe target: {error}"))?;
-
-        fs::remove_file(&member)
-            .map_err(|error| format!("cannot remove GHC configure member: {error}"))?;
-        let missing = match bind_native_archive_invocation(
-            &arguments,
-            &fixture,
-            &configure_root,
-            Some(&configure_root),
-            execution_deadline,
-        ) {
-            Ok(_) => return Err("a missing GHC configure member was accepted".to_owned()),
-            Err(error) => error.to_string(),
-        };
-        if missing != "GHC configure archive probe fixture is not a regular real file" {
-            return Err(format!(
-                "missing GHC probe member diagnostic differs: {missing}"
-            ));
-        }
-        fs::write(&member, b"object marker\n")
-            .map_err(|error| format!("cannot restore GHC configure member: {error}"))?;
-
-        let near_match = match bind_native_archive_invocation(
-            &[
-                OsString::from("clqs"),
-                OsString::from("conftest.a"),
-                OsString::from("member.o"),
-            ],
-            &fixture,
-            &configure_root,
-            Some(&configure_root),
-            execution_deadline,
-        ) {
-            Ok(_) => {
-                return Err("a near-match GHC configure probe gained direct authority".to_owned());
-            }
-            Err(error) => error.to_string(),
-        };
-        if near_match != "archive adapter temporary authority differs from its bound directory" {
-            return Err(format!(
-                "near-match GHC probe diagnostic differs: {near_match}"
-            ));
-        }
-        Ok(())
-    })();
+    let primary = prepare_ghc_configure_probe_fixture(&fixture)
+        .and_then(|probe| verify_ghc_configure_probe_fixture(&probe));
     let cleanup = fs::remove_dir_all(&fixture)
         .map_err(|error| format!("cannot clean GHC configure probe fixture: {error}"));
     match (primary, cleanup) {
@@ -15235,13 +16532,246 @@ pub(crate) fn verify_native_archive_ghc_configure_probe_for_integration(
 }
 
 #[cfg(unix)]
-pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
+struct GhcConfigureProbeFixture {
+    adapter_root: PathBuf,
+    configure_root: PathBuf,
+    member: PathBuf,
+    target: PathBuf,
+    arguments: [OsString; 3],
+    execution_deadline: Instant,
+    command_completion_deadline: Instant,
+    cleanup_deadline: Instant,
+}
 
+#[cfg(unix)]
+fn prepare_ghc_configure_probe_fixture(
+    adapter_root: &Path,
+) -> Result<GhcConfigureProbeFixture, String> {
+    let configure_root = adapter_root.join("configure-root");
+    fs::create_dir(adapter_root.join(".stack-work"))
+        .and_then(|()| fs::create_dir(&configure_root))
+        .map_err(|error| format!("cannot create GHC configure probe root: {error}"))?;
+    fs::write(configure_root.join("configure"), b"configure marker\n")
+        .map_err(|error| format!("cannot write GHC configure marker: {error}"))?;
+    let member = configure_root.join("conftest.o");
+    fs::write(&member, b"object marker\n")
+        .map_err(|error| format!("cannot write GHC configure member: {error}"))?;
+    let cleanup_deadline = Instant::now()
+        .checked_add(NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
+        .ok_or_else(|| "GHC configure probe deadline overflowed".to_owned())?;
+    let command_completion_deadline = cleanup_deadline
+        .checked_sub(NATIVE_ARCHIVE_ADAPTER_CLEANUP_RESERVE)
+        .ok_or_else(|| "GHC configure probe cleanup reserve underflowed".to_owned())?;
+    let execution_deadline = command_completion_deadline
+        .checked_sub(NATIVE_ARCHIVE_ADAPTER_CLEANUP_RESERVE)
+        .ok_or_else(|| "GHC configure probe command-completion reserve underflowed".to_owned())?;
+    Ok(GhcConfigureProbeFixture {
+        adapter_root: adapter_root.to_owned(),
+        target: configure_root.join("conftest.a"),
+        configure_root,
+        member,
+        arguments: [
+            OsString::from("clqs"),
+            OsString::from("conftest.a"),
+            OsString::from("conftest.o"),
+        ],
+        execution_deadline,
+        command_completion_deadline,
+        cleanup_deadline,
+    })
+}
+
+#[cfg(unix)]
+fn verify_ghc_configure_probe_fixture(probe: &GhcConfigureProbeFixture) -> Result<(), String> {
+    let invocation = bind_native_archive_invocation(
+        &probe.arguments,
+        &probe.adapter_root,
+        &probe.configure_root,
+        Some(&probe.configure_root),
+        probe.execution_deadline,
+    )
+    .map_err(|error| format!("cannot bind exact GHC configure probe: {error}"))?;
+    verify_ghc_configure_probe_binding(probe, &invocation)?;
+    invocation
+        .revalidate_before_launch(probe.execution_deadline)
+        .map_err(|error| format!("GHC configure probe receipt failed: {error}"))?;
+    #[cfg(target_os = "macos")]
+    verify_native_archive_ghc_configure_broker_for_integration(
+        &probe.adapter_root,
+        &probe.configure_root,
+        &probe.arguments,
+        probe.execution_deadline,
+        probe.command_completion_deadline,
+        probe.cleanup_deadline,
+    )?;
+    #[cfg(target_os = "macos")]
+    verify_expired_ghc_configure_probe(probe)?;
+    verify_existing_ghc_configure_target(probe)?;
+    verify_missing_ghc_configure_member(probe)?;
+    verify_near_match_ghc_configure_probe(probe)
+}
+
+#[cfg(unix)]
+fn verify_ghc_configure_probe_binding(
+    probe: &GhcConfigureProbeFixture,
+    invocation: &NativeArchiveInvocation,
+) -> Result<(), String> {
+    if invocation.arguments
+        != [
+            OsString::from("qclsL"),
+            OsString::from("conftest.a"),
+            OsString::from("conftest.o"),
+        ]
+        || invocation.input_groups.len() != 1
+        || invocation.input_groups[0].argument_index != 2
+        || invocation.input_groups[0].input_indices != [0]
+    {
+        return Err("GHC configure probe normalized argv topology differs".to_owned());
+    }
+    let authority = invocation
+        .authority
+        .as_ref()
+        .ok_or_else(|| "GHC configure probe retained authority is absent".to_owned())?;
+    let canonical_root = fs::canonicalize(&probe.configure_root)
+        .map_err(|error| format!("cannot bind GHC configure root: {error}"))?;
+    let canonical_member = fs::canonicalize(&probe.member)
+        .map_err(|error| format!("cannot bind GHC configure member: {error}"))?;
+    if authority.read_root != canonical_root
+        || authority.write_root != canonical_root
+        || authority.inputs.len() != 1
+        || authority.inputs[0].label != "archive member"
+        || authority.inputs[0].path != canonical_member
+        || !authority.targets.is_empty()
+        || authority.pending_targets != [canonical_root.join("conftest.a")]
+    {
+        return Err("GHC configure probe retained path authority differs".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn verify_expired_ghc_configure_probe(probe: &GhcConfigureProbeFixture) -> Result<(), String> {
+    let expired_target = probe.configure_root.join("expired.a");
+    let expired = run_ghc_configure_archiver_until(
+        &CommandSpec::new("/usr/bin/ar", Duration::from_secs(30))
+            .arguments(["q", "expired.a", "conftest.o"])
+            .current_directory(&probe.configure_root),
+        Instant::now(),
+        probe.command_completion_deadline,
+        "execute expired GHC configure probe",
+    )
+    .expect_err("expired GHC configure execution must fail before launch");
+    if !expired.contains("deadline expired before launch") || expired_target.exists() {
+        return Err("expired GHC configure probe launched late archiver work".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_ghc_configure_probe(
+    probe: &GhcConfigureProbeFixture,
+    arguments: &[OsString],
+) -> Result<NativeArchiveInvocation, std::io::Error> {
+    bind_native_archive_invocation(
+        arguments,
+        &probe.adapter_root,
+        &probe.configure_root,
+        Some(&probe.configure_root),
+        probe.execution_deadline,
+    )
+}
+
+#[cfg(unix)]
+fn reject_ghc_configure_probe(
+    probe: &GhcConfigureProbeFixture,
+    arguments: &[OsString],
+    accepted: &str,
+) -> Result<String, String> {
+    match bind_ghc_configure_probe(probe, arguments) {
+        Ok(_) => Err(accepted.to_owned()),
+        Err(error) => Ok(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn verify_existing_ghc_configure_target(probe: &GhcConfigureProbeFixture) -> Result<(), String> {
+    if !probe.target.exists() {
+        fs::write(&probe.target, b"existing archive\n")
+            .map_err(|error| format!("cannot create existing GHC probe target: {error}"))?;
+    }
+    let existing = reject_ghc_configure_probe(
+        probe,
+        &probe.arguments,
+        "an existing GHC configure target was accepted",
+    )?;
+    if existing != "GHC configure archive probe target already exists" {
+        return Err(format!(
+            "existing GHC probe target diagnostic differs: {existing}"
+        ));
+    }
+    fs::remove_file(&probe.target)
+        .map_err(|error| format!("cannot remove existing GHC probe target: {error}"))
+}
+
+#[cfg(unix)]
+fn verify_missing_ghc_configure_member(probe: &GhcConfigureProbeFixture) -> Result<(), String> {
+    fs::remove_file(&probe.member)
+        .map_err(|error| format!("cannot remove GHC configure member: {error}"))?;
+    let missing = reject_ghc_configure_probe(
+        probe,
+        &probe.arguments,
+        "a missing GHC configure member was accepted",
+    )?;
+    if missing != "GHC configure archive probe fixture is not a regular real file" {
+        return Err(format!(
+            "missing GHC probe member diagnostic differs: {missing}"
+        ));
+    }
+    fs::write(&probe.member, b"object marker\n")
+        .map_err(|error| format!("cannot restore GHC configure member: {error}"))
+}
+
+#[cfg(unix)]
+fn verify_near_match_ghc_configure_probe(probe: &GhcConfigureProbeFixture) -> Result<(), String> {
+    let near_match_arguments = [
+        OsString::from("clqs"),
+        OsString::from("conftest.a"),
+        OsString::from("member.o"),
+    ];
+    let near_match = reject_ghc_configure_probe(
+        probe,
+        &near_match_arguments,
+        "a near-match GHC configure probe gained direct authority",
+    )?;
+    if near_match != "archive adapter temporary authority differs from its bound directory" {
+        return Err(format!(
+            "near-match GHC probe diagnostic differs: {near_match}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), String> {
     verify_native_archive_feature_probe_policy()?;
     #[cfg(target_os = "macos")]
     verify_native_archive_identity_policy()?;
+    verify_native_stack_command_policy()?;
+    verify_native_archive_adapter_environment_policy()?;
+    verify_native_archive_clqs_policy()?;
 
+    verify_native_stack_provenance_policy()?;
+
+    verify_native_stack_overlay_policy()?;
+
+    verify_native_archive_path_policy()?;
+
+    verify_native_archive_inventory_policy()
+}
+
+#[cfg(unix)]
+fn verify_native_stack_command_policy() -> Result<(), String> {
     let source = Path::new("oracle-source");
     let stack_yaml = Path::new("stack.yaml");
     let build = native_stack_build(source, stack_yaml, Duration::from_secs(1));
@@ -15293,7 +16823,7 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
     }
     let adapter_root = Path::new("/fixed/adapter");
     let adapter = NativeArchiveAdapter {
-        _directory: None,
+        directory: None,
         bound_toolchain: None,
         llvm_ar: None,
         llvm_ar_version: None,
@@ -15317,9 +16847,13 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
     {
         return Err("native Stack adapter commands escaped the configured adapter root".to_owned());
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn verify_native_archive_adapter_environment_policy() -> Result<(), String> {
     let adapter = NativeArchiveAdapter {
-        _directory: None,
+        directory: None,
         bound_toolchain: None,
         llvm_ar: None,
         llvm_ar_version: None,
@@ -15342,13 +16876,18 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
     {
         return Err("native archive adapter environment is not exactly confined".to_owned());
     }
-    let clqs_root = std::env::temp_dir().join(format!(
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_native_archive_clqs_policy() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
         "hell-native-archive-policy-clqs-{}-{}",
         std::process::id(),
         ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let clqs_result = (|| {
-        let work = clqs_root.join(".stack-work");
+    let primary = (|| {
+        let work = root.join(".stack-work");
         fs::create_dir_all(&work)
             .map_err(|error| format!("cannot create CLQS verifier fixture: {error}"))?;
         fs::write(work.join("objects.rsp"), b"member.o\n")
@@ -15361,7 +16900,7 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
                 OsString::from("archive.a"),
                 OsString::from("@objects.rsp"),
             ],
-            &clqs_root,
+            &root,
             &work,
         )
         .map_err(|error| format!("cannot normalize CLQS archive arguments: {error}"))?;
@@ -15376,17 +16915,20 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
         }
         Ok(())
     })();
-    let clqs_cleanup = fs::remove_dir_all(&clqs_root)
+    let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove CLQS verifier fixture: {error}"));
-    clqs_result.and(clqs_cleanup)?;
+    primary.and(cleanup)
+}
 
-    let provenance_root = std::env::temp_dir().join(format!(
+#[cfg(unix)]
+fn verify_native_stack_provenance_policy() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
         "hell-native-stack-policy-provenance-{}-{}",
         std::process::id(),
         ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let provenance_result = (|| {
-        let source = provenance_root.join("oracle-source");
+    let primary = (|| {
+        let source = root.join("oracle-source");
         fs::create_dir_all(&source)
             .map_err(|error| format!("cannot create Stack provenance fixture: {error}"))?;
         fs::write(
@@ -15400,7 +16942,7 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
         )
         .map_err(|error| format!("cannot write Stack provenance lock: {error}"))?;
         let adapter = NativeArchiveAdapter {
-            _directory: None,
+            directory: None,
             bound_toolchain: None,
             llvm_ar: None,
             llvm_ar_version: None,
@@ -15422,127 +16964,156 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
         }
         Ok(())
     })();
-    let provenance_cleanup = fs::remove_dir_all(&provenance_root)
+    let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove Stack provenance fixture: {error}"));
-    provenance_result.and(provenance_cleanup)?;
+    primary.and(cleanup)
+}
 
-    let overlay_root = std::env::temp_dir().join(format!(
+#[cfg(unix)]
+fn verify_native_stack_overlay_policy() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
         "hell-native-stack-policy-overlay-{}-{}'s-base",
         std::process::id(),
         ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let overlay_result = (|| {
-        let source = overlay_root.join("oracle's source");
-        fs::create_dir_all(&source)
-            .map_err(|error| format!("cannot create Stack overlay fixture: {error}"))?;
-        fs::write(
-            source.join("stack.yaml"),
-            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
-        )
-        .map_err(|error| format!("cannot write Stack overlay configuration: {error}"))?;
-        fs::write(
-            source.join("stack.yaml.lock"),
-            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock"),
-        )
-        .map_err(|error| format!("cannot write Stack overlay lock: {error}"))?;
-        #[cfg(target_os = "macos")]
-        let mut directory = create_adapter_directory(&overlay_root)?;
-        #[cfg(not(target_os = "macos"))]
-        let directory = create_adapter_directory(&overlay_root)?;
-        let ghc_bin = directory.path().join(".toolchain/system-ghc-9.8.2/bin");
-        fs::create_dir_all(&ghc_bin)
-            .map_err(|error| format!("cannot create Stack overlay GHC bin: {error}"))?;
-        let overlay = write_native_stack_overlay(directory.path(), &source, &ghc_bin)?;
-        let content = fs::read_to_string(&overlay)
-            .map_err(|error| format!("cannot read Stack overlay: {error}"))?;
-        let canonical_adapter = fs::canonicalize(directory.path())
-            .map_err(|error| format!("cannot canonicalize Stack overlay adapter: {error}"))?;
-        let adapter_yaml = format!(
-            "'{}'",
-            canonical_adapter.display().to_string().replace('\'', "''")
-        );
-        let configure_ar = format!(
-            "'--with-ar={}'",
-            canonical_adapter
-                .join("ar")
-                .display()
-                .to_string()
-                .replace('\'', "''")
-        );
-        let ghc_bin_yaml = yaml_single_quoted_path(
-            &fs::canonicalize(&ghc_bin)
-                .map_err(|error| format!("cannot canonicalize Stack overlay GHC bin: {error}"))?,
-        )?;
-        if !content.starts_with("resolver: nightly-2024-10-21\npackages:\n")
-            || !content.contains("oracle''s source'\n")
-            || !content.contains(
-                "system-ghc: true\ninstall-ghc: false\ncompiler-check: match-exact\nallow-different-user: true\n",
-            )
-            || !content.contains(&format!(
-                "extra-path:\n  - {adapter_yaml}\n  - {ghc_bin_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
-            ))
-            || content.contains("extra-prog-path")
-            || !content.contains("  \"$everything\": \"-split-sections -j\"\n")
-            || !content.contains("  unix-time: \"-optl-all_load\"\n")
-            || !content.contains("  network-control: \"-fforce-recomp\"\n")
-            || content.matches("all_load").count() != 1
-            || content.matches("network-control").count() != 1
-            || content.matches("-fforce-recomp").count() != 1
-            || content.contains("apply-ghc-options")
-            || fs::read(directory.path().join("stack.yaml.lock"))
-                .map_err(|error| format!("cannot read copied Stack lock: {error}"))?
-                != include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock")
-        {
-            return Err("native Stack overlay differs from its exact policy".to_owned());
-        }
-        fs::write(source.join("stack.yaml"), b"resolver: changed\n")
-            .map_err(|error| format!("cannot mutate Stack overlay source: {error}"))?;
-        if !write_native_stack_overlay(directory.path(), &source, &ghc_bin)
-            .unwrap_err()
-            .contains("configuration differs")
-        {
-            return Err("native Stack overlay accepted changed configuration".to_owned());
-        }
-        fs::write(
-            source.join("stack.yaml"),
-            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
-        )
-        .map_err(|error| format!("cannot restore Stack overlay configuration: {error}"))?;
-        fs::write(source.join("stack.yaml.lock"), b"snapshots: []\n")
-            .map_err(|error| format!("cannot mutate Stack overlay lock: {error}"))?;
-        if !write_native_stack_overlay(directory.path(), &source, &ghc_bin)
-            .unwrap_err()
-            .contains("lock differs")
-        {
-            return Err("native Stack overlay accepted changed lock".to_owned());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let cleanup_deadline = Instant::now()
-                .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
-                .ok_or_else(|| "Stack overlay cleanup deadline overflowed".to_owned())?;
-            directory.close_until(cleanup_deadline)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        drop(directory);
-        if overlay.parent().is_some_and(Path::exists) {
-            return Err("native Stack overlay fixture survived adapter cleanup".to_owned());
-        }
-        Ok(())
-    })();
-    let overlay_cleanup = fs::remove_dir_all(&overlay_root)
+    let primary = verify_native_stack_overlay_fixture(&root);
+    let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove Stack overlay fixture: {error}"));
-    overlay_result.and(overlay_cleanup)?;
+    primary.and(cleanup)
+}
 
-    let path_root = std::env::temp_dir().join(format!(
+#[cfg(unix)]
+fn verify_native_stack_overlay_fixture(root: &Path) -> Result<(), String> {
+    let source = root.join("oracle's source");
+    fs::create_dir_all(&source)
+        .map_err(|error| format!("cannot create Stack overlay fixture: {error}"))?;
+    fs::write(
+        source.join("stack.yaml"),
+        include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
+    )
+    .map_err(|error| format!("cannot write Stack overlay configuration: {error}"))?;
+    fs::write(
+        source.join("stack.yaml.lock"),
+        include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock"),
+    )
+    .map_err(|error| format!("cannot write Stack overlay lock: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let mut directory = create_adapter_directory(root)?;
+    #[cfg(not(target_os = "macos"))]
+    let directory = create_adapter_directory(root)?;
+    let ghc_bin = directory.path().join(".toolchain/system-ghc-9.8.2/bin");
+    fs::create_dir_all(&ghc_bin)
+        .map_err(|error| format!("cannot create Stack overlay GHC bin: {error}"))?;
+    let overlay = write_native_stack_overlay(directory.path(), &source, &ghc_bin)?;
+    require_native_stack_overlay_content(directory.path(), &ghc_bin, &overlay)?;
+    verify_native_stack_overlay_input_mutations(directory.path(), &source, &ghc_bin)?;
+    #[cfg(target_os = "macos")]
+    {
+        let cleanup_deadline = Instant::now()
+            .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
+            .ok_or_else(|| "Stack overlay cleanup deadline overflowed".to_owned())?;
+        directory.close_until(cleanup_deadline)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(directory);
+    if overlay.parent().is_some_and(Path::exists) {
+        return Err("native Stack overlay fixture survived adapter cleanup".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_native_stack_overlay_content(
+    adapter_root: &Path,
+    ghc_bin: &Path,
+    overlay: &Path,
+) -> Result<(), String> {
+    let content = fs::read_to_string(overlay)
+        .map_err(|error| format!("cannot read Stack overlay: {error}"))?;
+    let canonical_adapter = fs::canonicalize(adapter_root)
+        .map_err(|error| format!("cannot canonicalize Stack overlay adapter: {error}"))?;
+    let adapter_yaml = format!(
+        "'{}'",
+        canonical_adapter.display().to_string().replace('\'', "''")
+    );
+    let configure_ar = format!(
+        "'--with-ar={}'",
+        canonical_adapter
+            .join("ar")
+            .display()
+            .to_string()
+            .replace('\'', "''")
+    );
+    let ghc_bin_yaml = yaml_single_quoted_path(
+        &fs::canonicalize(ghc_bin)
+            .map_err(|error| format!("cannot canonicalize Stack overlay GHC bin: {error}"))?,
+    )?;
+    if !content.starts_with("resolver: nightly-2024-10-21\npackages:\n")
+        || !content.contains("oracle''s source'\n")
+        || !content.contains(
+            "system-ghc: true\ninstall-ghc: false\ncompiler-check: match-exact\nallow-different-user: true\n",
+        )
+        || !content.contains(&format!(
+            "extra-path:\n  - {adapter_yaml}\n  - {ghc_bin_yaml}\nconfigure-options:\n  \"$everything\":\n    - {configure_ar}\nghc-options:\n"
+        ))
+        || content.contains("extra-prog-path")
+        || !content.contains("  \"$everything\": \"-split-sections -j\"\n")
+        || !content.contains("  unix-time: \"-optl-all_load\"\n")
+        || !content.contains("  network-control: \"-fforce-recomp\"\n")
+        || content.matches("all_load").count() != 1
+        || content.matches("network-control").count() != 1
+        || content.matches("-fforce-recomp").count() != 1
+        || content.contains("apply-ghc-options")
+        || fs::read(adapter_root.join("stack.yaml.lock"))
+            .map_err(|error| format!("cannot read copied Stack lock: {error}"))?
+            != include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock")
+    {
+        return Err("native Stack overlay differs from its exact policy".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_native_stack_overlay_input_mutations(
+    adapter_root: &Path,
+    source: &Path,
+    ghc_bin: &Path,
+) -> Result<(), String> {
+    fs::write(source.join("stack.yaml"), b"resolver: changed\n")
+        .map_err(|error| format!("cannot mutate Stack overlay source: {error}"))?;
+    if !write_native_stack_overlay(adapter_root, source, ghc_bin)
+        .unwrap_err()
+        .contains("configuration differs")
+    {
+        return Err("native Stack overlay accepted changed configuration".to_owned());
+    }
+    fs::write(
+        source.join("stack.yaml"),
+        include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
+    )
+    .map_err(|error| format!("cannot restore Stack overlay configuration: {error}"))?;
+    fs::write(source.join("stack.yaml.lock"), b"snapshots: []\n")
+        .map_err(|error| format!("cannot mutate Stack overlay lock: {error}"))?;
+    if !write_native_stack_overlay(adapter_root, source, ghc_bin)
+        .unwrap_err()
+        .contains("lock differs")
+    {
+        return Err("native Stack overlay accepted changed lock".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_native_archive_path_policy() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
         "hell-native-archive-policy-path-{}-{}",
         std::process::id(),
         ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let path_result = (|| {
-        let adapter = path_root.join("adapter");
-        let stack_bin = path_root.join("stack/bin");
-        let ghc_bin = path_root.join("ghc/bin");
+    let primary = (|| {
+        let adapter = root.join("adapter");
+        let stack_bin = root.join("stack/bin");
+        let ghc_bin = root.join("ghc/bin");
         for directory in [&adapter, &stack_bin, &ghc_bin] {
             fs::create_dir_all(directory)
                 .map_err(|error| format!("cannot create archive PATH fixture: {error}"))?;
@@ -15561,179 +17132,231 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
         }
         Ok(())
     })();
-    let path_cleanup = fs::remove_dir_all(&path_root)
+    let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove archive PATH fixture: {error}"));
-    path_result.and(path_cleanup)?;
+    primary.and(cleanup)
+}
 
-    let inventory_root = std::env::temp_dir().join(format!(
+#[cfg(unix)]
+fn verify_native_archive_inventory_policy() -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!(
         "hell-native-archive-policy-inventory-{}-{}",
         std::process::id(),
         ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let inventory_result = (|| {
-        let source = inventory_root.join("source");
-        fs::create_dir_all(&source)
-            .map_err(|error| format!("cannot create archive inventory source: {error}"))?;
-        fs::write(
-            source.join("stack.yaml"),
-            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
-        )
-        .map_err(|error| format!("cannot write archive inventory configuration: {error}"))?;
-        fs::write(
-            source.join("stack.yaml.lock"),
-            include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock"),
-        )
-        .map_err(|error| format!("cannot write archive inventory lock: {error}"))?;
+    let primary = verify_native_archive_inventory_fixture(&root);
+    let cleanup = fs::remove_dir_all(&root)
+        .map_err(|error| format!("cannot remove archive inventory fixture: {error}"));
+    primary.and(cleanup)
+}
+
+#[cfg(unix)]
+fn verify_native_archive_inventory_fixture(root: &Path) -> Result<(), String> {
+    let source = prepare_archive_inventory_source(root)?;
+    #[cfg(target_os = "macos")]
+    let mut directory = create_adapter_directory(root)?;
+    #[cfg(not(target_os = "macos"))]
+    let directory = create_adapter_directory(root)?;
+    let adapter = directory.path().to_owned();
+    prepare_adapter_work_directory(&adapter)?;
+    let confined_launcher = prepare_archive_inventory_launcher(root)?;
+    let llvm_ar = prepare_archive_inventory_archiver(root)?;
+    #[cfg(target_os = "macos")]
+    let staged_archiver = {
+        let transaction = NativeArchiverTransaction::new()?;
+        let acquired = acquire_native_archiver_candidate(&llvm_ar, &transaction)?;
+        install_staged_native_archive_adapter(
+            &adapter,
+            &confined_launcher,
+            &acquired,
+            &transaction,
+        )?
+    };
+    #[cfg(not(target_os = "macos"))]
+    install_native_archive_adapter(&adapter, &confined_launcher, &llvm_ar)?;
+    let ghc_bin = adapter.join(".toolchain/system-ghc-9.8.2/bin");
+    fs::create_dir_all(&ghc_bin)
+        .map_err(|error| format!("cannot create archive inventory GHC bin: {error}"))?;
+    let overlay = write_native_stack_overlay(&adapter, &source, &ghc_bin)?;
+    require_native_archive_inventory(
+        &adapter,
+        &confined_launcher,
+        &llvm_ar,
+        &overlay,
         #[cfg(target_os = "macos")]
-        let mut directory = create_adapter_directory(&inventory_root)?;
-        #[cfg(not(target_os = "macos"))]
-        let directory = create_adapter_directory(&inventory_root)?;
-        let adapter = directory.path().to_owned();
-        prepare_adapter_work_directory(&adapter)?;
-        let confined_launcher = inventory_root.join("confined-launcher");
-        fs::write(&confined_launcher, b"bound executable\n")
+        &staged_archiver,
+    )?;
+    #[cfg(target_os = "macos")]
+    {
+        let cleanup_deadline = Instant::now()
+            .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
+            .ok_or_else(|| "archive inventory cleanup deadline overflowed".to_owned())?;
+        directory.close_until(cleanup_deadline)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(directory);
+    if adapter.exists() {
+        return Err("native archive adapter inventory survived cleanup".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_archive_inventory_source(root: &Path) -> Result<PathBuf, String> {
+    let source = root.join("source");
+    fs::create_dir_all(&source)
+        .map_err(|error| format!("cannot create archive inventory source: {error}"))?;
+    fs::write(
+        source.join("stack.yaml"),
+        include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml"),
+    )
+    .map_err(|error| format!("cannot write archive inventory configuration: {error}"))?;
+    fs::write(
+        source.join("stack.yaml.lock"),
+        include_bytes!("../../../compat/oracle-sources/hell-8e952cf9/stack.yaml.lock"),
+    )
+    .map_err(|error| format!("cannot write archive inventory lock: {error}"))?;
+    Ok(source)
+}
+
+#[cfg(unix)]
+fn prepare_archive_inventory_launcher(root: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let launcher = root.join("confined-launcher");
+    fs::write(&launcher, b"bound executable\n")
+        .map_err(|error| format!("cannot write archive inventory executable: {error}"))?;
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot set archive inventory executable mode: {error}"))?;
+    Ok(launcher)
+}
+
+#[cfg(unix)]
+fn prepare_archive_inventory_archiver(root: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[cfg(target_os = "macos")]
+    let archiver = {
+        let bin = root.join("llvm-prefix/bin");
+        fs::create_dir_all(&bin)
+            .map_err(|error| format!("cannot create archive inventory LLVM bin: {error}"))?;
+        let archiver = bin.join("llvm-ar");
+        fs::copy(
+            std::env::current_exe()
+                .map_err(|error| format!("cannot locate archive inventory executable: {error}"))?,
+            &archiver,
+        )
+        .map_err(|error| format!("cannot copy archive inventory executable: {error}"))?;
+        archiver
+    };
+    #[cfg(not(target_os = "macos"))]
+    let archiver = {
+        let archiver = root.join("reviewed-llvm-ar");
+        fs::write(&archiver, b"bound executable\n")
             .map_err(|error| format!("cannot write archive inventory executable: {error}"))?;
-        fs::set_permissions(&confined_launcher, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot set archive inventory executable mode: {error}"))?;
-        #[cfg(target_os = "macos")]
-        let llvm_ar = {
-            let bin = inventory_root.join("llvm-prefix").join("bin");
-            fs::create_dir_all(&bin)
-                .map_err(|error| format!("cannot create archive inventory LLVM bin: {error}"))?;
-            let llvm_ar = bin.join("llvm-ar");
-            fs::copy(
-                std::env::current_exe().map_err(|error| {
-                    format!("cannot locate archive inventory executable: {error}")
-                })?,
-                &llvm_ar,
-            )
-            .map_err(|error| format!("cannot copy archive inventory executable: {error}"))?;
-            fs::set_permissions(&llvm_ar, fs::Permissions::from_mode(0o755)).map_err(|error| {
-                format!("cannot set archive inventory executable mode: {error}")
-            })?;
-            llvm_ar
-        };
-        #[cfg(not(target_os = "macos"))]
-        let llvm_ar = {
-            let llvm_ar = inventory_root.join("reviewed-llvm-ar");
-            fs::write(&llvm_ar, b"bound executable\n")
-                .map_err(|error| format!("cannot write archive inventory executable: {error}"))?;
-            fs::set_permissions(&llvm_ar, fs::Permissions::from_mode(0o755)).map_err(|error| {
-                format!("cannot set archive inventory executable mode: {error}")
-            })?;
-            llvm_ar
-        };
-        #[cfg(target_os = "macos")]
-        let staged_archiver = {
-            let transaction = NativeArchiverTransaction::new()?;
-            let acquired = acquire_native_archiver_candidate(&llvm_ar, &transaction)?;
-            install_staged_native_archive_adapter(
-                &adapter,
-                &confined_launcher,
-                &acquired,
-                &transaction,
-            )?
-        };
-        #[cfg(not(target_os = "macos"))]
-        install_native_archive_adapter(&adapter, &confined_launcher, &llvm_ar)?;
-        let ghc_bin = adapter.join(".toolchain/system-ghc-9.8.2/bin");
-        fs::create_dir_all(&ghc_bin)
-            .map_err(|error| format!("cannot create archive inventory GHC bin: {error}"))?;
-        let overlay = write_native_stack_overlay(&adapter, &source, &ghc_bin)?;
-        let mut entries = fs::read_dir(&adapter)
-            .map_err(|error| format!("cannot enumerate archive adapter inventory: {error}"))?
-            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot inspect archive adapter inventory: {error}"))?;
-        entries.sort();
-        let authority = adapter.join(".authority");
-        let mut authority_entries = fs::read_dir(&authority)
-            .map_err(|error| format!("cannot enumerate archive authority inventory: {error}"))?
-            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot inspect archive authority inventory: {error}"))?;
-        authority_entries.sort();
-        #[cfg(target_os = "macos")]
-        let expected_authority_entries = ["inputs".to_owned(), "llvm".to_owned()];
-        #[cfg(not(target_os = "macos"))]
-        let expected_authority_entries = ["llvm-ar".to_owned()];
-        let overlay_content = fs::read_to_string(&overlay)
-            .map_err(|error| format!("cannot read archive inventory overlay: {error}"))?;
-        if entries
-            != [
-                ".authority".to_owned(),
-                ".stack-work".to_owned(),
-                ".toolchain".to_owned(),
-                "ar".to_owned(),
-                "stack.yaml".to_owned(),
-                "stack.yaml.lock".to_owned(),
-            ]
-            || fs::symlink_metadata(adapter.join("llvm-ar")).is_ok()
-            || !fs::symlink_metadata(adapter.join("ar"))
-                .map_err(|error| format!("cannot inspect archive launcher: {error}"))?
+        archiver
+    };
+    fs::set_permissions(&archiver, fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("cannot set archive inventory executable mode: {error}"))?;
+    Ok(archiver)
+}
+
+#[cfg(unix)]
+fn sorted_archive_inventory_entries(root: &Path, label: &str) -> Result<Vec<String>, String> {
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("cannot enumerate archive {label} inventory: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot inspect archive {label} inventory: {error}"))?;
+    entries.sort();
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn require_native_archive_inventory(
+    adapter: &Path,
+    confined_launcher: &Path,
+    llvm_ar: &Path,
+    overlay: &Path,
+    #[cfg(target_os = "macos")] staged_archiver: &BoundNativeArchiver,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let entries = sorted_archive_inventory_entries(adapter, "adapter")?;
+    let authority = adapter.join(".authority");
+    let authority_entries = sorted_archive_inventory_entries(&authority, "authority")?;
+    #[cfg(target_os = "macos")]
+    let expected_authority_entries = ["inputs".to_owned(), "llvm".to_owned()];
+    #[cfg(not(target_os = "macos"))]
+    let expected_authority_entries = ["llvm-ar".to_owned()];
+    let overlay_content = fs::read_to_string(overlay)
+        .map_err(|error| format!("cannot read archive inventory overlay: {error}"))?;
+    if entries
+        != [
+            ".authority".to_owned(),
+            ".stack-work".to_owned(),
+            ".toolchain".to_owned(),
+            "ar".to_owned(),
+            "stack.yaml".to_owned(),
+            "stack.yaml.lock".to_owned(),
+        ]
+        || fs::symlink_metadata(adapter.join("llvm-ar")).is_ok()
+        || !fs::symlink_metadata(adapter.join("ar"))
+            .map_err(|error| format!("cannot inspect archive launcher: {error}"))?
+            .file_type()
+            .is_symlink()
+        || fs::canonicalize(adapter.join("ar"))
+            .map_err(|error| format!("cannot canonicalize archive launcher: {error}"))?
+            != fs::canonicalize(confined_launcher)
+                .map_err(|error| format!("cannot canonicalize confined launcher: {error}"))?
+        || fs::metadata(&authority)
+            .map_err(|error| format!("cannot inspect archive authority: {error}"))?
+            .permissions()
+            .mode()
+            & 0o7777
+            != 0o555
+        || authority_entries != expected_authority_entries
+        || archive_inventory_archiver_differs(
+            &authority,
+            llvm_ar,
+            #[cfg(target_os = "macos")]
+            staged_archiver,
+        )?
+        || !overlay_content.contains("extra-path:\n")
+        || overlay_content.contains("extra-prog-path")
+        || !overlay_content.contains("configure-options:\n")
+        || !overlay_content.contains("--with-ar=")
+    {
+        return Err("native archive adapter inventory is not exactly closed".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn archive_inventory_archiver_differs(
+    authority: &Path,
+    llvm_ar: &Path,
+    #[cfg(target_os = "macos")] staged_archiver: &BoundNativeArchiver,
+) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(staged_archiver.revalidate().is_err()
+            || staged_archiver.path() != authority.join("llvm/bin/llvm-ar")
+            || fs::symlink_metadata(staged_archiver.path())
+                .map_err(|error| format!("cannot inspect staged archive authority: {error}"))?
                 .file_type()
                 .is_symlink()
-            || fs::canonicalize(adapter.join("ar"))
-                .map_err(|error| format!("cannot canonicalize archive launcher: {error}"))?
-                != fs::canonicalize(&confined_launcher)
-                    .map_err(|error| format!("cannot canonicalize confined launcher: {error}"))?
-            || fs::metadata(&authority)
-                .map_err(|error| format!("cannot inspect archive authority: {error}"))?
-                .permissions()
-                .mode()
-                & 0o7777
-                != 0o555
-            || authority_entries != expected_authority_entries
-            || {
-                #[cfg(target_os = "macos")]
-                {
-                    staged_archiver.revalidate().is_err()
-                        || staged_archiver.path()
-                            != authority.join("llvm").join("bin").join("llvm-ar")
-                        || fs::symlink_metadata(staged_archiver.path())
-                            .map_err(|error| {
-                                format!("cannot inspect staged archive authority: {error}")
-                            })?
-                            .file_type()
-                            .is_symlink()
-                        || staged_archiver.sha256
-                            != sha256_file(&llvm_ar).map_err(|error| {
-                                format!("cannot hash reviewed archiver: {error}")
-                            })?
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    fs::canonicalize(authority.join("llvm-ar")).map_err(|error| {
-                        format!("cannot canonicalize archive authority: {error}")
-                    })? != fs::canonicalize(&llvm_ar).map_err(|error| {
-                        format!("cannot canonicalize reviewed archiver: {error}")
-                    })?
-                }
-            }
-            || !overlay_content.contains("extra-path:\n")
-            || overlay_content.contains("extra-prog-path")
-            || !overlay_content.contains("configure-options:\n")
-            || !overlay_content.contains("--with-ar=")
-        {
-            return Err("native archive adapter inventory is not exactly closed".to_owned());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let cleanup_deadline = Instant::now()
-                .checked_add(NATIVE_ARCHIVER_COMPLETION_BUDGET)
-                .ok_or_else(|| "archive inventory cleanup deadline overflowed".to_owned())?;
-            directory.close_until(cleanup_deadline)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        drop(directory);
-        if adapter.exists() {
-            return Err("native archive adapter inventory survived cleanup".to_owned());
-        }
-        Ok(())
-    })();
-    let inventory_cleanup = fs::remove_dir_all(&inventory_root)
-        .map_err(|error| format!("cannot remove archive inventory fixture: {error}"));
-    inventory_result.and(inventory_cleanup)
+            || staged_archiver.sha256
+                != sha256_file(llvm_ar)
+                    .map_err(|error| format!("cannot hash reviewed archiver: {error}"))?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(fs::canonicalize(authority.join("llvm-ar"))
+            .map_err(|error| format!("cannot canonicalize archive authority: {error}"))?
+            != fs::canonicalize(llvm_ar)
+                .map_err(|error| format!("cannot canonicalize reviewed archiver: {error}"))?)
+    }
 }
 
 #[cfg(unix)]
@@ -16333,26 +17956,34 @@ mod tests {
             source_file_identity: "source-file-id".to_owned(),
             rustup_file_identity: "rustup-file-id".to_owned(),
             selected_file_identity: "selected-file-id".to_owned(),
-            source_same_file_rustup: false,
-            source_same_file_selected: false,
-            source_direct: false,
-            rustup_direct: false,
-            canonical_paths_distinct: true,
-            canonical_parent_same: true,
-            invocation_parent_same: true,
+            file_relationship: WindowsToolFileRelationship {
+                source_same_file_rustup: false,
+                source_same_file_selected: false,
+            },
+            spelling_relationship: WindowsToolSpellingRelationship {
+                source_direct: false,
+                rustup_direct: false,
+                selected_canonical_exact: false,
+            },
+            path_relationship: WindowsToolPathRelationship {
+                canonical_paths_distinct: true,
+                canonical_parent_same: true,
+                invocation_parent_same: true,
+            },
             source_size: 17,
             rustup_size: 17,
             selected_size: 19,
-            size_equal: true,
+            content_relationship: WindowsToolContentRelationship {
+                size_equal: true,
+                identical_sha256: true,
+                matching_pe_identity: Some(true),
+            },
             source_sha256: "11".repeat(32),
             rustup_sha256: "11".repeat(32),
             selected_sha256: "22".repeat(32),
-            sha256_equal: true,
             source_pe: Ok(pe),
             rustup_pe: Ok(pe),
-            pe_identity_equal: Some(true),
             copied_proxy_result: Ok(false),
-            selected_canonical_exact: false,
         };
 
         let rendered = diagnostic.to_string();
@@ -16925,10 +18556,7 @@ mod tests {
             WINDOWS_RESTRICTED_GRAPHICAL_BINDING,
             WindowsRestrictedGraphicalBinding::InheritedDefault
         );
-        assert!(
-            windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING)
-                .is_ok()
-        );
+        windows_restricted_graphical_binding_contract(WINDOWS_RESTRICTED_GRAPHICAL_BINDING);
     }
 
     #[test]
@@ -17188,8 +18816,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn native_archive_adapter_uses_fixed_flattening_operations() {
+    fn native_archive_adapter_fixture() -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "hell-archive-adapter-arguments-{}-{}",
             std::process::id(),
@@ -17200,6 +18827,11 @@ mod tests {
         fs::write(work.join("objects.rsp"), b"object.o\n").unwrap();
         fs::write(work.join("object.o"), b"object\n").unwrap();
         let fresh = work.join("fresh.a");
+        (root, work, fresh)
+    }
+
+    #[cfg(unix)]
+    fn assert_supported_native_archive_operations(root: &Path, work: &Path, fresh: &Path) {
         for (input, expected, target) in [
             ("r", "qL", fresh.as_os_str()),
             ("-r", "-qL", fresh.as_os_str()),
@@ -17221,8 +18853,8 @@ mod tests {
                     OsString::from(target),
                     OsString::from("@objects.rsp"),
                 ],
-                &root,
-                &work,
+                root,
+                work,
             )
             .unwrap();
             assert_eq!(normalized[0], expected);
@@ -17237,57 +18869,14 @@ mod tests {
                 fresh.as_os_str().to_owned(),
                 OsString::from("@objects.rsp"),
             ],
-            &root,
-            &work,
+            root,
+            work,
         )
         .unwrap();
         assert_eq!(macos[0], "-qL");
         assert_eq!(macos[1], "-s");
         assert_eq!(macos[2], "-c");
         assert_eq!(macos[3], fresh.as_os_str());
-        fs::write(&fresh, b"existing\n").unwrap();
-        assert!(
-            normalize_native_archive_arguments(
-                &[
-                    OsString::from("-q"),
-                    OsString::from("-s"),
-                    OsString::from("-s"),
-                    fresh.as_os_str().to_owned(),
-                    OsString::from("@objects.rsp"),
-                ],
-                &root,
-                &work,
-            )
-            .is_err()
-        );
-        fs::write(&fresh, b"existing\n").unwrap();
-        assert!(
-            normalize_native_archive_arguments(
-                &[
-                    OsString::from("-r"),
-                    fresh.as_os_str().to_owned(),
-                    OsString::from("@objects.rsp"),
-                ],
-                &root,
-                &work,
-            )
-            .is_err()
-        );
-        fs::remove_file(&fresh).unwrap();
-        let unsupported = normalize_native_archive_arguments(
-            &[
-                OsString::from("qv"),
-                OsString::from("archive.a"),
-                OsString::from("@objects.rsp"),
-            ],
-            &root,
-            &work,
-        )
-        .unwrap_err();
-        assert_eq!(
-            unsupported.to_string(),
-            "archive adapter received unsupported operation \"qv\""
-        );
         assert_eq!(
             normalize_native_archive_arguments(
                 &[
@@ -17295,8 +18884,8 @@ mod tests {
                     OsString::from("archive.a"),
                     OsString::from("@objects.rsp"),
                 ],
-                &root,
-                &work,
+                root,
+                work,
             )
             .unwrap()
             .into_iter()
@@ -17304,6 +18893,10 @@ mod tests {
             .collect::<Vec<_>>(),
             ["t", "archive.a", "@objects.rsp"]
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_rejected_native_archive_flags(root: &Path, work: &Path) {
         for operation in ["x", "s", "--version"] {
             assert!(
                 normalize_native_archive_arguments(
@@ -17312,8 +18905,8 @@ mod tests {
                         OsString::from("archive.a"),
                         OsString::from("@objects.rsp"),
                     ],
-                    &root,
-                    &work,
+                    root,
+                    work,
                 )
                 .is_err(),
                 "unsupported operation {operation:?} was accepted"
@@ -17333,13 +18926,17 @@ mod tests {
                         OsString::from("archive.a"),
                         OsString::from(argument),
                     ],
-                    &root,
-                    &work,
+                    root,
+                    work,
                 )
                 .is_err(),
                 "unsupported argument {argument:?} was accepted"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_rejected_native_archive_paths(root: &Path, work: &Path) {
         assert!(
             normalize_native_archive_arguments(
                 &[
@@ -17347,8 +18944,8 @@ mod tests {
                     OsString::from("../archive.a"),
                     OsString::from("@objects.rsp"),
                 ],
-                &root,
-                &work,
+                root,
+                work,
             )
             .is_err()
         );
@@ -17361,8 +18958,8 @@ mod tests {
         assert!(
             normalize_native_archive_arguments(
                 &[OsString::from("t"), outside.as_os_str().to_owned(),],
-                &root,
-                &work,
+                root,
+                work,
             )
             .is_err()
         );
@@ -17375,11 +18972,68 @@ mod tests {
                     OsString::from("archive.a"),
                     OsString::from("@unsafe.rsp"),
                 ],
-                &root,
-                &work,
+                root,
+                work,
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_rejected_native_archive_operations(root: &Path, work: &Path, fresh: &Path) {
+        fs::write(fresh, b"existing\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("-q"),
+                    OsString::from("-s"),
+                    OsString::from("-s"),
+                    fresh.as_os_str().to_owned(),
+                    OsString::from("@objects.rsp"),
+                ],
+                root,
+                work,
+            )
+            .is_err()
+        );
+        fs::write(fresh, b"existing\n").unwrap();
+        assert!(
+            normalize_native_archive_arguments(
+                &[
+                    OsString::from("-r"),
+                    fresh.as_os_str().to_owned(),
+                    OsString::from("@objects.rsp"),
+                ],
+                root,
+                work,
+            )
+            .is_err()
+        );
+        fs::remove_file(fresh).unwrap();
+        let unsupported = normalize_native_archive_arguments(
+            &[
+                OsString::from("qv"),
+                OsString::from("archive.a"),
+                OsString::from("@objects.rsp"),
+            ],
+            root,
+            work,
+        )
+        .unwrap_err();
+        assert_eq!(
+            unsupported.to_string(),
+            "archive adapter received unsupported operation \"qv\""
+        );
+        assert_rejected_native_archive_flags(root, work);
+        assert_rejected_native_archive_paths(root, work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_archive_adapter_uses_fixed_flattening_operations() {
+        let (root, work, fresh) = native_archive_adapter_fixture();
+        assert_supported_native_archive_operations(&root, &work, &fresh);
+        assert_rejected_native_archive_operations(&root, &work, &fresh);
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -38,20 +38,382 @@ fn run_with_verification(
     output: PathBuf,
     report: PathBuf,
 ) -> Result<String, String> {
-    let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
+    let input = input.into_boxed_path();
+    let report = report.into_boxed_path();
+    let AssemblyInputs {
+        plan,
+        conformance_plan,
+        trusted_input_bytes,
+        source_inventory_bytes,
+    } = load_assembly_inputs(&plan_path, &conformance_plan_path)?;
+    if output.exists() {
+        return Err("release bundle output already exists".to_owned());
+    }
+    require_platform_roots(&input)?;
+    let native_environment = assemble_native_environment_set(&input, &report, &plan)?;
+
+    let evidence_members = BTreeMap::from([
+        (
+            "conformance-plan.json".to_owned(),
+            read_regular(&conformance_plan_path)?,
+        ),
+        (
+            "trusted-conformance-inputs.json".to_owned(),
+            trusted_input_bytes,
+        ),
+        (
+            "source-inventory.json".to_owned(),
+            source_inventory_bytes.clone(),
+        ),
+    ]);
+    let platform_evidence = collect_platform_evidence(
+        &input,
+        &report,
+        &plan,
+        &conformance_plan,
+        &source_inventory_bytes,
+        evidence_members,
+    )?;
+    let artifacts =
+        derive_conformance_artifacts(&report, &plan, &conformance_plan, platform_evidence)?;
+    let mut bundle = install_conformance_subjects(
+        &output,
+        &input,
+        &conformance_plan_path,
+        &plan,
+        &conformance_plan,
+        native_environment,
+        artifacts,
+    )?;
+    write_release_metadata(&output, &plan, &conformance_plan, &mut bundle)?;
+
+    let verification_report = report.with_file_name("release-assembly-verification.json");
+    verify::technical_bundle(
+        plan_path,
+        conformance_plan_path,
+        output,
+        verification_report,
+    )?;
+    Ok("assembled independently admitted three-platform release bundle".to_owned())
+}
+
+struct ConformanceArtifacts {
+    report: JsonValue,
+    acceptance: crate::conformance::ConformanceAcceptance,
+    evidence_bytes: Vec<u8>,
+    evidence_sha256: String,
+    report_sha256: String,
+    archives: BTreeMap<String, Vec<u8>>,
+}
+
+fn derive_conformance_artifacts(
+    report_path: &Path,
+    plan: &ReleasePlan,
+    conformance_plan: &crate::conformance::ConformancePlan,
+    evidence: PlatformEvidence,
+) -> Result<ConformanceArtifacts, String> {
+    let bindings = crate::conformance::TrustedEvidenceBindings::from_manifests(
+        conformance_plan,
+        &evidence.manifests,
+    )?;
+    let evidence_path =
+        report_path.with_file_name(format!(".conformance-evidence-{}.tar.gz", plan.plan_sha256));
+    if evidence_path.exists() {
+        return Err("assembly evidence staging path already exists".to_owned());
+    }
+    let evidence_sha256 = archive::create_evidence(
+        &evidence_path,
+        plan.source_date_epoch,
+        &evidence.evidence_members,
+    )?;
+    let reparsed_members = archive::read_evidence(&evidence_path, plan.source_date_epoch)?;
+    let repository = crate::conformance::EvidenceRepository::from_archive_members(
+        &evidence.manifests,
+        &reparsed_members,
+        &bindings,
+        conformance_plan,
+    )?;
+    let partition = crate::conformance::derive_partition(
+        conformance_plan,
+        &crate::conformance::canonical_universe()?,
+        &repository,
+        &bindings,
+    )?;
+    let report =
+        crate::conformance::conformance_report(conformance_plan, &partition, &evidence_sha256)?;
+    let report_sha256 = json_member(report.object()?, "reportSha256")?
+        .string()?
+        .to_owned();
+    let acceptance = crate::conformance::ConformanceAcceptance::derive(
+        conformance_plan,
+        &partition,
+        evidence_sha256.clone(),
+        report_sha256.clone(),
+    )?;
+    write_json(report_path, &report)?;
+    if !acceptance.admitted {
+        fs::remove_file(&evidence_path)
+            .map_err(|error| format!("cannot remove blocked evidence staging file: {error}"))?;
+        return Err("conformance partition contains blocking or unclassified cells".to_owned());
+    }
+    let evidence_bytes = read_regular(&evidence_path)?;
+    fs::remove_file(&evidence_path)
+        .map_err(|error| format!("cannot remove evidence staging file: {error}"))?;
+    Ok(ConformanceArtifacts {
+        report,
+        acceptance,
+        evidence_bytes,
+        evidence_sha256,
+        report_sha256,
+        archives: evidence.archives,
+    })
+}
+
+struct InstalledBundle {
+    subjects: BTreeMap<String, String>,
+    acceptance: crate::conformance::ConformanceAcceptance,
+    required_cells: u64,
+    evidence_sha256: String,
+    report_sha256: String,
+    native_environment_sha256: String,
+}
+
+fn install_conformance_subjects(
+    output: &Path,
+    input: &Path,
+    conformance_plan_path: &Path,
+    plan: &ReleasePlan,
+    conformance_plan: &crate::conformance::ConformancePlan,
+    native_environment: NativeEnvironmentAssembly,
+    artifacts: ConformanceArtifacts,
+) -> Result<InstalledBundle, String> {
+    fs::create_dir(output)
+        .map_err(|error| format!("cannot create exact release bundle: {error}"))?;
+    let mut subjects = BTreeMap::new();
+    for (name, bytes) in artifacts.archives {
+        install_subject(output, &mut subjects, &name, &bytes)?;
+    }
+    install_subject(
+        output,
+        &mut subjects,
+        "conformance-plan.json",
+        &read_regular(conformance_plan_path)?,
+    )?;
+    install_subject(
+        output,
+        &mut subjects,
+        "conformance-report.json",
+        &canonical_json_bytes(&artifacts.report)?,
+    )?;
+    let required_cells = conformance_plan
+        .cells
+        .iter()
+        .filter(|cell| {
+            matches!(
+                cell.scope,
+                crate::conformance::ScopeDisposition::Required { .. }
+            )
+        })
+        .count();
+    let required_cells =
+        u64::try_from(required_cells).map_err(|_| "required cell count overflow")?;
+    let counts = &artifacts.acceptance.counts;
+    if counts.verified().saturating_add(counts.exempted) != required_cells || counts.blocked() != 0
+    {
+        return Err("admitted partition does not cover every required cell".to_owned());
+    }
+    let html = conformance_html(plan, &artifacts.acceptance, required_cells);
+    install_subject(
+        output,
+        &mut subjects,
+        "conformance-report.html",
+        html.as_bytes(),
+    )?;
+    install_subject(
+        output,
+        &mut subjects,
+        "conformance-acceptance.json",
+        &canonical_json_bytes(&artifacts.acceptance.json())?,
+    )?;
+    install_subject(
+        output,
+        &mut subjects,
+        "conformance-evidence.tar.gz",
+        &artifacts.evidence_bytes,
+    )?;
+    install_subject(
+        output,
+        &mut subjects,
+        "native-environment-set.json",
+        &read_regular(&native_environment.path)?,
+    )?;
+    fs::remove_file(&native_environment.path)
+        .map_err(|error| format!("cannot clean native environment set staging: {error}"))?;
+    for name in ["dependency-policy.json", "mutation-report.json"] {
+        let bytes = read_regular(&input.join(ReleasePlatform::LinuxX86_64.id()).join(name))?;
+        install_subject(output, &mut subjects, name, &bytes)?;
+    }
+    verify_mutation_report(&output.join("mutation-report.json"), plan)?;
+    Ok(InstalledBundle {
+        subjects,
+        acceptance: artifacts.acceptance,
+        required_cells,
+        evidence_sha256: artifacts.evidence_sha256,
+        report_sha256: artifacts.report_sha256,
+        native_environment_sha256: native_environment.sha256,
+    })
+}
+
+fn write_release_metadata(
+    output: &Path,
+    plan: &ReleasePlan,
+    conformance_plan: &crate::conformance::ConformancePlan,
+    bundle: &mut InstalledBundle,
+) -> Result<(), String> {
+    let acceptance_sha256 = bundle.acceptance.decision_sha256.clone();
+    let conformance = conformance_summary(
+        conformance_plan,
+        &bundle.acceptance,
+        bundle.required_cells,
+        &bundle.evidence_sha256,
+        &bundle.report_sha256,
+        &acceptance_sha256,
+    );
+    let release_manifest = object([
+        ("candidateCodeExecutedInPublisher", JsonValue::Bool(false)),
+        ("conformance", conformance),
+        ("externalCustody", JsonValue::Bool(false)),
+        ("githubArtifactAttestations", JsonValue::Bool(true)),
+        ("githubImmutableReleaseRequired", JsonValue::Bool(true)),
+        ("independentProviderAcquisition", JsonValue::Bool(false)),
+        (
+            "nativeEnvironmentSetSha256",
+            string(&bundle.native_environment_sha256),
+        ),
+        (
+            "platforms",
+            JsonValue::Array(
+                PLATFORMS
+                    .iter()
+                    .map(|platform| string(platform.id()))
+                    .collect(),
+            ),
+        ),
+        ("schemaVersion", number(2)),
+        ("sshSignatures", JsonValue::Bool(false)),
+    ]);
+    install_subject(
+        output,
+        &mut bundle.subjects,
+        "release-manifest.json",
+        &canonical_json_bytes(&release_manifest)?,
+    )?;
+    let notes = release_notes(plan, &bundle.acceptance, bundle.required_cells);
+    install_subject(
+        output,
+        &mut bundle.subjects,
+        "release-notes.md",
+        notes.as_bytes(),
+    )?;
+    let mut subject_text = String::new();
+    for (name, digest) in &bundle.subjects {
+        subject_text.push_str(digest);
+        subject_text.push_str("  ");
+        subject_text.push_str(name);
+        subject_text.push('\n');
+    }
+    write_atomic(&output.join("SUBJECTS.sha256"), subject_text.as_bytes())?;
+    let subjects_sha256 = hell_testkit::sha256_bytes(subject_text.as_bytes()).hex();
+    write_release_gate(
+        output,
+        plan,
+        conformance_plan,
+        bundle,
+        &acceptance_sha256,
+        &subjects_sha256,
+    )
+}
+
+fn write_release_gate(
+    output: &Path,
+    plan: &ReleasePlan,
+    conformance_plan: &crate::conformance::ConformancePlan,
+    bundle: &InstalledBundle,
+    acceptance_sha256: &str,
+    subjects_sha256: &str,
+) -> Result<(), String> {
+    let gate_without_digest = object([
+        ("candidateCodeExecutedInPublisher", JsonValue::Bool(false)),
+        ("candidateSha", string(&plan.resolution.candidate_sha)),
+        ("conformanceAcceptanceSha256", string(acceptance_sha256)),
+        ("conformanceCounts", gate_counts(&bundle.acceptance)),
+        ("conformanceEvidenceSha256", string(&bundle.evidence_sha256)),
+        (
+            "conformancePlanSha256",
+            string(&conformance_plan.plan_sha256),
+        ),
+        ("conformanceReportSha256", string(&bundle.report_sha256)),
+        ("conformanceStandard", string(&conformance_plan.standard)),
+        ("externalInputsSha256", string(&plan.external_inputs_sha256)),
+        (
+            "governanceDeclarationSha256",
+            string(&plan.governance_declaration_sha256),
+        ),
+        (
+            "governanceProfileSha256",
+            string(&plan.governance_profile_sha256),
+        ),
+        (
+            "nativeEnvironmentSetSha256",
+            string(&bundle.native_environment_sha256),
+        ),
+        ("releasePlanSha256", string(&plan.plan_sha256)),
+        ("repository", string(&plan.resolution.repository)),
+        (
+            "residualAssumptionSetSha256",
+            string(&plan.residual_assumption_set_sha256),
+        ),
+        ("runAttempt", number(plan.resolution.run_attempt)),
+        ("runId", number(plan.resolution.run_id)),
+        ("schemaVersion", number(2)),
+        ("state", string("admitted")),
+        ("subjectsSha256", string(subjects_sha256)),
+        ("tag", string(&plan.tag)),
+        ("version", string(&plan.version)),
+        ("workflowSha", string(&plan.resolution.workflow_sha)),
+    ]);
+    let gate_sha256 =
+        hell_testkit::sha256_bytes(&canonical_json_bytes(&gate_without_digest)?).hex();
+    let mut gate_fields = gate_without_digest.object()?.clone();
+    gate_fields.insert("releaseGateSha256".to_owned(), string(&gate_sha256));
+    write_json(
+        &output.join("release-gate.json"),
+        &JsonValue::Object(gate_fields),
+    )?;
+    Ok(())
+}
+
+struct AssemblyInputs {
+    plan: ReleasePlan,
+    conformance_plan: crate::conformance::ConformancePlan,
+    trusted_input_bytes: Vec<u8>,
+    source_inventory_bytes: Vec<u8>,
+}
+
+fn load_assembly_inputs(
+    plan_path: &Path,
+    conformance_plan_path: &Path,
+) -> Result<AssemblyInputs, String> {
+    let plan = ReleasePlan::parse(&read_json(plan_path)?)?;
     let conformance_plan =
-        crate::conformance::ConformancePlan::parse(&read_json(&conformance_plan_path)?)?;
+        crate::conformance::ConformancePlan::parse(&read_json(conformance_plan_path)?)?;
     validate_conformance_binding(&plan, &conformance_plan)?;
-    let trusted_input_path = conformance_plan_path
+    let artifact_root = conformance_plan_path
         .parent()
-        .ok_or_else(|| "conformance plan has no artifact root".to_owned())?
-        .join("trusted-conformance-inputs.json");
+        .ok_or_else(|| "conformance plan has no artifact root".to_owned())?;
+    let trusted_input_path = artifact_root.join("trusted-conformance-inputs.json");
     let trusted_input_bytes = read_regular(&trusted_input_path)?;
-    let source_inventory_path = conformance_plan_path
-        .parent()
-        .ok_or_else(|| "conformance plan has no artifact root".to_owned())?
-        .join("source-inventory.json");
-    let source_inventory_bytes = read_regular(&source_inventory_path)?;
+    let source_inventory_bytes = read_regular(&artifact_root.join("source-inventory.json"))?;
     if hell_testkit::sha256_bytes(&source_inventory_bytes).hex() != plan.source_inventory_sha256 {
         return Err("plan artifact source inventory digest differs".to_owned());
     }
@@ -69,26 +431,69 @@ fn run_with_verification(
     if canonical_json_bytes(&rebuilt.manifest)? != trusted_input_bytes {
         return Err("plan artifact trusted inputs differ from assembly checkout".to_owned());
     }
-    if output.exists() {
-        return Err("release bundle output already exists".to_owned());
-    }
-    require_platform_roots(&input)?;
+    Ok(AssemblyInputs {
+        plan,
+        conformance_plan,
+        trusted_input_bytes,
+        source_inventory_bytes,
+    })
+}
 
-    let mut evidence_members = BTreeMap::from([
-        (
-            "conformance-plan.json".to_owned(),
-            read_regular(&conformance_plan_path)?,
-        ),
-        (
-            "trusted-conformance-inputs.json".to_owned(),
-            trusted_input_bytes,
-        ),
-        (
-            "source-inventory.json".to_owned(),
-            source_inventory_bytes.clone(),
-        ),
-    ]);
-    let mut reports = Vec::new();
+struct NativeEnvironmentAssembly {
+    path: PathBuf,
+    sha256: String,
+}
+
+fn assemble_native_environment_set(
+    input: &Path,
+    report: &Path,
+    plan: &ReleasePlan,
+) -> Result<NativeEnvironmentAssembly, String> {
+    let trusted_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let receipt_staging =
+        report.with_file_name(format!(".native-environment-receipts-{}", plan.plan_sha256));
+    let set_staging =
+        report.with_file_name(format!(".native-environment-set-{}.json", plan.plan_sha256));
+    if receipt_staging.exists() || set_staging.exists() {
+        return Err("native environment assembly staging already exists".to_owned());
+    }
+    fs::create_dir(&receipt_staging)
+        .map_err(|error| format!("cannot create native environment staging: {error}"))?;
+    for platform in PLATFORMS {
+        let platform_staging = receipt_staging.join(platform.id());
+        fs::create_dir(&platform_staging).map_err(|error| {
+            format!("cannot create native environment platform staging: {error}")
+        })?;
+        write_atomic(
+            &platform_staging.join("native-environment.json"),
+            &read_regular(&input.join(platform.id()).join("native-environment.json"))?,
+        )?;
+    }
+    let external_inputs = trusted_root.join("ci/external-inputs.toml");
+    super::native_environment::assemble_set(&receipt_staging, &external_inputs, &set_staging)?;
+    let sha256 = super::native_environment::verify_set(&set_staging, &external_inputs)?;
+    fs::remove_dir_all(&receipt_staging)
+        .map_err(|error| format!("cannot clean native environment receipt staging: {error}"))?;
+    Ok(NativeEnvironmentAssembly {
+        path: set_staging,
+        sha256,
+    })
+}
+
+struct PlatformEvidence {
+    evidence_members: BTreeMap<String, Vec<u8>>,
+    manifests: Vec<crate::conformance::EvidenceManifest>,
+    archives: BTreeMap<String, Vec<u8>>,
+}
+
+fn collect_platform_evidence(
+    input: &Path,
+    report: &Path,
+    plan: &ReleasePlan,
+    conformance_plan: &crate::conformance::ConformancePlan,
+    source_inventory_bytes: &[u8],
+    mut evidence_members: BTreeMap<String, Vec<u8>>,
+) -> Result<PlatformEvidence, String> {
     let mut manifests = Vec::new();
     let mut archives = BTreeMap::new();
     for platform in PLATFORMS {
@@ -102,66 +507,24 @@ fn run_with_verification(
         }
         let report_value = verify_platform_report(
             &root.join("platform-report.json"),
-            &plan,
-            &conformance_plan,
+            plan,
+            conformance_plan,
             platform,
         )?;
-        let manifest_bytes = read_regular(&root.join("conformance-evidence-manifest.json"))?;
-        let manifest = crate::conformance::EvidenceManifest::parse(&read_json(
-            &root.join("conformance-evidence-manifest.json"),
-        )?)?;
-        validate_platform_manifest(&manifest, &plan, &conformance_plan, platform)?;
+        let manifest_path = root.join("conformance-evidence-manifest.json");
+        let manifest_bytes = read_regular(&manifest_path)?;
+        let manifest = crate::conformance::EvidenceManifest::parse(&read_json(&manifest_path)?)?;
+        validate_platform_manifest(&manifest, plan, conformance_plan, platform)?;
         copy_manifest_members(&root, &manifest, &mut evidence_members)?;
         evidence_members.insert(
             format!("platform-manifests/{}.json", platform.id()),
             manifest_bytes,
         );
-        let report_fields = report_value.object()?;
-        let gate = json_member(
-            json_member(report_fields, "evidence")?.object()?,
-            "conformance-evidence",
-        )?
-        .object()?;
-        if json_member(gate, "candidateExecutableSha256")?.string()?
-            != manifest.candidate_executable_sha256
-            || oracle_binding(&root)? != manifest.oracle
-        {
-            return Err(format!(
-                "{} platform identity differs between report and evidence manifest",
-                platform.id()
-            ));
-        }
+        require_report_manifest_identity(&report_value, &manifest, &root, platform)?;
         let archive_name = format!("hell-v{}-{}.tar.gz", plan.version, platform.id());
-        let archive_path = root.join("archive").join(&archive_name);
-        archive::verify(
-            &archive_path,
-            platform,
-            &plan.version,
-            plan.source_date_epoch,
-        )?;
-        let extraction_root = report.with_file_name(format!(".platform-extract-{}", platform.id()));
-        if extraction_root.exists() {
-            return Err("platform archive extraction staging path already exists".to_owned());
-        }
-        let executable = archive::extract_binary(
-            &archive_path,
-            platform,
-            &plan.version,
-            plan.source_date_epoch,
-            &extraction_root,
-        )?;
-        let executable_sha256 = hell_testkit::sha256_file(&executable)
-            .map_err(|error| format!("cannot hash packaged executable: {error}"))?
-            .hex();
-        fs::remove_dir_all(&extraction_root)
-            .map_err(|error| format!("cannot remove archive extraction staging: {error}"))?;
-        if executable_sha256 != manifest.candidate_executable_sha256 {
-            return Err(format!(
-                "{} packaged executable differs from evidence identity",
-                platform.id()
-            ));
-        }
-        let bytes = read_regular(&archive_path)?;
+        let bytes =
+            verify_platform_archive(report, plan, platform, &root, &archive_name, &manifest)?;
+        let report_fields = report_value.object()?;
         if json_member(report_fields, "archiveSha256")?.string()?
             != hell_testkit::sha256_bytes(&bytes).hex()
         {
@@ -171,200 +534,76 @@ fn run_with_verification(
             ));
         }
         archives.insert(archive_name, bytes);
-        reports.push(report_value);
         manifests.push(manifest);
     }
-    let bindings =
-        crate::conformance::TrustedEvidenceBindings::from_manifests(&conformance_plan, &manifests)?;
+    Ok(PlatformEvidence {
+        evidence_members,
+        manifests,
+        archives,
+    })
+}
 
-    let evidence_path =
-        report.with_file_name(format!(".conformance-evidence-{}.tar.gz", plan.plan_sha256));
-    if evidence_path.exists() {
-        return Err("assembly evidence staging path already exists".to_owned());
+fn require_report_manifest_identity(
+    report: &JsonValue,
+    manifest: &crate::conformance::EvidenceManifest,
+    root: &Path,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
+    let gate = json_member(
+        json_member(report.object()?, "evidence")?.object()?,
+        "conformance-evidence",
+    )?
+    .object()?;
+    if json_member(gate, "candidateExecutableSha256")?.string()?
+        != manifest.candidate_executable_sha256
+        || oracle_binding(root)? != manifest.oracle
+    {
+        return Err(format!(
+            "{} platform identity differs between report and evidence manifest",
+            platform.id()
+        ));
     }
-    let evidence_sha256 =
-        archive::create_evidence(&evidence_path, plan.source_date_epoch, &evidence_members)?;
-    let reparsed_members = archive::read_evidence(&evidence_path, plan.source_date_epoch)?;
-    let repository = crate::conformance::EvidenceRepository::from_archive_members(
-        &manifests,
-        &reparsed_members,
-        &bindings,
-        &conformance_plan,
-    )?;
-    let partition = crate::conformance::derive_partition(
-        &conformance_plan,
-        &crate::conformance::canonical_universe()?,
-        &repository,
-        &bindings,
-    )?;
-    let conformance_report =
-        crate::conformance::conformance_report(&conformance_plan, &partition, &evidence_sha256)?;
-    let report_sha256 = json_member(conformance_report.object()?, "reportSha256")?
-        .string()?
-        .to_owned();
-    let acceptance = crate::conformance::ConformanceAcceptance::derive(
-        &conformance_plan,
-        &partition,
-        evidence_sha256.clone(),
-        report_sha256.clone(),
-    )?;
-    write_json(&report, &conformance_report)?;
-    if !acceptance.admitted {
-        fs::remove_file(&evidence_path)
-            .map_err(|error| format!("cannot remove blocked evidence staging file: {error}"))?;
-        return Err("conformance partition contains blocking or unclassified cells".to_owned());
-    }
+    Ok(())
+}
 
-    fs::create_dir(&output)
-        .map_err(|error| format!("cannot create exact release bundle: {error}"))?;
-    let mut subjects = BTreeMap::new();
-    for (name, bytes) in archives {
-        install_subject(&output, &mut subjects, &name, &bytes)?;
+fn verify_platform_archive(
+    report: &Path,
+    plan: &ReleasePlan,
+    platform: ReleasePlatform,
+    root: &Path,
+    archive_name: &str,
+    manifest: &crate::conformance::EvidenceManifest,
+) -> Result<Vec<u8>, String> {
+    let archive_path = root.join("archive").join(archive_name);
+    archive::verify(
+        &archive_path,
+        platform,
+        &plan.version,
+        plan.source_date_epoch,
+    )?;
+    let extraction_root = report.with_file_name(format!(".platform-extract-{}", platform.id()));
+    if extraction_root.exists() {
+        return Err("platform archive extraction staging path already exists".to_owned());
     }
-    install_subject(
-        &output,
-        &mut subjects,
-        "conformance-plan.json",
-        &read_regular(&conformance_plan_path)?,
+    let executable = archive::extract_binary(
+        &archive_path,
+        platform,
+        &plan.version,
+        plan.source_date_epoch,
+        &extraction_root,
     )?;
-    let report_bytes = canonical_json_bytes(&conformance_report)?;
-    install_subject(
-        &output,
-        &mut subjects,
-        "conformance-report.json",
-        &report_bytes,
-    )?;
-    let counts = acceptance.counts.clone();
-    let required_cells = conformance_plan
-        .cells
-        .iter()
-        .filter(|cell| {
-            matches!(
-                cell.scope,
-                crate::conformance::ScopeDisposition::Required { .. }
-            )
-        })
-        .count();
-    let required_cells =
-        u64::try_from(required_cells).map_err(|_| "required cell count overflow")?;
-    let html = conformance_html(&plan, &acceptance, required_cells);
-    install_subject(
-        &output,
-        &mut subjects,
-        "conformance-report.html",
-        html.as_bytes(),
-    )?;
-    let acceptance_bytes = canonical_json_bytes(&acceptance.json())?;
-    install_subject(
-        &output,
-        &mut subjects,
-        "conformance-acceptance.json",
-        &acceptance_bytes,
-    )?;
-    let evidence_bytes = read_regular(&evidence_path)?;
-    fs::remove_file(&evidence_path)
-        .map_err(|error| format!("cannot remove evidence staging file: {error}"))?;
-    install_subject(
-        &output,
-        &mut subjects,
-        "conformance-evidence.tar.gz",
-        &evidence_bytes,
-    )?;
-    for name in ["dependency-policy.json", "mutation-report.json"] {
-        let bytes = read_regular(&input.join(ReleasePlatform::LinuxX86_64.id()).join(name))?;
-        install_subject(&output, &mut subjects, name, &bytes)?;
+    let executable_sha256 = hell_testkit::sha256_file(&executable)
+        .map_err(|error| format!("cannot hash packaged executable: {error}"))?
+        .hex();
+    fs::remove_dir_all(&extraction_root)
+        .map_err(|error| format!("cannot remove archive extraction staging: {error}"))?;
+    if executable_sha256 != manifest.candidate_executable_sha256 {
+        return Err(format!(
+            "{} packaged executable differs from evidence identity",
+            platform.id()
+        ));
     }
-    verify_mutation_report(&output.join("mutation-report.json"), &plan)?;
-
-    let verified = counts.verified();
-    let blocked = counts.blocked();
-    if verified.saturating_add(counts.exempted) != required_cells || blocked != 0 {
-        return Err("admitted partition does not cover every required cell".to_owned());
-    }
-    let acceptance_sha256 = acceptance.decision_sha256.clone();
-    let conformance = conformance_summary(
-        &conformance_plan,
-        &acceptance,
-        required_cells,
-        &evidence_sha256,
-        &report_sha256,
-        &acceptance_sha256,
-    );
-    let release_manifest = object([
-        ("candidateCodeExecutedInPublisher", JsonValue::Bool(false)),
-        ("conformance", conformance.clone()),
-        ("externalCustody", JsonValue::Bool(false)),
-        ("githubArtifactAttestations", JsonValue::Bool(true)),
-        ("githubImmutableReleaseRequired", JsonValue::Bool(true)),
-        ("independentProviderAcquisition", JsonValue::Bool(false)),
-        (
-            "platforms",
-            JsonValue::Array(
-                PLATFORMS
-                    .iter()
-                    .map(|platform| string(platform.id()))
-                    .collect(),
-            ),
-        ),
-        ("schemaVersion", number(2)),
-        ("sshSignatures", JsonValue::Bool(false)),
-    ]);
-    let release_manifest_bytes = canonical_json_bytes(&release_manifest)?;
-    install_subject(
-        &output,
-        &mut subjects,
-        "release-manifest.json",
-        &release_manifest_bytes,
-    )?;
-    let notes = release_notes(&plan, &acceptance, required_cells);
-    install_subject(&output, &mut subjects, "release-notes.md", notes.as_bytes())?;
-    let subject_text = subjects
-        .iter()
-        .map(|(name, digest)| format!("{digest}  {name}\n"))
-        .collect::<String>();
-    write_atomic(&output.join("SUBJECTS.sha256"), subject_text.as_bytes())?;
-    let subjects_sha256 = hell_testkit::sha256_bytes(subject_text.as_bytes()).hex();
-    let gate_without_digest = object([
-        ("candidateCodeExecutedInPublisher", JsonValue::Bool(false)),
-        ("candidateSha", string(&plan.resolution.candidate_sha)),
-        ("conformanceAcceptanceSha256", string(&acceptance_sha256)),
-        ("conformanceCounts", gate_counts(&acceptance)),
-        ("conformanceEvidenceSha256", string(&evidence_sha256)),
-        (
-            "conformancePlanSha256",
-            string(&conformance_plan.plan_sha256),
-        ),
-        ("conformanceReportSha256", string(&report_sha256)),
-        ("conformanceStandard", string(&conformance_plan.standard)),
-        ("releasePlanSha256", string(&plan.plan_sha256)),
-        ("repository", string(&plan.resolution.repository)),
-        ("runAttempt", number(plan.resolution.run_attempt)),
-        ("runId", number(plan.resolution.run_id)),
-        ("schemaVersion", number(2)),
-        ("state", string("admitted")),
-        ("subjectsSha256", string(&subjects_sha256)),
-        ("tag", string(&plan.tag)),
-        ("version", string(&plan.version)),
-        ("workflowSha", string(&plan.resolution.workflow_sha)),
-    ]);
-    let gate_sha256 =
-        hell_testkit::sha256_bytes(&canonical_json_bytes(&gate_without_digest)?).hex();
-    let mut gate_fields = gate_without_digest.object()?.clone();
-    gate_fields.insert("releaseGateSha256".to_owned(), string(&gate_sha256));
-    write_json(
-        &output.join("release-gate.json"),
-        &JsonValue::Object(gate_fields),
-    )?;
-
-    let verification_report = report.with_file_name("release-assembly-verification.json");
-    verify::technical_bundle(
-        plan_path,
-        conformance_plan_path,
-        output,
-        verification_report,
-    )?;
-    let _ = reports;
-    Ok("assembled independently admitted three-platform release bundle".to_owned())
+    read_regular(&archive_path)
 }
 
 pub(super) fn validate_conformance_binding(
@@ -474,13 +713,14 @@ fn oracle_binding(root: &Path) -> Result<crate::conformance::OracleBinding, Stri
     })
 }
 
-pub(super) fn verify_platform_report(
+pub(crate) fn verify_platform_report(
     path: &Path,
     plan: &ReleasePlan,
     conformance: &crate::conformance::ConformancePlan,
     platform: ReleasePlatform,
 ) -> Result<JsonValue, String> {
     let value = read_json(path)?;
+    fuzz_parse_platform_report(&value)?;
     let fields = value.object()?;
     require_exact_json_keys(
         fields,
@@ -494,10 +734,12 @@ pub(super) fn verify_platform_report(
             "conformanceStandard",
             "evidence",
             "evidenceManifestSha256",
+            "externalInputsSha256",
             "exploratoryObservationCount",
             "gates",
             "imageOS",
             "imageVersion",
+            "nativeEnvironmentSha256",
             "planSha256",
             "platform",
             "producedEvidenceRecordCount",
@@ -513,6 +755,21 @@ pub(super) fn verify_platform_report(
             "workflowSha",
         ],
     )?;
+    require_platform_report_binding(fields, plan, conformance, platform)?;
+    let artifact_root = path
+        .parent()
+        .ok_or_else(|| "platform report has no artifact root".to_owned())?;
+    require_platform_report_evidence(fields, artifact_root, plan, conformance, platform)?;
+    require_platform_report_gates(fields, platform)?;
+    Ok(value)
+}
+
+fn require_platform_report_binding(
+    fields: &BTreeMap<String, JsonValue>,
+    plan: &ReleasePlan,
+    conformance: &crate::conformance::ConformancePlan,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
     if json_member(fields, "schemaVersion")?.number()? != 2
         || json_member(fields, "state")?.string()? != "passed"
         || json_member(fields, "platform")?.string()? != platform.id()
@@ -524,6 +781,7 @@ pub(super) fn verify_platform_report(
             != conformance.trusted_inputs_sha256
         || json_member(fields, "conformanceStandard")?.string()? != conformance.standard
         || json_member(fields, "buildInputsSha256")?.string()? != plan.build_inputs_sha256
+        || json_member(fields, "externalInputsSha256")?.string()? != plan.external_inputs_sha256
         || json_member(fields, "archiveName")?.string()?
             != format!("hell-v{}-{}.tar.gz", plan.version, platform.id())
         || json_member(fields, "version")?.string()? != plan.version
@@ -537,6 +795,49 @@ pub(super) fn verify_platform_report(
             platform.id()
         ));
     }
+    Ok(())
+}
+
+fn require_platform_report_evidence(
+    fields: &BTreeMap<String, JsonValue>,
+    artifact_root: &Path,
+    plan: &ReleasePlan,
+    conformance: &crate::conformance::ConformancePlan,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
+    let evidence_manifest = crate::conformance::EvidenceManifest::parse(&read_json(
+        &artifact_root.join("conformance-evidence-manifest.json"),
+    )?)?;
+    let conformance_platform = crate::conformance::ConformancePlatform::parse(platform.id())?;
+    if json_member(fields, "assignedObligationCount")?.number()?
+        != crate::conformance::assigned_obligation_count(conformance, conformance_platform)?
+        || json_member(fields, "producedEvidenceRecordCount")?.number()?
+            != evidence_manifest.produced_records
+    {
+        return Err(format!(
+            "{} platform report evidence counts are forged",
+            platform.id()
+        ));
+    }
+    if json_member(fields, "nativeEnvironmentSha256")?.string()?
+        != super::native_environment::verify_receipt(
+            &artifact_root.join("native-environment.json"),
+            platform,
+            &plan.external_inputs_sha256,
+        )?
+    {
+        return Err(format!(
+            "{} native environment receipt differs from platform report",
+            platform.id()
+        ));
+    }
+    Ok(())
+}
+
+fn require_platform_report_gates(
+    fields: &BTreeMap<String, JsonValue>,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
     let gates = json_member(fields, "gates")?.array()?;
     let evidence = json_member(fields, "evidence")?.object()?;
     let expected = expected_gates(platform);
@@ -569,7 +870,128 @@ pub(super) fn verify_platform_report(
             ));
         }
     }
-    Ok(value)
+    Ok(())
+}
+
+pub(crate) fn fuzz_parse_platform_report(value: &JsonValue) -> Result<(), String> {
+    let fields = value.object()?;
+    require_exact_json_keys(
+        fields,
+        &[
+            "archiveName",
+            "archiveSha256",
+            "assignedObligationCount",
+            "buildInputsSha256",
+            "candidateSha",
+            "conformancePlanSha256",
+            "conformanceStandard",
+            "evidence",
+            "evidenceManifestSha256",
+            "externalInputsSha256",
+            "exploratoryObservationCount",
+            "gates",
+            "imageOS",
+            "imageVersion",
+            "nativeEnvironmentSha256",
+            "planSha256",
+            "platform",
+            "producedEvidenceRecordCount",
+            "runAttempt",
+            "runId",
+            "schemaVersion",
+            "state",
+            "tag",
+            "toolIdentities",
+            "trustedConformanceInputsSha256",
+            "unclassifiedMismatchCount",
+            "version",
+            "workflowSha",
+        ],
+    )?;
+    let platform = fuzz_validate_platform_report_fields(fields)?;
+    fuzz_validate_platform_report_gates(fields, platform)
+}
+
+fn fuzz_validate_platform_report_fields(
+    fields: &BTreeMap<String, JsonValue>,
+) -> Result<ReleasePlatform, String> {
+    if json_member(fields, "schemaVersion")?.number()? != 2
+        || json_member(fields, "state")?.string()? != "passed"
+    {
+        return Err("unsupported or non-passing platform report".to_owned());
+    }
+    let platform = ReleasePlatform::parse(json_member(fields, "platform")?.string()?)?;
+    for name in [
+        "archiveSha256",
+        "buildInputsSha256",
+        "conformancePlanSha256",
+        "evidenceManifestSha256",
+        "externalInputsSha256",
+        "nativeEnvironmentSha256",
+        "planSha256",
+        "trustedConformanceInputsSha256",
+    ] {
+        super::schema::require_digest(json_member(fields, name)?.string()?, name)?;
+    }
+    for name in ["candidateSha", "workflowSha"] {
+        super::schema::require_sha(json_member(fields, name)?.string()?, name)?;
+    }
+    for name in [
+        "archiveName",
+        "conformanceStandard",
+        "imageOS",
+        "imageVersion",
+        "tag",
+        "version",
+    ] {
+        if json_member(fields, name)?.string()?.is_empty() {
+            return Err(format!("platform report field {name} is empty"));
+        }
+    }
+    for name in [
+        "assignedObligationCount",
+        "exploratoryObservationCount",
+        "producedEvidenceRecordCount",
+        "runAttempt",
+        "runId",
+        "unclassifiedMismatchCount",
+    ] {
+        json_member(fields, name)?.number()?;
+    }
+    Ok(platform)
+}
+
+fn fuzz_validate_platform_report_gates(
+    fields: &BTreeMap<String, JsonValue>,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
+    let expected = expected_gates(platform);
+    let gates = json_member(fields, "gates")?.array()?;
+    let evidence = json_member(fields, "evidence")?.object()?;
+    if gates.len() != expected.len()
+        || evidence.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            != expected.iter().copied().collect()
+    {
+        return Err("platform report gate inventory differs".to_owned());
+    }
+    for (gate, name) in gates.iter().zip(expected) {
+        let gate = gate.object()?;
+        require_exact_json_keys(gate, &["name", "passed"])?;
+        if json_member(gate, "name")?.string()? != *name
+            || !json_member(gate, "passed")?.boolean()?
+        {
+            return Err("platform report contains a failed or reordered gate".to_owned());
+        }
+        json_member(evidence, name)?.object()?;
+    }
+    let tools = json_member(fields, "toolIdentities")?.object()?;
+    if tools.is_empty() {
+        return Err("platform report tool identity inventory is empty".to_owned());
+    }
+    for identity in tools.values() {
+        super::schema::require_digest(identity.string()?, "platform tool identity")?;
+    }
+    Ok(())
 }
 
 fn verify_platform_inventory(
@@ -584,6 +1006,7 @@ fn verify_platform_inventory(
         "conformance-evidence",
         "conformance-evidence-manifest.json",
         "conformance-observations",
+        "native-environment.json",
         "oracle-report.json",
         "package-report.json",
         "platform-report.json",
@@ -837,6 +1260,10 @@ mod tests {
             source_inventory_sha256: "c".repeat(64),
             build_inputs_sha256: "d".repeat(64),
             policy_sha256: "e".repeat(64),
+            governance_declaration_sha256: "4".repeat(64),
+            governance_profile_sha256: "5".repeat(64),
+            residual_assumption_set_sha256: "6".repeat(64),
+            external_inputs_sha256: "7".repeat(64),
             trusted_conformance_inputs_sha256: "1".repeat(64),
             conformance_plan_sha256: "2".repeat(64),
             conformance_standard: crate::conformance::RELEASE_STANDARD.into(),
@@ -847,17 +1274,27 @@ mod tests {
         }
     }
 
-    fn acceptance(
-        verified: u64,
+    #[derive(Default)]
+    struct AcceptanceFixtureCounts {
+        verified_exact: u64,
+        verified_normalized: u64,
+        verified_platform_equivalent: u64,
         not_applicable: u64,
         excluded: u64,
         exempted: u64,
-        missing: u64,
-        mismatch: u64,
-        invalid: u64,
+        blocked_missing_evidence: u64,
+        blocked_mismatch: u64,
+        blocked_invalid_evidence: u64,
+    }
+
+    fn acceptance(
+        counts: &AcceptanceFixtureCounts,
         unclassified: u64,
     ) -> Result<crate::conformance::ConformanceAcceptance, String> {
-        let admitted = missing == 0 && mismatch == 0 && invalid == 0 && unclassified == 0;
+        let admitted = counts.blocked_missing_evidence == 0
+            && counts.blocked_mismatch == 0
+            && counts.blocked_invalid_evidence == 0
+            && unclassified == 0;
         let without_digest = object([
             ("admitted", JsonValue::Bool(admitted)),
             ("candidateSha", string(&"a".repeat(40))),
@@ -866,15 +1303,24 @@ mod tests {
             (
                 "partition",
                 object([
-                    ("blockedInvalidEvidence", number(invalid)),
-                    ("blockedMismatch", number(mismatch)),
-                    ("blockedMissingEvidence", number(missing)),
-                    ("excluded", number(excluded)),
-                    ("exempted", number(exempted)),
-                    ("notApplicable", number(not_applicable)),
-                    ("verifiedExact", number(verified)),
-                    ("verifiedNormalized", number(0)),
-                    ("verifiedPlatformEquivalent", number(0)),
+                    (
+                        "blockedInvalidEvidence",
+                        number(counts.blocked_invalid_evidence),
+                    ),
+                    ("blockedMismatch", number(counts.blocked_mismatch)),
+                    (
+                        "blockedMissingEvidence",
+                        number(counts.blocked_missing_evidence),
+                    ),
+                    ("excluded", number(counts.excluded)),
+                    ("exempted", number(counts.exempted)),
+                    ("notApplicable", number(counts.not_applicable)),
+                    ("verifiedExact", number(counts.verified_exact)),
+                    ("verifiedNormalized", number(counts.verified_normalized)),
+                    (
+                        "verifiedPlatformEquivalent",
+                        number(counts.verified_platform_equivalent),
+                    ),
                 ]),
             ),
             ("reportSha256", string(&"5".repeat(64))),
@@ -890,7 +1336,17 @@ mod tests {
 
     #[test]
     fn integrated_acceptance_matrix_is_fail_closed_and_deterministic() {
-        let accepted = acceptance(8, 2, 4, 1, 0, 0, 0, 0).unwrap();
+        let accepted = acceptance(
+            &AcceptanceFixtureCounts {
+                verified_exact: 8,
+                not_applicable: 2,
+                excluded: 4,
+                exempted: 1,
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
         assert!(accepted.admitted);
         assert_eq!(accepted.counts.verified(), 8);
         assert_eq!(accepted.counts.not_applicable, 2);
@@ -904,10 +1360,40 @@ mod tests {
         );
 
         for (name, result) in [
-            ("missing-cell", acceptance(0, 0, 0, 0, 1, 0, 0, 0)),
-            ("generated-mismatch", acceptance(0, 0, 0, 0, 0, 1, 0, 0)),
-            ("invalid-evidence", acceptance(0, 0, 0, 0, 0, 0, 1, 0)),
-            ("unclassified-generated", acceptance(0, 0, 0, 0, 0, 0, 0, 1)),
+            (
+                "missing-cell",
+                acceptance(
+                    &AcceptanceFixtureCounts {
+                        blocked_missing_evidence: 1,
+                        ..Default::default()
+                    },
+                    0,
+                ),
+            ),
+            (
+                "generated-mismatch",
+                acceptance(
+                    &AcceptanceFixtureCounts {
+                        blocked_mismatch: 1,
+                        ..Default::default()
+                    },
+                    0,
+                ),
+            ),
+            (
+                "invalid-evidence",
+                acceptance(
+                    &AcceptanceFixtureCounts {
+                        blocked_invalid_evidence: 1,
+                        ..Default::default()
+                    },
+                    0,
+                ),
+            ),
+            (
+                "unclassified-generated",
+                acceptance(&AcceptanceFixtureCounts::default(), 1),
+            ),
         ] {
             let decision = result.unwrap();
             assert!(!decision.admitted, "{name} was admitted");

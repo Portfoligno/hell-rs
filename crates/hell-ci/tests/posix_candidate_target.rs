@@ -4,6 +4,38 @@ use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 #[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+fn run(command: &mut Command, context: &str) -> hell_testkit::SupervisedOutput {
+    let output = hell_testkit::run_supervised_command(command, &[], Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("{context} must execute: {error}"));
+    assert!(!output.timed_out, "{context} timed out");
+    assert!(
+        output
+            .phase_timings
+            .iter()
+            .any(|phase| phase.name == "quiescence-complete")
+    );
+    assert_eq!(
+        output.phase_timings.last().map(|phase| phase.name),
+        Some("stdin-joined")
+    );
+    output
+}
+
+#[cfg(unix)]
+fn stderr(output: &hell_testkit::SupervisedOutput) -> String {
+    String::from_utf8_lossy(
+        output
+            .stderr
+            .complete
+            .as_deref()
+            .unwrap_or(&output.stderr.prefix),
+    )
+    .into_owned()
+}
 
 #[cfg(unix)]
 #[test]
@@ -24,96 +56,64 @@ fn candidate_receipt_consumer_accepts_exact_driver_identity_and_rejects_mutation
         digest.hex().into(),
         "fixture".into(),
     ];
-    let output = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    command
         .arg("__verify-posix-candidate-driver-receipt")
-        .args(&arguments)
-        .output()
-        .expect("POSIX candidate receipt verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .args(&arguments);
+    let output = run(&mut command, "POSIX candidate receipt verification");
+    assert!(output.status.success(), "{}", stderr(&output));
     let mut mutated = arguments;
     mutated[3] = metadata.ino().wrapping_add(1).to_string().into();
-    let rejected = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    command
         .arg("__verify-posix-candidate-driver-receipt")
-        .args(mutated)
-        .output()
-        .expect("mutated POSIX candidate receipt verification must execute");
+        .args(mutated);
+    let rejected = run(&mut command, "mutated POSIX candidate receipt verification");
     assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("lacks its driver-owned pre-candidate receipt")
-    );
+    assert!(stderr(&rejected).contains("lacks its driver-owned pre-candidate receipt"));
 }
 
 #[cfg(unix)]
 #[test]
 fn native_cargo_without_a_staged_compiler_is_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-posix-native-cargo-rejection")
-        .output()
-        .expect("POSIX native Cargo rejection verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-posix-native-cargo-rejection");
+    let output = run(&mut command, "POSIX native Cargo rejection verification");
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn rustc_environment_is_exact_without_path_or_wrapper_fallback() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-posix-rustc-environment")
-        .output()
-        .expect("POSIX Rust compiler environment verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-posix-rustc-environment");
+    let output = run(&mut command, "POSIX Rust compiler environment verification");
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn expired_identity_query_deadline_rejects_before_launch() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-posix-identity-query-deadline")
-        .output()
-        .expect("POSIX identity query deadline verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-posix-identity-query-deadline");
+    let output = run(&mut command, "POSIX identity query deadline verification");
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn candidate_target_remover_is_bounded_and_preserves_external_authorities() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-posix-candidate-target-remover")
-        .output()
-        .expect("POSIX candidate target remover verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-posix-candidate-target-remover");
+    let output = run(&mut command, "POSIX candidate target remover verification");
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[cfg(unix)]
 #[test]
 fn principal_cleanup_requires_quiescence_then_root_then_user_absence() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hell-ci"))
-        .arg("__verify-posix-principal-cleanup-order")
-        .output()
-        .expect("POSIX principal cleanup order verification must execute");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command.arg("__verify-posix-principal-cleanup-order");
+    let output = run(&mut command, "POSIX principal cleanup order verification");
+    assert!(output.status.success(), "{}", stderr(&output));
 }

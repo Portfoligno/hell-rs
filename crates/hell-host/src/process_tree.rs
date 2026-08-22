@@ -698,10 +698,29 @@ fn termination_executor_sender() -> io::Result<mpsc::Sender<TerminationTask>> {
 ///
 /// Returns an error if deadline enforcement or retained cleanup completion drifts.
 #[cfg(unix)]
+enum IntegrationFixtureProcess {
+    Sleep,
+    True,
+}
+
+#[cfg(unix)]
+impl IntegrationFixtureProcess {
+    fn command(self) -> Command {
+        match self {
+            Self::Sleep => {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("60");
+                command
+            }
+            Self::True => Command::new("/usr/bin/true"),
+        }
+    }
+}
+
+#[cfg(unix)]
 #[doc(hidden)]
 pub fn verify_termination_deadline_for_integration() -> Result<(), String> {
-    let mut command = Command::new("/bin/sleep");
-    command.arg("60");
+    let mut command = IntegrationFixtureProcess::Sleep.command();
     let mut child = SupervisedChild::spawn(&mut command)
         .map_err(|error| format!("cannot spawn termination deadline fixture: {error}"))?;
     let started = Instant::now();
@@ -753,8 +772,7 @@ pub fn verify_termination_deadline_for_integration() -> Result<(), String> {
 
 #[cfg(unix)]
 fn verify_termination_transition_probes(deadline: Instant) -> Result<(), String> {
-    let mut gated_command = Command::new("/bin/sleep");
-    gated_command.arg("60");
+    let mut gated_command = IntegrationFixtureProcess::Sleep.command();
     let mut gated = SupervisedChild::spawn(&mut gated_command)
         .map_err(|error| format!("cannot spawn gated termination fixture: {error}"))?;
     let child = gated
@@ -793,7 +811,7 @@ fn verify_termination_transition_probes(deadline: Instant) -> Result<(), String>
 
 #[cfg(unix)]
 fn verify_termination_panic_receipt(deadline: Instant) -> Result<(), String> {
-    let mut panic_command = Command::new("/usr/bin/true");
+    let mut panic_command = IntegrationFixtureProcess::True.command();
     let mut panic_child = SupervisedChild::spawn(&mut panic_command)
         .map_err(|error| format!("cannot spawn cleanup panic fixture: {error}"))?;
     let child = panic_child

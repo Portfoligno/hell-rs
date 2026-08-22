@@ -5,6 +5,8 @@ use std::path::PathBuf;
 #[cfg(feature = "mutation-testing")]
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mutation-testing")]
+use std::time::Duration;
 
 use hell_compiler::{CompilerSession, compile_source};
 use hell_runtime::{
@@ -431,7 +433,17 @@ fn run_io_pure_laziness_test(mutant: Option<&str>) -> Output {
             .args(["--skip", "__hell_mutant", "--skip"])
             .arg(mutant);
     }
-    command.output().expect("nested laziness test runs")
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(30))
+        .expect("supervise nested laziness test");
+    assert!(
+        !output.timed_out,
+        "nested laziness test exceeded its deadline"
+    );
+    Output {
+        status: output.status,
+        stdout: output.stdout.complete.expect("stdout capture is complete"),
+        stderr: output.stderr.complete.expect("stderr capture is complete"),
+    }
 }
 
 #[cfg(feature = "mutation-testing")]

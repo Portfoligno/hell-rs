@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::json::JsonValue;
 
@@ -25,10 +25,10 @@ impl RemoteState {
     }
 }
 
-pub(crate) fn check(plan_path: PathBuf, report: PathBuf) -> Result<String, String> {
-    let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
+pub(crate) fn check(plan_path: &Path, report: &Path) -> Result<String, String> {
+    let plan = ReleasePlan::parse(&read_json(plan_path)?)?;
     let client = GitHubClient::from_actions_environment()?;
-    check_with_client(&plan, &report, &client)
+    check_with_client(&plan, report, &client)
 }
 
 fn check_with_client(

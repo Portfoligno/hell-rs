@@ -1,0 +1,224 @@
+schema-version = 1
+protocol-version = "release-admission-v1"
+protocol-projection = "ci/release-protocol/v1/projection.json"
+
+[[vector]]
+id = "known-good"
+valid = true
+mutation = "none"
+
+[[vector]]
+id = "duplicate-json-key"
+valid = false
+mutation = "duplicate-json-key"
+diagnostic = "release.json.duplicate-key"
+
+[[vector]]
+id = "unknown-field"
+valid = false
+mutation = "unknown-field"
+diagnostic = "release.json.unknown-field"
+
+[[vector]]
+id = "trailing-json-bytes"
+valid = false
+mutation = "trailing-json-bytes"
+diagnostic = "release.json.trailing-bytes"
+
+[[vector]]
+id = "noncanonical-integer"
+valid = false
+mutation = "noncanonical-integer"
+diagnostic = "release.json.noncanonical-integer"
+
+[[vector]]
+id = "wrong-candidate-sha"
+valid = false
+mutation = "wrong-candidate-sha"
+diagnostic = "release.binding.candidate-sha"
+
+[[vector]]
+id = "wrong-workflow-sha"
+valid = false
+mutation = "wrong-workflow-sha"
+diagnostic = "release.binding.workflow-sha"
+
+[[vector]]
+id = "wrong-source-inventory-digest"
+valid = false
+mutation = "wrong-source-inventory-digest"
+diagnostic = "release.binding.source-inventory"
+
+[[vector]]
+id = "wrong-oracle-identity"
+valid = false
+mutation = "wrong-oracle-identity"
+diagnostic = "release.binding.oracle"
+
+[[vector]]
+id = "wrong-executable-digest"
+valid = false
+mutation = "wrong-executable-digest"
+diagnostic = "release.binding.executable"
+
+[[vector]]
+id = "linux-evidence-relabeled-as-windows"
+valid = false
+mutation = "linux-evidence-relabeled-as-windows"
+diagnostic = "release.evidence.platform"
+
+[[vector]]
+id = "evidence-replayed-into-another-case"
+valid = false
+mutation = "evidence-replayed-into-another-case"
+diagnostic = "release.evidence.case"
+
+[[vector]]
+id = "missing-cell"
+valid = false
+mutation = "missing-cell"
+diagnostic = "release.ledger.missing-cell"
+
+[[vector]]
+id = "duplicate-cell"
+valid = false
+mutation = "duplicate-cell"
+diagnostic = "release.ledger.duplicate-cell"
+
+[[vector]]
+id = "unused-authoritative-evidence"
+valid = false
+mutation = "unused-authoritative-evidence"
+diagnostic = "release.evidence.unused"
+
+[[vector]]
+id = "contradictory-evidence-for-one-cell"
+valid = false
+mutation = "contradictory-evidence-for-one-cell"
+diagnostic = "release.evidence.contradictory"
+
+[[vector]]
+id = "exemption-with-mismatched-selector"
+valid = false
+mutation = "exemption-with-mismatched-selector"
+diagnostic = "release.exemption.selector"
+
+[[vector]]
+id = "expired-exemption"
+valid = false
+mutation = "expired-exemption"
+diagnostic = "release.exemption.expired"
+
+[[vector]]
+id = "exemption-uses-wall-clock-time"
+valid = false
+mutation = "exemption-uses-wall-clock-time"
+diagnostic = "release.exemption.evaluation-instant"
+
+[[vector]]
+id = "extra-archive-member"
+valid = false
+mutation = "extra-archive-member"
+diagnostic = "release.archive.extra-member"
+
+[[vector]]
+id = "duplicate-archive-member"
+valid = false
+mutation = "duplicate-archive-member"
+diagnostic = "release.archive.duplicate-member"
+
+[[vector]]
+id = "archive-path-traversal"
+valid = false
+mutation = "archive-path-traversal"
+diagnostic = "release.archive.path-traversal"
+
+[[vector]]
+id = "absolute-archive-path"
+valid = false
+mutation = "absolute-archive-path"
+diagnostic = "release.archive.absolute-path"
+
+[[vector]]
+id = "archive-symbolic-link"
+valid = false
+mutation = "archive-symbolic-link"
+diagnostic = "release.archive.unsupported-type"
+
+[[vector]]
+id = "malformed-tar-checksum"
+valid = false
+mutation = "malformed-tar-checksum"
+diagnostic = "release.archive.tar-checksum"
+
+[[vector]]
+id = "trailing-gzip-member"
+valid = false
+mutation = "trailing-gzip-member"
+diagnostic = "release.archive.trailing-gzip-member"
+
+[[vector]]
+id = "decompression-limit-exceeded"
+valid = false
+mutation = "decompression-limit-exceeded"
+diagnostic = "release.limit.archive-expanded"
+
+[[vector]]
+id = "subject-omitted-from-manifest"
+valid = false
+mutation = "subject-omitted-from-manifest"
+diagnostic = "release.subject.missing"
+
+[[vector]]
+id = "unlisted-extra-subject"
+valid = false
+mutation = "unlisted-extra-subject"
+diagnostic = "release.subject.extra"
+
+[[vector]]
+id = "release-gate-bound-to-another-subject-manifest"
+valid = false
+mutation = "release-gate-bound-to-another-subject-manifest"
+diagnostic = "release.binding.subject-manifest"
+
+[[vector]]
+id = "blocked-count-hidden-by-forged-summary"
+valid = false
+mutation = "blocked-count-hidden-by-forged-summary"
+diagnostic = "release.ledger.forged-count"
+
+[[vector]]
+id = "malformed-platform-report-count"
+valid = false
+mutation = "malformed-platform-report-count"
+diagnostic = "release.platform.forged-count"
+
+[[vector]]
+id = "wrong-native-environment-receipt"
+valid = false
+mutation = "wrong-native-environment-receipt"
+diagnostic = "release.binding.native-environment"
+
+[[vector]]
+id = "wrong-governance-profile"
+valid = false
+mutation = "wrong-governance-profile"
+diagnostic = "release.binding.governance-profile"
+
+[[vector]]
+id = "protocol-downgrade"
+valid = false
+mutation = "protocol-downgrade"
+diagnostic = "release.protocol.downgrade"
+
+[[vector]]
+id = "primary-accepts-independent-rejects"
+valid = false
+mutation = "primary-accepts-independent-rejects"
+diagnostic = "release.verifier-disagreement"
+
+[[vector]]
+id = "independent-accepts-primary-rejects"
+valid = false
+mutation = "independent-accepts-primary-rejects"
+diagnostic = "release.verifier-disagreement"

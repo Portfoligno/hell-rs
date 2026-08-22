@@ -21,6 +21,7 @@ nix = { version = "0.27.1", default-features = false, features = ["fs"] }
 [dev-dependencies]
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
 hell-source = { version = "0.1.0", path = "../hell-source" }
+hell-testkit = { version = "0.1.0", path = "../hell-testkit" }
 
 [[bin]]
 name = "hell-runtime-process-fixture"

@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::env;
-#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::io::Read as _;
@@ -12,6 +10,8 @@ use std::time::Duration;
 
 use crate::command::CommandSpec;
 use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
+#[cfg(unix)]
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 
 use super::github::GitHubClient;
 #[cfg(unix)]
@@ -34,8 +34,12 @@ const ATTESTATION_DESTINATIONS: [&str; 2] = [
 
 #[cfg(unix)]
 pub(crate) fn stage_attestations(input: PathBuf) -> Result<String, String> {
+    let input = input.into_boxed_path();
+    let environment = ProcessEnvironment::from_process();
     let runner_temp = PathBuf::from(
-        env::var_os("RUNNER_TEMP").ok_or_else(|| "RUNNER_TEMP is required".to_owned())?,
+        environment
+            .value(StandardVariable::RunnerTemp)
+            .ok_or_else(|| "RUNNER_TEMP is required".to_owned())?,
     );
     let registry = runner_temp.join(ATTESTATION_REGISTRY);
     stage_attestations_from_registry(&input, &runner_temp, &registry)
@@ -259,12 +263,13 @@ fn require_same_destination_directory(
 
 pub(crate) fn run(plan_path: PathBuf, input: PathBuf, report: PathBuf) -> Result<String, String> {
     let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
-    let verification = verify::publication_bundle(
-        plan_path,
-        input.clone(),
-        report.with_file_name("release-publish-verification.json"),
-    )
-    .and_then(|_| verify_attestations(&plan, &input));
+    let verification_input = input.clone();
+    let verification_report = report.with_file_name("release-publish-verification.json");
+    let input = input.into_boxed_path();
+    let report = report.into_boxed_path();
+    let verification =
+        verify::publication_bundle(plan_path, verification_input, verification_report)
+            .and_then(|_| verify_attestations(&plan, &input));
     verification?;
     let client = GitHubClient::from_actions_environment()?;
     publish_after_verification(&plan, &input, &report, &client, Ok(()))
@@ -290,22 +295,61 @@ fn publish_with_client(
     if !client.immutable_releases_enabled(&plan.resolution.repository)? {
         return Err("GitHub immutable releases are not enabled".to_owned());
     }
-    require_stable_branch(&client, &plan)?;
+    require_stable_branch(client, plan)?;
     let marker = format!("<!-- hell-rs-release-plan-sha256: {} -->", plan.plan_sha256);
-    let assets = publication_assets(&input, &plan)?;
+    let assets = publication_assets(input, plan)?;
     let notes = read_regular(&input.join("release-notes.md"))?;
     let notes =
         std::str::from_utf8(&notes).map_err(|_| "release notes are not UTF-8".to_owned())?;
     let publication_body = format!("{notes}\n{marker}");
+    let prepared = prepare_release_draft(client, plan, &marker, &assets, &publication_body)?;
+    let mut draft = match prepared {
+        PreparedRelease::Complete(message) => {
+            write_report(report, plan, "already-published-immutable", false)?;
+            return Ok(message);
+        }
+        PreparedRelease::Draft(draft) => draft,
+    };
+    draft.release = reconcile_release_assets(client, plan, input, &marker, &assets, draft.release)?;
+    publish_prepared_release(
+        client,
+        plan,
+        report,
+        &marker,
+        &assets,
+        &publication_body,
+        draft,
+    )
+}
+
+enum PreparedRelease {
+    Complete(String),
+    Draft(PreparedDraft),
+}
+
+struct PreparedDraft {
+    release: JsonValue,
+    stale_draft_removed: bool,
+}
+
+fn prepare_release_draft(
+    client: &GitHubClient,
+    plan: &ReleasePlan,
+    marker: &str,
+    assets: &BTreeMap<String, (u64, String)>,
+    publication_body: &str,
+) -> Result<PreparedRelease, String> {
     let mut release = client.release_state_by_tag(&plan.resolution.repository, &plan.tag)?;
     let mut cleanup = false;
     if let Some(existing) = &release {
-        require_remote_tag(&client, &plan, existing)?;
-        match classify(existing, &plan, &marker, &assets)? {
+        require_remote_tag(client, plan, existing)?;
+        match classify(existing, plan, marker, assets)? {
             ExistingReleaseState::MatchingImmutable => {
-                require_exact_published_metadata(existing, plan, &publication_body)?;
-                write_report(&report, &plan, "already-published-immutable", false)?;
-                return Ok(format!("verified existing immutable release {}", plan.tag));
+                require_exact_published_metadata(existing, plan, publication_body)?;
+                return Ok(PreparedRelease::Complete(format!(
+                    "verified existing immutable release {}",
+                    plan.tag
+                )));
             }
             ExistingReleaseState::MatchingDraft => {}
             ExistingReleaseState::StaleMachineDraft => {
@@ -317,7 +361,7 @@ fn publish_with_client(
                     release =
                         client.release_state_by_tag(&plan.resolution.repository, &plan.tag)?;
                     if let Some(observed) = release.as_ref() {
-                        if classify(observed, &plan, &marker, &assets)?
+                        if classify(observed, plan, marker, assets)?
                             != ExistingReleaseState::StaleMachineDraft
                         {
                             return Err("ambiguous stale draft deletion left a conflicting state"
@@ -346,57 +390,74 @@ fn publish_with_client(
         }
     }
     if release.is_none() {
-        require_stable_branch(&client, &plan)?;
-        require_absent_tag(&client, &plan)?;
-        let body = draft_request(&plan, &marker)?;
-        match client.create_draft(&plan.resolution.repository, &body) {
-            Ok(created) => {
-                if classify(&created, &plan, &marker, &assets)?
-                    != ExistingReleaseState::MatchingDraft
-                {
-                    return Err("GitHub created a nonmatching release draft".to_owned());
-                }
-                release = Some(created);
+        require_stable_branch(client, plan)?;
+        require_absent_tag(client, plan)?;
+        let body = draft_request(plan, marker)?;
+        if let Ok(created) = client.create_draft(&plan.resolution.repository, &body) {
+            if classify(&created, plan, marker, assets)? != ExistingReleaseState::MatchingDraft {
+                return Err("GitHub created a nonmatching release draft".to_owned());
             }
-            Err(_) => {
-                release = client.release_state_by_tag(&plan.resolution.repository, &plan.tag)?;
-                let observed = release.as_ref().ok_or_else(|| {
-                    "ambiguous draft creation did not produce an observable release".to_owned()
-                })?;
-                if classify(observed, &plan, &marker, &assets)?
-                    != ExistingReleaseState::MatchingDraft
-                {
-                    return Err("ambiguous draft creation produced a conflicting state".to_owned());
-                }
+            release = Some(created);
+        } else {
+            release = client.release_state_by_tag(&plan.resolution.repository, &plan.tag)?;
+            let observed = release.as_ref().ok_or_else(|| {
+                "ambiguous draft creation did not produce an observable release".to_owned()
+            })?;
+            if classify(observed, plan, marker, assets)? != ExistingReleaseState::MatchingDraft {
+                return Err("ambiguous draft creation produced a conflicting state".to_owned());
             }
         }
     }
-    let mut release_value = release.ok_or_else(|| "release draft was not created".to_owned())?;
-    if reconcile_assets(&client, &plan, &input, &assets, &release_value).is_err() {
-        release_value = client
+    Ok(PreparedRelease::Draft(PreparedDraft {
+        release: release.ok_or_else(|| "release draft was not created".to_owned())?,
+        stale_draft_removed: cleanup,
+    }))
+}
+
+fn reconcile_release_assets(
+    client: &GitHubClient,
+    plan: &ReleasePlan,
+    input: &Path,
+    marker: &str,
+    assets: &BTreeMap<String, (u64, String)>,
+    mut release: JsonValue,
+) -> Result<JsonValue, String> {
+    if reconcile_assets(client, plan, input, assets, &release).is_err() {
+        release = client
             .release_state_by_tag(&plan.resolution.repository, &plan.tag)?
             .ok_or_else(|| {
                 "release draft disappeared during ambiguous asset mutation".to_owned()
             })?;
-        if classify(&release_value, &plan, &marker, &assets)? != ExistingReleaseState::MatchingDraft
-        {
+        if classify(&release, plan, marker, assets)? != ExistingReleaseState::MatchingDraft {
             return Err("ambiguous asset mutation produced a conflicting release".to_owned());
         }
-        reconcile_assets(&client, &plan, &input, &assets, &release_value)?;
+        reconcile_assets(client, plan, input, assets, &release)?;
     }
-    release_value = client
+    release = client
         .release_state_by_tag(&plan.resolution.repository, &plan.tag)?
         .ok_or_else(|| "release draft disappeared after asset reconciliation".to_owned())?;
-    if classify(&release_value, &plan, &marker, &assets)? != ExistingReleaseState::MatchingDraft {
+    if classify(&release, plan, marker, assets)? != ExistingReleaseState::MatchingDraft {
         return Err("release draft asset set did not reconcile exactly".to_owned());
     }
-    require_stable_branch(&client, &plan)?;
-    require_remote_tag(&client, &plan, &release_value)?;
-    let body = publish_request(&plan, &publication_body)?;
+    Ok(release)
+}
+
+fn publish_prepared_release(
+    client: &GitHubClient,
+    plan: &ReleasePlan,
+    report: &Path,
+    marker: &str,
+    assets: &BTreeMap<String, (u64, String)>,
+    publication_body: &str,
+    mut draft: PreparedDraft,
+) -> Result<String, String> {
+    require_stable_branch(client, plan)?;
+    require_remote_tag(client, plan, &draft.release)?;
+    let body = publish_request(plan, publication_body)?;
     if client
         .update_release(
             &plan.resolution.repository,
-            release_id(&release_value)?,
+            release_id(&draft.release)?,
             &body,
         )
         .is_err()
@@ -406,16 +467,20 @@ fn publish_with_client(
     {
         return Err("ambiguous publication produced no release".to_owned());
     }
-    release_value = client
+    draft.release = client
         .release_by_tag(&plan.resolution.repository, &plan.tag)?
         .ok_or_else(|| "published release disappeared before final verification".to_owned())?;
-    if classify(&release_value, &plan, &marker, &assets)? != ExistingReleaseState::MatchingImmutable
-    {
+    if classify(&draft.release, plan, marker, assets)? != ExistingReleaseState::MatchingImmutable {
         return Err("post-publication immutable release verification failed".to_owned());
     }
-    require_exact_published_metadata(&release_value, &plan, &publication_body)?;
-    require_remote_tag(&client, &plan, &release_value)?;
-    write_report(report, plan, "published-immutable", cleanup)?;
+    require_exact_published_metadata(&draft.release, plan, publication_body)?;
+    require_remote_tag(client, plan, &draft.release)?;
+    write_report(
+        report,
+        plan,
+        "published-immutable",
+        draft.stale_draft_removed,
+    )?;
     Ok(format!("published verified immutable release {}", plan.tag))
 }
 
@@ -556,7 +621,7 @@ fn require_exact_statement(statement: &BTreeMap<String, JsonValue>) -> Result<()
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return Err("attestation payload base64 is truncated".to_owned());
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
@@ -900,6 +965,7 @@ enum ExistingReleaseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     #[cfg(windows)]
     use std::io::Read as _;
     use std::io::Write as _;
@@ -932,6 +998,10 @@ mod tests {
             source_inventory_sha256: "c".repeat(64),
             build_inputs_sha256: "d".repeat(64),
             policy_sha256: "e".repeat(64),
+            governance_declaration_sha256: "4".repeat(64),
+            governance_profile_sha256: "5".repeat(64),
+            residual_assumption_set_sha256: "6".repeat(64),
+            external_inputs_sha256: "7".repeat(64),
             trusted_conformance_inputs_sha256: "2".repeat(64),
             conformance_plan_sha256: "3".repeat(64),
             conformance_standard: crate::conformance::RELEASE_STANDARD.into(),
@@ -1076,6 +1146,212 @@ mod tests {
         .unwrap();
     }
 
+    #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+    enum AmbiguousOperation {
+        Create,
+        Delete,
+        Upload,
+        Publish,
+    }
+
+    struct FakePublisherServer {
+        scenario: Scenario,
+        plan: ReleasePlan,
+        local: BTreeMap<String, (u64, String)>,
+        upload_url: String,
+        marker: String,
+        published_body: String,
+        release: Option<FakeRelease>,
+        next_asset: u64,
+        ambiguous: BTreeSet<AmbiguousOperation>,
+    }
+
+    impl FakePublisherServer {
+        fn respond_repository_state(&self, stream: &mut std::net::TcpStream, path: &str) -> bool {
+            if path.ends_with("/immutable-releases") {
+                respond(stream, "200 OK", "{\"enabled\":true}");
+            } else if path.contains("/git/ref/heads/release") {
+                let branch_sha = if matches!(self.scenario, Scenario::MovedBranch) {
+                    "9".repeat(40)
+                } else {
+                    self.plan.resolution.candidate_sha.clone()
+                };
+                respond(
+                    stream,
+                    "200 OK",
+                    &format!(
+                        "{{\"node_id\":\"n\",\"object\":{{\"sha\":\"{branch_sha}\",\"type\":\"commit\",\"url\":\"u\"}},\"ref\":\"refs/heads/release\",\"url\":\"u\"}}"
+                    ),
+                );
+            } else if path.contains("/git/ref/tags/") {
+                if matches!(self.scenario, Scenario::ConcurrentTag)
+                    || self.release.as_ref().is_some_and(|value| !value.draft)
+                {
+                    respond(
+                        stream,
+                        "200 OK",
+                        &format!(
+                            "{{\"node_id\":\"n\",\"object\":{{\"sha\":\"{}\",\"type\":\"commit\",\"url\":\"u\"}},\"ref\":\"refs/tags/{}\",\"url\":\"u\"}}",
+                            self.plan.resolution.candidate_sha, self.plan.tag
+                        ),
+                    );
+                } else {
+                    respond(stream, "404 Not Found", "{}");
+                }
+            } else {
+                return false;
+            }
+            true
+        }
+
+        fn respond_release_read(
+            &self,
+            stream: &mut std::net::TcpStream,
+            first: &str,
+            path: &str,
+        ) -> bool {
+            if first.starts_with("GET ") && path.contains("/releases?per_page") {
+                let body = self.release.as_ref().map_or_else(
+                    || "[]".to_owned(),
+                    |value| {
+                        format!(
+                            "[{}]",
+                            fake_release_json(&self.plan, value, &self.upload_url)
+                        )
+                    },
+                );
+                respond(stream, "200 OK", &body);
+            } else if first.starts_with("GET ") && path.contains("/releases/tags/") {
+                if let Some(value) = self.release.as_ref().filter(|value| !value.draft) {
+                    respond(
+                        stream,
+                        "200 OK",
+                        &fake_release_json(&self.plan, value, &self.upload_url),
+                    );
+                } else {
+                    respond(stream, "404 Not Found", "{}");
+                }
+            } else {
+                return false;
+            }
+            true
+        }
+
+        fn apply_release_write(
+            &mut self,
+            stream: &mut std::net::TcpStream,
+            first: &str,
+            path: &str,
+        ) -> bool {
+            if first.starts_with("POST ") && path.ends_with("/releases") {
+                self.release = Some(FakeRelease {
+                    draft: true,
+                    immutable: false,
+                    body: self.marker.clone(),
+                    target: self.plan.resolution.candidate_sha.clone(),
+                    assets: BTreeMap::new(),
+                });
+                if self.ambiguous.remove(&AmbiguousOperation::Create) {
+                    return true;
+                }
+                respond(
+                    stream,
+                    "201 Created",
+                    &fake_release_json(
+                        &self.plan,
+                        self.release.as_ref().unwrap(),
+                        &self.upload_url,
+                    ),
+                );
+            } else if first.starts_with("DELETE ") && path.contains("/releases/assets/") {
+                let id = path.rsplit('/').next().unwrap().parse::<u64>().unwrap();
+                self.release
+                    .as_mut()
+                    .unwrap()
+                    .assets
+                    .retain(|_, asset| asset.0 != id);
+                respond(stream, "204 No Content", "");
+            } else if first.starts_with("DELETE ") && path.ends_with("/releases/7") {
+                self.release = None;
+                if !self.ambiguous.remove(&AmbiguousOperation::Delete) {
+                    respond(stream, "204 No Content", "");
+                }
+            } else if first.starts_with("POST ") && path.starts_with("/upload?name=") {
+                self.upload_asset(stream, path);
+            } else if first.starts_with("PATCH ") && path.ends_with("/releases/7") {
+                self.publish_release(stream);
+            } else {
+                return false;
+            }
+            true
+        }
+
+        fn upload_asset(&mut self, stream: &mut std::net::TcpStream, path: &str) {
+            let name = path.strip_prefix("/upload?name=").unwrap().to_owned();
+            let (size, digest) = self.local.get(&name).unwrap();
+            self.release
+                .as_mut()
+                .unwrap()
+                .assets
+                .insert(name.clone(), (self.next_asset, *size, digest.clone()));
+            let body = format!(
+                "{{\"digest\":\"sha256:{digest}\",\"id\":{},\"name\":\"{name}\",\"size\":{size}}}",
+                self.next_asset
+            );
+            self.next_asset += 1;
+            if !self.ambiguous.remove(&AmbiguousOperation::Upload) {
+                respond(stream, "201 Created", &body);
+            }
+        }
+
+        fn publish_release(&mut self, stream: &mut std::net::TcpStream) {
+            let current = self.release.as_mut().unwrap();
+            current.draft = false;
+            current.immutable = true;
+            current.body.clone_from(&self.published_body);
+            if !self.ambiguous.remove(&AmbiguousOperation::Publish) {
+                respond(
+                    stream,
+                    "200 OK",
+                    &fake_release_json(&self.plan, current, &self.upload_url),
+                );
+            }
+        }
+    }
+
+    fn serve_fake_publisher(
+        listener: &TcpListener,
+        done: &AtomicBool,
+        requests: &Mutex<Vec<String>>,
+        mut server: FakePublisherServer,
+    ) {
+        while !done.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::yield_now();
+                    continue;
+                }
+                Err(error) => panic!("fake API accept failed: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let bytes = request_bytes(&mut stream);
+            if bytes.is_empty() {
+                continue;
+            }
+            let request = String::from_utf8_lossy(&bytes);
+            let first = request.lines().next().unwrap_or_default().to_owned();
+            requests.lock().unwrap().push(request.to_string());
+            let path = first.split_whitespace().nth(1).unwrap_or_default();
+            if !server.respond_repository_state(&mut stream, path)
+                && !server.respond_release_read(&mut stream, &first, path)
+                && !server.apply_release_write(&mut stream, &first, path)
+            {
+                panic!("unexpected fake API request: {first}");
+            }
+        }
+    }
+
     fn run_fake_publisher(scenario: Scenario) -> (Result<String, String>, Vec<String>) {
         let plan = plan();
         let (input, local) = publication_fixture(&plan);
@@ -1085,7 +1361,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let upload_url = format!("http://{address}/upload{{?name,label}}");
-        let mut release = match scenario {
+        let release = match scenario {
             Scenario::Human => Some(FakeRelease {
                 draft: true,
                 immutable: false,
@@ -1140,146 +1416,25 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_done = Arc::clone(&done);
         let server_requests = Arc::clone(&requests);
-        let server_plan = plan.clone();
-        let server_local = local.clone();
+        let fake_server = FakePublisherServer {
+            scenario,
+            plan: plan.clone(),
+            local: local.clone(),
+            upload_url,
+            marker,
+            published_body,
+            release,
+            next_asset: 100,
+            ambiguous: match scenario {
+                Scenario::AmbiguousCreate => BTreeSet::from([AmbiguousOperation::Create]),
+                Scenario::AmbiguousDelete => BTreeSet::from([AmbiguousOperation::Delete]),
+                Scenario::AmbiguousUpload => BTreeSet::from([AmbiguousOperation::Upload]),
+                Scenario::AmbiguousPublish => BTreeSet::from([AmbiguousOperation::Publish]),
+                _ => BTreeSet::new(),
+            },
+        };
         let server = thread::spawn(move || {
-            let mut next_asset = 100_u64;
-            let mut ambiguous_create = matches!(scenario, Scenario::AmbiguousCreate);
-            let mut ambiguous_delete = matches!(scenario, Scenario::AmbiguousDelete);
-            let mut ambiguous_upload = matches!(scenario, Scenario::AmbiguousUpload);
-            let mut ambiguous_publish = matches!(scenario, Scenario::AmbiguousPublish);
-            while !server_done.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::yield_now();
-                        continue;
-                    }
-                    Err(error) => panic!("fake API accept failed: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                let bytes = request_bytes(&mut stream);
-                if bytes.is_empty() {
-                    continue;
-                }
-                let request = String::from_utf8_lossy(&bytes);
-                let first = request.lines().next().unwrap_or_default().to_owned();
-                server_requests.lock().unwrap().push(request.to_string());
-                let path = first.split_whitespace().nth(1).unwrap_or_default();
-                if path.ends_with("/immutable-releases") {
-                    respond(&mut stream, "200 OK", "{\"enabled\":true}");
-                } else if path.contains("/git/ref/heads/release") {
-                    let branch_sha = if matches!(scenario, Scenario::MovedBranch) {
-                        "9".repeat(40)
-                    } else {
-                        server_plan.resolution.candidate_sha.clone()
-                    };
-                    let body = format!(
-                        "{{\"node_id\":\"n\",\"object\":{{\"sha\":\"{}\",\"type\":\"commit\",\"url\":\"u\"}},\"ref\":\"refs/heads/release\",\"url\":\"u\"}}",
-                        branch_sha
-                    );
-                    respond(&mut stream, "200 OK", &body);
-                } else if path.contains("/git/ref/tags/") {
-                    if matches!(scenario, Scenario::ConcurrentTag)
-                        || release.as_ref().is_some_and(|value| !value.draft)
-                    {
-                        let body = format!(
-                            "{{\"node_id\":\"n\",\"object\":{{\"sha\":\"{}\",\"type\":\"commit\",\"url\":\"u\"}},\"ref\":\"refs/tags/{}\",\"url\":\"u\"}}",
-                            server_plan.resolution.candidate_sha, server_plan.tag
-                        );
-                        respond(&mut stream, "200 OK", &body);
-                    } else {
-                        respond(&mut stream, "404 Not Found", "{}");
-                    }
-                } else if first.starts_with("GET ") && path.contains("/releases?per_page") {
-                    let body = release.as_ref().map_or_else(
-                        || "[]".to_owned(),
-                        |value| {
-                            format!("[{}]", fake_release_json(&server_plan, value, &upload_url))
-                        },
-                    );
-                    respond(&mut stream, "200 OK", &body);
-                } else if first.starts_with("GET ") && path.contains("/releases/tags/") {
-                    if let Some(value) = release.as_ref().filter(|value| !value.draft) {
-                        respond(
-                            &mut stream,
-                            "200 OK",
-                            &fake_release_json(&server_plan, value, &upload_url),
-                        );
-                    } else {
-                        respond(&mut stream, "404 Not Found", "{}");
-                    }
-                } else if first.starts_with("POST ") && path.ends_with("/releases") {
-                    release = Some(FakeRelease {
-                        draft: true,
-                        immutable: false,
-                        body: marker.clone(),
-                        target: server_plan.resolution.candidate_sha.clone(),
-                        assets: BTreeMap::new(),
-                    });
-                    if ambiguous_create {
-                        ambiguous_create = false;
-                    } else {
-                        respond(
-                            &mut stream,
-                            "201 Created",
-                            &fake_release_json(
-                                &server_plan,
-                                release.as_ref().unwrap(),
-                                &upload_url,
-                            ),
-                        );
-                    }
-                } else if first.starts_with("DELETE ") && path.contains("/releases/assets/") {
-                    let id = path.rsplit('/').next().unwrap().parse::<u64>().unwrap();
-                    release
-                        .as_mut()
-                        .unwrap()
-                        .assets
-                        .retain(|_, asset| asset.0 != id);
-                    respond(&mut stream, "204 No Content", "");
-                } else if first.starts_with("DELETE ") && path.ends_with("/releases/7") {
-                    release = None;
-                    if ambiguous_delete {
-                        ambiguous_delete = false;
-                    } else {
-                        respond(&mut stream, "204 No Content", "");
-                    }
-                } else if first.starts_with("POST ") && path.starts_with("/upload?name=") {
-                    let name = path.strip_prefix("/upload?name=").unwrap().to_owned();
-                    let (size, digest) = server_local.get(&name).unwrap();
-                    release
-                        .as_mut()
-                        .unwrap()
-                        .assets
-                        .insert(name.clone(), (next_asset, *size, digest.clone()));
-                    let body = format!(
-                        "{{\"digest\":\"sha256:{digest}\",\"id\":{next_asset},\"name\":\"{name}\",\"size\":{size}}}"
-                    );
-                    next_asset += 1;
-                    if ambiguous_upload {
-                        ambiguous_upload = false;
-                    } else {
-                        respond(&mut stream, "201 Created", &body);
-                    }
-                } else if first.starts_with("PATCH ") && path.ends_with("/releases/7") {
-                    let current = release.as_mut().unwrap();
-                    current.draft = false;
-                    current.immutable = true;
-                    current.body = published_body.clone();
-                    if ambiguous_publish {
-                        ambiguous_publish = false;
-                    } else {
-                        respond(
-                            &mut stream,
-                            "200 OK",
-                            &fake_release_json(&server_plan, current, &upload_url),
-                        );
-                    }
-                } else {
-                    panic!("unexpected fake API request: {first}");
-                }
-            }
+            serve_fake_publisher(&listener, &server_done, &server_requests, fake_server);
         });
         let client = GitHubClient::for_test(address);
         let report = input.join("publication.json");

@@ -32,10 +32,12 @@ use hell_testkit::{
     representative_differential_sample, sha256_bytes, sha256_file, verify_executable,
 };
 
-use crate::command::{CommandSpec, release_candidate_target};
+use crate::command::{CommandSpec, NativeProcessSpec, NativeStdio, release_candidate_target};
 use crate::compatibility;
 use crate::identity::require_git_sha;
 use crate::json::{JsonValue, canonical_json_bytes};
+#[cfg(windows)]
+use crate::process_environment::{ProcessEnvironment, StandardVariable};
 use crate::report::{ActivePhaseAttribution, Report};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,15 +47,15 @@ pub(crate) enum FailureKind {
     Fixture,
 }
 
-const WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_secs(90 * 60);
-const NIGHTLY_WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const NIGHTLY_CORE_DATA_TEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_mins(90);
+const NIGHTLY_WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_hours(1);
+const NIGHTLY_CORE_DATA_TEST_TIMEOUT: Duration = Duration::from_mins(30);
 #[cfg(target_os = "macos")]
-const NIGHTLY_MACOS_BROAD_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+const NIGHTLY_MACOS_BROAD_WORKSPACE_TIMEOUT: Duration = Duration::from_mins(40);
 #[cfg(target_os = "macos")]
-const NIGHTLY_MACOS_STAGED_NATIVE_TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-const NIGHTLY_COMMAND_CLEANUP_RESERVE: Duration = Duration::from_secs(5 * 60);
-const NIGHTLY_REPORT_RESERVE: Duration = Duration::from_secs(60);
+const NIGHTLY_MACOS_STAGED_NATIVE_TOOLCHAIN_TIMEOUT: Duration = Duration::from_mins(20);
+const NIGHTLY_COMMAND_CLEANUP_RESERVE: Duration = Duration::from_mins(5);
+const NIGHTLY_REPORT_RESERVE: Duration = Duration::from_mins(1);
 #[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_START_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(unix, windows))]
@@ -83,11 +85,11 @@ const NIGHTLY_CORE_DATA_TEST: &str =
     "core_data_obligations_round_trip_through_the_production_bundle_gate";
 const NIGHTLY_CORE_DATA_TEST_TARGET: &str = "core_data_production_bundle";
 #[cfg(windows)]
-const WINDOWS_PARALLEL_WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+const WINDOWS_PARALLEL_WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_mins(40);
 #[cfg(windows)]
-const WINDOWS_HELL_TESTKIT_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const PORTABILITY_SUITE_TIMEOUT: Duration = Duration::from_secs(40 * 60);
-const PORTABILITY_CLEANUP_RESERVE: Duration = Duration::from_secs(5 * 60);
+const WINDOWS_HELL_TESTKIT_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_mins(5);
+const PORTABILITY_SUITE_TIMEOUT: Duration = Duration::from_mins(40);
+const PORTABILITY_CLEANUP_RESERVE: Duration = Duration::from_mins(5);
 const PORTABILITY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const PORTABILITY_PROGRESS_DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 const PORTABILITY_PROGRESS_QUEUE_CAPACITY: usize = 64;
@@ -175,6 +177,10 @@ enum PortabilityWorkerOutcome<T> {
     ReceiptDisconnected,
     Panicked,
 }
+
+type AttributedCommandResult =
+    Result<crate::command::CommandResult, crate::command::CommandRunError>;
+type AttributedCommandOutcome = PortabilityWorkerOutcome<AttributedCommandResult>;
 
 enum AttributedWorkerTerminal {
     Complete(Result<crate::command::CommandResult, crate::command::CommandRunError>),
@@ -286,16 +292,13 @@ fn attributed_worker_sender() -> Result<mpsc::Sender<AttributedWorkerTask>, Stri
                                     progress,
                                 )
                             }));
-                        match outcome {
-                            Ok(result) => {
-                                let _ = terminal_sender
-                                    .send(AttributedWorkerTerminal::Complete(result));
-                                receipt.finish(AttributedWorkerState::Completed);
-                            }
-                            Err(_) => {
-                                let _ = terminal_sender.send(AttributedWorkerTerminal::Panicked);
-                                receipt.finish(AttributedWorkerState::Panicked);
-                            }
+                        if let Ok(result) = outcome {
+                            let _ =
+                                terminal_sender.send(AttributedWorkerTerminal::Complete(result));
+                            receipt.finish(AttributedWorkerState::Completed);
+                        } else {
+                            let _ = terminal_sender.send(AttributedWorkerTerminal::Panicked);
+                            receipt.finish(AttributedWorkerState::Panicked);
                         }
                     }
                 })
@@ -348,15 +351,12 @@ fn macos_staged_worker_sender() -> Result<mpsc::Sender<MacosStagedWorkerTask>, S
                         let _permit = permit;
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
-                        match outcome {
-                            Ok(result) => {
-                                receipt.finish(AttributedWorkerState::Completed);
-                                let _ = terminal.send(result);
-                            }
-                            Err(_) => {
-                                receipt.finish(AttributedWorkerState::Panicked);
-                                drop(terminal);
-                            }
+                        if let Ok(result) = outcome {
+                            receipt.finish(AttributedWorkerState::Completed);
+                            let _ = terminal.send(result);
+                        } else {
+                            receipt.finish(AttributedWorkerState::Panicked);
+                            drop(terminal);
                         }
                     }
                 })
@@ -371,7 +371,7 @@ fn macos_staged_worker_sender() -> Result<mpsc::Sender<MacosStagedWorkerTask>, S
 
 #[derive(Clone, Copy)]
 struct SupervisionEnvelope {
-    execution_deadline: Instant,
+    execution: Instant,
     child_completion_deadline: Instant,
     report_completion_deadline: Instant,
 }
@@ -639,10 +639,7 @@ fn windows_write_restricted_supervisor_command(
     let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = if spec.clear_environment {
         Vec::new()
     } else {
-        hell_testkit::RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
-            .iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
-            .collect()
+        ProcessEnvironment::from_process().release_child_entries()
     };
     for (name, value) in spec.environment {
         if let Some(index) = environment
@@ -660,7 +657,9 @@ fn windows_write_restricted_supervisor_command(
             .as_deref()
             .and_then(Path::parent)
             .ok_or_else(|| "imported Windows rustc has no staged bin".to_owned())?;
-        let system_root = std::env::var_os("SystemRoot")
+        let environment = ProcessEnvironment::from_process();
+        let system_root = environment
+            .value(StandardVariable::SystemRoot)
             .map(PathBuf::from)
             .ok_or_else(|| "Windows SystemRoot is unavailable".to_owned())?;
         let restricted_path = std::env::join_paths([
@@ -725,7 +724,9 @@ pub(crate) fn run_windows_supervisor_icacls(
     arguments: &[&str],
     deadline: Instant,
 ) -> Result<(), String> {
-    let system_root = std::env::var_os("SystemRoot")
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
         .ok_or_else(|| "standard Windows SystemRoot is unavailable".to_owned())?;
     let system32 = fs::canonicalize(PathBuf::from(system_root).join("System32"))
         .map_err(|error| format!("cannot canonicalize Windows System32: {error}"))?;
@@ -880,20 +881,15 @@ impl ExternalSupervisorFixtureControl {
 
 #[cfg(any(unix, windows))]
 struct ExternalSupervisorTerminal {
-    success: bool,
-    timed_out: bool,
+    execution: ExternalSupervisorExecutionState,
     exit_code: Option<i32>,
     stdout_bytes: u64,
     stdout_sha256: Digest,
-    stdout_truncated: bool,
     stderr_bytes: u64,
     stderr_sha256: Digest,
-    stderr_truncated: bool,
-    capture_available: bool,
-    cleanup_terminal: bool,
+    capture: ExternalSupervisorCaptureState,
+    cleanup: ExternalSupervisorCleanupState,
     cleanup_id: Option<u64>,
-    termination_requested: bool,
-    leader_reaped: bool,
     candidate_quiescence_complete: bool,
     cleanup_state: String,
     cleanup_error: Option<String>,
@@ -904,6 +900,26 @@ struct ExternalSupervisorTerminal {
     failed_case_unavailable: Option<String>,
     dropped_chunks: u64,
     dropped_bytes: u64,
+}
+
+#[cfg(any(unix, windows))]
+struct ExternalSupervisorExecutionState {
+    success: bool,
+    timed_out: bool,
+}
+
+#[cfg(any(unix, windows))]
+struct ExternalSupervisorCaptureState {
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    available: bool,
+}
+
+#[cfg(any(unix, windows))]
+struct ExternalSupervisorCleanupState {
+    terminal: bool,
+    termination_requested: bool,
+    leader_reaped: bool,
 }
 
 #[cfg(unix)]
@@ -1118,7 +1134,7 @@ impl SupervisionEnvelope {
             );
         }
         Ok(Self {
-            execution_deadline,
+            execution: execution_deadline,
             child_completion_deadline,
             report_completion_deadline,
         })
@@ -1567,11 +1583,18 @@ fn sanitize_portability_attribution(value: &str) -> String {
 /// Returns an error if child work can consume the suite cleanup/report reserve.
 #[doc(hidden)]
 pub fn verify_portability_timeout_policy_for_integration() -> Result<(), String> {
-    if PORTABILITY_SUITE_TIMEOUT != Duration::from_secs(40 * 60)
-        || PORTABILITY_CLEANUP_RESERVE != Duration::from_secs(5 * 60)
+    verify_portability_partition_policy()?;
+    verify_portability_checkpoint_lifecycle()?;
+    verify_portability_attribution_contract()?;
+    verify_portability_worker_capacity()
+}
+
+fn verify_portability_partition_policy() -> Result<(), String> {
+    if PORTABILITY_SUITE_TIMEOUT != Duration::from_mins(40)
+        || PORTABILITY_CLEANUP_RESERVE != Duration::from_mins(5)
         || PORTABILITY_PROGRESS_INTERVAL != Duration::from_secs(30)
         || PORTABILITY_SUITE_TIMEOUT.checked_sub(PORTABILITY_CLEANUP_RESERVE)
-            != Some(Duration::from_secs(35 * 60))
+            != Some(Duration::from_mins(35))
         || PORTABILITY_PROGRESS_INTERVAL >= PORTABILITY_CLEANUP_RESERVE
     {
         return Err("portability deadline policy no longer preserves its exact reserve".to_owned());
@@ -1596,6 +1619,10 @@ pub fn verify_portability_timeout_policy_for_integration() -> Result<(), String>
     }
     #[cfg(target_os = "macos")]
     verify_macos_staged_native_partition_for_integration()?;
+    Ok(())
+}
+
+fn verify_portability_checkpoint_lifecycle() -> Result<(), String> {
     let checkpoint = std::env::temp_dir().join(format!(
         "hell-portability-timeout-policy-{}.json",
         std::process::id()
@@ -1638,7 +1665,7 @@ pub fn verify_portability_timeout_policy_for_integration() -> Result<(), String>
     {
         let now = Instant::now();
         let deadline = now
-            .checked_add(Duration::from_secs(60))
+            .checked_add(Duration::from_mins(1))
             .ok_or_else(|| "macOS partition checkpoint deadline overflowed".to_owned())?;
         checkpoint_macos_staged_native_transition(
             &mut report,
@@ -1676,6 +1703,10 @@ pub fn verify_portability_timeout_policy_for_integration() -> Result<(), String>
     }
     fs::remove_file(checkpoint)
         .map_err(|error| format!("cannot remove portability checkpoint fixture: {error}"))?;
+    Ok(())
+}
+
+fn verify_portability_attribution_contract() -> Result<(), String> {
     let launched = std::cell::Cell::new(false);
     let expired = Instant::now();
     if run_before_portability_deadline(expired, "expired-fixture", || {
@@ -1761,6 +1792,10 @@ pub fn verify_portability_timeout_policy_for_integration() -> Result<(), String>
     {
         return Err("terminal attribution lost its enclosing phase provenance".to_owned());
     }
+    Ok(())
+}
+
+fn verify_portability_worker_capacity() -> Result<(), String> {
     let permits = (0..4)
         .map(|_| PortabilityWorkerPermit::acquire())
         .collect::<Result<Vec<_>, _>>()?;
@@ -1824,9 +1859,10 @@ const PORTABILITY_SUPERVISION_COMPLETION_TIMEOUT: Duration = Duration::from_secs
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn verify_portability_supervision_for_integration() -> Result<(), String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(10_000);
+
     hell_testkit::verify_supervised_progress_loss_for_integration()
         .map_err(|error| format!("deterministic progress loss verification failed: {error}"))?;
-    static SEQUENCE: AtomicU64 = AtomicU64::new(10_000);
     let first = SEQUENCE.fetch_add(64, Ordering::Relaxed);
     let fixture = NightlyFixtureRoot::create(first)?;
     let primary = (|| {
@@ -1938,8 +1974,8 @@ pub(crate) fn run_portability_supervision_fixture(arguments: &[std::ffi::OsStrin
     let executable = std::env::current_exe().unwrap_or_else(|error| {
         panic!("cannot resolve portability descendant executable: {error}")
     });
-    let mut descendant = std::process::Command::new(executable)
-        .arg("__portability-supervision-descendant")
+    let mut descendant = NativeProcessSpec::new(executable)
+        .argument("__portability-supervision-descendant")
         .spawn()
         .unwrap_or_else(|error| panic!("cannot spawn portability descendant: {error}"));
     fs::write(receipt, format!("{}\n", descendant.id()))
@@ -1970,13 +2006,18 @@ pub(crate) fn run_portability_supervision_descendant() -> ! {
 
 pub(crate) fn verify_nightly_workspace_partition_for_integration() -> Result<(), String> {
     let workspace_arguments = nightly_workspace_test_arguments();
+    verify_nightly_partition_arguments(&workspace_arguments)?;
+    verify_nightly_partition_envelopes()
+}
+
+fn verify_nightly_partition_arguments(workspace_arguments: &[&str]) -> Result<(), String> {
     if NIGHTLY_WORKSPACE_TEST_TIMEOUT.checked_add(NIGHTLY_CORE_DATA_TEST_TIMEOUT)
         != Some(WORKSPACE_TEST_TIMEOUT)
-        || NIGHTLY_COMMAND_CLEANUP_RESERVE != Duration::from_secs(5 * 60)
+        || NIGHTLY_COMMAND_CLEANUP_RESERVE != Duration::from_mins(5)
         || NIGHTLY_WORKSPACE_TEST_TIMEOUT.checked_sub(NIGHTLY_COMMAND_CLEANUP_RESERVE)
-            != Some(Duration::from_secs(55 * 60))
+            != Some(Duration::from_mins(55))
         || NIGHTLY_CORE_DATA_TEST_TIMEOUT.checked_sub(NIGHTLY_COMMAND_CLEANUP_RESERVE)
-            != Some(Duration::from_secs(25 * 60))
+            != Some(Duration::from_mins(25))
         || NIGHTLY_CORE_DATA_TEST
             != "core_data_obligations_round_trip_through_the_production_bundle_gate"
         || NIGHTLY_CORE_DATA_TEST_TARGET != "core_data_production_bundle"
@@ -2014,6 +2055,10 @@ pub(crate) fn verify_nightly_workspace_partition_for_integration() -> Result<(),
             );
         }
     }
+    Ok(())
+}
+
+fn verify_nightly_partition_envelopes() -> Result<(), String> {
     let now = Instant::now();
     let outer = now
         .checked_add(WORKSPACE_TEST_TIMEOUT)
@@ -2058,14 +2103,14 @@ pub(crate) fn verify_nightly_workspace_partition_for_integration() -> Result<(),
     #[cfg(target_os = "macos")]
     let macos_staged_invalid = macos_broad.report_completion_deadline != macos_staged_started
         || macos_staged.report_completion_deadline != workspace.report_completion_deadline
-        || macos_broad.execution_deadline >= macos_broad.child_completion_deadline
+        || macos_broad.execution >= macos_broad.child_completion_deadline
         || macos_broad.child_completion_deadline >= macos_broad.report_completion_deadline
-        || macos_staged.execution_deadline >= macos_staged.child_completion_deadline
+        || macos_staged.execution >= macos_staged.child_completion_deadline
         || macos_staged.child_completion_deadline >= macos_staged.report_completion_deadline;
     #[cfg(not(target_os = "macos"))]
     let macos_staged_invalid = false;
     if workspace.report_completion_deadline != core_started
-        || workspace.execution_deadline
+        || workspace.execution
             != workspace
                 .report_completion_deadline
                 .checked_sub(NIGHTLY_COMMAND_CLEANUP_RESERVE)
@@ -2076,7 +2121,7 @@ pub(crate) fn verify_nightly_workspace_partition_for_integration() -> Result<(),
                 .checked_sub(NIGHTLY_REPORT_RESERVE)
                 .ok_or_else(|| "nightly verifier workspace report reserve underflowed".to_owned())?
         || core.report_completion_deadline != outer
-        || core.execution_deadline
+        || core.execution
             != outer
                 .checked_sub(NIGHTLY_COMMAND_CLEANUP_RESERVE)
                 .ok_or_else(|| "nightly verifier core reserve underflowed".to_owned())?
@@ -2084,9 +2129,9 @@ pub(crate) fn verify_nightly_workspace_partition_for_integration() -> Result<(),
             != outer
                 .checked_sub(NIGHTLY_REPORT_RESERVE)
                 .ok_or_else(|| "nightly verifier core report reserve underflowed".to_owned())?
-        || workspace.execution_deadline >= workspace.child_completion_deadline
+        || workspace.execution >= workspace.child_completion_deadline
         || workspace.child_completion_deadline >= workspace.report_completion_deadline
-        || core.execution_deadline >= core.child_completion_deadline
+        || core.execution >= core.child_completion_deadline
         || core.child_completion_deadline >= core.report_completion_deadline
         || macos_staged_invalid
         || SupervisionEnvelope::within(
@@ -2116,6 +2161,15 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
         Duration::from_secs(2),
         outer,
     )?;
+    verify_nightly_failed_case_terminal(started, envelope)?;
+    verify_nightly_missing_case_attribution(envelope)
+}
+
+#[cfg(unix)]
+fn verify_nightly_failed_case_terminal(
+    started: Instant,
+    envelope: SupervisionEnvelope,
+) -> Result<(), String> {
     let executable = fs::canonicalize(
         std::env::current_exe()
             .map_err(|error| format!("cannot locate failed-case fixture child: {error}"))?,
@@ -2123,9 +2177,7 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
     .map_err(|error| format!("cannot canonicalize failed-case fixture child: {error}"))?;
     let spec = CommandSpec::new(
         executable,
-        envelope
-            .execution_deadline
-            .saturating_duration_since(Instant::now()),
+        envelope.execution.saturating_duration_since(Instant::now()),
     )
     .argument("__nightly-failed-case-child");
     let (result, progress, loss) = execute_external_supervisor_command(
@@ -2141,7 +2193,7 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
         loss,
         envelope.report_completion_deadline,
     );
-    if terminal.success || terminal.timed_out || terminal.exit_code != Some(1) {
+    if terminal.execution.success || terminal.execution.timed_out || terminal.exit_code != Some(1) {
         return Err("nightly failed-case fixture did not produce bounded status 1".to_owned());
     }
     let failed = terminal
@@ -2201,11 +2253,14 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
     {
         return Err("nightly report omitted causal failed-case evidence".to_owned());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_nightly_missing_case_attribution(envelope: SupervisionEnvelope) -> Result<(), String> {
     let silent_spec = CommandSpec::new(
         "/usr/bin/false",
-        envelope
-            .execution_deadline
-            .saturating_duration_since(Instant::now()),
+        envelope.execution.saturating_duration_since(Instant::now()),
     );
     let (silent_result, silent_progress, silent_loss) = execute_external_supervisor_command(
         silent_spec,
@@ -2220,7 +2275,7 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
         silent_loss,
         envelope.report_completion_deadline,
     );
-    if silent_terminal.success
+    if silent_terminal.execution.success
         || silent_terminal.failed_case.is_some()
         || silent_terminal.failed_case_unavailable.as_deref() != Some("no-failed-case-observed")
         || !silent_terminal
@@ -2258,39 +2313,17 @@ pub(crate) fn run_nightly_failed_case_child() {
 
 #[cfg(unix)]
 pub(crate) fn verify_nightly_attributed_supervision_for_integration() -> Result<(), String> {
-    hell_testkit::verify_supervised_progress_loss_for_integration()
-        .map_err(|error| format!("deterministic progress loss verification failed: {error}"))?;
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const CANDIDATES: u64 = 64;
+
+    hell_testkit::verify_supervised_progress_loss_for_integration()
+        .map_err(|error| format!("deterministic progress loss verification failed: {error}"))?;
     let first = SEQUENCE.fetch_add(CANDIDATES + 1, Ordering::Relaxed);
-    let parent = fs::canonicalize(std::env::temp_dir())
-        .map_err(|error| format!("cannot canonicalize nightly collision parent: {error}"))?;
-    let collision = parent.join(format!(
-        "hell-nightly-supervision-{}-{first}",
-        std::process::id()
-    ));
-    fs::create_dir(&collision)
-        .map_err(|error| format!("cannot create nightly collision fixture: {error}"))?;
-    let collision_root = fs::File::open(&collision)
-        .map_err(|error| format!("cannot retain nightly collision root: {error}"))?;
-    let collision_identity = collision_root
-        .metadata()
-        .map_err(|error| format!("cannot bind nightly collision root: {error}"))?;
-    let collision_marker = collision.join("preserve");
-    let collision_marker_handle = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&collision_marker)
-        .map_err(|error| format!("cannot create nightly collision marker: {error}"))?;
-    let collision_marker_identity = collision_marker_handle
-        .metadata()
-        .map_err(|error| format!("cannot bind nightly collision marker: {error}"))?;
+    let collision = NightlyCollisionFixture::create(first)?;
     let fixture = match NightlyFixtureRoot::create(first) {
         Ok(fixture) => fixture,
         Err(primary) => {
-            let cleanup = fs::remove_file(&collision_marker)
-                .and_then(|()| fs::remove_dir(&collision))
-                .map_err(|error| format!("cannot remove nightly collision fixture: {error}"));
+            let (_, cleanup) = collision.finish();
             return match cleanup {
                 Ok(()) => Err(primary),
                 Err(cleanup) => Err(format!("{primary}; cleanup also failed: {cleanup}")),
@@ -2323,7 +2356,7 @@ pub(crate) fn verify_nightly_attributed_supervision_for_integration() -> Result<
                 suite: "nightly-workspace-tests",
                 suite_started: started,
                 envelope: SupervisionEnvelope {
-                    execution_deadline,
+                    execution: execution_deadline,
                     child_completion_deadline,
                     report_completion_deadline,
                 },
@@ -2344,144 +2377,12 @@ pub(crate) fn verify_nightly_attributed_supervision_for_integration() -> Result<
                 "nightly production runner did not retain its cleanup/report reserve".to_owned(),
             );
         }
-        let durable = fs::read_to_string(&checkpoint)
-            .map_err(|error| format!("cannot read nightly durable checkpoint: {error}"))?;
-        for required in [
-            "nightly-workspace-tests-terminal-attribution",
-            "nightly-workspace-tests-terminal-capture",
-            "nightly-workspace-tests-worker-receipt",
-            "timed-out-cleaned",
-            "hell-testkit-lib",
-            "blocked-case",
-            "cleanupReceiptId",
-            "cleanupState\":\"completed",
-            "lifecycleIdle\":true",
-            "workerState\":\"completed",
-            "terminationReaped",
-            "processGroupTerminationRequested",
-            "leaderReaped",
-            "candidateQuiescenceComplete\":false",
-            "stdoutSha256",
-            "stderrSha256",
-            "stdoutTruncated",
-            "droppedChunks",
-            "droppedBytes",
-            "blocked-without-newline",
-            "subphase\":\"terminal",
-        ] {
-            if !durable.contains(required) {
-                return Err(format!(
-                    "nightly durable checkpoint omitted required typed field {required}"
-                ));
-            }
-        }
-        let descendant = fs::read_to_string(&receipt)
-            .map_err(|error| format!("cannot read nightly descendant receipt: {error}"))?;
-        let descendant = descendant
-            .strip_suffix('\n')
-            .ok_or_else(|| "nightly descendant receipt lacks its delimiter".to_owned())?;
-        if descendant.is_empty() || !descendant.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("nightly descendant receipt is not one decimal PID".to_owned());
-        }
-        let now = Instant::now();
-        let probe_deadline = now
-            .checked_add(Duration::from_millis(250))
-            .unwrap_or(report_completion_deadline)
-            .min(report_completion_deadline);
-        let (progress, _receiver) = SupervisedProgressObserver::bounded(1);
-        let probe = CommandSpec::new("/bin/ps", Duration::from_millis(250))
-            .arguments(["-p", descendant, "-o", "pid=,ppid=,stat="])
-            .run_until(probe_deadline, report_completion_deadline, progress)
-            .map_err(|error| format!("cannot probe nightly descendant: {error}"))?;
-        hell_testkit::wait_for_posix_uid_process_quiescence(
-            probe_deadline,
-            hell_testkit::PosixUidQuiescenceGoal::NoLiveProcesses,
-            || {
-                hell_testkit::parse_posix_uid_process_snapshot(
-                    probe.status.code(),
-                    &probe.stdout,
-                    &probe.stderr,
-                )
-            },
-            || {
-                Err(std::io::Error::other(
-                    "nightly descendant remained live after supervised tree termination",
-                ))
-            },
-            || {
-                Err(std::io::Error::other(
-                    "nightly verifier must not signal after typed cleanup",
-                ))
-            },
-        )
-        .map_err(|error| format!("nightly descendant did not reach no-live state: {error}"))?;
-        let permits = (0..4)
-            .map(|_| PortabilityWorkerPermit::acquire())
-            .collect::<Result<Vec<_>, _>>()?;
-        let rejected_started = Instant::now();
-        let rejected_execution = rejected_started
-            .checked_add(Duration::from_secs(1))
-            .ok_or_else(|| "nightly capacity execution deadline overflowed".to_owned())?;
-        let rejected_cleanup = rejected_started
-            .checked_add(Duration::from_secs(2))
-            .ok_or_else(|| "nightly capacity cleanup deadline overflowed".to_owned())?;
-        let rejected_report = rejected_started
-            .checked_add(Duration::from_secs(3))
-            .ok_or_else(|| "nightly capacity report deadline overflowed".to_owned())?;
-        let mut rejected = Report::new("nightly-capacity-verifier");
-        let launch_marker = fixture.path.join("capacity-launch.pid");
-        let rejected_outcome = run_attributed_command(
-            &mut rejected,
-            AttributedRunContext {
-                name: "nightly-capacity",
-                suite: "nightly-workspace-tests",
-                suite_started: rejected_started,
-                envelope: SupervisionEnvelope {
-                    execution_deadline: rejected_execution,
-                    child_completion_deadline: rejected_cleanup,
-                    report_completion_deadline: rejected_report,
-                },
-            },
-            Some(("workspace-all-targets", "capacity-rejection", "prelaunch")),
-            |timeout| {
-                CommandSpec::new(&executable, timeout)
-                    .argument("__portability-supervision-fixture")
-                    .argument(launch_marker.as_os_str())
-            },
-        );
-        drop(permits);
-        if rejected_outcome != Err(FailureKind::Child)
-            || !rejected.to_json().contains("launch-failed")
-            || !rejected.to_json().contains("captureState\":\"unavailable")
-            || launch_marker.exists()
-        {
-            return Err(
-                "nightly production runner did not reject exhausted capacity before launch"
-                    .to_owned(),
-            );
-        }
-        Ok(())
+        verify_nightly_checkpoint_fields(&checkpoint)?;
+        verify_nightly_descendant_quiescence(&receipt, report_completion_deadline)?;
+        verify_nightly_capacity_rejection(&fixture, &executable)
     })();
     let cleanup = fixture.close();
-    let collision_path_identity = fs::symlink_metadata(&collision);
-    let collision_marker_path_identity = fs::symlink_metadata(&collision_marker);
-    let collision_preserved = collision_path_identity.is_ok_and(|metadata| {
-        metadata.file_type().is_dir()
-            && !metadata.file_type().is_symlink()
-            && (metadata.dev(), metadata.ino())
-                == (collision_identity.dev(), collision_identity.ino())
-    }) && collision_marker_path_identity.is_ok_and(|metadata| {
-        metadata.file_type().is_file()
-            && !metadata.file_type().is_symlink()
-            && (metadata.dev(), metadata.ino())
-                == (
-                    collision_marker_identity.dev(),
-                    collision_marker_identity.ino(),
-                )
-    });
-    let collision_cleanup = fs::remove_file(&collision_marker)
-        .and_then(|()| fs::remove_dir(&collision))
-        .map_err(|error| format!("cannot remove owned nightly collision fixture: {error}"));
+    let (collision_preserved, collision_cleanup) = collision.finish();
     let result = if collision_preserved {
         result
     } else {
@@ -2495,6 +2396,210 @@ pub(crate) fn verify_nightly_attributed_supervision_for_integration() -> Result<
             "nightly supervision verification/cleanup failed: primary={primary:?}; root={cleanup:?}; collision={collision_cleanup:?}"
         )),
     }
+}
+
+#[cfg(unix)]
+fn verify_nightly_checkpoint_fields(checkpoint: &Path) -> Result<(), String> {
+    let durable = fs::read_to_string(checkpoint)
+        .map_err(|error| format!("cannot read nightly durable checkpoint: {error}"))?;
+    for required in [
+        "nightly-workspace-tests-terminal-attribution",
+        "nightly-workspace-tests-terminal-capture",
+        "nightly-workspace-tests-worker-receipt",
+        "timed-out-cleaned",
+        "hell-testkit-lib",
+        "blocked-case",
+        "cleanupReceiptId",
+        "cleanupState\":\"completed",
+        "lifecycleIdle\":true",
+        "workerState\":\"completed",
+        "terminationReaped",
+        "processGroupTerminationRequested",
+        "leaderReaped",
+        "candidateQuiescenceComplete\":false",
+        "stdoutSha256",
+        "stderrSha256",
+        "stdoutTruncated",
+        "droppedChunks",
+        "droppedBytes",
+        "blocked-without-newline",
+        "subphase\":\"terminal",
+    ] {
+        if !durable.contains(required) {
+            return Err(format!(
+                "nightly durable checkpoint omitted required typed field {required}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct NightlyCollisionFixture {
+    path: PathBuf,
+    marker: PathBuf,
+    root_handle: fs::File,
+    marker_handle: fs::File,
+    root_identity: fs::Metadata,
+    marker_identity: fs::Metadata,
+}
+
+#[cfg(unix)]
+impl NightlyCollisionFixture {
+    fn create(sequence: u64) -> Result<Self, String> {
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .map_err(|error| format!("cannot canonicalize nightly collision parent: {error}"))?;
+        let path = parent.join(format!(
+            "hell-nightly-supervision-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)
+            .map_err(|error| format!("cannot create nightly collision fixture: {error}"))?;
+        let root_handle = fs::File::open(&path)
+            .map_err(|error| format!("cannot retain nightly collision root: {error}"))?;
+        let root_identity = root_handle
+            .metadata()
+            .map_err(|error| format!("cannot bind nightly collision root: {error}"))?;
+        let marker = path.join("preserve");
+        let marker_handle = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .map_err(|error| format!("cannot create nightly collision marker: {error}"))?;
+        let marker_identity = marker_handle
+            .metadata()
+            .map_err(|error| format!("cannot bind nightly collision marker: {error}"))?;
+        Ok(Self {
+            path,
+            marker,
+            root_handle,
+            marker_handle,
+            root_identity,
+            marker_identity,
+        })
+    }
+
+    fn finish(self) -> (bool, Result<(), String>) {
+        let path_identity = fs::symlink_metadata(&self.path);
+        let marker_path_identity = fs::symlink_metadata(&self.marker);
+        let preserved = path_identity.is_ok_and(|metadata| {
+            metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink()
+                && (metadata.dev(), metadata.ino())
+                    == (self.root_identity.dev(), self.root_identity.ino())
+        }) && marker_path_identity.is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && (metadata.dev(), metadata.ino())
+                    == (self.marker_identity.dev(), self.marker_identity.ino())
+        });
+        drop(self.marker_handle);
+        drop(self.root_handle);
+        let cleanup = fs::remove_file(&self.marker)
+            .and_then(|()| fs::remove_dir(&self.path))
+            .map_err(|error| format!("cannot remove owned nightly collision fixture: {error}"));
+        (preserved, cleanup)
+    }
+}
+
+#[cfg(unix)]
+fn verify_nightly_descendant_quiescence(
+    receipt: &Path,
+    report_completion_deadline: Instant,
+) -> Result<(), String> {
+    let descendant = fs::read_to_string(receipt)
+        .map_err(|error| format!("cannot read nightly descendant receipt: {error}"))?;
+    let descendant = descendant
+        .strip_suffix('\n')
+        .ok_or_else(|| "nightly descendant receipt lacks its delimiter".to_owned())?;
+    if descendant.is_empty() || !descendant.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("nightly descendant receipt is not one decimal PID".to_owned());
+    }
+    let now = Instant::now();
+    let probe_deadline = now
+        .checked_add(Duration::from_millis(250))
+        .unwrap_or(report_completion_deadline)
+        .min(report_completion_deadline);
+    let (progress, _receiver) = SupervisedProgressObserver::bounded(1);
+    let probe = CommandSpec::new("/bin/ps", Duration::from_millis(250))
+        .arguments(["-p", descendant, "-o", "pid=,ppid=,stat="])
+        .run_until(probe_deadline, report_completion_deadline, progress)
+        .map_err(|error| format!("cannot probe nightly descendant: {error}"))?;
+    hell_testkit::wait_for_posix_uid_process_quiescence(
+        probe_deadline,
+        hell_testkit::PosixUidQuiescenceGoal::NoLiveProcesses,
+        || {
+            hell_testkit::parse_posix_uid_process_snapshot(
+                probe.status.code(),
+                &probe.stdout,
+                &probe.stderr,
+            )
+        },
+        || {
+            Err(std::io::Error::other(
+                "nightly descendant remained live after supervised tree termination",
+            ))
+        },
+        || {
+            Err(std::io::Error::other(
+                "nightly verifier must not signal after typed cleanup",
+            ))
+        },
+    )
+    .map_err(|error| format!("nightly descendant did not reach no-live state: {error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_nightly_capacity_rejection(
+    fixture: &NightlyFixtureRoot,
+    executable: &Path,
+) -> Result<(), String> {
+    let permits = (0..4)
+        .map(|_| PortabilityWorkerPermit::acquire())
+        .collect::<Result<Vec<_>, _>>()?;
+    let started = Instant::now();
+    let execution = started
+        .checked_add(Duration::from_secs(1))
+        .ok_or_else(|| "nightly capacity execution deadline overflowed".to_owned())?;
+    let cleanup = started
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| "nightly capacity cleanup deadline overflowed".to_owned())?;
+    let report_deadline = started
+        .checked_add(Duration::from_secs(3))
+        .ok_or_else(|| "nightly capacity report deadline overflowed".to_owned())?;
+    let mut report = Report::new("nightly-capacity-verifier");
+    let launch_marker = fixture.path.join("capacity-launch.pid");
+    let outcome = run_attributed_command(
+        &mut report,
+        AttributedRunContext {
+            name: "nightly-capacity",
+            suite: "nightly-workspace-tests",
+            suite_started: started,
+            envelope: SupervisionEnvelope {
+                execution,
+                child_completion_deadline: cleanup,
+                report_completion_deadline: report_deadline,
+            },
+        },
+        Some(("workspace-all-targets", "capacity-rejection", "prelaunch")),
+        |timeout| {
+            CommandSpec::new(executable, timeout)
+                .argument("__portability-supervision-fixture")
+                .argument(launch_marker.as_os_str())
+        },
+    );
+    drop(permits);
+    if outcome != Err(FailureKind::Child)
+        || !report.to_json().contains("launch-failed")
+        || !report.to_json().contains("captureState\":\"unavailable")
+        || launch_marker.exists()
+    {
+        return Err(
+            "nightly production runner did not reject exhausted capacity before launch".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2515,16 +2620,7 @@ impl NightlyFixtureRoot {
 
     fn create_in(parent_path: &Path, first: u64) -> Result<Self, String> {
         const CANDIDATES: usize = 64;
-        let parent_path = fs::canonicalize(parent_path)
-            .map_err(|error| format!("cannot canonicalize nightly fixture parent: {error}"))?;
-        let parent = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-            .open(&parent_path)
-            .map_err(|error| format!("cannot retain nightly fixture parent: {error}"))?;
-        let parent_metadata = parent
-            .metadata()
-            .map_err(|error| format!("cannot bind nightly fixture parent: {error}"))?;
+        let (parent_path, parent, parent_identity) = nightly_fixture_parent(parent_path)?;
         for offset in 0..CANDIDATES {
             let candidate = first
                 .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
@@ -2547,7 +2643,7 @@ impl NightlyFixtureRoot {
                                 &path,
                                 None,
                                 &parent,
-                                (parent_metadata.dev(), parent_metadata.ino()),
+                                parent_identity,
                             );
                         }
                     };
@@ -2559,7 +2655,7 @@ impl NightlyFixtureRoot {
                                 &path,
                                 None,
                                 &parent,
-                                (parent_metadata.dev(), parent_metadata.ino()),
+                                parent_identity,
                             );
                         }
                     };
@@ -2571,7 +2667,7 @@ impl NightlyFixtureRoot {
                                 &path,
                                 Some((root_metadata.dev(), root_metadata.ino())),
                                 &parent,
-                                (parent_metadata.dev(), parent_metadata.ino()),
+                                parent_identity,
                             );
                         }
                     };
@@ -2586,14 +2682,14 @@ impl NightlyFixtureRoot {
                             &path,
                             Some((root_metadata.dev(), root_metadata.ino())),
                             &parent,
-                            (parent_metadata.dev(), parent_metadata.ino()),
+                            parent_identity,
                         );
                     }
                     let owner = Self {
                         path,
                         parent,
                         root,
-                        parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+                        parent_identity,
                         root_identity: (root_metadata.dev(), root_metadata.ino()),
                         workspace: None,
                     };
@@ -2621,7 +2717,7 @@ impl NightlyFixtureRoot {
         Err("nightly fixture root exhausted its bounded candidate sequence".to_owned())
     }
 
-    fn close(&self) -> Result<(), String> {
+    fn close(self) -> Result<(), String> {
         let deadline = Instant::now()
             .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
             .unwrap_or_else(Instant::now);
@@ -2661,18 +2757,23 @@ impl NightlyFixtureRoot {
                 && name != "terminal.receipt"
             {
                 return Err(format!(
-                    "nightly fixture contains unexpected entry {name:?}"
+                    "nightly fixture contains unexpected entry {}",
+                    name.to_string_lossy()
                 ));
             }
             let metadata = fs::symlink_metadata(child.path())
                 .map_err(|error| format!("cannot bind nightly fixture cleanup entry: {error}"))?;
             if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                 return Err(format!(
-                    "nightly fixture cleanup entry {name:?} is not a file"
+                    "nightly fixture cleanup entry {} is not a file",
+                    name.to_string_lossy()
                 ));
             }
             fs::remove_file(child.path()).map_err(|error| {
-                format!("cannot remove nightly fixture entry {name:?}: {error}")
+                format!(
+                    "cannot remove nightly fixture entry {}: {error}",
+                    name.to_string_lossy()
+                )
             })?;
         }
         self.revalidate()?;
@@ -2776,6 +2877,22 @@ impl NightlyFixtureRoot {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn nightly_fixture_parent(parent_path: &Path) -> Result<(PathBuf, fs::File, (u64, u64)), String> {
+    let path = fs::canonicalize(parent_path)
+        .map_err(|error| format!("cannot canonicalize nightly fixture parent: {error}"))?;
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| format!("cannot retain nightly fixture parent: {error}"))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| format!("cannot bind nightly fixture parent: {error}"))?;
+    let identity = (metadata.dev(), metadata.ino());
+    Ok((path, handle, identity))
 }
 
 #[cfg(unix)]
@@ -3125,7 +3242,7 @@ fn validate_supervisor_handshake_bytes(
     }
     let actual = ExternalSupervisorMessage::from_byte(bytes[0])?;
     if actual != expected
-        || bytes[1..1 + digest_width] != request_sha256.0[..]
+        || bytes[1..=digest_width] != request_sha256.0[..]
         || bytes[1 + digest_width..] != nonce.0[..]
     {
         return Err("nightly supervisor handshake did not match its bound request".to_owned());
@@ -3290,9 +3407,7 @@ fn write_supervisor_budget(
     push_supervisor_u64(
         &mut bytes,
         duration_millis(
-            envelope
-                .execution_deadline
-                .saturating_duration_since(started),
+            envelope.execution.saturating_duration_since(started),
             "execution",
         )?,
     );
@@ -3341,7 +3456,7 @@ fn read_supervisor_budget(
         return Err("nightly supervisor received an unordered budget".to_owned());
     }
     Ok(SupervisionEnvelope {
-        execution_deadline: started
+        execution: started
             .checked_add(execution)
             .ok_or_else(|| "nightly supervisor execution deadline overflowed".to_owned())?,
         child_completion_deadline: started
@@ -3368,21 +3483,7 @@ fn encode_external_supervisor_terminal(
     bytes.push(NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE);
     bytes.extend_from_slice(&request_sha256.0);
     bytes.extend_from_slice(&nonce.0);
-    bytes.push(u8::from(terminal.success));
-    bytes.push(u8::from(terminal.timed_out));
-    bytes.extend_from_slice(&terminal.exit_code.unwrap_or(i32::MIN).to_be_bytes());
-    push_supervisor_u64(&mut bytes, terminal.stdout_bytes);
-    bytes.extend_from_slice(&terminal.stdout_sha256.0);
-    bytes.push(u8::from(terminal.stdout_truncated));
-    push_supervisor_u64(&mut bytes, terminal.stderr_bytes);
-    bytes.extend_from_slice(&terminal.stderr_sha256.0);
-    bytes.push(u8::from(terminal.stderr_truncated));
-    bytes.push(u8::from(terminal.capture_available));
-    bytes.push(u8::from(terminal.cleanup_terminal));
-    push_supervisor_u64(&mut bytes, terminal.cleanup_id.unwrap_or(u64::MAX));
-    bytes.push(u8::from(terminal.termination_requested));
-    bytes.push(u8::from(terminal.leader_reaped));
-    bytes.push(u8::from(terminal.candidate_quiescence_complete));
+    encode_external_supervisor_terminal_fixed(&mut bytes, terminal);
     push_supervisor_optional_text_with_budget(
         &mut bytes,
         Some(&terminal.cleanup_state),
@@ -3408,65 +3509,89 @@ fn encode_external_supervisor_terminal(
         .map_err(|_| "nightly supervisor terminal detail is too long".to_owned())?;
     push_supervisor_u32(&mut bytes, detail_length);
     bytes.extend_from_slice(detail);
-    push_supervisor_u64(&mut bytes, terminal.attribution.sequence);
-    push_supervisor_u64(
-        &mut bytes,
-        encode_external_supervisor_elapsed(terminal.attribution.transition_elapsed),
-    );
-    push_supervisor_optional_text_with_budget(
-        &mut bytes,
-        terminal.attribution.target.as_deref(),
-        &mut text_budget,
-    )?;
-    push_supervisor_optional_text_with_budget(
-        &mut bytes,
-        terminal.attribution.case.as_deref(),
-        &mut text_budget,
-    )?;
-    push_supervisor_optional_text_with_budget(
-        &mut bytes,
-        terminal.attribution.case_state.as_deref(),
-        &mut text_budget,
-    )?;
-    push_supervisor_optional_text_with_budget(
-        &mut bytes,
-        terminal.attribution.subphase.as_deref(),
-        &mut text_budget,
-    )?;
-    bytes.push(u8::from(terminal.failed_case.is_some()));
-    if let Some(failed_case) = &terminal.failed_case {
-        push_supervisor_u64(&mut bytes, failed_case.sequence);
-        push_supervisor_u64(
-            &mut bytes,
-            encode_external_supervisor_elapsed(failed_case.transition_elapsed),
-        );
-        push_supervisor_optional_text_with_budget(
-            &mut bytes,
-            failed_case.target.as_deref(),
-            &mut text_budget,
-        )?;
-        push_supervisor_optional_text_with_budget(
-            &mut bytes,
-            Some(&failed_case.case),
-            &mut text_budget,
-        )?;
-        push_supervisor_optional_text_with_budget(
-            &mut bytes,
-            Some(&failed_case.stream),
-            &mut text_budget,
-        )?;
-    }
-    push_supervisor_optional_text_with_budget(
-        &mut bytes,
-        terminal.failed_case_unavailable.as_deref(),
-        &mut text_budget,
-    )?;
+    encode_external_supervisor_attribution(&mut bytes, terminal, &mut text_budget)?;
     push_supervisor_u64(&mut bytes, terminal.dropped_chunks);
     push_supervisor_u64(&mut bytes, terminal.dropped_bytes);
     if bytes.len() > NIGHTLY_SUPERVISOR_TERMINAL_LIMIT {
         return Err("nightly supervisor terminal receipt exceeds its byte limit".to_owned());
     }
     Ok(bytes)
+}
+
+#[cfg(any(unix, windows))]
+fn encode_external_supervisor_terminal_fixed(
+    bytes: &mut Vec<u8>,
+    terminal: &ExternalSupervisorTerminal,
+) {
+    bytes.push(u8::from(terminal.execution.success));
+    bytes.push(u8::from(terminal.execution.timed_out));
+    bytes.extend_from_slice(&terminal.exit_code.unwrap_or(i32::MIN).to_be_bytes());
+    push_supervisor_u64(bytes, terminal.stdout_bytes);
+    bytes.extend_from_slice(&terminal.stdout_sha256.0);
+    bytes.push(u8::from(terminal.capture.stdout_truncated));
+    push_supervisor_u64(bytes, terminal.stderr_bytes);
+    bytes.extend_from_slice(&terminal.stderr_sha256.0);
+    bytes.push(u8::from(terminal.capture.stderr_truncated));
+    bytes.push(u8::from(terminal.capture.available));
+    bytes.push(u8::from(terminal.cleanup.terminal));
+    push_supervisor_u64(bytes, terminal.cleanup_id.unwrap_or(u64::MAX));
+    bytes.push(u8::from(terminal.cleanup.termination_requested));
+    bytes.push(u8::from(terminal.cleanup.leader_reaped));
+    bytes.push(u8::from(terminal.candidate_quiescence_complete));
+}
+
+#[cfg(any(unix, windows))]
+fn encode_external_supervisor_attribution(
+    bytes: &mut Vec<u8>,
+    terminal: &ExternalSupervisorTerminal,
+    text_budget: &mut usize,
+) -> Result<(), String> {
+    push_supervisor_u64(bytes, terminal.attribution.sequence);
+    push_supervisor_u64(
+        bytes,
+        encode_external_supervisor_elapsed(terminal.attribution.transition_elapsed),
+    );
+    push_supervisor_optional_text_with_budget(
+        bytes,
+        terminal.attribution.target.as_deref(),
+        text_budget,
+    )?;
+    push_supervisor_optional_text_with_budget(
+        bytes,
+        terminal.attribution.case.as_deref(),
+        text_budget,
+    )?;
+    push_supervisor_optional_text_with_budget(
+        bytes,
+        terminal.attribution.case_state.as_deref(),
+        text_budget,
+    )?;
+    push_supervisor_optional_text_with_budget(
+        bytes,
+        terminal.attribution.subphase.as_deref(),
+        text_budget,
+    )?;
+    bytes.push(u8::from(terminal.failed_case.is_some()));
+    if let Some(failed_case) = &terminal.failed_case {
+        push_supervisor_u64(bytes, failed_case.sequence);
+        push_supervisor_u64(
+            bytes,
+            encode_external_supervisor_elapsed(failed_case.transition_elapsed),
+        );
+        push_supervisor_optional_text_with_budget(
+            bytes,
+            failed_case.target.as_deref(),
+            text_budget,
+        )?;
+        push_supervisor_optional_text_with_budget(bytes, Some(&failed_case.case), text_budget)?;
+        push_supervisor_optional_text_with_budget(bytes, Some(&failed_case.stream), text_budget)?;
+    }
+    push_supervisor_optional_text_with_budget(
+        bytes,
+        terminal.failed_case_unavailable.as_deref(),
+        text_budget,
+    )?;
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -3638,20 +3763,7 @@ fn decode_external_supervisor_terminal(
     if bytes.len() > NIGHTLY_SUPERVISOR_TERMINAL_LIMIT {
         return Err("nightly supervisor terminal receipt exceeds its byte limit".to_owned());
     }
-    let mut remaining = bytes;
-    if take_supervisor_bytes(
-        &mut remaining,
-        NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC.len(),
-        "terminal magic",
-    )? != NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC
-        || take_supervisor_bytes(&mut remaining, 1, "terminal message")?[0]
-            != NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE
-        || take_supervisor_bytes(&mut remaining, request_sha256.0.len(), "request digest")?
-            != request_sha256.0
-        || take_supervisor_bytes(&mut remaining, nonce.0.len(), "nonce")? != nonce.0
-    {
-        return Err("nightly supervisor terminal receipt binding differs".to_owned());
-    }
+    let mut remaining = decode_external_supervisor_terminal_binding(bytes, request_sha256, nonce)?;
     let success = take_supervisor_bool(&mut remaining, "success")?;
     let timed_out = take_supervisor_bool(&mut remaining, "timeout")?;
     let raw_code = i32::from_be_bytes(
@@ -3683,21 +3795,7 @@ fn decode_external_supervisor_terminal(
     let cleanup_state = take_supervisor_optional_text(&mut remaining, "cleanup state name")?
         .ok_or_else(|| "nightly supervisor cleanup state name is unavailable".to_owned())?;
     let cleanup_error = take_supervisor_optional_text(&mut remaining, "cleanup error")?;
-    let cleanup_failure_count = usize::try_from(take_supervisor_u32(
-        &mut remaining,
-        "cleanup failure count",
-    )?)
-    .map_err(|_| "nightly supervisor cleanup failure count is not representable".to_owned())?;
-    if cleanup_failure_count > 8 {
-        return Err("nightly supervisor cleanup failure count exceeds its bound".to_owned());
-    }
-    let mut cleanup_failures = Vec::with_capacity(cleanup_failure_count);
-    for _ in 0..cleanup_failure_count {
-        cleanup_failures.push(
-            take_supervisor_optional_text(&mut remaining, "cleanup failure")?
-                .ok_or_else(|| "nightly supervisor cleanup failure is unavailable".to_owned())?,
-        );
-    }
+    let cleanup_failures = decode_external_supervisor_cleanup_failures(&mut remaining)?;
     let detail_length = usize::try_from(take_supervisor_u32(&mut remaining, "detail length")?)
         .map_err(|_| "nightly supervisor detail length is not representable".to_owned())?;
     let detail =
@@ -3713,21 +3811,7 @@ fn decode_external_supervisor_terminal(
         case_state: take_supervisor_optional_text(&mut remaining, "attribution case state")?,
         subphase: take_supervisor_optional_text(&mut remaining, "attribution subphase")?,
     };
-    let failed_case = if take_supervisor_bool(&mut remaining, "failed case availability")? {
-        let sequence = take_supervisor_u64(&mut remaining, "failed case sequence")?;
-        let transition_millis = take_supervisor_u64(&mut remaining, "failed case transition")?;
-        Some(CausalFailedCase {
-            sequence,
-            transition_elapsed: decode_external_supervisor_elapsed(transition_millis),
-            target: take_supervisor_optional_text(&mut remaining, "failed case target")?,
-            case: take_supervisor_optional_text(&mut remaining, "failed case name")?
-                .ok_or_else(|| "nightly supervisor failed case name is unavailable".to_owned())?,
-            stream: take_supervisor_optional_text(&mut remaining, "failed case stream")?
-                .ok_or_else(|| "nightly supervisor failed case stream is unavailable".to_owned())?,
-        })
-    } else {
-        None
-    };
+    let failed_case = decode_external_supervisor_failed_case(&mut remaining)?;
     let failed_case_unavailable =
         take_supervisor_optional_text(&mut remaining, "failed case unavailable reason")?;
     if failed_case
@@ -3742,20 +3826,23 @@ fn decode_external_supervisor_terminal(
         return Err("nightly supervisor terminal receipt has trailing bytes".to_owned());
     }
     Ok(ExternalSupervisorTerminal {
-        success,
-        timed_out,
+        execution: ExternalSupervisorExecutionState { success, timed_out },
         exit_code: (raw_code != i32::MIN).then_some(raw_code),
         stdout_bytes,
         stdout_sha256,
-        stdout_truncated,
         stderr_bytes,
         stderr_sha256,
-        stderr_truncated,
-        capture_available,
-        cleanup_terminal,
+        capture: ExternalSupervisorCaptureState {
+            stdout_truncated,
+            stderr_truncated,
+            available: capture_available,
+        },
+        cleanup: ExternalSupervisorCleanupState {
+            terminal: cleanup_terminal,
+            termination_requested,
+            leader_reaped,
+        },
         cleanup_id: (cleanup_id != u64::MAX).then_some(cleanup_id),
-        termination_requested,
-        leader_reaped,
         candidate_quiescence_complete,
         cleanup_state,
         cleanup_error,
@@ -3770,11 +3857,75 @@ fn decode_external_supervisor_terminal(
 }
 
 #[cfg(any(unix, windows))]
+fn decode_external_supervisor_terminal_binding(
+    bytes: &[u8],
+    request_sha256: Digest,
+    nonce: Digest,
+) -> Result<&[u8], String> {
+    let mut remaining = bytes;
+    if take_supervisor_bytes(
+        &mut remaining,
+        NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC.len(),
+        "terminal magic",
+    )? != NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC
+        || take_supervisor_bytes(&mut remaining, 1, "terminal message")?[0]
+            != NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE
+        || take_supervisor_bytes(&mut remaining, request_sha256.0.len(), "request digest")?
+            != request_sha256.0
+        || take_supervisor_bytes(&mut remaining, nonce.0.len(), "nonce")? != nonce.0
+    {
+        return Err("nightly supervisor terminal receipt binding differs".to_owned());
+    }
+    Ok(remaining)
+}
+
+#[cfg(any(unix, windows))]
+fn decode_external_supervisor_cleanup_failures(
+    remaining: &mut &[u8],
+) -> Result<Vec<String>, String> {
+    let cleanup_failure_count =
+        usize::try_from(take_supervisor_u32(remaining, "cleanup failure count")?).map_err(
+            |_| "nightly supervisor cleanup failure count is not representable".to_owned(),
+        )?;
+    if cleanup_failure_count > 8 {
+        return Err("nightly supervisor cleanup failure count exceeds its bound".to_owned());
+    }
+    let mut cleanup_failures = Vec::with_capacity(cleanup_failure_count);
+    for _ in 0..cleanup_failure_count {
+        cleanup_failures.push(
+            take_supervisor_optional_text(remaining, "cleanup failure")?
+                .ok_or_else(|| "nightly supervisor cleanup failure is unavailable".to_owned())?,
+        );
+    }
+    Ok(cleanup_failures)
+}
+
+#[cfg(any(unix, windows))]
+fn decode_external_supervisor_failed_case(
+    remaining: &mut &[u8],
+) -> Result<Option<CausalFailedCase>, String> {
+    let failed_case = if take_supervisor_bool(remaining, "failed case availability")? {
+        let sequence = take_supervisor_u64(remaining, "failed case sequence")?;
+        let transition_millis = take_supervisor_u64(remaining, "failed case transition")?;
+        Some(CausalFailedCase {
+            sequence,
+            transition_elapsed: decode_external_supervisor_elapsed(transition_millis),
+            target: take_supervisor_optional_text(remaining, "failed case target")?,
+            case: take_supervisor_optional_text(remaining, "failed case name")?
+                .ok_or_else(|| "nightly supervisor failed case name is unavailable".to_owned())?,
+            stream: take_supervisor_optional_text(remaining, "failed case stream")?
+                .ok_or_else(|| "nightly supervisor failed case stream is unavailable".to_owned())?,
+        })
+    } else {
+        None
+    };
+    Ok(failed_case)
+}
+
+#[cfg(any(unix, windows))]
 struct ExternalSupervisorCleanupOutcome {
-    completed: bool,
+    lifecycle: ExternalSupervisorCleanupState,
     cleanup_id: Option<u64>,
-    termination_requested: bool,
-    leader_reaped: bool,
     candidate_quiescence_complete: bool,
     state: String,
     error: Option<String>,
@@ -3789,10 +3940,12 @@ fn external_supervisor_cleanup_outcome(
     deadline: Instant,
 ) -> ExternalSupervisorCleanupOutcome {
     let mut outcome = ExternalSupervisorCleanupOutcome {
-        completed: true,
+        lifecycle: ExternalSupervisorCleanupState {
+            terminal: true,
+            termination_requested: false,
+            leader_reaped: false,
+        },
         cleanup_id: None,
-        termination_requested: false,
-        leader_reaped: false,
         candidate_quiescence_complete: false,
         state: "completed".to_owned(),
         error: None,
@@ -3805,21 +3958,21 @@ fn external_supervisor_cleanup_outcome(
         let snapshot = receipt.wait_until(deadline);
         match snapshot.state {
             hell_testkit::RetainedTerminationState::Completed(report) => {
-                outcome.termination_requested = report.forced;
-                outcome.leader_reaped = report.reaped;
+                outcome.lifecycle.termination_requested = report.forced;
+                outcome.lifecycle.leader_reaped = report.reaped;
                 if !snapshot.lifecycle_idle {
-                    outcome.completed = false;
+                    outcome.lifecycle.terminal = false;
                     outcome.failures.push(
                         "process:lifecycle-owned: process cleanup completed before its I/O lifecycle became idle".to_owned(),
                     );
                 }
             }
             hell_testkit::RetainedTerminationState::Failed(detail) => {
-                outcome.completed = false;
+                outcome.lifecycle.terminal = false;
                 outcome.failures.push(format!("process:failed: {detail}"));
             }
             hell_testkit::RetainedTerminationState::Owned => {
-                outcome.completed = false;
+                outcome.lifecycle.terminal = false;
                 outcome
                     .failures
                     .push("process:owned: retained process cleanup remains owned".to_owned());
@@ -3845,7 +3998,7 @@ fn external_supervisor_cleanup_outcome(
                     _ => {}
                 }
             } else {
-                outcome.completed = false;
+                outcome.lifecycle.terminal = false;
                 outcome.failures.push(format!(
                     "{label}:{:?}: {}",
                     task.state,
@@ -3860,13 +4013,13 @@ fn external_supervisor_cleanup_outcome(
                 outcome.candidate_quiescence_complete = true;
             }
             hell_testkit::CandidateQuiescenceState::Failed(detail) => {
-                outcome.completed = false;
+                outcome.lifecycle.terminal = false;
                 outcome
                     .failures
                     .push(format!("candidate-quiescence:failed: {detail}"));
             }
             hell_testkit::CandidateQuiescenceState::Owned => {
-                outcome.completed = false;
+                outcome.lifecycle.terminal = false;
                 outcome.failures.push(
                     "candidate-quiescence:owned: candidate quiescence remains owned".to_owned(),
                 );
@@ -3874,7 +4027,7 @@ fn external_supervisor_cleanup_outcome(
         }
     }
     if !outcome.failures.is_empty() {
-        outcome.state = "failed".to_owned();
+        "failed".clone_into(&mut outcome.state);
         outcome.error = Some(bounded_external_supervisor_detail(
             &outcome.failures.join("; "),
         ));
@@ -3934,7 +4087,7 @@ fn execute_external_supervisor_command(
     worker
         .send(AttributedWorkerTask {
             spec,
-            execution_deadline: envelope.execution_deadline,
+            execution_deadline: envelope.execution,
             child_completion_deadline: envelope.child_completion_deadline,
             progress,
             terminal,
@@ -4045,133 +4198,183 @@ fn external_supervisor_terminal_from_result(
 ) -> ExternalSupervisorTerminal {
     let attribution = progress.attribution();
     let failed_case = progress.failed_case.clone();
-    let unavailable_reason = || {
-        if failed_case.is_some() {
-            None
-        } else if progress.case_line_truncated
-            || progress.stdout_line_truncated
-            || progress.stderr_line_truncated
-        {
-            Some("authoritative-case-line-truncated".to_owned())
-        } else if loss.chunks != 0 || loss.bytes != 0 {
-            Some("progress-observation-loss".to_owned())
-        } else {
-            Some("no-failed-case-observed".to_owned())
-        }
-    };
     match result {
-        Ok(result) => {
-            let success = result.status.success() && !result.timed_out;
-            let causal_failed_case = (!success).then(|| failed_case.clone()).flatten();
-            let base_detail = if success {
-                "completed".to_owned()
-            } else {
-                format!(
-                    "status {:?}, timed out: {}",
-                    result.status.code(),
-                    result.timed_out
-                )
-            };
-            let failed_case_unavailable = (!success).then(unavailable_reason).flatten();
-            ExternalSupervisorTerminal {
-                success,
-                timed_out: result.timed_out,
-                exit_code: result.status.code(),
-                stdout_bytes: result.stdout_bytes,
-                stdout_sha256: result.stdout_sha256,
-                stdout_truncated: result.stdout_truncated,
-                stderr_bytes: result.stderr_bytes,
-                stderr_sha256: result.stderr_sha256,
-                stderr_truncated: result.stderr_truncated,
-                capture_available: true,
-                cleanup_terminal: true,
-                cleanup_id: result.cleanup_id,
-                termination_requested: result.termination_forced,
-                leader_reaped: result.termination_reaped,
-                candidate_quiescence_complete: result.candidate_quiescence_complete,
-                cleanup_state: "completed".to_owned(),
-                cleanup_error: None,
-                cleanup_failures: Vec::new(),
-                detail: causal_failed_case_detail(
-                    &base_detail,
-                    causal_failed_case.as_ref(),
-                    failed_case_unavailable.as_deref(),
-                ),
-                attribution,
-                failed_case: causal_failed_case,
-                failed_case_unavailable,
-                dropped_chunks: loss.chunks,
-                dropped_bytes: loss.bytes,
-            }
-        }
-        Err(error) => {
-            let cleanup = external_supervisor_cleanup_outcome(&error, cleanup_deadline);
-            let completed = error.completed();
-            let stdout = completed
-                .map(|result| {
-                    (
-                        result.stdout_bytes,
-                        result.stdout_sha256,
-                        result.stdout_truncated,
-                    )
-                })
-                .or(cleanup.stdout);
-            let stderr = completed
-                .map(|result| {
-                    (
-                        result.stderr_bytes,
-                        result.stderr_sha256,
-                        result.stderr_truncated,
-                    )
-                })
-                .or(cleanup.stderr);
-            let failed_case_unavailable = unavailable_reason();
-            ExternalSupervisorTerminal {
-                success: false,
-                timed_out: error.kind() == std::io::ErrorKind::TimedOut
-                    || completed.is_some_and(|result| result.timed_out),
-                exit_code: completed.and_then(|result| result.status.code()),
-                stdout_bytes: stdout.map_or(0, |capture| capture.0),
-                stdout_sha256: stdout.map_or_else(Digest::default, |capture| capture.1),
-                stdout_truncated: stdout.is_some_and(|capture| capture.2),
-                stderr_bytes: stderr.map_or(0, |capture| capture.0),
-                stderr_sha256: stderr.map_or_else(Digest::default, |capture| capture.1),
-                stderr_truncated: stderr.is_some_and(|capture| capture.2),
-                capture_available: stdout.is_some() && stderr.is_some(),
-                cleanup_terminal: cleanup.completed,
-                cleanup_id: cleanup
-                    .cleanup_id
-                    .or_else(|| completed.and_then(|result| result.cleanup_id)),
-                termination_requested: cleanup.termination_requested
-                    || completed.is_some_and(|result| result.termination_forced),
-                leader_reaped: cleanup.leader_reaped
-                    || completed.is_some_and(|result| result.termination_reaped),
-                candidate_quiescence_complete: cleanup.candidate_quiescence_complete
-                    || completed.is_some_and(|result| result.candidate_quiescence_complete),
-                cleanup_state: cleanup.state,
-                cleanup_error: cleanup.error,
-                cleanup_failures: cleanup
-                    .failures
-                    .into_iter()
-                    .map(|failure| {
-                        bounded_external_supervisor_text(
-                            &failure,
-                            NIGHTLY_SUPERVISOR_TERMINAL_LIMIT / 32,
-                        )
-                    })
-                    .collect(),
-                detail: bounded_external_supervisor_detail(&causal_failed_case_detail(
-                    &error.to_string(),
-                    failed_case.as_ref(),
-                    failed_case_unavailable.as_deref(),
-                )),
-                attribution,
-                failed_case,
-                failed_case_unavailable,
-                dropped_chunks: loss.chunks,
-                dropped_bytes: loss.bytes,
-            }
-        }
+        Ok(result) => external_supervisor_completed_terminal(
+            &result,
+            progress,
+            attribution,
+            failed_case,
+            loss,
+        ),
+        Err(error) => external_supervisor_error_terminal(
+            &error,
+            progress,
+            attribution,
+            failed_case,
+            loss,
+            cleanup_deadline,
+        ),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn failed_case_unavailable_reason(
+    progress: &PortabilityChildProgress,
+    loss: hell_testkit::SupervisedProgressLoss,
+    failed_case_present: bool,
+) -> Option<String> {
+    if failed_case_present {
+        None
+    } else if progress.case_line_truncated
+        || progress.stdout_line_truncated
+        || progress.stderr_line_truncated
+    {
+        Some("authoritative-case-line-truncated".to_owned())
+    } else if loss.chunks != 0 || loss.bytes != 0 {
+        Some("progress-observation-loss".to_owned())
+    } else {
+        Some("no-failed-case-observed".to_owned())
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_completed_terminal(
+    result: &crate::command::CommandResult,
+    progress: &PortabilityChildProgress,
+    attribution: ActivePhaseAttribution,
+    failed_case: Option<CausalFailedCase>,
+    loss: hell_testkit::SupervisedProgressLoss,
+) -> ExternalSupervisorTerminal {
+    let success = result.status.success() && !result.timed_out;
+    let causal_failed_case = (!success).then_some(failed_case).flatten();
+    let base_detail = if success {
+        "completed".to_owned()
+    } else {
+        format!(
+            "status {:?}, timed out: {}",
+            result.status.code(),
+            result.timed_out
+        )
+    };
+    let failed_case_unavailable = (!success)
+        .then(|| failed_case_unavailable_reason(progress, loss, causal_failed_case.is_some()))
+        .flatten();
+    ExternalSupervisorTerminal {
+        execution: ExternalSupervisorExecutionState {
+            success,
+            timed_out: result.timed_out,
+        },
+        exit_code: result.status.code(),
+        stdout_bytes: result.stdout_bytes,
+        stdout_sha256: result.stdout_sha256,
+        stderr_bytes: result.stderr_bytes,
+        stderr_sha256: result.stderr_sha256,
+        capture: ExternalSupervisorCaptureState {
+            stdout_truncated: result.stdout_truncated,
+            stderr_truncated: result.stderr_truncated,
+            available: true,
+        },
+        cleanup: ExternalSupervisorCleanupState {
+            terminal: true,
+            termination_requested: result.termination.forced,
+            leader_reaped: result.termination.reaped,
+        },
+        cleanup_id: result.termination.cleanup_id,
+        candidate_quiescence_complete: result.termination.candidate_quiescence_complete,
+        cleanup_state: "completed".to_owned(),
+        cleanup_error: None,
+        cleanup_failures: Vec::new(),
+        detail: causal_failed_case_detail(
+            &base_detail,
+            causal_failed_case.as_ref(),
+            failed_case_unavailable.as_deref(),
+        ),
+        attribution,
+        failed_case: causal_failed_case,
+        failed_case_unavailable,
+        dropped_chunks: loss.chunks,
+        dropped_bytes: loss.bytes,
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_error_terminal(
+    error: &crate::command::CommandRunError,
+    progress: &PortabilityChildProgress,
+    attribution: ActivePhaseAttribution,
+    failed_case: Option<CausalFailedCase>,
+    loss: hell_testkit::SupervisedProgressLoss,
+    cleanup_deadline: Instant,
+) -> ExternalSupervisorTerminal {
+    let cleanup = external_supervisor_cleanup_outcome(error, cleanup_deadline);
+    let completed = error.completed();
+    let stdout = completed
+        .map(|result| {
+            (
+                result.stdout_bytes,
+                result.stdout_sha256,
+                result.stdout_truncated,
+            )
+        })
+        .or(cleanup.stdout);
+    let stderr = completed
+        .map(|result| {
+            (
+                result.stderr_bytes,
+                result.stderr_sha256,
+                result.stderr_truncated,
+            )
+        })
+        .or(cleanup.stderr);
+    let failed_case_unavailable =
+        failed_case_unavailable_reason(progress, loss, failed_case.is_some());
+    ExternalSupervisorTerminal {
+        execution: ExternalSupervisorExecutionState {
+            success: false,
+            timed_out: error.kind() == std::io::ErrorKind::TimedOut
+                || completed.is_some_and(|result| result.timed_out),
+        },
+        exit_code: completed.and_then(|result| result.status.code()),
+        stdout_bytes: stdout.map_or(0, |capture| capture.0),
+        stdout_sha256: stdout.map_or_else(Digest::default, |capture| capture.1),
+        stderr_bytes: stderr.map_or(0, |capture| capture.0),
+        stderr_sha256: stderr.map_or_else(Digest::default, |capture| capture.1),
+        capture: ExternalSupervisorCaptureState {
+            stdout_truncated: stdout.is_some_and(|capture| capture.2),
+            stderr_truncated: stderr.is_some_and(|capture| capture.2),
+            available: stdout.is_some() && stderr.is_some(),
+        },
+        cleanup: ExternalSupervisorCleanupState {
+            terminal: cleanup.lifecycle.terminal,
+            termination_requested: cleanup.lifecycle.termination_requested
+                || completed.is_some_and(|result| result.termination.forced),
+            leader_reaped: cleanup.lifecycle.leader_reaped
+                || completed.is_some_and(|result| result.termination.reaped),
+        },
+        cleanup_id: cleanup
+            .cleanup_id
+            .or_else(|| completed.and_then(|result| result.termination.cleanup_id)),
+        candidate_quiescence_complete: cleanup.candidate_quiescence_complete
+            || completed.is_some_and(|result| result.termination.candidate_quiescence_complete),
+        cleanup_state: cleanup.state,
+        cleanup_error: cleanup.error,
+        cleanup_failures: cleanup
+            .failures
+            .into_iter()
+            .map(|failure| {
+                bounded_external_supervisor_text(&failure, NIGHTLY_SUPERVISOR_TERMINAL_LIMIT / 32)
+            })
+            .collect(),
+        detail: bounded_external_supervisor_detail(&causal_failed_case_detail(
+            &error.to_string(),
+            failed_case.as_ref(),
+            failed_case_unavailable.as_deref(),
+        )),
+        attribution,
+        failed_case,
+        failed_case_unavailable,
+        dropped_chunks: loss.chunks,
+        dropped_bytes: loss.bytes,
     }
 }
 
@@ -4201,11 +4404,11 @@ fn apply_terminal_failed_case(
     progress: &mut PortabilityChildProgress,
     terminal: &ExternalSupervisorTerminal,
 ) {
-    progress.failed_case = terminal.failed_case.clone();
-    if !terminal.success
+    progress.failed_case.clone_from(&terminal.failed_case);
+    if !terminal.execution.success
         && let Some(failed) = &terminal.failed_case
     {
-        progress.target = failed.target.clone();
+        progress.target.clone_from(&failed.target);
         progress.case = Some(failed.case.clone());
         progress.case_state = Some(PortabilityCaseState::Failed);
     }
@@ -4219,20 +4422,26 @@ fn external_supervisor_failure_terminal(
 ) -> ExternalSupervisorTerminal {
     let seed = plan.seed();
     ExternalSupervisorTerminal {
-        success: false,
-        timed_out: false,
+        execution: ExternalSupervisorExecutionState {
+            success: false,
+            timed_out: false,
+        },
         exit_code: None,
         stdout_bytes: 0,
         stdout_sha256: Digest::default(),
-        stdout_truncated: false,
         stderr_bytes: 0,
         stderr_sha256: Digest::default(),
-        stderr_truncated: false,
-        capture_available: false,
-        cleanup_terminal,
+        capture: ExternalSupervisorCaptureState {
+            stdout_truncated: false,
+            stderr_truncated: false,
+            available: false,
+        },
+        cleanup: ExternalSupervisorCleanupState {
+            terminal: cleanup_terminal,
+            termination_requested: false,
+            leader_reaped: false,
+        },
         cleanup_id: None,
-        termination_requested: false,
-        leader_reaped: false,
         candidate_quiescence_complete: false,
         cleanup_state: if cleanup_terminal {
             "completed"
@@ -4275,9 +4484,7 @@ fn execute_external_supervisor_plan(
 ) -> ExternalSupervisorTerminal {
     let prelaunch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         write_create_new_file(started_path, started_receipt)?;
-        let timeout = envelope
-            .execution_deadline
-            .saturating_duration_since(Instant::now());
+        let timeout = envelope.execution.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return Err("nightly supervisor execution deadline expired before launch".to_owned());
         }
@@ -4388,6 +4595,92 @@ pub(crate) fn run_external_nightly_supervisor(
 ) -> Result<(), String> {
     nix::unistd::setsid()
         .map_err(|error| format!("cannot isolate nightly command supervisor session: {error}"))?;
+    let LoadedExternalSupervisor {
+        request_path,
+        expected_digest,
+        request,
+        session,
+    } = load_external_supervisor(arguments)?;
+    let mut finalizer_deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let mut session_closed = false;
+    let mut terminal_receipt_persisted = false;
+    let mut terminal_receipt_acknowledged = false;
+    let primary = (|| -> Result<(), String> {
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        let mut control_input = stdin.lock();
+        let mut control_output = stdout.lock();
+        let startup = authorize_external_supervisor_start(
+            &mut control_input,
+            &mut control_output,
+            &request_path,
+            expected_digest,
+            &request,
+            finalizer_deadline,
+        )?;
+        let envelope = startup.envelope;
+        finalizer_deadline = envelope.report_completion_deadline;
+        let terminal = execute_and_persist_external_supervisor_terminal(
+            &mut control_output,
+            &request_path,
+            expected_digest,
+            &request,
+            &session,
+            envelope,
+            &startup,
+        )?;
+        terminal_receipt_persisted = terminal.persisted;
+        match request.fixture_control {
+            ExternalSupervisorFixtureControl::Normal => {}
+            ExternalSupervisorFixtureControl::CloseBeforeTerminal => return Ok(()),
+            ExternalSupervisorFixtureControl::FailBeforeTerminal => {
+                return Err("injected nightly supervisor pre-terminal failure".to_owned());
+            }
+        }
+        let acknowledgement = publish_external_supervisor_terminal(
+            &mut control_input,
+            &mut control_output,
+            expected_digest,
+            &request,
+            &session,
+            envelope,
+            &terminal,
+        )?;
+        terminal_receipt_acknowledged = acknowledgement.acknowledged;
+        session_closed = acknowledgement.session_closed;
+        acknowledgement.completion?;
+        Ok(())
+    })();
+    let cleanup =
+        if session_closed || (terminal_receipt_persisted && !terminal_receipt_acknowledged) {
+            Ok(())
+        } else {
+            session.close_until(finalizer_deadline)
+        };
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => std::process::exit(0),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; supervisor session cleanup also failed: {cleanup}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+struct LoadedExternalSupervisor {
+    request_path: PathBuf,
+    expected_digest: Digest,
+    request: ExternalSupervisorRequest,
+    session: NightlyFixtureRoot,
+}
+
+#[cfg(unix)]
+fn load_external_supervisor(
+    arguments: &[std::ffi::OsString],
+) -> Result<LoadedExternalSupervisor, String> {
     let [
         request_path,
         expected_digest,
@@ -4451,245 +4744,288 @@ pub(crate) fn run_external_nightly_supervisor(
     }
     let request = decode_external_supervisor_request(&request_bytes)?;
     let session = validate_external_supervisor_session(&request_path, &request)?;
-    let mut finalizer_deadline = Instant::now()
-        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+    Ok(LoadedExternalSupervisor {
+        request_path,
+        expected_digest,
+        request,
+        session,
+    })
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorStartup {
+    envelope: SupervisionEnvelope,
+    started_path: PathBuf,
+    started_receipt: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn authorize_external_supervisor_start(
+    control_input: &mut std::io::StdinLock<'_>,
+    control_output: &mut std::io::StdoutLock<'_>,
+    request_path: &Path,
+    expected_digest: Digest,
+    request: &ExternalSupervisorRequest,
+    finalizer_deadline: Instant,
+) -> Result<ExternalSupervisorStartup, String> {
+    let startup_deadline = finalizer_deadline
+        .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
         .unwrap_or_else(Instant::now);
-    let mut session_closed = false;
-    let mut terminal_receipt_persisted = false;
-    let mut terminal_receipt_acknowledged = false;
-    let primary = (|| -> Result<(), String> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut control_input = stdin.lock();
-        let mut control_output = stdout.lock();
-        let startup_deadline = finalizer_deadline
-            .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
-            .unwrap_or_else(Instant::now);
-        write_supervisor_handshake(
-            &mut control_output,
-            ExternalSupervisorMessage::Ready,
-            expected_digest,
-            request.nonce,
-        )?;
-        if !read_supervisor_handshake_until(
-            &mut control_input,
-            ExternalSupervisorMessage::Go,
-            expected_digest,
-            request.nonce,
-            startup_deadline,
-        )? {
-            return Err(
-                "nightly supervisor start authorization exceeded its startup deadline".to_owned(),
-            );
-        }
-        let started = Instant::now();
-        write_supervisor_handshake(
-            &mut control_output,
-            ExternalSupervisorMessage::Started,
-            expected_digest,
-            request.nonce,
-        )?;
-        let envelope = read_supervisor_budget(&mut control_input, started, startup_deadline)?;
-        finalizer_deadline = envelope.report_completion_deadline;
-        if envelope
-            .report_completion_deadline
-            .saturating_duration_since(started)
-            > request.plan.total()
-        {
-            return Err("nightly supervisor budget exceeds its named plan total".to_owned());
-        }
-        write_supervisor_handshake(
-            &mut control_output,
-            ExternalSupervisorMessage::Ready,
-            expected_digest,
-            request.nonce,
-        )?;
-        if !read_supervisor_handshake_until(
-            &mut control_input,
-            ExternalSupervisorMessage::Go,
-            expected_digest,
-            request.nonce,
-            startup_deadline,
-        )? {
-            return Err(
-                "nightly supervisor launch authorization exceeded its startup deadline".to_owned(),
-            );
-        }
-        let started_path = request_path.with_file_name("started.receipt");
-        let mut started_receipt = supervisor_handshake_bytes(
-            ExternalSupervisorMessage::Started,
-            expected_digest,
-            request.nonce,
+    write_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Ready,
+        expected_digest,
+        request.nonce,
+    )?;
+    if !read_supervisor_handshake_until(
+        control_input,
+        ExternalSupervisorMessage::Go,
+        expected_digest,
+        request.nonce,
+        startup_deadline,
+    )? {
+        return Err(
+            "nightly supervisor start authorization exceeded its startup deadline".to_owned(),
         );
+    }
+    let started = Instant::now();
+    write_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Started,
+        expected_digest,
+        request.nonce,
+    )?;
+    let envelope = read_supervisor_budget(control_input, started, startup_deadline)?;
+    if envelope
+        .report_completion_deadline
+        .saturating_duration_since(started)
+        > request.plan.total()
+    {
+        return Err("nightly supervisor budget exceeds its named plan total".to_owned());
+    }
+    write_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Ready,
+        expected_digest,
+        request.nonce,
+    )?;
+    if !read_supervisor_handshake_until(
+        control_input,
+        ExternalSupervisorMessage::Go,
+        expected_digest,
+        request.nonce,
+        startup_deadline,
+    )? {
+        return Err(
+            "nightly supervisor launch authorization exceeded its startup deadline".to_owned(),
+        );
+    }
+    let started_path = request_path.with_file_name("started.receipt");
+    let mut started_receipt = supervisor_handshake_bytes(
+        ExternalSupervisorMessage::Started,
+        expected_digest,
+        request.nonce,
+    );
+    for (deadline, field) in [
+        (envelope.execution, "execution"),
+        (envelope.child_completion_deadline, "cleanup"),
+        (envelope.report_completion_deadline, "report"),
+    ] {
         push_supervisor_u64(
             &mut started_receipt,
-            duration_millis(
-                envelope
-                    .execution_deadline
-                    .saturating_duration_since(started),
-                "execution",
-            )?,
+            duration_millis(deadline.saturating_duration_since(started), field)?,
         );
-        push_supervisor_u64(
-            &mut started_receipt,
-            duration_millis(
-                envelope
-                    .child_completion_deadline
-                    .saturating_duration_since(started),
-                "cleanup",
-            )?,
-        );
-        push_supervisor_u64(
-            &mut started_receipt,
-            duration_millis(
-                envelope
-                    .report_completion_deadline
-                    .saturating_duration_since(started),
-                "report",
-            )?,
-        );
-        let progress_nonblocking = set_supervisor_nonblocking(&control_output, true);
-        let mut progress_channel_usable = progress_nonblocking.is_ok();
-        let mut terminal = match progress_nonblocking.as_ref() {
-            Ok(()) => execute_external_supervisor_plan(
-                &request,
-                &session,
-                expected_digest,
-                envelope,
-                &started_receipt,
-                &started_path,
-                |progress| match try_write_external_supervisor_progress(
-                    &control_output,
+    }
+    Ok(ExternalSupervisorStartup {
+        envelope,
+        started_path,
+        started_receipt,
+    })
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorTerminalReceipt {
+    bytes: Vec<u8>,
+    progress_channel_usable: bool,
+    persisted: bool,
+}
+
+#[cfg(unix)]
+fn execute_and_persist_external_supervisor_terminal(
+    control_output: &mut std::io::StdoutLock<'_>,
+    request_path: &Path,
+    expected_digest: Digest,
+    request: &ExternalSupervisorRequest,
+    session: &NightlyFixtureRoot,
+    envelope: SupervisionEnvelope,
+    startup: &ExternalSupervisorStartup,
+) -> Result<ExternalSupervisorTerminalReceipt, String> {
+    let progress_nonblocking = set_supervisor_nonblocking(control_output, true);
+    let mut progress_channel_usable = progress_nonblocking.is_ok();
+    let mut terminal = match progress_nonblocking.as_ref() {
+        Ok(()) => execute_external_supervisor_plan(
+            request,
+            session,
+            expected_digest,
+            envelope,
+            &startup.started_receipt,
+            &startup.started_path,
+            |progress| {
+                if let Ok(published) = try_write_external_supervisor_progress(
+                    control_output,
                     expected_digest,
                     request.nonce,
                     progress,
                 ) {
-                    Ok(published) => published,
-                    Err(_) => {
-                        progress_channel_usable = false;
-                        false
-                    }
-                },
+                    published
+                } else {
+                    progress_channel_usable = false;
+                    false
+                }
+            },
+        ),
+        Err(error) => external_supervisor_failure_terminal(request.plan, error, true),
+    };
+    if progress_nonblocking.is_ok()
+        && let Err(error) = set_supervisor_nonblocking(control_output, false)
+    {
+        terminal = external_supervisor_failure_terminal(
+            request.plan,
+            format!(
+                "{}; progress relay pipe restoration failed: {error}",
+                terminal.detail
             ),
-            Err(error) => external_supervisor_failure_terminal(request.plan, error, true),
-        };
-        if progress_nonblocking.is_ok()
-            && let Err(error) = set_supervisor_nonblocking(&control_output, false)
-        {
-            terminal = external_supervisor_failure_terminal(
-                request.plan,
-                format!(
-                    "{}; progress relay pipe restoration failed: {error}",
-                    terminal.detail
-                ),
-                terminal.cleanup_terminal,
-            );
-        }
-        let mut terminal_bytes =
-            encode_external_supervisor_terminal(expected_digest, request.nonce, &terminal)?;
-        if let Err(error) = write_create_new_file(
-            &request_path.with_file_name("terminal.receipt"),
-            &terminal_bytes,
-        ) {
-            terminal = external_supervisor_failure_terminal(
-                request.plan,
-                format!("{}; terminal receipt unavailable: {error}", terminal.detail),
-                terminal.cleanup_terminal,
-            );
-            terminal_bytes =
-                encode_external_supervisor_terminal(expected_digest, request.nonce, &terminal)?;
-        } else {
-            terminal_receipt_persisted = true;
-        }
-        match request.fixture_control {
-            ExternalSupervisorFixtureControl::Normal => {}
-            ExternalSupervisorFixtureControl::CloseBeforeTerminal => return Ok(()),
-            ExternalSupervisorFixtureControl::FailBeforeTerminal => {
-                return Err("injected nightly supervisor pre-terminal failure".to_owned());
-            }
-        }
-        if let Some(observer) = request.terminal_observer {
-            let connect_timeout = envelope
-                .report_completion_deadline
-                .saturating_duration_since(Instant::now());
-            if connect_timeout.is_zero() {
-                return Ok(());
-            }
-            let mut observer =
-                TcpStream::connect_timeout(&std::net::SocketAddr::V4(observer), connect_timeout)
-                    .map_err(|error| {
-                        format!("cannot connect nightly terminal observer: {error}")
-                    })?;
-            write_supervisor_handshake(
-                &mut observer,
-                ExternalSupervisorMessage::Terminal,
-                expected_digest,
-                request.nonce,
-            )?;
-            write_supervisor_terminal_payload(&mut observer, &terminal_bytes)?;
-            if !read_supervisor_handshake_until(
-                &mut observer,
-                ExternalSupervisorMessage::Go,
-                expected_digest,
-                request.nonce,
-                envelope.report_completion_deadline,
-            )? {
-                return Ok(());
-            }
-            terminal_receipt_acknowledged = true;
-            session.close_until(envelope.report_completion_deadline)?;
-            session_closed = true;
-            write_supervisor_handshake(
-                &mut observer,
-                ExternalSupervisorMessage::Ready,
-                expected_digest,
-                request.nonce,
-            )?;
-        } else if progress_channel_usable
-            && write_supervisor_handshake(
-                &mut control_output,
-                ExternalSupervisorMessage::Terminal,
-                expected_digest,
-                request.nonce,
-            )
-            .and_then(|()| write_supervisor_terminal_payload(&mut control_output, &terminal_bytes))
-            .is_ok()
-        {
-            if !read_supervisor_handshake_until(
-                &mut control_input,
-                ExternalSupervisorMessage::Go,
-                expected_digest,
-                request.nonce,
-                envelope.report_completion_deadline,
-            )? {
-                return Ok(());
-            }
-            terminal_receipt_acknowledged = true;
-            session.close_until(envelope.report_completion_deadline)?;
-            session_closed = true;
-            write_supervisor_handshake(
-                &mut control_output,
-                ExternalSupervisorMessage::Ready,
-                expected_digest,
-                request.nonce,
-            )?;
-        }
-        Ok(())
-    })();
-    let cleanup =
-        if session_closed || (terminal_receipt_persisted && !terminal_receipt_acknowledged) {
-            Ok(())
-        } else {
-            session.close_until(finalizer_deadline)
-        };
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => std::process::exit(0),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(format!(
-            "{primary}; supervisor session cleanup also failed: {cleanup}"
-        )),
+            terminal.cleanup.terminal,
+        );
     }
+    let mut bytes = encode_external_supervisor_terminal(expected_digest, request.nonce, &terminal)?;
+    let persisted =
+        match write_create_new_file(&request_path.with_file_name("terminal.receipt"), &bytes) {
+            Ok(()) => true,
+            Err(error) => {
+                terminal = external_supervisor_failure_terminal(
+                    request.plan,
+                    format!("{}; terminal receipt unavailable: {error}", terminal.detail),
+                    terminal.cleanup.terminal,
+                );
+                bytes =
+                    encode_external_supervisor_terminal(expected_digest, request.nonce, &terminal)?;
+                false
+            }
+        };
+    Ok(ExternalSupervisorTerminalReceipt {
+        bytes,
+        progress_channel_usable,
+        persisted,
+    })
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorTerminalAcknowledgement {
+    acknowledged: bool,
+    session_closed: bool,
+    completion: Result<(), String>,
+}
+
+#[cfg(unix)]
+fn publish_external_supervisor_terminal(
+    control_input: &mut std::io::StdinLock<'_>,
+    control_output: &mut std::io::StdoutLock<'_>,
+    expected_digest: Digest,
+    request: &ExternalSupervisorRequest,
+    session: &NightlyFixtureRoot,
+    envelope: SupervisionEnvelope,
+    terminal: &ExternalSupervisorTerminalReceipt,
+) -> Result<ExternalSupervisorTerminalAcknowledgement, String> {
+    let acknowledged = if let Some(observer) = request.terminal_observer {
+        let connect_timeout = envelope
+            .report_completion_deadline
+            .saturating_duration_since(Instant::now());
+        if connect_timeout.is_zero() {
+            return Ok(ExternalSupervisorTerminalAcknowledgement {
+                acknowledged: false,
+                session_closed: false,
+                completion: Ok(()),
+            });
+        }
+        let mut observer =
+            TcpStream::connect_timeout(&std::net::SocketAddr::V4(observer), connect_timeout)
+                .map_err(|error| format!("cannot connect nightly terminal observer: {error}"))?;
+        write_supervisor_handshake(
+            &mut observer,
+            ExternalSupervisorMessage::Terminal,
+            expected_digest,
+            request.nonce,
+        )?;
+        write_supervisor_terminal_payload(&mut observer, &terminal.bytes)?;
+        if !read_supervisor_handshake_until(
+            &mut observer,
+            ExternalSupervisorMessage::Go,
+            expected_digest,
+            request.nonce,
+            envelope.report_completion_deadline,
+        )? {
+            return Ok(ExternalSupervisorTerminalAcknowledgement {
+                acknowledged: false,
+                session_closed: false,
+                completion: Ok(()),
+            });
+        }
+        session.close_until(envelope.report_completion_deadline)?;
+        let completion = write_supervisor_handshake(
+            &mut observer,
+            ExternalSupervisorMessage::Ready,
+            expected_digest,
+            request.nonce,
+        );
+        return Ok(ExternalSupervisorTerminalAcknowledgement {
+            acknowledged: true,
+            session_closed: true,
+            completion,
+        });
+    } else if terminal.progress_channel_usable
+        && write_supervisor_handshake(
+            control_output,
+            ExternalSupervisorMessage::Terminal,
+            expected_digest,
+            request.nonce,
+        )
+        .and_then(|()| write_supervisor_terminal_payload(control_output, &terminal.bytes))
+        .is_ok()
+    {
+        if !read_supervisor_handshake_until(
+            control_input,
+            ExternalSupervisorMessage::Go,
+            expected_digest,
+            request.nonce,
+            envelope.report_completion_deadline,
+        )? {
+            return Ok(ExternalSupervisorTerminalAcknowledgement {
+                acknowledged: false,
+                session_closed: false,
+                completion: Ok(()),
+            });
+        }
+        session.close_until(envelope.report_completion_deadline)?;
+        let completion = write_supervisor_handshake(
+            control_output,
+            ExternalSupervisorMessage::Ready,
+            expected_digest,
+            request.nonce,
+        );
+        return Ok(ExternalSupervisorTerminalAcknowledgement {
+            acknowledged: true,
+            session_closed: true,
+            completion,
+        });
+    } else {
+        false
+    };
+    Ok(ExternalSupervisorTerminalAcknowledgement {
+        acknowledged,
+        session_closed: acknowledged,
+        completion: Ok(()),
+    })
 }
 
 #[cfg(unix)]
@@ -4742,7 +5078,7 @@ fn start_external_nightly_supervisor(
         plan,
         phase_started,
         outer_deadline,
-        ExternalSupervisorStartPolicy {
+        &ExternalSupervisorStartPolicy {
             total: plan.total(),
             cleanup_reserve: NIGHTLY_COMMAND_CLEANUP_RESERVE,
             report_reserve: NIGHTLY_REPORT_RESERVE,
@@ -4761,153 +5097,41 @@ fn start_external_nightly_supervisor_with_policy(
     plan: ExternalSupervisorPlan,
     phase_started: Instant,
     outer_deadline: Instant,
-    policy: ExternalSupervisorStartPolicy,
+    policy: &ExternalSupervisorStartPolicy,
 ) -> Result<ExternalSupervisorStarted, String> {
     static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     let session = NightlyFixtureRoot::create_in(
         &policy.session_parent,
         SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     )?;
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot canonicalize nightly supervisor workspace: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let root_handle = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-        .open(&root)
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot retain nightly supervisor workspace: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let root_metadata = match root_handle.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot bind nightly supervisor workspace: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let session_uid = match session.root.metadata() {
-        Ok(metadata) => metadata.uid(),
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot bind nightly supervisor session owner: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let request = ExternalSupervisorRequest {
-        plan,
-        root,
-        root_device: root_metadata.dev(),
-        root_inode: root_metadata.ino(),
-        root_uid: root_metadata.uid(),
-        root_mode: root_metadata.mode(),
-        nonce: supervisor_nonce(),
-        session_device: session.root_identity.0,
-        session_inode: session.root_identity.1,
-        session_uid,
-        terminal_observer: policy.terminal_observer,
-        launch_gate: policy.launch_gate,
-        fixture_command: policy.fixture_command,
-        fixture_control: policy.fixture_control,
-    };
-    let request_bytes = match encode_external_supervisor_request(&request) {
-        Ok(bytes) => bytes,
+    let prepared = match prepare_external_supervisor_request(root, plan, policy, &session) {
+        Ok(prepared) => prepared,
         Err(error) => return close_failed_external_supervisor_start(error, None, session),
     };
-    let request_sha256 = sha256_bytes(&request_bytes);
-    let request_path = session.path().join("request.bin");
-    if let Err(error) = write_create_new_file(&request_path, &request_bytes) {
-        return close_failed_external_supervisor_start(error, None, session);
-    }
-    let request_handle = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&request_path)
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot retain nightly supervisor request: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let request_metadata = match request_handle.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot bind nightly supervisor request: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let executable = match std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|error| format!("cannot bind nightly supervisor executable: {error}"))
-    {
-        Ok(executable) => executable,
+    let request = prepared.request;
+    let spawn = match prepare_external_supervisor_spawn(&session, &request) {
+        Ok(spawn) => spawn,
         Err(error) => return close_failed_external_supervisor_start(error, None, session),
     };
-    let executable_handle = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&executable)
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot retain nightly supervisor executable: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let executable_identity = match executable_handle.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return close_failed_external_supervisor_start(
-                format!("cannot inspect retained nightly supervisor: {error}"),
-                None,
-                session,
-            );
-        }
-    };
-    let exit_waiter = match ExternalSupervisorExitWaiter::prepare() {
-        Ok(waiter) => waiter,
-        Err(error) => return close_failed_external_supervisor_start(error, None, session),
-    };
-    let mut child = match std::process::Command::new(&executable)
-        .arg("__release-command-supervisor-v1")
-        .arg(&request_path)
-        .arg(request_sha256.hex())
-        .arg(request_metadata.dev().to_string())
-        .arg(request_metadata.ino().to_string())
-        .arg(request_metadata.uid().to_string())
-        .arg(request_metadata.mode().to_string())
-        .arg(request_metadata.len().to_string())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+    let request_sha256 = spawn.request_sha256;
+    let request_path = spawn.request_path;
+    let request_handle = spawn.request_handle;
+    let request_metadata = spawn.request_metadata;
+    let executable = spawn.executable;
+    let executable_identity = spawn.executable_identity;
+    let exit_waiter = spawn.exit_waiter;
+    let mut child = match NativeProcessSpec::new(&executable)
+        .argument("__release-command-supervisor-v1")
+        .argument(&request_path)
+        .argument(request_sha256.hex())
+        .argument(request_metadata.dev().to_string())
+        .argument(request_metadata.ino().to_string())
+        .argument(request_metadata.uid().to_string())
+        .argument(request_metadata.mode().to_string())
+        .argument(request_metadata.len().to_string())
+        .stdin(NativeStdio::Piped)
+        .stdout(NativeStdio::Piped)
+        .stderr(NativeStdio::Null)
         .spawn()
     {
         Ok(child) => child,
@@ -4919,15 +5143,8 @@ fn start_external_nightly_supervisor_with_policy(
             );
         }
     };
-    let rebound = fs::symlink_metadata(&executable)
-        .map_err(|error| format!("cannot revalidate nightly supervisor executable: {error}"));
-    if !matches!(rebound, Ok(metadata) if (metadata.dev(), metadata.ino()) == (executable_identity.dev(), executable_identity.ino()))
-    {
-        return close_failed_external_supervisor_start(
-            "nightly supervisor executable changed across spawn".to_owned(),
-            Some(child),
-            session,
-        );
+    if let Err(error) = verify_external_supervisor_executable(&executable, &executable_identity) {
+        return close_failed_external_supervisor_start(error, Some(child), session);
     }
     let Some(mut control_input) = child.stdin.take() else {
         return close_failed_external_supervisor_start(
@@ -4943,88 +5160,21 @@ fn start_external_nightly_supervisor_with_policy(
             session,
         );
     };
-    let phase_completion_deadline = phase_started
-        .checked_add(policy.total)
-        .ok_or_else(|| "nightly supervisor phase deadline overflowed".to_owned())?
-        .min(outer_deadline);
-    let startup_deadline = Instant::now()
-        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
-        .unwrap_or(phase_completion_deadline)
-        .min(phase_completion_deadline);
-    match read_supervisor_handshake_until(
-        &mut control_output,
-        ExternalSupervisorMessage::Ready,
-        request_sha256,
-        request.nonce,
-        startup_deadline,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return close_failed_external_supervisor_start(
-                "nightly supervisor Ready handshake exceeded its startup deadline".to_owned(),
-                Some(child),
-                session,
-            );
-        }
-        Err(error) => return close_failed_external_supervisor_start(error, Some(child), session),
-    }
-    drop(request_handle);
-    if let Err(error) = write_supervisor_handshake(
+    let envelope = match complete_external_supervisor_start_handshake(
         &mut control_input,
-        ExternalSupervisorMessage::Go,
-        request_sha256,
-        request.nonce,
-    ) {
-        return close_failed_external_supervisor_start(error, Some(child), session);
-    }
-    match read_supervisor_handshake_until(
         &mut control_output,
-        ExternalSupervisorMessage::Started,
-        request_sha256,
-        request.nonce,
-        startup_deadline,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return close_failed_external_supervisor_start(
-                "nightly supervisor Started handshake exceeded its startup deadline".to_owned(),
-                Some(child),
-                session,
-            );
-        }
-        Err(error) => return close_failed_external_supervisor_start(error, Some(child), session),
-    }
-    let observed_started = Instant::now();
-    let envelope = match SupervisionEnvelope::within(
-        phase_started,
-        policy.total,
-        policy.cleanup_reserve,
-        policy.report_reserve,
-        outer_deadline,
+        ExternalSupervisorStartHandshake {
+            request: &request,
+            request_sha256,
+            request_handle,
+            phase_started,
+            outer_deadline,
+            policy,
+        },
     ) {
         Ok(envelope) => envelope,
         Err(error) => return close_failed_external_supervisor_start(error, Some(child), session),
     };
-    if let Err(error) = write_supervisor_budget(&mut control_input, envelope, observed_started) {
-        return close_failed_external_supervisor_start(error, Some(child), session);
-    }
-    match read_supervisor_handshake_until(
-        &mut control_output,
-        ExternalSupervisorMessage::Ready,
-        request_sha256,
-        request.nonce,
-        startup_deadline,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return close_failed_external_supervisor_start(
-                "nightly supervisor launch admission exceeded its startup deadline".to_owned(),
-                Some(child),
-                session,
-            );
-        }
-        Err(error) => return close_failed_external_supervisor_start(error, Some(child), session),
-    }
     let exit = match exit_waiter.transfer(child) {
         Ok(exit) => exit,
         Err((error, child)) => {
@@ -5047,6 +5197,206 @@ fn start_external_nightly_supervisor_with_policy(
         nonce: request.nonce,
         envelope,
         launch_ownership_uncertain,
+    })
+}
+
+#[cfg(unix)]
+fn verify_external_supervisor_executable(
+    executable: &Path,
+    expected: &fs::Metadata,
+) -> Result<(), String> {
+    let observed = fs::symlink_metadata(executable)
+        .map_err(|error| format!("cannot revalidate nightly supervisor executable: {error}"))?;
+    if (observed.dev(), observed.ino()) == (expected.dev(), expected.ino()) {
+        Ok(())
+    } else {
+        Err("nightly supervisor executable changed across spawn".to_owned())
+    }
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorStartHandshake<'a> {
+    request: &'a ExternalSupervisorRequest,
+    request_sha256: Digest,
+    request_handle: fs::File,
+    phase_started: Instant,
+    outer_deadline: Instant,
+    policy: &'a ExternalSupervisorStartPolicy,
+}
+
+#[cfg(unix)]
+fn complete_external_supervisor_start_handshake(
+    control_input: &mut std::process::ChildStdin,
+    control_output: &mut std::process::ChildStdout,
+    handshake: ExternalSupervisorStartHandshake<'_>,
+) -> Result<SupervisionEnvelope, String> {
+    let phase_completion_deadline = handshake
+        .phase_started
+        .checked_add(handshake.policy.total)
+        .ok_or_else(|| "nightly supervisor phase deadline overflowed".to_owned())?
+        .min(handshake.outer_deadline);
+    let startup_deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+        .unwrap_or(phase_completion_deadline)
+        .min(phase_completion_deadline);
+    require_external_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Ready,
+        handshake.request_sha256,
+        handshake.request.nonce,
+        startup_deadline,
+        "nightly supervisor Ready handshake exceeded its startup deadline",
+    )?;
+    drop(handshake.request_handle);
+    write_supervisor_handshake(
+        control_input,
+        ExternalSupervisorMessage::Go,
+        handshake.request_sha256,
+        handshake.request.nonce,
+    )?;
+    require_external_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Started,
+        handshake.request_sha256,
+        handshake.request.nonce,
+        startup_deadline,
+        "nightly supervisor Started handshake exceeded its startup deadline",
+    )?;
+    let observed_started = Instant::now();
+    let envelope = SupervisionEnvelope::within(
+        handshake.phase_started,
+        handshake.policy.total,
+        handshake.policy.cleanup_reserve,
+        handshake.policy.report_reserve,
+        handshake.outer_deadline,
+    )?;
+    write_supervisor_budget(control_input, envelope, observed_started)?;
+    require_external_supervisor_handshake(
+        control_output,
+        ExternalSupervisorMessage::Ready,
+        handshake.request_sha256,
+        handshake.request.nonce,
+        startup_deadline,
+        "nightly supervisor launch admission exceeded its startup deadline",
+    )?;
+    Ok(envelope)
+}
+
+#[cfg(unix)]
+fn require_external_supervisor_handshake(
+    control_output: &mut std::process::ChildStdout,
+    expected: ExternalSupervisorMessage,
+    request_sha256: Digest,
+    nonce: Digest,
+    deadline: Instant,
+    deadline_error: &str,
+) -> Result<(), String> {
+    match read_supervisor_handshake_until(control_output, expected, request_sha256, nonce, deadline)
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(deadline_error.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+struct PreparedExternalSupervisorRequest {
+    request: ExternalSupervisorRequest,
+    _root_handle: fs::File,
+}
+
+#[cfg(unix)]
+struct PreparedExternalSupervisorSpawn {
+    request_sha256: Digest,
+    request_path: PathBuf,
+    request_handle: fs::File,
+    request_metadata: fs::Metadata,
+    executable: PathBuf,
+    _executable_handle: fs::File,
+    executable_identity: fs::Metadata,
+    exit_waiter: ExternalSupervisorExitWaiter,
+}
+
+#[cfg(unix)]
+fn prepare_external_supervisor_spawn(
+    session: &NightlyFixtureRoot,
+    request: &ExternalSupervisorRequest,
+) -> Result<PreparedExternalSupervisorSpawn, String> {
+    let request_bytes = encode_external_supervisor_request(request)?;
+    let request_sha256 = sha256_bytes(&request_bytes);
+    let request_path = session.path().join("request.bin");
+    write_create_new_file(&request_path, &request_bytes)?;
+    let request_handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&request_path)
+        .map_err(|error| format!("cannot retain nightly supervisor request: {error}"))?;
+    let request_metadata = request_handle
+        .metadata()
+        .map_err(|error| format!("cannot bind nightly supervisor request: {error}"))?;
+    let executable = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|error| format!("cannot bind nightly supervisor executable: {error}"))?;
+    let executable_handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&executable)
+        .map_err(|error| format!("cannot retain nightly supervisor executable: {error}"))?;
+    let executable_identity = executable_handle
+        .metadata()
+        .map_err(|error| format!("cannot inspect retained nightly supervisor: {error}"))?;
+    Ok(PreparedExternalSupervisorSpawn {
+        request_sha256,
+        request_path,
+        request_handle,
+        request_metadata,
+        executable,
+        _executable_handle: executable_handle,
+        executable_identity,
+        exit_waiter: ExternalSupervisorExitWaiter::prepare()?,
+    })
+}
+
+#[cfg(unix)]
+fn prepare_external_supervisor_request(
+    root: &Path,
+    plan: ExternalSupervisorPlan,
+    policy: &ExternalSupervisorStartPolicy,
+    session: &NightlyFixtureRoot,
+) -> Result<PreparedExternalSupervisorRequest, String> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!("cannot canonicalize nightly supervisor workspace: {error}"))?;
+    let root_handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(&root)
+        .map_err(|error| format!("cannot retain nightly supervisor workspace: {error}"))?;
+    let root_metadata = root_handle
+        .metadata()
+        .map_err(|error| format!("cannot bind nightly supervisor workspace: {error}"))?;
+    let session_uid = session
+        .root
+        .metadata()
+        .map_err(|error| format!("cannot bind nightly supervisor session owner: {error}"))?
+        .uid();
+    Ok(PreparedExternalSupervisorRequest {
+        request: ExternalSupervisorRequest {
+            plan,
+            root,
+            root_device: root_metadata.dev(),
+            root_inode: root_metadata.ino(),
+            root_uid: root_metadata.uid(),
+            root_mode: root_metadata.mode(),
+            nonce: supervisor_nonce(),
+            session_device: session.root_identity.0,
+            session_inode: session.root_identity.1,
+            session_uid,
+            terminal_observer: policy.terminal_observer,
+            launch_gate: policy.launch_gate,
+            fixture_command: policy.fixture_command,
+            fixture_control: policy.fixture_control,
+        },
+        _root_handle: root_handle,
     })
 }
 
@@ -5150,7 +5500,7 @@ pub(crate) fn run_external_supervisor_reporter_fixture(
         Instant::now()
             .checked_add(total)
             .ok_or_else(|| "nightly supervisor fixture deadline overflowed".to_owned())?,
-        ExternalSupervisorStartPolicy {
+        &ExternalSupervisorStartPolicy {
             total,
             cleanup_reserve: Duration::from_mins(1),
             report_reserve: Duration::from_secs(30),
@@ -5222,11 +5572,11 @@ pub(crate) fn run_external_supervisor_owned_child(
             .map_err(|error| format!("cannot locate nightly owned grandchild: {error}"))?,
     )
     .map_err(|error| format!("cannot canonicalize nightly owned grandchild: {error}"))?;
-    let mut grandchild = std::process::Command::new(executable)
-        .arg("__nightly-supervisor-owned-grandchild")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+    let mut grandchild = NativeProcessSpec::new(executable)
+        .argument("__nightly-supervisor-owned-grandchild")
+        .stdin(NativeStdio::Piped)
+        .stdout(NativeStdio::Null)
+        .stderr(NativeStdio::Null)
         .spawn()
         .map_err(|error| format!("cannot start nightly owned grandchild: {error}"))?;
     let mut grandchild_input = grandchild
@@ -5245,137 +5595,12 @@ pub(crate) fn run_external_supervisor_owned_child(
         .and_then(|()| gate.write_all(&grandchild.id().to_be_bytes()))
         .map_err(|error| format!("cannot publish nightly owned process ids: {error}"))?;
     #[cfg(windows)]
-    {
-        let token = firehazard::open_process_token(
-            firehazard::get_current_process(),
-            firehazard::token::QUERY,
-        )
-        .map_err(|error| format!("cannot inspect nightly payload token: {error:?}"))?;
-        let session_path = Path::new(session_path);
-        let ownership_path = session_path.join("ownership.receipt");
-        let collision = session_path.join("candidate-forgery.receipt");
-        let session_write_denied = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&collision)
-        {
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => true,
-            Err(_) => false,
-            Ok(file) => {
-                drop(file);
-                let _ = fs::remove_file(collision);
-                false
-            }
-        };
-        let authenticated_users = firehazard::convert_string_sid_to_sid_a("S-1-5-11")
-            .map_err(|error| format!("cannot bind authenticated-users SID: {error:?}"))?;
-        let restricted_code = firehazard::convert_string_sid_to_sid_a("S-1-5-12")
-            .map_err(|error| format!("cannot bind restricted-code SID: {error:?}"))?;
-        let restricted_sids = token
-            .restricted_sids()
-            .map_err(|error| format!("cannot inspect nightly restricted SIDs: {error:?}"))?;
-        let exact_restricted_sids = restricted_sids.groups().len() == 2
-            && restricted_sids
-                .groups()
-                .iter()
-                .any(|group| *group.sid == *authenticated_users)
-            && restricted_sids
-                .groups()
-                .iter()
-                .any(|group| *group.sid == *restricted_code);
-        let privileges = token
-            .privileges()
-            .map_err(|error| format!("cannot inspect nightly restricted privileges: {error:?}"))?;
-        let privileges_minimal = privileges.privileges().len() <= 1
-            && privileges.privileges().iter().all(|privilege| {
-                privilege.luid == firehazard::privilege::name::CHANGE_NOTIFY.luid()
-            });
-        let existing_write_denied = matches!(
-            fs::OpenOptions::new().write(true).open(&ownership_path),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
-        );
-        let existing_truncate_denied = matches!(
-            fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&ownership_path),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
-        );
-        let renamed = session_path.join("candidate-renamed.receipt");
-        let rename_denied = fs::rename(&ownership_path, &renamed).is_err();
-        if !rename_denied {
-            let _ = fs::rename(&renamed, &ownership_path);
-        }
-        let delete_denied = fs::remove_file(&ownership_path).is_err();
-        let system_root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .ok_or_else(|| "SystemRoot is absent from nightly restricted child".to_owned())?;
-        let supervisor_pid = supervisor_pid
-            .to_str()
-            .ok_or_else(|| "Windows supervisor PID is not UTF-8".to_owned())?;
-        let tasklist =
-            std::process::Command::new(system_root.join("System32").join("tasklist.exe"))
-                .args(["/FO", "CSV", "/NH"])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .map_err(|error| {
-                    format!("cannot inspect restricted supervisor liveness: {error}")
-                })?;
-        let supervisor_liveness_allowed = tasklist.status.success()
-            && String::from_utf8_lossy(&tasklist.stdout)
-                .lines()
-                .filter_map(|line| windows_csv_fields(line).ok())
-                .any(|fields| fields.get(1).is_some_and(|pid| pid == supervisor_pid));
-        let supervisor_terminate_denied =
-            !std::process::Command::new(system_root.join("System32").join("taskkill.exe"))
-                .args(["/PID", supervisor_pid, "/F"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-        let dacl_mutation_denied =
-            !std::process::Command::new(system_root.join("System32").join("icacls.exe"))
-                .args([
-                    ownership_path.as_os_str(),
-                    std::ffi::OsStr::new("/grant:r"),
-                    std::ffi::OsStr::new("*S-1-5-12:(F)"),
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-        let mut target_nonce = [0_u8; 16];
-        getrandom::getrandom(&mut target_nonce)
-            .map_err(|error| format!("cannot allocate nightly target receipt: {error}"))?;
-        let target_receipt = Path::new(writable_target).join(format!(
-            "nightly-restricted-write-{}",
-            sha256_bytes(&target_nonce).hex()
-        ));
-        let target_write_succeeded = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target_receipt)
-            .and_then(|mut file| file.write_all(b"nightly-write-restricted\n"))
-            .and_then(|()| fs::remove_file(&target_receipt))
-            .is_ok();
-        gate.write_all(&[
-            u8::from(firehazard::is_token_restricted(&token)),
-            u8::from(exact_restricted_sids),
-            u8::from(privileges_minimal),
-            u8::from(session_write_denied),
-            u8::from(existing_write_denied),
-            u8::from(existing_truncate_denied),
-            u8::from(rename_denied),
-            u8::from(delete_denied),
-            u8::from(dacl_mutation_denied),
-            u8::from(target_write_succeeded),
-            u8::from(supervisor_liveness_allowed),
-            u8::from(supervisor_terminate_denied),
-        ])
-        .map_err(|error| format!("cannot publish nightly payload token receipt: {error}"))?;
-    }
+    publish_windows_owned_child_receipt(
+        &mut gate,
+        Path::new(session_path),
+        Path::new(writable_target),
+        supervisor_pid,
+    )?;
     read_supervisor_handshake(
         &mut gate,
         ExternalSupervisorMessage::Go,
@@ -5398,6 +5623,175 @@ pub(crate) fn run_external_supervisor_owned_child(
 }
 
 #[cfg(windows)]
+fn publish_windows_owned_child_receipt(
+    gate: &mut TcpStream,
+    session_path: &Path,
+    writable_target: &Path,
+    supervisor_pid: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let token = windows_owned_child_token_receipt()?;
+    let session = windows_owned_child_session_receipt(session_path);
+    let process = windows_owned_child_process_receipt(
+        &session_path.join("ownership.receipt"),
+        writable_target,
+        supervisor_pid,
+    )?;
+    let receipt = [
+        token[0], token[1], token[2], session[0], session[1], session[2], session[3], session[4],
+        process[0], process[1], process[2], process[3],
+    ];
+    gate.write_all(&receipt)
+        .map_err(|error| format!("cannot publish nightly payload token receipt: {error}"))
+}
+
+#[cfg(windows)]
+fn windows_owned_child_token_receipt() -> Result<[u8; 3], String> {
+    let token =
+        firehazard::open_process_token(firehazard::get_current_process(), firehazard::token::QUERY)
+            .map_err(|error| format!("cannot inspect nightly payload token: {error:?}"))?;
+    let authenticated_users = firehazard::convert_string_sid_to_sid_a("S-1-5-11")
+        .map_err(|error| format!("cannot bind authenticated-users SID: {error:?}"))?;
+    let restricted_code = firehazard::convert_string_sid_to_sid_a("S-1-5-12")
+        .map_err(|error| format!("cannot bind restricted-code SID: {error:?}"))?;
+    let restricted_sids = token
+        .restricted_sids()
+        .map_err(|error| format!("cannot inspect nightly restricted SIDs: {error:?}"))?;
+    let exact_restricted_sids = restricted_sids.groups().len() == 2
+        && restricted_sids
+            .groups()
+            .iter()
+            .any(|group| *group.sid == *authenticated_users)
+        && restricted_sids
+            .groups()
+            .iter()
+            .any(|group| *group.sid == *restricted_code);
+    let privileges = token
+        .privileges()
+        .map_err(|error| format!("cannot inspect nightly restricted privileges: {error:?}"))?;
+    let privileges_minimal = privileges.privileges().len() <= 1
+        && privileges
+            .privileges()
+            .iter()
+            .all(|privilege| privilege.luid == firehazard::privilege::name::CHANGE_NOTIFY.luid());
+    Ok([
+        u8::from(firehazard::is_token_restricted(&token)),
+        u8::from(exact_restricted_sids),
+        u8::from(privileges_minimal),
+    ])
+}
+
+#[cfg(windows)]
+fn windows_owned_child_session_receipt(session_path: &Path) -> [u8; 5] {
+    let ownership_path = session_path.join("ownership.receipt");
+    let collision = session_path.join("candidate-forgery.receipt");
+    let session_write_denied = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&collision)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => true,
+        Err(_) => false,
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(collision);
+            false
+        }
+    };
+    let existing_write_denied = matches!(
+        fs::OpenOptions::new().write(true).open(&ownership_path),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    let existing_truncate_denied = matches!(
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&ownership_path),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    let renamed = session_path.join("candidate-renamed.receipt");
+    let rename_denied = fs::rename(&ownership_path, &renamed).is_err();
+    if !rename_denied {
+        let _ = fs::rename(&renamed, &ownership_path);
+    }
+    let delete_denied = fs::remove_file(&ownership_path).is_err();
+    [
+        u8::from(session_write_denied),
+        u8::from(existing_write_denied),
+        u8::from(existing_truncate_denied),
+        u8::from(rename_denied),
+        u8::from(delete_denied),
+    ]
+}
+
+#[cfg(windows)]
+fn windows_owned_child_process_receipt(
+    ownership_path: &Path,
+    writable_target: &Path,
+    supervisor_pid: &std::ffi::OsStr,
+) -> Result<[u8; 4], String> {
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
+        .map(PathBuf::from)
+        .ok_or_else(|| "SystemRoot is absent from nightly restricted child".to_owned())?;
+    let supervisor_pid = supervisor_pid
+        .to_str()
+        .ok_or_else(|| "Windows supervisor PID is not UTF-8".to_owned())?;
+    let tasklist = NativeProcessSpec::new(system_root.join("System32").join("tasklist.exe"))
+        .arguments(["/FO", "CSV", "/NH"])
+        .stdin(NativeStdio::Null)
+        .stdout(NativeStdio::Piped)
+        .stderr(NativeStdio::Piped)
+        .output()
+        .map_err(|error| format!("cannot inspect restricted supervisor liveness: {error}"))?;
+    let supervisor_liveness_allowed = tasklist.status.success()
+        && String::from_utf8_lossy(&tasklist.stdout)
+            .lines()
+            .filter_map(|line| windows_csv_fields(line).ok())
+            .any(|fields| fields.get(1).is_some_and(|pid| pid == supervisor_pid));
+    let supervisor_terminate_denied =
+        !NativeProcessSpec::new(system_root.join("System32").join("taskkill.exe"))
+            .arguments(["/PID", supervisor_pid, "/F"])
+            .stdin(NativeStdio::Null)
+            .stdout(NativeStdio::Null)
+            .stderr(NativeStdio::Null)
+            .status()
+            .is_ok_and(|status| status.success());
+    let dacl_mutation_denied =
+        !NativeProcessSpec::new(system_root.join("System32").join("icacls.exe"))
+            .arguments([
+                ownership_path.as_os_str(),
+                std::ffi::OsStr::new("/grant:r"),
+                std::ffi::OsStr::new("*S-1-5-12:(F)"),
+            ])
+            .stdin(NativeStdio::Null)
+            .stdout(NativeStdio::Null)
+            .stderr(NativeStdio::Null)
+            .status()
+            .is_ok_and(|status| status.success());
+    let mut target_nonce = [0_u8; 16];
+    getrandom::getrandom(&mut target_nonce)
+        .map_err(|error| format!("cannot allocate nightly target receipt: {error}"))?;
+    let target_receipt = writable_target.join(format!(
+        "nightly-restricted-write-{}",
+        sha256_bytes(&target_nonce).hex()
+    ));
+    let target_write_succeeded = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target_receipt)
+        .and_then(|mut file| file.write_all(b"nightly-write-restricted\n"))
+        .and_then(|()| fs::remove_file(&target_receipt))
+        .is_ok();
+    Ok([
+        u8::from(dacl_mutation_denied),
+        u8::from(target_write_succeeded),
+        u8::from(supervisor_liveness_allowed),
+        u8::from(supervisor_terminate_denied),
+    ])
+}
+
+#[cfg(windows)]
 fn windows_restricted_receipt_mutation_denied(
     path: &Path,
     replacement: &Path,
@@ -5411,15 +5805,15 @@ fn windows_restricted_receipt_mutation_denied(
         .is_err();
     let rename_denied = fs::rename(path, replacement).is_err();
     let delete_denied = fs::remove_file(path).is_err();
-    let acl_denied = !std::process::Command::new(icacls)
-        .args([
+    let acl_denied = !NativeProcessSpec::new(icacls)
+        .arguments([
             path.as_os_str(),
             std::ffi::OsStr::new("/grant:r"),
             std::ffi::OsStr::new("*S-1-5-12:(F)"),
         ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(NativeStdio::Null)
+        .stdout(NativeStdio::Null)
+        .stderr(NativeStdio::Null)
         .status()
         .is_ok_and(|status| status.success());
     write_denied && truncate_denied && rename_denied && delete_denied && acl_denied
@@ -5444,15 +5838,15 @@ fn windows_restricted_directory_mutation_denied(
             false
         }
     };
-    let acl_denied = !std::process::Command::new(icacls)
-        .args([
+    let acl_denied = !NativeProcessSpec::new(icacls)
+        .arguments([
             path.as_os_str(),
             std::ffi::OsStr::new("/grant:r"),
             std::ffi::OsStr::new("*S-1-5-12:(F)"),
         ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(NativeStdio::Null)
+        .stdout(NativeStdio::Null)
+        .stderr(NativeStdio::Null)
         .status()
         .is_ok_and(|status| status.success());
     create_denied && rename_denied && acl_denied
@@ -5512,19 +5906,21 @@ pub(crate) fn run_windows_supervisor_session_probe(
         "cleanup.commit",
         "cleanup.receipt",
     ];
-    let system_root = std::env::var_os("SystemRoot")
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
         .map(PathBuf::from)
         .ok_or_else(|| "SystemRoot is absent from Windows supervisor session probe".to_owned())?;
     let icacls = system_root.join("System32").join("icacls.exe");
-    let root_acl_denied = !std::process::Command::new(&icacls)
-        .args([
+    let root_acl_denied = !NativeProcessSpec::new(&icacls)
+        .arguments([
             session_path.as_os_str(),
             std::ffi::OsStr::new("/grant:r"),
             std::ffi::OsStr::new("*S-1-5-12:(F)"),
         ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(NativeStdio::Null)
+        .stdout(NativeStdio::Null)
+        .stderr(NativeStdio::Null)
         .status()
         .is_ok_and(|status| status.success());
     let collision = session_path.join("candidate-session-probe.receipt");
@@ -5644,11 +6040,11 @@ fn start_external_supervisor_exit_fixture(
     executable: &Path,
 ) -> Result<(ExternalSupervisorExitReceipt, std::process::ChildStdin), String> {
     let waiter = ExternalSupervisorExitWaiter::prepare()?;
-    let mut child = std::process::Command::new(executable)
-        .arg("__nightly-supervisor-owned-grandchild")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+    let mut child = NativeProcessSpec::new(executable)
+        .argument("__nightly-supervisor-owned-grandchild")
+        .stdin(NativeStdio::Piped)
+        .stdout(NativeStdio::Null)
+        .stderr(NativeStdio::Null)
         .spawn()
         .map_err(|error| format!("cannot start nightly exit receipt fixture: {error}"))?;
     let Some(control) = child.stdin.take() else {
@@ -5786,35 +6182,20 @@ impl ExternalSupervisorVerifierFinalizer {
             return Ok(());
         }
         self.armed = false;
-        if let Some(mut release) = self.reporter_release.take() {
-            drop(write_supervisor_handshake(
-                &mut release,
-                ExternalSupervisorMessage::Go,
-                self.request_sha256,
-                self.nonce,
-            ));
-        }
-        if let Some(mut release) = self.target_release.take() {
-            drop(write_supervisor_handshake(
-                &mut release,
-                ExternalSupervisorMessage::Go,
-                self.request_sha256,
-                self.nonce,
-            ));
-        }
+        self.release_controls();
         let mut cleanup_errors = Vec::new();
         let supervisor_pid = if self.supervisor_pid == 0 {
             cleanup_errors.push("nightly verifier supervisor pid is invalid".to_owned());
             None
         } else {
-            match i32::try_from(self.supervisor_pid) {
-                Ok(pid) => Some(pid),
-                Err(_) => {
+            i32::try_from(self.supervisor_pid).map_or_else(
+                |_| {
                     cleanup_errors
                         .push("nightly verifier supervisor pid is not representable".to_owned());
                     None
-                }
-            }
+                },
+                Some,
+            )
         };
         for pid in self
             .owned_pids
@@ -5822,13 +6203,9 @@ impl ExternalSupervisorVerifierFinalizer {
             .copied()
             .chain((self.supervisor_pid != 0).then_some(self.supervisor_pid))
         {
-            let pid = match i32::try_from(pid) {
-                Ok(pid) => pid,
-                Err(_) => {
-                    cleanup_errors
-                        .push("nightly verifier owned pid is not representable".to_owned());
-                    continue;
-                }
+            let Ok(pid) = i32::try_from(pid) else {
+                cleanup_errors.push("nightly verifier owned pid is not representable".to_owned());
+                continue;
             };
             match nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
@@ -5891,6 +6268,25 @@ impl ExternalSupervisorVerifierFinalizer {
             Err(cleanup_errors.join("; "))
         }
     }
+
+    fn release_controls(&mut self) {
+        if let Some(mut release) = self.reporter_release.take() {
+            drop(write_supervisor_handshake(
+                &mut release,
+                ExternalSupervisorMessage::Go,
+                self.request_sha256,
+                self.nonce,
+            ));
+        }
+        if let Some(mut release) = self.target_release.take() {
+            drop(write_supervisor_handshake(
+                &mut release,
+                ExternalSupervisorMessage::Go,
+                self.request_sha256,
+                self.nonce,
+            ));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -5904,6 +6300,8 @@ impl Drop for ExternalSupervisorVerifierFinalizer {
 
 #[cfg(unix)]
 fn close_external_supervisor_verifier_session(path: &Path) -> Result<(), String> {
+    const MAXIMUM_ENTRIES: usize = 5;
+
     let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
         return Err("nightly verifier session name is not UTF-8".to_owned());
     };
@@ -5939,7 +6337,6 @@ fn close_external_supervisor_verifier_session(path: &Path) -> Result<(), String>
     }
     let mut children = fs::read_dir(path)
         .map_err(|error| format!("cannot enumerate nightly verifier session: {error}"))?;
-    const MAXIMUM_ENTRIES: usize = 5;
     for index in 0..=MAXIMUM_ENTRIES {
         let Some(child) = children.next() else {
             break;
@@ -5991,137 +6388,11 @@ fn verify_external_supervisor_control_recovery_case(
     target_release: ExternalSupervisorMessage,
     expect_success: bool,
 ) -> Result<(), String> {
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| format!("cannot bind nightly recovery verifier gate: {error}"))?;
-    let gate_address = gate
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly recovery verifier gate: {error}"))?;
-    let std::net::SocketAddr::V4(gate_address) = gate_address else {
-        return Err("nightly recovery verifier gate is not IPv4".to_owned());
-    };
-    let gate_receiver = submit_external_supervisor_accept(gate)?;
-    let total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
-    let phase_started = Instant::now();
-    let outer_deadline = phase_started
-        .checked_add(total)
-        .ok_or_else(|| "nightly recovery verifier deadline overflowed".to_owned())?;
-    let mut started = start_external_nightly_supervisor_with_policy(
-        root,
-        ExternalSupervisorPlan::NightlyCoreData,
-        phase_started,
-        outer_deadline,
-        ExternalSupervisorStartPolicy {
-            total,
-            cleanup_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2),
-            report_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT,
-            terminal_observer: None,
-            launch_gate: Some(gate_address),
-            fixture_command: true,
-            fixture_control,
-            session_parent: std::env::temp_dir(),
-        },
-    )?;
-    let mut finalizer = ExternalSupervisorVerifierFinalizer::new(
-        started.pid(),
-        started.session.path().to_owned(),
-        started.request_sha256,
-        started.nonce,
-        None,
-    );
-    if let Some(error) = &started.launch_ownership_uncertain {
-        return Err(format!(
-            "nightly recovery launch authorization was indeterminate: {error}"
-        ));
-    }
-    let mut gate =
-        match receive_external_supervisor_connection(&gate_receiver, "recovery launch gate") {
-            Ok(gate) => gate,
-            Err(error) => {
-                let exit_deadline = Instant::now()
-                    .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
-                    .unwrap_or_else(Instant::now);
-                let exit = match started.exit.wait_until(exit_deadline) {
-                    ExternalSupervisorExitState::Exited(status) => {
-                        format!("exited({:?})", status.code())
-                    }
-                    ExternalSupervisorExitState::DeadlineExpired => "deadline-expired".to_owned(),
-                    ExternalSupervisorExitState::Failed(error) => format!("wait-failed({error})"),
-                };
-                let terminal = read_bounded_file(
-                    &started.session.path().join("terminal.receipt"),
-                    NIGHTLY_SUPERVISOR_TERMINAL_LIMIT,
-                )
-                .and_then(|bytes| {
-                    decode_external_supervisor_terminal(
-                        &bytes,
-                        started.request_sha256,
-                        started.nonce,
-                    )
-                })
-                .map(|terminal| terminal.detail)
-                .unwrap_or_else(|error| format!("unavailable({error})"));
-                return Err(format!("{error}; supervisor={exit}; terminal={terminal}"));
-            }
-        };
-    finalizer.retain_target_release(
-        gate.try_clone()
-            .map_err(|error| format!("cannot retain nightly recovery gate: {error}"))?,
-    );
-    read_supervisor_handshake(
-        &mut gate,
-        ExternalSupervisorMessage::Started,
-        started.request_sha256,
-        started.nonce,
-    )?;
-    let mut owned_pids = [0_u8; size_of::<u32>() * 2];
-    gate.read_exact(&mut owned_pids)
-        .map_err(|error| format!("cannot read nightly recovery process ids: {error}"))?;
-    let target_pid = u32::from_be_bytes(
-        owned_pids[..size_of::<u32>()]
-            .try_into()
-            .map_err(|_| "nightly recovery target pid width drifted".to_owned())?,
-    );
-    let descendant_pid = u32::from_be_bytes(
-        owned_pids[size_of::<u32>()..]
-            .try_into()
-            .map_err(|_| "nightly recovery descendant pid width drifted".to_owned())?,
-    );
-    finalizer.retain_owned_pids([target_pid, descendant_pid]);
-    write_supervisor_handshake(
-        &mut gate,
-        target_release,
-        started.request_sha256,
-        started.nonce,
-    )?;
-    let lifecycle_deadline = started
-        .envelope
-        .report_completion_deadline
-        .checked_sub(REPORT_WRITE_RESERVE)
-        .unwrap_or(started.envelope.child_completion_deadline)
-        .max(started.envelope.child_completion_deadline);
-    let control_error = loop {
-        match read_supervisor_message_until(
-            &mut started.control_output,
-            started.request_sha256,
-            started.nonce,
-            lifecycle_deadline,
-        ) {
-            Ok(Some(ExternalSupervisorMessage::Progress)) => {
-                drop(read_supervisor_terminal_payload_until(
-                    &mut started.control_output,
-                    lifecycle_deadline,
-                )?);
-            }
-            Ok(Some(message)) => {
-                return Err(format!(
-                    "nightly recovery verifier observed unexpected {message:?}"
-                ));
-            }
-            Ok(None) if Instant::now() < lifecycle_deadline => {}
-            Ok(None) => break "nightly recovery verifier reached its lifecycle cutoff".to_owned(),
-            Err(error) => break error,
-        }
-    };
+    let mut recovery = start_external_supervisor_recovery_case(root, fixture_control)?;
+    let observation = observe_external_supervisor_control_failure(&mut recovery, target_release)?;
+    let started = &mut recovery.started;
+    let finalizer = &mut recovery.finalizer;
+    let phase_started = recovery.phase_started;
     let context = AttributedRunContext {
         name: ExternalSupervisorPlan::NightlyCoreData.name(),
         suite: "nightly-recovery-verifier",
@@ -6140,15 +6411,18 @@ fn verify_external_supervisor_control_recovery_case(
         &mut report,
         context,
         &mut progress,
-        ExternalSupervisorControlFailure {
+        &ExternalSupervisorControlFailure {
             plan: ExternalSupervisorPlan::NightlyCoreData,
-            started: &started,
-            control_error: &control_error,
-            exit_deadline: lifecycle_deadline,
+            started,
+            control_error: &observation.control_error,
+            exit_deadline: observation.lifecycle_deadline,
             lifecycle_deadline: started.envelope.report_completion_deadline,
         },
     );
-    for (label, pid) in [("target", target_pid), ("descendant", descendant_pid)] {
+    for (label, pid) in [
+        ("target", observation.target_pid),
+        ("descendant", observation.descendant_pid),
+    ] {
         let pid = i32::try_from(pid)
             .map_err(|_| format!("nightly recovery {label} pid is not representable"))?;
         match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
@@ -6199,6 +6473,186 @@ fn verify_external_supervisor_control_recovery_case(
 }
 
 #[cfg(unix)]
+struct ExternalSupervisorRecoveryObservation {
+    target_pid: u32,
+    descendant_pid: u32,
+    lifecycle_deadline: Instant,
+    control_error: String,
+}
+
+#[cfg(unix)]
+fn observe_external_supervisor_control_failure(
+    recovery: &mut ExternalSupervisorRecoveryStart,
+    target_release: ExternalSupervisorMessage,
+) -> Result<ExternalSupervisorRecoveryObservation, String> {
+    let mut owned_pids = [0_u8; size_of::<u32>() * 2];
+    recovery
+        .gate
+        .read_exact(&mut owned_pids)
+        .map_err(|error| format!("cannot read nightly recovery process ids: {error}"))?;
+    let target_pid = u32::from_be_bytes(
+        owned_pids[..size_of::<u32>()]
+            .try_into()
+            .map_err(|_| "nightly recovery target pid width drifted".to_owned())?,
+    );
+    let descendant_pid = u32::from_be_bytes(
+        owned_pids[size_of::<u32>()..]
+            .try_into()
+            .map_err(|_| "nightly recovery descendant pid width drifted".to_owned())?,
+    );
+    recovery
+        .finalizer
+        .retain_owned_pids([target_pid, descendant_pid]);
+    write_supervisor_handshake(
+        &mut recovery.gate,
+        target_release,
+        recovery.started.request_sha256,
+        recovery.started.nonce,
+    )?;
+    let lifecycle_deadline = recovery
+        .started
+        .envelope
+        .report_completion_deadline
+        .checked_sub(REPORT_WRITE_RESERVE)
+        .unwrap_or(recovery.started.envelope.child_completion_deadline)
+        .max(recovery.started.envelope.child_completion_deadline);
+    let control_error = loop {
+        match read_supervisor_message_until(
+            &mut recovery.started.control_output,
+            recovery.started.request_sha256,
+            recovery.started.nonce,
+            lifecycle_deadline,
+        ) {
+            Ok(Some(ExternalSupervisorMessage::Progress)) => {
+                drop(read_supervisor_terminal_payload_until(
+                    &mut recovery.started.control_output,
+                    lifecycle_deadline,
+                )?);
+            }
+            Ok(Some(message)) => {
+                return Err(format!(
+                    "nightly recovery verifier observed unexpected {message:?}"
+                ));
+            }
+            Ok(None) if Instant::now() < lifecycle_deadline => {}
+            Ok(None) => break "nightly recovery verifier reached its lifecycle cutoff".to_owned(),
+            Err(error) => break error,
+        }
+    };
+    Ok(ExternalSupervisorRecoveryObservation {
+        target_pid,
+        descendant_pid,
+        lifecycle_deadline,
+        control_error,
+    })
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorRecoveryStart {
+    started: ExternalSupervisorStarted,
+    finalizer: ExternalSupervisorVerifierFinalizer,
+    gate: TcpStream,
+    phase_started: Instant,
+}
+
+#[cfg(unix)]
+fn start_external_supervisor_recovery_case(
+    root: &Path,
+    fixture_control: ExternalSupervisorFixtureControl,
+) -> Result<ExternalSupervisorRecoveryStart, String> {
+    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("cannot bind nightly recovery verifier gate: {error}"))?;
+    let gate_address = gate
+        .local_addr()
+        .map_err(|error| format!("cannot inspect nightly recovery verifier gate: {error}"))?;
+    let std::net::SocketAddr::V4(gate_address) = gate_address else {
+        return Err("nightly recovery verifier gate is not IPv4".to_owned());
+    };
+    let gate_receiver = submit_external_supervisor_accept(gate)?;
+    let total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
+    let phase_started = Instant::now();
+    let outer_deadline = phase_started
+        .checked_add(total)
+        .ok_or_else(|| "nightly recovery verifier deadline overflowed".to_owned())?;
+    let started = start_external_nightly_supervisor_with_policy(
+        root,
+        ExternalSupervisorPlan::NightlyCoreData,
+        phase_started,
+        outer_deadline,
+        &ExternalSupervisorStartPolicy {
+            total,
+            cleanup_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2),
+            report_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT,
+            terminal_observer: None,
+            launch_gate: Some(gate_address),
+            fixture_command: true,
+            fixture_control,
+            session_parent: std::env::temp_dir(),
+        },
+    )?;
+    let mut finalizer = ExternalSupervisorVerifierFinalizer::new(
+        started.pid(),
+        started.session.path().to_owned(),
+        started.request_sha256,
+        started.nonce,
+        None,
+    );
+    if let Some(error) = &started.launch_ownership_uncertain {
+        return Err(format!(
+            "nightly recovery launch authorization was indeterminate: {error}"
+        ));
+    }
+    let mut gate =
+        match receive_external_supervisor_connection(&gate_receiver, "recovery launch gate") {
+            Ok(gate) => gate,
+            Err(error) => {
+                let exit_deadline = Instant::now()
+                    .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
+                let exit = match started.exit.wait_until(exit_deadline) {
+                    ExternalSupervisorExitState::Exited(status) => {
+                        format!("exited({:?})", status.code())
+                    }
+                    ExternalSupervisorExitState::DeadlineExpired => "deadline-expired".to_owned(),
+                    ExternalSupervisorExitState::Failed(error) => format!("wait-failed({error})"),
+                };
+                let terminal = read_bounded_file(
+                    &started.session.path().join("terminal.receipt"),
+                    NIGHTLY_SUPERVISOR_TERMINAL_LIMIT,
+                )
+                .and_then(|bytes| {
+                    decode_external_supervisor_terminal(
+                        &bytes,
+                        started.request_sha256,
+                        started.nonce,
+                    )
+                })
+                .map_or_else(
+                    |error| format!("unavailable({error})"),
+                    |terminal| terminal.detail,
+                );
+                return Err(format!("{error}; supervisor={exit}; terminal={terminal}"));
+            }
+        };
+    finalizer.retain_target_release(
+        gate.try_clone()
+            .map_err(|error| format!("cannot retain nightly recovery gate: {error}"))?,
+    );
+    read_supervisor_handshake(
+        &mut gate,
+        ExternalSupervisorMessage::Started,
+        started.request_sha256,
+        started.nonce,
+    )?;
+    Ok(ExternalSupervisorRecoveryStart {
+        started,
+        finalizer,
+        gate,
+        phase_started,
+    })
+}
+
+#[cfg(unix)]
 fn verify_external_supervisor_finalizer_for_integration(root: &Path) -> Result<(), String> {
     let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind nightly finalizer verifier gate: {error}"))?;
@@ -6218,7 +6672,7 @@ fn verify_external_supervisor_finalizer_for_integration(root: &Path) -> Result<(
         phase_started
             .checked_add(total)
             .ok_or_else(|| "nightly finalizer verifier deadline overflowed".to_owned())?,
-        ExternalSupervisorStartPolicy {
+        &ExternalSupervisorStartPolicy {
             total,
             cleanup_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2),
             report_reserve: NIGHTLY_SUPERVISOR_START_TIMEOUT,
@@ -6316,29 +6770,46 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
         false,
     )?;
     verify_external_supervisor_finalizer_for_integration(&root)?;
-    let observer = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| format!("cannot bind nightly supervisor verifier observer: {error}"))?;
-    let observer_address = observer
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly supervisor verifier observer: {error}"))?;
-    let std::net::SocketAddr::V4(observer_address) = observer_address else {
-        return Err("nightly supervisor verifier observer is not IPv4".to_owned());
-    };
-    let session_receiver = submit_external_supervisor_accept(
-        observer
-            .try_clone()
-            .map_err(|error| format!("cannot clone nightly session observer: {error}"))?,
-    )?;
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| format!("cannot bind nightly supervisor verifier gate: {error}"))?;
-    let gate_address = gate
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly supervisor verifier gate: {error}"))?;
-    let std::net::SocketAddr::V4(gate_address) = gate_address else {
-        return Err("nightly supervisor verifier gate is not IPv4".to_owned());
-    };
-    let gate_receiver = submit_external_supervisor_accept(gate)?;
-    let reporter = CommandSpec::new(&executable, NIGHTLY_SUPERVISOR_START_TIMEOUT).arguments([
+    verify_external_supervisor_reporter_fixture(&root, &executable)
+}
+
+#[cfg(unix)]
+fn verify_external_supervisor_reporter_fixture(
+    root: &Path,
+    executable: &Path,
+) -> Result<(), String> {
+    let endpoints = external_supervisor_reporter_endpoints()?;
+    let fixture = start_external_supervisor_reporter_fixture(root, executable, endpoints)?;
+    finish_external_supervisor_reporter_fixture(fixture)
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorReporterFixture {
+    observer: TcpListener,
+    finalizer: ExternalSupervisorVerifierFinalizer,
+    gate_stream: TcpStream,
+    session_path: PathBuf,
+    supervisor_pid: u32,
+    request_sha256: Digest,
+    nonce: Digest,
+    target_pid: u32,
+    descendant_pid: u32,
+}
+
+#[cfg(unix)]
+fn start_external_supervisor_reporter_fixture(
+    root: &Path,
+    executable: &Path,
+    endpoints: ExternalSupervisorReporterEndpoints,
+) -> Result<ExternalSupervisorReporterFixture, String> {
+    let ExternalSupervisorReporterEndpoints {
+        observer,
+        observer_address,
+        session_receiver,
+        gate_address,
+        gate_receiver,
+    } = endpoints;
+    let reporter = CommandSpec::new(executable, NIGHTLY_SUPERVISOR_START_TIMEOUT).arguments([
         std::ffi::OsString::from("__nightly-supervisor-reporter-fixture"),
         root.as_os_str().to_owned(),
         std::ffi::OsString::from(observer_address.ip().to_string()),
@@ -6406,6 +6877,34 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
             reporter.timed_out
         ));
     }
+    Ok(ExternalSupervisorReporterFixture {
+        observer,
+        finalizer,
+        gate_stream,
+        session_path,
+        supervisor_pid,
+        request_sha256,
+        nonce,
+        target_pid,
+        descendant_pid,
+    })
+}
+
+#[cfg(unix)]
+fn finish_external_supervisor_reporter_fixture(
+    fixture: ExternalSupervisorReporterFixture,
+) -> Result<(), String> {
+    let ExternalSupervisorReporterFixture {
+        observer,
+        mut finalizer,
+        mut gate_stream,
+        session_path,
+        supervisor_pid,
+        request_sha256,
+        nonce,
+        target_pid,
+        descendant_pid,
+    } = fixture;
     write_supervisor_handshake(
         &mut gate_stream,
         ExternalSupervisorMessage::Go,
@@ -6414,7 +6913,7 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
     )?;
     let terminal_receiver = submit_external_supervisor_accept(observer)?;
     let mut terminal_stream = terminal_receiver
-        .recv_timeout(Duration::from_secs(5 * 60))
+        .recv_timeout(Duration::from_mins(5))
         .map_err(|error| format!("nightly terminal receipt exceeded its deadline: {error}"))?
         .map_err(|error| format!("cannot accept nightly terminal receipt: {error}"))?;
     read_supervisor_handshake(
@@ -6436,7 +6935,7 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
         return Err("nightly supervisor receipt has an invalid pid".to_owned());
     }
     let terminal_deadline = Instant::now()
-        .checked_add(Duration::from_secs(5 * 60))
+        .checked_add(Duration::from_mins(5))
         .ok_or_else(|| "nightly terminal payload deadline overflowed".to_owned())?;
     let terminal_payload =
         read_supervisor_terminal_payload_until(&mut terminal_stream, terminal_deadline)?;
@@ -6448,10 +6947,10 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
         return Err("nightly terminal file differs from authenticated payload".to_owned());
     }
     let terminal = decode_external_supervisor_terminal(&terminal_payload, request_sha256, nonce)?;
-    if !terminal.success || !terminal.cleanup_terminal {
+    if !terminal.execution.success || !terminal.cleanup.terminal {
         return Err(format!(
             "nightly supervisor fixture terminal differs: success={}, cleanupTerminal={}, detail={}",
-            terminal.success, terminal.cleanup_terminal, terminal.detail
+            terminal.execution.success, terminal.cleanup.terminal, terminal.detail
         ));
     }
     write_supervisor_handshake(
@@ -6484,6 +6983,48 @@ pub(crate) fn verify_external_nightly_supervisor_for_integration() -> Result<(),
         )),
         Ok(_) => Err("nightly supervisor session remains after receipt-bound cleanup".to_owned()),
     }
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorReporterEndpoints {
+    observer: TcpListener,
+    observer_address: SocketAddrV4,
+    session_receiver: mpsc::Receiver<std::io::Result<TcpStream>>,
+    gate_address: SocketAddrV4,
+    gate_receiver: mpsc::Receiver<std::io::Result<TcpStream>>,
+}
+
+#[cfg(unix)]
+fn external_supervisor_reporter_endpoints() -> Result<ExternalSupervisorReporterEndpoints, String> {
+    let observer = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("cannot bind nightly supervisor verifier observer: {error}"))?;
+    let observer_address = observer
+        .local_addr()
+        .map_err(|error| format!("cannot inspect nightly supervisor verifier observer: {error}"))?;
+    let std::net::SocketAddr::V4(observer_address) = observer_address else {
+        return Err("nightly supervisor verifier observer is not IPv4".to_owned());
+    };
+    let session_receiver = submit_external_supervisor_accept(
+        observer
+            .try_clone()
+            .map_err(|error| format!("cannot clone nightly session observer: {error}"))?,
+    )?;
+    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("cannot bind nightly supervisor verifier gate: {error}"))?;
+    let gate_address = gate
+        .local_addr()
+        .map_err(|error| format!("cannot inspect nightly supervisor verifier gate: {error}"))?;
+    let std::net::SocketAddr::V4(gate_address) = gate_address else {
+        return Err("nightly supervisor verifier gate is not IPv4".to_owned());
+    };
+    let gate_receiver = submit_external_supervisor_accept(gate)?;
+    Ok(ExternalSupervisorReporterEndpoints {
+        observer,
+        observer_address,
+        session_receiver,
+        gate_address,
+        gate_receiver,
+    })
 }
 
 pub(crate) fn failures_directory(report: &Path) -> PathBuf {
@@ -6700,10 +7241,135 @@ where
         + Send
         + 'static,
 {
-    const PHASE: &str = "macos-staged-native-toolchain";
-    const PHASE_QUEUE_CAPACITY: usize = 32;
-
     let started = Instant::now();
+    checkpoint_macos_staged_native_prelaunch(report, suite_started, execution_deadline)?;
+    let worker = launch_macos_staged_native_worker(
+        root,
+        report,
+        started,
+        suite_started,
+        execution_deadline,
+        completion_deadline,
+        verify,
+    )?;
+    let mut progress = MacosStagedNativeProgress::prelaunch(suite_started);
+    let mut next_checkpoint = Instant::now()
+        .checked_add(PORTABILITY_PROGRESS_INTERVAL)
+        .unwrap_or(completion_deadline)
+        .min(completion_deadline);
+    let result = loop {
+        while let Ok(subphase) = worker.phase_receiver.try_recv() {
+            observe_macos_staged_native_phase(
+                &mut progress,
+                report,
+                suite_started,
+                execution_deadline,
+                subphase,
+            );
+        }
+        match worker.terminal_receiver.try_recv() {
+            Ok(result) => {
+                while let Ok(subphase) = worker.phase_receiver.try_recv() {
+                    observe_macos_staged_native_phase(
+                        &mut progress,
+                        report,
+                        suite_started,
+                        execution_deadline,
+                        subphase,
+                    );
+                }
+                let worker_state =
+                    worker.retain_terminal(report, &progress, completion_deadline, "completed");
+                break if worker_state == "completed" {
+                    result
+                } else {
+                    Err("macOS staged-toolchain worker panicked".to_owned())
+                };
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let worker_state = worker.retain_terminal(
+                    report,
+                    &progress,
+                    completion_deadline,
+                    "receipt-disconnected",
+                );
+                break Err(format!(
+                    "macOS staged-toolchain terminal receipt {worker_state}"
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= completion_deadline {
+            worker.retain_terminal(report, &progress, completion_deadline, "completed");
+            break Err(
+                "macOS staged-toolchain worker exceeded its absolute completion deadline"
+                    .to_owned(),
+            );
+        }
+        if Instant::now() >= next_checkpoint {
+            if progress.checkpoint_error.is_none()
+                && let Err(error) = checkpoint_macos_staged_native_transition(
+                    report,
+                    suite_started,
+                    execution_deadline,
+                    progress.sequence,
+                    progress.last_transition_elapsed,
+                    progress.last_subphase.as_deref(),
+                )
+            {
+                progress.checkpoint_error = Some(error);
+            }
+            next_checkpoint = Instant::now()
+                .checked_add(PORTABILITY_PROGRESS_INTERVAL)
+                .unwrap_or(completion_deadline)
+                .min(completion_deadline);
+        }
+        let wait = completion_deadline
+            .saturating_duration_since(Instant::now())
+            .min(PORTABILITY_PROGRESS_DRAIN_INTERVAL);
+        if let Ok(subphase) = worker.phase_receiver.recv_timeout(wait) {
+            observe_macos_staged_native_phase(
+                &mut progress,
+                report,
+                suite_started,
+                execution_deadline,
+                subphase,
+            );
+        }
+    };
+    finish_macos_staged_native_result(report, started, progress, result)
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_staged_native_result(
+    report: &mut Report,
+    started: Instant,
+    progress: MacosStagedNativeProgress,
+    result: Result<(), String>,
+) -> Result<(), FailureKind> {
+    report.check(
+        "macos-staged-native-toolchain",
+        started.elapsed(),
+        result.clone(),
+    );
+    let checkpoint_failed = progress.checkpoint_error.is_some();
+    if let Some(error) = progress.checkpoint_error {
+        report.check("portability-report-checkpoint", Duration::ZERO, Err(error));
+    }
+    checkpoint_portability_phase_complete(report)?;
+    if checkpoint_failed {
+        Err(FailureKind::Fixture)
+    } else {
+        result.map_err(|_| FailureKind::Child)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn checkpoint_macos_staged_native_prelaunch(
+    report: &mut Report,
+    suite_started: Instant,
+    execution_deadline: Instant,
+) -> Result<(), FailureKind> {
     checkpoint_macos_staged_native_transition(
         report,
         suite_started,
@@ -6715,7 +7381,67 @@ where
     .map_err(|error| {
         report.check("portability-report-checkpoint", Duration::ZERO, Err(error));
         FailureKind::Fixture
-    })?;
+    })
+}
+
+#[cfg(target_os = "macos")]
+struct MacosStagedNativeWorker {
+    phase_receiver: mpsc::Receiver<crate::command::StagedNativeToolchainProgress>,
+    terminal_receiver: mpsc::Receiver<Result<(), String>>,
+    worker_receipt: AttributedWorkerReceipt,
+    worker_receipt_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosStagedNativeWorker {
+    fn retain_terminal(
+        &self,
+        report: &mut Report,
+        progress: &MacosStagedNativeProgress,
+        deadline: Instant,
+        completed_state: &'static str,
+    ) -> &'static str {
+        let worker_state = match self.worker_receipt.wait_until(deadline) {
+            AttributedWorkerState::Completed => completed_state,
+            AttributedWorkerState::Panicked => "panicked",
+            AttributedWorkerState::Owned => "retained",
+            AttributedWorkerState::Rejected => "launch-failed",
+        };
+        retain_macos_staged_native_terminal(
+            report,
+            progress.sequence,
+            progress.last_transition_elapsed,
+            progress.last_subphase.as_deref(),
+            progress.manifest_passes,
+            self.worker_receipt_id,
+            worker_state,
+        );
+        worker_state
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_staged_native_worker<F>(
+    root: &Path,
+    report: &mut Report,
+    started: Instant,
+    suite_started: Instant,
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+    verify: F,
+) -> Result<MacosStagedNativeWorker, FailureKind>
+where
+    F: FnOnce(
+            PathBuf,
+            Instant,
+            Instant,
+            mpsc::SyncSender<crate::command::StagedNativeToolchainProgress>,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
+{
+    const PHASE: &str = "macos-staged-native-toolchain";
+    const PHASE_QUEUE_CAPACITY: usize = 32;
     let sequence = PORTABILITY_PARTITION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let adapter = root.join("target").join(format!(
         "hell-ci-portability-staged-native-toolchain-{}-{sequence}",
@@ -6767,142 +7493,12 @@ where
         checkpoint_portability_phase_complete(report)?;
         return Err(FailureKind::Child);
     }
-    let mut progress = MacosStagedNativeProgress {
-        last_transition_elapsed: Some(suite_started.elapsed()),
-        last_subphase: Some("prelaunch".to_owned()),
-        ..MacosStagedNativeProgress::default()
-    };
-    let mut next_checkpoint = Instant::now()
-        .checked_add(PORTABILITY_PROGRESS_INTERVAL)
-        .unwrap_or(completion_deadline)
-        .min(completion_deadline);
-    let result = loop {
-        while let Ok(subphase) = phase_receiver.try_recv() {
-            observe_macos_staged_native_phase(
-                &mut progress,
-                report,
-                suite_started,
-                execution_deadline,
-                subphase,
-            );
-        }
-        match terminal_receiver.try_recv() {
-            Ok(result) => {
-                while let Ok(subphase) = phase_receiver.try_recv() {
-                    observe_macos_staged_native_phase(
-                        &mut progress,
-                        report,
-                        suite_started,
-                        execution_deadline,
-                        subphase,
-                    );
-                }
-                let worker_state = match worker_receipt.wait_until(completion_deadline) {
-                    AttributedWorkerState::Completed => "completed",
-                    AttributedWorkerState::Panicked => "panicked",
-                    AttributedWorkerState::Owned => "retained",
-                    AttributedWorkerState::Rejected => "launch-failed",
-                };
-                retain_macos_staged_native_terminal(
-                    report,
-                    progress.sequence,
-                    progress.last_transition_elapsed,
-                    progress.last_subphase.as_deref(),
-                    progress.manifest_passes,
-                    worker_receipt_id,
-                    worker_state,
-                );
-                break if worker_state == "completed" {
-                    result
-                } else {
-                    Err("macOS staged-toolchain worker panicked".to_owned())
-                };
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let worker_state = match worker_receipt.wait_until(completion_deadline) {
-                    AttributedWorkerState::Completed => "receipt-disconnected",
-                    AttributedWorkerState::Panicked => "panicked",
-                    AttributedWorkerState::Owned => "retained",
-                    AttributedWorkerState::Rejected => "launch-failed",
-                };
-                retain_macos_staged_native_terminal(
-                    report,
-                    progress.sequence,
-                    progress.last_transition_elapsed,
-                    progress.last_subphase.as_deref(),
-                    progress.manifest_passes,
-                    worker_receipt_id,
-                    worker_state,
-                );
-                break Err(format!(
-                    "macOS staged-toolchain terminal receipt {worker_state}"
-                ));
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        if Instant::now() >= completion_deadline {
-            let worker_state = match worker_receipt.wait_until(completion_deadline) {
-                AttributedWorkerState::Completed => "completed",
-                AttributedWorkerState::Panicked => "panicked",
-                AttributedWorkerState::Owned => "retained",
-                AttributedWorkerState::Rejected => "launch-failed",
-            };
-            retain_macos_staged_native_terminal(
-                report,
-                progress.sequence,
-                progress.last_transition_elapsed,
-                progress.last_subphase.as_deref(),
-                progress.manifest_passes,
-                worker_receipt_id,
-                worker_state,
-            );
-            break Err(
-                "macOS staged-toolchain worker exceeded its absolute completion deadline"
-                    .to_owned(),
-            );
-        }
-        if Instant::now() >= next_checkpoint {
-            if progress.checkpoint_error.is_none()
-                && let Err(error) = checkpoint_macos_staged_native_transition(
-                    report,
-                    suite_started,
-                    execution_deadline,
-                    progress.sequence,
-                    progress.last_transition_elapsed,
-                    progress.last_subphase.as_deref(),
-                )
-            {
-                progress.checkpoint_error = Some(error);
-            }
-            next_checkpoint = Instant::now()
-                .checked_add(PORTABILITY_PROGRESS_INTERVAL)
-                .unwrap_or(completion_deadline)
-                .min(completion_deadline);
-        }
-        let wait = completion_deadline
-            .saturating_duration_since(Instant::now())
-            .min(PORTABILITY_PROGRESS_DRAIN_INTERVAL);
-        if let Ok(subphase) = phase_receiver.recv_timeout(wait) {
-            observe_macos_staged_native_phase(
-                &mut progress,
-                report,
-                suite_started,
-                execution_deadline,
-                subphase,
-            );
-        }
-    };
-    report.check(PHASE, started.elapsed(), result.clone());
-    let checkpoint_failed = progress.checkpoint_error.is_some();
-    if let Some(error) = progress.checkpoint_error {
-        report.check("portability-report-checkpoint", Duration::ZERO, Err(error));
-    }
-    checkpoint_portability_phase_complete(report)?;
-    if checkpoint_failed {
-        Err(FailureKind::Fixture)
-    } else {
-        result.map_err(|_| FailureKind::Child)
-    }
+    Ok(MacosStagedNativeWorker {
+        phase_receiver,
+        terminal_receiver,
+        worker_receipt,
+        worker_receipt_id,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -6913,6 +7509,17 @@ struct MacosStagedNativeProgress {
     last_subphase: Option<String>,
     checkpoint_error: Option<String>,
     manifest_passes: Option<crate::command::StagedNativeManifestPassCounts>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosStagedNativeProgress {
+    fn prelaunch(suite_started: Instant) -> Self {
+        Self {
+            last_transition_elapsed: Some(suite_started.elapsed()),
+            last_subphase: Some("prelaunch".to_owned()),
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7163,59 +7770,7 @@ fn verify_macos_staged_native_partition_for_integration() -> Result<(), String> 
             return Err("macOS partition terminal evidence lost typed chronology".to_owned());
         }
 
-        let tracker = portability_worker_tracker();
-        let baseline = *tracker
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (release_sender, release_receiver) = mpsc::sync_channel(0);
-        let mut retained_report = Report::new("macos-staged-partition-retained-verifier");
-        let retained_started = Instant::now();
-        let retained_execution = retained_started
-            .checked_add(Duration::from_millis(50))
-            .ok_or_else(|| "retained partition execution deadline overflowed".to_owned())?;
-        let retained_completion = retained_started
-            .checked_add(Duration::from_millis(150))
-            .ok_or_else(|| "retained partition completion deadline overflowed".to_owned())?;
-        let retained = run_macos_staged_native_toolchain_partition_with(
-            &root,
-            &mut retained_report,
-            retained_started,
-            retained_execution,
-            retained_completion,
-            move |_, _, _, phase_sender| {
-                phase_sender
-                    .send(crate::command::StagedNativeToolchainProgress::Phase(
-                        "blocked-fixture".to_owned(),
-                    ))
-                    .map_err(|error| format!("cannot send blocked partition phase: {error}"))?;
-                release_receiver
-                    .recv()
-                    .map_err(|error| format!("cannot release blocked partition fixture: {error}"))
-            },
-        );
-        if retained != Err(FailureKind::Child)
-            || !retained_report
-                .to_json()
-                .contains("\"workerState\":\"retained\"")
-        {
-            return Err("macOS partition did not retain timed-out worker ownership".to_owned());
-        }
-        release_sender
-            .send(())
-            .map_err(|error| format!("cannot release retained partition worker: {error}"))?;
-        let active = tracker
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (active, timeout) = tracker
-            .idle
-            .wait_timeout_while(active, Duration::from_secs(1), |active| *active > baseline)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if timeout.timed_out() || *active > baseline {
-            return Err("retained macOS partition worker did not reach eventual idle".to_owned());
-        }
-        Ok(())
+        verify_retained_macos_partition(&root)
     })();
     let cleanup = fs::remove_dir_all(&root)
         .map_err(|error| format!("cannot remove macOS partition fixture: {error}"));
@@ -7225,6 +7780,61 @@ fn verify_macos_staged_native_partition_for_integration() -> Result<(), String> 
         (Ok(()), Err(cleanup)) => Err(cleanup),
         (Err(primary), Err(cleanup)) => Err(format!("{primary}; {cleanup}")),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_retained_macos_partition(root: &Path) -> Result<(), String> {
+    let tracker = portability_worker_tracker();
+    let baseline = *tracker
+        .active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let mut report = Report::new("macos-staged-partition-retained-verifier");
+    let started = Instant::now();
+    let execution = started
+        .checked_add(Duration::from_millis(50))
+        .ok_or_else(|| "retained partition execution deadline overflowed".to_owned())?;
+    let completion = started
+        .checked_add(Duration::from_millis(150))
+        .ok_or_else(|| "retained partition completion deadline overflowed".to_owned())?;
+    let retained = run_macos_staged_native_toolchain_partition_with(
+        root,
+        &mut report,
+        started,
+        execution,
+        completion,
+        move |_, _, _, phase_sender| {
+            phase_sender
+                .send(crate::command::StagedNativeToolchainProgress::Phase(
+                    "blocked-fixture".to_owned(),
+                ))
+                .map_err(|error| format!("cannot send blocked partition phase: {error}"))?;
+            release_receiver
+                .recv()
+                .map_err(|error| format!("cannot release blocked partition fixture: {error}"))
+        },
+    );
+    if retained != Err(FailureKind::Child)
+        || !report.to_json().contains("\"workerState\":\"retained\"")
+    {
+        return Err("macOS partition did not retain timed-out worker ownership".to_owned());
+    }
+    release_sender
+        .send(())
+        .map_err(|error| format!("cannot release retained partition worker: {error}"))?;
+    let active = tracker
+        .active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (active, timeout) = tracker
+        .idle
+        .wait_timeout_while(active, Duration::from_secs(1), |active| *active > baseline)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if timeout.timed_out() || *active > baseline {
+        return Err("retained macOS partition worker did not reach eventual idle".to_owned());
+    }
+    Ok(())
 }
 
 fn checkpoint_portability_phase(
@@ -7277,7 +7887,7 @@ fn checkpoint_attributed_phase_with_progress(
     let elapsed = context.suite_started.elapsed();
     let execution_remaining = context
         .envelope
-        .execution_deadline
+        .execution
         .saturating_duration_since(Instant::now());
     let cleanup_remaining = context
         .envelope
@@ -7362,14 +7972,14 @@ fn checkpoint_attributed_phase_complete(
     Ok(())
 }
 
-fn fail_attributed_prelaunch(
+fn fail_attributed_prelaunch<T>(
     report: &mut Report,
     context: AttributedRunContext<'_>,
     progress: &mut PortabilityChildProgress,
     worker_receipt_id: Option<u64>,
     state: PortabilityCaseState,
     reason: String,
-) -> Result<(), FailureKind> {
+) -> Result<T, FailureKind> {
     progress.record_terminal(context.name, state);
     emit_attributed_progress_with_deadlines(context, "terminal", progress);
     let checkpoint_failed = if let Err(error) = report.checkpoint_phase_attribution_deadlines(
@@ -7378,7 +7988,7 @@ fn fail_attributed_prelaunch(
         progress.attribution(),
         context
             .envelope
-            .execution_deadline
+            .execution
             .saturating_duration_since(Instant::now()),
         context
             .envelope
@@ -7464,7 +8074,7 @@ fn emit_attributed_progress_with_deadlines(
         context.suite_started.elapsed().as_millis(),
         context
             .envelope
-            .execution_deadline
+            .execution
             .saturating_duration_since(now)
             .as_millis(),
         context
@@ -7504,7 +8114,7 @@ fn run_portability_cargo_command(
             suite: "portability",
             suite_started,
             envelope: SupervisionEnvelope {
-                execution_deadline: child_deadline,
+                execution: child_deadline,
                 child_completion_deadline: completion_deadline,
                 report_completion_deadline: completion_deadline,
             },
@@ -7536,228 +8146,45 @@ fn run_attributed_command(
     let name = context.name;
     let suite = context.suite;
     let suite_started = context.suite_started;
-    let child_deadline = context.envelope.execution_deadline;
+    let child_deadline = context.envelope.execution;
     let child_completion_deadline = context.envelope.child_completion_deadline;
     let report_completion_deadline = context.envelope.report_completion_deadline;
     let mut child_progress = seed.map_or_else(PortabilityChildProgress::default, |seed| {
         PortabilityChildProgress::seeded(suite, seed.0, seed.1, seed.2)
     });
     child_progress.suite = suite;
-    let timeout = child_deadline.saturating_duration_since(Instant::now());
-    if timeout.is_zero() {
-        if let Err(error) =
-            checkpoint_attributed_phase_with_progress(report, context, &child_progress)
-        {
-            report.check(
-                format!("{suite}-report-checkpoint"),
-                Duration::ZERO,
-                Err(format!("cannot persist prelaunch {suite} phase: {error:?}")),
-            );
-        }
-        return fail_attributed_prelaunch(
-            report,
-            context,
-            &mut child_progress,
-            None,
-            PortabilityCaseState::LaunchFailed,
-            format!("{suite} child deadline expired before launch"),
-        );
-    }
-    checkpoint_attributed_phase_with_progress(report, context, &child_progress)?;
-    let spec = build_spec(timeout);
-    let command_started = Instant::now();
-    let worker_sender = match attributed_worker_sender() {
-        Ok(sender) => sender,
-        Err(error) => {
-            return fail_attributed_prelaunch(
-                report,
-                context,
-                &mut child_progress,
-                None,
-                PortabilityCaseState::LaunchFailed,
-                error,
-            );
-        }
-    };
-    let worker_permit = match PortabilityWorkerPermit::acquire() {
-        Ok(permit) => permit,
-        Err(error) => {
-            return fail_attributed_prelaunch(
-                report,
-                context,
-                &mut child_progress,
-                None,
-                PortabilityCaseState::LaunchFailed,
-                error,
-            );
-        }
-    };
-    let worker_receipt_id = worker_permit.id;
-    let worker_receipt = AttributedWorkerReceipt::new(worker_receipt_id);
+    let AttributedCommandWorker {
+        spec,
+        command_started,
+        worker_receipt_id,
+        worker_receipt,
+        progress_receiver,
+        progress_loss,
+        terminal_receiver,
+    } = launch_attributed_command_worker(report, context, &mut child_progress, build_spec)?;
     let mut checkpoint_error = None;
-    let (progress, progress_receiver) =
-        SupervisedProgressObserver::bounded(PORTABILITY_PROGRESS_QUEUE_CAPACITY);
-    let progress_loss = progress.loss_receipt();
-    let (terminal_sender, terminal_receiver) = mpsc::sync_channel(1);
-    if worker_sender
-        .send(AttributedWorkerTask {
-            spec: spec.clone(),
-            execution_deadline: child_deadline,
-            child_completion_deadline,
-            progress,
-            terminal: terminal_sender,
-            receipt: worker_receipt.clone(),
-            permit: worker_permit,
-        })
-        .is_err()
-    {
-        worker_receipt.finish(AttributedWorkerState::Rejected);
-        return fail_attributed_prelaunch(
-            report,
-            context,
-            &mut child_progress,
-            Some(worker_receipt_id),
-            PortabilityCaseState::LaunchFailed,
-            "attributed command executor disconnected before launch".to_owned(),
-        );
-    }
-    let mut next_checkpoint = Instant::now()
-        .checked_add(PORTABILITY_PROGRESS_INTERVAL)
-        .unwrap_or(child_completion_deadline)
-        .min(child_completion_deadline);
-    let result = loop {
-        drain_portability_progress(&progress_receiver, &mut child_progress, name);
-        let remaining = child_completion_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            child_progress.emit_summary(name, progress_loss.snapshot());
-            child_progress.record_attribution(
-                name,
-                PortabilityAttributionEvent::Subphase("awaiting-terminal-receipt".to_owned()),
-            );
-            if let Err(error) = report.checkpoint_phase_attribution_deadlines(
-                name,
-                suite_started.elapsed(),
-                child_progress.attribution(),
-                Duration::ZERO,
-                Duration::ZERO,
-                report_completion_deadline.saturating_duration_since(Instant::now()),
-            ) {
-                checkpoint_error = Some(error.to_string());
-                report.check(
-                    format!("{suite}-report-checkpoint"),
-                    Duration::ZERO,
-                    Err(format!("cannot persist cleanup transition: {error}")),
-                );
-            }
-            break match receive_portability_terminal(
-                &terminal_receiver,
-                terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
-            ) {
-                PortabilityTerminal::Complete(AttributedWorkerTerminal::Complete(result)) => {
-                    PortabilityWorkerOutcome::Complete(result)
-                }
-                PortabilityTerminal::Complete(AttributedWorkerTerminal::Panicked) => {
-                    PortabilityWorkerOutcome::Panicked
-                }
-                PortabilityTerminal::Disconnected => PortabilityWorkerOutcome::ReceiptDisconnected,
-                PortabilityTerminal::Pending => PortabilityWorkerOutcome::CompletionDeadlineExpired,
-            };
-        }
-        match receive_portability_terminal(&terminal_receiver, child_completion_deadline) {
-            PortabilityTerminal::Complete(AttributedWorkerTerminal::Complete(result)) => {
-                drain_portability_progress(&progress_receiver, &mut child_progress, name);
-                child_progress.emit_summary(name, progress_loss.snapshot());
-                break PortabilityWorkerOutcome::Complete(result);
-            }
-            PortabilityTerminal::Complete(AttributedWorkerTerminal::Panicked) => {
-                child_progress.emit_summary(name, progress_loss.snapshot());
-                break PortabilityWorkerOutcome::Panicked;
-            }
-            PortabilityTerminal::Disconnected => {
-                child_progress.emit_summary(name, progress_loss.snapshot());
-                break PortabilityWorkerOutcome::ReceiptDisconnected;
-            }
-            PortabilityTerminal::Pending => {
-                if Instant::now() >= next_checkpoint {
-                    let elapsed = suite_started.elapsed();
-                    let execution_remaining =
-                        child_deadline.saturating_duration_since(Instant::now());
-                    let cleanup_remaining =
-                        child_completion_deadline.saturating_duration_since(Instant::now());
-                    let report_remaining =
-                        report_completion_deadline.saturating_duration_since(Instant::now());
-                    emit_attributed_progress_with_deadlines(context, "running", &child_progress);
-                    if checkpoint_error.is_none()
-                        && let Err(error) = report.checkpoint_phase_attribution_deadlines(
-                            name,
-                            elapsed,
-                            child_progress.attribution(),
-                            execution_remaining,
-                            cleanup_remaining,
-                            report_remaining,
-                        )
-                    {
-                        checkpoint_error = Some(error.to_string());
-                    }
-                    next_checkpoint = Instant::now()
-                        .checked_add(PORTABILITY_PROGRESS_INTERVAL)
-                        .unwrap_or(child_completion_deadline)
-                        .min(child_completion_deadline);
-                }
-            }
-        }
-    };
+    let result = wait_for_attributed_command_worker(
+        report,
+        context,
+        &mut child_progress,
+        &progress_receiver,
+        &progress_loss,
+        &terminal_receiver,
+        &mut checkpoint_error,
+    );
     drain_portability_progress(&progress_receiver, &mut child_progress, name);
     child_progress.retain_partial_line_evidence(report, name);
-    let worker_receipt_state = worker_receipt.wait_until(cleanup_observation_deadline(
-        terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
-        report_completion_deadline,
-    ));
-    report.evidence(
-        format!("{suite}-worker-receipt"),
-        JsonValue::Object(BTreeMap::from([
-            ("phase".to_owned(), JsonValue::String(name.to_owned())),
-            (
-                "workerReceiptId".to_owned(),
-                JsonValue::Number(worker_receipt.id),
-            ),
-            (
-                "workerState".to_owned(),
-                JsonValue::String(
-                    match worker_receipt_state {
-                        AttributedWorkerState::Owned => "owned",
-                        AttributedWorkerState::Completed => "completed",
-                        AttributedWorkerState::Panicked => "panicked",
-                        AttributedWorkerState::Rejected => "rejected",
-                    }
-                    .to_owned(),
-                ),
-            ),
-        ])),
-    );
-    let (worker_state, case_state) = match &result {
-        PortabilityWorkerOutcome::Complete(Ok(result)) if result.timed_out => {
-            ("completed", PortabilityCaseState::TimedOutCleaned)
-        }
-        PortabilityWorkerOutcome::Complete(Ok(result)) if !result.status.success() => {
-            ("failed", PortabilityCaseState::Failed)
-        }
-        PortabilityWorkerOutcome::Complete(Ok(_)) => ("completed", PortabilityCaseState::Completed),
-        PortabilityWorkerOutcome::Complete(Err(error))
-            if error.retained_cleanup_receipt().is_some() =>
-        {
-            ("cleanup-retained", PortabilityCaseState::Retained)
-        }
-        PortabilityWorkerOutcome::Complete(Err(_)) => ("failed", PortabilityCaseState::Failed),
-        PortabilityWorkerOutcome::CompletionDeadlineExpired => {
-            ("retained", PortabilityCaseState::Retained)
-        }
-        PortabilityWorkerOutcome::ReceiptDisconnected => (
-            "receipt-disconnected",
-            PortabilityCaseState::ReceiptDisconnected,
+    retain_attributed_worker_receipt(
+        report,
+        suite,
+        name,
+        &worker_receipt,
+        cleanup_observation_deadline(
+            terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
+            report_completion_deadline,
         ),
-        PortabilityWorkerOutcome::Panicked => ("panicked", PortabilityCaseState::Panicked),
-    };
+    );
+    let (worker_state, case_state) = attributed_worker_terminal_state(&result);
     child_progress.record_terminal(name, case_state);
     if checkpoint_error.is_none()
         && let Err(error) = report.checkpoint_phase_attribution_deadlines(
@@ -7780,41 +8207,7 @@ fn run_attributed_command(
         Some(worker_receipt_id),
         worker_state,
     );
-    let result = match result {
-        PortabilityWorkerOutcome::Complete(result) => result,
-        PortabilityWorkerOutcome::CompletionDeadlineExpired => {
-            retain_portability_capture_unavailable(report, suite, name);
-            report.check(
-                name,
-                command_started.elapsed(),
-                Err(format!(
-                    "{suite} command exceeded its absolute completion deadline"
-                )),
-            );
-            checkpoint_attributed_phase_complete(report, suite, Some(report_completion_deadline))?;
-            return Err(FailureKind::Child);
-        }
-        PortabilityWorkerOutcome::ReceiptDisconnected => {
-            retain_portability_capture_unavailable(report, suite, name);
-            report.check(
-                name,
-                command_started.elapsed(),
-                Err(format!("{suite} command terminal receipt disconnected")),
-            );
-            checkpoint_attributed_phase_complete(report, suite, Some(report_completion_deadline))?;
-            return Err(FailureKind::Child);
-        }
-        PortabilityWorkerOutcome::Panicked => {
-            retain_portability_capture_unavailable(report, suite, name);
-            report.check(
-                name,
-                command_started.elapsed(),
-                Err(format!("{suite} command worker panicked")),
-            );
-            checkpoint_attributed_phase_complete(report, suite, Some(report_completion_deadline))?;
-            return Err(FailureKind::Child);
-        }
-    };
+    let result = resolve_attributed_worker_outcome(report, context, command_started, result)?;
     retain_portability_terminal_capture(
         report,
         suite,
@@ -7852,6 +8245,290 @@ fn run_attributed_command(
     }
 }
 
+fn retain_attributed_worker_receipt(
+    report: &mut Report,
+    suite: &str,
+    phase: &str,
+    receipt: &AttributedWorkerReceipt,
+    deadline: Instant,
+) {
+    let state = match receipt.wait_until(deadline) {
+        AttributedWorkerState::Owned => "owned",
+        AttributedWorkerState::Completed => "completed",
+        AttributedWorkerState::Panicked => "panicked",
+        AttributedWorkerState::Rejected => "rejected",
+    };
+    report.evidence(
+        format!("{suite}-worker-receipt"),
+        JsonValue::Object(BTreeMap::from([
+            ("phase".to_owned(), JsonValue::String(phase.to_owned())),
+            ("workerReceiptId".to_owned(), JsonValue::Number(receipt.id)),
+            (
+                "workerState".to_owned(),
+                JsonValue::String(state.to_owned()),
+            ),
+        ])),
+    );
+}
+
+fn attributed_worker_terminal_state(
+    result: &AttributedCommandOutcome,
+) -> (&'static str, PortabilityCaseState) {
+    match result {
+        PortabilityWorkerOutcome::Complete(Ok(result)) if result.timed_out => {
+            ("completed", PortabilityCaseState::TimedOutCleaned)
+        }
+        PortabilityWorkerOutcome::Complete(Ok(result)) if !result.status.success() => {
+            ("failed", PortabilityCaseState::Failed)
+        }
+        PortabilityWorkerOutcome::Complete(Ok(_)) => ("completed", PortabilityCaseState::Completed),
+        PortabilityWorkerOutcome::Complete(Err(error))
+            if error.retained_cleanup_receipt().is_some() =>
+        {
+            ("cleanup-retained", PortabilityCaseState::Retained)
+        }
+        PortabilityWorkerOutcome::Complete(Err(_)) => ("failed", PortabilityCaseState::Failed),
+        PortabilityWorkerOutcome::CompletionDeadlineExpired => {
+            ("retained", PortabilityCaseState::Retained)
+        }
+        PortabilityWorkerOutcome::ReceiptDisconnected => (
+            "receipt-disconnected",
+            PortabilityCaseState::ReceiptDisconnected,
+        ),
+        PortabilityWorkerOutcome::Panicked => ("panicked", PortabilityCaseState::Panicked),
+    }
+}
+
+fn resolve_attributed_worker_outcome(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    command_started: Instant,
+    outcome: AttributedCommandOutcome,
+) -> Result<AttributedCommandResult, FailureKind> {
+    let reason = match outcome {
+        PortabilityWorkerOutcome::Complete(result) => return Ok(result),
+        PortabilityWorkerOutcome::CompletionDeadlineExpired => {
+            format!(
+                "{} command exceeded its absolute completion deadline",
+                context.suite
+            )
+        }
+        PortabilityWorkerOutcome::ReceiptDisconnected => {
+            format!("{} command terminal receipt disconnected", context.suite)
+        }
+        PortabilityWorkerOutcome::Panicked => {
+            format!("{} command worker panicked", context.suite)
+        }
+    };
+    retain_portability_capture_unavailable(report, context.suite, context.name);
+    report.check(context.name, command_started.elapsed(), Err(reason));
+    checkpoint_attributed_phase_complete(
+        report,
+        context.suite,
+        Some(context.envelope.report_completion_deadline),
+    )?;
+    Err(FailureKind::Child)
+}
+
+fn wait_for_attributed_command_worker(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    child_progress: &mut PortabilityChildProgress,
+    progress_receiver: &mpsc::Receiver<hell_testkit::SupervisedProgressChunk>,
+    progress_loss: &hell_testkit::SupervisedProgressLossReceipt,
+    terminal_receiver: &mpsc::Receiver<AttributedWorkerTerminal>,
+    checkpoint_error: &mut Option<String>,
+) -> AttributedCommandOutcome {
+    let child_deadline = context.envelope.execution;
+    let child_completion_deadline = context.envelope.child_completion_deadline;
+    let report_completion_deadline = context.envelope.report_completion_deadline;
+    let mut next_checkpoint = Instant::now()
+        .checked_add(PORTABILITY_PROGRESS_INTERVAL)
+        .unwrap_or(child_completion_deadline)
+        .min(child_completion_deadline);
+    loop {
+        drain_portability_progress(progress_receiver, child_progress, context.name);
+        let remaining = child_completion_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            child_progress.emit_summary(context.name, progress_loss.snapshot());
+            child_progress.record_attribution(
+                context.name,
+                PortabilityAttributionEvent::Subphase("awaiting-terminal-receipt".to_owned()),
+            );
+            if let Err(error) = report.checkpoint_phase_attribution_deadlines(
+                context.name,
+                context.suite_started.elapsed(),
+                child_progress.attribution(),
+                Duration::ZERO,
+                Duration::ZERO,
+                report_completion_deadline.saturating_duration_since(Instant::now()),
+            ) {
+                *checkpoint_error = Some(error.to_string());
+                report.check(
+                    format!("{}-report-checkpoint", context.suite),
+                    Duration::ZERO,
+                    Err(format!("cannot persist cleanup transition: {error}")),
+                );
+            }
+            return match receive_portability_terminal(
+                terminal_receiver,
+                terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
+            ) {
+                PortabilityTerminal::Complete(AttributedWorkerTerminal::Complete(result)) => {
+                    PortabilityWorkerOutcome::Complete(result)
+                }
+                PortabilityTerminal::Complete(AttributedWorkerTerminal::Panicked) => {
+                    PortabilityWorkerOutcome::Panicked
+                }
+                PortabilityTerminal::Disconnected => PortabilityWorkerOutcome::ReceiptDisconnected,
+                PortabilityTerminal::Pending => PortabilityWorkerOutcome::CompletionDeadlineExpired,
+            };
+        }
+        match receive_portability_terminal(terminal_receiver, child_completion_deadline) {
+            PortabilityTerminal::Complete(AttributedWorkerTerminal::Complete(result)) => {
+                drain_portability_progress(progress_receiver, child_progress, context.name);
+                child_progress.emit_summary(context.name, progress_loss.snapshot());
+                return PortabilityWorkerOutcome::Complete(result);
+            }
+            PortabilityTerminal::Complete(AttributedWorkerTerminal::Panicked) => {
+                child_progress.emit_summary(context.name, progress_loss.snapshot());
+                return PortabilityWorkerOutcome::Panicked;
+            }
+            PortabilityTerminal::Disconnected => {
+                child_progress.emit_summary(context.name, progress_loss.snapshot());
+                return PortabilityWorkerOutcome::ReceiptDisconnected;
+            }
+            PortabilityTerminal::Pending if Instant::now() >= next_checkpoint => {
+                emit_attributed_progress_with_deadlines(context, "running", child_progress);
+                if checkpoint_error.is_none()
+                    && let Err(error) = report.checkpoint_phase_attribution_deadlines(
+                        context.name,
+                        context.suite_started.elapsed(),
+                        child_progress.attribution(),
+                        child_deadline.saturating_duration_since(Instant::now()),
+                        child_completion_deadline.saturating_duration_since(Instant::now()),
+                        report_completion_deadline.saturating_duration_since(Instant::now()),
+                    )
+                {
+                    *checkpoint_error = Some(error.to_string());
+                }
+                next_checkpoint = Instant::now()
+                    .checked_add(PORTABILITY_PROGRESS_INTERVAL)
+                    .unwrap_or(child_completion_deadline)
+                    .min(child_completion_deadline);
+            }
+            PortabilityTerminal::Pending => {}
+        }
+    }
+}
+
+struct AttributedCommandWorker {
+    spec: CommandSpec,
+    command_started: Instant,
+    worker_receipt_id: u64,
+    worker_receipt: AttributedWorkerReceipt,
+    progress_receiver: mpsc::Receiver<hell_testkit::SupervisedProgressChunk>,
+    progress_loss: hell_testkit::SupervisedProgressLossReceipt,
+    terminal_receiver: mpsc::Receiver<AttributedWorkerTerminal>,
+}
+
+fn launch_attributed_command_worker(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    child_progress: &mut PortabilityChildProgress,
+    build_spec: impl FnOnce(Duration) -> CommandSpec,
+) -> Result<AttributedCommandWorker, FailureKind> {
+    let suite = context.suite;
+    let child_deadline = context.envelope.execution;
+    let child_completion_deadline = context.envelope.child_completion_deadline;
+    let timeout = child_deadline.saturating_duration_since(Instant::now());
+    if timeout.is_zero() {
+        if let Err(error) =
+            checkpoint_attributed_phase_with_progress(report, context, child_progress)
+        {
+            report.check(
+                format!("{suite}-report-checkpoint"),
+                Duration::ZERO,
+                Err(format!("cannot persist prelaunch {suite} phase: {error:?}")),
+            );
+        }
+        return fail_attributed_prelaunch(
+            report,
+            context,
+            child_progress,
+            None,
+            PortabilityCaseState::LaunchFailed,
+            format!("{suite} child deadline expired before launch"),
+        );
+    }
+    checkpoint_attributed_phase_with_progress(report, context, child_progress)?;
+    let spec = build_spec(timeout);
+    let command_started = Instant::now();
+    let worker_sender = match attributed_worker_sender() {
+        Ok(sender) => sender,
+        Err(error) => {
+            return fail_attributed_prelaunch(
+                report,
+                context,
+                child_progress,
+                None,
+                PortabilityCaseState::LaunchFailed,
+                error,
+            );
+        }
+    };
+    let worker_permit = match PortabilityWorkerPermit::acquire() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return fail_attributed_prelaunch(
+                report,
+                context,
+                child_progress,
+                None,
+                PortabilityCaseState::LaunchFailed,
+                error,
+            );
+        }
+    };
+    let worker_receipt_id = worker_permit.id;
+    let worker_receipt = AttributedWorkerReceipt::new(worker_receipt_id);
+    let (progress, progress_receiver) =
+        SupervisedProgressObserver::bounded(PORTABILITY_PROGRESS_QUEUE_CAPACITY);
+    let progress_loss = progress.loss_receipt();
+    let (terminal_sender, terminal_receiver) = mpsc::sync_channel(1);
+    if worker_sender
+        .send(AttributedWorkerTask {
+            spec: spec.clone(),
+            execution_deadline: child_deadline,
+            child_completion_deadline,
+            progress,
+            terminal: terminal_sender,
+            receipt: worker_receipt.clone(),
+            permit: worker_permit,
+        })
+        .is_err()
+    {
+        worker_receipt.finish(AttributedWorkerState::Rejected);
+        return fail_attributed_prelaunch(
+            report,
+            context,
+            child_progress,
+            Some(worker_receipt_id),
+            PortabilityCaseState::LaunchFailed,
+            "attributed command executor disconnected before launch".to_owned(),
+        );
+    }
+    Ok(AttributedCommandWorker {
+        spec,
+        command_started,
+        worker_receipt_id,
+        worker_receipt,
+        progress_receiver,
+        progress_loss,
+        terminal_receiver,
+    })
+}
+
 fn retain_portability_terminal_attribution(
     report: &mut Report,
     suite: &str,
@@ -7862,6 +8539,8 @@ fn retain_portability_terminal_attribution(
     worker_state: &str,
 ) {
     let attribution = progress.attribution();
+    let (failed_case, failed_case_unavailable) =
+        portability_failed_case_evidence(progress, loss, worker_state);
     report.evidence(
         format!("{suite}-terminal-attribution"),
         JsonValue::Object(BTreeMap::from([
@@ -7877,48 +8556,8 @@ fn retain_portability_terminal_attribution(
             ),
             ("droppedBytes".to_owned(), JsonValue::Number(loss.bytes)),
             ("droppedChunks".to_owned(), JsonValue::Number(loss.chunks)),
-            (
-                "failedCase".to_owned(),
-                (worker_state == "failed")
-                    .then_some(progress.failed_case.as_ref())
-                    .flatten()
-                    .map_or(JsonValue::Null, |failed| {
-                        JsonValue::Object(BTreeMap::from([
-                            ("case".to_owned(), JsonValue::String(failed.case.clone())),
-                            ("sequence".to_owned(), JsonValue::Number(failed.sequence)),
-                            (
-                                "stream".to_owned(),
-                                JsonValue::String(failed.stream.clone()),
-                            ),
-                            (
-                                "target".to_owned(),
-                                failed
-                                    .target
-                                    .clone()
-                                    .map_or(JsonValue::Null, JsonValue::String),
-                            ),
-                        ]))
-                    }),
-            ),
-            (
-                "failedCaseUnavailable".to_owned(),
-                (progress.failed_case.is_none() && worker_state == "failed")
-                    .then_some({
-                        if progress.case_line_truncated
-                            || progress.stdout_line_truncated
-                            || progress.stderr_line_truncated
-                        {
-                            "authoritative-case-line-truncated"
-                        } else if loss.chunks != 0 || loss.bytes != 0 {
-                            "progress-observation-loss"
-                        } else {
-                            "no-failed-case-observed"
-                        }
-                    })
-                    .map_or(JsonValue::Null, |reason| {
-                        JsonValue::String(reason.to_owned())
-                    }),
-            ),
+            ("failedCase".to_owned(), failed_case),
+            ("failedCaseUnavailable".to_owned(), failed_case_unavailable),
             ("phase".to_owned(), JsonValue::String(phase.to_owned())),
             (
                 "sequence".to_owned(),
@@ -7972,6 +8611,40 @@ fn retain_portability_terminal_attribution(
     );
 }
 
+fn portability_failed_case_evidence(
+    progress: &PortabilityChildProgress,
+    loss: hell_testkit::SupervisedProgressLoss,
+    worker_state: &str,
+) -> (JsonValue, JsonValue) {
+    let failed_case = (worker_state == "failed")
+        .then_some(progress.failed_case.as_ref())
+        .flatten()
+        .map_or(JsonValue::Null, |failed| {
+            JsonValue::Object(BTreeMap::from([
+                ("case".to_owned(), JsonValue::String(failed.case.clone())),
+                ("sequence".to_owned(), JsonValue::Number(failed.sequence)),
+                (
+                    "stream".to_owned(),
+                    JsonValue::String(failed.stream.clone()),
+                ),
+                (
+                    "target".to_owned(),
+                    failed
+                        .target
+                        .clone()
+                        .map_or(JsonValue::Null, JsonValue::String),
+                ),
+            ]))
+        });
+    let unavailable = if progress.failed_case.is_none() && worker_state == "failed" {
+        failed_case_unavailable_reason(progress, loss, progress.failed_case.is_some())
+            .map_or(JsonValue::Null, JsonValue::String)
+    } else {
+        JsonValue::Null
+    };
+    (failed_case, unavailable)
+}
+
 fn retain_portability_terminal_capture(
     report: &mut Report,
     suite: &str,
@@ -7985,67 +8658,7 @@ fn retain_portability_terminal_capture(
     };
     let mut evidence = BTreeMap::from([("phase".to_owned(), JsonValue::String(phase.to_owned()))]);
     match capture {
-        Some(capture) => {
-            evidence.insert(
-                "captureState".to_owned(),
-                JsonValue::String("complete".to_owned()),
-            );
-            evidence.insert(
-                "stdoutBytes".to_owned(),
-                JsonValue::Number(capture.stdout_bytes),
-            );
-            evidence.insert(
-                "stdoutSha256".to_owned(),
-                JsonValue::String(capture.stdout_sha256.hex()),
-            );
-            evidence.insert(
-                "stderrBytes".to_owned(),
-                JsonValue::Number(capture.stderr_bytes),
-            );
-            evidence.insert(
-                "stderrSha256".to_owned(),
-                JsonValue::String(capture.stderr_sha256.hex()),
-            );
-            evidence.insert(
-                "stdoutTruncated".to_owned(),
-                JsonValue::Bool(capture.stdout_truncated),
-            );
-            evidence.insert(
-                "stderrTruncated".to_owned(),
-                JsonValue::Bool(capture.stderr_truncated),
-            );
-            evidence.insert(
-                "cleanupReceiptId".to_owned(),
-                capture
-                    .cleanup_id
-                    .map_or(JsonValue::Null, JsonValue::Number),
-            );
-            evidence.insert(
-                "cleanupState".to_owned(),
-                JsonValue::String("completed".to_owned()),
-            );
-            evidence.insert("lifecycleIdle".to_owned(), JsonValue::Bool(true));
-            evidence.insert(
-                "terminationForced".to_owned(),
-                JsonValue::Bool(capture.termination_forced),
-            );
-            evidence.insert(
-                "terminationReaped".to_owned(),
-                JsonValue::Bool(capture.termination_reaped),
-            );
-            evidence.insert(
-                "processGroupTerminationRequested".to_owned(),
-                JsonValue::Bool(capture.termination_forced),
-            );
-            evidence.insert(
-                "leaderReaped".to_owned(),
-                JsonValue::Bool(capture.termination_reaped),
-            );
-            evidence.insert(
-                "candidateQuiescenceComplete".to_owned(),
-                JsonValue::Bool(capture.candidate_quiescence_complete),
-            );
-        }
+        Some(capture) => retain_completed_portability_capture(&mut evidence, capture),
         None => {
             evidence.insert(
                 "captureState".to_owned(),
@@ -8054,46 +8667,7 @@ fn retain_portability_terminal_capture(
         }
     }
     if let Err(error) = result {
-        if let Some(receipt) = error.retained_cleanup_receipt() {
-            let snapshot = receipt.wait_until(observation_deadline);
-            evidence.insert(
-                "cleanupReceiptId".to_owned(),
-                JsonValue::Number(receipt.id()),
-            );
-            match snapshot.state {
-                hell_testkit::RetainedTerminationState::Owned => {
-                    evidence.insert(
-                        "cleanupState".to_owned(),
-                        JsonValue::String("owned".to_owned()),
-                    );
-                }
-                hell_testkit::RetainedTerminationState::Completed(termination) => {
-                    evidence.insert(
-                        "cleanupState".to_owned(),
-                        JsonValue::String("completed".to_owned()),
-                    );
-                    evidence.insert(
-                        "terminationForced".to_owned(),
-                        JsonValue::Bool(termination.forced),
-                    );
-                    evidence.insert(
-                        "terminationReaped".to_owned(),
-                        JsonValue::Bool(termination.reaped),
-                    );
-                }
-                hell_testkit::RetainedTerminationState::Failed(cleanup) => {
-                    evidence.insert(
-                        "cleanupState".to_owned(),
-                        JsonValue::String("failed".to_owned()),
-                    );
-                    evidence.insert("cleanupError".to_owned(), JsonValue::String(cleanup));
-                }
-            }
-            evidence.insert(
-                "lifecycleIdle".to_owned(),
-                JsonValue::Bool(snapshot.lifecycle_idle),
-            );
-        }
+        retain_portability_cleanup_receipt(&mut evidence, error, observation_deadline);
         if let Some(receipt) = error.supervised_io_receipt() {
             let snapshot = receipt.wait_until(observation_deadline);
             retain_supervised_io_snapshot(&mut evidence, &snapshot);
@@ -8128,6 +8702,120 @@ fn retain_portability_terminal_capture(
     report.evidence(
         format!("{suite}-terminal-capture"),
         JsonValue::Object(evidence),
+    );
+}
+
+fn retain_completed_portability_capture(
+    evidence: &mut BTreeMap<String, JsonValue>,
+    capture: &crate::command::CommandResult,
+) {
+    evidence.insert(
+        "captureState".to_owned(),
+        JsonValue::String("complete".to_owned()),
+    );
+    evidence.insert(
+        "stdoutBytes".to_owned(),
+        JsonValue::Number(capture.stdout_bytes),
+    );
+    evidence.insert(
+        "stdoutSha256".to_owned(),
+        JsonValue::String(capture.stdout_sha256.hex()),
+    );
+    evidence.insert(
+        "stderrBytes".to_owned(),
+        JsonValue::Number(capture.stderr_bytes),
+    );
+    evidence.insert(
+        "stderrSha256".to_owned(),
+        JsonValue::String(capture.stderr_sha256.hex()),
+    );
+    evidence.insert(
+        "stdoutTruncated".to_owned(),
+        JsonValue::Bool(capture.stdout_truncated),
+    );
+    evidence.insert(
+        "stderrTruncated".to_owned(),
+        JsonValue::Bool(capture.stderr_truncated),
+    );
+    evidence.insert(
+        "cleanupReceiptId".to_owned(),
+        capture
+            .termination
+            .cleanup_id
+            .map_or(JsonValue::Null, JsonValue::Number),
+    );
+    evidence.insert(
+        "cleanupState".to_owned(),
+        JsonValue::String("completed".to_owned()),
+    );
+    evidence.insert("lifecycleIdle".to_owned(), JsonValue::Bool(true));
+    evidence.insert(
+        "terminationForced".to_owned(),
+        JsonValue::Bool(capture.termination.forced),
+    );
+    evidence.insert(
+        "terminationReaped".to_owned(),
+        JsonValue::Bool(capture.termination.reaped),
+    );
+    evidence.insert(
+        "processGroupTerminationRequested".to_owned(),
+        JsonValue::Bool(capture.termination.forced),
+    );
+    evidence.insert(
+        "leaderReaped".to_owned(),
+        JsonValue::Bool(capture.termination.reaped),
+    );
+    evidence.insert(
+        "candidateQuiescenceComplete".to_owned(),
+        JsonValue::Bool(capture.termination.candidate_quiescence_complete),
+    );
+}
+
+fn retain_portability_cleanup_receipt(
+    evidence: &mut BTreeMap<String, JsonValue>,
+    error: &crate::command::CommandRunError,
+    observation_deadline: Instant,
+) {
+    let Some(receipt) = error.retained_cleanup_receipt() else {
+        return;
+    };
+    let snapshot = receipt.wait_until(observation_deadline);
+    evidence.insert(
+        "cleanupReceiptId".to_owned(),
+        JsonValue::Number(receipt.id()),
+    );
+    match snapshot.state {
+        hell_testkit::RetainedTerminationState::Owned => {
+            evidence.insert(
+                "cleanupState".to_owned(),
+                JsonValue::String("owned".to_owned()),
+            );
+        }
+        hell_testkit::RetainedTerminationState::Completed(termination) => {
+            evidence.insert(
+                "cleanupState".to_owned(),
+                JsonValue::String("completed".to_owned()),
+            );
+            evidence.insert(
+                "terminationForced".to_owned(),
+                JsonValue::Bool(termination.forced),
+            );
+            evidence.insert(
+                "terminationReaped".to_owned(),
+                JsonValue::Bool(termination.reaped),
+            );
+        }
+        hell_testkit::RetainedTerminationState::Failed(cleanup) => {
+            evidence.insert(
+                "cleanupState".to_owned(),
+                JsonValue::String("failed".to_owned()),
+            );
+            evidence.insert("cleanupError".to_owned(), JsonValue::String(cleanup));
+        }
+    }
+    evidence.insert(
+        "lifecycleIdle".to_owned(),
+        JsonValue::Bool(snapshot.lifecycle_idle),
     );
 }
 
@@ -8540,150 +9228,18 @@ fn external_supervisor_terminal_evidence(
     terminal: &ExternalSupervisorTerminal,
     request_sha256: Digest,
 ) -> JsonValue {
-    JsonValue::Object(BTreeMap::from([
-        (
-            "cleanupTerminal".to_owned(),
-            JsonValue::Bool(terminal.cleanup_terminal),
-        ),
-        (
-            "cleanupState".to_owned(),
-            JsonValue::String(terminal.cleanup_state.clone()),
-        ),
-        (
-            "cleanupError".to_owned(),
-            terminal
-                .cleanup_error
-                .clone()
-                .map_or(JsonValue::Null, JsonValue::String),
-        ),
-        (
-            "cleanupFailures".to_owned(),
-            JsonValue::Array(
-                terminal
-                    .cleanup_failures
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
-        ),
-        (
-            "cleanupId".to_owned(),
-            terminal
-                .cleanup_id
-                .map_or(JsonValue::Null, JsonValue::Number),
-        ),
-        (
-            "processGroupTerminationRequested".to_owned(),
-            JsonValue::Bool(terminal.termination_requested),
-        ),
-        (
-            "containmentScope".to_owned(),
-            JsonValue::String(
-                if cfg!(windows) {
-                    "supervisor-owned-kill-on-close-job-plus-leader-reap"
-                } else {
-                    "process-group-termination-request-plus-leader-reap"
-                }
-                .to_owned(),
-            ),
-        ),
-        (
-            "leaderReaped".to_owned(),
-            JsonValue::Bool(terminal.leader_reaped),
-        ),
-        (
-            "candidateQuiescenceComplete".to_owned(),
-            JsonValue::Bool(terminal.candidate_quiescence_complete),
-        ),
+    let mut evidence = BTreeMap::from([
         (
             "detail".to_owned(),
             JsonValue::String(terminal.detail.clone()),
         ),
         (
             "attribution".to_owned(),
-            JsonValue::Object(BTreeMap::from([
-                (
-                    "case".to_owned(),
-                    terminal
-                        .attribution
-                        .case
-                        .clone()
-                        .map_or(JsonValue::Null, JsonValue::String),
-                ),
-                (
-                    "caseState".to_owned(),
-                    terminal
-                        .attribution
-                        .case_state
-                        .clone()
-                        .map_or(JsonValue::Null, JsonValue::String),
-                ),
-                (
-                    "sequence".to_owned(),
-                    JsonValue::Number(terminal.attribution.sequence),
-                ),
-                (
-                    "transitionElapsedMillis".to_owned(),
-                    terminal
-                        .attribution
-                        .transition_elapsed
-                        .map_or(JsonValue::Null, |elapsed| {
-                            JsonValue::Number(
-                                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                            )
-                        }),
-                ),
-                (
-                    "subphase".to_owned(),
-                    terminal
-                        .attribution
-                        .subphase
-                        .clone()
-                        .map_or(JsonValue::Null, JsonValue::String),
-                ),
-                (
-                    "target".to_owned(),
-                    terminal
-                        .attribution
-                        .target
-                        .clone()
-                        .map_or(JsonValue::Null, JsonValue::String),
-                ),
-            ])),
+            external_supervisor_attribution_evidence(terminal),
         ),
         (
             "failedCase".to_owned(),
-            terminal
-                .failed_case
-                .as_ref()
-                .map_or(JsonValue::Null, |failed| {
-                    JsonValue::Object(BTreeMap::from([
-                        ("case".to_owned(), JsonValue::String(failed.case.clone())),
-                        ("sequence".to_owned(), JsonValue::Number(failed.sequence)),
-                        (
-                            "stream".to_owned(),
-                            JsonValue::String(failed.stream.clone()),
-                        ),
-                        (
-                            "target".to_owned(),
-                            failed
-                                .target
-                                .clone()
-                                .map_or(JsonValue::Null, JsonValue::String),
-                        ),
-                        (
-                            "transitionElapsedMillis".to_owned(),
-                            failed
-                                .transition_elapsed
-                                .map_or(JsonValue::Null, |elapsed| {
-                                    JsonValue::Number(
-                                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                                    )
-                                }),
-                        ),
-                    ]))
-                }),
+            external_supervisor_failed_case_evidence(terminal),
         ),
         (
             "failedCaseUnavailable".to_owned(),
@@ -8718,7 +9274,7 @@ fn external_supervisor_terminal_evidence(
         (
             "captureState".to_owned(),
             JsonValue::String(
-                if terminal.capture_available {
+                if terminal.capture.available {
                     "available"
                 } else {
                     "unavailable"
@@ -8746,7 +9302,7 @@ fn external_supervisor_terminal_evidence(
         ),
         (
             "stderrTruncated".to_owned(),
-            JsonValue::Bool(terminal.stderr_truncated),
+            JsonValue::Bool(terminal.capture.stderr_truncated),
         ),
         (
             "stdoutBytes".to_owned(),
@@ -8758,11 +9314,167 @@ fn external_supervisor_terminal_evidence(
         ),
         (
             "stdoutTruncated".to_owned(),
-            JsonValue::Bool(terminal.stdout_truncated),
+            JsonValue::Bool(terminal.capture.stdout_truncated),
         ),
-        ("success".to_owned(), JsonValue::Bool(terminal.success)),
-        ("timedOut".to_owned(), JsonValue::Bool(terminal.timed_out)),
+        (
+            "success".to_owned(),
+            JsonValue::Bool(terminal.execution.success),
+        ),
+        (
+            "timedOut".to_owned(),
+            JsonValue::Bool(terminal.execution.timed_out),
+        ),
+    ]);
+    evidence.extend(external_supervisor_cleanup_evidence(terminal));
+    JsonValue::Object(evidence)
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_cleanup_evidence(
+    terminal: &ExternalSupervisorTerminal,
+) -> BTreeMap<String, JsonValue> {
+    BTreeMap::from([
+        (
+            "cleanupTerminal".to_owned(),
+            JsonValue::Bool(terminal.cleanup.terminal),
+        ),
+        (
+            "cleanupState".to_owned(),
+            JsonValue::String(terminal.cleanup_state.clone()),
+        ),
+        (
+            "cleanupError".to_owned(),
+            terminal
+                .cleanup_error
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        (
+            "cleanupFailures".to_owned(),
+            JsonValue::Array(
+                terminal
+                    .cleanup_failures
+                    .iter()
+                    .cloned()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
+        ),
+        (
+            "cleanupId".to_owned(),
+            terminal
+                .cleanup_id
+                .map_or(JsonValue::Null, JsonValue::Number),
+        ),
+        (
+            "processGroupTerminationRequested".to_owned(),
+            JsonValue::Bool(terminal.cleanup.termination_requested),
+        ),
+        (
+            "containmentScope".to_owned(),
+            JsonValue::String(
+                if cfg!(windows) {
+                    "supervisor-owned-kill-on-close-job-plus-leader-reap"
+                } else {
+                    "process-group-termination-request-plus-leader-reap"
+                }
+                .to_owned(),
+            ),
+        ),
+        (
+            "leaderReaped".to_owned(),
+            JsonValue::Bool(terminal.cleanup.leader_reaped),
+        ),
+        (
+            "candidateQuiescenceComplete".to_owned(),
+            JsonValue::Bool(terminal.candidate_quiescence_complete),
+        ),
+    ])
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_attribution_evidence(terminal: &ExternalSupervisorTerminal) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        (
+            "case".to_owned(),
+            terminal
+                .attribution
+                .case
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        (
+            "caseState".to_owned(),
+            terminal
+                .attribution
+                .case_state
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        (
+            "sequence".to_owned(),
+            JsonValue::Number(terminal.attribution.sequence),
+        ),
+        (
+            "transitionElapsedMillis".to_owned(),
+            terminal
+                .attribution
+                .transition_elapsed
+                .map_or(JsonValue::Null, |elapsed| {
+                    JsonValue::Number(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                }),
+        ),
+        (
+            "subphase".to_owned(),
+            terminal
+                .attribution
+                .subphase
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        (
+            "target".to_owned(),
+            terminal
+                .attribution
+                .target
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
     ]))
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_failed_case_evidence(terminal: &ExternalSupervisorTerminal) -> JsonValue {
+    terminal
+        .failed_case
+        .as_ref()
+        .map_or(JsonValue::Null, |failed| {
+            JsonValue::Object(BTreeMap::from([
+                ("case".to_owned(), JsonValue::String(failed.case.clone())),
+                ("sequence".to_owned(), JsonValue::Number(failed.sequence)),
+                (
+                    "stream".to_owned(),
+                    JsonValue::String(failed.stream.clone()),
+                ),
+                (
+                    "target".to_owned(),
+                    failed
+                        .target
+                        .clone()
+                        .map_or(JsonValue::Null, JsonValue::String),
+                ),
+                (
+                    "transitionElapsedMillis".to_owned(),
+                    failed
+                        .transition_elapsed
+                        .map_or(JsonValue::Null, |elapsed| {
+                            JsonValue::Number(
+                                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                            )
+                        }),
+                ),
+            ]))
+        })
 }
 
 #[cfg(windows)]
@@ -9990,9 +10702,7 @@ fn windows_supervisor_request_fields(
         session.request_path.as_os_str().to_owned(),
         session.late_receipt_path.as_os_str().to_owned(),
         nonce.hex().into(),
-        remaining_millis(envelope.execution_deadline)
-            .to_string()
-            .into(),
+        remaining_millis(envelope.execution).to_string().into(),
         remaining_millis(envelope.child_completion_deadline)
             .to_string()
             .into(),
@@ -11360,8 +12070,8 @@ fn prepare_windows_external_supervisor(
 ) -> Result<WindowsExternalPrepared, WindowsExternalStartFailure> {
     let startup_cleanup_deadline = phase_started
         .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
-        .unwrap_or(envelope.execution_deadline)
-        .min(envelope.execution_deadline);
+        .unwrap_or(envelope.execution)
+        .min(envelope.execution);
     let startup_deadline = startup_cleanup_deadline
         .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
         .ok_or_else(|| "Windows supervisor startup cleanup reserve underflowed".to_owned())?;
@@ -11389,8 +12099,7 @@ fn prepare_windows_external_supervisor(
         WindowsSupervisorSession::create(session_parent, &seed_digest.0, startup_deadline)?;
     let prepared = (|| {
         let late_receipt = session.create_late_receipt(startup_deadline)?;
-        let manifest =
-            encode_windows_nightly_authority_manifest(authority, envelope.execution_deadline)?;
+        let manifest = encode_windows_nightly_authority_manifest(authority, envelope.execution)?;
         let (manifest_receipt, manifest_sha256) =
             session.seal_authority_manifest(&manifest, startup_deadline)?;
         let fields = windows_supervisor_request_fields(WindowsSupervisorRequestFields {
@@ -11545,7 +12254,7 @@ fn prepare_windows_external_supervisor(
         nonce,
         manifest_sha256,
         startup_cleanup_deadline,
-        ownership_deadline: envelope.execution_deadline,
+        ownership_deadline: envelope.execution,
         ownership_cleanup_deadline: envelope.child_completion_deadline,
     })
 }
@@ -12480,7 +13189,7 @@ pub(crate) fn run_external_nightly_supervisor(
             .ok_or_else(|| format!("Windows supervisor {field} deadline overflowed"))
     };
     let envelope = SupervisionEnvelope {
-        execution_deadline: deadline_from_remaining(execution, "execution")?,
+        execution: deadline_from_remaining(execution, "execution")?,
         child_completion_deadline: deadline_from_remaining(cleanup, "cleanup")?,
         report_completion_deadline: deadline_from_remaining(report, "report")?,
     };
@@ -12495,7 +13204,7 @@ pub(crate) fn run_external_nightly_supervisor(
             )
         })
         .transpose()?;
-    if envelope.execution_deadline >= envelope.child_completion_deadline
+    if envelope.execution >= envelope.child_completion_deadline
         || envelope.child_completion_deadline >= envelope.report_completion_deadline
         || envelope.report_completion_deadline > lifetime_deadline
     {
@@ -12514,7 +13223,7 @@ pub(crate) fn run_external_nightly_supervisor(
     };
     let received_cleanup_reserve = envelope
         .report_completion_deadline
-        .saturating_duration_since(envelope.execution_deadline);
+        .saturating_duration_since(envelope.execution);
     let received_report_reserve = envelope
         .report_completion_deadline
         .saturating_duration_since(envelope.child_completion_deadline);
@@ -12725,8 +13434,8 @@ pub(crate) fn run_external_nightly_supervisor(
             nonce,
             deadline: lifetime_deadline,
         })?;
-    protect_windows_supervisor_session(&session_path, envelope.execution_deadline)?;
-    protect_windows_supervisor_receipt(&late_receipt_path, envelope.execution_deadline)?;
+    protect_windows_supervisor_session(&session_path, envelope.execution)?;
+    protect_windows_supervisor_receipt(&late_receipt_path, envelope.execution)?;
     if windows_file_receipt(&root_guard)? != root_receipt
         || windows_file_receipt(&writable_target_guard)? != writable_target_receipt
         || windows_file_receipt(&session_guard)? != session_receipt
@@ -12745,10 +13454,8 @@ pub(crate) fn run_external_nightly_supervisor(
         &windows_supervisor_frame(1, request_sha256, nonce, &[])?,
     )?;
     drop(observations);
-    let imported_authority = import_windows_nightly_authority_manifest(
-        &authority_manifest_bytes,
-        envelope.execution_deadline,
-    )?;
+    let imported_authority =
+        import_windows_nightly_authority_manifest(&authority_manifest_bytes, envelope.execution)?;
     let probe_executable = fs::canonicalize(
         std::env::current_exe()
             .map_err(|error| format!("cannot locate Windows session probe: {error}"))?,
@@ -12772,11 +13479,11 @@ pub(crate) fn run_external_nightly_supervisor(
         probe,
         &writable_target,
         None,
-        envelope.execution_deadline,
+        envelope.execution,
     )?;
     let (probe_progress, _probe_progress_receiver) = SupervisedProgressObserver::bounded(8);
     let probe_result = probe.run_until(
-        envelope.execution_deadline,
+        envelope.execution,
         envelope.child_completion_deadline,
         probe_progress,
     );
@@ -12814,7 +13521,7 @@ pub(crate) fn run_external_nightly_supervisor(
         let cleanup_deadline = envelope
             .child_completion_deadline
             .checked_sub(TERMINAL_PERSISTENCE_RESERVE)
-            .unwrap_or(envelope.execution_deadline);
+            .unwrap_or(envelope.execution);
         let cleanup = imported_authority.close_until(cleanup_deadline);
         let detail = match cleanup {
             Ok(()) => format!("precommit-control-failed:{primary}"),
@@ -13072,7 +13779,7 @@ pub(crate) fn run_external_nightly_supervisor(
                 spec,
                 &writable_target,
                 (!imported_authority.root.as_os_str().is_empty()).then_some(&imported_authority),
-                envelope.execution_deadline,
+                envelope.execution,
             )?;
             let result = execute_external_supervisor_command(
                 spec,
@@ -13136,7 +13843,7 @@ pub(crate) fn run_external_nightly_supervisor(
                 )?;
                 drop(workspace_file);
             }
-            if terminal.success && combined {
+            if terminal.execution.success && combined {
                 let core_plan = plan
                     .combined_followup()
                     .ok_or_else(|| "Windows combined follow-up plan is absent".to_owned())?;
@@ -13171,7 +13878,7 @@ pub(crate) fn run_external_nightly_supervisor(
                     core_plan.command(&root, core_timeout),
                     &writable_target,
                     Some(&imported_authority),
-                    core_envelope.execution_deadline,
+                    core_envelope.execution,
                 )?;
                 let core_result = execute_external_supervisor_command(
                     core_spec,
@@ -13248,12 +13955,12 @@ pub(crate) fn run_external_nightly_supervisor(
     ) {
         Ok((successor, failure)) => {
             if let Some(error) = failure {
-                terminal.success = false;
+                terminal.execution.success = false;
                 if terminal.failed_case.is_none() && terminal.failed_case_unavailable.is_none() {
                     terminal.failed_case_unavailable =
                         Some("process-cleanup-failure-without-test-failure".to_owned());
                 }
-                terminal.cleanup_terminal = false;
+                terminal.cleanup.terminal = false;
                 terminal.cleanup_state = "failed".to_owned();
                 terminal.cleanup_failures.push(format!(
                     "windows-toolchain-authority:failed: {}",
@@ -13268,12 +13975,12 @@ pub(crate) fn run_external_nightly_supervisor(
             Some(successor)
         }
         Err(error) => {
-            terminal.success = false;
+            terminal.execution.success = false;
             if terminal.failed_case.is_none() && terminal.failed_case_unavailable.is_none() {
                 terminal.failed_case_unavailable =
                     Some("process-cleanup-failure-without-test-failure".to_owned());
             }
-            terminal.cleanup_terminal = false;
+            terminal.cleanup.terminal = false;
             terminal.cleanup_state = "failed".to_owned();
             terminal.cleanup_failures.push(format!(
                 "windows-toolchain-authority:failed: {}",
@@ -13912,7 +14619,7 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
                     },
                 )?;
                 if let Some(authority) = authority.as_deref_mut() {
-                    authority.prepare_cleanup_transfer(envelope.execution_deadline)?;
+                    authority.prepare_cleanup_transfer(envelope.execution)?;
                 }
                 if fixture.is_some_and(|fixture| {
                     fixture.stage == WindowsReporterExitStage::AuthorityImported
@@ -14342,7 +15049,7 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
         plan.name(),
         PortabilityAttributionEvent::Case(
             terminal_case,
-            if terminal.success {
+            if terminal.execution.success {
                 PortabilityCaseState::Completed
             } else {
                 PortabilityCaseState::Failed
@@ -14350,17 +15057,18 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
         ),
     );
     checkpoint_attributed_phase_with_progress(report, context, &progress)?;
-    let primary = if terminal.success && terminal.cleanup_terminal && supervisor_status == 0 {
-        None
-    } else {
-        Some(format!(
-            "{}: {}; cleanup terminal: {}; supervisor status: {}",
-            plan.name(),
-            terminal.detail,
-            terminal.cleanup_terminal,
-            supervisor_status
-        ))
-    };
+    let primary =
+        if terminal.execution.success && terminal.cleanup.terminal && supervisor_status == 0 {
+            None
+        } else {
+            Some(format!(
+                "{}: {}; cleanup terminal: {}; supervisor status: {}",
+                plan.name(),
+                terminal.detail,
+                terminal.cleanup.terminal,
+                supervisor_status
+            ))
+        };
     let result = match (primary, session_cleanup) {
         (None, Ok(())) => Ok(()),
         (Some(primary), Ok(())) => Err(primary),
@@ -14372,7 +15080,7 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
     let passed = result.is_ok();
     let completed_workspace = workspace_terminal
         .as_ref()
-        .is_some_and(|workspace| workspace.success && workspace.cleanup_terminal);
+        .is_some_and(|workspace| workspace.execution.success && workspace.cleanup.terminal);
     if completed_workspace {
         report.check(plan.name(), suite_started.elapsed(), Ok(()));
     }
@@ -14469,7 +15177,7 @@ pub(crate) fn run_windows_external_supervisor_reporter_fixture(
     let report_path = PathBuf::from(report_path);
     let root = Path::new(root);
     let envelope = SupervisionEnvelope {
-        execution_deadline,
+        execution: execution_deadline,
         child_completion_deadline,
         report_completion_deadline: outer_deadline,
     };
@@ -14478,7 +15186,7 @@ pub(crate) fn run_windows_external_supervisor_reporter_fixture(
             WindowsReporterBorrowedAuthority::bind_until(
                 Path::new(session_parent),
                 Path::new(authority_root),
-                envelope.execution_deadline,
+                envelope.execution,
             )?
         }
     };
@@ -14741,7 +15449,9 @@ fn windows_csv_fields(line: &str) -> Result<Vec<String>, String> {
 
 #[cfg(windows)]
 fn require_windows_process_absent(pid: u32, deadline: Instant) -> Result<(), String> {
-    let system_root = std::env::var_os("SystemRoot")
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
         .map(PathBuf::from)
         .ok_or_else(|| "Windows system root is absent".to_owned())?;
     let tasklist = system_root.join("System32").join("tasklist.exe");
@@ -14862,14 +15572,14 @@ fn verify_windows_cargo_authority_for_integration(
     let mut authority = crate::release::platform::NightlyWindowsLaunchAuthority::acquire_until(
         root,
         &target,
-        envelope.execution_deadline,
+        envelope.execution,
         envelope.child_completion_deadline,
     )?;
     let staged_root = authority.staged_root().to_path_buf();
     verify_windows_external_supervisor_no_go_for_integration(
         root,
         session_parent,
-        envelope.execution_deadline,
+        envelope.execution,
         Some(&authority),
     )?;
     let mut report = Report::new("windows-nightly-authority-probe");
@@ -15991,10 +16701,10 @@ impl WindowsReporterExitObservation {
                 }
                 let terminal =
                     decode_external_supervisor_terminal(&late, self.request_sha256, self.nonce)?;
-                if !terminal.success
-                    || !terminal.cleanup_terminal
-                    || !terminal.capture_available
-                    || !terminal.leader_reaped
+                if !terminal.execution.success
+                    || !terminal.cleanup.terminal
+                    || !terminal.capture.available
+                    || !terminal.cleanup.leader_reaped
                     || terminal.cleanup_state != "completed"
                     || !terminal.cleanup_failures.is_empty()
                     || terminal.dropped_chunks == 0
@@ -16745,7 +17455,7 @@ fn retain_external_supervisor_lifecycle(
     report: &mut Report,
     plan: ExternalSupervisorPlan,
     started: &ExternalSupervisorStarted,
-    observation: ExternalSupervisorLifecycleObservation<'_>,
+    observation: &ExternalSupervisorLifecycleObservation<'_>,
 ) {
     report.evidence(
         format!("{}-external-supervisor-lifecycle", plan.name()),
@@ -16805,7 +17515,7 @@ fn persist_external_supervisor_terminal_outcome(
         report,
         plan,
         started,
-        ExternalSupervisorLifecycleObservation {
+        &ExternalSupervisorLifecycleObservation {
             state: "terminal-authenticated",
             terminal,
             cleanup_receipted: false,
@@ -16826,21 +17536,21 @@ fn persist_external_supervisor_terminal_outcome(
         plan.name(),
         PortabilityAttributionEvent::Case(
             terminal_case,
-            if terminal.success {
+            if terminal.execution.success {
                 PortabilityCaseState::Completed
             } else {
                 PortabilityCaseState::Failed
             },
         ),
     );
-    let result = if terminal.success && terminal.cleanup_terminal {
+    let result = if terminal.execution.success && terminal.cleanup.terminal {
         Ok(())
     } else {
         Err(format!(
             "{}: {}; cleanup terminal: {}",
             plan.name(),
             terminal.detail,
-            terminal.cleanup_terminal
+            terminal.cleanup.terminal
         ))
     };
     let passed = result.is_ok();
@@ -16902,7 +17612,7 @@ fn retain_external_supervisor_exit_owned(
     context: AttributedRunContext<'_>,
     progress: &mut PortabilityChildProgress,
     started: &ExternalSupervisorStarted,
-    retained: ExternalSupervisorRetainedExit<'_>,
+    retained: &ExternalSupervisorRetainedExit<'_>,
 ) -> Result<(), FailureKind> {
     progress.record_attribution(
         context.name,
@@ -16912,7 +17622,7 @@ fn retain_external_supervisor_exit_owned(
         report,
         retained.plan,
         started,
-        ExternalSupervisorLifecycleObservation {
+        &ExternalSupervisorLifecycleObservation {
             state: retained.state,
             terminal: retained.terminal,
             cleanup_receipted: retained.cleanup_receipted,
@@ -17013,17 +17723,97 @@ fn finish_external_supervisor_after_control_failure(
     report: &mut Report,
     context: AttributedRunContext<'_>,
     progress: &mut PortabilityChildProgress,
-    failure: ExternalSupervisorControlFailure<'_>,
+    failure: &ExternalSupervisorControlFailure<'_>,
 ) -> Result<(), FailureKind> {
+    let Some((status, terminal)) =
+        import_terminal_after_control_failure(report, context, progress, failure)?
+    else {
+        return Ok(());
+    };
+    if let Err(error) = progress.apply_external_attribution(terminal.attribution.clone()) {
+        report.check(
+            format!("{}-external-supervisor-recovery", failure.plan.name()),
+            context.suite_started.elapsed(),
+            Err(format!("{}; {error}", failure.control_error)),
+        );
+        checkpoint_attributed_phase_with_progress(report, context, progress)?;
+        return Err(FailureKind::Fixture);
+    }
+    let terminal_passed = persist_external_supervisor_terminal_outcome(
+        report,
+        context,
+        progress,
+        failure.plan,
+        failure.started,
+        &terminal,
+    )?;
+    retain_external_supervisor_lifecycle(
+        report,
+        failure.plan,
+        failure.started,
+        &ExternalSupervisorLifecycleObservation {
+            state: "terminal-imported-after-control-failure",
+            terminal: &terminal,
+            cleanup_receipted: false,
+            transport_closed: true,
+            exit_status: status.code(),
+        },
+    );
+    let session_cleanup = failure
+        .started
+        .session
+        .close_until(failure.lifecycle_deadline);
+    let exit_passed = status.success();
+    if !exit_passed {
+        report.check(
+            format!("{}-external-supervisor-exit", failure.plan.name()),
+            context.suite_started.elapsed(),
+            Err(format!(
+                "nightly supervisor exited with status {:?} after {}",
+                status.code(),
+                failure.control_error
+            )),
+        );
+    }
+    if let Err(cleanup) = &session_cleanup {
+        report.check(
+            format!("{}-external-supervisor-session", failure.plan.name()),
+            context.suite_started.elapsed(),
+            Err(format!(
+                "nightly supervisor session cleanup failed after {}: {cleanup}",
+                failure.control_error
+            )),
+        );
+    }
+    checkpoint_attributed_phase_complete(
+        report,
+        context.suite,
+        Some(context.envelope.report_completion_deadline),
+    )?;
+    if terminal_passed && exit_passed && session_cleanup.is_ok() {
+        Ok(())
+    } else {
+        Err(FailureKind::Child)
+    }
+}
+
+#[cfg(unix)]
+fn import_terminal_after_control_failure(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    failure: &ExternalSupervisorControlFailure<'_>,
+) -> Result<Option<(std::process::ExitStatus, ExternalSupervisorTerminal)>, FailureKind> {
     let status = match failure.started.exit.wait_until(failure.exit_deadline) {
         ExternalSupervisorExitState::DeadlineExpired => {
-            return retain_external_supervisor_owned(
+            retain_external_supervisor_owned(
                 report,
                 context,
                 progress,
                 failure.started,
                 &format!("{}; exit receipt remains pending", failure.control_error),
-            );
+            )?;
+            return Ok(None);
         }
         ExternalSupervisorExitState::Failed(exit_error) => {
             report.check(
@@ -17106,71 +17896,7 @@ fn finish_external_supervisor_after_control_failure(
             return Err(FailureKind::Fixture);
         }
     };
-    if let Err(error) = progress.apply_external_attribution(terminal.attribution.clone()) {
-        report.check(
-            format!("{}-external-supervisor-recovery", failure.plan.name()),
-            context.suite_started.elapsed(),
-            Err(format!("{}; {error}", failure.control_error)),
-        );
-        checkpoint_attributed_phase_with_progress(report, context, progress)?;
-        return Err(FailureKind::Fixture);
-    }
-    let terminal_passed = persist_external_supervisor_terminal_outcome(
-        report,
-        context,
-        progress,
-        failure.plan,
-        failure.started,
-        &terminal,
-    )?;
-    retain_external_supervisor_lifecycle(
-        report,
-        failure.plan,
-        failure.started,
-        ExternalSupervisorLifecycleObservation {
-            state: "terminal-imported-after-control-failure",
-            terminal: &terminal,
-            cleanup_receipted: false,
-            transport_closed: true,
-            exit_status: status.code(),
-        },
-    );
-    let session_cleanup = failure
-        .started
-        .session
-        .close_until(failure.lifecycle_deadline);
-    let exit_passed = status.success();
-    if !exit_passed {
-        report.check(
-            format!("{}-external-supervisor-exit", failure.plan.name()),
-            context.suite_started.elapsed(),
-            Err(format!(
-                "nightly supervisor exited with status {:?} after {}",
-                status.code(),
-                failure.control_error
-            )),
-        );
-    }
-    if let Err(cleanup) = &session_cleanup {
-        report.check(
-            format!("{}-external-supervisor-session", failure.plan.name()),
-            context.suite_started.elapsed(),
-            Err(format!(
-                "nightly supervisor session cleanup failed after {}: {cleanup}",
-                failure.control_error
-            )),
-        );
-    }
-    checkpoint_attributed_phase_complete(
-        report,
-        context.suite,
-        Some(context.envelope.report_completion_deadline),
-    )?;
-    if terminal_passed && exit_passed && session_cleanup.is_ok() {
-        Ok(())
-    } else {
-        Err(FailureKind::Child)
-    }
+    Ok(Some((status, terminal)))
 }
 
 #[cfg(unix)]
@@ -17191,7 +17917,7 @@ fn finish_external_supervisor_after_authenticated_terminal_control_failure(
     report: &mut Report,
     context: AttributedRunContext<'_>,
     progress: &mut PortabilityChildProgress,
-    failure: AuthenticatedTerminalControlFailure<'_>,
+    failure: &AuthenticatedTerminalControlFailure<'_>,
 ) -> Result<(), FailureKind> {
     let status = match failure.started.exit.wait_until(failure.exit_deadline) {
         ExternalSupervisorExitState::DeadlineExpired => {
@@ -17200,7 +17926,7 @@ fn finish_external_supervisor_after_authenticated_terminal_control_failure(
                 context,
                 progress,
                 failure.started,
-                ExternalSupervisorRetainedExit {
+                &ExternalSupervisorRetainedExit {
                     plan: failure.plan,
                     terminal: failure.terminal,
                     state: "control-failed-exit-owned-by-waiter",
@@ -17232,7 +17958,7 @@ fn finish_external_supervisor_after_authenticated_terminal_control_failure(
         report,
         failure.plan,
         failure.started,
-        ExternalSupervisorLifecycleObservation {
+        &ExternalSupervisorLifecycleObservation {
             state: "exit-reaped-after-control-failure",
             terminal: failure.terminal,
             cleanup_receipted: failure.cleanup_receipted,
@@ -17287,6 +18013,80 @@ fn run_externally_supervised_nightly_command(
     suite_started: Instant,
     outer_deadline: Instant,
 ) -> Result<(), FailureKind> {
+    let Some(mut execution) = start_external_supervisor_nightly_phase(
+        root,
+        session_parent,
+        report,
+        plan,
+        suite_started,
+        outer_deadline,
+    )?
+    else {
+        return Ok(());
+    };
+    let context = execution.context;
+    let progress = &mut execution.progress;
+    let started = &mut execution.started;
+    let observation_deadline = execution.observation_deadline;
+    let exit_recovery_deadline = execution.exit_recovery_deadline;
+    wait_for_external_supervisor_terminal(
+        report,
+        context,
+        progress,
+        plan,
+        started,
+        observation_deadline,
+        exit_recovery_deadline,
+    )?;
+    let Some((terminal, terminal_passed)) = load_external_supervisor_terminal(
+        report,
+        context,
+        progress,
+        plan,
+        started,
+        observation_deadline,
+        exit_recovery_deadline,
+    )?
+    else {
+        return Ok(());
+    };
+    let mut terminal_phase = ExternalSupervisorTerminalPhase {
+        plan,
+        started,
+        terminal: &terminal,
+        terminal_passed,
+        observation_deadline,
+        exit_recovery_deadline,
+    };
+    if !complete_external_supervisor_terminal_cleanup(
+        report,
+        context,
+        progress,
+        &mut terminal_phase,
+    )? {
+        return Ok(());
+    }
+    finish_external_supervisor_exit(report, context, progress, &mut terminal_phase)
+}
+
+#[cfg(unix)]
+struct StartedExternalSupervisorNightly {
+    context: AttributedRunContext<'static>,
+    progress: PortabilityChildProgress,
+    started: ExternalSupervisorStarted,
+    observation_deadline: Instant,
+    exit_recovery_deadline: Instant,
+}
+
+#[cfg(unix)]
+fn start_external_supervisor_nightly_phase(
+    root: &Path,
+    session_parent: &Path,
+    report: &mut Report,
+    plan: ExternalSupervisorPlan,
+    suite_started: Instant,
+    outer_deadline: Instant,
+) -> Result<Option<StartedExternalSupervisorNightly>, FailureKind> {
     let phase_started = Instant::now();
     let envelope = SupervisionEnvelope::within(
         phase_started,
@@ -17315,7 +18115,7 @@ fn run_externally_supervised_nightly_command(
         );
         return Err(FailureKind::Fixture);
     }
-    let mut started = start_external_nightly_supervisor(
+    let started = start_external_nightly_supervisor(
         root,
         session_parent,
         plan,
@@ -17326,12 +18126,9 @@ fn run_externally_supervised_nightly_command(
         report.check(plan.name(), suite_started.elapsed(), Err(error));
         FailureKind::Child
     })?;
-    debug_assert_eq!(
-        started.envelope.execution_deadline,
-        envelope.execution_deadline
-    );
+    debug_assert_eq!(started.envelope.execution, envelope.execution);
     if let Some(reason) = started.launch_ownership_uncertain.clone() {
-        return retain_external_supervisor_owned(
+        retain_external_supervisor_owned(
             report,
             context,
             &mut progress,
@@ -17339,16 +18136,18 @@ fn run_externally_supervised_nightly_command(
             &format!(
                 "nightly supervisor launch authorization delivery was indeterminate: {reason}"
             ),
-        );
+        )?;
+        return Ok(None);
     }
     if checkpoint_attributed_phase_with_progress(report, context, &progress).is_err() {
-        return retain_external_supervisor_owned(
+        retain_external_supervisor_owned(
             report,
             context,
             &mut progress,
             &started,
             "nightly supervisor ownership transferred before its initial checkpoint persisted",
-        );
+        )?;
+        return Ok(None);
     }
     let observation_deadline = started
         .envelope
@@ -17360,16 +18159,409 @@ fn run_externally_supervised_nightly_command(
         .checked_sub(TERMINAL_PERSISTENCE_RESERVE)
         .unwrap_or(started.envelope.child_completion_deadline)
         .max(started.envelope.child_completion_deadline);
+    Ok(Some(StartedExternalSupervisorNightly {
+        context,
+        progress,
+        started,
+        observation_deadline,
+        exit_recovery_deadline,
+    }))
+}
+
+#[cfg(unix)]
+fn finish_external_supervisor_exit(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    phase: &mut ExternalSupervisorTerminalPhase<'_>,
+) -> Result<(), FailureKind> {
+    let Some(supervisor_status) =
+        wait_for_external_supervisor_exit(report, context, progress, phase)?
+    else {
+        return Ok(());
+    };
+    retain_external_supervisor_lifecycle(
+        report,
+        phase.plan,
+        phase.started,
+        &ExternalSupervisorLifecycleObservation {
+            state: if supervisor_status.success() {
+                "exit-reaped"
+            } else {
+                "exit-reaped-nonzero"
+            },
+            terminal: phase.terminal,
+            cleanup_receipted: true,
+            transport_closed: true,
+            exit_status: supervisor_status.code(),
+        },
+    );
+    let supervisor_exit_passed = supervisor_status.success();
+    if !supervisor_exit_passed {
+        report.check(
+            format!("{}-external-supervisor-exit", phase.plan.name()),
+            context.suite_started.elapsed(),
+            Err(format!(
+                "nightly supervisor exited with status {:?}",
+                supervisor_status.code()
+            )),
+        );
+        checkpoint_attributed_phase_with_progress(report, context, progress)?;
+    }
+    let session_absent = matches!(
+        fs::symlink_metadata(phase.started.session.path()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if !session_absent {
+        report.check(
+            format!("{}-external-supervisor-session", phase.plan.name()),
+            context.suite_started.elapsed(),
+            Err("nightly supervisor session remains after cleanup receipt".to_owned()),
+        );
+        checkpoint_attributed_phase_with_progress(report, context, progress)?;
+    }
+    if session_absent {
+        retain_external_supervisor_lifecycle(
+            report,
+            phase.plan,
+            phase.started,
+            &ExternalSupervisorLifecycleObservation {
+                state: "exit-reaped-session-absent",
+                terminal: phase.terminal,
+                cleanup_receipted: true,
+                transport_closed: true,
+                exit_status: supervisor_status.code(),
+            },
+        );
+    }
+    checkpoint_attributed_phase_complete(
+        report,
+        "nightly",
+        Some(phase.started.envelope.report_completion_deadline),
+    )?;
+    if phase.terminal_passed && supervisor_exit_passed && session_absent {
+        Ok(())
+    } else {
+        Err(FailureKind::Child)
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_external_supervisor_exit(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    phase: &mut ExternalSupervisorTerminalPhase<'_>,
+) -> Result<Option<std::process::ExitStatus>, FailureKind> {
+    let status = match phase.started.exit.wait_until(phase.observation_deadline) {
+        ExternalSupervisorExitState::Exited(status) => status,
+        ExternalSupervisorExitState::DeadlineExpired => {
+            retain_external_supervisor_exit_owned(
+                report,
+                context,
+                progress,
+                phase.started,
+                &ExternalSupervisorRetainedExit {
+                    plan: phase.plan,
+                    terminal: phase.terminal,
+                    state: "exit-reap-owned-by-waiter",
+                    reason: "nightly supervisor exit exceeded its report deadline",
+                    cleanup_receipted: true,
+                    transport_closed: true,
+                },
+            )?;
+            return Ok(None);
+        }
+        ExternalSupervisorExitState::Failed(error) => {
+            retain_external_supervisor_lifecycle(
+                report,
+                phase.plan,
+                phase.started,
+                &ExternalSupervisorLifecycleObservation {
+                    state: "exit-reap-failed",
+                    terminal: phase.terminal,
+                    cleanup_receipted: true,
+                    transport_closed: true,
+                    exit_status: None,
+                },
+            );
+            report.check(
+                phase.plan.name(),
+                context.suite_started.elapsed(),
+                Err(error),
+            );
+            checkpoint_attributed_phase_with_progress(report, context, progress)?;
+            return Err(FailureKind::Fixture);
+        }
+    };
+    Ok(Some(status))
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorTerminalPhase<'a> {
+    plan: ExternalSupervisorPlan,
+    started: &'a mut ExternalSupervisorStarted,
+    terminal: &'a ExternalSupervisorTerminal,
+    terminal_passed: bool,
+    observation_deadline: Instant,
+    exit_recovery_deadline: Instant,
+}
+
+#[cfg(unix)]
+struct ExternalSupervisorCleanupObservation<'a> {
+    reason: &'a str,
+    cleanup_receipted: bool,
+    transport_closed: bool,
+}
+
+#[cfg(unix)]
+fn complete_external_supervisor_terminal_cleanup(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    phase: &mut ExternalSupervisorTerminalPhase<'_>,
+) -> Result<bool, FailureKind> {
+    if let Err(error) = write_supervisor_handshake(
+        &mut phase.started.control_input,
+        ExternalSupervisorMessage::Go,
+        phase.started.request_sha256,
+        phase.started.nonce,
+    ) {
+        return finish_external_supervisor_terminal_phase_failure(
+            report,
+            context,
+            progress,
+            phase,
+            &ExternalSupervisorCleanupObservation {
+                reason: &format!(
+                    "cannot acknowledge nightly supervisor terminal ownership: {error}"
+                ),
+                cleanup_receipted: false,
+                transport_closed: false,
+            },
+        );
+    }
+    let cleanup_receipt = read_supervisor_handshake_until(
+        &mut phase.started.control_output,
+        ExternalSupervisorMessage::Ready,
+        phase.started.request_sha256,
+        phase.started.nonce,
+        phase.observation_deadline,
+    );
+    match cleanup_receipt {
+        Ok(true) => {}
+        Ok(false) => {
+            return finish_external_supervisor_terminal_phase_failure(
+                report,
+                context,
+                progress,
+                phase,
+                &ExternalSupervisorCleanupObservation {
+                    reason: "nightly supervisor session cleanup exceeded its lifecycle deadline",
+                    cleanup_receipted: false,
+                    transport_closed: false,
+                },
+            );
+        }
+        Err(error) => {
+            return finish_external_supervisor_terminal_phase_failure(
+                report,
+                context,
+                progress,
+                phase,
+                &ExternalSupervisorCleanupObservation {
+                    reason: &format!("cannot read nightly supervisor cleanup receipt: {error}"),
+                    cleanup_receipted: false,
+                    transport_closed: false,
+                },
+            );
+        }
+    }
+    complete_external_supervisor_transport_close(report, context, progress, phase)
+}
+
+#[cfg(unix)]
+fn complete_external_supervisor_transport_close(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    phase: &mut ExternalSupervisorTerminalPhase<'_>,
+) -> Result<bool, FailureKind> {
+    retain_external_supervisor_lifecycle(
+        report,
+        phase.plan,
+        phase.started,
+        &ExternalSupervisorLifecycleObservation {
+            state: "cleanup-receipted",
+            terminal: phase.terminal,
+            cleanup_receipted: true,
+            transport_closed: false,
+            exit_status: None,
+        },
+    );
+    match wait_supervisor_eof_until(
+        &mut phase.started.control_output,
+        phase.observation_deadline,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return finish_external_supervisor_terminal_phase_failure(
+                report,
+                context,
+                progress,
+                phase,
+                &ExternalSupervisorCleanupObservation {
+                    reason: "nightly supervisor transport closure exceeded its lifecycle deadline",
+                    cleanup_receipted: true,
+                    transport_closed: false,
+                },
+            );
+        }
+        Err(error) => {
+            return finish_external_supervisor_terminal_phase_failure(
+                report,
+                context,
+                progress,
+                phase,
+                &ExternalSupervisorCleanupObservation {
+                    reason: &error,
+                    cleanup_receipted: true,
+                    transport_closed: false,
+                },
+            );
+        }
+    }
+    retain_external_supervisor_lifecycle(
+        report,
+        phase.plan,
+        phase.started,
+        &ExternalSupervisorLifecycleObservation {
+            state: "transport-closed",
+            terminal: phase.terminal,
+            cleanup_receipted: true,
+            transport_closed: true,
+            exit_status: None,
+        },
+    );
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn finish_external_supervisor_terminal_phase_failure(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    phase: &ExternalSupervisorTerminalPhase<'_>,
+    observation: &ExternalSupervisorCleanupObservation<'_>,
+) -> Result<bool, FailureKind> {
+    finish_external_supervisor_after_authenticated_terminal_control_failure(
+        report,
+        context,
+        progress,
+        &AuthenticatedTerminalControlFailure {
+            plan: phase.plan,
+            started: phase.started,
+            terminal: phase.terminal,
+            terminal_passed: phase.terminal_passed,
+            control_error: observation.reason,
+            cleanup_receipted: observation.cleanup_receipted,
+            transport_closed: observation.transport_closed,
+            exit_deadline: phase.exit_recovery_deadline,
+            lifecycle_deadline: phase.observation_deadline,
+        },
+    )?;
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn load_external_supervisor_terminal(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    plan: ExternalSupervisorPlan,
+    started: &mut ExternalSupervisorStarted,
+    observation_deadline: Instant,
+    exit_recovery_deadline: Instant,
+) -> Result<Option<(ExternalSupervisorTerminal, bool)>, FailureKind> {
+    let terminal_bytes = match read_supervisor_terminal_payload_until(
+        &mut started.control_output,
+        observation_deadline,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            finish_external_supervisor_after_control_failure(
+                report,
+                context,
+                progress,
+                &ExternalSupervisorControlFailure {
+                    plan,
+                    started,
+                    control_error: &format!(
+                        "cannot read nightly supervisor terminal payload: {error}"
+                    ),
+                    exit_deadline: exit_recovery_deadline,
+                    lifecycle_deadline: observation_deadline,
+                },
+            )?;
+            return Ok(None);
+        }
+    };
+    let terminal = match decode_external_supervisor_terminal(
+        &terminal_bytes,
+        started.request_sha256,
+        started.nonce,
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            finish_external_supervisor_after_control_failure(
+                report,
+                context,
+                progress,
+                &ExternalSupervisorControlFailure {
+                    plan,
+                    started,
+                    control_error: &format!(
+                        "cannot decode nightly supervisor terminal payload: {error}"
+                    ),
+                    exit_deadline: exit_recovery_deadline,
+                    lifecycle_deadline: observation_deadline,
+                },
+            )?;
+            return Ok(None);
+        }
+    };
+    if let Err(error) = progress.apply_external_attribution(terminal.attribution.clone()) {
+        retain_external_supervisor_owned(report, context, progress, started, &error)?;
+        return Ok(None);
+    }
+    let terminal_passed = persist_external_supervisor_terminal_outcome(
+        report, context, progress, plan, started, &terminal,
+    )?;
+    Ok(Some((terminal, terminal_passed)))
+}
+
+#[cfg(unix)]
+fn wait_for_external_supervisor_terminal(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    plan: ExternalSupervisorPlan,
+    started: &mut ExternalSupervisorStarted,
+    observation_deadline: Instant,
+    exit_recovery_deadline: Instant,
+) -> Result<(), FailureKind> {
     loop {
-        let remaining = observation_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if observation_deadline
+            .saturating_duration_since(Instant::now())
+            .is_zero()
+        {
             return finish_external_supervisor_after_control_failure(
                 report,
                 context,
-                &mut progress,
-                ExternalSupervisorControlFailure {
+                progress,
+                &ExternalSupervisorControlFailure {
                     plan,
-                    started: &started,
+                    started,
                     control_error: "nightly external supervisor reached its report cutoff",
                     exit_deadline: exit_recovery_deadline,
                     lifecycle_deadline: observation_deadline,
@@ -17386,70 +18578,26 @@ fn run_externally_supervised_nightly_command(
             started.nonce,
             observation,
         ) {
-            Ok(Some(ExternalSupervisorMessage::Terminal)) => break,
+            Ok(Some(ExternalSupervisorMessage::Terminal)) => return Ok(()),
             Ok(Some(ExternalSupervisorMessage::Progress)) => {
-                let payload = match read_supervisor_terminal_payload_until(
-                    &mut started.control_output,
+                process_external_supervisor_progress(
+                    report,
+                    context,
+                    progress,
+                    plan,
+                    started,
                     observation_deadline,
-                ) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return finish_external_supervisor_after_control_failure(
-                            report,
-                            context,
-                            &mut progress,
-                            ExternalSupervisorControlFailure {
-                                plan,
-                                started: &started,
-                                control_error: &format!(
-                                    "cannot read nightly supervisor progress: {error}"
-                                ),
-                                exit_deadline: exit_recovery_deadline,
-                                lifecycle_deadline: observation_deadline,
-                            },
-                        );
-                    }
-                };
-                let attribution = match decode_external_supervisor_progress(&payload) {
-                    Ok(attribution) => attribution,
-                    Err(error) => {
-                        return retain_external_supervisor_owned(
-                            report,
-                            context,
-                            &mut progress,
-                            &started,
-                            &format!("cannot decode nightly supervisor progress: {error}"),
-                        );
-                    }
-                };
-                if let Err(error) = progress.apply_external_attribution(attribution) {
-                    return retain_external_supervisor_owned(
-                        report,
-                        context,
-                        &mut progress,
-                        &started,
-                        &error,
-                    );
-                }
-                emit_attributed_progress_with_deadlines(context, "running", &progress);
-                if checkpoint_attributed_phase_with_progress(report, context, &progress).is_err() {
-                    return retain_external_supervisor_owned(
-                        report,
-                        context,
-                        &mut progress,
-                        &started,
-                        "nightly supervisor progress checkpoint could not be persisted",
-                    );
-                }
+                    exit_recovery_deadline,
+                )?;
             }
             Ok(Some(_)) => {
                 return finish_external_supervisor_after_control_failure(
                     report,
                     context,
-                    &mut progress,
-                    ExternalSupervisorControlFailure {
+                    progress,
+                    &ExternalSupervisorControlFailure {
                         plan,
-                        started: &started,
+                        started,
                         control_error: "nightly supervisor sent an out-of-order control message",
                         exit_deadline: exit_recovery_deadline,
                         lifecycle_deadline: observation_deadline,
@@ -17457,13 +18605,13 @@ fn run_externally_supervised_nightly_command(
                 );
             }
             Ok(None) => {
-                emit_attributed_progress_with_deadlines(context, "running", &progress);
-                if checkpoint_attributed_phase_with_progress(report, context, &progress).is_err() {
+                emit_attributed_progress_with_deadlines(context, "running", progress);
+                if checkpoint_attributed_phase_with_progress(report, context, progress).is_err() {
                     return retain_external_supervisor_owned(
                         report,
                         context,
-                        &mut progress,
-                        &started,
+                        progress,
+                        started,
                         "nightly supervisor heartbeat checkpoint could not be persisted",
                     );
                 }
@@ -17472,10 +18620,10 @@ fn run_externally_supervised_nightly_command(
                 return finish_external_supervisor_after_control_failure(
                     report,
                     context,
-                    &mut progress,
-                    ExternalSupervisorControlFailure {
+                    progress,
+                    &ExternalSupervisorControlFailure {
                         plan,
-                        started: &started,
+                        started,
                         control_error: &format!(
                             "cannot read nightly supervisor terminal signal: {error}"
                         ),
@@ -17486,299 +18634,64 @@ fn run_externally_supervised_nightly_command(
             }
         }
     }
-    let terminal_bytes = match read_supervisor_terminal_payload_until(
+}
+
+#[cfg(unix)]
+fn process_external_supervisor_progress(
+    report: &mut Report,
+    context: AttributedRunContext<'_>,
+    progress: &mut PortabilityChildProgress,
+    plan: ExternalSupervisorPlan,
+    started: &mut ExternalSupervisorStarted,
+    observation_deadline: Instant,
+    exit_recovery_deadline: Instant,
+) -> Result<(), FailureKind> {
+    let payload = match read_supervisor_terminal_payload_until(
         &mut started.control_output,
         observation_deadline,
     ) {
-        Ok(bytes) => bytes,
+        Ok(payload) => payload,
         Err(error) => {
             return finish_external_supervisor_after_control_failure(
                 report,
                 context,
-                &mut progress,
-                ExternalSupervisorControlFailure {
+                progress,
+                &ExternalSupervisorControlFailure {
                     plan,
-                    started: &started,
-                    control_error: &format!(
-                        "cannot read nightly supervisor terminal payload: {error}"
-                    ),
+                    started,
+                    control_error: &format!("cannot read nightly supervisor progress: {error}"),
                     exit_deadline: exit_recovery_deadline,
                     lifecycle_deadline: observation_deadline,
                 },
             );
         }
     };
-    let terminal = match decode_external_supervisor_terminal(
-        &terminal_bytes,
-        started.request_sha256,
-        started.nonce,
-    ) {
-        Ok(terminal) => terminal,
+    let attribution = match decode_external_supervisor_progress(&payload) {
+        Ok(attribution) => attribution,
         Err(error) => {
-            return finish_external_supervisor_after_control_failure(
+            return retain_external_supervisor_owned(
                 report,
                 context,
-                &mut progress,
-                ExternalSupervisorControlFailure {
-                    plan,
-                    started: &started,
-                    control_error: &format!(
-                        "cannot decode nightly supervisor terminal payload: {error}"
-                    ),
-                    exit_deadline: exit_recovery_deadline,
-                    lifecycle_deadline: observation_deadline,
-                },
+                progress,
+                started,
+                &format!("cannot decode nightly supervisor progress: {error}"),
             );
         }
     };
-    if let Err(error) = progress.apply_external_attribution(terminal.attribution.clone()) {
-        return retain_external_supervisor_owned(report, context, &mut progress, &started, &error);
+    if let Err(error) = progress.apply_external_attribution(attribution) {
+        return retain_external_supervisor_owned(report, context, progress, started, &error);
     }
-    let terminal_passed = persist_external_supervisor_terminal_outcome(
-        report,
-        context,
-        &mut progress,
-        plan,
-        &started,
-        &terminal,
-    )?;
-    if let Err(error) = write_supervisor_handshake(
-        &mut started.control_input,
-        ExternalSupervisorMessage::Go,
-        started.request_sha256,
-        started.nonce,
-    ) {
-        return finish_external_supervisor_after_authenticated_terminal_control_failure(
+    emit_attributed_progress_with_deadlines(context, "running", progress);
+    if checkpoint_attributed_phase_with_progress(report, context, progress).is_err() {
+        return retain_external_supervisor_owned(
             report,
             context,
-            &mut progress,
-            AuthenticatedTerminalControlFailure {
-                plan,
-                started: &started,
-                terminal: &terminal,
-                terminal_passed,
-                control_error: &format!(
-                    "cannot acknowledge nightly supervisor terminal ownership: {error}"
-                ),
-                cleanup_receipted: false,
-                transport_closed: false,
-                exit_deadline: exit_recovery_deadline,
-                lifecycle_deadline: observation_deadline,
-            },
+            progress,
+            started,
+            "nightly supervisor progress checkpoint could not be persisted",
         );
     }
-    match read_supervisor_handshake_until(
-        &mut started.control_output,
-        ExternalSupervisorMessage::Ready,
-        started.request_sha256,
-        started.nonce,
-        observation_deadline,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return finish_external_supervisor_after_authenticated_terminal_control_failure(
-                report,
-                context,
-                &mut progress,
-                AuthenticatedTerminalControlFailure {
-                    plan,
-                    started: &started,
-                    terminal: &terminal,
-                    terminal_passed,
-                    control_error: "nightly supervisor session cleanup exceeded its lifecycle deadline",
-                    cleanup_receipted: false,
-                    transport_closed: false,
-                    exit_deadline: exit_recovery_deadline,
-                    lifecycle_deadline: observation_deadline,
-                },
-            );
-        }
-        Err(error) => {
-            return finish_external_supervisor_after_authenticated_terminal_control_failure(
-                report,
-                context,
-                &mut progress,
-                AuthenticatedTerminalControlFailure {
-                    plan,
-                    started: &started,
-                    terminal: &terminal,
-                    terminal_passed,
-                    control_error: &format!(
-                        "cannot read nightly supervisor cleanup receipt: {error}"
-                    ),
-                    cleanup_receipted: false,
-                    transport_closed: false,
-                    exit_deadline: exit_recovery_deadline,
-                    lifecycle_deadline: observation_deadline,
-                },
-            );
-        }
-    }
-    retain_external_supervisor_lifecycle(
-        report,
-        plan,
-        &started,
-        ExternalSupervisorLifecycleObservation {
-            state: "cleanup-receipted",
-            terminal: &terminal,
-            cleanup_receipted: true,
-            transport_closed: false,
-            exit_status: None,
-        },
-    );
-    let supervisor_eof =
-        wait_supervisor_eof_until(&mut started.control_output, observation_deadline);
-    match supervisor_eof {
-        Ok(true) => {}
-        Ok(false) => {
-            return finish_external_supervisor_after_authenticated_terminal_control_failure(
-                report,
-                context,
-                &mut progress,
-                AuthenticatedTerminalControlFailure {
-                    plan,
-                    started: &started,
-                    terminal: &terminal,
-                    terminal_passed,
-                    control_error: "nightly supervisor transport closure exceeded its lifecycle deadline",
-                    cleanup_receipted: true,
-                    transport_closed: false,
-                    exit_deadline: exit_recovery_deadline,
-                    lifecycle_deadline: observation_deadline,
-                },
-            );
-        }
-        Err(error) => {
-            return finish_external_supervisor_after_authenticated_terminal_control_failure(
-                report,
-                context,
-                &mut progress,
-                AuthenticatedTerminalControlFailure {
-                    plan,
-                    started: &started,
-                    terminal: &terminal,
-                    terminal_passed,
-                    control_error: &error,
-                    cleanup_receipted: true,
-                    transport_closed: false,
-                    exit_deadline: exit_recovery_deadline,
-                    lifecycle_deadline: observation_deadline,
-                },
-            );
-        }
-    }
-    retain_external_supervisor_lifecycle(
-        report,
-        plan,
-        &started,
-        ExternalSupervisorLifecycleObservation {
-            state: "transport-closed",
-            terminal: &terminal,
-            cleanup_receipted: true,
-            transport_closed: true,
-            exit_status: None,
-        },
-    );
-    let supervisor_status = match started.exit.wait_until(observation_deadline) {
-        ExternalSupervisorExitState::Exited(status) => status,
-        ExternalSupervisorExitState::DeadlineExpired => {
-            return retain_external_supervisor_exit_owned(
-                report,
-                context,
-                &mut progress,
-                &started,
-                ExternalSupervisorRetainedExit {
-                    plan,
-                    terminal: &terminal,
-                    state: "exit-reap-owned-by-waiter",
-                    reason: "nightly supervisor exit exceeded its report deadline",
-                    cleanup_receipted: true,
-                    transport_closed: true,
-                },
-            );
-        }
-        ExternalSupervisorExitState::Failed(error) => {
-            retain_external_supervisor_lifecycle(
-                report,
-                plan,
-                &started,
-                ExternalSupervisorLifecycleObservation {
-                    state: "exit-reap-failed",
-                    terminal: &terminal,
-                    cleanup_receipted: true,
-                    transport_closed: true,
-                    exit_status: None,
-                },
-            );
-            report.check(plan.name(), suite_started.elapsed(), Err(error));
-            checkpoint_attributed_phase_with_progress(report, context, &progress)?;
-            return Err(FailureKind::Fixture);
-        }
-    };
-    retain_external_supervisor_lifecycle(
-        report,
-        plan,
-        &started,
-        ExternalSupervisorLifecycleObservation {
-            state: if supervisor_status.success() {
-                "exit-reaped"
-            } else {
-                "exit-reaped-nonzero"
-            },
-            terminal: &terminal,
-            cleanup_receipted: true,
-            transport_closed: true,
-            exit_status: supervisor_status.code(),
-        },
-    );
-    let supervisor_exit_passed = supervisor_status.success();
-    if !supervisor_exit_passed {
-        report.check(
-            format!("{}-external-supervisor-exit", plan.name()),
-            suite_started.elapsed(),
-            Err(format!(
-                "nightly supervisor exited with status {:?}",
-                supervisor_status.code()
-            )),
-        );
-        checkpoint_attributed_phase_with_progress(report, context, &progress)?;
-    }
-    let session_absent = matches!(
-        fs::symlink_metadata(started.session.path()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    );
-    if !session_absent {
-        report.check(
-            format!("{}-external-supervisor-session", plan.name()),
-            suite_started.elapsed(),
-            Err("nightly supervisor session remains after cleanup receipt".to_owned()),
-        );
-        checkpoint_attributed_phase_with_progress(report, context, &progress)?;
-    }
-    if session_absent {
-        retain_external_supervisor_lifecycle(
-            report,
-            plan,
-            &started,
-            ExternalSupervisorLifecycleObservation {
-                state: "exit-reaped-session-absent",
-                terminal: &terminal,
-                cleanup_receipted: true,
-                transport_closed: true,
-                exit_status: supervisor_status.code(),
-            },
-        );
-    }
-    checkpoint_attributed_phase_complete(
-        report,
-        "nightly",
-        Some(started.envelope.report_completion_deadline),
-    )?;
-    if terminal_passed && supervisor_exit_passed && session_absent {
-        Ok(())
-    } else {
-        Err(FailureKind::Child)
-    }
+    Ok(())
 }
 
 pub(crate) fn nightly(
@@ -17801,7 +18714,31 @@ pub(crate) fn nightly(
             );
             FailureKind::Policy
         })?;
-    #[cfg(unix)]
+    run_nightly_platform_phases(root, report, failures, tests_started, tests_deadline)?;
+    finish_verify(root, report, failures)?;
+    let candidate = candidate_binary(root, false);
+    differential_gate(
+        report,
+        &DifferentialExecution {
+            root,
+            failures,
+            oracle,
+            oracle_digest: Some(oracle_sha256),
+            candidate: &candidate,
+            dependency,
+            candidate_sha: None,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn run_nightly_platform_phases(
+    root: &Path,
+    report: &mut Report,
+    failures: &Path,
+    tests_started: Instant,
+    tests_deadline: Instant,
+) -> Result<(), FailureKind> {
     let workspace_partition_deadline = tests_started
         .checked_add(NIGHTLY_WORKSPACE_TEST_TIMEOUT)
         .ok_or_else(|| {
@@ -17813,10 +18750,10 @@ pub(crate) fn nightly(
             FailureKind::Policy
         })?
         .min(tests_deadline);
-    #[cfg(unix)]
+    let session_parent = failures.parent().unwrap_or_else(|| Path::new("."));
     run_externally_supervised_nightly_command(
         root,
-        failures.parent().unwrap_or_else(|| Path::new(".")),
+        session_parent,
         report,
         ExternalSupervisorPlan::NightlyWorkspace,
         tests_started,
@@ -17825,38 +18762,112 @@ pub(crate) fn nightly(
     #[cfg(target_os = "macos")]
     run_externally_supervised_nightly_command(
         root,
-        failures.parent().unwrap_or_else(|| Path::new(".")),
+        session_parent,
         report,
         ExternalSupervisorPlan::MacosStagedNativeToolchain,
         tests_started,
         workspace_partition_deadline,
     )?;
-    #[cfg(windows)]
-    let mut windows_authority = {
-        let workspace_envelope = SupervisionEnvelope::within(
-            tests_started,
-            ExternalSupervisorPlan::NightlyWorkspace.total(),
-            NIGHTLY_COMMAND_CLEANUP_RESERVE,
-            NIGHTLY_REPORT_RESERVE,
-            tests_deadline,
-        )
-        .map_err(|error| {
-            report.check("nightly-deadline", tests_started.elapsed(), Err(error));
-            FailureKind::Policy
-        })?;
-        let context = AttributedRunContext {
-            name: ExternalSupervisorPlan::NightlyWorkspace.name(),
-            suite: "nightly",
+    run_externally_supervised_nightly_command(
+        root,
+        session_parent,
+        report,
+        ExternalSupervisorPlan::NightlyCoreData,
+        tests_started,
+        tests_deadline,
+    )
+}
+
+#[cfg(windows)]
+fn run_nightly_platform_phases(
+    root: &Path,
+    report: &mut Report,
+    failures: &Path,
+    tests_started: Instant,
+    tests_deadline: Instant,
+) -> Result<(), FailureKind> {
+    let mut authority =
+        acquire_windows_nightly_authority(root, report, tests_started, tests_deadline)?;
+    report.evidence(
+        "nightly-windows-launch-authority",
+        JsonValue::Object(BTreeMap::from([
+            (
+                "stagedCargo".to_owned(),
+                JsonValue::String(authority.staged_cargo().display().to_string()),
+            ),
+            (
+                "stagedRustc".to_owned(),
+                JsonValue::String(authority.staged_rustc().display().to_string()),
+            ),
+            (
+                "state".to_owned(),
+                JsonValue::String("retained-across-nightly-phases".to_owned()),
+            ),
+            (
+                "writableTarget".to_owned(),
+                JsonValue::String(authority.target().display().to_string()),
+            ),
+        ])),
+    );
+    let phases = run_windows_externally_supervised_nightly_command(
+        WindowsNightlyRunContext {
+            root,
+            session_parent: failures.parent().unwrap_or_else(|| Path::new(".")),
+            plan: ExternalSupervisorPlan::NightlyWorkspace,
             suite_started: tests_started,
-            envelope: workspace_envelope,
-        };
-        let seed = ExternalSupervisorPlan::NightlyWorkspace.seed();
-        let mut progress =
-            PortabilityChildProgress::seeded("nightly", seed.0, seed.1, "authority-acquisition");
-        checkpoint_attributed_phase_with_progress(report, context, &progress)?;
-        let target = match fs::canonicalize(
-            release_candidate_target().unwrap_or_else(|| root.join("target")),
-        ) {
+            outer_deadline: tests_deadline,
+            phase_started: tests_started,
+            fixture: None,
+        },
+        report,
+        &mut authority,
+    );
+    let cleanup = if authority.cleanup_transferred() {
+        Ok(())
+    } else {
+        authority.close_until(tests_deadline)
+    };
+    if let Err(error) = cleanup {
+        report.check(
+            "nightly-windows-launch-authority-cleanup",
+            tests_started.elapsed(),
+            Err(error),
+        );
+        return Err(FailureKind::Fixture);
+    }
+    phases
+}
+
+#[cfg(windows)]
+fn acquire_windows_nightly_authority(
+    root: &Path,
+    report: &mut Report,
+    tests_started: Instant,
+    tests_deadline: Instant,
+) -> Result<crate::release::platform::NightlyWindowsLaunchAuthority, FailureKind> {
+    let envelope = SupervisionEnvelope::within(
+        tests_started,
+        ExternalSupervisorPlan::NightlyWorkspace.total(),
+        NIGHTLY_COMMAND_CLEANUP_RESERVE,
+        NIGHTLY_REPORT_RESERVE,
+        tests_deadline,
+    )
+    .map_err(|error| {
+        report.check("nightly-deadline", tests_started.elapsed(), Err(error));
+        FailureKind::Policy
+    })?;
+    let context = AttributedRunContext {
+        name: ExternalSupervisorPlan::NightlyWorkspace.name(),
+        suite: "nightly",
+        suite_started: tests_started,
+        envelope,
+    };
+    let seed = ExternalSupervisorPlan::NightlyWorkspace.seed();
+    let mut progress =
+        PortabilityChildProgress::seeded("nightly", seed.0, seed.1, "authority-acquisition");
+    checkpoint_attributed_phase_with_progress(report, context, &progress)?;
+    let target =
+        match fs::canonicalize(release_candidate_target().unwrap_or_else(|| root.join("target"))) {
             Ok(target) => target,
             Err(error) => {
                 return fail_attributed_prelaunch(
@@ -17869,81 +18880,32 @@ pub(crate) fn nightly(
                 );
             }
         };
-        match crate::release::platform::NightlyWindowsLaunchAuthority::acquire_until(
-            root,
-            &target,
-            workspace_envelope.execution_deadline,
-            workspace_envelope.child_completion_deadline,
-        ) {
-            Ok(authority) => authority,
-            Err(error) => {
-                return fail_attributed_prelaunch(
-                    report,
-                    context,
-                    &mut progress,
-                    None,
-                    PortabilityCaseState::LaunchFailed,
-                    error,
-                );
-            }
-        }
-    };
-    #[cfg(windows)]
-    let windows_phases = {
-        report.evidence(
-            "nightly-windows-launch-authority",
-            JsonValue::Object(BTreeMap::from([
-                (
-                    "stagedCargo".to_owned(),
-                    JsonValue::String(windows_authority.staged_cargo().display().to_string()),
-                ),
-                (
-                    "stagedRustc".to_owned(),
-                    JsonValue::String(windows_authority.staged_rustc().display().to_string()),
-                ),
-                (
-                    "state".to_owned(),
-                    JsonValue::String("retained-across-nightly-phases".to_owned()),
-                ),
-                (
-                    "writableTarget".to_owned(),
-                    JsonValue::String(windows_authority.target().display().to_string()),
-                ),
-            ])),
-        );
-        run_windows_externally_supervised_nightly_command(
-            WindowsNightlyRunContext {
-                root,
-                session_parent: failures.parent().unwrap_or_else(|| Path::new(".")),
-                plan: ExternalSupervisorPlan::NightlyWorkspace,
-                suite_started: tests_started,
-                outer_deadline: tests_deadline,
-                phase_started: tests_started,
-                fixture: None,
-            },
+    match crate::release::platform::NightlyWindowsLaunchAuthority::acquire_until(
+        root,
+        &target,
+        envelope.execution,
+        envelope.child_completion_deadline,
+    ) {
+        Ok(authority) => Ok(authority),
+        Err(error) => fail_attributed_prelaunch(
             report,
-            &mut windows_authority,
-        )
-    };
-    #[cfg(windows)]
-    {
-        let windows_cleanup_deadline = tests_deadline;
-        let cleanup = if windows_authority.cleanup_transferred() {
-            Ok(())
-        } else {
-            windows_authority.close_until(windows_cleanup_deadline)
-        };
-        if let Err(error) = cleanup {
-            report.check(
-                "nightly-windows-launch-authority-cleanup",
-                tests_started.elapsed(),
-                Err(error),
-            );
-            return Err(FailureKind::Fixture);
-        }
-        windows_phases?;
+            context,
+            &mut progress,
+            None,
+            PortabilityCaseState::LaunchFailed,
+            error,
+        ),
     }
-    #[cfg(not(any(unix, windows)))]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn run_nightly_platform_phases(
+    root: &Path,
+    report: &mut Report,
+    _failures: &Path,
+    tests_started: Instant,
+    tests_deadline: Instant,
+) -> Result<(), FailureKind> {
     run_direct_nightly_command(
         root,
         report,
@@ -17951,34 +18913,12 @@ pub(crate) fn nightly(
         tests_started,
         tests_deadline,
     )?;
-    #[cfg(unix)]
-    run_externally_supervised_nightly_command(
-        root,
-        failures.parent().unwrap_or_else(|| Path::new(".")),
-        report,
-        ExternalSupervisorPlan::NightlyCoreData,
-        tests_started,
-        tests_deadline,
-    )?;
-    #[cfg(not(any(unix, windows)))]
     run_direct_nightly_command(
         root,
         report,
         ExternalSupervisorPlan::NightlyCoreData,
         tests_started,
         tests_deadline,
-    )?;
-    finish_verify(root, report, failures)?;
-    let candidate = candidate_binary(root, false);
-    differential_gate(
-        root,
-        report,
-        failures,
-        oracle,
-        Some(oracle_sha256),
-        &candidate,
-        dependency,
-        None,
     )
 }
 
@@ -18001,6 +18941,54 @@ pub(crate) fn native_differential_benchmark(
     sample_count: usize,
 ) -> Result<(), FailureKind> {
     policy_suite(root, report)?;
+    let authority = prepare_native_benchmark(report, oracle, candidate)?;
+    let inventory = native_benchmark_inventory();
+    let sample = representative_differential_sample(&inventory, sample_count).map_err(|error| {
+        report.check("native-benchmark-inventory", Duration::ZERO, Err(error));
+        FailureKind::Policy
+    })?;
+    report_benchmark_inventory(report, &sample);
+    let selected_indices = sample.selected_indices;
+    let inventory_count = sample.inventory_count;
+    let mut cases = sample.cases;
+    let helper = bind_helper(&mut cases).map_err(|error| {
+        report.check("native-benchmark-helper", Duration::ZERO, Err(error));
+        FailureKind::Fixture
+    })?;
+    report_benchmark_artifact_identity(report, "helper", &helper).map_err(|error| {
+        report.check(
+            "native-benchmark-helper-identity",
+            Duration::ZERO,
+            Err(error),
+        );
+        FailureKind::Fixture
+    })?;
+    let workers = differential_worker_limit();
+    let started = Instant::now();
+    let batch = differential_batch_with_identities(
+        &authority.oracle,
+        &authority.candidate,
+        &cases,
+        workers,
+    );
+    let (metrics, result) =
+        native_benchmark_result(report, &cases, &selected_indices, inventory_count, batch);
+    report_benchmark_metrics(report, metrics);
+    let passed = result.is_ok();
+    report.check("native-differential-benchmark", started.elapsed(), result);
+    passed.then_some(()).ok_or(FailureKind::Fixture)
+}
+
+struct NativeBenchmarkAuthority {
+    oracle: ExecutableIdentity,
+    candidate: ExecutableIdentity,
+}
+
+fn prepare_native_benchmark(
+    report: &mut Report,
+    oracle: &Path,
+    candidate: &Path,
+) -> Result<NativeBenchmarkAuthority, FailureKind> {
     let oracle = verify_executable(
         oracle,
         ExecutableRole::Oracle,
@@ -18067,28 +19055,19 @@ pub(crate) fn native_differential_benchmark(
         );
         FailureKind::Fixture
     })?;
-    let inventory = native_benchmark_inventory();
-    let sample = representative_differential_sample(&inventory, sample_count).map_err(|error| {
-        report.check("native-benchmark-inventory", Duration::ZERO, Err(error));
-        FailureKind::Policy
-    })?;
-    report_benchmark_inventory(report, &sample);
-    let mut cases = sample.cases;
-    let helper = bind_helper(&mut cases).map_err(|error| {
-        report.check("native-benchmark-helper", Duration::ZERO, Err(error));
-        FailureKind::Fixture
-    })?;
-    report_benchmark_artifact_identity(report, "helper", &helper).map_err(|error| {
-        report.check(
-            "native-benchmark-helper-identity",
-            Duration::ZERO,
-            Err(error),
-        );
-        FailureKind::Fixture
-    })?;
-    let workers = differential_worker_limit();
-    let started = Instant::now();
-    let batch = differential_batch_with_identities(&oracle, &candidate, &cases, workers);
+    Ok(NativeBenchmarkAuthority { oracle, candidate })
+}
+
+fn native_benchmark_result(
+    report: &mut Report,
+    cases: &[DifferentialCase],
+    selected_indices: &[usize],
+    inventory_count: usize,
+    batch: Result<
+        hell_testkit::DifferentialBatchReport,
+        Box<hell_testkit::DifferentialBatchFailure>,
+    >,
+) -> (DifferentialMetrics, Result<(), String>) {
     let (metrics, result) = match batch {
         Ok(batch) => {
             let metrics = DifferentialMetrics {
@@ -18096,16 +19075,16 @@ pub(crate) fn native_differential_benchmark(
             };
             report_benchmark_timings(
                 report,
-                &cases,
-                &sample.selected_indices,
+                cases,
+                selected_indices,
                 &batch.case_timings,
                 batch.timing,
-                sample.inventory_count,
+                inventory_count,
             );
             let mismatch = cases
                 .iter()
                 .zip(&batch.reports)
-                .zip(&sample.selected_indices)
+                .zip(selected_indices)
                 .find(|((_, result), _)| !result.agrees())
                 .map(|((case, result), inventory_index)| {
                     let details = result
@@ -18132,10 +19111,7 @@ pub(crate) fn native_differential_benchmark(
             (metrics, Err(error.to_string()))
         }
     };
-    report_benchmark_metrics(report, metrics);
-    let passed = result.is_ok();
-    report.check("native-differential-benchmark", started.elapsed(), result);
-    passed.then_some(()).ok_or(FailureKind::Fixture)
+    (metrics, result)
 }
 
 const BENCHMARK_MISMATCH_PREFIX_BYTES: usize = 128;
@@ -18399,7 +19375,7 @@ fn benchmark_executable_identity_detail(
         .to_str()
         .ok_or_else(|| format!("benchmark {role} path is not UTF-8"))?;
     let optional_digest =
-        |value: Option<Digest>| value.map_or_else(|| "none".to_owned(), |digest| digest.hex());
+        |value: Option<Digest>| value.map_or_else(|| "none".to_owned(), hell_digest::Digest::hex);
     let receipt_id = identity
         .acquisition_receipt_id
         .as_deref()
@@ -18715,8 +19691,7 @@ fn runtime_failure_payload_diagnostic_json(
             diagnostic
                 .oracle_handling
                 .as_ref()
-                .map(runtime_failure_payload_component_json)
-                .unwrap_or(JsonValue::Null),
+                .map_or(JsonValue::Null, runtime_failure_payload_component_json),
         ),
         (
             "oracleOuter".to_owned(),
@@ -19091,15 +20066,18 @@ pub(crate) fn release_native_oracle_shard(
         run_spec(report, "native-oracle-build", &build)?;
         let oracle = stack_oracle(report, &path)?;
         crate::command::verify_pinned_oracle_checkout(source).map_err(|_| FailureKind::Fixture)?;
+        let candidate = candidate_binary(root, true);
         differential_gate(
-            root,
             report,
-            failures,
-            &oracle,
-            None,
-            &candidate_binary(root, true),
-            dependency,
-            candidate_sha,
+            &DifferentialExecution {
+                root,
+                failures,
+                oracle: &oracle,
+                oracle_digest: None,
+                candidate: &candidate,
+                dependency,
+                candidate_sha,
+            },
         )?;
         crate::command::verify_pinned_oracle_checkout(source).map_err(|_| FailureKind::Fixture)
     })();
@@ -19247,30 +20225,12 @@ fn portability_fixture_gate(
     passed.then_some(()).ok_or(FailureKind::Fixture)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn differential_gate(
-    root: &Path,
     report: &mut Report,
-    failures: &Path,
-    oracle: &Path,
-    oracle_digest: Option<Digest>,
-    candidate: &Path,
-    dependency: &Path,
-    candidate_sha: Option<&str>,
+    execution: &DifferentialExecution<'_>,
 ) -> Result<(), FailureKind> {
     let started = Instant::now();
-    let result = run_differential(
-        report,
-        DifferentialExecution {
-            root,
-            failures,
-            oracle,
-            oracle_digest,
-            candidate,
-            dependency,
-            candidate_sha,
-        },
-    );
+    let result = run_differential(report, execution);
     let (metrics, result) = match result {
         Ok(outcome) => {
             let result = if outcome.committed_mismatches == 0 {
@@ -19359,7 +20319,7 @@ impl DifferentialMetrics {
     }
 }
 
-fn batch_failure(error: Box<hell_testkit::DifferentialBatchFailure>) -> String {
+fn batch_failure(error: &hell_testkit::DifferentialBatchFailure) -> String {
     let timing = DifferentialMetrics {
         timing: error.timing,
     };
@@ -19378,7 +20338,7 @@ struct DifferentialExecution<'a> {
 
 fn run_differential(
     report: &mut Report,
-    execution: DifferentialExecution<'_>,
+    execution: &DifferentialExecution<'_>,
 ) -> Result<DifferentialOutcome, String> {
     verify_dependency(
         execution.root,
@@ -19424,8 +20384,8 @@ fn run_differential(
         execution.root,
         report,
         execution.failures,
-        oracle,
-        candidate,
+        &oracle,
+        &candidate,
     )
 }
 
@@ -19433,63 +20393,42 @@ fn run_differential_identities(
     root: &Path,
     report: &mut Report,
     failures: &Path,
-    oracle: ExecutableInvocationAuthority,
-    candidate: ExecutableInvocationAuthority,
+    oracle: &ExecutableInvocationAuthority,
+    candidate: &ExecutableInvocationAuthority,
 ) -> Result<DifferentialOutcome, String> {
     const GENERATED_SEED: u64 = 0x4845_4c4c;
-    let mut cases = committed_differential_cases();
-    let committed_inventory_sha256 = differential_inventory_sha256(&cases)?;
-    let generated = generated_typed_cases(GENERATED_SEED, 32);
-    let mut combined_inventory = cases.clone();
-    combined_inventory.extend(generated.iter().map(|case| DifferentialCase {
-        id: case.id.clone(),
-        source: case.source.clone(),
-        ..DifferentialCase::default()
-    }));
-    let combined_inventory_sha256 = differential_inventory_sha256(&combined_inventory)?;
-    let combined_inventory_count = combined_inventory.len();
+    let DifferentialInventories {
+        mut cases,
+        generated,
+        committed_sha256,
+        combined_count,
+        combined_sha256,
+    } = differential_inventories(GENERATED_SEED)?;
     let helper = bind_helper(&mut cases)?;
     report_artifact_identity(report, "helper", &helper)?;
     let output_root = failures.parent().unwrap_or_else(|| Path::new("."));
-    let mut cells = reviewed_compatibility_cells()?;
+    let mut cells = reviewed_compatibility_cells();
     let reviewed_cells = cells.len();
     let mut committed_mismatches = Vec::new();
     let workers = differential_worker_limit();
-    let committed = differential_batch_with_invocations(&oracle, &candidate, &cases, workers)
-        .map_err(batch_failure)?;
+    let committed = differential_batch_with_invocations(oracle, candidate, &cases, workers)
+        .map_err(|error| batch_failure(&error))?;
     let mut metrics = DifferentialMetrics::default();
     metrics.add(committed.timing);
-    for (authoritative_index, (case, result)) in cases.iter().zip(committed.reports).enumerate() {
-        let status = if matches!(
-            result.comparison_projection,
-            hell_testkit::DifferentialComparisonProjection::ReviewedWindowsDivergence { .. }
-        ) {
-            "deliberate-divergence"
-        } else if result.agrees() {
-            "exact"
-        } else {
-            "unverified"
-        };
-        if !result.agrees() {
-            committed_mismatches.push(differential_mismatch_summary(
-                authoritative_index,
-                case,
-                &result,
-            )?);
-        }
-        cells.push(JsonValue::Object(BTreeMap::from([
-            ("caseId".to_owned(), JsonValue::String(case.id.to_string())),
-            ("status".to_owned(), JsonValue::String(status.to_owned())),
-        ])));
-    }
+    record_committed_differential(
+        &cases,
+        committed.reports,
+        &mut committed_mismatches,
+        &mut cells,
+    )?;
     let committed_mismatch_count = committed_mismatches.len();
     report.evidence(
         "conformance-differential-mismatches",
         differential_inventory_evidence_json(DifferentialInventoryEvidence {
             authoritative_case_count: cases.len(),
-            authoritative_inventory_sha256: committed_inventory_sha256,
-            combined_inventory_count,
-            combined_inventory_sha256,
+            authoritative_inventory_sha256: committed_sha256,
+            combined_inventory_count: combined_count,
+            combined_inventory_sha256: combined_sha256,
             generated_case_count: generated.len(),
             generated_seed: GENERATED_SEED,
             mismatches: committed_mismatches,
@@ -19503,7 +20442,7 @@ fn run_differential_identities(
             .map(|(_, case)| case.clone())
             .collect::<Vec<_>>();
         let batch = differential_batch_with_invocations(&oracle, &candidate, &probe_cases, 1)
-            .map_err(batch_failure)?;
+            .map_err(|error| batch_failure(&error))?;
         metrics.add(batch.timing);
         let observations = probes
             .iter()
@@ -19521,7 +20460,99 @@ fn run_differential_identities(
             ])),
         );
     }
-    let mut generated_mismatches = Vec::new();
+    process_generated_differential(
+        output_root,
+        oracle,
+        candidate,
+        &generated,
+        workers,
+        &mut cells,
+        &mut metrics,
+    )?;
+    write_differential_compatibility(
+        root,
+        output_root,
+        cells,
+        reviewed_cells,
+        cases.len(),
+        generated.len(),
+        committed_mismatch_count,
+    )?;
+    Ok(DifferentialOutcome {
+        metrics,
+        committed_mismatches: committed_mismatch_count,
+    })
+}
+
+fn record_committed_differential(
+    cases: &[DifferentialCase],
+    reports: Vec<DifferentialReport>,
+    mismatches: &mut Vec<JsonValue>,
+    cells: &mut Vec<JsonValue>,
+) -> Result<(), String> {
+    for (authoritative_index, (case, result)) in cases.iter().zip(reports).enumerate() {
+        let status = if matches!(
+            result.comparison_projection,
+            hell_testkit::DifferentialComparisonProjection::ReviewedWindowsDivergence { .. }
+        ) {
+            "deliberate-divergence"
+        } else if result.agrees() {
+            "exact"
+        } else {
+            "unverified"
+        };
+        if !result.agrees() {
+            mismatches.push(differential_mismatch_summary(
+                authoritative_index,
+                case,
+                &result,
+            )?);
+        }
+        cells.push(JsonValue::Object(BTreeMap::from([
+            ("caseId".to_owned(), JsonValue::String(case.id.to_string())),
+            ("status".to_owned(), JsonValue::String(status.to_owned())),
+        ])));
+    }
+    Ok(())
+}
+
+struct DifferentialInventories {
+    cases: Vec<DifferentialCase>,
+    generated: Vec<GeneratedCase>,
+    committed_sha256: Digest,
+    combined_count: usize,
+    combined_sha256: Digest,
+}
+
+fn differential_inventories(generated_seed: u64) -> Result<DifferentialInventories, String> {
+    let cases = committed_differential_cases();
+    let committed_sha256 = differential_inventory_sha256(&cases)?;
+    let generated = generated_typed_cases(generated_seed, 32);
+    let mut combined = cases.clone();
+    combined.extend(generated.iter().map(|case| DifferentialCase {
+        id: case.id.clone(),
+        source: case.source.clone(),
+        ..DifferentialCase::default()
+    }));
+    let combined_sha256 = differential_inventory_sha256(&combined)?;
+    Ok(DifferentialInventories {
+        cases,
+        generated,
+        committed_sha256,
+        combined_count: combined.len(),
+        combined_sha256,
+    })
+}
+
+fn process_generated_differential(
+    output_root: &Path,
+    oracle: &ExecutableInvocationAuthority,
+    candidate: &ExecutableInvocationAuthority,
+    generated: &[GeneratedCase],
+    workers: usize,
+    cells: &mut Vec<JsonValue>,
+    metrics: &mut DifferentialMetrics,
+) -> Result<(), String> {
     let generated_cases = generated
         .iter()
         .map(|case| DifferentialCase {
@@ -19530,14 +20561,14 @@ fn run_differential_identities(
             ..DifferentialCase::default()
         })
         .collect::<Vec<_>>();
-    let generated_batch =
-        differential_batch_with_invocations(&oracle, &candidate, &generated_cases, workers)
-            .map_err(batch_failure)?;
-    metrics.add(generated_batch.timing);
-    for (case, result) in generated.iter().zip(generated_batch.reports) {
+    let batch = differential_batch_with_invocations(oracle, candidate, &generated_cases, workers)
+        .map_err(|error| batch_failure(&error))?;
+    metrics.add(batch.timing);
+    let mut mismatches = Vec::new();
+    for (case, result) in generated.iter().zip(batch.reports) {
         if !result.agrees() {
             retain_generated_mismatch(output_root, case)?;
-            generated_mismatches.push(case.id.to_string());
+            mismatches.push(case.id.to_string());
         }
         cells.push(JsonValue::Object(BTreeMap::from([
             ("caseId".to_owned(), JsonValue::String(case.id.to_string())),
@@ -19547,7 +20578,18 @@ fn run_differential_identities(
             ),
         ])));
     }
-    write_generated_inventory(output_root, &generated_mismatches)?;
+    write_generated_inventory(output_root, &mismatches)
+}
+
+fn write_differential_compatibility(
+    root: &Path,
+    output_root: &Path,
+    cells: Vec<JsonValue>,
+    reviewed_cells: usize,
+    committed_case_count: usize,
+    generated_count: usize,
+    committed_mismatch_count: usize,
+) -> Result<(), String> {
     let deliberate_divergences = count_status(&cells, "deliberate-divergence")?;
     let out_of_scope_cells = count_status(&cells, "out-of-scope")?;
     let unverified_cells = count_status(&cells, "unverified")?;
@@ -19560,7 +20602,7 @@ fn run_differential_identities(
         (
             "committedCells".to_owned(),
             JsonValue::Number(
-                (reviewed_cells + cases.len())
+                (reviewed_cells + committed_case_count)
                     .try_into()
                     .map_err(|_| "case count overflow")?,
             ),
@@ -19572,8 +20614,7 @@ fn run_differential_identities(
         (
             "generatedObservations".to_owned(),
             JsonValue::Number(
-                generated
-                    .len()
+                generated_count
                     .try_into()
                     .map_err(|_| "case count overflow")?,
             ),
@@ -19600,19 +20641,16 @@ fn run_differential_identities(
         &output_root.join("compatibility-report.html"),
         format!(
             "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Bounded compatibility</title>\n<p>{} committed observations agree; {} reviewed cells remain unverified; {} cells are out of scope.</p>\n",
-            cases.len().saturating_sub(committed_mismatch_count),
+            committed_case_count.saturating_sub(committed_mismatch_count),
             unverified_cells,
             out_of_scope_cells
         )
         .as_bytes(),
     )?;
-    Ok(DifferentialOutcome {
-        metrics,
-        committed_mismatches: committed_mismatch_count,
-    })
+    Ok(())
 }
 
-fn reviewed_compatibility_cells() -> Result<Vec<JsonValue>, String> {
+fn reviewed_compatibility_cells() -> Vec<JsonValue> {
     let mut cells = Vec::new();
     for claim in hell_builtins::compatibility_requirements() {
         for dimension in &claim.dimensions {
@@ -19644,7 +20682,7 @@ fn reviewed_compatibility_cells() -> Result<Vec<JsonValue>, String> {
             }
         }
     }
-    Ok(cells)
+    cells
 }
 
 fn count_status(cells: &[JsonValue], expected: &str) -> Result<u64, String> {

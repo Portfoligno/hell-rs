@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "lockId": "hell-rs-action-metadata-v1",
+  "normalization": "RFC8785 object with sorted input and output names and runtime class",
+  "actions": [
+    {
+      "id": "checkout",
+      "repository": "actions/checkout",
+      "commitSha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "reviewedVersion": "v7.0.1",
+      "normalizedMetadataSha256": "0058cf85d92a664ec8d4aac8725042659fc50137378dff224e4e1bf093544dbc",
+      "inputs": ["fetch-depth", "path", "persist-credentials", "ref", "repository"],
+      "outputs": [],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "cache-restore",
+      "repository": "actions/cache/restore",
+      "commitSha": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+      "reviewedVersion": "v6.1.0",
+      "normalizedMetadataSha256": "a3cefd82f3a8c5258236878cf741c2d2d8e19051564faec991854ae027180033",
+      "inputs": ["fail-on-cache-miss", "key", "lookup-only", "path", "restore-keys"],
+      "outputs": ["cache-hit", "cache-matched-key"],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "cache-save",
+      "repository": "actions/cache/save",
+      "commitSha": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+      "reviewedVersion": "v6.1.0",
+      "normalizedMetadataSha256": "98a66f91c3297797f44c8468bedc161340b4125a7c7d13fa5d88a20a27028909",
+      "inputs": ["key", "path"],
+      "outputs": ["cache-id"],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "upload-artifact",
+      "repository": "actions/upload-artifact",
+      "commitSha": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+      "reviewedVersion": "v7.0.1",
+      "normalizedMetadataSha256": "55f391bb6befc8b92c5915ee46376ddb12eafc617528f8b0cc899d5a246abb53",
+      "inputs": ["compression-level", "if-no-files-found", "include-hidden-files", "name", "overwrite", "path", "retention-days"],
+      "outputs": ["artifact-digest", "artifact-id", "artifact-url"],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "download-artifact",
+      "repository": "actions/download-artifact",
+      "commitSha": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+      "reviewedVersion": "v8.0.1",
+      "normalizedMetadataSha256": "eeabf7c4c09ab5885547c5873457fcc55b1b6a698056c01412f43a854d01e865",
+      "inputs": ["artifact-ids", "digest-mismatch", "github-token", "merge-multiple", "name", "path", "pattern", "repository", "run-id"],
+      "outputs": ["download-path"],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "haskell-setup",
+      "repository": "haskell-actions/setup",
+      "commitSha": "6037f33647c3f17758a2356c80fc4a53d7e0685d",
+      "reviewedVersion": "v2.12.0",
+      "normalizedMetadataSha256": "7c33da5ee4e229219c95bb012a15305587674a7babb43f04987b0427beec02c9",
+      "inputs": ["cabal-update", "cabal-version", "enable-stack", "ghc-version", "stack-no-global", "stack-version"],
+      "outputs": ["cabal-store", "ghc-exe", "ghc-version", "stack-root"],
+      "runtime": "node",
+      "projectPermissionClass": "read"
+    },
+    {
+      "id": "attest",
+      "repository": "actions/attest",
+      "commitSha": "508db95dd578ae2727ebd6217d5ba78e4fbda05d",
+      "reviewedVersion": "v4.2.1",
+      "normalizedMetadataSha256": "63b73b127b9cb595b91d3365d26a6b62da299bd38ac66c6cdbc132b5510bffe3",
+      "inputs": ["predicate-path", "predicate-type", "subject-checksums", "subject-path"],
+      "outputs": ["attestation-id", "attestation-url", "bundle-path"],
+      "runtime": "node",
+      "projectPermissionClass": "attest"
+    }
+  ]
+}

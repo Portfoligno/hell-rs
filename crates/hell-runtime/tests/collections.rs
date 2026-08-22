@@ -2,6 +2,8 @@ use std::io::Write;
 #[cfg(feature = "mutation-testing")]
 use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mutation-testing")]
+use std::time::Duration;
 
 use hell_compiler::{CompilerSession, compile_source};
 use hell_runtime::{RuntimeContext, run_main};
@@ -193,7 +195,13 @@ fn run_map_comparator_test(mutant: Option<&str>) -> ExitStatus {
             .args(["--skip", "__hell_mutant", "--skip"])
             .arg(mutant);
     }
-    command.status().expect("nested collections test runs")
+    let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(30))
+        .expect("supervise nested collections test");
+    assert!(
+        !output.timed_out,
+        "nested collections test exceeded its deadline"
+    );
+    output.status
 }
 
 #[cfg(feature = "mutation-testing")]

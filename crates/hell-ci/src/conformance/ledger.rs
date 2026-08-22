@@ -236,13 +236,18 @@ impl ConformancePlan {
         if self.baseline.is_empty() {
             return Err("conformance baseline is empty".to_owned());
         }
-        if !super::mutant_active("required-cell-omitted-from-plan")
-            && (self.cells.len() != expected_universe.len()
-                || !self
-                    .cells
-                    .iter()
-                    .map(|cell| &cell.key)
-                    .eq(expected_universe.iter()))
+        let observed = self.cells.iter().map(|cell| &cell.key).collect::<Vec<_>>();
+        let omitted_final = super::mutant_active("required-cell-omitted-from-plan")
+            && observed.len().checked_add(1) == Some(expected_universe.len())
+            && observed
+                .iter()
+                .copied()
+                .eq(expected_universe[..observed.len()].iter());
+        let accepted_duplicate = super::mutant_active("duplicate-cell-accepted")
+            && one_duplicate_from_universe(&observed, expected_universe);
+        if !observed.iter().copied().eq(expected_universe.iter())
+            && !omitted_final
+            && !accepted_duplicate
         {
             return Err("conformance plan does not equal the exact canonical universe".to_owned());
         }
@@ -253,6 +258,131 @@ impl ConformancePlan {
         }
         Ok(())
     }
+}
+
+fn one_duplicate_from_universe(observed: &[&CellKey], expected: &[CellKey]) -> bool {
+    if observed.len() != expected.len().saturating_add(1) {
+        return false;
+    }
+    (1..observed.len()).any(|duplicate_index| {
+        observed[duplicate_index] == observed[duplicate_index - 1]
+            && observed
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| (index != duplicate_index).then_some(*value))
+                .eq(expected.iter())
+    })
+}
+
+pub(crate) fn assurance_final_cell_omission() -> Result<(), String> {
+    let first = assurance_cell("Bool.bool")?;
+    let second = assurance_cell("Bool.not")?;
+    assurance_plan(vec![first.clone()]).validate(&[first.key, second.key])
+}
+
+pub(crate) fn assurance_duplicate_cell() -> Result<(), String> {
+    let cell = assurance_cell("Bool.bool")?;
+    assurance_plan(vec![cell.clone(), cell.clone()]).validate(&[cell.key])
+}
+
+pub(crate) fn assurance_exemption_selector_mismatch() -> Result<(), String> {
+    let mut plan = assurance_exemption_plan("2026-08-14")?;
+    let selector = &mut plan
+        .cells
+        .first_mut()
+        .and_then(|cell| cell.exemption.as_mut())
+        .ok_or_else(|| "assurance exemption fixture is incomplete".to_owned())?
+        .candidate_sha;
+    hell_builtins::UPSTREAM_COMMIT.clone_into(selector);
+    let expected = vec![plan.cells[0].key.clone()];
+    plan.validate(&expected)
+}
+
+pub(crate) fn assurance_exemption_expired_at_plan_time() -> Result<(), String> {
+    let plan = assurance_exemption_plan("2026-08-13")?;
+    let expected = vec![plan.cells[0].key.clone()];
+    plan.validate(&expected)
+}
+
+fn assurance_exemption_plan(expires_on: &str) -> Result<ConformancePlan, String> {
+    let mut cell = assurance_cell("Bool.bool")?;
+    let obligation = PlannedObligation {
+        id: "bool-native".to_owned(),
+        strategy: EvidenceStrategy::NativeOracle,
+        case_ids: vec!["bool-false".to_owned()],
+        case_descriptor_sha256: BTreeMap::from([(
+            "bool-false".to_owned(),
+            hell_testkit::sha256_bytes(b"bool-false assurance descriptor").hex(),
+        )]),
+        allowed_normalizers: Vec::new(),
+    };
+    cell.scope = ScopeDisposition::Required {
+        decision_id: "applicable".to_owned(),
+    };
+    cell.obligations = vec![obligation.clone()];
+    let candidate_sha = assurance_candidate_sha();
+    cell.exemption = Some(PlannedExemption {
+        id: "EX-ASSURANCE".to_owned(),
+        kind: ExemptionKind::EvidenceGap,
+        candidate_sha: candidate_sha.clone(),
+        standard: super::RELEASE_STANDARD.to_owned(),
+        baseline: "2026-05-29".to_owned(),
+        cell: cell.key.clone(),
+        obligation_id: obligation.id,
+        expected_mismatch_sha256: None,
+        issue: "COMPAT-ASSURANCE".to_owned(),
+        rationale: "Focused exact-selector mutation assurance.".to_owned(),
+        review_group: "release-conformance".to_owned(),
+        expires_on: expires_on.to_owned(),
+    });
+    let mut plan = assurance_plan(vec![cell]);
+    plan.candidate_sha = candidate_sha;
+    Ok(plan)
+}
+
+fn assurance_cell(builtin: &str) -> Result<PlannedCell, String> {
+    Ok(PlannedCell {
+        key: CellKey::new(
+            builtin,
+            hell_builtins::CompatibilityDimension::PureRuntime,
+            super::ProfileId::Upstream,
+            ConformancePlatform::LinuxX86_64,
+        )?,
+        scope: ScopeDisposition::NotApplicable {
+            decision_id: "assurance-not-applicable".to_owned(),
+            rationale: "Focused ledger inventory assurance.".to_owned(),
+        },
+        obligations: Vec::new(),
+        exemption: None,
+    })
+}
+
+fn assurance_plan(cells: Vec<PlannedCell>) -> ConformancePlan {
+    ConformancePlan {
+        standard: super::RELEASE_STANDARD.to_owned(),
+        candidate_sha: assurance_candidate_sha(),
+        workflow_sha: hell_builtins::UPSTREAM_COMMIT.to_owned(),
+        release_evaluation_instant: "2026-08-13T00:00:00Z".to_owned(),
+        trusted_inputs_sha256: hell_testkit::sha256_bytes(b"assurance trusted inputs").hex(),
+        source_inventory_sha256: hell_testkit::sha256_bytes(b"assurance source inventory").hex(),
+        baseline: "2026-05-29".to_owned(),
+        exploratory_generator_version: super::EXPLORATORY_GENERATOR_VERSION.to_owned(),
+        exploratory_generator_seed: super::EXPLORATORY_GENERATOR_SEED,
+        exploratory_generator_count_per_platform: u64::try_from(super::EXPLORATORY_GENERATOR_COUNT)
+            .expect("exploratory count is bounded"),
+        generated_agreement_may_verify: super::GENERATED_AGREEMENT_MAY_VERIFY,
+        generated_mismatch_blocks: super::GENERATED_MISMATCH_BLOCKS,
+        cells,
+        plan_sha256: hell_testkit::sha256_bytes(b"assurance conformance plan").hex(),
+    }
+}
+
+fn assurance_candidate_sha() -> String {
+    let digest = hell_testkit::sha256_bytes(b"assurance candidate commit").hex();
+    digest
+        .strip_suffix(&digest[hell_builtins::UPSTREAM_COMMIT.len()..])
+        .expect("digest has at least one Git SHA worth of bytes")
+        .to_owned()
 }
 
 impl PlannedCell {
@@ -634,16 +764,16 @@ fn validate_exemption(
     }
     require_sha(&exemption.candidate_sha, "exemption candidate SHA")?;
     validate_date(&exemption.expires_on)?;
-    if (!super::mutant_active("exemption-candidate-sha-ignored")
-        && exemption.candidate_sha != plan.candidate_sha)
-        || exemption.standard != plan.standard
-        || exemption.baseline != plan.baseline
-        || exemption.cell != cell.key
-        || !cell
+    let selector_matches = (super::mutant_active("exemption-candidate-sha-ignored")
+        || exemption.candidate_sha == plan.candidate_sha)
+        && exemption.standard == plan.standard
+        && exemption.baseline == plan.baseline
+        && exemption.cell == cell.key
+        && cell
             .obligations
             .iter()
-            .any(|obligation| obligation.id == exemption.obligation_id)
-    {
+            .any(|obligation| obligation.id == exemption.obligation_id);
+    if !super::mutant_active("compare-exemption-id-only") && !selector_matches {
         return Err(format!(
             "exemption {} does not exactly target its cell",
             exemption.id

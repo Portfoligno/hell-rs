@@ -1,0 +1,10 @@
+name: Fuzz seed
+on:
+  push: {}
+permissions:
+  contents: read
+jobs:
+  parse:
+    runs-on: ubuntu-24.04
+    steps:
+    - run: cargo check --locked
