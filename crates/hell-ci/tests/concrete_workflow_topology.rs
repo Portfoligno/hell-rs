@@ -67,7 +67,7 @@ fn assert_release_assembly_and_governance(assemble: &str, governance: &str) {
 }
 
 fn assert_final_verification(release: &str, final_verify: &str) {
-    assert!(final_verify.contains("needs:\n    - resolve\n    - assemble\n    - governance"));
+    assert!(final_verify.contains("needs:\n      - resolve\n      - assemble\n      - governance"));
     assert!(release.contains("permissions:\n  actions: read\n  contents: read"));
     assert!(!final_verify.contains("permissions:"));
     assert!(!final_verify.contains("id-token: write"));
@@ -103,7 +103,7 @@ fn assert_final_verification(release: &str, final_verify: &str) {
 }
 
 fn assert_attestation(attest: &str) {
-    assert!(attest.contains("needs:\n    - resolve\n    - final-verify"));
+    assert!(attest.contains("needs:\n      - resolve\n      - final-verify"));
     assert!(attest.contains("contents: read"));
     assert!(attest.contains("id-token: write"));
     assert!(attest.contains("attestations: write"));
@@ -132,7 +132,7 @@ fn assert_attestation(attest: &str) {
 }
 
 fn assert_publication(publish: &str) {
-    assert!(publish.contains("needs:\n    - resolve\n    - governance\n    - attest"));
+    assert!(publish.contains("needs:\n      - resolve\n      - governance\n      - attest"));
     assert!(publish.contains("contents: write"));
     assert!(!publish.contains("id-token: write"));
     assert!(!publish.contains("attestations: write"));
@@ -220,10 +220,9 @@ fn governance_receipts_are_plan_bound_chained_and_retained_at_every_phase() {
 fn readiness_summary_is_failure_terminal_and_uses_one_artifact_layout() {
     let ci = workflow("ci.yml");
     let summary = job_block(&ci, "summary", None);
-    assert!(
-        summary
-            .contains("needs:\n    - plan\n    - linux\n    - macos\n    - windows\n    - verify")
-    );
+    assert!(summary.contains(
+        "needs:\n      - plan\n      - linux\n      - macos\n      - windows\n      - verify"
+    ));
     assert!(summary.contains("if: ${{ !cancelled() }}"));
     assert!(!summary.contains("if: ${{ always() }}\n    permissions:"));
     for state in ["success", "failure", "skipped"] {
@@ -268,6 +267,77 @@ fn readiness_plan_executes_the_typed_and_independent_control_audits_before_plann
             *expected
         );
     }
+}
+
+#[test]
+fn macos_platform_jobs_provision_the_pinned_cargo_deny_authority() {
+    let ci = workflow("ci.yml");
+    let release = workflow("release.yml");
+    let ci_macos = job_block(&ci, "macos", Some("windows"));
+    let release_macos = job_block(&release, "macos", Some("windows"));
+
+    for (label, job, cargo_key, target_key, gate) in [
+        (
+            "readiness macOS",
+            ci_macos,
+            "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2",
+            "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}",
+            "Run macOS technical readiness gate",
+        ),
+        (
+            "release macOS",
+            release_macos,
+            "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2",
+            "release-macos-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2",
+            "Run macOS release gate, collect conformance evidence, and package",
+        ),
+    ] {
+        let restore = job
+            .find("- name: Restore cargo-deny compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not restore the cargo-deny cache"));
+        let candidate_cache = job
+            .find("- name: Restore candidate compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not restore the candidate cache"));
+        let install = job
+            .find("- name: Install pinned cargo-deny")
+            .unwrap_or_else(|| panic!("{label} does not install cargo-deny"));
+        let gate = job
+            .find(gate)
+            .unwrap_or_else(|| panic!("{label} platform gate is missing"));
+        let save = job
+            .find("- name: Save cargo-deny compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not save the cargo-deny cache"));
+        let candidate_save = job
+            .find("- name: Save candidate compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not save the candidate cache"));
+
+        assert!(restore < candidate_cache, "{label} restores tools first");
+        assert!(
+            candidate_cache < install && install < gate,
+            "{label} installs before use"
+        );
+        assert!(
+            gate < save && save < candidate_save,
+            "{label} saves tools first"
+        );
+        assert_eq!(job.matches(cargo_key).count(), 2, "{label} Cargo cache key");
+        assert_eq!(job.matches(target_key).count(), 2, "{label} tool cache key");
+        assert_eq!(
+            job.matches("path: ci-tool-cache/cargo-deny-target").count(),
+            2
+        );
+        assert_eq!(
+            job.matches("run: cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ../ci-tool-cache/cargo-deny-target")
+                .count(),
+            1,
+            "{label} pinned installation",
+        );
+    }
+
+    let ci_windows = job_block(&ci, "windows", Some("verify"));
+    let release_windows = job_block(&release, "windows", Some("assemble"));
+    assert!(!ci_windows.contains("cargo-deny"));
+    assert!(!release_windows.contains("cargo-deny"));
 }
 
 fn projected_commands(

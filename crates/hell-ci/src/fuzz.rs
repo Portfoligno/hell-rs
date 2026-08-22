@@ -53,9 +53,8 @@ const RETAINED_TARGETS: [&str; 5] = [
     "semantic_trace",
 ];
 
-const PRESERVED_REGRESSION_CORPORA: [&str; 9] = [
+const PRESERVED_REGRESSION_CORPORA: [&str; 8] = [
     "acquisition_receipt",
-    "claim_toml",
     "custody_receipt",
     "dsse_envelope",
     "evidence_graph_merge",

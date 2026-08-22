@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::io::Read as _;
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;

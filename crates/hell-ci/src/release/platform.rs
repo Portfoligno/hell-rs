@@ -12073,15 +12073,12 @@ fn stage_windows_toolchain_until_with_entry_gate(
 
 #[cfg(windows)]
 fn establish_candidate_process_confinement(
-    input: CandidateConfinementInput<'_>,
+    input: &CandidateConfinementInput<'_>,
 ) -> Result<CandidateConfinement, String> {
-    let CandidateConfinementInput {
-        candidate_root,
-        oracle_root,
-        workspace_target: target,
-        output,
-        ..
-    } = input;
+    let candidate_root = input.candidate_root;
+    let oracle_root = input.oracle_root;
+    let target = input.workspace_target;
+    let output = input.output;
     let toolchain_envelope = WindowsToolchainConstructionEnvelope::new()?;
     let cargo = crate::command::resolve_cargo_executable()?;
     let rustup = crate::command::resolve_windows_rustup_authority(&cargo, candidate_root)?;

@@ -657,8 +657,8 @@ fn windows_write_restricted_supervisor_command(
             .as_deref()
             .and_then(Path::parent)
             .ok_or_else(|| "imported Windows rustc has no staged bin".to_owned())?;
-        let environment = ProcessEnvironment::from_process();
-        let system_root = environment
+        let process_environment = ProcessEnvironment::from_process();
+        let system_root = process_environment
             .value(StandardVariable::SystemRoot)
             .map(PathBuf::from)
             .ok_or_else(|| "Windows SystemRoot is unavailable".to_owned())?;
@@ -13463,9 +13463,7 @@ pub(crate) fn run_external_nightly_supervisor(
     .map_err(|error| format!("cannot canonicalize Windows session probe: {error}"))?;
     let probe = CommandSpec::new(
         probe_executable,
-        envelope
-            .execution_deadline
-            .saturating_duration_since(Instant::now()),
+        envelope.execution.saturating_duration_since(Instant::now()),
     )
     .arguments([
         std::ffi::OsString::from("__nightly-windows-session-access-probe"),
@@ -13614,11 +13612,7 @@ pub(crate) fn run_external_nightly_supervisor(
         windows_write_inherited_frame(&mut cleanup_successor.control, &successor_commit)?;
         let successor_commit_receipt = cleanup_successor
             .observations
-            .recv_timeout(
-                envelope
-                    .execution_deadline
-                    .saturating_duration_since(Instant::now()),
-            )
+            .recv_timeout(envelope.execution.saturating_duration_since(Instant::now()))
             .map_err(|error| format!("cannot receive Windows cleanup commit receipt: {error}"))??;
         windows_validate_frame(&successor_commit_receipt, 11, request_sha256, nonce)?;
         Ok(())
@@ -13744,9 +13738,7 @@ pub(crate) fn run_external_nightly_supervisor(
                 .map_err(|_| {
                     "Windows supervisor progress relay disconnected before Started".to_owned()
                 })?;
-            let timeout = envelope
-                .execution_deadline
-                .saturating_duration_since(Instant::now());
+            let timeout = envelope.execution.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
                 return Err(
                     "Windows supervisor execution deadline expired before payload launch"
@@ -13866,7 +13858,7 @@ pub(crate) fn run_external_nightly_supervisor(
                     core_command_deadline,
                 )?;
                 let core_timeout = core_envelope
-                    .execution_deadline
+                    .execution
                     .saturating_duration_since(Instant::now());
                 if core_timeout.is_zero() {
                     return Err(
@@ -14534,7 +14526,7 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
                 JsonValue::Number(
                     u64::try_from(
                         envelope
-                            .execution_deadline
+                            .execution
                             .saturating_duration_since(Instant::now())
                             .as_millis(),
                     )

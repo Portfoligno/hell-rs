@@ -933,7 +933,7 @@ with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-targe
 [physical.job.ci.macos]
 name = "Technical readiness / macOS aarch64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s016", "s006", "s007", "s008", "s009", "s017", "s010", "s011", "s012", "s013", "s018", "s014", "s015"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -993,7 +993,16 @@ kind = "action"
 action = "cache-restore"
 with-order = ["path", "key"]
 with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
-with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2"
+
+[physical.step.ci.macos.s016]
+name = "Restore cargo-deny compilation cache"
+id = "cargo-deny-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}"
 
 [physical.step.ci.macos.s006]
 name = "Restore candidate compilation cache"
@@ -1026,6 +1035,14 @@ name = "Expose pinned LLVM archiver"
 kind = "run"
 executable = "brew"
 arguments = ["link", "--force", "llvm@18"]
+credential = "none"
+
+[physical.step.ci.macos.s017]
+name = "Install pinned cargo-deny"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["install", "cargo-deny", "--locked", "--version", "0.20.2", "--force", "--target-dir", "../ci-tool-cache/cargo-deny-target"]
 credential = "none"
 
 [physical.step.ci.macos.s010]
@@ -1062,7 +1079,16 @@ kind = "action"
 action = "cache-save"
 with-order = ["path", "key"]
 with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
-with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2"
+
+[physical.step.ci.macos.s018]
+name = "Save cargo-deny compilation cache"
+if = "${{ always() && steps.cargo-deny-target-cache.outcome == 'success' && steps.cargo-deny-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}"
 
 [physical.step.ci.macos.s014]
 name = "Save candidate compilation cache"
@@ -2633,7 +2659,7 @@ with.key = "release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }
 [physical.job.release.macos]
 name = "Release gate / macOS aarch64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s014", "s006", "s007", "s008", "s015", "s009", "s010", "s011", "s012", "s016", "s013"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -2694,7 +2720,16 @@ kind = "action"
 action = "cache-restore"
 with-order = ["path", "key"]
 with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
-with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2"
+
+[physical.step.release.macos.s014]
+name = "Restore cargo-deny compilation cache"
+id = "cargo-deny-target-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "release-macos-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2"
 
 [physical.step.release.macos.s006]
 name = "Restore candidate compilation cache"
@@ -2718,6 +2753,14 @@ name = "Expose pinned LLVM archiver"
 kind = "run"
 executable = "brew"
 arguments = ["link", "--force", "llvm@18"]
+credential = "none"
+
+[physical.step.release.macos.s015]
+name = "Install pinned cargo-deny"
+working-directory = "automation"
+kind = "run"
+executable = "cargo"
+arguments = ["install", "cargo-deny", "--locked", "--version", "0.20.2", "--force", "--target-dir", "../ci-tool-cache/cargo-deny-target"]
 credential = "none"
 
 [physical.step.release.macos.s009]
@@ -2753,7 +2796,16 @@ kind = "action"
 action = "cache-save"
 with-order = ["path", "key"]
 with.path = "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n"
-with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}"
+with.key = "release-macos-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2"
+
+[physical.step.release.macos.s016]
+name = "Save cargo-deny compilation cache"
+if = "${{ always() && steps.cargo-deny-target-cache.outcome == 'success' && steps.cargo-deny-target-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/cargo-deny-target"
+with.key = "release-macos-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2"
 
 [physical.step.release.macos.s013]
 name = "Save candidate compilation cache"

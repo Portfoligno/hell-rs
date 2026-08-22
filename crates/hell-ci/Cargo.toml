@@ -28,7 +28,7 @@ hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
 hell-testkit = { version = "0.1.0", path = "../hell-testkit" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
-syn = { version = "2.0.106", features = ["full", "visit"] }
+syn = { version = "3.0.3", features = ["full", "visit"] }
 tar = "0.4.44"
 ureq = { version = "3.1.2", default-features = false, features = ["rustls"] }
 
