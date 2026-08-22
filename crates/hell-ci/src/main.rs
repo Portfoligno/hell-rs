@@ -17,7 +17,9 @@ mod release_suite;
 mod report;
 mod strict_toml;
 
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -513,9 +515,163 @@ fn main() -> ExitCode {
     #[cfg(not(unix))]
     let _ = invoked;
     let arguments = process_arguments.collect::<Vec<_>>();
+    #[cfg(any(unix, windows))]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__release-command-supervisor-v1")
+    {
+        return match release_suite::run_external_nightly_supervisor(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-supervisor-reporter-fixture")
+    {
+        return match release_suite::run_external_supervisor_reporter_fixture(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-supervisor-reporter-fixture")
+    {
+        return match release_suite::run_windows_external_supervisor_reporter_fixture(
+            &arguments[1..],
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(any(unix, windows))]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-supervisor-owned-child")
+    {
+        return match release_suite::run_external_supervisor_owned_child(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-windows-session-access-probe")
+    {
+        return match release_suite::run_windows_supervisor_session_probe(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(any(unix, windows))]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-supervisor-owned-grandchild")
+    {
+        if arguments.len() != 1 {
+            eprintln!("nightly supervisor owned grandchild accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::run_external_supervisor_owned_grandchild() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-external-nightly-supervisor")
+    {
+        if arguments.len() != 1 {
+            eprintln!("external nightly supervisor verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_external_nightly_supervisor_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-external-nightly-supervisor")
+    {
+        if arguments.len() != 2 {
+            eprintln!("Windows external nightly supervisor verification requires one case");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_windows_external_nightly_supervisor_for_integration(
+            &arguments[1..],
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(unix)]
     if native_archive_adapter_dispatch(invoked.as_deref()) {
         return command::run_native_archive_adapter(&arguments);
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-portability-timeout-policy")
+    {
+        if arguments.len() != 1 {
+            eprintln!("portability timeout policy verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_portability_timeout_policy_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-portability-supervision")
+    {
+        if arguments.len() != 1 {
+            eprintln!("portability supervision verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_portability_supervision_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__portability-supervision-fixture")
+    {
+        release_suite::run_portability_supervision_fixture(&arguments[1..]);
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__portability-supervision-descendant")
+    {
+        release_suite::run_portability_supervision_descendant();
     }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
@@ -523,11 +679,612 @@ fn main() -> ExitCode {
     {
         return command::run_posix_release_child(&arguments[1..]);
     }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-broker-descendant-launcher")
+    {
+        return match command::verify_native_archive_broker_descendant_launcher(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-broker-descendant-consumer")
+    {
+        return match command::verify_native_archive_broker_descendant_consumer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-staged-native-toolchain")
+    {
+        let [adapter_root] = &arguments[1..] else {
+            eprintln!("staged native toolchain verification requires one adapter root");
+            return ExitCode::FAILURE;
+        };
+        return match command::verify_staged_native_toolchain_for_integration(Path::new(
+            adapter_root,
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-seal-rebinding")
+    {
+        let [adapter_root] = &arguments[1..] else {
+            eprintln!("native archive seal verification requires one adapter root");
+            return ExitCode::FAILURE;
+        };
+        return match command::verify_native_archive_seal_rebinding_for_integration(Path::new(
+            adapter_root,
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-archive-adapter-transition")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX archive adapter transition verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_archive_adapter_transition_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-source-stack-cleanup-order")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX source Stack cleanup verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_source_stack_work_cleanup_order_for_integration(
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-macos-archive-cleanup-principal")
+    {
+        if arguments.len() != 1 {
+            eprintln!("macOS archive cleanup principal verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_macos_archive_cleanup_principal_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-post-state-metadata")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX post-state metadata verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_post_state_metadata_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-candidate-environment-construction")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX candidate environment verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_candidate_environment_construction_for_integration(
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-process-authority")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX process authority verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_process_authority_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-identity-query-deadline")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX identity query deadline verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_identity_query_deadline_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-candidate-target-remover")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX candidate target remover verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_candidate_target_remover_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-principal-cleanup-order")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX principal cleanup order verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_principal_cleanup_order_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-candidate-driver-receipt")
+    {
+        return match release::platform::verify_posix_candidate_driver_receipt_for_integration(
+            &arguments[1..],
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-candidate-target-authority")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX candidate target verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_candidate_target_authority_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-native-cargo-rejection")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX native Cargo rejection verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_native_cargo_rejection_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-rustc-environment")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX Rust compiler environment verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_rustc_environment_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-posix-candidate-home-test-authority")
+    {
+        if arguments.len() != 1 {
+            eprintln!("POSIX candidate home test verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_posix_candidate_home_test_authority_for_integration()
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__verify-cargo-multicall-argv") {
+        if arguments.len() != 1 {
+            eprintln!("Cargo multicall argv verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_cargo_multicall_argv_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__verify-standard-tool-resolver")
+    {
+        if arguments.len() != 1 {
+            eprintln!("standard tool resolver verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_standard_tool_resolver_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-cargo-multicall-argv-child")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Cargo multicall argv child verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_cargo_multicall_argv_child_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-staged-native-acl-policy")
+    {
+        if arguments.len() != 1 {
+            eprintln!("staged native ACL verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_staged_native_acl_policy_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__native-archiver-receipt-child")
+    {
+        if arguments.len() != 1 {
+            eprintln!("native archiver receipt child accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        println!("member.o");
+        return ExitCode::SUCCESS;
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-macos-native-archiver-acquisition")
+    {
+        if arguments.len() != 2 {
+            eprintln!("macOS native archiver acquisition verification requires RECEIPT");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_macos_native_archiver_acquisition_for_integration(Path::new(
+            &arguments[1],
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-macos-native-archiver-topology")
+    {
+        if arguments.len() != 2 {
+            eprintln!("macOS native archiver topology verification requires RECEIPT");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_macos_native_archiver_topology_for_integration(Path::new(
+            &arguments[1],
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-macos-native-archiver-dependency-receipt")
+    {
+        if arguments.len() != 1 {
+            eprintln!("macOS native archiver dependency verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_macos_native_archiver_dependency_receipt_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-macos-native-archiver-receipt")
+    {
+        if arguments.len() != 1 {
+            eprintln!("macOS native archiver receipt verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_macos_native_archiver_receipt_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-ghc-configure-probe")
+    {
+        let [base] = &arguments[1..] else {
+            eprintln!("native archive GHC configure verification requires one base path");
+            return ExitCode::FAILURE;
+        };
+        return match command::verify_native_archive_ghc_configure_probe_for_integration(Path::new(
+            base,
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__native-archive-ghc-configure-hung-child")
+    {
+        return match command::run_native_archive_ghc_configure_hung_child_for_integration(
+            &arguments[1..],
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__verify-native-archive-policy")
+    {
+        if arguments.len() != 1 {
+            eprintln!("native archive policy verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_native_archive_policy_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-adapter-cleanup")
+    {
+        let [base] = &arguments[1..] else {
+            eprintln!("native archive adapter cleanup verification requires one base path");
+            return ExitCode::FAILURE;
+        };
+        return match command::verify_native_archive_adapter_cleanup_for_integration(Path::new(base))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-nightly-workspace-partition")
+    {
+        if arguments.len() != 1 {
+            eprintln!("nightly workspace partition verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_nightly_workspace_partition_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__nightly-failed-case-child") {
+        if arguments.len() != 1 {
+            eprintln!("nightly failed-case child accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        release_suite::run_nightly_failed_case_child();
+        return ExitCode::FAILURE;
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-nightly-failed-case-attribution")
+    {
+        if arguments.len() != 1 {
+            eprintln!("nightly failed-case attribution verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_nightly_failed_case_attribution_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-nightly-attributed-supervision")
+    {
+        if arguments.len() != 1 {
+            eprintln!("nightly attributed supervision verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_nightly_attributed_supervision_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-windows-hell-testkit-diagnostics")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Windows hell-testkit diagnostic verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release_suite::verify_windows_hell_testkit_diagnostics_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(any(unix, windows))]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-platform-command-failure-report")
+    {
+        if arguments.len() != 1 {
+            eprintln!("platform command-failure report verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_platform_command_failure_report_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(any(unix, windows))]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__platform-command-failure-child")
+    {
+        return release::platform::run_platform_command_failure_child(&arguments[1..]);
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__repository-inventory-target-stderr-child")
+    {
+        return release::platform::run_repository_inventory_target_stderr_child(&arguments[1..]);
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__release-normalize-candidate-cache")
     {
         return match release::platform::run_posix_candidate_cache_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__release-remove-candidate-target-verifier")
+    {
+        return match release::platform::run_posix_candidate_target_verifier_remover(&arguments[1..])
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
@@ -570,8 +1327,63 @@ fn main() -> ExitCode {
         };
     }
     #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-windows-platform-gate-topology")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Windows platform gate topology verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_windows_platform_gate_topology_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-windows-final-platform-inventory")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Windows final platform inventory verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_windows_final_platform_inventory_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-windows-candidate-target-authority")
+    {
+        if arguments.len() != 1 {
+            eprintln!("Windows candidate target verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::platform::verify_windows_candidate_target_authority_for_integration()
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(windows)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-restricted-child") {
         return command::run_windows_restricted_child(&arguments[1..]);
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__nightly-write-restricted-child")
+    {
+        return command::run_windows_write_restricted_child(&arguments[1..]);
     }
     let root = match std::env::current_dir() {
         Ok(root) => root,
@@ -671,6 +1483,16 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
         Invocation::Examples { report, .. } => ("examples", report),
     };
     let mut report = Report::new(suite_name);
+    if (matches!(invocation, Invocation::Nightly { .. })
+        || (cfg!(target_os = "macos") && matches!(invocation, Invocation::Portability { .. })))
+        && let Err(error) = report.attach_checkpoint(report_path.clone())
+    {
+        eprintln!(
+            "cannot write initial report checkpoint {}: {error}",
+            report_path.display()
+        );
+        return ExitCode::from(40);
+    }
     if matches!(invocation, Invocation::NativeDifferentialBenchmark { .. }) {
         report.mark_non_authoritative();
     }
@@ -730,6 +1552,7 @@ fn run(invocation: &Invocation, root: &Path) -> ExitCode {
             eprintln!("{line}");
         }
     }
+    report.complete();
     if let Err(error) = report.write(report_path) {
         eprintln!("cannot write report {}: {error}", report_path.display());
         return ExitCode::from(40);

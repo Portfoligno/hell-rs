@@ -3,9 +3,11 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use hell_testkit::{
-    WindowsToolchainAuthority, WindowsToolchainExecutableAuthority,
+    BoundProgramInvocation, WindowsToolchainAuthority, WindowsToolchainExecutableAuthority,
     configure_windows_restricted_child_environment, configure_windows_restricted_child_path,
 };
 
@@ -91,6 +93,195 @@ fn inventory(root: &Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
         }
     }
     (root, files, directories)
+}
+
+fn promoted_inventory(files: &[PathBuf], deadline: Instant) -> Vec<BoundProgramInvocation> {
+    files
+        .iter()
+        .map(|path| {
+            BoundProgramInvocation::new_until(path.clone(), path.clone(), deadline).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn promoted_staged_inventory_is_not_hashed_again_and_expiry_does_no_late_work() {
+    let fixture = Fixture::new("promoted");
+    let cargo_proxy = fixture.tool_file("proxy-cargo", "cargo.exe", b"proxy");
+    let rustc_proxy = fixture.tool_file("proxy-rustc", "rustc.exe", b"proxy");
+    let source_cargo = fixture.tool_file("source-cargo", "cargo.exe", b"cargo");
+    let staged_cargo = fixture.tool_file("stage/bin", "cargo.exe", b"cargo");
+    let source_rustc = fixture.tool_file("source-rustc", "rustc.exe", b"rustc");
+    let staged_rustc = fixture.tool_file("stage/bin", "rustc.exe", b"rustc");
+    let staged_lld = fixture.tool_file(
+        "stage/lib/rustlib/x86_64-pc-windows-msvc/bin",
+        "rust-lld.exe",
+        b"lld",
+    );
+    let (trusted_path, _, system_root) = fixture.trusted_path();
+    let (inventory_root, inventory_files, inventory_directories) =
+        inventory(&fixture.root.join("stage"));
+    let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+    let promoted = promoted_inventory(&inventory_files, deadline);
+    let promoted_for_nonmember = promoted.clone();
+    let authority = WindowsToolchainAuthority::new_from_promoted_inventory_until(
+        mapping(&cargo_proxy, &source_cargo, &staged_cargo),
+        mapping(&rustc_proxy, &source_rustc, &staged_rustc),
+        inventory_root.clone(),
+        promoted,
+        inventory_directories.clone(),
+        trusted_path.clone(),
+        system_root.clone(),
+        deadline,
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(
+        authority.windows_inventory_full_hash_passes_for_integration(),
+        0
+    );
+    assert_eq!(
+        authority
+            .mapped_program(OsStr::new("cargo"), &cargo_proxy)
+            .unwrap(),
+        Some(staged_cargo.clone())
+    );
+    assert!(fs::write(&staged_lld, b"bad").is_err());
+    let extra = inventory_root.join("extra.dll");
+    fs::write(&extra, b"extra").unwrap();
+    assert!(authority.revalidate().is_err());
+    fs::remove_file(extra).unwrap();
+    drop(authority);
+
+    let nonmember = inventory_root.join("not-a-member.exe");
+    let invalid_mapping = WindowsToolchainAuthority::new_from_promoted_inventory_until(
+        mapping(&cargo_proxy, &source_cargo, &nonmember),
+        mapping(&rustc_proxy, &source_rustc, &staged_rustc),
+        inventory_root,
+        promoted_for_nonmember,
+        inventory_directories.clone(),
+        trusted_path.clone(),
+        system_root.clone(),
+        deadline,
+        deadline,
+    )
+    .unwrap_err();
+    assert!(
+        invalid_mapping
+            .to_string()
+            .contains("operation=bind-staged-cargo")
+    );
+    assert!(!nonmember.exists());
+
+    let missing = fixture.root.join("expired-must-not-open");
+    let expired_deadline = Instant::now();
+    let expired = WindowsToolchainAuthority::new_from_promoted_inventory_until(
+        mapping(&missing, &missing, &missing),
+        mapping(&missing, &missing, &missing),
+        missing.clone(),
+        Vec::new(),
+        inventory_directories,
+        trusted_path,
+        system_root,
+        expired_deadline,
+        expired_deadline,
+    )
+    .unwrap_err();
+    assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!missing.exists());
+}
+
+const MALFORMED_SYSTEM_ROOT_PROBE: &str = "__hell_malformed_system_root_probe";
+const MALFORMED_SYSTEM_ROOT_CASES: [&str; 4] =
+    ["removed", "forged", "empty", "duplicate-case-insensitive"];
+
+fn malformed_system_root_probe_argument() -> Option<String> {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    arguments.windows(4).find_map(|window| {
+        (window[0] == OsStr::new("--skip")
+            && window[1] == OsStr::new(MALFORMED_SYSTEM_ROOT_PROBE)
+            && window[2] == OsStr::new("--skip"))
+        .then(|| window[3].to_string_lossy().into_owned())
+    })
+}
+
+fn malformed_system_root_authority(name: &str) -> (Fixture, WindowsToolchainAuthority, OsString) {
+    let fixture = Fixture::new(name);
+    let cargo_proxy = fixture.tool_file("proxy-cargo", "cargo.exe", b"proxy");
+    let rustc_proxy = fixture.tool_file("proxy-rustc", "rustc.exe", b"proxy");
+    let source_cargo = fixture.tool_file("source-cargo", "cargo.exe", b"cargo");
+    let staged_cargo = fixture.tool_file("stage/bin", "cargo.exe", b"cargo");
+    let source_rustc = fixture.tool_file("source-rustc", "rustc.exe", b"rustc");
+    let staged_rustc = fixture.tool_file("stage/bin", "rustc.exe", b"rustc");
+    let (trusted_path, _, system_root) = fixture.trusted_path();
+    let (inventory_root, inventory_files, inventory_directories) =
+        inventory(&fixture.root.join("stage"));
+    let authority = WindowsToolchainAuthority::new(
+        mapping(&cargo_proxy, &source_cargo, &staged_cargo),
+        mapping(&rustc_proxy, &source_rustc, &staged_rustc),
+        inventory_root,
+        inventory_files,
+        inventory_directories,
+        trusted_path,
+        system_root.clone(),
+    )
+    .unwrap();
+    (fixture, authority, system_root)
+}
+
+fn run_malformed_system_root_probe(case: &str) -> ExitStatus {
+    Command::new(std::env::current_exe().expect("Windows toolchain test executable"))
+        .arg("malformed_system_root_rejection_is_process_isolated")
+        .arg("--exact")
+        .args(["--skip", MALFORMED_SYSTEM_ROOT_PROBE, "--skip", case])
+        .status()
+        .expect("malformed SystemRoot subprocess probe runs")
+}
+
+#[test]
+fn malformed_system_root_rejection_is_process_isolated() {
+    if let Some(case) = malformed_system_root_probe_argument() {
+        let (_fixture, authority, system_root) = malformed_system_root_authority(&case);
+        let (mut environment, expected_message) = match case.as_str() {
+            "removed" => (
+                vec![(OsString::from("SystemRoot"), None)],
+                "Windows release child removed its trusted SystemRoot",
+            ),
+            "forged" => (
+                vec![(
+                    OsString::from("SystemRoot"),
+                    Some(OsString::from(r"D:\ForgedWindows")),
+                )],
+                "Windows release child SystemRoot differs from its trusted parent capture",
+            ),
+            "empty" => (
+                vec![(OsString::from("SystemRoot"), Some(OsString::new()))],
+                "Windows release child SystemRoot differs from its trusted parent capture",
+            ),
+            "duplicate-case-insensitive" => (
+                vec![
+                    (OsString::from("SystemRoot"), Some(system_root.clone())),
+                    (OsString::from("SYSTEMROOT"), Some(system_root)),
+                ],
+                "Windows release child has duplicate SystemRoot entries",
+            ),
+            unknown => panic!("unknown malformed SystemRoot probe {unknown:?}"),
+        };
+        let error =
+            configure_windows_restricted_child_environment(&authority, &mut environment, false)
+                .expect_err("malformed SystemRoot must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), expected_message);
+        return;
+    }
+
+    for case in MALFORMED_SYSTEM_ROOT_CASES {
+        let status = run_malformed_system_root_probe(case);
+        assert!(
+            status.success(),
+            "SystemRoot probe {case:?} exited {status}"
+        );
+    }
 }
 
 #[test]

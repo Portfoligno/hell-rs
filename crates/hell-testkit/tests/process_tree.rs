@@ -2,7 +2,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hell_platform::{SupervisedChild, WaitOutcome};
-use hell_testkit::run_supervised_command;
+use hell_testkit::{
+    SupervisedProgressObserver, run_supervised_command, run_supervised_command_until,
+};
 
 fn helper() -> &'static str {
     env!("CARGO_BIN_EXE_hell-test-helper")
@@ -114,4 +116,40 @@ fn timeout_kills_the_descendant_tree() {
     assert!(termination.reaped);
     std::thread::sleep(Duration::from_millis(650));
     assert!(!marker.exists(), "grandchild escaped its process tree");
+}
+
+#[test]
+fn absolute_deadline_closes_blocked_input_and_progress_tasks_before_return() {
+    let marker = std::env::temp_dir().join(format!(
+        "hell-testkit-absolute-deadline-{}-{}.marker",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut command = Command::new(helper());
+    command.arg("spawn-grandchild").arg("500").arg(&marker);
+    let started = Instant::now();
+    let execution_deadline = started + Duration::from_millis(100);
+    let completion_deadline = started + Duration::from_secs(2);
+    let input = vec![b'x'; 8 * 1024 * 1024];
+    let (progress, receiver) = SupervisedProgressObserver::bounded(4);
+    let output = run_supervised_command_until(
+        &mut command,
+        &input,
+        execution_deadline,
+        completion_deadline,
+        Some(progress),
+    )
+    .expect("absolute-deadline process tree terminates");
+    assert!(output.timed_out);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    while receiver.try_recv().is_ok() {}
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Disconnected)
+    ));
+    assert!(
+        !marker.exists(),
+        "grandchild escaped absolute deadline cleanup"
+    );
 }

@@ -11,6 +11,7 @@ mod peer_disconnect;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::{Future, poll_fn};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -281,6 +282,65 @@ pub struct ServerConfig {
     pub acquire_connection: Arc<dyn Fn() -> HostResult<Box<dyn Send>> + Send + Sync>,
 }
 
+/// One exact loopback listener whose ownership can be transferred into a server.
+///
+/// Unlike a numeric port reservation, this keeps the kernel listener open
+/// continuously from address selection through server startup.
+pub struct BoundServerListener {
+    listener: std::net::TcpListener,
+    address: SocketAddr,
+}
+
+impl BoundServerListener {
+    /// Binds one kernel-selected IPv4 loopback address and retains its listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listener cannot be bound or inspected.
+    pub fn bind_loopback() -> HostResult<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| HostError::new(format!("bind reserved HTTP listener: {error}")))?;
+        let address = listener.local_addr().map_err(|error| {
+            HostError::new(format!("inspect reserved HTTP listener address: {error}"))
+        })?;
+        Ok(Self { listener, address })
+    }
+
+    /// Returns the exact address owned by this listener.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn into_tokio(self) -> HostResult<TcpListener> {
+        self.listener.set_nonblocking(true).map_err(|error| {
+            HostError::new(format!("configure reserved HTTP listener: {error}"))
+        })?;
+        TcpListener::from_std(self.listener)
+            .map_err(|error| HostError::new(format!("install reserved HTTP listener: {error}")))
+    }
+}
+
+/// One typed pre-ready HTTP server lifecycle observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerStartupEvent {
+    /// The exact listener is installed and the server is entering its accept loop.
+    Ready {
+        /// Exact installed listener address.
+        address: SocketAddr,
+    },
+    /// The server failed before publishing readiness.
+    Failed {
+        /// Bounded startup phase name.
+        phase: &'static str,
+        /// Bounded startup failure.
+        message: Arc<str>,
+    },
+}
+
+/// Observer for the one pre-ready HTTP server lifecycle event.
+pub type ServerStartupObserver = Arc<dyn Fn(ServerStartupEvent) + Send + Sync>;
+
 /// Runs the asynchronous HTTP/1 host until shutdown or failure.
 ///
 /// # Errors
@@ -303,6 +363,80 @@ async fn serve_async(config: ServerConfig, application: Arc<dyn Application>) ->
     let listener = TcpListener::bind((bind_host, config.port))
         .await
         .map_err(|error| HostError::new(format!("bind HTTP listener: {error}")))?;
+    serve_on_listener(config, application, listener).await
+}
+
+/// Runs the HTTP host on one already-bound listener and publishes exact startup state.
+///
+/// # Errors
+///
+/// Returns an error when the listener does not match policy, runtime or listener
+/// installation fails, or serving fails.
+pub fn serve_with_listener(
+    config: ServerConfig,
+    application: Arc<dyn Application>,
+    listener: BoundServerListener,
+    startup: &ServerStartupObserver,
+) -> HostResult<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            let error = HostError::new(format!("create HTTP async runtime: {error}"));
+            startup(ServerStartupEvent::Failed {
+                phase: "runtime",
+                message: Arc::from(error.message()),
+            });
+            error
+        })?;
+    runtime.block_on(async {
+        let address = listener.address();
+        if address.port() != config.port || (config.loopback_only && !address.ip().is_loopback()) {
+            let error = HostError::new(format!(
+                "reserved HTTP listener differs from policy: expectedPort={}; \
+                 loopbackOnly={}; observed={address}",
+                config.port, config.loopback_only
+            ));
+            startup(ServerStartupEvent::Failed {
+                phase: "listener-policy",
+                message: Arc::from(error.message()),
+            });
+            return Err(error);
+        }
+        let listener = listener.into_tokio().inspect_err(|error| {
+            startup(ServerStartupEvent::Failed {
+                phase: "listener-install",
+                message: Arc::from(error.message()),
+            });
+        })?;
+        let observed = listener.local_addr().map_err(|error| {
+            let error = HostError::new(format!("inspect installed HTTP listener: {error}"));
+            startup(ServerStartupEvent::Failed {
+                phase: "listener-identity",
+                message: Arc::from(error.message()),
+            });
+            error
+        })?;
+        if observed != address {
+            let error = HostError::new(format!(
+                "installed HTTP listener identity changed: expected={address}; observed={observed}"
+            ));
+            startup(ServerStartupEvent::Failed {
+                phase: "listener-identity",
+                message: Arc::from(error.message()),
+            });
+            return Err(error);
+        }
+        startup(ServerStartupEvent::Ready { address });
+        serve_on_listener(config, application, listener).await
+    })
+}
+
+async fn serve_on_listener(
+    config: ServerConfig,
+    application: Arc<dyn Application>,
+    listener: TcpListener,
+) -> HostResult<()> {
     let server_cancellation = Cancellation::new();
     let abort_cancellation = Cancellation::new();
     let semaphore = config

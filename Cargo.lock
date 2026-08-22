@@ -212,6 +212,7 @@ dependencies = [
  "getrandom",
  "hell-builtins",
  "hell-compiler",
+ "hell-digest",
  "hell-docgen",
  "hell-runtime",
  "hell-source",
@@ -224,6 +225,7 @@ dependencies = [
  "tar",
  "ureq",
  "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

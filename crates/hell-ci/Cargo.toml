@@ -17,6 +17,7 @@ flate2 = { version = "1.1.2", default-features = false, features = ["rust_backen
 hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
 hell-compiler = { version = "0.1.0", path = "../hell-compiler" }
 hell-docgen = { version = "0.1.0", path = "../hell-docgen" }
+hell-digest = { version = "0.1.0", path = "../hell-digest" }
 hell-runtime = { version = "0.1.0", path = "../hell-runtime" }
 hell-source = { version = "0.1.0", path = "../hell-source" }
 hell-syntax = { version = "0.1.0", path = "../hell-syntax" }
@@ -27,7 +28,7 @@ tar = "0.4.44"
 ureq = { version = "3.1.2", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27.1", default-features = false, features = ["fs"] }
+nix = { version = "0.27.1", default-features = false, features = ["fs", "poll", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 abistr = "=0.2.0-rc3"
@@ -35,6 +36,7 @@ firehazard = "=0.0.0-2022-09-10"
 getrandom = "=0.2.17"
 widestring = "=1.2.1"
 same-file = "=1.0.6"
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

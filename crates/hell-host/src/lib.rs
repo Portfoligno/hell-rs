@@ -9,7 +9,14 @@ use std::sync::Arc;
 
 mod process_tree;
 
-pub use process_tree::{SupervisedChild, TerminationReport, WaitOutcome};
+#[cfg(unix)]
+#[doc(hidden)]
+pub use process_tree::verify_termination_deadline_for_integration;
+pub use process_tree::{
+    CleanupLease, CleanupLifecycleReceipt, RetainedTerminationReceipt, RetainedTerminationSnapshot,
+    RetainedTerminationState, SupervisedChild, TerminationReport, WaitOutcome,
+    retained_termination_receipt,
+};
 
 /// A captured native environment used for platform path discovery.
 #[derive(Clone, Debug)]

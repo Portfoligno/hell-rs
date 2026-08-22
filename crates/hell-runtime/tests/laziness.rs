@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "mutation-testing")]
-use std::process::{Command, ExitStatus};
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use hell_compiler::{CompilerSession, compile_source};
@@ -11,6 +11,32 @@ use hell_runtime::{
     RuntimeContext, RuntimeDirectoryOperation, RuntimeError, RuntimeErrorKind,
     RuntimeErrorPresentation, RuntimeFileOperation, run_main,
 };
+
+#[cfg(target_os = "linux")]
+const COPY_FILE_MISSING_PRESENTATION: &str = concat!(
+    "hell: missing/source.txt: copyFile:atomicCopyFileContents:",
+    "withReplacementFile:",
+    "copyFileToHandle:openFileWithCloseOnExec: does not exist (No such file or directory)",
+);
+#[cfg(not(target_os = "linux"))]
+const COPY_FILE_MISSING_PRESENTATION: &str = concat!(
+    "hell: missing/source.txt: copyFile:atomicCopyFileContents:",
+    "withReplacementFile:",
+    "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
+);
+
+#[cfg(target_os = "linux")]
+const COPY_FILE_ALTERNATE_MISSING_PRESENTATION: &str = concat!(
+    "hell: other-missing/other-source: copyFile:atomicCopyFileContents:",
+    "withReplacementFile:",
+    "copyFileToHandle:openFileWithCloseOnExec: does not exist (No such file or directory)",
+);
+#[cfg(not(target_os = "linux"))]
+const COPY_FILE_ALTERNATE_MISSING_PRESENTATION: &str = concat!(
+    "hell: other-missing/other-source: copyFile:atomicCopyFileContents:",
+    "withReplacementFile:",
+    "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
+);
 
 #[derive(Clone)]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -395,7 +421,7 @@ fn io_pure_does_not_force_an_ignored_result() {
 }
 
 #[cfg(feature = "mutation-testing")]
-fn run_io_pure_laziness_test(mutant: Option<&str>) -> ExitStatus {
+fn run_io_pure_laziness_test(mutant: Option<&str>) -> Output {
     let mut command = Command::new(std::env::current_exe().expect("laziness test executable"));
     command
         .arg("io_pure_does_not_force_an_ignored_result")
@@ -405,14 +431,26 @@ fn run_io_pure_laziness_test(mutant: Option<&str>) -> ExitStatus {
             .args(["--skip", "__hell_mutant", "--skip"])
             .arg(mutant);
     }
-    command.status().expect("nested laziness test runs")
+    command.output().expect("nested laziness test runs")
 }
 
 #[cfg(feature = "mutation-testing")]
 #[test]
 fn io_pure_eager_force_mutant_is_detected() {
-    assert!(run_io_pure_laziness_test(None).success());
-    assert!(!run_io_pure_laziness_test(Some("io-pure-force-argument")).success());
+    let baseline = run_io_pure_laziness_test(None);
+    assert!(
+        baseline.status.success(),
+        "baseline laziness probe failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let mutant = run_io_pure_laziness_test(Some("io-pure-force-argument"));
+    assert!(
+        !mutant.status.success(),
+        "eager IO.pure mutant unexpectedly survived: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&mutant.stdout),
+        String::from_utf8_lossy(&mutant.stderr)
+    );
 }
 
 #[test]
@@ -943,11 +981,7 @@ fn directory_os_errors_match_the_pinned_operation_and_guest_path_presentations()
             RuntimeDirectoryOperation::CopyFile,
             "missing/source.txt",
             Some("target.txt"),
-            concat!(
-                "hell: missing/source.txt: copyFile:atomicCopyFileContents:",
-                "withReplacementFile:",
-                "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
-            ),
+            COPY_FILE_MISSING_PRESENTATION,
         ),
         (
             "create",
@@ -1085,11 +1119,7 @@ fn directory_error_presentations_are_dynamic_and_other_error_kinds_remain_generi
             RuntimeDirectoryOperation::CopyFile,
             "other-missing/other-source",
             Some("other-target"),
-            concat!(
-                "hell: other-missing/other-source: copyFile:atomicCopyFileContents:",
-                "withReplacementFile:",
-                "copyFileToHandle:openFdAt: does not exist (No such file or directory)",
-            ),
+            COPY_FILE_ALTERNATE_MISSING_PRESENTATION,
         ),
         (
             "create-alternate",

@@ -4,12 +4,33 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    let (logical_invocation, arguments) = {
+        let mut invocation = std::env::args_os();
+        let logical_invocation = invocation.next();
+        (logical_invocation, invocation.collect::<Vec<_>>())
+    };
+    #[cfg(not(unix))]
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(unix)]
+    if matches!(arguments.as_slice(), [argument] if argument == "__posix-logical-invocation-child")
+    {
+        let Some(logical_name) = logical_invocation
+            .as_deref()
+            .and_then(|value| std::path::Path::new(value).file_name())
+        else {
+            return ExitCode::FAILURE;
+        };
+        println!("{}", logical_name.to_string_lossy());
+        return ExitCode::SUCCESS;
+    }
     #[cfg(unix)]
     if let Some(status) = run_cargo_probe(&arguments) {
         return status;
@@ -17,6 +38,10 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__release-argv-child") {
         return run_windows_release_argv_child(&arguments[1..]);
+    }
+    #[cfg(windows)]
+    if let Some(status) = run_windows_release_lifecycle_fixture(&arguments) {
+        return status;
     }
     mark_forbidden_invocation();
     let (audit, arguments) = match parse_evidence_options(arguments) {
@@ -52,6 +77,67 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[cfg(windows)]
+fn run_windows_release_lifecycle_fixture(arguments: &[OsString]) -> Option<ExitCode> {
+    if matches!(arguments, [argument] if argument == "__windows-status-zero") {
+        return Some(ExitCode::SUCCESS);
+    }
+    let executable = std::env::current_exe().ok()?;
+    if !executable
+        .file_stem()
+        .is_some_and(|name| name.eq_ignore_ascii_case("cargo"))
+    {
+        return None;
+    }
+    let [
+        build,
+        target_option,
+        target,
+        release,
+        locked,
+        package_option,
+        package,
+        binary_option,
+        binary,
+        features_option,
+        features,
+    ] = arguments
+    else {
+        return Some(ExitCode::FAILURE);
+    };
+    if build != "build"
+        || target_option != "--target-dir"
+        || release != "--release"
+        || locked != "--locked"
+        || package_option != "--package"
+        || package != "hell-cli"
+        || binary_option != "--bin"
+        || binary != "hell"
+        || features_option != "--features"
+        || features != "compat-tracing"
+    {
+        return Some(ExitCode::FAILURE);
+    }
+    if executable
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "cargo-no-output")
+    {
+        return Some(ExitCode::SUCCESS);
+    }
+    let output = Path::new(target).join("release").join("hell.exe");
+    let result = output
+        .parent()
+        .ok_or_else(|| std::io::Error::other("fixture output has no parent"))
+        .and_then(fs::create_dir_all)
+        .and_then(|()| fs::copy(&executable, output).map(|_| ()));
+    Some(if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 #[cfg(unix)]
@@ -92,23 +178,37 @@ fn run_windows_release_argv_child(arguments: &[OsString]) -> ExitCode {
                 "Windows argv adapter requires one token",
             ));
         };
-        let decoded = hell_testkit::decode_windows_argv(encoded)?;
-        let (program, child_arguments) = decoded
+        let request = hell_testkit::parse_windows_release_child_request(
+            hell_testkit::decode_windows_argv(encoded)?,
+        )?;
+        let cargo_release_target = request.cargo_release_target().map(Path::to_path_buf);
+        if let Some(target) = cargo_release_target.as_deref() {
+            hell_testkit::prepare_windows_cargo_release_receipt(target)?;
+        }
+        let (current_directory, environment, target_arguments) = request.into_parts();
+        let (program, child_arguments) = target_arguments
             .split_first()
             .ok_or_else(|| std::io::Error::other("decoded Windows argv is empty"))?;
-        let evidence =
-            hell_testkit::windows_argv_target_prelaunch_diagnostic(std::path::Path::new(program));
-        Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(child_arguments)
-            .status()
-            .map(|status| (status, evidence))
+            .current_dir(current_directory)
+            .env_clear()
+            .envs(environment);
+        let mut child = command.spawn()?;
+        let status = child.wait()?;
+        if status.success()
+            && let Some(target) = cargo_release_target
+        {
+            hell_testkit::publish_windows_cargo_release_receipt(&target)?;
+        }
+        Ok(status)
     })();
     match result {
-        Ok((status, evidence)) => {
+        Ok(status) => {
             let code = status.code();
             if let Some(diagnostic) = hell_testkit::windows_argv_child_status_diagnostic(code) {
                 eprintln!("{diagnostic}");
-                eprintln!("{evidence}");
                 ExitCode::FAILURE
             } else {
                 ExitCode::from(u8::try_from(code.expect("representable status")).expect("bounded"))

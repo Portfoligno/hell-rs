@@ -342,31 +342,101 @@ fn remote_state_requires_the_standard_token_name() {
     assert!(error.contains("GITHUB_TOKEN is required"));
 }
 
+#[cfg(unix)]
 #[test]
 fn stack_work_cleanup_precedes_exact_oracle_snapshot_validation() {
-    let source = include_str!("../src/release/platform.rs");
-    let restore = source
-        .split_once("fn restore_inner(&self)")
-        .unwrap()
-        .1
-        .split_once("impl Drop for PosixArchiveAdapterSeal")
-        .unwrap()
-        .0;
-    let normalize = restore.find("self.normalize_stack_work()").unwrap();
-    let remove = restore.find("&self.tools.remove_file").unwrap();
-    let prove_absent = restore
-        .find("candidate Stack work cleanup was not exact")
-        .unwrap();
-    let exact_clean = restore.find("require_clean_checkout(").unwrap();
-    assert!(normalize < remove && remove < prove_absent && prove_absent < exact_clean);
+    let output = hell_ci()
+        .arg("__verify-posix-source-stack-cleanup-order")
+        .output()
+        .expect("POSIX archive cleanup lifecycle verifier must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
-    let validation = source
-        .split_once("fn validate_posix_sources(")
-        .unwrap()
-        .1
-        .split_once("fn validate_posix_retained_oracle(")
-        .unwrap()
-        .0;
-    assert!(validation.contains("if stack_work_present {"));
-    assert!(validation.contains("} else {\n        require_clean_checkout("));
+#[cfg(target_os = "macos")]
+#[test]
+fn staged_native_toolchain_accepts_real_ghc_without_inner_launcher_aliases() {
+    let fixture = Fixture::new("staged-native-toolchain");
+    let adapter = fixture.path("adapter");
+    let status = hell_ci()
+        .arg("__verify-staged-native-toolchain")
+        .arg(&adapter)
+        .status()
+        .expect("staged native toolchain verification must execute");
+    assert!(status.success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sealed_native_archive_authority_rebinds_before_use_and_rejects_later_mutation() {
+    let fixture = Fixture::new("native-archive-seal-rebinding");
+    let adapter = fixture.path("adapter");
+    let output = hell_ci()
+        .arg("__verify-native-archive-seal-rebinding")
+        .arg(&adapter)
+        .output()
+        .expect("native archive seal verification must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_adapter_transition_rejects_cleared_setgid_and_substitution() {
+    let output = hell_ci()
+        .arg("__verify-posix-archive-adapter-transition")
+        .output()
+        .expect("POSIX archive adapter transition verification must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_archive_policy_preserves_commands_overlay_path_and_inventory() {
+    let output = hell_ci()
+        .arg("__verify-native-archive-policy")
+        .output()
+        .expect("native archive policy verification must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn nightly_workspace_partition_preserves_the_existing_total_deadline() {
+    let output = hell_ci()
+        .arg("__verify-nightly-workspace-partition")
+        .output()
+        .expect("nightly workspace partition verification must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_hell_testkit_diagnostics_preserve_exact_targets_and_aggregate_budget() {
+    let output = hell_ci()
+        .arg("__verify-windows-hell-testkit-diagnostics")
+        .output()
+        .expect("Windows hell-testkit diagnostic verification must execute");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

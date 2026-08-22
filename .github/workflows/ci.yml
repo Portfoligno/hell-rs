@@ -169,6 +169,7 @@ jobs:
         run: ./automation/target/ci/hell-ci readiness platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan readiness-input/readiness-plan.json --conformance-plan readiness-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Linux readiness result
         id: upload
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: readiness-linux-${{ github.run_id }}-${{ github.run_attempt }}
@@ -243,8 +244,8 @@ jobs:
         uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
         with:
           enable-stack: true
-          stack-version: 3.11.1
           ghc-version: 9.8.2
+          stack-version: 3.11.1
       - name: Restore Cargo downloads
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -278,6 +279,7 @@ jobs:
         run: ./automation/target/ci/hell-ci readiness platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan readiness-input/readiness-plan.json --conformance-plan readiness-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact macOS readiness result
         id: upload
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: readiness-macos-${{ github.run_id }}-${{ github.run_attempt }}
@@ -379,6 +381,7 @@ jobs:
         run: .\automation\target\ci\hell-ci.exe readiness platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan readiness-input\readiness-plan.json --conformance-plan readiness-input\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Windows readiness result
         id: upload
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: readiness-windows-${{ github.run_id }}-${{ github.run_attempt }}

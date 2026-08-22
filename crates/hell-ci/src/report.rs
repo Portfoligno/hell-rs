@@ -46,6 +46,27 @@ pub struct CompletedCommandReport {
     pub stderr_sha256: String,
 }
 
+#[derive(Clone, Debug)]
+struct ActivePhaseReport {
+    name: String,
+    elapsed: Duration,
+    remaining: Duration,
+    attribution: Option<ActivePhaseAttribution>,
+    execution_remaining: Option<Duration>,
+    cleanup_remaining: Option<Duration>,
+    report_remaining: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActivePhaseAttribution {
+    pub sequence: u64,
+    pub transition_elapsed: Option<Duration>,
+    pub target: Option<String>,
+    pub case: Option<String>,
+    pub case_state: Option<String>,
+    pub subphase: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct Report {
     pub suite: String,
@@ -53,6 +74,9 @@ pub struct Report {
     pub failures: Vec<String>,
     evidence: Vec<(String, JsonValue)>,
     authoritative: bool,
+    checkpoint_path: Option<PathBuf>,
+    active_phase: Option<ActivePhaseReport>,
+    running: bool,
 }
 
 impl Report {
@@ -63,6 +87,106 @@ impl Report {
             failures: Vec::new(),
             evidence: Vec::new(),
             authoritative: true,
+            checkpoint_path: None,
+            active_phase: None,
+            running: false,
+        }
+    }
+
+    /// Attaches a durable in-progress report and writes its initial state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initial checkpoint cannot be written.
+    pub fn attach_checkpoint(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.checkpoint_path = Some(path);
+        self.running = true;
+        self.write_checkpoint()
+    }
+
+    /// Publishes the exact active suite phase to the durable checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint cannot be atomically replaced.
+    pub fn checkpoint_phase(
+        &mut self,
+        name: &str,
+        elapsed: Duration,
+        remaining: Duration,
+    ) -> std::io::Result<()> {
+        self.active_phase = Some(ActivePhaseReport {
+            name: name.to_owned(),
+            elapsed,
+            remaining,
+            attribution: None,
+            execution_remaining: None,
+            cleanup_remaining: None,
+            report_remaining: None,
+        });
+        self.write_checkpoint()
+    }
+
+    pub(crate) fn checkpoint_phase_attribution(
+        &mut self,
+        name: &str,
+        elapsed: Duration,
+        remaining: Duration,
+        attribution: ActivePhaseAttribution,
+    ) -> std::io::Result<()> {
+        self.active_phase = Some(ActivePhaseReport {
+            name: name.to_owned(),
+            elapsed,
+            remaining,
+            attribution: Some(attribution),
+            execution_remaining: None,
+            cleanup_remaining: None,
+            report_remaining: None,
+        });
+        self.write_checkpoint()
+    }
+
+    pub(crate) fn checkpoint_phase_attribution_deadlines(
+        &mut self,
+        name: &str,
+        elapsed: Duration,
+        attribution: ActivePhaseAttribution,
+        execution_remaining: Duration,
+        cleanup_remaining: Duration,
+        report_remaining: Duration,
+    ) -> std::io::Result<()> {
+        self.active_phase = Some(ActivePhaseReport {
+            name: name.to_owned(),
+            elapsed,
+            remaining: report_remaining,
+            attribution: Some(attribution),
+            execution_remaining: Some(execution_remaining),
+            cleanup_remaining: Some(cleanup_remaining),
+            report_remaining: Some(report_remaining),
+        });
+        self.write_checkpoint()
+    }
+
+    /// Clears the active phase and durably retains all completed report steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint cannot be atomically replaced.
+    pub fn checkpoint_phase_complete(&mut self) -> std::io::Result<()> {
+        self.active_phase = None;
+        self.write_checkpoint()
+    }
+
+    /// Marks the in-memory document terminal before its final write.
+    pub fn complete(&mut self) {
+        self.running = false;
+        self.active_phase = None;
+    }
+
+    fn write_checkpoint(&self) -> std::io::Result<()> {
+        match &self.checkpoint_path {
+            Some(path) => self.write(path),
+            None => Ok(()),
         }
     }
 
@@ -232,6 +356,14 @@ impl Report {
         self.evidence.push((name.into(), value));
     }
 
+    #[cfg(windows)]
+    pub(crate) fn evidence_value(&self, name: &str) -> Option<&JsonValue> {
+        self.evidence
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+    }
+
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -244,8 +376,59 @@ impl Report {
     pub(crate) fn to_json(&self) -> String {
         let mut json = String::from("{\n  \"schemaVersion\": 1,\n  \"suite\": ");
         push_json_string(&mut json, &self.suite);
+        json.push_str(",\n  \"lifecycle\": ");
+        push_json_string(&mut json, if self.running { "running" } else { "complete" });
         json.push_str(",\n  \"passed\": ");
-        json.push_str(if self.passed() { "true" } else { "false" });
+        json.push_str(if !self.running && self.passed() {
+            "true"
+        } else {
+            "false"
+        });
+        if let Some(phase) = &self.active_phase {
+            json.push_str(",\n  \"activePhase\": {\"name\": ");
+            push_json_string(&mut json, &phase.name);
+            json.push_str(", \"elapsedMillis\": ");
+            json.push_str(&phase.elapsed.as_millis().to_string());
+            json.push_str(", \"remainingMillis\": ");
+            json.push_str(&phase.remaining.as_millis().to_string());
+            for (name, remaining) in [
+                ("executionRemainingMillis", phase.execution_remaining),
+                ("cleanupRemainingMillis", phase.cleanup_remaining),
+                ("reportRemainingMillis", phase.report_remaining),
+            ] {
+                if let Some(remaining) = remaining {
+                    json.push_str(", \"");
+                    json.push_str(name);
+                    json.push_str("\": ");
+                    json.push_str(&remaining.as_millis().to_string());
+                }
+            }
+            if let Some(attribution) = &phase.attribution {
+                json.push_str(", \"attribution\": {\"sequence\": ");
+                json.push_str(&attribution.sequence.to_string());
+                json.push_str(", \"transitionElapsedMillis\": ");
+                match attribution.transition_elapsed {
+                    Some(elapsed) => json.push_str(&elapsed.as_millis().to_string()),
+                    None => json.push_str("null"),
+                }
+                for (name, value) in [
+                    ("target", attribution.target.as_deref()),
+                    ("case", attribution.case.as_deref()),
+                    ("caseState", attribution.case_state.as_deref()),
+                    ("subphase", attribution.subphase.as_deref()),
+                ] {
+                    json.push_str(", \"");
+                    json.push_str(name);
+                    json.push_str("\": ");
+                    match value {
+                        Some(value) => push_json_string(&mut json, value),
+                        None => json.push_str("null"),
+                    }
+                }
+                json.push('}');
+            }
+            json.push('}');
+        }
         if !self.authoritative {
             json.push_str(",\n  \"authoritative\": false");
         }

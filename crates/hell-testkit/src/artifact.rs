@@ -1939,6 +1939,12 @@ pub fn retained_bundle_outcome_facts(
     case: &DifferentialCase,
 ) -> std::io::Result<RetainedBundleOutcomeFacts> {
     verify_observation_bundle_for_case(directory, case)?;
+    retained_bundle_outcome_facts_from_verified(directory)
+}
+
+fn retained_bundle_outcome_facts_from_verified(
+    directory: &Path,
+) -> std::io::Result<RetainedBundleOutcomeFacts> {
     let side = |name: &str| -> std::io::Result<RetainedSideOutcomeFacts> {
         let side = directory.join(name);
         let observation = fs::read_to_string(side.join("observation.json"))?;
@@ -1981,6 +1987,24 @@ pub fn runtime_platform_shard_for_bundle(
     expected_candidate_executable_sha256: Digest,
 ) -> std::io::Result<Option<RuntimePlatformShard>> {
     let bundle_sha256 = verify_observation_bundle_for_case(directory, case)?;
+    runtime_platform_shard_from_verified_bundle(
+        directory,
+        case,
+        platform,
+        candidate_source_sha256,
+        expected_candidate_executable_sha256,
+        bundle_sha256,
+    )
+}
+
+fn runtime_platform_shard_from_verified_bundle(
+    directory: &Path,
+    case: &DifferentialCase,
+    platform: hell_builtins::ClaimPlatform,
+    candidate_source_sha256: Digest,
+    expected_candidate_executable_sha256: Digest,
+    bundle_sha256: Digest,
+) -> std::io::Result<Option<RuntimePlatformShard>> {
     let descriptor = case
         .claim_evidence
         .as_ref()
@@ -8897,6 +8921,292 @@ fn push_toml_string(output: &mut String, value: &str) {
     push_json_string(output, value);
 }
 
+#[cfg(feature = "compat-tracing")]
+fn runtime_case_expects_failure(case: &DifferentialCase) -> bool {
+    !case.expected_runtime_completion
+        || runtime_descriptor_expects_failure(case)
+        || case.id.ends_with("list-laziness-error")
+        || case.id.as_ref() == "runtime-parser-observable-flag-help"
+        || case.id.as_ref() == "runtime-parser-observable-option-help"
+        || case.id.as_ref() == "runtime-parser-observable-argument-metavar"
+        || case.id.as_ref() == "runtime-parser-observable-argument-help"
+        || case.id.as_ref() == "runtime-parser-observable-options-header"
+        || case.id.as_ref() == "runtime-parser-observable-options-progdesc"
+        || case.id.as_ref() == "runtime-parser-observable-options-helper"
+        || case.id.as_ref() == "runtime-typed-io-bytestring-writefile-failure"
+        || case.id.as_ref() == "runtime-typed-io-text-writefile-failure"
+        || case.id.as_ref() == "runtime-typed-io-text-appendfile-failure"
+        || case.id.as_ref() == "runtime-typed-io-text-readfile-failure"
+        || case.id.as_ref() == "runtime-typed-io-bytestring-readfile-failure"
+        || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-failure"
+        || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-checked-failure"
+        || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-stdout-checked-failure"
+        || case.id.as_ref() == "runtime-typed-thread-delay-forced-argument-failure"
+        || case.id.as_ref() == "runtime-typed-timeout-positive-action-failure"
+        || case.id.as_ref() == "runtime-typed-async-race-left-fails"
+        || case.id.as_ref() == "runtime-typed-async-race-right-fails"
+        || case.id.as_ref() == "runtime-typed-async-concurrently-left-fails"
+        || case.id.as_ref() == "runtime-typed-async-concurrently-right-fails"
+        || case.id.as_ref() == "runtime-typed-exit-die"
+        || case.id.as_ref() == "runtime-typed-exit-with-failure"
+        || case.id.as_ref() == "runtime-typed-exit-with-success"
+        || case.id.as_ref() == "runtime-typed-alternative-optional-parser-partial"
+        || case.id.as_ref() == "runtime-typed-alternative-many-parser-partial"
+        || case.id.as_ref() == "runtime-environment-get-env-missing"
+        || (case.id.starts_with("runtime-directory-") && case.id.ends_with("-failure"))
+        || (case.id.starts_with("runtime-io-") && case.id.ends_with("-failure"))
+        || (case.id.starts_with("runtime-process-") && case.id.ends_with("-failure"))
+        || (case.id.starts_with("runtime-temp-") && case.id.ends_with("-failure"))
+        || matches!(
+            case.id.as_ref(),
+            "list-cycle-boundary-empty-input"
+                | "text-decodeutf8-boundary-invalid-encoding"
+                | "text-getcontents-boundary-invalid-encoding"
+                | "text-getline-boundary-empty-input"
+                | "text-getline-boundary-invalid-encoding"
+                | "text-readfile-boundary-invalid-encoding"
+                | "text-interact-boundary-invalid-encoding"
+                | "text-readprocess-boundary-invalid-encoding"
+                | "text-readprocess-checked-boundary-invalid-encoding"
+                | "text-readprocess-stdout-checked-boundary-invalid-encoding"
+                | "options-execparser-boundary-absent-option"
+                | "options-execparser-boundary-malformed-option"
+                | "options-stroption-boundary-absent-option"
+                | "options-stroption-boundary-malformed-option"
+                | "options-strargument-boundary-absent-option"
+                | "options-strargument-boundary-repeated-option"
+                | "options-strargument-boundary-malformed-option"
+                | "options-switch-boundary-repeated-option"
+                | "options-switch-boundary-malformed-option"
+                | "options-flag-boundary-repeated-option"
+                | "options-flag-boundary-malformed-option"
+                | "options-flag-prime-boundary-absent-option"
+                | "options-flag-prime-boundary-repeated-option"
+                | "options-flag-prime-boundary-malformed-option"
+                | "flag-long-boundary-repeated-option"
+                | "flag-long-boundary-malformed-option"
+                | "flag-help-boundary-repeated-option"
+                | "flag-help-boundary-malformed-option"
+                | "option-long-boundary-absent-option"
+                | "option-long-boundary-malformed-option"
+                | "option-help-boundary-absent-option"
+                | "option-help-boundary-malformed-option"
+                | "argument-metavar-boundary-absent-option"
+                | "argument-metavar-boundary-repeated-option"
+                | "argument-metavar-boundary-malformed-option"
+                | "argument-help-boundary-absent-option"
+                | "argument-help-boundary-repeated-option"
+                | "argument-help-boundary-malformed-option"
+                | "option-value-boundary-repeated-option"
+                | "option-value-boundary-malformed-option"
+                | "argument-value-boundary-repeated-option"
+                | "argument-value-boundary-malformed-option"
+                | "options-header-boundary-repeated-option"
+                | "options-header-boundary-malformed-option"
+                | "options-progdesc-boundary-repeated-option"
+                | "options-progdesc-boundary-malformed-option"
+                | "options-helper-boundary-repeated-option"
+                | "options-helper-boundary-malformed-option"
+                | "options-info-boundary-repeated-option"
+                | "options-info-boundary-malformed-option"
+                | "options-fulldesc-boundary-repeated-option"
+                | "options-fulldesc-boundary-malformed-option"
+                | "options-command-boundary-absent-option"
+                | "options-command-boundary-repeated-option"
+                | "options-command-boundary-malformed-option"
+                | "options-hsubparser-boundary-absent-option"
+                | "options-hsubparser-boundary-repeated-option"
+                | "options-hsubparser-boundary-malformed-option"
+        )
+}
+
+#[cfg(feature = "compat-tracing")]
+fn runtime_descriptor_expects_failure(case: &DifferentialCase) -> bool {
+    case.claim_evidence.as_ref().is_some_and(|descriptor| {
+        descriptor.semantic_targets.iter().any(|target| {
+            target.expected_process_status_sha256
+                == Some(crate::process_status_sha256(false, Some(1)))
+        })
+    })
+}
+
+#[cfg(feature = "compat-tracing")]
+fn run_core_data_production_bundle_case<Execute>(
+    root: &Path,
+    case: &DifferentialCase,
+    index: usize,
+    case_count: usize,
+    execute: &mut Execute,
+) -> std::io::Result<()>
+where
+    Execute: FnMut(&DifferentialCase, &Path) -> std::io::Result<(bool, DifferentialReport)>,
+{
+    eprintln!(
+        "core-data-bundle case start: {}/{} {:?}",
+        index.saturating_add(1),
+        case_count,
+        case.id
+    );
+    let execution_root = root.join(case.id.as_ref());
+    fs::create_dir_all(&execution_root)?;
+    let expected_targets = case
+        .claim_evidence
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("core data case has no descriptor"))?
+        .semantic_targets
+        .len();
+    let (runtime_success, retained) = execute(case, &execution_root)?;
+    if runtime_success == runtime_case_expects_failure(case) {
+        return Err(std::io::Error::other(format!(
+            "{} runtime completion differs from its descriptor",
+            case.id
+        )));
+    }
+    let status = retained.candidate.status.clone();
+    let directory = retain_observation_bundle(&root.join("evidence"), case, &retained)?;
+    let bundle_sha256 = verify_observation_bundle_for_case(&directory, case)?;
+    let outcome = retained_bundle_outcome_facts_from_verified(&directory)?;
+    if outcome.oracle.timed_out
+        || outcome.candidate.timed_out
+        || outcome.candidate.status_success != status.success
+        || outcome.candidate.resource_failures != 0
+    {
+        return Err(std::io::Error::other(format!(
+            "{} retained outcome facts differ from runtime execution",
+            case.id
+        )));
+    }
+    let shard = runtime_platform_shard_from_verified_bundle(
+        &directory,
+        case,
+        hell_builtins::ClaimPlatform::Linux,
+        sha256_bytes(b"candidate-source"),
+        retained.candidate.identity.sha256,
+        bundle_sha256,
+    )?
+    .ok_or_else(|| std::io::Error::other("core data case produced no platform shard"))?;
+    if shard.targets.len() != expected_targets {
+        return Err(std::io::Error::other(format!(
+            "{} platform shard target count differs from its descriptor",
+            case.id
+        )));
+    }
+    eprintln!(
+        "core-data-bundle case done: {}/{} {:?}",
+        index.saturating_add(1),
+        case_count,
+        case.id
+    );
+    Ok(())
+}
+
+/// Executes every committed core-data obligation through the production
+/// retention, verification, outcome, and runtime-platform bundle gates.
+///
+/// Work is assigned by authoritative case index modulo the repository's
+/// bounded differential worker limit. Every case is joined and accounted for
+/// before the lowest indexed error is returned.
+///
+/// # Errors
+///
+/// Returns an error when no eligible case exists, an indexed worker result is
+/// missing, case execution fails, a retained bundle is invalid, or a derived
+/// fact differs from the runtime observation.
+#[cfg(feature = "compat-tracing")]
+pub fn run_core_data_production_bundle_gate<MakeWorker, Execute>(
+    cases: &[DifferentialCase],
+    make_worker: MakeWorker,
+) -> std::io::Result<()>
+where
+    MakeWorker: Fn() -> Execute + Sync,
+    Execute: FnMut(&DifferentialCase, &Path) -> std::io::Result<(bool, DifferentialReport)> + Send,
+{
+    static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    if !cases
+        .iter()
+        .any(|case| case.id.starts_with("runtime-typed-"))
+    {
+        return Err(std::io::Error::other(
+            "core data catalog has no typed runtime case",
+        ));
+    }
+    let case_count = cases.len();
+    let worker_count = crate::differential_worker_limit().min(case_count);
+    if worker_count == 0 {
+        return Err(std::io::Error::other("core data catalog is empty"));
+    }
+    let nonce = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "hell-testkit-core-data-bundle-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root)?;
+    let mut outcomes = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for shard_index in 0..worker_count {
+            let cases = &cases;
+            let root = &root;
+            let make_worker = &make_worker;
+            workers.push(scope.spawn(move || {
+                let mut execute = make_worker();
+                (shard_index..case_count)
+                    .step_by(worker_count)
+                    .map(|index| {
+                        (
+                            index,
+                            run_core_data_production_bundle_case(
+                                root,
+                                &cases[index],
+                                index,
+                                case_count,
+                                &mut execute,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+    });
+    outcomes.sort_by_key(|(index, _)| *index);
+    let outcome_count = outcomes.len();
+    let mut failure = None;
+    for (expected_index, (actual_index, result)) in outcomes.into_iter().enumerate() {
+        if actual_index != expected_index {
+            failure = Some(std::io::Error::other(format!(
+                "core data shard result index {actual_index} differs from {expected_index}"
+            )));
+            break;
+        }
+        if let Err(error) = result {
+            failure = Some(std::io::Error::other(format!(
+                "{} core data bundle failed: {error}",
+                cases[actual_index].id
+            )));
+            break;
+        }
+    }
+    if failure.is_none() && outcome_count != case_count {
+        failure = Some(std::io::Error::other(
+            "core data shards did not account for every committed case",
+        ));
+    }
+    let cleanup = fs::remove_dir_all(&root);
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    cleanup
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10623,7 +10933,6 @@ mod tests {
         assert!(verify_observation_bundle_for_case(&directory, &case).is_err());
         fs::remove_dir_all(root).unwrap();
     }
-
     #[cfg(feature = "compat-tracing")]
     #[derive(Clone, Default)]
     struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -17325,188 +17634,6 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "compat-tracing")]
-    #[test]
-    fn core_data_obligations_round_trip_through_the_production_bundle_gate() {
-        let mut cases = crate::committed_differential_cases()
-            .into_iter()
-            .filter(|case| {
-                case.claim_evidence
-                    .as_ref()
-                    .is_some_and(|descriptor| !descriptor.semantic_targets.is_empty())
-            })
-            .collect::<Vec<_>>();
-        bind_test_process_helpers(&mut cases);
-        assert!(
-            cases
-                .iter()
-                .any(|case| case.id.starts_with("runtime-typed-"))
-        );
-        let root = root("runtime-core-data-bundle");
-        fs::create_dir_all(&root).unwrap();
-        for case in cases {
-            let execution_root = root.join(case.id.as_ref());
-            fs::create_dir_all(&execution_root).unwrap();
-            let expected_targets = case
-                .claim_evidence
-                .as_ref()
-                .expect("core data descriptor")
-                .semantic_targets
-                .len();
-            let (runtime_success, status, semantic, stdout, stderr) =
-                execute_runtime_interaction_with_status(&case, &execution_root);
-            assert_eq!(
-                runtime_success,
-                !runtime_case_expects_failure(&case),
-                "{}",
-                case.id
-            );
-            let mut retained = report();
-            for observation in [&mut retained.oracle, &mut retained.candidate] {
-                observation.case_id = std::sync::Arc::clone(&case.id);
-                observation.environment_profile = case.environment_profile;
-                observation.process_helper_sha256 = case.process_helper_sha256;
-                observation.stdout = crate::BoundedCapture::from_bytes(stdout.clone());
-                observation.raw_stderr = BoundedCapture::from_bytes(stderr.clone());
-                observation.claim_input_stderr = BoundedCapture::from_bytes(stderr.clone());
-                observation.stderr = BoundedCapture::from_bytes(stderr.clone());
-                observation.status = status.clone();
-            }
-            retained.candidate.semantic = Some(semantic);
-            let directory = retain_observation_bundle(&root.join("evidence"), &case, &retained)
-                .expect("retain core data observation bundle");
-            verify_observation_bundle_for_case(&directory, &case).unwrap_or_else(|error| {
-                panic!("{} core data observation bundle failed: {error}", case.id)
-            });
-            let outcome = retained_bundle_outcome_facts(&directory, &case)
-                .unwrap_or_else(|error| panic!("{} outcome facts failed: {error}", case.id));
-            assert!(!outcome.oracle.timed_out);
-            assert!(!outcome.candidate.timed_out);
-            assert_eq!(outcome.candidate.status_success, status.success);
-            assert_eq!(outcome.candidate.resource_failures, 0);
-            let shard = runtime_platform_shard_for_bundle(
-                &directory,
-                &case,
-                hell_builtins::ClaimPlatform::Linux,
-                sha256_bytes(b"candidate-source"),
-                retained.candidate.identity.sha256,
-            )
-            .expect("validate core data platform shard")
-            .expect("core data case produces a platform shard");
-            assert_eq!(shard.targets.len(), expected_targets);
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "compat-tracing")]
-    fn runtime_case_expects_failure(case: &crate::DifferentialCase) -> bool {
-        !case.expected_runtime_completion
-            || runtime_descriptor_expects_failure(case)
-            || case.id.ends_with("list-laziness-error")
-            || case.id.as_ref() == "runtime-parser-observable-flag-help"
-            || case.id.as_ref() == "runtime-parser-observable-option-help"
-            || case.id.as_ref() == "runtime-parser-observable-argument-metavar"
-            || case.id.as_ref() == "runtime-parser-observable-argument-help"
-            || case.id.as_ref() == "runtime-parser-observable-options-header"
-            || case.id.as_ref() == "runtime-parser-observable-options-progdesc"
-            || case.id.as_ref() == "runtime-parser-observable-options-helper"
-            || case.id.as_ref() == "runtime-typed-io-bytestring-writefile-failure"
-            || case.id.as_ref() == "runtime-typed-io-text-writefile-failure"
-            || case.id.as_ref() == "runtime-typed-io-text-appendfile-failure"
-            || case.id.as_ref() == "runtime-typed-io-text-readfile-failure"
-            || case.id.as_ref() == "runtime-typed-io-bytestring-readfile-failure"
-            || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-failure"
-            || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-checked-failure"
-            || case.id.as_ref() == "runtime-typed-io-bytestring-readprocess-stdout-checked-failure"
-            || case.id.as_ref() == "runtime-typed-thread-delay-forced-argument-failure"
-            || case.id.as_ref() == "runtime-typed-timeout-positive-action-failure"
-            || case.id.as_ref() == "runtime-typed-async-race-left-fails"
-            || case.id.as_ref() == "runtime-typed-async-race-right-fails"
-            || case.id.as_ref() == "runtime-typed-async-concurrently-left-fails"
-            || case.id.as_ref() == "runtime-typed-async-concurrently-right-fails"
-            || case.id.as_ref() == "runtime-typed-exit-die"
-            || case.id.as_ref() == "runtime-typed-exit-with-failure"
-            || case.id.as_ref() == "runtime-typed-exit-with-success"
-            || case.id.as_ref() == "runtime-typed-alternative-optional-parser-partial"
-            || case.id.as_ref() == "runtime-typed-alternative-many-parser-partial"
-            || case.id.as_ref() == "runtime-environment-get-env-missing"
-            || (case.id.starts_with("runtime-directory-") && case.id.ends_with("-failure"))
-            || (case.id.starts_with("runtime-io-") && case.id.ends_with("-failure"))
-            || (case.id.starts_with("runtime-process-") && case.id.ends_with("-failure"))
-            || (case.id.starts_with("runtime-temp-") && case.id.ends_with("-failure"))
-            || matches!(
-                case.id.as_ref(),
-                "list-cycle-boundary-empty-input"
-                    | "text-decodeutf8-boundary-invalid-encoding"
-                    | "text-getcontents-boundary-invalid-encoding"
-                    | "text-getline-boundary-empty-input"
-                    | "text-getline-boundary-invalid-encoding"
-                    | "text-readfile-boundary-invalid-encoding"
-                    | "text-interact-boundary-invalid-encoding"
-                    | "text-readprocess-boundary-invalid-encoding"
-                    | "text-readprocess-checked-boundary-invalid-encoding"
-                    | "text-readprocess-stdout-checked-boundary-invalid-encoding"
-                    | "options-execparser-boundary-absent-option"
-                    | "options-execparser-boundary-malformed-option"
-                    | "options-stroption-boundary-absent-option"
-                    | "options-stroption-boundary-malformed-option"
-                    | "options-strargument-boundary-absent-option"
-                    | "options-strargument-boundary-repeated-option"
-                    | "options-strargument-boundary-malformed-option"
-                    | "options-switch-boundary-repeated-option"
-                    | "options-switch-boundary-malformed-option"
-                    | "options-flag-boundary-repeated-option"
-                    | "options-flag-boundary-malformed-option"
-                    | "options-flag-prime-boundary-absent-option"
-                    | "options-flag-prime-boundary-repeated-option"
-                    | "options-flag-prime-boundary-malformed-option"
-                    | "flag-long-boundary-repeated-option"
-                    | "flag-long-boundary-malformed-option"
-                    | "flag-help-boundary-repeated-option"
-                    | "flag-help-boundary-malformed-option"
-                    | "option-long-boundary-absent-option"
-                    | "option-long-boundary-malformed-option"
-                    | "option-help-boundary-absent-option"
-                    | "option-help-boundary-malformed-option"
-                    | "argument-metavar-boundary-absent-option"
-                    | "argument-metavar-boundary-repeated-option"
-                    | "argument-metavar-boundary-malformed-option"
-                    | "argument-help-boundary-absent-option"
-                    | "argument-help-boundary-repeated-option"
-                    | "argument-help-boundary-malformed-option"
-                    | "option-value-boundary-repeated-option"
-                    | "option-value-boundary-malformed-option"
-                    | "argument-value-boundary-repeated-option"
-                    | "argument-value-boundary-malformed-option"
-                    | "options-header-boundary-repeated-option"
-                    | "options-header-boundary-malformed-option"
-                    | "options-progdesc-boundary-repeated-option"
-                    | "options-progdesc-boundary-malformed-option"
-                    | "options-helper-boundary-repeated-option"
-                    | "options-helper-boundary-malformed-option"
-                    | "options-info-boundary-repeated-option"
-                    | "options-info-boundary-malformed-option"
-                    | "options-fulldesc-boundary-repeated-option"
-                    | "options-fulldesc-boundary-malformed-option"
-                    | "options-command-boundary-absent-option"
-                    | "options-command-boundary-repeated-option"
-                    | "options-command-boundary-malformed-option"
-                    | "options-hsubparser-boundary-absent-option"
-                    | "options-hsubparser-boundary-repeated-option"
-                    | "options-hsubparser-boundary-malformed-option"
-            )
-    }
-
-    #[cfg(feature = "compat-tracing")]
-    fn runtime_descriptor_expects_failure(case: &crate::DifferentialCase) -> bool {
-        case.claim_evidence.as_ref().is_some_and(|descriptor| {
-            descriptor.semantic_targets.iter().any(|target| {
-                target.expected_process_status_sha256
-                    == Some(crate::process_status_sha256(false, Some(1)))
-            })
-        })
     }
 
     #[cfg(feature = "compat-tracing")]

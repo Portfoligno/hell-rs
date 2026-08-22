@@ -79,6 +79,25 @@ pub type ValueRef = Arc<Value>;
 pub type RuntimeResult<T> = Result<T, Arc<RuntimeError>>;
 pub type EvaluationId = NonZeroU64;
 
+struct RuntimeHttpListenerAuthority {
+    listener: Mutex<Option<hell_http_host::BoundServerListener>>,
+    startup: hell_http_host::ServerStartupObserver,
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One cloneable cancellation handle for an embedding-owned HTTP server.
+#[derive(Clone)]
+pub struct RuntimeHttpServerControl {
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RuntimeHttpServerControl {
+    /// Requests bounded graceful shutdown of the associated HTTP server.
+    pub fn cancel(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeErrorKind {
     UserError,
@@ -314,11 +333,17 @@ impl RuntimeErrorPresentation {
     ) -> fmt::Result {
         let missing = "does not exist (No such file or directory)";
         match operation {
-            RuntimeDirectoryOperation::CopyFile => write!(
-                f,
-                "hell: {path}: copyFile:atomicCopyFileContents:withReplacementFile:\
-                 copyFileToHandle:openFdAt: {missing}"
-            ),
+            RuntimeDirectoryOperation::CopyFile => {
+                #[cfg(target_os = "linux")]
+                let open_operation = "openFileWithCloseOnExec";
+                #[cfg(not(target_os = "linux"))]
+                let open_operation = "openFdAt";
+                write!(
+                    f,
+                    "hell: {path}: copyFile:atomicCopyFileContents:withReplacementFile:\
+                     copyFileToHandle:{open_operation}: {missing}"
+                )
+            }
             RuntimeDirectoryOperation::CreateDirectory => {
                 write!(
                     f,
@@ -390,6 +415,7 @@ pub struct RuntimeContext {
     current_time: Option<SystemTime>,
     allow_network: bool,
     http_request_limit: Option<usize>,
+    http_listener: Option<Arc<RuntimeHttpListenerAuthority>>,
     policy: Arc<RuntimePolicy>,
     budget: Arc<budget::Budget>,
     host_services: Arc<HostServices>,
@@ -406,6 +432,7 @@ impl fmt::Debug for RuntimeContext {
             .field("current_time_override", &self.current_time.is_some())
             .field("allow_network", &self.allow_network)
             .field("http_request_limit", &self.http_request_limit)
+            .field("http_listener", &self.http_listener.is_some())
             .field("policy", &self.policy.id)
             .finish_non_exhaustive()
     }
@@ -481,6 +508,7 @@ impl RuntimeContext {
             current_time: None,
             allow_network: true,
             http_request_limit: None,
+            http_listener: None,
             policy,
             budget,
             host_services: Arc::new(HostServices::from_environment(host_environment)),
@@ -549,6 +577,61 @@ impl RuntimeContext {
     pub fn with_http_request_limit(mut self, request_limit: usize) -> Self {
         self.http_request_limit = Some(request_limit.max(1));
         self
+    }
+
+    /// Transfers one already-bound listener into the next `Http.run` action.
+    ///
+    /// The listener is a one-use authority shared by cloned contexts. The
+    /// observer receives either exact readiness after installation or one
+    /// typed pre-ready failure.
+    #[must_use]
+    pub fn with_http_listener(
+        mut self,
+        listener: hell_http_host::BoundServerListener,
+        startup: hell_http_host::ServerStartupObserver,
+    ) -> (Self, RuntimeHttpServerControl) {
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control = RuntimeHttpServerControl {
+            shutdown_requested: Arc::clone(&shutdown_requested),
+        };
+        self.http_listener = Some(Arc::new(RuntimeHttpListenerAuthority {
+            listener: Mutex::new(Some(listener)),
+            startup,
+            shutdown_requested,
+        }));
+        (self, control)
+    }
+
+    fn take_http_listener(
+        &self,
+    ) -> RuntimeResult<
+        Option<(
+            hell_http_host::BoundServerListener,
+            hell_http_host::ServerStartupObserver,
+            Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    > {
+        let Some(authority) = &self.http_listener else {
+            return Ok(None);
+        };
+        let listener = authority
+            .listener
+            .lock()
+            .map_err(|_| RuntimeError::internal("HTTP listener authority mutex was poisoned"))?
+            .take();
+        let Some(listener) = listener else {
+            let message: Arc<str> = Arc::from("prebound HTTP listener authority was already used");
+            (authority.startup)(hell_http_host::ServerStartupEvent::Failed {
+                phase: "listener-authority",
+                message: Arc::clone(&message),
+            });
+            return Err(RuntimeError::http(message));
+        };
+        Ok(Some((
+            listener,
+            Arc::clone(&authority.startup),
+            Arc::clone(&authority.shutdown_requested),
+        )))
     }
 
     pub(crate) fn current_time(&self) -> RuntimeResult<SystemTime> {

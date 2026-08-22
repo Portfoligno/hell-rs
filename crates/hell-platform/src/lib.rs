@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use hell_runtime::RuntimeContext;
 
-pub use hell_host::{HostServices, SupervisedChild, TerminationReport, WaitOutcome};
+pub use hell_host::{
+    CleanupLease, CleanupLifecycleReceipt, HostServices, RetainedTerminationReceipt,
+    RetainedTerminationSnapshot, RetainedTerminationState, SupervisedChild, TerminationReport,
+    WaitOutcome, retained_termination_receipt,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityPolicy {

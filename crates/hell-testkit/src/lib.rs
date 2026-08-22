@@ -13,17 +13,33 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write as _};
+#[cfg(windows)]
+use std::io::{Seek as _, SeekFrom};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
+use hell_platform::{CleanupLease, SupervisedChild, TerminationReport, WaitOutcome};
+pub use hell_platform::{
+    CleanupLifecycleReceipt, RetainedTerminationReceipt, RetainedTerminationSnapshot,
+    RetainedTerminationState,
+};
 
 use hell_builtins::CompatibilityDimension;
 pub use hell_builtins::{BuiltinId, ClaimPlatform, ExecutionProfile, NormalizerId};
 pub use windows_presentation::WindowsPresentationField;
+
+struct EscapedPath<'a>(&'a Path);
+
+impl std::fmt::Debug for EscapedPath<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.0, formatter)
+    }
+}
 
 /// Environment names that a release-candidate child may inherit from the
 /// trusted driver. Values are selected from the trusted parent's environment;
@@ -96,6 +112,9 @@ pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "CI",
     "DEVELOPER_DIR",
     "GITHUB_ACTIONS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
     "HOME",
     "ImageOS",
     "ImageVersion",
@@ -105,7 +124,7 @@ pub const POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "PATH",
     "RUNNER_ARCH",
     "RUNNER_OS",
-    "RUSTC_WRAPPER",
+    "RUSTC",
     "RUSTDOCFLAGS",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
@@ -128,6 +147,8 @@ pub fn configure_release_child_environment(command: &mut Command) {
     command.envs(retained);
 }
 
+#[cfg(feature = "compat-tracing")]
+pub use artifact::run_core_data_production_bundle_gate;
 pub use artifact::{
     EvidenceSummary, NATIVE_BUILD_ENVIRONMENT_NAMES, NativeExecutionEnvironment,
     NativeExecutionEnvironmentInputs, ObservationEquivalence, RetainedBundleOutcomeFacts,
@@ -184,11 +205,27 @@ const FILE_INLINE_BYTES: usize = 64 * 1024;
 const FILESYSTEM_ENTRY_LIMIT: usize = 4_096;
 const FILESYSTEM_HASH_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Returns the exact complete-stream capture boundary used by supervision.
+#[doc(hidden)]
+#[must_use]
+pub const fn complete_capture_byte_limit_for_integration() -> usize {
+    COMPLETE_CAPTURE_BYTES
+}
+#[cfg(windows)]
+const WINDOWS_PROGRAM_AUTHORITY_ACQUISITION_BUDGET: Duration = Duration::from_secs(30);
+
+#[cfg(windows)]
+fn windows_program_authority_acquisition_deadline() -> std::io::Result<Instant> {
+    Instant::now()
+        .checked_add(WINDOWS_PROGRAM_AUTHORITY_ACQUISITION_BUDGET)
+        .ok_or_else(|| std::io::Error::other("Windows program authority deadline overflowed"))
+}
+
 /// A trusted, typed launcher policy for release candidate and oracle children.
 #[derive(Clone, Debug)]
 pub struct CandidateLaunchPolicy {
     #[cfg(unix)]
-    launcher: PathBuf,
+    process_authorities: Arc<BoundPosixProcessAuthorities>,
     #[cfg(unix)]
     adapter: PathBuf,
     #[cfg(unix)]
@@ -214,28 +251,959 @@ pub struct CandidateLaunchPolicy {
     #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
-    group: Arc<str>,
+    primary_gid: u32,
     #[cfg(windows)]
-    launcher: PathBuf,
+    launcher: BoundProgramInvocation,
     #[cfg(windows)]
-    launcher_sha256: Digest,
-    #[cfg(windows)]
-    restricted_adapter: PathBuf,
-    #[cfg(windows)]
-    restricted_adapter_sha256: Digest,
+    restricted_adapter: BoundProgramInvocation,
     #[cfg(windows)]
     toolchain: WindowsToolchainAuthority,
     writable_roots: Arc<[PathBuf]>,
+}
+
+#[cfg(windows)]
+struct WindowsLaunchControlAuthority {
+    request_sha256: Digest,
+    program: Option<BoundProgramInvocation>,
+    current_directory: PathBuf,
+    current_directory_identity: same_file::Handle,
+}
+
+#[cfg(windows)]
+const WINDOWS_LAUNCH_CONTROL_PHASES: [&str; 12] = [
+    "request-parsed",
+    "adapter-revalidated",
+    "token-duplicated",
+    "supported-canary-start",
+    "supported-canary-complete",
+    "argv-helper-start",
+    "helper-entry",
+    "request-decoded",
+    "target-spawned",
+    "target-terminal",
+    "argv-helper-complete",
+    "job-closed",
+];
+
+#[cfg(windows)]
+impl WindowsLaunchControlAuthority {
+    fn complete(
+        self,
+        status: ExitStatus,
+        timed_out: bool,
+        termination: Option<TerminationReport>,
+        candidate_quiescence_complete: bool,
+    ) -> std::io::Result<WindowsLaunchControlReceipt> {
+        if same_file::Handle::from_path(&self.current_directory)? != self.current_directory_identity
+            || fs::canonicalize(&self.current_directory)? != self.current_directory
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows restricted launch current-directory identity changed",
+            ));
+        }
+        let (program, program_bytes, program_sha256) = match self.program {
+            Some(program) => {
+                program.revalidate(program.invocation_path.as_os_str())?;
+                (
+                    Some(program.invocation_path.clone()),
+                    Some(program.length()),
+                    Some(program.sha256()),
+                )
+            }
+            None => (None, None, None),
+        };
+        let termination_forced = termination.is_some_and(|report| report.forced);
+        let termination_reaped = termination.is_some_and(|report| report.reaped);
+        let completed =
+            status.success() && !timed_out && termination_reaped && candidate_quiescence_complete;
+        let state = if completed { "completed" } else { "failed" };
+        let mut receipt = WindowsLaunchControlReceipt {
+            schema_version: 1,
+            request_sha256: self.request_sha256,
+            state,
+            phases: if completed {
+                Arc::from(WINDOWS_LAUNCH_CONTROL_PHASES)
+            } else {
+                Arc::from([])
+            },
+            bytes: 0,
+            sha256: Digest::default(),
+            status_code: status.code(),
+            timed_out,
+            termination_forced,
+            termination_reaped,
+            candidate_quiescence_complete,
+            program,
+            program_bytes,
+            program_sha256,
+            current_directory: self.current_directory,
+        };
+        let encoded = receipt.encoded();
+        receipt.bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        receipt.sha256 = sha256_bytes(&encoded);
+        receipt.validate()?;
+        Ok(receipt)
+    }
+}
+
+/// One exact POSIX directory identity and policy checkpoint.
+#[cfg(unix)]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PosixDirectoryCheckpoint {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl PosixDirectoryCheckpoint {
+    /// Captures and immediately validates one exact directory checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic when the path cannot be inspected or its
+    /// type, identity, ownership, or mode differs from policy.
+    pub fn capture(
+        path: &Path,
+        owner: u32,
+        group: u32,
+        mode: u32,
+        checkpoint: &str,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            format!("cannot inspect POSIX authority {}: {error}", path.display())
+        })?;
+        let authority = Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner,
+            group,
+            mode,
+        };
+        authority.validate(checkpoint)?;
+        Ok(authority)
+    }
+
+    /// Returns the exact path bound by this checkpoint.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Revalidates this checkpoint from one metadata snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic naming the checkpoint, path, and complete
+    /// expected and observed identity tuples.
+    pub fn validate(&self, checkpoint: &str) -> Result<(), String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            format!(
+                "cannot inspect candidate environment authority: checkpoint={checkpoint:?}; \
+                 path={:?}; failure={error}",
+                EscapedPath(&self.path)
+            )
+        })?;
+        let observed_kind = posix_checkpoint_metadata_kind(&metadata);
+        let observed_device = metadata.dev();
+        let observed_inode = metadata.ino();
+        let observed_owner = metadata.uid();
+        let observed_group = metadata.gid();
+        let observed_mode = metadata.permissions().mode() & 0o7777;
+        if observed_kind != "directory"
+            || observed_device != self.device
+            || observed_inode != self.inode
+            || observed_owner != self.owner
+            || observed_group != self.group
+            || observed_mode != self.mode
+        {
+            return Err(format!(
+                "candidate environment directory authority changed: checkpoint={checkpoint:?}; \
+                 path={:?}; expected=kind=directory,dev={},inode={},uid={},gid={},mode={:#06o}; \
+                 observed=kind={observed_kind},dev={observed_device},inode={observed_inode},uid={observed_owner},gid={observed_group},mode={observed_mode:#06o}",
+                EscapedPath(&self.path),
+                self.device,
+                self.inode,
+                self.owner,
+                self.group,
+                self.mode,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revalidates this directory and its exact immediate-child inventory.
+    /// Nested content below an expected child remains outside this checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic naming the checkpoint, path, and complete
+    /// expected and observed immediate-child inventories.
+    pub fn validate_exact_children(
+        &self,
+        checkpoint: &str,
+        expected: &[&str],
+    ) -> Result<(), String> {
+        const ENTRY_LIMIT: usize = 32;
+        const TEXT_LIMIT: usize = 4_096;
+
+        self.validate(checkpoint)?;
+        if expected.len() > ENTRY_LIMIT {
+            return Err(format!(
+                "candidate environment inventory policy is unbounded: checkpoint={checkpoint:?}; path={:?}; expectedCount={}",
+                EscapedPath(&self.path),
+                expected.len()
+            ));
+        }
+        let mut observed = Vec::new();
+        let mut truncated = false;
+        let entries = fs::read_dir(&self.path).map_err(|error| {
+            format!(
+                "cannot enumerate candidate environment inventory: checkpoint={checkpoint:?}; path={:?}; failure={error}",
+                EscapedPath(&self.path)
+            )
+        })?;
+        for entry in entries {
+            if observed.len() == ENTRY_LIMIT {
+                truncated = true;
+                break;
+            }
+            observed.push(
+                entry
+                    .map_err(|error| {
+                        format!(
+                            "cannot read candidate environment inventory entry: checkpoint={checkpoint:?}; path={:?}; failure={error}",
+                            EscapedPath(&self.path)
+                        )
+                    })?
+                    .file_name(),
+            );
+        }
+        observed.sort();
+        let mut expected = expected
+            .iter()
+            .map(OsString::from)
+            .collect::<Vec<OsString>>();
+        expected.sort();
+        if truncated || observed != expected {
+            let bounded = |entries: &[OsString]| {
+                let mut text = format!("{entries:?}");
+                if text.len() > TEXT_LIMIT {
+                    text.truncate(TEXT_LIMIT);
+                    text.push_str("<truncated>");
+                }
+                text
+            };
+            return Err(format!(
+                "candidate environment directory inventory changed: checkpoint={checkpoint:?}; path={:?}; expectedInventory={}; observedInventory={}{}",
+                EscapedPath(&self.path),
+                bounded(&expected),
+                bounded(&observed),
+                if truncated {
+                    ",<entry-limit-exceeded>"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn posix_checkpoint_metadata_kind(metadata: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else if file_type.is_block_device() {
+        "block-device"
+    } else if file_type.is_char_device() {
+        "character-device"
+    } else if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_socket() {
+        "socket"
+    } else {
+        "unknown"
+    }
+}
+
+/// Exact identity and bounded diagnostics for one Windows release artifact.
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct WindowsReleaseBinaryCheckpoint {
+    target: PathBuf,
+    binary: PathBuf,
+    candidate_target_binding: Option<PathBuf>,
+    observation: WindowsReleaseBinaryObservation,
+    release_receipt: WindowsCargoReleaseReceipt,
+}
+
+#[cfg(windows)]
+const WINDOWS_CARGO_RELEASE_RECEIPT: &str = ".hell-cargo-release-receipt-v1";
+
+#[cfg(windows)]
+const WINDOWS_CARGO_RELEASE_RECEIPT_HEADER: &str = "hell-windows-cargo-release-receipt-v1";
+
+/// Bound evidence emitted only after the restricted Cargo release child succeeds.
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct WindowsCargoReleaseReceipt {
+    target: PathBuf,
+    binary: PathBuf,
+    receipt: PathBuf,
+    receipt_identity: Arc<same_file::Handle>,
+    attestation: WindowsCargoReleaseArtifactAttestation,
+    observation: WindowsReleaseBinaryObservation,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsCargoReleaseArtifactAttestation {
+    length: u64,
+    sha256: Digest,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsReleaseBinaryObservation {
+    identity: Arc<same_file::Handle>,
+    length: u64,
+    sha256: Digest,
+}
+
+#[cfg(windows)]
+impl WindowsReleaseBinaryCheckpoint {
+    /// Captures a release binary after a successful build.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic when the artifact is absent, redirected,
+    /// or disagrees with the candidate target environment binding.
+    pub fn capture(
+        target: PathBuf,
+        binary: PathBuf,
+        candidate_target_binding: Option<PathBuf>,
+        release_receipt: Option<WindowsCargoReleaseReceipt>,
+        checkpoint: &str,
+        release_build_passed: bool,
+    ) -> Result<Self, String> {
+        let observation =
+            windows_release_binary_observation(&target, &binary).map_err(|detail| {
+                windows_release_binary_diagnostic(
+                    checkpoint,
+                    &target,
+                    &binary,
+                    candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    None,
+                    None,
+                    &detail,
+                )
+            })?;
+        if candidate_target_binding.as_deref() != Some(target.as_path()) {
+            return Err(windows_release_binary_diagnostic(
+                checkpoint,
+                &target,
+                &binary,
+                candidate_target_binding.as_deref(),
+                release_build_passed,
+                Some(&observation),
+                Some(&observation),
+                "candidate target environment binding differs from the expected output directory",
+            ));
+        }
+        let release_receipt = release_receipt.ok_or_else(|| {
+            windows_release_binary_diagnostic(
+                checkpoint,
+                &target,
+                &binary,
+                candidate_target_binding.as_deref(),
+                release_build_passed,
+                Some(&observation),
+                Some(&observation),
+                "successful restricted Cargo release receipt is absent",
+            )
+        })?;
+        release_receipt
+            .validate(&target, &binary)
+            .map_err(|detail| {
+                windows_release_binary_diagnostic(
+                    checkpoint,
+                    &target,
+                    &binary,
+                    candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    Some(&observation),
+                    Some(&observation),
+                    &detail,
+                )
+            })?;
+        Ok(Self {
+            target,
+            binary,
+            candidate_target_binding,
+            observation,
+            release_receipt,
+        })
+    }
+
+    /// Revalidates the release binary identity and content.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded checkpoint and directory-inventory diagnostic when
+    /// the artifact is absent or has changed.
+    pub fn validate(&self, checkpoint: &str, release_build_passed: bool) -> Result<(), String> {
+        self.release_receipt
+            .validate(&self.target, &self.binary)
+            .map_err(|detail| {
+                windows_release_binary_diagnostic(
+                    checkpoint,
+                    &self.target,
+                    &self.binary,
+                    self.candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    Some(&self.observation),
+                    None,
+                    &detail,
+                )
+            })?;
+        let observed =
+            windows_release_binary_observation(&self.target, &self.binary).map_err(|detail| {
+                windows_release_binary_diagnostic(
+                    checkpoint,
+                    &self.target,
+                    &self.binary,
+                    self.candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    Some(&self.observation),
+                    None,
+                    &detail,
+                )
+            })?;
+        if observed != self.observation {
+            return Err(windows_release_binary_diagnostic(
+                checkpoint,
+                &self.target,
+                &self.binary,
+                self.candidate_target_binding.as_deref(),
+                release_build_passed,
+                Some(&self.observation),
+                Some(&observed),
+                "release binary identity or content changed after the successful build",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the exact executable path while this authority retains a
+    /// Windows handle that denies write, delete, and replacement access.
+    pub fn bound_binary_path(&self) -> Result<&Path, String> {
+        self.validate("before retained-path consumption", true)?;
+        Ok(&self.binary)
+    }
+
+    /// Copies the executable through the retained, identity-bound handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the destination exists, the retained identity
+    /// changes, or the copied byte count differs from the receipt.
+    pub fn copy_bound_binary(&self, destination: &Path) -> Result<(), String> {
+        self.validate("before retained-handle copy", true)?;
+        let mut source = self
+            .observation
+            .identity
+            .as_file()
+            .try_clone()
+            .map_err(|error| format!("cannot clone retained release binary handle: {error}"))?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("cannot rewind retained release binary handle: {error}"))?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|error| format!("cannot create retained release binary copy: {error}"))?;
+        let copied = std::io::copy(&mut source, &mut output)
+            .map_err(|error| format!("cannot copy retained release binary handle: {error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("cannot sync retained release binary copy: {error}"))?;
+        if copied != self.observation.length {
+            return Err("retained release binary copy length differs".to_owned());
+        }
+        self.validate("after retained-handle copy", true)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsCargoReleaseReceipt {
+    /// Loads and binds the helper-produced receipt for an exact release target.
+    pub fn load(target: &Path) -> Result<Self, String> {
+        let binary = target.join("release").join("hell.exe");
+        let receipt = target.join(WINDOWS_CARGO_RELEASE_RECEIPT);
+        require_real_windows_release_receipt(target, &receipt)?;
+        let receipt_identity = windows_locked_same_file_handle(&receipt)
+            .map_err(|error| format!("cannot bind restricted Cargo release receipt: {error}"))?;
+        let text = read_bounded_windows_release_receipt(receipt_identity.as_file())?;
+        let attestation = parse_windows_release_receipt(&text)?;
+        let observation = windows_release_binary_observation(target, &binary)?;
+        if observation.length != attestation.length || observation.sha256 != attestation.sha256 {
+            return Err("restricted Cargo release receipt artifact content differs".to_owned());
+        }
+        let authority = Self {
+            target: target.to_path_buf(),
+            binary,
+            receipt,
+            receipt_identity: Arc::new(receipt_identity),
+            attestation,
+            observation,
+        };
+        authority.validate(target, &authority.binary)?;
+        Ok(authority)
+    }
+
+    fn validate(&self, target: &Path, binary: &Path) -> Result<(), String> {
+        if self.target != target || self.binary != binary {
+            return Err("restricted Cargo release receipt target or artifact differs".to_owned());
+        }
+        let rebound = same_file::Handle::from_path(&self.receipt)
+            .map_err(|error| format!("cannot rebind restricted Cargo release receipt: {error}"))?;
+        if rebound != *self.receipt_identity {
+            return Err("restricted Cargo release receipt identity changed".to_owned());
+        }
+        let text = read_bounded_windows_release_receipt(self.receipt_identity.as_file())?;
+        if parse_windows_release_receipt(&text)? != self.attestation {
+            return Err("restricted Cargo release receipt content changed".to_owned());
+        }
+        let observed = windows_release_binary_observation(target, binary)?;
+        if observed != self.observation {
+            return Err(
+                "restricted Cargo release receipt artifact identity or content differs".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn read_bounded_windows_release_receipt(file: &fs::File) -> Result<String, String> {
+    const BYTE_LIMIT: u64 = 512;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect restricted Cargo release receipt: {error}"))?;
+    if metadata.len() > BYTE_LIMIT {
+        return Err("restricted Cargo release receipt exceeds its byte bound".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("cannot clone restricted Cargo release receipt: {error}"))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot rewind restricted Cargo release receipt: {error}"))?;
+    reader
+        .take(BYTE_LIMIT.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read restricted Cargo release receipt: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > BYTE_LIMIT {
+        return Err("restricted Cargo release receipt exceeds its byte bound".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "restricted Cargo release receipt is not UTF-8".to_owned())
+}
+
+#[cfg(windows)]
+fn parse_windows_release_receipt(
+    text: &str,
+) -> Result<WindowsCargoReleaseArtifactAttestation, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(WINDOWS_CARGO_RELEASE_RECEIPT_HEADER)
+        || lines.next() != Some("program=cargo")
+        || lines.next() != Some("subcommand=build")
+        || lines.next() != Some("package=hell-cli")
+        || lines.next() != Some("binary=hell")
+        || lines.next() != Some("features=compat-tracing")
+    {
+        return Err("restricted Cargo release receipt grammar differs".to_owned());
+    }
+    let length_text = lines
+        .next()
+        .and_then(|line| line.strip_prefix("length="))
+        .ok_or_else(|| "restricted Cargo release receipt length is absent".to_owned())?;
+    let length = length_text
+        .parse::<u64>()
+        .map_err(|_| "restricted Cargo release receipt length is malformed".to_owned())?;
+    let digest_text = lines
+        .next()
+        .and_then(|line| line.strip_prefix("sha256="))
+        .ok_or_else(|| "restricted Cargo release receipt digest is absent".to_owned())?;
+    if length_text != length.to_string()
+        || digest_text != digest_text.to_ascii_lowercase()
+        || lines.next().is_some()
+        || !text.ends_with('\n')
+    {
+        return Err("restricted Cargo release receipt framing differs".to_owned());
+    }
+    let sha256 = Digest::from_hex(digest_text).map_err(|error| {
+        format!("restricted Cargo release receipt digest is malformed: {error}")
+    })?;
+    Ok(WindowsCargoReleaseArtifactAttestation { length, sha256 })
+}
+
+#[cfg(windows)]
+fn require_real_windows_release_receipt(target: &Path, receipt: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let target_metadata = fs::symlink_metadata(target)
+        .map_err(|error| format!("cannot inspect restricted Cargo receipt target: {error}"))?;
+    let receipt_metadata = fs::symlink_metadata(receipt)
+        .map_err(|error| format!("cannot inspect restricted Cargo release receipt: {error}"))?;
+    if !target_metadata.is_dir()
+        || target_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || fs::canonicalize(target).map_err(|error| {
+            format!("cannot canonicalize restricted Cargo receipt target: {error}")
+        })? != target
+        || !receipt_metadata.is_file()
+        || receipt_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || fs::canonicalize(receipt).map_err(|error| {
+            format!("cannot canonicalize restricted Cargo release receipt: {error}")
+        })? != receipt
+    {
+        return Err("restricted Cargo release receipt or target is redirected".to_owned());
+    }
+    Ok(())
+}
+
+/// Removes an earlier exact-release receipt before the restricted Cargo child starts.
+///
+/// # Errors
+///
+/// Fails closed when the target or an existing receipt is redirected or has the
+/// wrong file kind.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn prepare_windows_cargo_release_receipt(target: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = fs::symlink_metadata(target)?;
+    if !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || fs::canonicalize(target)? != target
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo release receipt target is redirected",
+        ));
+    }
+    let receipt = target.join(WINDOWS_CARGO_RELEASE_RECEIPT);
+    match fs::symlink_metadata(&receipt) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || fs::canonicalize(&receipt)? != receipt
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "existing Windows Cargo release receipt is redirected",
+                ));
+            }
+            fs::remove_file(receipt)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Publishes the exact-release receipt after a successful restricted Cargo child.
+///
+/// # Errors
+///
+/// Fails when the exact release artifact is absent, redirected, or a receipt
+/// was created after the pre-spawn stale-receipt check.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn publish_windows_cargo_release_receipt(target: &Path) -> std::io::Result<()> {
+    let binary = target.join("release").join("hell.exe");
+    let observation =
+        windows_release_binary_observation(target, &binary).map_err(std::io::Error::other)?;
+    let receipt = target.join(WINDOWS_CARGO_RELEASE_RECEIPT);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt)?;
+    let text = format!(
+        "{WINDOWS_CARGO_RELEASE_RECEIPT_HEADER}\nprogram=cargo\nsubcommand=build\npackage=hell-cli\nbinary=hell\nfeatures=compat-tracing\nlength={}\nsha256={}\n",
+        observation.length,
+        observation.sha256.hex()
+    );
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    // The retained reader intentionally denies write sharing, so the mutable
+    // publication handle must be closed before the receipt is rebound.
+    drop(file);
+    let loaded = WindowsCargoReleaseReceipt::load(target).map_err(std::io::Error::other)?;
+    loaded
+        .validate(target, &binary)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(windows)]
+fn windows_release_binary_observation(
+    target: &Path,
+    binary: &Path,
+) -> Result<WindowsReleaseBinaryObservation, String> {
+    require_real_windows_release_binary(target, binary)?;
+    let identity = windows_locked_same_file_handle(binary)
+        .map_err(|error| format!("cannot bind release binary identity: {error}"))?;
+    let before = identity
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("cannot inspect bound release binary identity: {error}"))?;
+    let mut file = identity.as_file();
+    let mut digest = Sha256::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash bound release binary identity: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| "release binary length overflowed while hashing".to_owned())?;
+        digest.update(&buffer[..read]);
+    }
+    let after = identity
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("cannot reinspect bound release binary identity: {error}"))?;
+    require_real_windows_release_binary(target, binary)?;
+    let rebound = same_file::Handle::from_path(binary)
+        .map_err(|error| format!("cannot rebind release binary identity: {error}"))?;
+    if before.len() != length || after.len() != length || rebound != identity {
+        return Err("release binary identity changed while it was hashed".to_owned());
+    }
+    Ok(WindowsReleaseBinaryObservation {
+        identity: Arc::new(identity),
+        length,
+        sha256: digest.finish(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_locked_same_file_handle(path: &Path) -> std::io::Result<same_file::Handle> {
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)?;
+    same_file::Handle::from_file(file)
+}
+
+#[cfg(windows)]
+fn bind_windows_program_parent(path: &Path) -> std::io::Result<Arc<same_file::Handle>> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("bound program has no parent"))?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bound program invocation parent is not one canonical direct directory",
+        ));
+    }
+    same_file::Handle::from_path(parent).map(Arc::new)
+}
+
+#[cfg(windows)]
+pub fn sha256_retained_windows_file_until(
+    mut file: &fs::File,
+    deadline: Instant,
+) -> std::io::Result<Digest> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "bound Windows program hash exceeded its absolute deadline",
+            ));
+        }
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(digest.finish());
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+#[cfg(windows)]
+fn require_real_windows_release_binary(target: &Path, binary: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let release = target.join("release");
+    let release_metadata = fs::symlink_metadata(&release)
+        .map_err(|error| format!("cannot inspect release target directory: {error}"))?;
+    if release_metadata.file_type().is_symlink()
+        || !release_metadata.is_dir()
+        || release_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("candidate release target is not a real directory".to_owned());
+    }
+    if fs::canonicalize(&release)
+        .map_err(|error| format!("cannot canonicalize release target: {error}"))?
+        != release
+    {
+        return Err("candidate release target is redirected".to_owned());
+    }
+    let binary_metadata = fs::symlink_metadata(binary)
+        .map_err(|error| format!("cannot inspect release binary: {error}"))?;
+    if binary_metadata.file_type().is_symlink()
+        || !binary_metadata.is_file()
+        || binary_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("candidate release binary is not a real file".to_owned());
+    }
+    if fs::canonicalize(binary)
+        .map_err(|error| format!("cannot canonicalize release binary: {error}"))?
+        != binary
+    {
+        return Err("candidate release binary is redirected".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_release_binary_diagnostic(
+    checkpoint: &str,
+    target: &Path,
+    binary: &Path,
+    candidate_target_binding: Option<&Path>,
+    release_build_passed: bool,
+    expected: Option<&WindowsReleaseBinaryObservation>,
+    observed: Option<&WindowsReleaseBinaryObservation>,
+    detail: &str,
+) -> String {
+    format!(
+        "Windows release binary checkpoint failed: checkpoint={checkpoint:?} expectedPath={} \
+         candidateTargetBinding={} releaseBuildPassed={release_build_passed} \
+         expectedIdentity={} observedIdentity={} targetInventory={} releaseInventory={} detail={detail}",
+        binary.display(),
+        candidate_target_binding
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        windows_release_binary_identity_text(expected),
+        windows_release_binary_identity_text(observed),
+        bounded_windows_directory_inventory(target),
+        bounded_windows_directory_inventory(&target.join("release")),
+    )
+}
+
+#[cfg(windows)]
+fn windows_release_binary_identity_text(
+    observation: Option<&WindowsReleaseBinaryObservation>,
+) -> String {
+    observation.map_or_else(
+        || "<unavailable>".to_owned(),
+        |observation| {
+            format!(
+                "fileIdentity=bound,length={},sha256={}",
+                observation.length,
+                observation.sha256.hex()
+            )
+        },
+    )
+}
+
+#[cfg(windows)]
+fn bounded_windows_directory_inventory(directory: &Path) -> String {
+    const ENTRY_LIMIT: usize = 32;
+    const TEXT_LIMIT: usize = 4_096;
+
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => return format!("<unavailable:{error}>"),
+    };
+    let mut inventory = Vec::new();
+    let mut truncated = false;
+    for entry in entries {
+        if inventory.len() == ENTRY_LIMIT {
+            truncated = true;
+            break;
+        }
+        let item = match entry {
+            Ok(entry) => match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => {
+                    let kind = if metadata.file_type().is_symlink() {
+                        "symlink"
+                    } else if metadata.is_dir() {
+                        "directory"
+                    } else if metadata.is_file() {
+                        "file"
+                    } else {
+                        "special"
+                    };
+                    format!("{:?}:{kind}", entry.file_name())
+                }
+                Err(error) => format!("{:?}:<unavailable:{error}>", entry.file_name()),
+            },
+            Err(error) => format!("<unavailable:{error}>"),
+        };
+        inventory.push(item);
+    }
+    inventory.sort();
+    if truncated {
+        inventory.push("<truncated>".to_owned());
+    }
+    let mut text = format!("[{}]", inventory.join(","));
+    if text.len() > TEXT_LIMIT {
+        let mut boundary = TEXT_LIMIT;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        text.push_str("<truncated>]");
+    }
+    text
 }
 
 /// Exact executable authorities for the Windows restricted-child boundary.
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub struct WindowsLaunchAuthorities {
-    launcher: PathBuf,
-    launcher_sha256: Digest,
-    restricted_adapter: PathBuf,
-    restricted_adapter_sha256: Digest,
+    launcher: BoundProgramInvocation,
+    restricted_adapter: BoundProgramInvocation,
     toolchain: WindowsToolchainAuthority,
 }
 
@@ -255,6 +1223,14 @@ pub struct WindowsToolchainAuthority {
     trusted_parent_path: OsString,
     trusted_path_entries: Arc<[WindowsTrustedPathEntry]>,
     system_root: WindowsSystemRootAuthority,
+    inventory_full_hash_passes: usize,
+    lifecycle_execution_deadline: Option<Instant>,
+}
+
+#[cfg(windows)]
+enum WindowsToolchainInventoryInput {
+    Paths(Vec<PathBuf>),
+    Promoted(Vec<BoundProgramInvocation>),
 }
 
 #[cfg(windows)]
@@ -633,6 +1609,105 @@ impl WindowsToolchainAuthority {
         trusted_parent_path: OsString,
         trusted_parent_system_root: OsString,
     ) -> std::io::Result<Self> {
+        let acquisition_deadline = windows_program_authority_acquisition_deadline()?;
+        Self::new_until(
+            cargo,
+            rustc,
+            inventory_root,
+            inventory_files,
+            inventory_directories,
+            trusted_parent_path,
+            trusted_parent_system_root,
+            acquisition_deadline,
+        )
+    }
+
+    /// Binds one selected/staged Rust toolchain before an existing absolute deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deadline expires or any path is redirected,
+    /// substituted, or differs from the closed staged inventory.
+    pub fn new_until(
+        cargo: WindowsToolchainExecutableAuthority,
+        rustc: WindowsToolchainExecutableAuthority,
+        inventory_root: PathBuf,
+        inventory_files: Vec<PathBuf>,
+        inventory_directories: Vec<PathBuf>,
+        trusted_parent_path: OsString,
+        trusted_parent_system_root: OsString,
+        acquisition_deadline: Instant,
+    ) -> std::io::Result<Self> {
+        Self::new_with_inventory_until(
+            cargo,
+            rustc,
+            inventory_root,
+            WindowsToolchainInventoryInput::Paths(inventory_files),
+            inventory_directories,
+            trusted_parent_path,
+            trusted_parent_system_root,
+            acquisition_deadline,
+            None,
+        )
+    }
+
+    /// Promotes an already-hashed staged inventory into the selected toolchain authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every promoted member remains an exact direct
+    /// child of the closed staged inventory and the selected Cargo/rustc
+    /// mappings name exact promoted members.
+    #[doc(hidden)]
+    pub fn new_from_promoted_inventory_until(
+        cargo: WindowsToolchainExecutableAuthority,
+        rustc: WindowsToolchainExecutableAuthority,
+        inventory_root: PathBuf,
+        inventory_files: Vec<BoundProgramInvocation>,
+        inventory_directories: Vec<PathBuf>,
+        trusted_parent_path: OsString,
+        trusted_parent_system_root: OsString,
+        acquisition_deadline: Instant,
+        lifecycle_execution_deadline: Instant,
+    ) -> std::io::Result<Self> {
+        Self::new_with_inventory_until(
+            cargo,
+            rustc,
+            inventory_root,
+            WindowsToolchainInventoryInput::Promoted(inventory_files),
+            inventory_directories,
+            trusted_parent_path,
+            trusted_parent_system_root,
+            acquisition_deadline,
+            Some(lifecycle_execution_deadline),
+        )
+    }
+
+    fn new_with_inventory_until(
+        cargo: WindowsToolchainExecutableAuthority,
+        rustc: WindowsToolchainExecutableAuthority,
+        inventory_root: PathBuf,
+        inventory: WindowsToolchainInventoryInput,
+        inventory_directories: Vec<PathBuf>,
+        trusted_parent_path: OsString,
+        trusted_parent_system_root: OsString,
+        acquisition_deadline: Instant,
+        lifecycle_execution_deadline: Option<Instant>,
+    ) -> std::io::Result<Self> {
+        if lifecycle_execution_deadline
+            .is_some_and(|lifecycle_deadline| lifecycle_deadline < acquisition_deadline)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows toolchain lifecycle deadline precedes receipt acquisition",
+            ));
+        }
+        if Instant::now() >= acquisition_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Windows toolchain authority acquisition deadline expired before binding",
+            ));
+        }
         let inventory_root = fs::canonicalize(&inventory_root).map_err(|error| {
             windows_toolchain_bind_failure(
                 WindowsToolchainBindOperation::CanonicalizeInventoryRoot,
@@ -678,74 +1753,133 @@ impl WindowsToolchainAuthority {
         let staged_cargo_path = cargo.staged.clone();
         let selected_rustc_path = rustc.selected.clone();
         let staged_rustc_path = rustc.staged.clone();
-        let cargo_source =
-            BoundProgramInvocation::new(cargo.source_invocation, cargo.source_identity).map_err(
-                |error| {
+        let cargo_source = BoundProgramInvocation::new_until(
+            cargo.source_invocation,
+            cargo.source_identity,
+            acquisition_deadline,
+        )
+        .map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::BindCargoSource,
+                &cargo_source_path,
+                &error,
+            )
+        })?;
+        let rustc_source = BoundProgramInvocation::new_until(
+            rustc.source_invocation,
+            rustc.source_identity,
+            acquisition_deadline,
+        )
+        .map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::BindRustcSource,
+                &rustc_source_path,
+                &error,
+            )
+        })?;
+        let selected_cargo = BoundProgramInvocation::new_until(
+            selected_cargo_path.clone(),
+            selected_cargo_path.clone(),
+            acquisition_deadline,
+        )
+        .map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::BindSelectedCargo,
+                &selected_cargo_path,
+                &error,
+            )
+        })?;
+        let selected_rustc = BoundProgramInvocation::new_until(
+            selected_rustc_path.clone(),
+            selected_rustc_path.clone(),
+            acquisition_deadline,
+        )
+        .map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::BindSelectedRustc,
+                &selected_rustc_path,
+                &error,
+            )
+        })?;
+        let (inventory_files, inventory_full_hash_passes) = match inventory {
+            WindowsToolchainInventoryInput::Paths(paths) => (
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        BoundProgramInvocation::new_until(
+                            path.clone(),
+                            path.clone(),
+                            acquisition_deadline,
+                        )
+                        .map_err(|error| {
+                            windows_toolchain_bind_failure(
+                                WindowsToolchainBindOperation::BindInventoryFile,
+                                &path,
+                                &error,
+                            )
+                        })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?,
+                1,
+            ),
+            WindowsToolchainInventoryInput::Promoted(files) => {
+                for file in &files {
+                    if Instant::now() >= acquisition_deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "staged Windows toolchain promotion exceeded its absolute deadline",
+                        ));
+                    }
+                    if file.invocation_path != file.canonical_identity
+                        || !file.invocation_path.starts_with(&inventory_root)
+                        || file.invocation_path == inventory_root
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "promoted Windows toolchain member is outside the staged inventory",
+                        ));
+                    }
+                    file.revalidate(file.invocation_path.as_os_str())?;
+                }
+                (files, 0)
+            }
+        };
+        let unique_files = inventory_files
+            .iter()
+            .map(|file| file.invocation_path.clone())
+            .collect::<BTreeSet<_>>();
+        if unique_files.len() != inventory_files.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows toolchain inventory contains duplicate files",
+            ));
+        }
+        let staged_member = |path: &Path,
+                             operation: WindowsToolchainBindOperation|
+         -> std::io::Result<BoundProgramInvocation> {
+            inventory_files
+                .iter()
+                .find(|file| file.invocation_path == path)
+                .cloned()
+                .ok_or_else(|| {
                     windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindCargoSource,
-                        &cargo_source_path,
-                        &error,
-                    )
-                },
-            )?;
-        let rustc_source =
-            BoundProgramInvocation::new(rustc.source_invocation, rustc.source_identity).map_err(
-                |error| {
-                    windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindRustcSource,
-                        &rustc_source_path,
-                        &error,
-                    )
-                },
-            )?;
-        let selected_cargo =
-            BoundProgramInvocation::new(selected_cargo_path.clone(), selected_cargo_path.clone())
-                .map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::BindSelectedCargo,
-                    &selected_cargo_path,
-                    &error,
-                )
-            })?;
-        let staged_cargo =
-            BoundProgramInvocation::new(staged_cargo_path.clone(), staged_cargo_path.clone())
-                .map_err(|error| {
-                    windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindStagedCargo,
-                        &staged_cargo_path,
-                        &error,
-                    )
-                })?;
-        let selected_rustc =
-            BoundProgramInvocation::new(selected_rustc_path.clone(), selected_rustc_path.clone())
-                .map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::BindSelectedRustc,
-                    &selected_rustc_path,
-                    &error,
-                )
-            })?;
-        let staged_rustc =
-            BoundProgramInvocation::new(staged_rustc_path.clone(), staged_rustc_path.clone())
-                .map_err(|error| {
-                    windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindStagedRustc,
-                        &staged_rustc_path,
-                        &error,
-                    )
-                })?;
-        let inventory_files = inventory_files
-            .into_iter()
-            .map(|path| {
-                BoundProgramInvocation::new(path.clone(), path.clone()).map_err(|error| {
-                    windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindInventoryFile,
-                        &path,
-                        &error,
+                        operation,
+                        path,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "selected staged executable is absent from the promoted inventory",
+                        ),
                     )
                 })
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
+        };
+        let staged_cargo = staged_member(
+            &staged_cargo_path,
+            WindowsToolchainBindOperation::BindStagedCargo,
+        )?;
+        let staged_rustc = staged_member(
+            &staged_rustc_path,
+            WindowsToolchainBindOperation::BindStagedRustc,
+        )?;
         let authority = Self {
             cargo_source,
             rustc_source,
@@ -759,52 +1893,28 @@ impl WindowsToolchainAuthority {
             trusted_parent_path,
             trusted_path_entries: trusted_path_entries.into(),
             system_root,
+            inventory_full_hash_passes,
+            lifecycle_execution_deadline,
         };
-        let selected_cargo_sha = sha256_file(&authority.selected_cargo.canonical_identity)
-            .map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::HashSelectedCargo,
-                    &authority.selected_cargo.canonical_identity,
-                    &error,
-                )
-            })?;
-        let staged_cargo_sha =
-            sha256_file(&authority.staged_cargo.canonical_identity).map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::HashStagedCargo,
-                    &authority.staged_cargo.canonical_identity,
-                    &error,
-                )
-            })?;
-        let selected_rustc_sha = sha256_file(&authority.selected_rustc.canonical_identity)
-            .map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::HashSelectedRustc,
-                    &authority.selected_rustc.canonical_identity,
-                    &error,
-                )
-            })?;
-        let staged_rustc_sha =
-            sha256_file(&authority.staged_rustc.canonical_identity).map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::HashStagedRustc,
-                    &authority.staged_rustc.canonical_identity,
-                    &error,
-                )
-            })?;
+        let selected_cargo_sha = authority.selected_cargo.sha256();
+        let staged_cargo_sha = authority.staged_cargo.sha256();
+        let selected_rustc_sha = authority.selected_rustc.sha256();
+        let staged_rustc_sha = authority.staged_rustc.sha256();
         if selected_cargo_sha != staged_cargo_sha || selected_rustc_sha != staged_rustc_sha {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "staged Windows Rust executable differs from selected source",
             ));
         }
-        authority.revalidate_inventory().map_err(|error| {
-            windows_toolchain_bind_failure(
-                WindowsToolchainBindOperation::RevalidateInventory,
-                &authority.inventory_root,
-                &error,
-            )
-        })?;
+        authority
+            .revalidate_inventory_until(acquisition_deadline)
+            .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::RevalidateInventory,
+                    &authority.inventory_root,
+                    &error,
+                )
+            })?;
         Ok(authority)
     }
 
@@ -866,8 +1976,8 @@ impl WindowsToolchainAuthority {
             .map(Some)
     }
 
-    /// Produces the exact child PATH after proving it still equals the trusted
-    /// parent capture and revalidating every staged and suffix directory.
+    /// Produces the closed child PATH containing only the staged Rust bin,
+    /// System32, and SystemRoot after revalidating the trusted parent capture.
     ///
     /// # Errors
     ///
@@ -901,31 +2011,55 @@ impl WindowsToolchainAuthority {
                 "staged Windows Cargo and rustc do not share the inventoried bin directory",
             ));
         }
-        std::env::join_paths(
-            std::iter::once(staged_bin.to_path_buf()).chain(
-                self.trusted_path_entries
-                    .iter()
-                    .filter_map(|entry| entry.canonical_identity().map(Path::to_path_buf)),
-            ),
-        )
+        std::env::join_paths([
+            staged_bin.to_path_buf(),
+            self.system_root.system32.canonical_identity.clone(),
+            self.system_root.root.canonical_identity.clone(),
+        ])
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
     }
 
     fn revalidate_inventory(&self) -> std::io::Result<()> {
+        self.revalidate_inventory_with_deadline(self.lifecycle_execution_deadline)
+    }
+
+    fn revalidate_inventory_until(&self, deadline: Instant) -> std::io::Result<()> {
+        self.revalidate_inventory_with_deadline(Some(deadline))
+    }
+
+    fn revalidate_inventory_with_deadline(&self, deadline: Option<Instant>) -> std::io::Result<()> {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let require_time = || {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "staged Windows toolchain cheap revalidation exceeded its absolute deadline",
+                ));
+            }
+            Ok(())
+        };
         let mut expected = BTreeSet::new();
         for directory in self.inventory_directories.iter() {
+            require_time()?;
             expected.insert((directory.clone(), true));
         }
         for file in self.inventory_files.iter() {
+            require_time()?;
             expected.insert((file.invocation_path.clone(), false));
             file.revalidate(file.invocation_path.as_os_str())?;
+        }
+        if expected.len() != self.inventory_directories.len() + self.inventory_files.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows toolchain expected inventory contains duplicates",
+            ));
         }
         let mut observed = BTreeSet::new();
         let mut pending = vec![self.inventory_root.clone()];
         while let Some(directory) = pending.pop() {
+            require_time()?;
             let metadata = fs::symlink_metadata(&directory)?;
             if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             {
@@ -936,6 +2070,7 @@ impl WindowsToolchainAuthority {
             }
             observed.insert((directory.clone(), true));
             for entry in fs::read_dir(&directory)? {
+                require_time()?;
                 let path = entry?.path();
                 let metadata = fs::symlink_metadata(&path)?;
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -954,6 +2089,12 @@ impl WindowsToolchainAuthority {
                         "staged Windows toolchain gained a special entry",
                     ));
                 }
+                if observed.len() + pending.len() > expected.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged Windows toolchain observed inventory exceeds its closed bound",
+                    ));
+                }
             }
         }
         if observed != expected {
@@ -963,6 +2104,14 @@ impl WindowsToolchainAuthority {
             ));
         }
         Ok(())
+    }
+
+    /// Returns the number of complete staged-inventory hash passes performed
+    /// while constructing this authority.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn windows_inventory_full_hash_passes_for_integration(&self) -> usize {
+        self.inventory_full_hash_passes
     }
 }
 
@@ -1128,7 +2277,7 @@ pub fn configure_windows_restricted_child_environment(
     configure_windows_standard_system_root_value(environment, &toolchain.system_root.value, true)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_executable_has_logical_name(path: &OsStr, expected: &str) -> bool {
     let path = Path::new(path);
     path.file_stem()
@@ -1142,25 +2291,66 @@ fn windows_executable_has_logical_name(path: &OsStr, expected: &str) -> bool {
             })
 }
 
+#[cfg(any(windows, test))]
+fn windows_program_requires_trusted_path(
+    requested: &OsStr,
+    resolved: &Path,
+    mapped_toolchain_program: bool,
+) -> bool {
+    mapped_toolchain_program
+        || windows_executable_has_logical_name(requested, "stack")
+        || windows_executable_has_logical_name(resolved.as_os_str(), "stack")
+}
+
 #[cfg(windows)]
 impl WindowsLaunchAuthorities {
     /// Binds the unrestricted token launcher and the minimal executable that
     /// enters under the restricted token.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both programs can be bound under one acquisition deadline.
     pub fn new(
         launcher: PathBuf,
-        launcher_sha256: Digest,
         restricted_adapter: PathBuf,
-        restricted_adapter_sha256: Digest,
         toolchain: WindowsToolchainAuthority,
-    ) -> Self {
-        Self {
-            launcher,
-            launcher_sha256,
+    ) -> std::io::Result<Self> {
+        let deadline = windows_program_authority_acquisition_deadline()?;
+        Self::new_until(launcher, restricted_adapter, toolchain, deadline)
+    }
+
+    /// Binds both Windows launch programs before an existing absolute deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deadline expires or either program changes.
+    pub fn new_until(
+        launcher: PathBuf,
+        restricted_adapter: PathBuf,
+        toolchain: WindowsToolchainAuthority,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        let launcher = fs::canonicalize(launcher)?;
+        let launcher = BoundProgramInvocation::new_until(launcher.clone(), launcher, deadline)?;
+        let restricted_adapter = fs::canonicalize(restricted_adapter)?;
+        let restricted_adapter = BoundProgramInvocation::new_until(
+            restricted_adapter.clone(),
             restricted_adapter,
-            restricted_adapter_sha256,
-            toolchain,
+            deadline,
+        )?;
+        if restricted_adapter.canonical_identity.file_name()
+            != Some(OsStr::new("hell-test-helper.exe"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "restricted argv adapter identity changed",
+            ));
         }
+        Ok(Self {
+            launcher,
+            restricted_adapter,
+            toolchain,
+        })
     }
 }
 
@@ -1176,6 +2366,61 @@ pub struct PosixLaunchAuthorities {
     cargo_authority: PosixCargoSourceAuthority,
     cargo_deny_authority: Option<PosixCargoDenyAuthority>,
     stack_authority: Option<PosixStackAuthority>,
+}
+
+/// Fixed role of one trusted POSIX process-lifecycle executable.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixProcessToolRole {
+    Sudo,
+    Identity,
+    Inventory,
+    Terminator,
+}
+
+/// Exact metadata and content receipt for one trusted POSIX executable.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixExecutableMetadata {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    bytes: u64,
+}
+
+/// Exact no-follow-independent metadata receipt for a canonical invocation parent.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixExecutableParentMetadata {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+/// Parent-resolved invocation and exact file receipt for one POSIX tool.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixExecutableAuthority {
+    role: PosixProcessToolRole,
+    invocation: PathBuf,
+    logical_name: Option<OsString>,
+    parent_metadata: Option<PosixExecutableParentMetadata>,
+    canonical: PathBuf,
+    metadata: PosixExecutableMetadata,
+}
+
+/// Complete parent-resolved authority used for candidate process lifecycle.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixProcessAuthorities {
+    sudo: PosixExecutableAuthority,
+    identity: PosixExecutableAuthority,
+    inventory: PosixExecutableAuthority,
+    terminator: PosixExecutableAuthority,
 }
 
 /// Exact source-to-stage authority for the pinned POSIX `cargo-deny` binary.
@@ -1307,8 +2552,8 @@ pub struct PosixRustupProxyIdentity {
 pub struct PosixCandidateIdentity {
     principal: String,
     uid: u32,
+    primary_gid: u32,
     group_ids: Vec<u32>,
-    group: String,
 }
 
 #[cfg(unix)]
@@ -1327,10 +2572,11 @@ impl PosixCandidateIdentity {
         group_ids: Vec<u32>,
         group: String,
     ) -> std::io::Result<Self> {
+        let group = group.into_bytes();
         if principal.is_empty()
             || group.is_empty()
             || !principal.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            || !group.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !group.iter().all(u8::is_ascii_alphanumeric)
             || !posix_candidate_group_inventory_is_valid(primary_gid, &group_ids)
         {
             return Err(std::io::Error::new(
@@ -1341,8 +2587,8 @@ impl PosixCandidateIdentity {
         Ok(Self {
             principal,
             uid,
+            primary_gid,
             group_ids,
-            group,
         })
     }
 }
@@ -1480,6 +2726,340 @@ impl PosixLaunchAuthorities {
 }
 
 #[cfg(unix)]
+impl PosixExecutableMetadata {
+    /// Retains the exact metadata and digest captured by the trusted parent.
+    #[must_use]
+    pub fn new(device: u64, inode: u64, owner: u32, group: u32, mode: u32, bytes: u64) -> Self {
+        Self {
+            device,
+            inode,
+            owner,
+            group,
+            mode,
+            bytes,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixExecutableParentMetadata {
+    #[must_use]
+    pub fn new(device: u64, inode: u64, owner: u32, group: u32, mode: u32) -> Self {
+        Self {
+            device,
+            inode,
+            owner,
+            group,
+            mode,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixExecutableAuthority {
+    /// Retains one canonical-parent invocation and its exact file receipt.
+    #[must_use]
+    pub fn new(
+        role: PosixProcessToolRole,
+        invocation: PathBuf,
+        canonical: PathBuf,
+        metadata: PosixExecutableMetadata,
+    ) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let parent_metadata = invocation
+            .parent()
+            .and_then(|parent| fs::metadata(parent).ok())
+            .map(|parent| {
+                PosixExecutableParentMetadata::new(
+                    parent.dev(),
+                    parent.ino(),
+                    parent.uid(),
+                    parent.gid(),
+                    parent.mode(),
+                )
+            });
+        let logical_name = invocation.file_name().map(OsStr::to_os_string);
+        Self {
+            role,
+            invocation,
+            logical_name,
+            parent_metadata,
+            canonical,
+            metadata,
+        }
+    }
+
+    /// Retains an independently captured canonical-parent receipt.
+    #[must_use]
+    pub fn with_parent_metadata(
+        role: PosixProcessToolRole,
+        invocation: PathBuf,
+        parent_metadata: PosixExecutableParentMetadata,
+        canonical: PathBuf,
+        metadata: PosixExecutableMetadata,
+    ) -> Self {
+        let logical_name = invocation.file_name().map(OsStr::to_os_string);
+        Self {
+            role,
+            invocation,
+            logical_name,
+            parent_metadata: Some(parent_metadata),
+            canonical,
+            metadata,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PosixProcessAuthorities {
+    /// Binds the four distinct roles used for candidate process lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a supplied receipt is assigned to the wrong role.
+    pub fn new(
+        sudo: PosixExecutableAuthority,
+        identity: PosixExecutableAuthority,
+        inventory: PosixExecutableAuthority,
+        terminator: PosixExecutableAuthority,
+    ) -> std::io::Result<Self> {
+        if sudo.role != PosixProcessToolRole::Sudo
+            || identity.role != PosixProcessToolRole::Identity
+            || inventory.role != PosixProcessToolRole::Inventory
+            || terminator.role != PosixProcessToolRole::Terminator
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX process authority role assignment differs from policy",
+            ));
+        }
+        Ok(Self {
+            sudo,
+            identity,
+            inventory,
+            terminator,
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixExecutableAuthority {
+    authority: PosixExecutableAuthority,
+}
+
+#[cfg(unix)]
+impl BoundPosixExecutableAuthority {
+    fn new(authority: PosixExecutableAuthority) -> std::io::Result<Self> {
+        let bound = Self { authority };
+        bound.revalidate()?;
+        Ok(bound)
+    }
+
+    fn revalidate(&self) -> std::io::Result<PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let invocation = &self.authority.invocation;
+        let canonical = &self.authority.canonical;
+        let role = self.authority.role;
+        if !invocation.is_absolute() {
+            return Err(posix_process_authority_error(role, "absolute-invocation"));
+        }
+        let parent = invocation
+            .parent()
+            .ok_or_else(|| posix_process_authority_error(role, "invocation-parent"))?;
+        let logical_name = self
+            .authority
+            .logical_name
+            .as_deref()
+            .ok_or_else(|| posix_process_authority_error(role, "logical-leaf"))?;
+        if invocation.file_name() != Some(logical_name)
+            || Path::new(logical_name).components().count() != 1
+        {
+            return Err(posix_process_authority_error(role, "logical-leaf"));
+        }
+        let observed_parent = fs::canonicalize(parent)
+            .map_err(|_| posix_process_authority_error(role, "canonical-parent"))?;
+        if observed_parent != parent {
+            return Err(posix_process_authority_error(role, "canonical-parent"));
+        }
+        let parent_metadata = fs::metadata(parent)
+            .map_err(|_| posix_process_authority_error(role, "parent-metadata"))?;
+        let expected_parent = self
+            .authority
+            .parent_metadata
+            .as_ref()
+            .ok_or_else(|| posix_process_authority_error(role, "parent-metadata"))?;
+        if !parent_metadata.is_dir() {
+            return Err(posix_process_authority_error(role, "parent-kind"));
+        }
+        for (matches, predicate) in [
+            (
+                parent_metadata.dev() == expected_parent.device,
+                "parent-device",
+            ),
+            (
+                parent_metadata.ino() == expected_parent.inode,
+                "parent-inode",
+            ),
+            (
+                parent_metadata.uid() == expected_parent.owner,
+                "parent-owner",
+            ),
+            (
+                parent_metadata.gid() == expected_parent.group,
+                "parent-group",
+            ),
+            (
+                parent_metadata.mode() == expected_parent.mode,
+                "parent-mode",
+            ),
+        ] {
+            if !matches {
+                return Err(posix_process_authority_error(role, predicate));
+            }
+        }
+        require_trusted_posix_executable_parent(&parent_metadata)
+            .map_err(|predicate| posix_process_authority_error(role, predicate))?;
+        let observed_canonical = fs::canonicalize(canonical)
+            .map_err(|_| posix_process_authority_error(role, "canonical-target"))?;
+        if observed_canonical != *canonical {
+            return Err(posix_process_authority_error(role, "canonical-target"));
+        }
+        let observed_invocation = fs::canonicalize(invocation)
+            .map_err(|_| posix_process_authority_error(role, "invocation-resolves-to-target"))?;
+        if observed_invocation != *canonical {
+            return Err(posix_process_authority_error(
+                role,
+                "invocation-resolves-to-target",
+            ));
+        }
+        let metadata = fs::metadata(canonical)
+            .map_err(|_| posix_process_authority_error(role, "target-metadata"))?;
+        let expected = &self.authority.metadata;
+        if !metadata.is_file() {
+            return Err(posix_process_authority_error(role, "file-kind"));
+        }
+        for (matches, predicate) in [
+            (metadata.dev() == expected.device, "device"),
+            (metadata.ino() == expected.inode, "inode"),
+            (metadata.uid() == expected.owner, "owner"),
+            (metadata.gid() == expected.group, "group"),
+            (metadata.mode() == expected.mode, "mode"),
+            (metadata.len() == expected.bytes, "length"),
+        ] {
+            if !matches {
+                return Err(posix_process_authority_error(role, predicate));
+            }
+        }
+        require_posix_effective_executable(invocation)
+            .map_err(|_| posix_process_authority_error(role, "effective-X-OK"))?;
+        Ok(invocation.clone())
+    }
+}
+
+#[cfg(unix)]
+fn require_trusted_posix_executable_parent(metadata: &fs::Metadata) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    require_trusted_posix_executable_parent_fields(metadata.uid(), metadata.mode())
+}
+
+#[cfg(unix)]
+fn require_trusted_posix_executable_parent_fields(
+    owner: u32,
+    mode: u32,
+) -> Result<(), &'static str> {
+    use nix::unistd::geteuid;
+
+    if owner != 0 && owner != geteuid().as_raw() {
+        return Err("parent-trusted-owner");
+    }
+    if mode & 0o022 != 0 {
+        return Err("parent-non-owner-write");
+    }
+    Ok(())
+}
+
+/// Verifies canonical executable-parent ownership/write policy through an external test seam.
+///
+/// # Errors
+///
+/// Returns the exact rejected predicate when the owner or mode is not trusted.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn verify_posix_executable_parent_policy_for_integration(
+    owner: u32,
+    mode: u32,
+) -> Result<(), &'static str> {
+    require_trusted_posix_executable_parent_fields(owner, mode)
+}
+
+#[cfg(unix)]
+fn posix_process_authority_error(
+    role: PosixProcessToolRole,
+    predicate: &'static str,
+) -> std::io::Error {
+    let role = match role {
+        PosixProcessToolRole::Sudo => "sudo",
+        PosixProcessToolRole::Identity => "identity",
+        PosixProcessToolRole::Inventory => "inventory",
+        PosixProcessToolRole::Terminator => "terminator",
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("POSIX process authority role={role} predicate={predicate}"),
+    )
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct BoundPosixProcessAuthorities {
+    sudo: BoundPosixExecutableAuthority,
+    identity: BoundPosixExecutableAuthority,
+    inventory: BoundPosixExecutableAuthority,
+    terminator: BoundPosixExecutableAuthority,
+}
+
+#[cfg(unix)]
+impl BoundPosixProcessAuthorities {
+    fn new(authorities: PosixProcessAuthorities) -> std::io::Result<Self> {
+        Ok(Self {
+            sudo: BoundPosixExecutableAuthority::new(authorities.sudo)?,
+            identity: BoundPosixExecutableAuthority::new(authorities.identity)?,
+            inventory: BoundPosixExecutableAuthority::new(authorities.inventory)?,
+            terminator: BoundPosixExecutableAuthority::new(authorities.terminator)?,
+        })
+    }
+}
+
+/// Revalidates a complete POSIX process-authority bundle for external regression tests.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn verify_posix_process_authorities_for_integration(
+    authorities: PosixProcessAuthorities,
+) -> std::io::Result<()> {
+    BoundPosixProcessAuthorities::new(authorities).map(|_| ())
+}
+
+/// Revalidates a complete bundle and returns one exact logical invocation for external tests.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn revalidated_posix_process_invocation_for_integration(
+    authorities: PosixProcessAuthorities,
+    role: PosixProcessToolRole,
+) -> std::io::Result<PathBuf> {
+    let authorities = BoundPosixProcessAuthorities::new(authorities)?;
+    match role {
+        PosixProcessToolRole::Sudo => authorities.sudo.revalidate(),
+        PosixProcessToolRole::Identity => authorities.identity.revalidate(),
+        PosixProcessToolRole::Inventory => authorities.inventory.revalidate(),
+        PosixProcessToolRole::Terminator => authorities.terminator.revalidate(),
+    }
+}
+
+#[cfg(unix)]
 impl PosixCargoDenyAuthority {
     /// Binds the independently resolved source and exact protected staged copy.
     #[must_use]
@@ -1569,6 +3149,8 @@ pub struct BoundProgramInvocation {
     invocation_path: PathBuf,
     canonical_identity: PathBuf,
     file_identity: BoundProgramFileIdentity,
+    #[cfg(windows)]
+    invocation_parent_identity: Arc<same_file::Handle>,
 }
 
 #[cfg(unix)]
@@ -1581,7 +3163,10 @@ struct BoundProgramFileIdentity {
 #[cfg(windows)]
 #[derive(Clone)]
 struct BoundProgramFileIdentity {
-    _guard: Arc<fs::File>,
+    guard: Arc<same_file::Handle>,
+    parent_path: PathBuf,
+    parent_identity: Arc<same_file::Handle>,
+    length: u64,
     sha256: Digest,
 }
 
@@ -1590,6 +3175,8 @@ impl std::fmt::Debug for BoundProgramFileIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BoundProgramFileIdentity")
+            .field("parent_path", &self.parent_path)
+            .field("length", &self.length)
             .field("sha256", &self.sha256)
             .finish_non_exhaustive()
     }
@@ -1598,7 +3185,11 @@ impl std::fmt::Debug for BoundProgramFileIdentity {
 #[cfg(windows)]
 impl PartialEq for BoundProgramFileIdentity {
     fn eq(&self, other: &Self) -> bool {
-        self.sha256 == other.sha256
+        self.guard == other.guard
+            && self.parent_path == other.parent_path
+            && self.parent_identity == other.parent_identity
+            && self.length == other.length
+            && self.sha256 == other.sha256
     }
 }
 
@@ -1628,27 +3219,140 @@ impl BoundProgramFileIdentity {
     }
 
     #[cfg(windows)]
-    fn bind(path: &Path) -> std::io::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt as _;
+    fn bind_until(path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        use std::os::windows::fs::MetadataExt as _;
 
-        // Keep one read-only handle whose sharing contract permits only other
-        // readers. Windows therefore refuses writes, deletes, and same-path
-        // replacement for the complete cloned authority lifetime.
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        let guard = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(path)?;
-        if !guard.metadata()?.is_file() {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("bound program has no parent"))?
+            .to_path_buf();
+        let parent_metadata = fs::symlink_metadata(&parent_path)?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || fs::canonicalize(&parent_path)? != parent_path
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound program parent is not one canonical direct directory",
+            ));
+        }
+        let path_metadata = fs::symlink_metadata(path)?;
+        if !path_metadata.is_file()
+            || path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound program identity is not one direct file",
+            ));
+        }
+        let guard = windows_locked_same_file_handle(path)?;
+        let before = guard.as_file().metadata()?;
+        if !before.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "bound program identity is not a file",
             ));
         }
+        let sha256 = sha256_retained_windows_file_until(guard.as_file(), deadline)?;
+        let after = guard.as_file().metadata()?;
+        let rebound = same_file::Handle::from_path(path)?;
+        if before.len() != after.len() || rebound != guard {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bound program identity changed while hashing",
+            ));
+        }
         Ok(Self {
-            _guard: Arc::new(guard),
-            sha256: sha256_file(path)?,
+            guard: Arc::new(guard),
+            parent_identity: Arc::new(same_file::Handle::from_path(&parent_path)?),
+            parent_path,
+            length: after.len(),
+            sha256,
         })
+    }
+
+    #[cfg(windows)]
+    fn promote_until(
+        path: &Path,
+        retained_file: fs::File,
+        length: u64,
+        sha256: Digest,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "staged Windows toolchain receipt promotion exceeded its absolute deadline",
+            ));
+        }
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("promoted program has no parent"))?
+            .to_path_buf();
+        let parent_metadata = fs::symlink_metadata(&parent_path)?;
+        let path_metadata = fs::symlink_metadata(path)?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || fs::canonicalize(&parent_path)? != parent_path
+            || !path_metadata.is_file()
+            || path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "promoted Windows program is not one canonical direct file",
+            ));
+        }
+        let guard = same_file::Handle::from_file(retained_file)?;
+        let retained_metadata = guard.as_file().metadata()?;
+        if !retained_metadata.is_file()
+            || retained_metadata.len() != length
+            || path_metadata.len() != length
+            || same_file::Handle::from_path(path)? != guard
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "promoted Windows program retained identity changed",
+            ));
+        }
+        Ok(Self {
+            guard: Arc::new(guard),
+            parent_identity: Arc::new(same_file::Handle::from_path(&parent_path)?),
+            parent_path,
+            length,
+            sha256,
+        })
+    }
+
+    #[cfg(windows)]
+    fn revalidate(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("bound program has no parent"))?;
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        let path_metadata = fs::symlink_metadata(path)?;
+        if parent != self.parent_path
+            || !parent_metadata.is_dir()
+            || parent_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || fs::canonicalize(parent)? != self.parent_path
+            || same_file::Handle::from_path(parent)? != *self.parent_identity
+            || !path_metadata.is_file()
+            || path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || same_file::Handle::from_path(path)? != *self.guard
+            || self.guard.as_file().metadata()?.len() != self.length
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bound program retained file identity changed",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1669,11 +3373,83 @@ impl BoundProgramInvocation {
     /// not resolve to the expected file, the resolved target is not a file, or
     /// an exact platform file identity cannot be established.
     pub fn new(invocation_path: PathBuf, canonical_identity: PathBuf) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            return Self::new_until(
+                invocation_path,
+                canonical_identity,
+                windows_program_authority_acquisition_deadline()?,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let identity = Self {
+                invocation_path,
+                file_identity: BoundProgramFileIdentity::bind(&canonical_identity)?,
+                canonical_identity,
+            };
+            identity.revalidate(identity.invocation_path.as_os_str())?;
+            Ok(identity)
+        }
+    }
+
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn new_until(
+        invocation_path: PathBuf,
+        canonical_identity: PathBuf,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        let invocation_parent_identity = bind_windows_program_parent(&invocation_path)?;
         let identity = Self {
             invocation_path,
-            file_identity: BoundProgramFileIdentity::bind(&canonical_identity)?,
+            file_identity: BoundProgramFileIdentity::bind_until(&canonical_identity, deadline)?,
             canonical_identity,
+            invocation_parent_identity,
         };
+        identity.revalidate(identity.invocation_path.as_os_str())?;
+        Ok(identity)
+    }
+
+    /// Promotes an already-hashed retained Windows file into a program receipt.
+    ///
+    /// This constructor never reads file contents. The caller must supply the
+    /// digest produced while it retained the same no-write/no-delete file
+    /// authority.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn promote_windows_retained_file_until(
+        path: PathBuf,
+        retained_file: fs::File,
+        length: u64,
+        sha256: Digest,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "staged Windows toolchain receipt promotion exceeded its absolute deadline",
+            ));
+        }
+        let invocation_parent_identity = bind_windows_program_parent(&path)?;
+        let identity = Self {
+            invocation_path: path.clone(),
+            canonical_identity: path.clone(),
+            file_identity: BoundProgramFileIdentity::promote_until(
+                &path,
+                retained_file,
+                length,
+                sha256,
+                deadline,
+            )?,
+            invocation_parent_identity,
+        };
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "staged Windows toolchain receipt promotion exceeded its absolute deadline",
+            ));
+        }
         identity.revalidate(identity.invocation_path.as_os_str())?;
         Ok(identity)
     }
@@ -1694,7 +3470,26 @@ impl BoundProgramInvocation {
                 "bound program invocation identity changed",
             ));
         }
-        if BoundProgramFileIdentity::bind(&self.canonical_identity)? != self.file_identity {
+        #[cfg(windows)]
+        if same_file::Handle::from_path(invocation_parent)? != *self.invocation_parent_identity
+            || same_file::Handle::from_path(&self.invocation_path)? != *self.file_identity.guard
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bound program invocation parent identity changed",
+            ));
+        }
+        #[cfg(unix)]
+        let file_changed =
+            BoundProgramFileIdentity::bind(&self.canonical_identity)? != self.file_identity;
+        #[cfg(windows)]
+        let file_changed = self
+            .file_identity
+            .revalidate(&self.canonical_identity)
+            .is_err();
+        #[cfg(not(any(unix, windows)))]
+        let file_changed = true;
+        if file_changed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "bound program file identity changed",
@@ -1702,10 +3497,78 @@ impl BoundProgramInvocation {
         }
         Ok(self.invocation_path.clone())
     }
+
+    #[cfg(windows)]
+    fn sha256(&self) -> Digest {
+        self.file_identity.sha256
+    }
+
+    #[cfg(windows)]
+    fn length(&self) -> u64 {
+        self.file_identity.length
+    }
+
+    /// Returns the number of full byte-hash passes retained by this Windows authority.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn windows_hash_passes_for_integration(&self) -> usize {
+        1
+    }
+
+    /// Revalidates this exact Windows receipt without rereading executable bytes.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn windows_revalidate_for_integration(&self) -> std::io::Result<()> {
+        self.revalidate(self.invocation_path.as_os_str())
+            .map(|_| ())
+    }
 }
 
 thread_local! {
     static CANDIDATE_LAUNCH_POLICY: RefCell<Option<CandidateLaunchPolicy>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn resolve_standard_posix_process_authorities(
+    sudo: &Path,
+) -> std::io::Result<PosixProcessAuthorities> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let bind = |role, requested: &Path| -> std::io::Result<PosixExecutableAuthority> {
+        let canonical = fs::canonicalize(requested)?;
+        let parent = requested
+            .parent()
+            .ok_or_else(|| std::io::Error::other("POSIX process authority has no parent"))?;
+        let invocation = fs::canonicalize(parent)?.join(
+            requested
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("POSIX process authority has no name"))?,
+        );
+        let metadata = fs::metadata(&canonical)?;
+        Ok(PosixExecutableAuthority::new(
+            role,
+            invocation,
+            canonical,
+            PosixExecutableMetadata::new(
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+                metadata.len(),
+            ),
+        ))
+    };
+    PosixProcessAuthorities::new(
+        bind(PosixProcessToolRole::Sudo, sudo)?,
+        bind(PosixProcessToolRole::Identity, Path::new("/usr/bin/id"))?,
+        bind(PosixProcessToolRole::Inventory, Path::new("/bin/ps"))?,
+        bind(
+            PosixProcessToolRole::Terminator,
+            Path::new("/usr/bin/pkill"),
+        )?,
+    )
 }
 
 impl CandidateLaunchPolicy {
@@ -1716,13 +3579,44 @@ impl CandidateLaunchPolicy {
     ///
     /// Returns an error when a launcher path cannot be canonicalized or the
     /// supplied principal, group, or writable roots are not canonical.
-    #[cfg(unix)]
-    pub fn posix(
+    #[cfg(all(unix, test))]
+    fn posix(
         launcher: PathBuf,
         authorities: PosixLaunchAuthorities,
         identity: PosixCandidateIdentity,
         writable_roots: Vec<PathBuf>,
     ) -> std::io::Result<Self> {
+        let process = resolve_standard_posix_process_authorities(&launcher)?;
+        Self::posix_with_process_authorities(
+            launcher,
+            process,
+            authorities,
+            identity,
+            writable_roots,
+        )
+    }
+
+    /// Creates a POSIX policy from the complete parent-resolved process authority bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any process authority changes or the supplied
+    /// principal, group, or writable roots are not canonical.
+    #[cfg(unix)]
+    pub fn posix_with_process_authorities(
+        launcher: PathBuf,
+        mut process: PosixProcessAuthorities,
+        authorities: PosixLaunchAuthorities,
+        identity: PosixCandidateIdentity,
+        writable_roots: Vec<PathBuf>,
+    ) -> std::io::Result<Self> {
+        if process.sudo.invocation != launcher {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "POSIX launcher differs from its typed sudo authority",
+            ));
+        }
+        process.sudo.invocation = launcher;
         let PosixLaunchAuthorities {
             adapter,
             adapter_sha256,
@@ -1733,7 +3627,7 @@ impl CandidateLaunchPolicy {
             cargo_deny_authority,
             stack_authority,
         } = authorities;
-        let launcher = fs::canonicalize(launcher)?;
+        let process_authorities = Arc::new(BoundPosixProcessAuthorities::new(process)?);
         let adapter = fs::canonicalize(adapter)?;
         let adapter_identity = posix_adapter_identity(&adapter)?;
         verify_posix_adapter_identity(&adapter, &adapter, adapter_sha256, &adapter_identity)?;
@@ -1749,8 +3643,8 @@ impl CandidateLaunchPolicy {
         let PosixCandidateIdentity {
             principal,
             uid,
+            primary_gid,
             group_ids: candidate_group_ids,
-            group,
         } = identity;
         let candidate_group_ids: Arc<[u32]> = candidate_group_ids.into();
         let cargo_authority = BoundPosixCargoSourceAuthority::new(
@@ -1781,7 +3675,7 @@ impl CandidateLaunchPolicy {
             })
             .transpose()?;
         Ok(Self {
-            launcher,
+            process_authorities,
             adapter,
             adapter_sha256,
             adapter_identity,
@@ -1794,7 +3688,7 @@ impl CandidateLaunchPolicy {
             stack_authority,
             principal: principal.into(),
             uid,
-            group: group.into(),
+            primary_gid,
             writable_roots: writable_roots.into(),
         })
     }
@@ -1830,30 +3724,38 @@ impl CandidateLaunchPolicy {
     ) -> std::io::Result<Self> {
         let WindowsLaunchAuthorities {
             launcher,
-            launcher_sha256,
             restricted_adapter,
-            restricted_adapter_sha256,
             toolchain,
         } = authorities;
-        let launcher = fs::canonicalize(launcher)?;
-        verify_windows_launcher_identity(&launcher, &launcher, launcher_sha256)?;
-        let restricted_adapter = fs::canonicalize(restricted_adapter)?;
-        verify_windows_restricted_adapter_identity(
-            &restricted_adapter,
-            &restricted_adapter,
-            restricted_adapter_sha256,
-        )?;
-        if writable_roots.is_empty() || writable_roots.iter().any(|path| !path.is_absolute()) {
+        launcher.revalidate(launcher.invocation_path.as_os_str())?;
+        restricted_adapter.revalidate(restricted_adapter.invocation_path.as_os_str())?;
+        if writable_roots.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "candidate launch policy is not canonical",
             ));
         }
+        let writable_roots = writable_roots
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::symlink_metadata(&path)?;
+                let canonical = fs::canonicalize(&path)?;
+                if !path.is_absolute()
+                    || metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || canonical != path
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "candidate writable root is not one canonical direct directory",
+                    ));
+                }
+                Ok(path)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
         Ok(Self {
             launcher,
-            launcher_sha256,
             restricted_adapter,
-            restricted_adapter_sha256,
             toolchain,
             writable_roots: writable_roots.into(),
         })
@@ -1885,6 +3787,50 @@ impl CandidateLaunchPolicy {
     }
 
     #[cfg(unix)]
+    fn mapped_posix_rustc_request(
+        &self,
+        requested: &OsStr,
+        resolved: &Path,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let Some(authority) = self.cargo_authority.rustup() else {
+            return Ok(None);
+        };
+        authority
+            .request_is_bound_rustc(requested, resolved)?
+            .then(|| authority.staged_rustc())
+            .transpose()
+    }
+
+    #[cfg(unix)]
+    fn wrapped_posix_command(
+        &self,
+        invocation_name: OsString,
+        program: PathBuf,
+        arguments: Vec<OsString>,
+        directory: Option<PathBuf>,
+        environment: BTreeMap<OsString, OsString>,
+    ) -> std::io::Result<Command> {
+        let mut wrapped = Command::new(self.process_authorities.sudo.revalidate()?);
+        wrapped
+            .arg("-n")
+            .arg("-u")
+            .arg(self.principal.as_ref())
+            .arg("--")
+            .arg(&self.adapter)
+            .arg(POSIX_RELEASE_CHILD_REQUEST_V1)
+            .env_clear();
+        wrapped.arg(environment.len().to_string());
+        for (name, value) in environment {
+            wrapped.arg(name).arg(value);
+        }
+        wrapped.arg(invocation_name).arg(program).args(arguments);
+        if let Some(directory) = directory {
+            wrapped.current_dir(directory);
+        }
+        Ok(wrapped)
+    }
+
+    #[cfg(unix)]
     fn wrap(
         &self,
         command: &mut Command,
@@ -1910,6 +3856,8 @@ impl CandidateLaunchPolicy {
             .map(|authority| authority.mapped_request(command.get_program(), &resolved_program))
             .transpose()?
             .flatten();
+        let staged_rustc =
+            self.mapped_posix_rustc_request(command.get_program(), &resolved_program)?;
         let uses_staged_cargo_tools = staged_cargo || staged_cargo_deny.is_some();
         if uses_staged_cargo_tools {
             verify_posix_adapter_identity(
@@ -1926,16 +3874,24 @@ impl CandidateLaunchPolicy {
             staged.clone()
         } else if let Some((staged, _, _)) = &staged_stack {
             staged.clone()
-        } else if let Some(authority) = self.cargo_authority.rustup() {
-            if authority.request_is_bound_rustc(command.get_program(), &resolved_program)? {
-                authority.revalidate()?;
-                authority.compiler_mapping.staged.path.clone()
-            } else {
-                resolved_program
-            }
+        } else if let Some(staged) = staged_rustc {
+            staged
         } else {
             resolved_program
         };
+        let invocation_name = bound_program
+            .map_or_else(
+                || Path::new(command.get_program()),
+                |identity| identity.invocation_path.as_path(),
+            )
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "POSIX release child invocation name is absent",
+                )
+            })?
+            .to_owned();
         let arguments = posix_stack_arguments(
             command.get_args().map(OsString::from).collect(),
             staged_stack.as_ref().map(|(_, root, _)| root.as_path()),
@@ -1968,25 +3924,38 @@ impl CandidateLaunchPolicy {
                 .as_ref()
                 .map(|(_, cargo_home, _)| cargo_home.as_path()),
         )?;
-        let mut wrapped = Command::new(&self.launcher);
-        wrapped
-            .arg("-n")
-            .arg("-u")
-            .arg(self.principal.as_ref())
-            .arg("--")
-            .arg(&self.adapter)
-            .arg(POSIX_RELEASE_CHILD_REQUEST_V1)
-            .arg(environment.len().to_string())
-            .env_clear();
-        for (name, value) in environment {
-            wrapped.arg(name).arg(value);
-        }
-        wrapped.arg(program).args(arguments);
-        if let Some(directory) = directory {
-            wrapped.current_dir(directory);
-        }
-        *command = wrapped;
+        *command = self.wrapped_posix_command(
+            invocation_name,
+            program,
+            arguments,
+            directory,
+            environment,
+        )?;
         Ok(())
+    }
+
+    /// Applies the Windows restricted-launch environment without a separately
+    /// bound program identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a retained authority no longer validates.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn apply_unbound_windows_command(&self, command: &mut Command) -> std::io::Result<()> {
+        self.wrap(command, None)
+    }
+
+    /// Returns the one-time launcher and adapter hash-pass receipts used by Windows wrapping.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn windows_static_hash_passes_for_integration(&self) -> (usize, usize) {
+        (
+            self.launcher.windows_hash_passes_for_integration(),
+            self.restricted_adapter
+                .windows_hash_passes_for_integration(),
+        )
     }
 
     #[cfg(windows)]
@@ -1995,29 +3964,91 @@ impl CandidateLaunchPolicy {
         command: &mut Command,
         bound_program: Option<&BoundProgramInvocation>,
     ) -> std::io::Result<()> {
-        verify_windows_launcher_identity(&self.launcher, &self.launcher, self.launcher_sha256)?;
-        verify_windows_restricted_adapter_identity(
-            &self.restricted_adapter,
-            &self.restricted_adapter,
-            self.restricted_adapter_sha256,
-        )?;
+        self.wrap_with_control(
+            command,
+            bound_program,
+            windows_program_authority_acquisition_deadline()?,
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    fn wrap_with_control(
+        &self,
+        command: &mut Command,
+        bound_program: Option<&BoundProgramInvocation>,
+        deadline: Instant,
+    ) -> std::io::Result<WindowsLaunchControlAuthority> {
+        let launcher = self
+            .launcher
+            .revalidate(self.launcher.invocation_path.as_os_str())?;
+        let restricted_adapter = self
+            .restricted_adapter
+            .revalidate(self.restricted_adapter.invocation_path.as_os_str())?;
         let program = resolve_parent_program_for_launch(command.get_program(), bound_program)?;
         let mapped_program = self
             .toolchain
             .mapped_program(command.get_program(), &program)?;
-        let requires_trusted_path = mapped_program.is_some();
+        let requires_trusted_path = windows_program_requires_trusted_path(
+            command.get_program(),
+            &program,
+            mapped_program.is_some(),
+        );
+        let mapped_cargo = mapped_program.is_some()
+            && windows_executable_has_logical_name(program.as_os_str(), "cargo");
         let program = mapped_program.unwrap_or(program);
+        let git_inventory = program.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case(OsStr::new("git.exe"))
+                || name.eq_ignore_ascii_case(OsStr::new("git"))
+        }) && command
+            .get_args()
+            .eq([OsStr::new("ls-files"), OsStr::new("-z")]);
+        let program_authority = git_inventory
+            .then(|| {
+                BoundProgramInvocation::new_until(
+                    program.clone(),
+                    fs::canonicalize(&program)?,
+                    deadline,
+                )
+            })
+            .transpose()?;
+        let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let target_subcommand = if mapped_cargo {
+            windows_cargo_target_subcommand(&arguments)?
+        } else {
+            None
+        };
+        let (arguments, required_target) = if let Some(subcommand) = target_subcommand {
+            let [target] = self.writable_roots.as_ref() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "target-producing Windows Cargo requires one exact writable authority",
+                ));
+            };
+            (
+                windows_bound_cargo_arguments(arguments, subcommand, target)?,
+                Some(target.as_path()),
+            )
+        } else {
+            (arguments, None)
+        };
         let target_arguments = std::iter::once(program.as_os_str())
-            .chain(command.get_args())
+            .chain(arguments.iter().map(OsString::as_os_str))
             .map(OsString::from)
             .collect::<Vec<_>>();
-        let request = windows_restricted_launch_request(
-            &self.restricted_adapter,
-            self.restricted_adapter_sha256,
-            &target_arguments,
-        );
-        let encoded = encode_windows_argv(&request)?;
-        let directory = command.get_current_dir().map(Path::to_owned);
+        let directory = if let Some(requested) = command.get_current_dir() {
+            let metadata = fs::symlink_metadata(requested)?;
+            let canonical = fs::canonicalize(requested)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || canonical != requested {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows release child current directory is redirected",
+                ));
+            }
+            canonical
+        } else {
+            fs::canonicalize(std::env::current_dir()?)?
+        };
         let mut environment = command
             .get_envs()
             .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
@@ -2027,83 +4058,322 @@ impl CandidateLaunchPolicy {
             &mut environment,
             requires_trusted_path,
         )?;
-        let mut wrapped = Command::new(&self.launcher);
+        let environment = windows_release_child_environment(
+            environment,
+            &self.writable_roots,
+            required_target,
+            Some(&directory),
+        )?;
+        validate_windows_cargo_target_binding(&environment, &target_arguments)?;
+        let request = windows_restricted_launch_request_with_environment(
+            &restricted_adapter,
+            self.restricted_adapter.sha256(),
+            &directory,
+            &environment,
+            &target_arguments,
+        )?;
+        let encoded = encode_windows_argv(&request)?;
+        let request_sha256 = sha256_bytes(encoded.as_encoded_bytes());
+        let current_directory_identity = same_file::Handle::from_path(&directory)?;
+        let mut wrapped = Command::new(launcher);
         wrapped
             .arg("__release-restricted-child")
             .arg(encoded)
             .env_clear();
         for (name, value) in environment {
-            if let Some(value) = value {
-                wrapped.env(name, value);
-            }
+            wrapped.env(name, value);
         }
-        if let Some(directory) = directory {
-            wrapped.current_dir(directory);
-        }
+        wrapped.current_dir(&directory);
         *command = wrapped;
-        Ok(())
+        Ok(WindowsLaunchControlAuthority {
+            request_sha256,
+            program: program_authority,
+            current_directory: directory,
+            current_directory_identity,
+        })
     }
 
     #[cfg(unix)]
-    fn require_quiescence(&self) -> std::io::Result<()> {
+    fn require_quiescence(&self, deadline: Instant) -> std::io::Result<()> {
+        self.posix_quiescence_receipt_until(deadline).map(|_| ())
+    }
+
+    /// Revalidates the exact candidate identity and retains a no-live-process receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity, process authority, or bounded quiescence differs.
+    #[cfg(unix)]
+    pub fn posix_quiescence_receipt_until(
+        &self,
+        deadline: Instant,
+    ) -> std::io::Result<PosixCandidateQuiescenceReceipt> {
         let uid = self.uid.to_string();
-        for _ in 0..8 {
-            let _ = Command::new(&self.launcher)
-                .args(["-n", "--", "/usr/bin/pkill", "-KILL", "-U"])
-                .arg(&uid)
-                .status()?;
-            let output = Command::new("/bin/ps")
-                .args(["-U", uid.as_str(), "-o", "pid=,stat="])
-                .output()?;
-            if uid_process_snapshot_is_quiescent(
-                output.status.code(),
-                &output.stdout,
-                &output.stderr,
-            ) {
-                return Ok(());
+        wait_for_posix_uid_process_quiescence(
+            deadline,
+            PosixUidQuiescenceGoal::NoLiveProcesses,
+            || {
+                let program = self.process_authorities.inventory.revalidate()?;
+                let output = run_bounded_posix_authority_command(
+                    &program,
+                    &[
+                        OsString::from("-U"),
+                        OsString::from(&uid),
+                        OsString::from("-o"),
+                        OsString::from("pid=,ppid=,stat="),
+                    ],
+                    deadline,
+                )?;
+                parse_posix_uid_process_snapshot(
+                    output.status.code(),
+                    &output.stdout,
+                    &output.stderr,
+                )
+            },
+            || self.require_exact_signal_identity(deadline),
+            || {
+                let process_terminator = self.process_authorities.terminator.revalidate()?;
+                let launcher = self.process_authorities.sudo.revalidate()?;
+                let output = run_bounded_posix_authority_command(
+                    &launcher,
+                    &[
+                        OsString::from("-n"),
+                        OsString::from("--"),
+                        process_terminator.into_os_string(),
+                        OsString::from("-KILL"),
+                        OsString::from("-U"),
+                        OsString::from(&uid),
+                    ],
+                    deadline,
+                )?;
+                if !matches!(output.status.code(), Some(0 | 1)) || !output.stderr.is_empty() {
+                    return Err(std::io::Error::other(
+                        "candidate principal process cleanup did not succeed",
+                    ));
+                }
+                Ok(())
+            },
+        )?;
+        self.require_exact_signal_identity(deadline)?;
+        Ok(PosixCandidateQuiescenceReceipt {
+            principal: Arc::clone(&self.principal),
+            uid: self.uid,
+            primary_gid: self.primary_gid,
+        })
+    }
+
+    #[cfg(unix)]
+    fn require_exact_signal_identity(&self, deadline: Instant) -> std::io::Result<()> {
+        let identity_resolver = self.process_authorities.identity.revalidate()?;
+        for (option, expected, label) in [
+            ("-u", self.uid, "UID"),
+            ("-g", self.primary_gid, "primary GID"),
+        ] {
+            self.process_authorities.identity.revalidate()?;
+            let output = run_bounded_posix_authority_command(
+                &identity_resolver,
+                &[OsString::from(option), OsString::from(&*self.principal)],
+                deadline,
+            )?;
+            let mut exact = expected.to_string().into_bytes();
+            exact.push(b'\n');
+            if !output.status.success() || !output.stderr.is_empty() || output.stdout != exact {
+                return Err(std::io::Error::other(format!(
+                    "candidate principal {label} changed before process termination"
+                )));
             }
         }
-        Err(std::io::Error::other(
-            "candidate principal retained a process after the bounded UID sweep",
-        ))
+        Ok(())
     }
 
     #[cfg(not(unix))]
-    fn require_quiescence(&self) -> std::io::Result<()> {
+    fn require_quiescence(&self, _deadline: Instant) -> std::io::Result<()> {
         Ok(())
     }
 
     /// Grants the already-created sandbox to the exact candidate group.
     #[cfg(unix)]
     fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        if !path.is_absolute()
-            || !self
-                .writable_roots
-                .iter()
-                .any(|root| path.starts_with(root))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "candidate writable directory is outside the exact policy roots",
-            ));
-        }
-        let status = Command::new(&self.launcher)
-            .args(["-n", "--", "/usr/bin/chgrp"])
-            .arg(self.group.as_ref())
-            .arg(path)
-            .status()?;
-        if !status.success() {
-            return Err(std::io::Error::other("cannot bind candidate sandbox group"));
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o2770))
+        prepare_posix_writable_directory(
+            &self.process_authorities.sudo.revalidate()?,
+            self.primary_gid,
+            &self.writable_roots,
+            path,
+        )
     }
 
     #[cfg(not(unix))]
     fn prepare_writable_directory(&self, _path: &Path) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct PosixFixedConstructionTool {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl PosixFixedConstructionTool {
+    fn bind(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(path)?;
+        if fs::canonicalize(path)? != path
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixed POSIX construction tool is not a root-owned immutable executable",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if fs::canonicalize(&self.path)? != self.path
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixed POSIX construction tool identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn prepare_posix_writable_directory(
+    launcher: &Path,
+    candidate_group: u32,
+    writable_roots: &[PathBuf],
+    path: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let root = writable_roots
+        .iter()
+        .find(|root| path.starts_with(root.as_path()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "candidate writable directory is outside the exact policy roots",
+            )
+        })?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    let before = fs::symlink_metadata(path)?;
+    if !path.is_absolute()
+        || path == root
+        || fs::canonicalize(root)? != *root
+        || fs::canonicalize(path)? != path
+        || root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || before.file_type().is_symlink()
+        || !before.is_dir()
+        || before.dev() != root_metadata.dev()
+        || before.uid() != root_metadata.uid()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "candidate writable directory is redirected or has an untrusted owner identity",
+        ));
+    }
+    let owner_identity = (before.dev(), before.ino(), before.uid());
+    let chgrp = PosixFixedConstructionTool::bind(Path::new("/usr/bin/chgrp"))?;
+    #[cfg(target_os = "linux")]
+    let chmod_path = Path::new("/usr/bin/chmod");
+    #[cfg(not(target_os = "linux"))]
+    let chmod_path = Path::new("/bin/chmod");
+    let chmod = PosixFixedConstructionTool::bind(chmod_path)?;
+
+    chgrp.revalidate()?;
+    let status = Command::new(launcher)
+        .args(["-n", "--"])
+        .arg(&chgrp.path)
+        .arg(candidate_group.to_string())
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other("cannot bind candidate sandbox group"));
+    }
+    let grouped = fs::symlink_metadata(path)?;
+    if (grouped.dev(), grouped.ino(), grouped.uid()) != owner_identity
+        || grouped.gid() != candidate_group
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "candidate sandbox identity changed during group binding",
+        ));
+    }
+
+    chmod.revalidate()?;
+    let mut command = Command::new(launcher);
+    command.args(["-n", "--"]).arg(&chmod.path).arg("2770");
+    #[cfg(target_os = "linux")]
+    command.arg("--");
+    let status = command.arg(path).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(
+            "cannot establish candidate sandbox permissions",
+        ));
+    }
+    let after = fs::symlink_metadata(path)?;
+    if fs::canonicalize(path)? != path
+        || after.file_type().is_symlink()
+        || !after.is_dir()
+        || (after.dev(), after.ino(), after.uid()) != owner_identity
+        || after.gid() != candidate_group
+        || after.permissions().mode() & 0o7777 != 0o2770
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "candidate sandbox identity or permissions differ after construction",
+        ));
+    }
+    Ok(())
+}
+
+/// Exercises the production writable-directory construction seam.
+///
+/// # Errors
+///
+/// Returns an error unless the directory is canonically contained beneath the
+/// supplied root and is constructed with the exact candidate group and mode.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn prepare_posix_writable_directory_for_integration(
+    launcher: &Path,
+    candidate_group: u32,
+    writable_root: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    prepare_posix_writable_directory(
+        launcher,
+        candidate_group,
+        &[writable_root.to_path_buf()],
+        path,
+    )
 }
 
 #[cfg(unix)]
@@ -2184,6 +4454,28 @@ fn posix_release_child_environment(
     bound_cargo: Option<&Path>,
     cargo_home: Option<&Path>,
 ) -> std::io::Result<BTreeMap<OsString, OsString>> {
+    let bound_rustc = rustup_authority
+        .map(BoundPosixRustupAuthority::staged_rustc)
+        .transpose()?;
+    posix_release_child_environment_with_rustc(
+        environment,
+        rustup_authority,
+        bound_rustc.as_deref(),
+        child_tool_path,
+        bound_cargo,
+        cargo_home,
+    )
+}
+
+#[cfg(unix)]
+fn posix_release_child_environment_with_rustc(
+    environment: impl IntoIterator<Item = (OsString, Option<OsString>)>,
+    rustup_authority: Option<&BoundPosixRustupAuthority>,
+    bound_rustc: Option<&Path>,
+    child_tool_path: Option<&Path>,
+    bound_cargo: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> std::io::Result<BTreeMap<OsString, OsString>> {
     let mut encoded = BTreeMap::new();
     for (name, value) in environment {
         let Some(value) = value else {
@@ -2205,12 +4497,33 @@ fn posix_release_child_environment(
             ));
         }
     }
+    validate_posix_git_safe_directory_environment(&encoded)?;
+    if bound_rustc.is_some() && encoded.contains_key(OsStr::new("RUSTC")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX release child attempts to replace its bound Rust compiler",
+        ));
+    }
     if let Some(authority) = rustup_authority {
         encoded.insert(OsString::from("RUSTUP_HOME"), authority.home.clone().into());
         encoded.insert(
             OsString::from("RUSTUP_TOOLCHAIN"),
             authority.toolchain.clone(),
         );
+    }
+    if let Some(bound_rustc) = bound_rustc {
+        let metadata = fs::symlink_metadata(bound_rustc)?;
+        if !bound_rustc.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || fs::canonicalize(bound_rustc)? != bound_rustc
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound POSIX Rust compiler is not one canonical file",
+            ));
+        }
+        encoded.insert(OsString::from("RUSTC"), bound_rustc.as_os_str().to_owned());
     }
     if let Some(bound_cargo) = bound_cargo {
         encoded.insert(OsString::from("CARGO"), bound_cargo.as_os_str().to_owned());
@@ -2246,7 +4559,65 @@ fn posix_release_child_environment(
     Ok(encoded)
 }
 
-#[cfg(any(windows, test))]
+/// Exercises exact POSIX Rust compiler environment binding without invoking a shell.
+///
+/// # Errors
+///
+/// Returns an error when the compiler authority is absent or the environment
+/// attempts to replace the exact compiler or retain a compiler wrapper.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn bind_posix_rustc_environment_for_integration(
+    environment: Vec<(OsString, Option<OsString>)>,
+    bound_rustc: Option<&Path>,
+) -> std::io::Result<BTreeMap<OsString, OsString>> {
+    let bound_rustc = bound_rustc.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bound POSIX Rust compiler authority is absent",
+        )
+    })?;
+    posix_release_child_environment_with_rustc(
+        environment,
+        None,
+        Some(bound_rustc),
+        None,
+        None,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn validate_posix_git_safe_directory_environment(
+    environment: &BTreeMap<OsString, OsString>,
+) -> std::io::Result<()> {
+    let count = environment.get(OsStr::new("GIT_CONFIG_COUNT"));
+    let key = environment.get(OsStr::new("GIT_CONFIG_KEY_0"));
+    let value = environment.get(OsStr::new("GIT_CONFIG_VALUE_0"));
+    if count.is_none() && key.is_none() && value.is_none() {
+        return Ok(());
+    }
+    let (Some(count), Some(key), Some(value)) = (count, key, value) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX release child Git safe.directory environment is incomplete",
+        ));
+    };
+    let directory = Path::new(value);
+    if count != OsStr::new("1")
+        || key != OsStr::new("safe.directory")
+        || !directory.is_absolute()
+        || fs::canonicalize(directory).ok().as_deref() != Some(directory)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX release child Git safe.directory environment differs from policy",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
 fn windows_restricted_launch_request(
     restricted_adapter: &Path,
     restricted_adapter_sha256: Digest,
@@ -2258,6 +4629,592 @@ fn windows_restricted_launch_request(
         )))
         .chain(target_arguments.iter().cloned())
         .collect()
+}
+
+#[cfg(windows)]
+const WINDOWS_RELEASE_CHILD_REQUEST_V1: &str = "hell-windows-release-child-v1";
+
+#[cfg(windows)]
+const WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT: &[&str] = &[
+    "CARGO_INCREMENTAL",
+    "CARGO_TARGET_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "RUSTDOCFLAGS",
+    "SOURCE_DATE_EPOCH",
+];
+
+#[cfg(windows)]
+fn windows_release_child_environment_name_allowed(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
+        .iter()
+        .chain(WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT)
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+#[cfg(windows)]
+fn windows_cargo_target_argument(argument: &OsStr) -> bool {
+    argument == OsStr::new("--target-dir")
+        || argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--target-dir="))
+            .is_some()
+}
+
+#[cfg(windows)]
+fn windows_cargo_target_subcommand_name(argument: &OsStr) -> bool {
+    [
+        "bench", "build", "check", "clippy", "doc", "fix", "run", "rustc", "rustdoc", "test",
+    ]
+    .iter()
+    .any(|subcommand| argument == OsStr::new(subcommand))
+}
+
+#[cfg(windows)]
+fn windows_cargo_target_subcommand(arguments: &[OsString]) -> std::io::Result<Option<usize>> {
+    if arguments
+        .iter()
+        .any(|argument| windows_cargo_target_argument(argument))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows Cargo request attempts to replace its target authority",
+        ));
+    }
+    Ok(arguments
+        .first()
+        .is_some_and(|argument| windows_cargo_target_subcommand_name(argument))
+        .then_some(0))
+}
+
+#[cfg(windows)]
+fn windows_bound_cargo_arguments(
+    mut arguments: Vec<OsString>,
+    subcommand: usize,
+    target: &Path,
+) -> std::io::Result<Vec<OsString>> {
+    if windows_cargo_target_subcommand(&arguments)? != Some(subcommand) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo request has no supported target-producing subcommand",
+        ));
+    }
+    let option = subcommand
+        .checked_add(1)
+        .expect("bounded Cargo subcommand position cannot overflow");
+    arguments.splice(
+        option..option,
+        [
+            OsString::from("--target-dir"),
+            target.as_os_str().to_owned(),
+        ],
+    );
+    Ok(arguments)
+}
+
+#[cfg(windows)]
+fn windows_release_child_environment(
+    environment: Vec<(OsString, Option<OsString>)>,
+    writable_roots: &[PathBuf],
+    required_target: Option<&Path>,
+    safe_directory: Option<&Path>,
+) -> std::io::Result<Vec<(OsString, OsString)>> {
+    let mut retained = Vec::new();
+    let mut names = BTreeSet::new();
+    for (name, value) in environment {
+        let Some(value) = value else {
+            continue;
+        };
+        let Some(name_text) = name.to_str() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows release child environment name is not UTF-8",
+            ));
+        };
+        if name_text.contains('=') || !windows_release_child_environment_name_allowed(&name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows release child environment name is not allowed",
+            ));
+        }
+        if !names.insert(name_text.to_ascii_uppercase()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows release child environment name is duplicated",
+            ));
+        }
+        retained.push((name, value));
+    }
+    let entry_limit = RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
+        .len()
+        .checked_add(WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT.len())
+        .expect("fixed Windows environment limit cannot overflow");
+    if retained.len() > entry_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child environment exceeds its entry bound",
+        ));
+    }
+    let configured_target = retained
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")));
+    if configured_target.is_none()
+        && let Some(target) = required_target
+    {
+        retained.push((
+            OsString::from("CARGO_TARGET_DIR"),
+            target.as_os_str().to_owned(),
+        ));
+    }
+    if let Some((_, target)) = retained
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+    {
+        let target = Path::new(target);
+        let metadata = fs::symlink_metadata(target)?;
+        let canonical = fs::canonicalize(target)?;
+        if !target.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || canonical != target
+            || (!writable_roots.is_empty() && !writable_roots.iter().any(|root| root == target))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows Cargo target environment differs from its writable authority",
+            ));
+        }
+    }
+    validate_windows_git_safe_directory_environment(&retained, safe_directory)?;
+    retained.sort_by(|(left, _), (right, _)| {
+        left.to_string_lossy()
+            .to_ascii_uppercase()
+            .cmp(&right.to_string_lossy().to_ascii_uppercase())
+    });
+    Ok(retained)
+}
+
+#[cfg(windows)]
+fn validate_windows_git_safe_directory_environment(
+    environment: &[(OsString, OsString)],
+    safe_directory: Option<&Path>,
+) -> std::io::Result<()> {
+    let find = |expected: &str| {
+        environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new(expected)))
+            .map(|(_, value)| value)
+    };
+    let count = find("GIT_CONFIG_COUNT");
+    let key = find("GIT_CONFIG_KEY_0");
+    let value = find("GIT_CONFIG_VALUE_0");
+    if count.is_none() && key.is_none() && value.is_none() {
+        return Ok(());
+    }
+    let (Some(count), Some(key), Some(value), Some(safe_directory)) =
+        (count, key, value, safe_directory)
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child Git safe.directory environment is incomplete",
+        ));
+    };
+    if count != OsStr::new("1")
+        || key != OsStr::new("safe.directory")
+        || Path::new(value) != safe_directory
+        || !safe_directory.is_absolute()
+        || fs::canonicalize(safe_directory).ok().as_deref() != Some(safe_directory)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child Git safe.directory environment differs from policy",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_release_child_request_fields(
+    current_directory: &Path,
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<Vec<OsString>> {
+    let metadata = fs::symlink_metadata(current_directory)?;
+    if !current_directory.is_absolute()
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(current_directory)? != current_directory
+        || target_arguments.is_empty()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child current directory or target argv differs from policy",
+        ));
+    }
+    let mut fields = Vec::with_capacity(3 + environment.len() * 2 + target_arguments.len());
+    fields.push(OsString::from(WINDOWS_RELEASE_CHILD_REQUEST_V1));
+    fields.push(current_directory.as_os_str().to_owned());
+    fields.push(OsString::from(environment.len().to_string()));
+    for (name, value) in environment {
+        fields.push(name.clone());
+        fields.push(value.clone());
+    }
+    fields.extend(target_arguments.iter().cloned());
+    Ok(fields)
+}
+
+/// Builds one canonical restricted-child wire request for external lifecycle coverage.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_release_child_request_fields_for_integration(
+    current_directory: &Path,
+    environment: Vec<(OsString, OsString)>,
+    target_arguments: &[OsString],
+) -> std::io::Result<Vec<OsString>> {
+    let environment = windows_release_child_environment(
+        environment
+            .into_iter()
+            .map(|(name, value)| (name, Some(value)))
+            .collect(),
+        &[],
+        None,
+        None,
+    )?;
+    windows_release_child_request_fields(current_directory, &environment, target_arguments)
+}
+
+/// Builds a canonical restricted-child request with one exact writable Cargo target.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_nightly_child_request_fields_for_integration(
+    current_directory: &Path,
+    environment: Vec<(OsString, OsString)>,
+    target_arguments: &[OsString],
+    writable_target: &Path,
+) -> std::io::Result<Vec<OsString>> {
+    let metadata = fs::symlink_metadata(writable_target)?;
+    if !writable_target.is_absolute()
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(writable_target)? != writable_target
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Nightly writable target is not one canonical directory",
+        ));
+    }
+    let mut target_arguments = target_arguments.to_vec();
+    let target_is_cargo = target_arguments
+        .first()
+        .is_some_and(|program| windows_executable_has_logical_name(program.as_os_str(), "cargo"));
+    if target_is_cargo {
+        let program = target_arguments.remove(0);
+        let subcommand = windows_cargo_target_subcommand(&target_arguments)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows Nightly Cargo request has no target-producing subcommand",
+            )
+        })?;
+        target_arguments =
+            windows_bound_cargo_arguments(target_arguments, subcommand, writable_target)?;
+        target_arguments.insert(0, program);
+    }
+    let environment = windows_release_child_environment(
+        environment
+            .into_iter()
+            .map(|(name, value)| (name, Some(value)))
+            .collect(),
+        &[writable_target.to_path_buf()],
+        target_is_cargo.then_some(writable_target),
+        None,
+    )?;
+    windows_release_child_request_fields(current_directory, &environment, &target_arguments)
+}
+
+#[cfg(windows)]
+fn windows_restricted_launch_request_with_environment(
+    restricted_adapter: &Path,
+    restricted_adapter_sha256: Digest,
+    current_directory: &Path,
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<Vec<OsString>> {
+    let mut request = Vec::new();
+    request.push(restricted_adapter.as_os_str().to_owned());
+    request.push(OsString::from(restricted_adapter_sha256.hex()));
+    request.extend(windows_release_child_request_fields(
+        current_directory,
+        environment,
+        target_arguments,
+    )?);
+    Ok(request)
+}
+
+#[cfg(windows)]
+fn validate_windows_cargo_target_binding(
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<bool> {
+    let target_is_cargo = target_arguments
+        .first()
+        .is_some_and(|program| windows_executable_has_logical_name(program.as_os_str(), "cargo"));
+    if !target_is_cargo {
+        return Ok(false);
+    }
+    let configured_target = environment
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+        .map(|(_, value)| Path::new(value));
+    let target_subcommand = target_arguments
+        .get(1)
+        .is_some_and(|argument| windows_cargo_target_subcommand_name(argument));
+    let explicit_target = match (target_subcommand, target_arguments) {
+        (true, [_, _, option, target, remaining @ ..])
+            if option == OsStr::new("--target-dir")
+                && !remaining
+                    .iter()
+                    .any(|argument| windows_cargo_target_argument(argument)) =>
+        {
+            Some(Path::new(target))
+        }
+        (true, _) => None,
+        (false, _) => {
+            if configured_target.is_some()
+                || target_arguments
+                    .iter()
+                    .skip(1)
+                    .any(|argument| windows_cargo_target_argument(argument))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "target-free Windows Cargo request retains a target authority",
+                ));
+            }
+            return Ok(false);
+        }
+    };
+    if explicit_target.is_none() || explicit_target != configured_target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo argv target differs from its environment authority",
+        ));
+    }
+    Ok(true)
+}
+
+/// One decoded, closed Windows release-child request.
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsReleaseChildRequest {
+    current_directory: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+    target_arguments: Vec<OsString>,
+}
+
+#[cfg(windows)]
+impl WindowsReleaseChildRequest {
+    /// Returns the exact canonical current directory.
+    #[must_use]
+    pub fn current_directory(&self) -> &Path {
+        &self.current_directory
+    }
+
+    /// Returns the approved environment entries.
+    #[must_use]
+    pub fn environment(&self) -> &[(OsString, OsString)] {
+        &self.environment
+    }
+
+    /// Returns the exact target argv.
+    #[must_use]
+    pub fn target_arguments(&self) -> &[OsString] {
+        &self.target_arguments
+    }
+
+    /// Returns the exact target directory for a Cargo release build request.
+    #[must_use]
+    pub fn cargo_release_target(&self) -> Option<&Path> {
+        let [
+            program,
+            subcommand,
+            target_option,
+            target,
+            release,
+            locked,
+            package_option,
+            package,
+            binary_option,
+            binary,
+            features_option,
+            features,
+        ] = self.target_arguments.as_slice()
+        else {
+            return None;
+        };
+        let program_path = Path::new(program);
+        let program_metadata = fs::symlink_metadata(program_path).ok()?;
+        if !program_path.is_absolute()
+            || program_metadata.file_type().is_symlink()
+            || !program_metadata.is_file()
+            || fs::canonicalize(program_path).ok()? != program_path
+            || !windows_executable_has_logical_name(program, "cargo")
+            || subcommand != OsStr::new("build")
+            || target_option != OsStr::new("--target-dir")
+            || release != OsStr::new("--release")
+            || locked != OsStr::new("--locked")
+            || package_option != OsStr::new("--package")
+            || package != OsStr::new("hell-cli")
+            || binary_option != OsStr::new("--bin")
+            || binary != OsStr::new("hell")
+            || features_option != OsStr::new("--features")
+            || features != OsStr::new("compat-tracing")
+        {
+            return None;
+        }
+        let configured = self
+            .environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+            .map(|(_, value)| Path::new(value))?;
+        (configured == Path::new(target)).then_some(configured)
+    }
+
+    /// Splits the request into its exact environment and argv.
+    #[must_use]
+    pub fn into_parts(self) -> (PathBuf, Vec<(OsString, OsString)>, Vec<OsString>) {
+        (
+            self.current_directory,
+            self.environment,
+            self.target_arguments,
+        )
+    }
+
+    /// Recreates the bounded wire fields after trusted decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained target argv is empty.
+    pub fn fields(&self) -> std::io::Result<Vec<OsString>> {
+        windows_release_child_request_fields(
+            &self.current_directory,
+            &self.environment,
+            &self.target_arguments,
+        )
+    }
+}
+
+/// Parses and validates a closed Windows release-child request.
+///
+/// # Errors
+///
+/// Returns an error for a version mismatch, malformed environment count,
+/// disallowed or duplicate environment name, redirected Cargo target, or empty argv.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn parse_windows_release_child_request(
+    fields: Vec<OsString>,
+) -> std::io::Result<WindowsReleaseChildRequest> {
+    let mut fields = fields.into_iter();
+    if fields.next().as_deref() != Some(OsStr::new(WINDOWS_RELEASE_CHILD_REQUEST_V1)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child request version differs",
+        ));
+    }
+    let current_directory = PathBuf::from(fields.next().ok_or_else(|| {
+        std::io::Error::other("Windows release child current directory is absent")
+    })?);
+    let directory_metadata = fs::symlink_metadata(&current_directory)?;
+    if !current_directory.is_absolute()
+        || directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || fs::canonicalize(&current_directory)? != current_directory
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child current directory is redirected",
+        ));
+    }
+    let count_text = fields
+        .next()
+        .ok_or_else(|| std::io::Error::other("Windows release child environment count is absent"))?
+        .into_string()
+        .map_err(|_| {
+            std::io::Error::other("Windows release child environment count is not UTF-8")
+        })?;
+    let count = count_text.parse::<usize>().map_err(|_| {
+        std::io::Error::other("Windows release child environment count is malformed")
+    })?;
+    let entry_limit = RELEASE_CHILD_ENVIRONMENT_ALLOWLIST
+        .len()
+        .checked_add(WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT.len())
+        .expect("fixed Windows environment limit cannot overflow");
+    if count_text != count.to_string() || count > entry_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child environment count is noncanonical or exceeds its entry bound",
+        ));
+    }
+    let mut environment = Vec::with_capacity(count);
+    let mut previous_name = None::<String>;
+    for _ in 0..count {
+        let name = fields.next().ok_or_else(|| {
+            std::io::Error::other("Windows release child environment name is absent")
+        })?;
+        let value = fields.next().ok_or_else(|| {
+            std::io::Error::other("Windows release child environment value is absent")
+        })?;
+        let canonical_name = name
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::other("Windows release child environment name is not UTF-8")
+            })?
+            .to_ascii_uppercase();
+        if previous_name
+            .as_ref()
+            .is_some_and(|previous| previous >= &canonical_name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows release child environment order is noncanonical",
+            ));
+        }
+        previous_name = Some(canonical_name);
+        environment.push((name, Some(value)));
+    }
+    let environment =
+        windows_release_child_environment(environment, &[], None, Some(&current_directory))?;
+    let target_arguments = fields.collect::<Vec<_>>();
+    let has_target = environment
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")));
+    let has_release_epoch = environment
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("SOURCE_DATE_EPOCH")));
+    let has_bound_cargo_target =
+        validate_windows_cargo_target_binding(&environment, &target_arguments)?;
+    if (has_bound_cargo_target || has_release_epoch) && !has_target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child target and epoch bindings are incomplete",
+        ));
+    }
+    if target_arguments.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child target argv is empty",
+        ));
+    }
+    Ok(WindowsReleaseChildRequest {
+        current_directory,
+        environment,
+        target_arguments,
+    })
 }
 
 #[cfg(unix)]
@@ -3578,6 +6535,17 @@ impl BoundPosixRustupAuthority {
         if requested.file_name() != Some(OsStr::new("rustc")) {
             return Ok(false);
         }
+        let staged = &self.compiler_mapping.staged.path;
+        if requested == staged {
+            self.revalidate()?;
+            if resolved != staged || fs::canonicalize(resolved)? != *staged {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "staged Rust compiler authority changed before spawn",
+                ));
+            }
+            return Ok(true);
+        }
         if requested.components().count() != 1 && requested != self.rustc_authority.invocation() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3594,6 +6562,11 @@ impl BoundPosixRustupAuthority {
             ));
         }
         Ok(true)
+    }
+
+    fn staged_rustc(&self) -> std::io::Result<PathBuf> {
+        self.revalidate()?;
+        Ok(self.compiler_mapping.staged.path.clone())
     }
 
     fn selected_tool_bin(&self) -> std::io::Result<PathBuf> {
@@ -4105,7 +7078,7 @@ fn verify_posix_adapter_identity(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(all(test, not(windows)))]
 fn verify_windows_launcher_identity(
     path: &Path,
     expected_canonical_path: &Path,
@@ -4133,7 +7106,7 @@ fn verify_windows_launcher_identity(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(all(test, not(windows)))]
 fn verify_windows_restricted_adapter_identity(
     path: &Path,
     expected_canonical_path: &Path,
@@ -4150,31 +7123,289 @@ fn verify_windows_restricted_adapter_identity(
 }
 
 #[cfg(unix)]
-fn uid_process_snapshot_is_quiescent(status: Option<i32>, snapshot: &[u8], stderr: &[u8]) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixUidProcessState {
+    Live,
+    Zombie,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixUidProcess {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub state: PosixUidProcessState,
+    pub raw_state: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixUidQuiescenceGoal {
+    NoLiveProcesses,
+    Empty,
+}
+
+/// Exact candidate identity retained after a bounded no-live-process observation.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixCandidateQuiescenceReceipt {
+    principal: Arc<str>,
+    uid: u32,
+    primary_gid: u32,
+}
+
+#[cfg(unix)]
+impl PosixCandidateQuiescenceReceipt {
+    /// Returns the exact principal name observed by this receipt.
+    #[must_use]
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// Returns whether this receipt authorizes cleanup for the exact principal identity.
+    #[must_use]
+    pub fn matches_numeric_identity(&self, uid: u32, primary_gid: u32) -> bool {
+        self.uid == uid && self.primary_gid == primary_gid
+    }
+}
+
+/// Verifies exact and mismatched opaque quiescence-receipt identity binding.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn verify_posix_candidate_quiescence_receipt_binding_for_integration() -> std::io::Result<()> {
+    let receipt = PosixCandidateQuiescenceReceipt {
+        principal: Arc::from("candidate-receipt-verifier"),
+        uid: 41_001,
+        primary_gid: 41_002,
+    };
+    if receipt.principal() != "candidate-receipt-verifier"
+        || !receipt.matches_numeric_identity(41_001, 41_002)
+        || receipt.matches_numeric_identity(41_003, 41_002)
+        || receipt.matches_numeric_identity(41_001, 41_004)
+    {
+        return Err(std::io::Error::other(
+            "POSIX candidate quiescence receipt binding is not exact",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct BoundedPosixAuthorityOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn run_bounded_posix_authority_command(
+    program: &Path,
+    arguments: &[OsString],
+    deadline: Instant,
+) -> std::io::Result<BoundedPosixAuthorityOutput> {
+    const CLEANUP_RESERVE: Duration = Duration::from_secs(1);
+    let execution_deadline = deadline.checked_sub(CLEANUP_RESERVE).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "process authority command has no cleanup reserve",
+        )
+    })?;
+    if Instant::now() >= execution_deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "process authority command execution reserve expired before launch",
+        ));
+    }
+    let mut command = Command::new(program);
+    command.args(arguments);
+    let output = without_candidate_launch_policy(|| {
+        run_supervised_command_until(&mut command, &[], execution_deadline, deadline, None)
+    })?;
+    if output.timed_out || output.stdout.truncated || output.stderr.truncated {
+        return Err(std::io::Error::other(
+            "process authority command did not complete within its capture bound",
+        ));
+    }
+    Ok(BoundedPosixAuthorityOutput {
+        status: output.status,
+        stdout: output.stdout.complete.unwrap_or_default(),
+        stderr: output.stderr.complete.unwrap_or_default(),
+    })
+}
+
+#[cfg(unix)]
+fn without_candidate_launch_policy<T>(operation: impl FnOnce() -> T) -> T {
+    CANDIDATE_LAUNCH_POLICY.with(|slot| {
+        struct Restore<'a> {
+            slot: &'a RefCell<Option<CandidateLaunchPolicy>>,
+            previous: Option<CandidateLaunchPolicy>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.replace(self.previous.take());
+            }
+        }
+        let previous = slot.replace(None);
+        let _restore = Restore { slot, previous };
+        operation()
+    })
+}
+
+#[cfg(unix)]
+fn parse_posix_process_id(field: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(field).ok()?;
+    let value = text.parse::<u32>().ok()?;
+    (value != 0 && value.to_string() == text).then_some(value)
+}
+
+#[cfg(unix)]
+/// Parses an exact `ps` inventory for one candidate UID.
+///
+/// # Errors
+///
+/// Returns an error when the command status, stderr, row shape, process IDs,
+/// process state, or inventory size is not canonical and bounded.
+pub fn parse_posix_uid_process_snapshot(
+    status: Option<i32>,
+    snapshot: &[u8],
+    stderr: &[u8],
+) -> std::io::Result<Vec<PosixUidProcess>> {
+    const ENTRY_LIMIT: usize = 4_096;
+
+    if !stderr.is_empty() || !matches!(status, Some(0 | 1)) {
+        return Err(std::io::Error::other(
+            "candidate process inventory query failed",
+        ));
+    }
     if status == Some(1) {
-        return snapshot.is_empty() && stderr.is_empty();
+        if snapshot.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(std::io::Error::other(
+            "candidate process inventory absence was not exact",
+        ));
     }
-    if status != Some(0) || !stderr.is_empty() {
-        return false;
-    }
-    snapshot.split(|byte| *byte == b'\n').all(|line| {
+    let mut processes = Vec::new();
+    let mut observed_pids = BTreeSet::new();
+    for line in snapshot.split(|byte| *byte == b'\n') {
         let mut fields = line
             .split(u8::is_ascii_whitespace)
             .filter(|field| !field.is_empty());
         let Some(pid) = fields.next() else {
-            return true;
+            continue;
         };
-        let Some(state) = fields.next() else {
-            return false;
+        let parent_pid = fields.next().ok_or_else(|| {
+            std::io::Error::other("candidate process inventory row has no parent PID")
+        })?;
+        let raw_state = fields
+            .next()
+            .ok_or_else(|| std::io::Error::other("candidate process inventory row has no state"))?;
+        if fields.next().is_some() {
+            return Err(std::io::Error::other(
+                "candidate process inventory row has trailing fields",
+            ));
+        }
+        let pid = parse_posix_process_id(pid)
+            .ok_or_else(|| std::io::Error::other("candidate process PID is not canonical"))?;
+        if !observed_pids.insert(pid) {
+            return Err(std::io::Error::other(
+                "candidate process inventory contains a duplicate PID",
+            ));
+        }
+        let parent_pid = parse_posix_process_id(parent_pid).ok_or_else(|| {
+            std::io::Error::other("candidate process parent PID is not canonical")
+        })?;
+        let Some(first_state) = raw_state.first() else {
+            return Err(std::io::Error::other("candidate process state is empty"));
         };
-        fields.next().is_none()
-            && pid.iter().all(u8::is_ascii_digit)
-            && pid.iter().any(|byte| *byte != b'0')
-            && state.first() == Some(&b'Z')
-            && state[1..]
+        if !first_state.is_ascii_alphabetic()
+            || !raw_state[1..]
                 .iter()
                 .all(|byte| matches!(byte, b'<' | b'N' | b'L' | b's' | b'l' | b'+'))
-    })
+        {
+            return Err(std::io::Error::other(
+                "candidate process state is not canonical",
+            ));
+        }
+        processes.push(PosixUidProcess {
+            pid,
+            parent_pid,
+            state: if *first_state == b'Z' {
+                PosixUidProcessState::Zombie
+            } else {
+                PosixUidProcessState::Live
+            },
+            raw_state: std::str::from_utf8(raw_state)
+                .map_err(|_| std::io::Error::other("candidate process state is not UTF-8"))?
+                .to_owned(),
+        });
+        if processes.len() > ENTRY_LIMIT {
+            return Err(std::io::Error::other(
+                "candidate process inventory exceeds its entry bound",
+            ));
+        }
+    }
+    Ok(processes)
+}
+
+#[cfg(unix)]
+fn posix_uid_process_diagnostic(processes: &[PosixUidProcess]) -> String {
+    const RETAINED_ENTRY_LIMIT: usize = 32;
+
+    let retained = processes
+        .iter()
+        .take(RETAINED_ENTRY_LIMIT)
+        .map(|process| {
+            format!(
+                "pid={},ppid={},state={}",
+                process.pid, process.parent_pid, process.raw_state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!("count={};retained={retained}", processes.len())
+}
+
+#[cfg(unix)]
+/// Waits for the requested candidate-UID quiescence state until `deadline`.
+///
+/// # Errors
+///
+/// Returns an error when observation or termination fails, or when the
+/// requested state is not reached before the monotonic deadline.
+pub fn wait_for_posix_uid_process_quiescence(
+    deadline: Instant,
+    goal: PosixUidQuiescenceGoal,
+    mut observe: impl FnMut() -> std::io::Result<Vec<PosixUidProcess>>,
+    mut authorize_signal: impl FnMut() -> std::io::Result<()>,
+    mut terminate_live: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<Vec<PosixUidProcess>> {
+    let mut signaled = BTreeSet::new();
+    loop {
+        let processes = observe()?;
+        let live = processes
+            .iter()
+            .filter(|process| process.state == PosixUidProcessState::Live)
+            .collect::<Vec<_>>();
+        if live.is_empty()
+            && (goal == PosixUidQuiescenceGoal::NoLiveProcesses || processes.is_empty())
+        {
+            return Ok(processes);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "candidate process quiescence deadline expired: {}",
+                posix_uid_process_diagnostic(&processes)
+            )));
+        }
+        if live.iter().any(|process| !signaled.contains(&process.pid)) {
+            authorize_signal()?;
+            terminate_live()?;
+            signaled.extend(live.into_iter().map(|process| process.pid));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -4260,6 +7491,21 @@ fn bounded_windows_path_debug(path: &Path) -> String {
     }
 }
 
+fn bounded_windows_diagnostic_detail(detail: &str) -> String {
+    const LIMIT: usize = 1_024;
+
+    let rendered = format!("\"{}\"", detail.escape_debug());
+    if rendered.len() <= LIMIT {
+        rendered
+    } else {
+        let split = (0..=LIMIT)
+            .rev()
+            .find(|index| rendered.is_char_boundary(*index))
+            .expect("zero is a UTF-8 boundary");
+        format!("{}<truncated:{}>", &rendered[..split], rendered.len())
+    }
+}
+
 /// Captures bounded prelaunch evidence for the exact Windows argv target.
 ///
 /// This report is diagnostic-only: failures are encoded in the returned text
@@ -4267,83 +7513,493 @@ fn bounded_windows_path_debug(path: &Path) -> String {
 #[doc(hidden)]
 #[must_use]
 pub fn windows_argv_target_prelaunch_diagnostic(program: &Path) -> String {
-    const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-    const MAX_DLL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    const MAX_DLLS: usize = 128;
+    let deadline = Instant::now()
+        .checked_add(WINDOWS_PRELAUNCH_DIAGNOSTIC_BUDGET)
+        .unwrap_or_else(Instant::now);
+    windows_argv_target_prelaunch_diagnostic_until(program, deadline)
+        .rendered
+        .clone()
+}
 
-    let program_text = bounded_windows_path_debug(program);
-    let result = (|| -> std::io::Result<String> {
-        let metadata = fs::symlink_metadata(program)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() > MAX_FILE_BYTES
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "target is not one bounded direct file",
+const WINDOWS_PRELAUNCH_DIAGNOSTIC_BUDGET: Duration = Duration::from_secs(1);
+#[doc(hidden)]
+pub const WINDOWS_PRELAUNCH_DIRECTORY_ENTRY_LIMIT: usize = 1_024;
+#[doc(hidden)]
+pub const WINDOWS_PRELAUNCH_DLL_LIMIT: usize = 128;
+#[doc(hidden)]
+pub const WINDOWS_PRELAUNCH_FILE_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
+#[doc(hidden)]
+pub const WINDOWS_PRELAUNCH_DLL_BYTE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+const WINDOWS_PRELAUNCH_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// One bounded phase in the optional Windows target diagnostic.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPrelaunchDiagnosticPhase {
+    ProgramMetadata,
+    DirectoryEnumeration,
+    DllMetadata,
+    DllHash,
+    ProgramHash,
+}
+
+impl WindowsPrelaunchDiagnosticPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProgramMetadata => "program-metadata",
+            Self::DirectoryEnumeration => "directory-enumeration",
+            Self::DllMetadata => "dll-metadata",
+            Self::DllHash => "dll-hash",
+            Self::ProgramHash => "program-hash",
+        }
+    }
+}
+
+/// Typed reason that optional Windows prelaunch evidence is incomplete.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPrelaunchDiagnosticReason {
+    Deadline,
+    Io(std::io::ErrorKind),
+    DirectoryEntryLimit,
+    DllEntryLimit,
+    FileByteLimit,
+    DllByteLimit,
+    FileChanged,
+}
+
+/// Typed completion state for optional Windows prelaunch evidence.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPrelaunchDiagnosticOutcome {
+    Complete,
+    Unavailable {
+        phase: WindowsPrelaunchDiagnosticPhase,
+        reason: WindowsPrelaunchDiagnosticReason,
+    },
+}
+
+/// Bounded receipt for optional Windows target diagnostics.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPrelaunchDiagnosticReceipt {
+    pub outcome: WindowsPrelaunchDiagnosticOutcome,
+    pub directory_entries: usize,
+    pub dll_count: usize,
+    pub dll_bytes: u64,
+    pub hashed_dlls: usize,
+    pub hashed_bytes: u64,
+    pub program_hashed: bool,
+    pub program_reused: bool,
+    rendered: String,
+}
+
+impl WindowsPrelaunchDiagnosticReceipt {
+    /// Returns the bounded durable diagnostic attached to supervision output.
+    #[must_use]
+    pub fn rendered(&self) -> &str {
+        &self.rendered
+    }
+}
+
+#[derive(Default)]
+struct WindowsPrelaunchDiagnosticState {
+    directory_entries: usize,
+    dll_count: usize,
+    dll_bytes: u64,
+    hashed_dlls: usize,
+    hashed_bytes: u64,
+    program_hashed: bool,
+    program_reused: bool,
+    dll_evidence: Vec<String>,
+}
+
+struct WindowsPrelaunchDiagnosticFailure {
+    phase: WindowsPrelaunchDiagnosticPhase,
+    reason: WindowsPrelaunchDiagnosticReason,
+    detail: String,
+}
+
+fn windows_prelaunch_failure(
+    phase: WindowsPrelaunchDiagnosticPhase,
+    reason: WindowsPrelaunchDiagnosticReason,
+    detail: impl Into<String>,
+) -> WindowsPrelaunchDiagnosticFailure {
+    WindowsPrelaunchDiagnosticFailure {
+        phase,
+        reason,
+        detail: detail.into(),
+    }
+}
+
+fn require_windows_prelaunch_deadline(
+    deadline: Instant,
+    phase: WindowsPrelaunchDiagnosticPhase,
+) -> Result<(), WindowsPrelaunchDiagnosticFailure> {
+    if Instant::now() >= deadline {
+        Err(windows_prelaunch_failure(
+            phase,
+            WindowsPrelaunchDiagnosticReason::Deadline,
+            "absolute diagnostic deadline expired",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn windows_prelaunch_io_failure(
+    phase: WindowsPrelaunchDiagnosticPhase,
+    error: &std::io::Error,
+) -> WindowsPrelaunchDiagnosticFailure {
+    windows_prelaunch_failure(
+        phase,
+        WindowsPrelaunchDiagnosticReason::Io(error.kind()),
+        error.to_string(),
+    )
+}
+
+fn hash_windows_prelaunch_file_until(
+    path: &Path,
+    expected_bytes: u64,
+    deadline: Instant,
+    phase: WindowsPrelaunchDiagnosticPhase,
+    hashed_bytes: &mut u64,
+) -> Result<Digest, WindowsPrelaunchDiagnosticFailure> {
+    require_windows_prelaunch_deadline(deadline, phase)?;
+    let mut file =
+        fs::File::open(path).map_err(|error| windows_prelaunch_io_failure(phase, &error))?;
+    hash_windows_prelaunch_reader(&mut file, expected_bytes, phase, hashed_bytes, || {
+        require_windows_prelaunch_deadline(deadline, phase)
+    })
+}
+
+fn hash_windows_prelaunch_reader(
+    mut reader: impl Read,
+    expected_bytes: u64,
+    phase: WindowsPrelaunchDiagnosticPhase,
+    hashed_bytes: &mut u64,
+    mut require_next_chunk: impl FnMut() -> Result<(), WindowsPrelaunchDiagnosticFailure>,
+) -> Result<Digest, WindowsPrelaunchDiagnosticFailure> {
+    let mut digest = Sha256::new();
+    let mut file_bytes = 0_u64;
+    let mut buffer = vec![0_u8; WINDOWS_PRELAUNCH_HASH_CHUNK_BYTES].into_boxed_slice();
+    loop {
+        require_next_chunk()?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| windows_prelaunch_io_failure(phase, &error))?;
+        if read == 0 {
+            break;
+        }
+        let read = u64::try_from(read).unwrap_or(u64::MAX);
+        file_bytes = file_bytes.saturating_add(read);
+        *hashed_bytes = hashed_bytes.saturating_add(read);
+        digest.update(&buffer[..usize::try_from(read).unwrap_or(buffer.len())]);
+    }
+    if file_bytes != expected_bytes {
+        return Err(windows_prelaunch_failure(
+            phase,
+            WindowsPrelaunchDiagnosticReason::FileChanged,
+            "file length changed while hashing",
+        ));
+    }
+    Ok(digest.finish())
+}
+
+/// Verifies deterministic chunk-level diagnostic cancellation without wall-clock sleeps.
+///
+/// # Errors
+///
+/// Returns an error if the deadline gate permits a read after typed expiry or
+/// loses the exact partial-byte receipt.
+#[doc(hidden)]
+pub fn verify_windows_prelaunch_chunk_deadline_for_integration() -> Result<(), String> {
+    struct CountingReader {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let gates = AtomicUsize::new(0);
+    let mut hashed_bytes = 0_u64;
+    let result = hash_windows_prelaunch_reader(
+        CountingReader {
+            reads: Arc::clone(&reads),
+        },
+        u64::MAX,
+        WindowsPrelaunchDiagnosticPhase::DllHash,
+        &mut hashed_bytes,
+        || {
+            if gates.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(())
+            } else {
+                Err(windows_prelaunch_failure(
+                    WindowsPrelaunchDiagnosticPhase::DllHash,
+                    WindowsPrelaunchDiagnosticReason::Deadline,
+                    "deterministic chunk deadline",
+                ))
+            }
+        },
+    );
+    let Err(failure) = result else {
+        return Err("chunk deadline unexpectedly completed hashing".to_owned());
+    };
+    if failure.phase != WindowsPrelaunchDiagnosticPhase::DllHash
+        || failure.reason != WindowsPrelaunchDiagnosticReason::Deadline
+        || reads.load(Ordering::Relaxed) != 1
+        || hashed_bytes != u64::try_from(WINDOWS_PRELAUNCH_HASH_CHUNK_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err("chunk deadline did not stop at the exact partial receipt".to_owned());
+    }
+    Ok(())
+}
+
+fn collect_windows_prelaunch_dlls(
+    parent: &Path,
+    deadline: Instant,
+    state: &mut WindowsPrelaunchDiagnosticState,
+) -> Result<Vec<(PathBuf, u64)>, WindowsPrelaunchDiagnosticFailure> {
+    let phase = WindowsPrelaunchDiagnosticPhase::DirectoryEnumeration;
+    require_windows_prelaunch_deadline(deadline, phase)?;
+    let entries =
+        fs::read_dir(parent).map_err(|error| windows_prelaunch_io_failure(phase, &error))?;
+    let mut dlls = Vec::new();
+    for entry in entries {
+        require_windows_prelaunch_deadline(deadline, phase)?;
+        if state.directory_entries >= WINDOWS_PRELAUNCH_DIRECTORY_ENTRY_LIMIT {
+            return Err(windows_prelaunch_failure(
+                phase,
+                WindowsPrelaunchDiagnosticReason::DirectoryEntryLimit,
+                "staged-bin directory inventory exceeds its entry bound",
             ));
         }
-        let parent = program
-            .parent()
-            .ok_or_else(|| std::io::Error::other("target has no staged-bin parent"))?;
-        let mut dlls = fs::read_dir(parent)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        dlls.retain(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("dll"))
-        });
-        dlls.sort_by_key(|path| path.file_name().map(OsStr::to_os_string));
-        if dlls.len() > MAX_DLLS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+        state.directory_entries += 1;
+        let path = entry
+            .map_err(|error| windows_prelaunch_io_failure(phase, &error))?
+            .path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("dll"))
+        {
+            continue;
+        }
+        if state.dll_count >= WINDOWS_PRELAUNCH_DLL_LIMIT {
+            return Err(windows_prelaunch_failure(
+                phase,
+                WindowsPrelaunchDiagnosticReason::DllEntryLimit,
                 "staged-bin DLL inventory exceeds its entry bound",
             ));
         }
-        let mut total_bytes = 0_u64;
-        let mut dll_evidence = Vec::with_capacity(dlls.len());
-        for dll in dlls {
-            let metadata = fs::symlink_metadata(&dll)?;
-            total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "staged-bin DLL inventory size overflowed",
-                )
-            })?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() > MAX_FILE_BYTES
-                || total_bytes > MAX_DLL_BYTES
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "staged-bin DLL inventory is not bounded direct files",
-                ));
-            }
-            dll_evidence.push(format!(
-                "{{name={},bytes={},sha256={}}}",
-                bounded_windows_path_debug(Path::new(
-                    dll.file_name().unwrap_or_else(|| OsStr::new("<missing>"))
-                )),
-                metadata.len(),
-                sha256_file(&dll)?.hex(),
+        let metadata_phase = WindowsPrelaunchDiagnosticPhase::DllMetadata;
+        require_windows_prelaunch_deadline(deadline, metadata_phase)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| windows_prelaunch_io_failure(metadata_phase, &error))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > WINDOWS_PRELAUNCH_FILE_BYTE_LIMIT
+        {
+            return Err(windows_prelaunch_failure(
+                metadata_phase,
+                WindowsPrelaunchDiagnosticReason::FileByteLimit,
+                "staged-bin DLL inventory is not bounded direct files",
             ));
         }
-        Ok(format!(
-            "program={program_text},programBytes={},programSha256={},stagedBin={},dllCount={},dllBytes={total_bytes},dlls=[{}]",
-            metadata.len(),
-            sha256_file(program)?.hex(),
-            bounded_windows_path_debug(parent),
-            dll_evidence.len(),
-            dll_evidence.join(","),
-        ))
-    })();
-    match result {
-        Ok(report) => format!("Windows argv target prelaunch evidence: {report}"),
-        Err(error) => format!(
-            "Windows argv target prelaunch evidence: program={program_text},unavailable={error}"
-        ),
+        let total_bytes = state.dll_bytes.checked_add(metadata.len()).ok_or_else(|| {
+            windows_prelaunch_failure(
+                metadata_phase,
+                WindowsPrelaunchDiagnosticReason::DllByteLimit,
+                "staged-bin DLL inventory size overflowed",
+            )
+        })?;
+        if total_bytes > WINDOWS_PRELAUNCH_DLL_BYTE_LIMIT {
+            return Err(windows_prelaunch_failure(
+                metadata_phase,
+                WindowsPrelaunchDiagnosticReason::DllByteLimit,
+                "staged-bin DLL inventory exceeds its byte bound",
+            ));
+        }
+        state.dll_count += 1;
+        state.dll_bytes = total_bytes;
+        dlls.push((path, metadata.len()));
     }
+    dlls.sort_by_key(|(path, _)| path.file_name().map(OsStr::to_os_string));
+    Ok(dlls)
+}
+
+fn acquire_windows_prelaunch_diagnostic(
+    program: &Path,
+    program_authority: Option<&BoundProgramInvocation>,
+    deadline: Instant,
+    state: &mut WindowsPrelaunchDiagnosticState,
+) -> Result<(u64, Digest, PathBuf), WindowsPrelaunchDiagnosticFailure> {
+    let phase = WindowsPrelaunchDiagnosticPhase::ProgramMetadata;
+    require_windows_prelaunch_deadline(deadline, phase)?;
+    let metadata = fs::symlink_metadata(program)
+        .map_err(|error| windows_prelaunch_io_failure(phase, &error))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > WINDOWS_PRELAUNCH_FILE_BYTE_LIMIT
+    {
+        return Err(windows_prelaunch_failure(
+            phase,
+            WindowsPrelaunchDiagnosticReason::FileByteLimit,
+            "target is not one bounded direct file",
+        ));
+    }
+    let parent = program.parent().ok_or_else(|| {
+        windows_prelaunch_failure(
+            phase,
+            WindowsPrelaunchDiagnosticReason::FileChanged,
+            "target has no staged-bin parent",
+        )
+    })?;
+    #[cfg(windows)]
+    let retained_program = program_authority
+        .map(|authority| {
+            authority
+                .revalidate(program.as_os_str())
+                .map_err(|error| windows_prelaunch_io_failure(phase, &error))?;
+            if authority.length() != metadata.len() {
+                return Err(windows_prelaunch_failure(
+                    phase,
+                    WindowsPrelaunchDiagnosticReason::FileChanged,
+                    "retained target length differs from diagnostic metadata",
+                ));
+            }
+            state.program_hashed = true;
+            state.program_reused = true;
+            Ok(authority.sha256())
+        })
+        .transpose()?;
+    #[cfg(not(windows))]
+    let retained_program = {
+        let _ = program_authority;
+        None
+    };
+    let dlls = collect_windows_prelaunch_dlls(parent, deadline, state)?;
+    for (dll, bytes) in dlls {
+        let digest = hash_windows_prelaunch_file_until(
+            &dll,
+            bytes,
+            deadline,
+            WindowsPrelaunchDiagnosticPhase::DllHash,
+            &mut state.hashed_bytes,
+        )?;
+        state.hashed_dlls += 1;
+        state.dll_evidence.push(format!(
+            "{{name={},bytes={bytes},sha256={}}}",
+            bounded_windows_path_debug(Path::new(
+                dll.file_name().unwrap_or_else(|| OsStr::new("<missing>"))
+            )),
+            digest.hex(),
+        ));
+    }
+    let program_digest = if let Some(digest) = retained_program {
+        digest
+    } else {
+        let digest = hash_windows_prelaunch_file_until(
+            program,
+            metadata.len(),
+            deadline,
+            WindowsPrelaunchDiagnosticPhase::ProgramHash,
+            &mut state.hashed_bytes,
+        )?;
+        state.program_hashed = true;
+        digest
+    };
+    Ok((metadata.len(), program_digest, parent.to_owned()))
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[must_use]
+pub fn windows_argv_target_prelaunch_diagnostic_with_program_until(
+    program: &Path,
+    authority: Option<&BoundProgramInvocation>,
+    deadline: Instant,
+) -> WindowsPrelaunchDiagnosticReceipt {
+    windows_argv_target_prelaunch_diagnostic_from_authority_until(program, authority, deadline)
+}
+
+fn windows_argv_target_prelaunch_diagnostic_from_authority_until(
+    program: &Path,
+    authority: Option<&BoundProgramInvocation>,
+    deadline: Instant,
+) -> WindowsPrelaunchDiagnosticReceipt {
+    let program_text = bounded_windows_path_debug(program);
+    let mut state = WindowsPrelaunchDiagnosticState::default();
+    let acquired = acquire_windows_prelaunch_diagnostic(program, authority, deadline, &mut state);
+    let (outcome, rendered) = match acquired {
+        Ok((program_bytes, program_sha256, parent)) => (
+            WindowsPrelaunchDiagnosticOutcome::Complete,
+            format!(
+                "Windows argv target prelaunch evidence: program={program_text},programBytes={program_bytes},programSha256={},programSource={},stagedBin={},directoryEntries={},dllCount={},dllBytes={},hashedDlls={},hashedBytes={},dlls=[{}]",
+                program_sha256.hex(),
+                if state.program_reused {
+                    "retained-authority"
+                } else {
+                    "diagnostic-hash"
+                },
+                bounded_windows_path_debug(&parent),
+                state.directory_entries,
+                state.dll_count,
+                state.dll_bytes,
+                state.hashed_dlls,
+                state.hashed_bytes,
+                state.dll_evidence.join(","),
+            ),
+        ),
+        Err(failure) => (
+            WindowsPrelaunchDiagnosticOutcome::Unavailable {
+                phase: failure.phase,
+                reason: failure.reason,
+            },
+            format!(
+                "Windows argv target prelaunch evidence: program={program_text},outcome=unavailable,phase={},reason={:?},detail={},directoryEntries={},dllCount={},dllBytes={},hashedDlls={},hashedBytes={},programHashed={},programReused={}",
+                failure.phase.as_str(),
+                failure.reason,
+                bounded_windows_diagnostic_detail(&failure.detail),
+                state.directory_entries,
+                state.dll_count,
+                state.dll_bytes,
+                state.hashed_dlls,
+                state.hashed_bytes,
+                state.program_hashed,
+                state.program_reused,
+            ),
+        ),
+    };
+    WindowsPrelaunchDiagnosticReceipt {
+        outcome,
+        directory_entries: state.directory_entries,
+        dll_count: state.dll_count,
+        dll_bytes: state.dll_bytes,
+        hashed_dlls: state.hashed_dlls,
+        hashed_bytes: state.hashed_bytes,
+        program_hashed: state.program_hashed,
+        program_reused: state.program_reused,
+        rendered,
+    }
+}
+
+/// Captures optional Windows target evidence under its own absolute deadline.
+///
+/// The receipt is always returned. An incomplete receipt is diagnostic-only
+/// and must never authorize, reject, or delay the semantic child launch.
+#[doc(hidden)]
+#[must_use]
+pub fn windows_argv_target_prelaunch_diagnostic_until(
+    program: &Path,
+    deadline: Instant,
+) -> WindowsPrelaunchDiagnosticReceipt {
+    windows_argv_target_prelaunch_diagnostic_from_authority_until(program, None, deadline)
 }
 
 #[cfg(any(windows, test))]
@@ -5620,8 +9276,8 @@ mod candidate_launch_policy_tests {
         }
         (
             environment,
-            arguments[pairs_end].clone(),
-            arguments[pairs_end + 1..].to_vec(),
+            arguments[pairs_end + 1].clone(),
+            arguments[pairs_end + 2..].to_vec(),
         )
     }
 
@@ -5686,6 +9342,62 @@ mod candidate_launch_policy_tests {
     }
 
     #[test]
+    fn posix_git_safe_directory_environment_is_closed_and_complete() {
+        for name in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
+            assert!(POSIX_RELEASE_CHILD_ENVIRONMENT_ALLOWLIST.contains(&name));
+            assert!(!RELEASE_CHILD_ENVIRONMENT_ALLOWLIST.contains(&name));
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hell-posix-git-safe-directory-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let exact = [
+            (
+                OsString::from("GIT_CONFIG_COUNT"),
+                Some(OsString::from("1")),
+            ),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                Some(OsString::from("safe.directory")),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                Some(root.as_os_str().to_owned()),
+            ),
+        ];
+        let encoded = posix_release_child_environment(exact, None, None, None, None).unwrap();
+        assert_eq!(
+            encoded.get(OsStr::new("GIT_CONFIG_VALUE_0")),
+            Some(&root.as_os_str().to_owned())
+        );
+
+        let partial = [(
+            OsString::from("GIT_CONFIG_COUNT"),
+            Some(OsString::from("1")),
+        )];
+        assert!(posix_release_child_environment(partial, None, None, None, None).is_err());
+        let wrong_key = [
+            (
+                OsString::from("GIT_CONFIG_COUNT"),
+                Some(OsString::from("1")),
+            ),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                Some(OsString::from("core.hooksPath")),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                Some(root.as_os_str().to_owned()),
+            ),
+        ];
+        assert!(posix_release_child_environment(wrong_key, None, None, None, None).is_err());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn posix_adapter_identity_rejects_permissions_path_and_digest_substitution() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
@@ -5746,41 +9458,6 @@ mod candidate_launch_policy_tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(replaced_parent).unwrap();
-    }
-
-    #[test]
-    fn uid_sweep_accepts_only_exact_empty_selection_or_zombie_rows() {
-        for quiescent in [
-            b"".as_slice(),
-            b"   \n".as_slice(),
-            b" 123 Z\n".as_slice(),
-            b" 123 Z+\n 456 Zs\n".as_slice(),
-        ] {
-            assert!(uid_process_snapshot_is_quiescent(Some(0), quiescent, b""));
-        }
-        assert!(uid_process_snapshot_is_quiescent(Some(1), b"", b""));
-        for retained in [
-            b" 123 R\n".as_slice(),
-            b" 123 S+\n".as_slice(),
-            b" 123 D\n".as_slice(),
-            b" 123 T\n".as_slice(),
-            b" 123\n".as_slice(),
-            b" Z\n".as_slice(),
-            b" 0 Z\n".as_slice(),
-            b" 123 Z?\n".as_slice(),
-            b" 123 Z unexpected\n".as_slice(),
-        ] {
-            assert!(!uid_process_snapshot_is_quiescent(Some(0), retained, b""));
-        }
-        for (status, stdout, stderr) in [
-            (Some(1), b" \n".as_slice(), b"".as_slice()),
-            (Some(1), b"".as_slice(), b"ps error\n".as_slice()),
-            (Some(2), b"".as_slice(), b"".as_slice()),
-            (None, b"".as_slice(), b"".as_slice()),
-            (Some(0), b"".as_slice(), b"ps warning\n".as_slice()),
-        ] {
-            assert!(!uid_process_snapshot_is_quiescent(status, stdout, stderr));
-        }
     }
 
     #[test]
@@ -7660,6 +11337,253 @@ impl BoundedCapture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupervisedIoTaskState {
+    NotStarted,
+    Owned,
+    Completed,
+    Failed,
+    Panicked,
+    LaunchFailed,
+    AbortedBeforeLaunch,
+}
+
+impl SupervisedIoTaskState {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotStarted => "not-started",
+            Self::Owned => "owned",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Panicked => "panicked",
+            Self::LaunchFailed => "launch-failed",
+            Self::AbortedBeforeLaunch => "aborted-before-launch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisedIoTaskSnapshot {
+    pub state: SupervisedIoTaskState,
+    pub bytes: Option<u64>,
+    pub sha256: Option<Digest>,
+    pub truncated: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisedIoSnapshot {
+    pub stdout: SupervisedIoTaskSnapshot,
+    pub stderr: SupervisedIoTaskSnapshot,
+    pub stdin: SupervisedIoTaskSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct SupervisedIoReceipt {
+    inner: Arc<(Mutex<SupervisedIoSnapshot>, Condvar)>,
+}
+
+impl SupervisedIoReceipt {
+    fn new() -> Self {
+        let not_started = SupervisedIoTaskSnapshot {
+            state: SupervisedIoTaskState::NotStarted,
+            bytes: None,
+            sha256: None,
+            truncated: None,
+            error: None,
+        };
+        Self {
+            inner: Arc::new((
+                Mutex::new(SupervisedIoSnapshot {
+                    stdout: not_started.clone(),
+                    stderr: not_started.clone(),
+                    stdin: not_started,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn set_state(&self, stream: Option<SupervisedOutputStream>, state: SupervisedIoTaskState) {
+        let mut snapshot = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = match stream {
+            Some(SupervisedOutputStream::Stdout) => &mut snapshot.stdout,
+            Some(SupervisedOutputStream::Stderr) => &mut snapshot.stderr,
+            None => &mut snapshot.stdin,
+        };
+        task.state = state;
+        self.inner.1.notify_all();
+    }
+
+    fn abort_not_started(&self) {
+        let mut snapshot = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let abort = |task: &mut SupervisedIoTaskSnapshot| {
+            if task.state == SupervisedIoTaskState::NotStarted {
+                task.state = SupervisedIoTaskState::AbortedBeforeLaunch;
+            }
+        };
+        abort(&mut snapshot.stdout);
+        abort(&mut snapshot.stderr);
+        abort(&mut snapshot.stdin);
+        self.inner.1.notify_all();
+    }
+
+    fn finish_capture(
+        &self,
+        stream: SupervisedOutputStream,
+        result: &std::io::Result<BoundedCapture>,
+    ) {
+        let snapshot = match result {
+            Ok(capture) => SupervisedIoTaskSnapshot {
+                state: SupervisedIoTaskState::Completed,
+                bytes: Some(capture.total_bytes),
+                sha256: Some(capture.sha256),
+                truncated: Some(capture.truncated),
+                error: None,
+            },
+            Err(error) => SupervisedIoTaskSnapshot {
+                state: SupervisedIoTaskState::Failed,
+                bytes: None,
+                sha256: None,
+                truncated: None,
+                error: Some(error.to_string()),
+            },
+        };
+        let mut state = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match stream {
+            SupervisedOutputStream::Stdout => state.stdout = snapshot,
+            SupervisedOutputStream::Stderr => state.stderr = snapshot,
+        }
+        self.inner.1.notify_all();
+    }
+
+    fn finish_stdin(&self, result: &std::io::Result<()>) {
+        let snapshot = match result {
+            Ok(()) => SupervisedIoTaskSnapshot {
+                state: SupervisedIoTaskState::Completed,
+                bytes: Some(0),
+                sha256: None,
+                truncated: Some(false),
+                error: None,
+            },
+            Err(error) => SupervisedIoTaskSnapshot {
+                state: SupervisedIoTaskState::Failed,
+                bytes: None,
+                sha256: None,
+                truncated: None,
+                error: Some(error.to_string()),
+            },
+        };
+        self.inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stdin = snapshot;
+        self.inner.1.notify_all();
+    }
+
+    fn mark_panicked(&self, stream: Option<SupervisedOutputStream>) {
+        let panicked = SupervisedIoTaskSnapshot {
+            state: SupervisedIoTaskState::Panicked,
+            bytes: None,
+            sha256: None,
+            truncated: None,
+            error: Some("supervised I/O worker panicked".to_owned()),
+        };
+        let mut state = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match stream {
+            Some(SupervisedOutputStream::Stdout) => state.stdout = panicked,
+            Some(SupervisedOutputStream::Stderr) => state.stderr = panicked,
+            None => state.stdin = panicked,
+        }
+        self.inner.1.notify_all();
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> SupervisedIoSnapshot {
+        self.inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[must_use]
+    pub fn wait_until(&self, deadline: Instant) -> SupervisedIoSnapshot {
+        let mut snapshot = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while supervised_io_owned(&snapshot) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, timeout) = self
+                .inner
+                .1
+                .wait_timeout(snapshot, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot = next;
+            if timeout.timed_out() && supervised_io_owned(&snapshot) {
+                break;
+            }
+        }
+        snapshot.clone()
+    }
+
+    /// Waits until all three admitted I/O tasks reach typed terminal states.
+    #[must_use]
+    pub fn wait(&self) -> SupervisedIoSnapshot {
+        let mut snapshot = self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while supervised_io_owned(&snapshot) {
+            snapshot = self
+                .inner
+                .1
+                .wait(snapshot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        snapshot.clone()
+    }
+}
+
+fn supervised_io_owned(snapshot: &SupervisedIoSnapshot) -> bool {
+    [
+        &snapshot.stdout.state,
+        &snapshot.stderr.state,
+        &snapshot.stdin.state,
+    ]
+    .into_iter()
+    .any(|state| {
+        matches!(
+            state,
+            SupervisedIoTaskState::NotStarted | SupervisedIoTaskState::Owned
+        )
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessStatus {
     pub success: bool,
     pub code: Option<i32>,
@@ -8448,7 +12372,7 @@ pub fn required_obligations_for_target(
         .collect())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RuntimeCoverageObservations {
     obligations: HashMap<RuntimeCoverageKey, BTreeSet<Arc<str>>>,
     boundaries: HashMap<RuntimeBoundaryKey, BTreeSet<Arc<str>>>,
@@ -8644,6 +12568,12 @@ fn record_boolean_outcome(
 pub fn validate_runtime_obligation_coverage(cases: &[DifferentialCase]) -> Result<(), String> {
     validate_evidence_catalog(cases)?;
     let observations = runtime_coverage_observations(cases)?;
+    validate_runtime_obligation_observations(&observations)
+}
+
+fn validate_runtime_obligation_observations(
+    observations: &RuntimeCoverageObservations,
+) -> Result<(), String> {
     let expected = applicable_runtime_obligation_cells();
     let missing = expected
         .iter()
@@ -8691,8 +12621,8 @@ pub fn validate_runtime_obligation_coverage(cases: &[DifferentialCase]) -> Resul
             })
         })
         .collect::<Vec<_>>();
-    let boundary_gaps = runtime_boundary_gaps(&observations);
-    let interaction_gaps = runtime_interaction_gaps(&observations);
+    let boundary_gaps = runtime_boundary_gaps(observations);
+    let interaction_gaps = runtime_interaction_gaps(observations);
     if missing.is_empty() && boundary_gaps.is_empty() && interaction_gaps.is_empty() {
         Ok(())
     } else {
@@ -8706,6 +12636,61 @@ pub fn validate_runtime_obligation_coverage(cases: &[DifferentialCase]) -> Resul
             interaction_gaps.join("; "),
         ))
     }
+}
+
+/// Verifies every registry-derived `Ord` instance retains both Boolean outcomes.
+///
+/// This integration seam builds and validates the immutable committed observation index once,
+/// then checks each omitted outcome against the same validator used by
+/// [`validate_runtime_obligation_coverage`].
+///
+/// # Errors
+///
+/// Returns the exact missing registry scope or an unexpected coverage diagnostic.
+#[doc(hidden)]
+pub fn verify_committed_ord_boolean_partition_for_integration() -> Result<(), String> {
+    let cases = committed_differential_cases();
+    validate_evidence_catalog(&cases)?;
+    let baseline = runtime_coverage_observations(&cases)?;
+    for builtin in ["Ord.lt", "Ord.gt"] {
+        for scope in required_runtime_instance_scopes(builtin) {
+            let RuntimeInstanceScope::Resolved(instance) = &scope else {
+                return Err(format!(
+                    "{builtin} unexpectedly has an unconstrained instance"
+                ));
+            };
+            for result in [true, false] {
+                let key = (Arc::<str>::from(builtin), scope.clone());
+                let baseline_outcomes = baseline.boolean_outcomes.get(&key).ok_or_else(|| {
+                    format!("committed {builtin}/{instance} has no Boolean outcomes")
+                })?;
+                if !baseline_outcomes.contains(&result) {
+                    return Err(format!(
+                        "committed {builtin}/{instance} omits Boolean outcome {result}"
+                    ));
+                }
+                let mut omitted = baseline.clone();
+                omitted
+                    .boolean_outcomes
+                    .get_mut(&key)
+                    .expect("baseline outcome key was cloned")
+                    .remove(&result);
+                let error = validate_runtime_obligation_observations(&omitted).map_or_else(
+                    |error| error,
+                    |()| format!("removing {builtin}/{instance}/{result} did not reopen its scope"),
+                );
+                let expected_cell = format!(
+                    "{builtin}/PureRuntime: instance-scopes=[{instance}:missing=[],bool-partition=true]"
+                );
+                if !error.contains(&expected_cell) {
+                    return Err(format!(
+                        "unexpected {builtin}/{instance}/{result} diagnostic: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether one exact runtime instance scope contains every required obligation.
@@ -9248,6 +13233,66 @@ pub struct RuntimeFailureProjectionRejection {
     pub resource_event_count: usize,
 }
 
+/// One bounded, parser-normalized exception payload component.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFailurePayloadComponentDiagnostic {
+    pub bytes: u64,
+    pub sha256: Digest,
+    pub utf8_prefix: String,
+    pub prefix_truncated: bool,
+}
+
+/// The oracle component selected by the production exception projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFailureOraclePayloadSelection {
+    Outer,
+    Handling,
+}
+
+impl RuntimeFailureOraclePayloadSelection {
+    #[must_use]
+    pub const fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::Outer => "outer",
+            Self::Handling => "handling",
+        }
+    }
+}
+
+/// Exact relationship between the selected oracle payload and candidate payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFailurePayloadRelationship {
+    Selected,
+    Outer,
+    Handling,
+    Distinct,
+}
+
+impl RuntimeFailurePayloadRelationship {
+    #[must_use]
+    pub const fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::Selected => "candidate-matches-selected",
+            Self::Outer => "candidate-matches-oracle-outer",
+            Self::Handling => "candidate-matches-oracle-handling",
+            Self::Distinct => "candidate-distinct-from-oracle-components",
+        }
+    }
+}
+
+/// Bounded parsed payload evidence for an exact-table projection rejection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFailurePayloadDiagnostic {
+    pub mismatch_field: &'static str,
+    pub handling_projection: &'static str,
+    pub oracle_selection: RuntimeFailureOraclePayloadSelection,
+    pub relationship: RuntimeFailurePayloadRelationship,
+    pub oracle_outer: RuntimeFailurePayloadComponentDiagnostic,
+    pub oracle_handling: Option<RuntimeFailurePayloadComponentDiagnostic>,
+    pub oracle_selected: RuntimeFailurePayloadComponentDiagnostic,
+    pub candidate: RuntimeFailurePayloadComponentDiagnostic,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeFailurePresentationAuthority {
     pub family: RuntimeFailureExceptionFamily,
@@ -9267,6 +13312,17 @@ pub(crate) enum RuntimeFailureHandlingProjection {
     Payload,
     Prefix(&'static str),
     AfterPathPrefix(&'static str),
+}
+
+impl RuntimeFailureHandlingProjection {
+    const fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Payload => "payload",
+            Self::Prefix(_) => "prefix",
+            Self::AfterPathPrefix(_) => "after-path-prefix",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10355,8 +14411,8 @@ pub fn inspect_executable(
     path: &Path,
     role: ExecutableRole,
 ) -> std::io::Result<ExecutableIdentity> {
-    let (path, sha256) = resolve_and_hash(path)?;
-    probe_identity(path, sha256, role, false)
+    let (path, sha256, authority) = resolve_and_hash(path)?;
+    probe_identity(path, sha256, role, false, authority.as_ref())
 }
 
 /// Verifies the pinned digest and reported language version before a corpus.
@@ -10371,7 +14427,7 @@ pub fn verify_executable(
     expected_sha256: Option<Digest>,
     expected_version: &str,
 ) -> std::io::Result<ExecutableIdentity> {
-    let (path, sha256) = resolve_and_hash(path)?;
+    let (path, sha256, authority) = resolve_and_hash(path)?;
     if let Some(expected) = expected_sha256
         && sha256 != expected
     {
@@ -10382,7 +14438,7 @@ pub fn verify_executable(
             sha256.hex()
         )));
     }
-    let identity = probe_identity(path, sha256, role, true)?;
+    let identity = probe_identity(path, sha256, role, true, authority.as_ref())?;
     if identity.reported_version.as_ref() != expected_version {
         return Err(std::io::Error::other(format!(
             "{:?} executable version mismatch: expected {expected_version:?}, observed {:?}",
@@ -10988,9 +15044,16 @@ fn reviewed_runtime_failure_effect_causality(
     authority: RuntimeFailurePresentationAuthority,
     semantic: &SemanticObservation,
 ) -> bool {
+    reviewed_runtime_failure_effect_builtin_causality(authority.builtin, semantic)
+}
+
+fn reviewed_runtime_failure_effect_builtin_causality(
+    expected_builtin: BuiltinId,
+    semantic: &SemanticObservation,
+) -> bool {
     if !semantic
         .coverage
-        .contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+        .contains(&CoverageEvent::EnteredAdapter(expected_builtin))
     {
         return false;
     }
@@ -11004,7 +15067,7 @@ fn reviewed_runtime_failure_effect_causality(
                 sequence,
                 parent_sequence,
                 effect,
-            } if *builtin == authority.builtin => {
+            } if *builtin == expected_builtin => {
                 Some((*owner_task, *sequence, *parent_sequence, effect))
             }
             _ => None,
@@ -11016,6 +15079,91 @@ fn reviewed_runtime_failure_effect_causality(
         && effects[0].2 == effects[1].2
         && effects[0].3.as_ref() == "started"
         && effects[1].3.as_ref() == "failed"
+}
+
+fn reviewed_runtime_failure_obligation_descends_from(
+    child: &ObligationTraceEvent,
+    ancestor: &ObligationTraceEvent,
+    events: &[ObligationTraceEvent],
+) -> bool {
+    if child.owner_task != ancestor.owner_task || child.sequence <= ancestor.sequence {
+        return false;
+    }
+    let mut current = child;
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..events.len() {
+        if !visited.insert(current.sequence) {
+            return false;
+        }
+        let Some(parent_sequence) = current.parent_sequence else {
+            return false;
+        };
+        if parent_sequence == ancestor.sequence {
+            return true;
+        }
+        let mut matching = events.iter().filter(|event| {
+            event.owner_task == current.owner_task && event.sequence == parent_sequence
+        });
+        let Some(parent) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some() || parent.sequence >= current.sequence {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn reviewed_runtime_failure_lazy_descendant_causality(
+    authority: RuntimeFailurePresentationAuthority,
+    force_boundaries: &[(u16, &str, Option<&str>)],
+    semantic: &SemanticObservation,
+) -> bool {
+    let Some(error) = hell_builtins::lookup("Error.error") else {
+        return false;
+    };
+    let Some(print) = hell_builtins::lookup("IO.print") else {
+        return false;
+    };
+    let matching = |builtin| {
+        semantic
+            .obligation_trace
+            .iter()
+            .filter(|event| event.builtin == builtin)
+            .collect::<Vec<_>>()
+    };
+    let errors = matching(error.id);
+    let [error] = errors.as_slice() else {
+        return false;
+    };
+    let targets = matching(authority.builtin)
+        .into_iter()
+        .filter(|target| {
+            target.outcome.as_ref() == "alias"
+                && reviewed_runtime_failure_obligation_descends_from(
+                    error,
+                    target,
+                    &semantic.obligation_trace,
+                )
+        })
+        .collect::<Vec<_>>();
+    let [_target] = targets.as_slice() else {
+        return false;
+    };
+    let exact_lazy_observations = !force_boundaries.is_empty()
+        && force_boundaries.iter().all(|(_, outcome, error)| {
+            matches!(*outcome, "value" | "not-forced") && error.is_none()
+        })
+        && force_boundaries.iter().any(|(argument, outcome, error)| {
+            *argument == 1 && *outcome == "not-forced" && error.is_none()
+        });
+    exact_lazy_observations
+        && semantic
+            .coverage
+            .contains(&CoverageEvent::EnteredAdapter(authority.builtin))
+        && error.outcome.as_ref() == "error"
+        && reviewed_runtime_failure_effect_builtin_causality(print.id, semantic)
 }
 
 fn reviewed_runtime_failure_pure_causality(
@@ -11057,28 +15205,37 @@ fn reviewed_runtime_failure_pure_causality(
             let Some(expected) = target.expected_whnf_argument_failure_sha256 else {
                 return false;
             };
-            force_boundaries
-                .iter()
-                .all(|(_, outcome, error)| *outcome == "error" && error.is_some())
-                && !force_boundaries.is_empty()
-                && whnf_argument_failure_sha256(force_boundaries.iter().filter_map(
-                    |(argument, outcome, error)| error.map(|error| (*argument, *outcome, error)),
-                )) == expected
-        }
-        "lazy-boundary" => {
-            let Some(expected) = target.expected_lazy_argument_exit_sha256 else {
-                return false;
-            };
-            !force_boundaries.is_empty()
-                && force_boundaries
+            let error_boundaries =
+                force_boundaries
                     .iter()
-                    .any(|(_, outcome, _)| *outcome == "error")
-                && lazy_argument_exit_sha256(
-                    force_boundaries
-                        .iter()
-                        .map(|(argument, outcome, _)| (*argument, *outcome)),
-                ) == expected
+                    .filter_map(|(argument, outcome, error)| match (*outcome, *error) {
+                        ("error", Some(error)) => Some((*argument, *outcome, error)),
+                        _ => None,
+                    });
+            let error_boundaries = error_boundaries.collect::<Vec<_>>();
+            !error_boundaries.is_empty()
+                && whnf_argument_failure_sha256(error_boundaries.iter().copied()) == expected
         }
+        "lazy-boundary" => target.expected_lazy_argument_exit_sha256.map_or_else(
+            || {
+                reviewed_runtime_failure_lazy_descendant_causality(
+                    authority,
+                    &force_boundaries,
+                    semantic,
+                )
+            },
+            |expected| {
+                !force_boundaries.is_empty()
+                    && force_boundaries
+                        .iter()
+                        .any(|(_, outcome, _)| *outcome == "error")
+                    && lazy_argument_exit_sha256(
+                        force_boundaries
+                            .iter()
+                            .map(|(argument, outcome, _)| (*argument, *outcome)),
+                    ) == expected
+            },
+        ),
         "result-force-failure" => {
             semantic
                 .coverage
@@ -11086,12 +15243,21 @@ fn reviewed_runtime_failure_pure_causality(
                 && semantic.typed_result_builtin == Some(authority.builtin)
                 && semantic.typed_result_sha256 == target.expected_typed_result_sha256
                 && target.expected_typed_result_sha256.is_some()
-                && force_boundaries
-                    .iter()
-                    .any(|(_, outcome, _)| *outcome == "error")
         }
         _ => false,
     }
+}
+
+/// Exercises the exact reviewed runtime-failure causal authority without
+/// weakening the public observation-comparison boundary.
+#[doc(hidden)]
+#[must_use]
+pub fn reviewed_runtime_failure_causality_for_integration(
+    case: &DifferentialCase,
+    semantic: &SemanticObservation,
+) -> bool {
+    reviewed_runtime_failure_presentation_authority(case)
+        .is_some_and(|authority| reviewed_runtime_failure_causality(case, authority, semantic))
 }
 
 struct GhcBacktraceFrame<'a> {
@@ -11262,10 +15428,18 @@ fn after_path_handling_matches(payload: &str, handling: &str, prefix: &str) -> b
         && handling.ends_with(operation_without_prefix)
 }
 
-fn oracle_framed_payload_result(
+#[derive(Clone, Copy)]
+struct OracleFramedPayload<'a> {
+    outer: &'a str,
+    handling: Option<&'a str>,
+    selected: &'a str,
+    selection: RuntimeFailureOraclePayloadSelection,
+}
+
+fn oracle_framed_payload_components_result(
     authority: RuntimeFailurePresentationAuthority,
     framed_payload: &str,
-) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
+) -> Result<OracleFramedPayload<'_>, RuntimeFailureProjectionRejectionReason> {
     use RuntimeFailureProjectionRejectionReason::{
         OracleFrameGrammar, OraclePayloadHandlingMismatch, OraclePayloadHandlingMissing,
         OraclePayloadUnexpectedHandling,
@@ -11277,11 +15451,18 @@ fn oracle_framed_payload_result(
             if framed_payload.contains(HANDLING_MARKER) {
                 return Err(OraclePayloadUnexpectedHandling);
             }
-            if authority.oracle_frame_layout == RuntimeFailureOracleFrameLayout::Frameless {
-                framed_payload.strip_suffix('\n').ok_or(OracleFrameGrammar)
-            } else {
-                Ok(framed_payload)
-            }
+            let outer =
+                if authority.oracle_frame_layout == RuntimeFailureOracleFrameLayout::Frameless {
+                    framed_payload.strip_suffix('\n').ok_or(OracleFrameGrammar)
+                } else {
+                    Ok(framed_payload)
+                }?;
+            Ok(OracleFramedPayload {
+                outer,
+                handling: None,
+                selected: outer,
+                selection: RuntimeFailureOraclePayloadSelection::Outer,
+            })
         }
         projection => {
             let (payload, handling) = framed_payload
@@ -11308,7 +15489,12 @@ fn oracle_framed_payload_result(
             if !handling_matches {
                 return Err(OraclePayloadHandlingMismatch);
             }
-            Ok(payload)
+            Ok(OracleFramedPayload {
+                outer: payload,
+                handling: Some(handling),
+                selected: payload,
+                selection: RuntimeFailureOraclePayloadSelection::Outer,
+            })
         }
     }
 }
@@ -11317,6 +15503,14 @@ fn oracle_exception_payload_result(
     authority: RuntimeFailurePresentationAuthority,
     stderr: &[u8],
 ) -> Result<&str, RuntimeFailureProjectionRejectionReason> {
+    oracle_exception_payload_components_result(authority, stderr)
+        .map(|components| components.selected)
+}
+
+fn oracle_exception_payload_components_result(
+    authority: RuntimeFailurePresentationAuthority,
+    stderr: &[u8],
+) -> Result<OracleFramedPayload<'_>, RuntimeFailureProjectionRejectionReason> {
     use RuntimeFailureProjectionRejectionReason::{
         OracleExceptionFamily, OracleFrameGrammar, OracleParserStage, OraclePayloadControl,
         OraclePayloadEmpty, OraclePayloadMultiline,
@@ -11367,21 +15561,21 @@ fn oracle_exception_payload_result(
             (body, None)
         }
     };
-    let payload = oracle_framed_payload_result(authority, framed_payload)?;
-    if payload.is_empty() {
+    let components = oracle_framed_payload_components_result(authority, framed_payload)?;
+    if components.selected.is_empty() {
         return Err(OraclePayloadEmpty);
     }
-    if payload.contains('\n') {
+    if components.selected.contains('\n') {
         return Err(OraclePayloadMultiline);
     }
-    if payload.chars().any(char::is_control) {
+    if components.selected.chars().any(char::is_control) {
         return Err(OraclePayloadControl);
     }
     if let Some(frames) = frames {
         exact_ghc_backtrace_result(authority, frames, authority.oracle_frame_functions)
             .map_err(oracle_frame_rejection)?;
     }
-    Ok(payload)
+    Ok(components)
 }
 
 fn candidate_exception_payload_result(
@@ -11893,6 +16087,74 @@ pub fn runtime_failure_projection_rejection(
         effect_event_count: semantic.map_or(0, |value| value.effect_trace.len()),
         task_event_count: semantic.map_or(0, |value| value.task_trace.len()),
         resource_event_count: semantic.map_or(0, |value| value.resource_trace.len()),
+    })
+}
+
+const RUNTIME_FAILURE_PAYLOAD_DIAGNOSTIC_PREFIX_BYTES: usize = 256;
+
+fn runtime_failure_payload_component_diagnostic(
+    payload: &str,
+) -> RuntimeFailurePayloadComponentDiagnostic {
+    let mut prefix_end = 0;
+    for (index, character) in payload.char_indices() {
+        let next = index + character.len_utf8();
+        if next > RUNTIME_FAILURE_PAYLOAD_DIAGNOSTIC_PREFIX_BYTES {
+            break;
+        }
+        prefix_end = next;
+    }
+    RuntimeFailurePayloadComponentDiagnostic {
+        bytes: u64::try_from(payload.len()).expect("payload length fits u64"),
+        sha256: sha256_bytes(payload.as_bytes()),
+        utf8_prefix: payload[..prefix_end].to_owned(),
+        prefix_truncated: prefix_end != payload.len(),
+    }
+}
+
+/// Returns bounded parsed payload components for a payload-mismatch rejection.
+///
+/// This diagnostic does not change comparison authority. It is available only after the exact
+/// observation binding, exception-family parser, frame parser, and handling relation succeed.
+#[must_use]
+pub fn runtime_failure_payload_diagnostic(
+    case: &DifferentialCase,
+    oracle: &Observation,
+    candidate: &Observation,
+) -> Option<RuntimeFailurePayloadDiagnostic> {
+    let authority = reviewed_runtime_failure_presentation_authority(case)?;
+    if !runtime_failure_observations_are_bound(case, oracle, candidate) {
+        return None;
+    }
+    let oracle_stderr = oracle.stderr.complete.as_deref()?;
+    let candidate_stderr = candidate.stderr.complete.as_deref()?;
+    if reviewed_runtime_failure_payload_sha256_result(authority, oracle_stderr, candidate_stderr)
+        != Err(RuntimeFailureProjectionRejectionReason::PayloadMismatch)
+    {
+        return None;
+    }
+    let oracle_components =
+        oracle_exception_payload_components_result(authority, oracle_stderr).ok()?;
+    let candidate_payload = candidate_exception_payload_result(authority, candidate_stderr).ok()?;
+    let relationship = if candidate_payload == oracle_components.selected {
+        RuntimeFailurePayloadRelationship::Selected
+    } else if candidate_payload == oracle_components.outer {
+        RuntimeFailurePayloadRelationship::Outer
+    } else if oracle_components.handling == Some(candidate_payload) {
+        RuntimeFailurePayloadRelationship::Handling
+    } else {
+        RuntimeFailurePayloadRelationship::Distinct
+    };
+    Some(RuntimeFailurePayloadDiagnostic {
+        mismatch_field: "oracle-selected-payload-vs-candidate-payload",
+        handling_projection: authority.while_handling.descriptor_name(),
+        oracle_selection: oracle_components.selection,
+        relationship,
+        oracle_outer: runtime_failure_payload_component_diagnostic(oracle_components.outer),
+        oracle_handling: oracle_components
+            .handling
+            .map(runtime_failure_payload_component_diagnostic),
+        oracle_selected: runtime_failure_payload_component_diagnostic(oracle_components.selected),
+        candidate: runtime_failure_payload_component_diagnostic(candidate_payload),
     })
 }
 
@@ -14646,10 +18908,22 @@ fn parse_location_field(value: Option<&str>, name: &str) -> std::io::Result<usiz
         .map_err(|_| std::io::Error::other(format!("diagnostic {name} was not an integer")))
 }
 
-fn resolve_and_hash(path: &Path) -> std::io::Result<(PathBuf, Digest)> {
+fn resolve_and_hash(
+    path: &Path,
+) -> std::io::Result<(PathBuf, Digest, Option<BoundProgramInvocation>)> {
     let path = fs::canonicalize(path)?;
-    let sha256 = sha256_file(&path)?;
-    Ok((path, sha256))
+    #[cfg(windows)]
+    {
+        let deadline = windows_program_authority_acquisition_deadline()?;
+        let authority = BoundProgramInvocation::new_until(path.clone(), path.clone(), deadline)?;
+        let sha256 = authority.sha256();
+        Ok((path, sha256, Some(authority)))
+    }
+    #[cfg(not(windows))]
+    {
+        let sha256 = sha256_file(&path)?;
+        Ok((path, sha256, None))
+    }
 }
 
 fn probe_identity(
@@ -14657,14 +18931,15 @@ fn probe_identity(
     sha256: Digest,
     role: ExecutableRole,
     require_candidate_build_info: bool,
+    authority: Option<&BoundProgramInvocation>,
 ) -> std::io::Result<ExecutableIdentity> {
-    let reported_version = probe_lines(&path, "--version")?;
+    let reported_version = probe_lines(&path, "--version", authority)?;
     let reported_version: Arc<str> = reported_version
         .first()
         .ok_or_else(|| std::io::Error::other("--version produced no output"))?
         .clone();
     let build_info = if role == ExecutableRole::Candidate {
-        let parsed = probe_lines(&path, "--build-info").and_then(|lines| {
+        let parsed = probe_lines(&path, "--build-info", authority).and_then(|lines| {
             parse_candidate_build_info(lines.iter().map(std::convert::AsRef::as_ref))
         });
         match parsed {
@@ -14675,7 +18950,19 @@ fn probe_identity(
     } else {
         None
     };
-    let observed_sha256 = sha256_file(&path)?;
+    let observed_sha256 = if let Some(authority) = authority {
+        authority.revalidate(path.as_os_str())?;
+        #[cfg(windows)]
+        {
+            authority.sha256()
+        }
+        #[cfg(not(windows))]
+        {
+            sha256_file(&path)?
+        }
+    } else {
+        sha256_file(&path)?
+    };
     if observed_sha256 != sha256 {
         return Err(std::io::Error::other(format!(
             "{:?} executable changed during identity probing: expected {}, observed {}",
@@ -14697,22 +18984,67 @@ fn probe_identity(
     })
 }
 
-fn probe_lines(path: &Path, argument: &str) -> std::io::Result<Vec<Arc<str>>> {
+fn probe_lines(
+    path: &Path,
+    argument: &str,
+    authority: Option<&BoundProgramInvocation>,
+) -> std::io::Result<Vec<Arc<str>>> {
     let mut command = Command::new(path);
     scrub_ci_authority_environment(&mut command);
     command.arg(argument);
-    let output = run_supervised_command(&mut command, &[], Duration::from_secs(5))?;
+    #[cfg(windows)]
+    let prelaunch_evidence = if CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().is_some()) {
+        let diagnostic_deadline = Instant::now()
+            .checked_add(WINDOWS_PRELAUNCH_DIAGNOSTIC_BUDGET)
+            .ok_or_else(|| std::io::Error::other("prelaunch diagnostic deadline overflowed"))?;
+        Some(
+            windows_argv_target_prelaunch_diagnostic_with_program_until(
+                path,
+                authority,
+                diagnostic_deadline,
+            )
+            .rendered
+            .clone(),
+        )
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let prelaunch_evidence = None;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| std::io::Error::other("version probe deadline overflowed"))?;
+    let output = run_supervised_command_inner(
+        &mut command,
+        &[],
+        deadline,
+        None,
+        authority,
+        prelaunch_evidence.clone(),
+        None,
+    )
+    .map_err(|primary| compose_prelaunch_evidence_error(primary, prelaunch_evidence.as_deref()))?;
     if output.timed_out {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "version probe exceeded five seconds",
+            format!(
+                "version probe {argument:?} for {:?} exceeded five seconds: status={}, termination={:?}, phases={}, prelaunchEvidence={:?}, stdout={}, stderr={}",
+                EscapedPath(path),
+                supervised_status_diagnostic(output.status.code()),
+                output.termination,
+                supervised_phase_diagnostic(&output.phase_timings),
+                output.prelaunch_evidence,
+                bounded_probe_capture_diagnostic(&output.stdout),
+                bounded_probe_capture_diagnostic(&output.stderr),
+            ),
         ));
     }
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
-            "{argument} failed with status {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr.mismatch_bytes())
+            "{argument} failed with status {}: {}; prelaunchEvidence={:?}",
+            supervised_status_diagnostic(output.status.code()),
+            bounded_probe_capture_diagnostic(&output.stderr),
+            output.prelaunch_evidence,
         )));
     }
     let complete = output
@@ -14730,12 +19062,100 @@ fn probe_lines(path: &Path, argument: &str) -> std::io::Result<Vec<Arc<str>>> {
     Ok(lines)
 }
 
+fn compose_prelaunch_evidence_error(
+    primary: std::io::Error,
+    prelaunch_evidence: Option<&str>,
+) -> std::io::Error {
+    match prelaunch_evidence {
+        Some(evidence) => {
+            let kind = primary.kind();
+            std::io::Error::new(
+                kind,
+                PrelaunchEvidenceError {
+                    primary,
+                    evidence: evidence.to_owned(),
+                },
+            )
+        }
+        None => primary,
+    }
+}
+
+#[derive(Debug)]
+struct PrelaunchEvidenceError {
+    primary: std::io::Error,
+    evidence: String,
+}
+
+impl std::fmt::Display for PrelaunchEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; prelaunchEvidence={:?}",
+            self.primary, self.evidence
+        )
+    }
+}
+
+impl std::error::Error for PrelaunchEvidenceError {}
+
+const PROBE_DIAGNOSTIC_EDGE_BYTES: usize = 4 * 1024;
+
+fn bounded_probe_capture_diagnostic(capture: &BoundedCapture) -> String {
+    let mut retained = capture
+        .prefix
+        .iter()
+        .take(PROBE_DIAGNOSTIC_EDGE_BYTES)
+        .copied()
+        .collect::<Vec<_>>();
+    if capture.truncated || capture.total_bytes > u64::try_from(retained.len()).unwrap_or(u64::MAX)
+    {
+        retained.extend_from_slice(b"<TRUNCATED>");
+        let suffix_start = capture
+            .suffix
+            .len()
+            .saturating_sub(PROBE_DIAGNOSTIC_EDGE_BYTES);
+        retained.extend_from_slice(&capture.suffix[suffix_start..]);
+    }
+    format!(
+        "bytes={},sha256={},retained={:?}",
+        capture.total_bytes,
+        capture.sha256.hex(),
+        String::from_utf8_lossy(&retained),
+    )
+}
+
+fn supervised_status_diagnostic(status: Option<i32>) -> String {
+    status.map_or_else(
+        || "none".to_owned(),
+        |code| format!("{code} (0x{:08x})", code.cast_unsigned()),
+    )
+}
+
+fn supervised_phase_diagnostic(phases: &[SupervisedPhaseTiming]) -> String {
+    phases
+        .iter()
+        .map(|phase| format!("{}={}ms", phase.name, phase.elapsed.as_millis()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct CapturedProcess {
     status: ExitStatus,
     stdout: BoundedCapture,
     stderr: BoundedCapture,
     timed_out: bool,
     duration: Duration,
+}
+
+struct QuiescenceGuard {
+    policy: Option<CandidateLaunchPolicy>,
+}
+
+impl QuiescenceGuard {
+    fn new(policy: Option<CandidateLaunchPolicy>) -> Self {
+        Self { policy }
+    }
 }
 
 /// Result of a structured host command run under process-tree supervision.
@@ -14746,6 +19166,213 @@ pub struct SupervisedOutput {
     pub stderr: BoundedCapture,
     pub timed_out: bool,
     pub termination: Option<TerminationReport>,
+    pub phase_timings: Vec<SupervisedPhaseTiming>,
+    pub prelaunch_evidence: Option<String>,
+    pub candidate_quiescence_complete: bool,
+    #[cfg(windows)]
+    pub windows_launch_control: Option<WindowsLaunchControlReceipt>,
+}
+
+/// Authenticated terminal receipt for the Windows restricted-launch control plane.
+///
+/// Successful launcher and argv-adapter phases are retained here instead of
+/// being mixed into the target program's stderr stream.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsLaunchControlReceipt {
+    pub schema_version: u64,
+    pub request_sha256: Digest,
+    pub state: &'static str,
+    pub phases: Arc<[&'static str]>,
+    pub bytes: u64,
+    pub sha256: Digest,
+    pub status_code: Option<i32>,
+    pub timed_out: bool,
+    pub termination_forced: bool,
+    pub termination_reaped: bool,
+    pub candidate_quiescence_complete: bool,
+    pub program: Option<PathBuf>,
+    pub program_bytes: Option<u64>,
+    pub program_sha256: Option<Digest>,
+    pub current_directory: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsLaunchControlReceipt {
+    fn encoded(&self) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        fn field(bytes: &mut Vec<u8>, value: &[u8]) {
+            bytes.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
+
+        fn path_field(bytes: &mut Vec<u8>, value: Option<&Path>) {
+            let encoded = value
+                .into_iter()
+                .flat_map(|path| path.as_os_str().encode_wide())
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            field(bytes, &encoded);
+        }
+
+        let mut encoded = b"windows-launch-control-v1".to_vec();
+        field(&mut encoded, &self.request_sha256.0);
+        field(&mut encoded, self.state.as_bytes());
+        for phase in self.phases.iter() {
+            field(&mut encoded, phase.as_bytes());
+        }
+        field(
+            &mut encoded,
+            &self.status_code.unwrap_or(i32::MIN).to_le_bytes(),
+        );
+        field(
+            &mut encoded,
+            &[
+                u8::from(self.timed_out),
+                u8::from(self.termination_forced),
+                u8::from(self.termination_reaped),
+                u8::from(self.candidate_quiescence_complete),
+            ],
+        );
+        path_field(&mut encoded, self.program.as_deref());
+        field(
+            &mut encoded,
+            &self.program_bytes.unwrap_or(u64::MAX).to_le_bytes(),
+        );
+        field(&mut encoded, &self.program_sha256.unwrap_or_default().0);
+        path_field(&mut encoded, Some(&self.current_directory));
+        encoded
+    }
+
+    /// Revalidates the bounded authenticated control receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when its schema, terminal state, byte count, digest,
+    /// phase inventory, program authority, or canonical cwd differs.
+    pub fn validate(&self) -> std::io::Result<()> {
+        let encoded = self.encoded();
+        if self.schema_version != 1
+            || !matches!(self.state, "completed" | "failed")
+            || (self.state == "completed" && self.phases.as_ref() != WINDOWS_LAUNCH_CONTROL_PHASES)
+            || (self.state == "failed" && !self.phases.is_empty())
+            || self.bytes != u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+            || self.sha256 != sha256_bytes(&encoded)
+            || (self.state == "completed"
+                && (self.status_code != Some(0)
+                    || self.timed_out
+                    || !self.termination_reaped
+                    || !self.candidate_quiescence_complete))
+            || fs::canonicalize(&self.current_directory)? != self.current_directory
+            || self.program.is_some() != self.program_bytes.is_some()
+            || self.program.is_some() != self.program_sha256.is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows restricted launch control receipt differs",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisedPhaseTiming {
+    pub name: &'static str,
+    pub elapsed: Duration,
+}
+
+/// Identifies one supervised child output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisedOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// One bounded child-output progress record.
+#[derive(Debug)]
+pub struct SupervisedProgressChunk {
+    pub stream: SupervisedOutputStream,
+    pub bytes: Vec<u8>,
+}
+
+/// Snapshot of progress records omitted because the bounded queue was full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupervisedProgressLoss {
+    pub chunks: u64,
+    pub bytes: u64,
+}
+
+/// Counter-only progress loss receipt that does not keep the output queue connected.
+#[derive(Clone)]
+pub struct SupervisedProgressLossReceipt {
+    dropped_chunks: Arc<AtomicU64>,
+    dropped_bytes: Arc<AtomicU64>,
+}
+
+impl SupervisedProgressLossReceipt {
+    #[must_use]
+    pub fn snapshot(&self) -> SupervisedProgressLoss {
+        SupervisedProgressLoss {
+            chunks: self.dropped_chunks.load(Ordering::Relaxed),
+            bytes: self.dropped_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Nonblocking bounded progress sink used by supervised capture readers.
+#[derive(Clone)]
+pub struct SupervisedProgressObserver {
+    sender: mpsc::SyncSender<SupervisedProgressChunk>,
+    dropped_chunks: Arc<AtomicU64>,
+    dropped_bytes: Arc<AtomicU64>,
+}
+
+impl SupervisedProgressObserver {
+    #[must_use]
+    pub fn bounded(capacity: usize) -> (Self, mpsc::Receiver<SupervisedProgressChunk>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        (
+            Self {
+                sender,
+                dropped_chunks: Arc::new(AtomicU64::new(0)),
+                dropped_bytes: Arc::new(AtomicU64::new(0)),
+            },
+            receiver,
+        )
+    }
+
+    fn observe(&self, stream: SupervisedOutputStream, bytes: &[u8]) {
+        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self
+            .sender
+            .try_send(SupervisedProgressChunk {
+                stream,
+                bytes: bytes.to_vec(),
+            })
+            .is_err()
+        {
+            self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+            self.dropped_bytes.fetch_add(length, Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn loss(&self) -> SupervisedProgressLoss {
+        SupervisedProgressLoss {
+            chunks: self.dropped_chunks.load(Ordering::Relaxed),
+            bytes: self.dropped_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    #[must_use]
+    pub fn loss_receipt(&self) -> SupervisedProgressLossReceipt {
+        SupervisedProgressLossReceipt {
+            dropped_chunks: Arc::clone(&self.dropped_chunks),
+            dropped_bytes: Arc::clone(&self.dropped_bytes),
+        }
+    }
 }
 
 /// Runs an already-structured command with concurrent bounded capture.
@@ -14764,7 +19391,10 @@ pub fn run_supervised_command(
     input: &[u8],
     timeout: Duration,
 ) -> std::io::Result<SupervisedOutput> {
-    run_supervised_command_inner(command, input, timeout, None)
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::other("process deadline overflowed"))?;
+    run_supervised_command_inner(command, input, deadline, None, None, None, None)
 }
 
 /// Runs a structured command while preserving one separately bound logical
@@ -14780,92 +19410,834 @@ pub fn run_supervised_command_with_bound_program(
     timeout: Duration,
     bound_program: &BoundProgramInvocation,
 ) -> std::io::Result<SupervisedOutput> {
-    run_supervised_command_inner(command, input, timeout, Some(bound_program))
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::other("process deadline overflowed"))?;
+    run_supervised_command_inner(
+        command,
+        input,
+        deadline,
+        None,
+        Some(bound_program),
+        None,
+        None,
+    )
+}
+
+/// Runs a structured command under exact absolute execution and completion deadlines.
+///
+/// # Errors
+///
+/// Returns an error when launch, capture, termination, or cleanup exceeds the
+/// supplied absolute boundaries.
+pub fn run_supervised_command_until(
+    command: &mut Command,
+    input: &[u8],
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+    progress: Option<SupervisedProgressObserver>,
+) -> std::io::Result<SupervisedOutput> {
+    run_supervised_command_inner(
+        command,
+        input,
+        execution_deadline,
+        Some(completion_deadline),
+        None,
+        None,
+        progress,
+    )
+}
+
+/// Runs a structured command with one already-completed diagnostic receipt.
+///
+/// This external-verifier seam proves that optional diagnostic availability
+/// cannot consume or replace the independently supplied semantic deadlines.
+///
+/// # Errors
+///
+/// Returns an error only for semantic launch, capture, termination, or cleanup
+/// failure; the diagnostic text is retained as evidence and is never a gate.
+#[doc(hidden)]
+pub fn run_supervised_command_with_prelaunch_evidence_until(
+    command: &mut Command,
+    input: &[u8],
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+    prelaunch_evidence: &str,
+) -> std::io::Result<SupervisedOutput> {
+    run_supervised_command_inner(
+        command,
+        input,
+        execution_deadline,
+        Some(completion_deadline),
+        None,
+        Some(prelaunch_evidence.to_owned()),
+        None,
+    )
+    .map_err(|primary| compose_prelaunch_evidence_error(primary, Some(prelaunch_evidence)))
+}
+
+/// Runs a bound structured command under exact absolute execution and cleanup deadlines.
+///
+/// # Errors
+///
+/// Returns an error when the bound invocation changes or any supervised phase
+/// exceeds the supplied absolute boundaries.
+pub fn run_supervised_command_with_bound_program_until(
+    command: &mut Command,
+    input: &[u8],
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+    bound_program: &BoundProgramInvocation,
+    progress: Option<SupervisedProgressObserver>,
+) -> std::io::Result<SupervisedOutput> {
+    run_supervised_command_inner(
+        command,
+        input,
+        execution_deadline,
+        Some(completion_deadline),
+        Some(bound_program),
+        None,
+        progress,
+    )
+}
+
+fn record_supervised_phase(
+    timings: &mut Vec<SupervisedPhaseTiming>,
+    started: Instant,
+    name: &'static str,
+) {
+    timings.push(SupervisedPhaseTiming {
+        name,
+        elapsed: started.elapsed(),
+    });
 }
 
 fn run_supervised_command_inner(
     command: &mut Command,
     input: &[u8],
-    timeout: Duration,
+    execution_deadline: Instant,
+    completion_deadline: Option<Instant>,
     bound_program: Option<&BoundProgramInvocation>,
+    prelaunch_evidence: Option<String>,
+    progress: Option<SupervisedProgressObserver>,
 ) -> std::io::Result<SupervisedOutput> {
-    struct QuiescenceGuard(Option<CandidateLaunchPolicy>);
-    impl Drop for QuiescenceGuard {
-        fn drop(&mut self) {
-            if let Some(policy) = self.0.take() {
-                let _ = policy.require_quiescence();
-            }
-        }
-    }
+    let started = Instant::now();
+    let mut phase_timings = Vec::with_capacity(12);
 
+    require_before_deadline(execution_deadline, "bound revalidation")?;
     if let Some(identity) = bound_program {
         identity.revalidate(command.get_program())?;
     }
+    record_supervised_phase(&mut phase_timings, started, "bound-revalidated");
     let launch_policy = CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().clone());
+    if prelaunch_evidence.is_some() {
+        record_supervised_phase(&mut phase_timings, started, "prelaunch-evidence-attached");
+    }
+    require_before_deadline(execution_deadline, "launch policy wrapping")?;
+    #[cfg(windows)]
+    let windows_launch_control = launch_policy
+        .as_ref()
+        .map(|policy| policy.wrap_with_control(command, bound_program, execution_deadline))
+        .transpose()?;
+    #[cfg(not(windows))]
     if let Some(policy) = &launch_policy {
         policy.wrap(command, bound_program)?;
     }
-    let mut quiescence = QuiescenceGuard(launch_policy);
+    record_supervised_phase(&mut phase_timings, started, "policy-wrapped");
+    let mut quiescence = QuiescenceGuard::new(launch_policy);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let _ = completion_reaper_sender()?;
+    require_before_deadline(execution_deadline, "child spawn")?;
     let mut child = SupervisedChild::spawn(command)?;
+    record_supervised_phase(&mut phase_timings, started, "child-spawned");
 
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| std::io::Error::other("piped child stdout was unavailable"))?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| std::io::Error::other("piped child stderr was unavailable"))?;
-    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
-    let stdin = child.take_stdin();
-    let input = input.to_vec();
-    let stdin_writer = std::thread::spawn(move || {
-        if let Some(mut stdin) = stdin {
-            stdin.write_all(&input)?;
-        }
-        Ok::<(), std::io::Error>(())
-    });
-
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| std::io::Error::other("process deadline overflowed"))?;
-    let (status, timed_out, termination) = match child.wait_until(deadline)? {
-        WaitOutcome::Exited(status) => {
-            // A leader may exit while descendants retain pipe handles. Close
-            // the complete group/job before joining readers, while preserving
-            // the leader's status as the observed result.
-            let (_, cleanup) = child.terminate()?;
-            (status, false, Some(cleanup))
-        }
-        WaitOutcome::DeadlineExpired => {
-            let (status, termination) = child.terminate()?;
-            if !termination.reaped {
-                return Err(std::io::Error::other(
-                    "timed-out process tree was not completely reaped",
-                ));
-            }
-            (status, true, Some(termination))
-        }
+    let cleanup_deadline = completion_deadline.unwrap_or(execution_deadline);
+    let io = spawn_supervised_io_with_cleanup(
+        &mut child,
+        &mut quiescence,
+        input,
+        progress,
+        cleanup_deadline,
+    )?;
+    let io_receipt = io.receipt.clone();
+    record_supervised_phase(&mut phase_timings, started, "deadline-started");
+    let wait = wait_supervised_child_until(
+        &mut child,
+        &mut quiescence,
+        execution_deadline,
+        cleanup_deadline,
+    )
+    .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
+    let (status, timed_out, termination) = finish_supervised_wait(
+        &wait,
+        &mut child,
+        &mut quiescence,
+        cleanup_deadline,
+        &io_receipt,
+        &mut phase_timings,
+        started,
+    )?;
+    require_before_deadline(cleanup_deadline, "process-tree quiescence").map_err(|error| {
+        with_quiescence_after_error(error, &mut quiescence, cleanup_deadline, &io_receipt)
+    })?;
+    let candidate_quiescence_complete = if let Some(policy) = quiescence.policy.take() {
+        require_candidate_quiescence(&policy, cleanup_deadline)
+            .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
+        true
+    } else {
+        false
     };
-    if let Some(policy) = quiescence.0.take() {
-        policy.require_quiescence()?;
-    }
-    let stdout = join_reader(stdout_reader, "stdout")?;
-    let stderr = join_reader(stderr_reader, "stderr")?;
-    stdin_writer
-        .join()
-        .map_err(|_| std::io::Error::other("stdin writer thread panicked"))??;
-    let output = SupervisedOutput {
+    record_supervised_phase(&mut phase_timings, started, "quiescence-complete");
+    let stdout = join_reader_until(io.stdout, "stdout", completion_deadline)
+        .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
+    record_supervised_phase(&mut phase_timings, started, "stdout-joined");
+    let stderr = join_reader_until(io.stderr, "stderr", completion_deadline)
+        .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
+    record_supervised_phase(&mut phase_timings, started, "stderr-joined");
+    join_writer_until(io.stdin, completion_deadline)
+        .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
+    record_supervised_phase(&mut phase_timings, started, "stdin-joined");
+    #[cfg(windows)]
+    let windows_launch_control = windows_launch_control
+        .map(|authority| {
+            authority.complete(
+                status,
+                timed_out,
+                termination,
+                candidate_quiescence_complete,
+            )
+        })
+        .transpose()?;
+    Ok(SupervisedOutput {
         status,
         stdout,
         stderr,
         timed_out,
         termination,
+        phase_timings,
+        prelaunch_evidence,
+        candidate_quiescence_complete,
+        #[cfg(windows)]
+        windows_launch_control,
+    })
+}
+
+fn finish_supervised_wait(
+    wait: &WaitOutcome,
+    child: &mut SupervisedChild,
+    quiescence: &mut QuiescenceGuard,
+    cleanup_deadline: Instant,
+    io_receipt: &SupervisedIoReceipt,
+    phase_timings: &mut Vec<SupervisedPhaseTiming>,
+    started: Instant,
+) -> std::io::Result<(std::process::ExitStatus, bool, Option<TerminationReport>)> {
+    match wait {
+        WaitOutcome::Exited(status) => {
+            record_supervised_phase(phase_timings, started, "leader-exited");
+            // A leader may exit while descendants retain pipe handles. Close
+            // the complete group/job before joining readers, while preserving
+            // the leader's status as the observed result.
+            let (_, cleanup) = child.terminate_until(cleanup_deadline).map_err(|error| {
+                with_quiescence_after_error(error, quiescence, cleanup_deadline, io_receipt)
+            })?;
+            record_supervised_phase(phase_timings, started, "tree-terminated");
+            Ok((*status, false, Some(cleanup)))
+        }
+        WaitOutcome::DeadlineExpired => {
+            record_supervised_phase(phase_timings, started, "deadline-expired");
+            let (status, termination) =
+                child.terminate_until(cleanup_deadline).map_err(|error| {
+                    with_quiescence_after_error(error, quiescence, cleanup_deadline, io_receipt)
+                })?;
+            record_supervised_phase(phase_timings, started, "tree-terminated");
+            if !termination.reaped {
+                return Err(std::io::Error::other(
+                    "timed-out process tree was not completely reaped",
+                ));
+            }
+            Ok((status, true, Some(termination)))
+        }
+    }
+}
+
+fn spawn_supervised_io_with_cleanup(
+    child: &mut SupervisedChild,
+    quiescence: &mut QuiescenceGuard,
+    input: &[u8],
+    progress: Option<SupervisedProgressObserver>,
+    cleanup_deadline: Instant,
+) -> std::io::Result<SupervisedIoTasks> {
+    match spawn_supervised_io_with_probe(child, input, progress, SupervisedIoProbe::None) {
+        Ok(io) => Ok(io),
+        Err(primary) => {
+            let cleanup = cleanup_supervised_child_after_error(child, quiescence, cleanup_deadline);
+            Err(compose_supervised_cleanup_error(primary, cleanup))
+        }
+    }
+}
+
+fn wait_supervised_child_until(
+    child: &mut SupervisedChild,
+    quiescence: &mut QuiescenceGuard,
+    execution_deadline: Instant,
+    cleanup_deadline: Instant,
+) -> std::io::Result<WaitOutcome> {
+    match child.wait_until(execution_deadline) {
+        Ok(wait) => Ok(wait),
+        Err(primary) => {
+            let cleanup = cleanup_supervised_child_after_error(child, quiescence, cleanup_deadline);
+            Err(compose_supervised_cleanup_error(primary, cleanup))
+        }
+    }
+}
+
+fn cleanup_supervised_child_after_error(
+    child: &mut SupervisedChild,
+    quiescence: &mut QuiescenceGuard,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let process = child.terminate_until(deadline).map(|_| ());
+    let policy = match quiescence.policy.take() {
+        Some(policy) => require_candidate_quiescence(&policy, deadline),
+        None => Ok(()),
     };
-    Ok(output)
+    match (process, policy) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(process), Ok(())) => Err(process),
+        (Ok(()), Err(policy)) => Err(policy),
+        (Err(process), Err(policy)) => Err(std::io::Error::new(
+            process.kind(),
+            CompositeSupervisedCleanupError {
+                primary: process,
+                cleanup: policy,
+            },
+        )),
+    }
+}
+
+fn with_quiescence_after_error(
+    primary: std::io::Error,
+    quiescence: &mut QuiescenceGuard,
+    deadline: Instant,
+    io: &SupervisedIoReceipt,
+) -> std::io::Error {
+    let cleanup = match quiescence.policy.take() {
+        Some(policy) => require_candidate_quiescence(&policy, deadline),
+        None => Ok(()),
+    };
+    with_supervised_io_receipt(compose_supervised_cleanup_error(primary, cleanup), io)
+}
+
+fn compose_supervised_cleanup_error(
+    primary: std::io::Error,
+    cleanup: std::io::Result<()>,
+) -> std::io::Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => {
+            let kind = primary.kind();
+            std::io::Error::new(kind, CompositeSupervisedCleanupError { primary, cleanup })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompositeSupervisedCleanupError {
+    primary: std::io::Error,
+    cleanup: std::io::Error,
+}
+
+impl std::fmt::Display for CompositeSupervisedCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; supervised cleanup also failed: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for CompositeSupervisedCleanupError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CandidateQuiescenceState {
+    Owned,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CandidateQuiescenceReceipt {
+    state: Arc<Mutex<CandidateQuiescenceState>>,
+}
+
+impl CandidateQuiescenceReceipt {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CandidateQuiescenceState::Owned)),
+        }
+    }
+
+    fn finish(&self, state: CandidateQuiescenceState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+
+    #[must_use]
+    pub fn state(&self) -> CandidateQuiescenceState {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug)]
+struct CandidateQuiescenceError {
+    primary: std::io::Error,
+    receipt: CandidateQuiescenceReceipt,
+}
+
+impl std::fmt::Display for CandidateQuiescenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.primary.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CandidateQuiescenceError {}
+
+fn require_candidate_quiescence(
+    policy: &CandidateLaunchPolicy,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let receipt = CandidateQuiescenceReceipt::new();
+    match policy.require_quiescence(deadline) {
+        Ok(()) => {
+            receipt.finish(CandidateQuiescenceState::Completed);
+            Ok(())
+        }
+        Err(primary) => {
+            receipt.finish(CandidateQuiescenceState::Failed(primary.to_string()));
+            let kind = primary.kind();
+            Err(std::io::Error::new(
+                kind,
+                CandidateQuiescenceError { primary, receipt },
+            ))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SupervisedLifecycleError {
+    primary: std::io::Error,
+    process: Option<RetainedTerminationReceipt>,
+    io: SupervisedIoReceipt,
+}
+
+impl std::fmt::Display for SupervisedLifecycleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.primary.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SupervisedLifecycleError {}
+
+fn with_supervised_io_receipt(primary: std::io::Error, io: &SupervisedIoReceipt) -> std::io::Error {
+    let kind = primary.kind();
+    let process = retained_termination_receipt_inner(&primary);
+    std::io::Error::new(
+        kind,
+        SupervisedLifecycleError {
+            primary,
+            process,
+            io: io.clone(),
+        },
+    )
+}
+
+fn retained_termination_receipt_inner(
+    error: &std::io::Error,
+) -> Option<RetainedTerminationReceipt> {
+    if let Some(receipt) = hell_platform::retained_termination_receipt(error) {
+        return Some(receipt);
+    }
+    let source = error.get_ref()?;
+    if let Some(lifecycle) = source.downcast_ref::<SupervisedLifecycleError>() {
+        return lifecycle
+            .process
+            .clone()
+            .or_else(|| retained_termination_receipt_inner(&lifecycle.primary));
+    }
+    if let Some(evidence) = source.downcast_ref::<PrelaunchEvidenceError>() {
+        return retained_termination_receipt_inner(&evidence.primary);
+    }
+    if let Some(quiescence) = source.downcast_ref::<CandidateQuiescenceError>() {
+        return retained_termination_receipt_inner(&quiescence.primary);
+    }
+    source
+        .downcast_ref::<CompositeSupervisedCleanupError>()
+        .and_then(|composite| {
+            retained_termination_receipt_inner(&composite.cleanup)
+                .or_else(|| retained_termination_receipt_inner(&composite.primary))
+        })
+}
+
+/// Extracts typed retained process cleanup ownership through composed supervision errors.
+#[must_use]
+pub fn retained_termination_receipt(error: &std::io::Error) -> Option<RetainedTerminationReceipt> {
+    retained_termination_receipt_inner(error)
+}
+
+/// Extracts the durable stdout/stderr/stdin terminal receipt from a supervision error.
+#[must_use]
+pub fn supervised_io_receipt(error: &std::io::Error) -> Option<SupervisedIoReceipt> {
+    let source = error.get_ref()?;
+    if let Some(lifecycle) = source.downcast_ref::<SupervisedLifecycleError>() {
+        return Some(lifecycle.io.clone());
+    }
+    if let Some(evidence) = source.downcast_ref::<PrelaunchEvidenceError>() {
+        return supervised_io_receipt(&evidence.primary);
+    }
+    if let Some(quiescence) = source.downcast_ref::<CandidateQuiescenceError>() {
+        return supervised_io_receipt(&quiescence.primary);
+    }
+    source
+        .downcast_ref::<CompositeSupervisedCleanupError>()
+        .and_then(|composite| {
+            supervised_io_receipt(&composite.cleanup)
+                .or_else(|| supervised_io_receipt(&composite.primary))
+        })
+}
+
+/// Extracts the exact terminal candidate-quiescence receipt from a supervision error.
+#[must_use]
+pub fn candidate_quiescence_receipt(error: &std::io::Error) -> Option<CandidateQuiescenceReceipt> {
+    let source = error.get_ref()?;
+    if let Some(quiescence) = source.downcast_ref::<CandidateQuiescenceError>() {
+        return Some(quiescence.receipt.clone());
+    }
+    if let Some(lifecycle) = source.downcast_ref::<SupervisedLifecycleError>() {
+        return candidate_quiescence_receipt(&lifecycle.primary);
+    }
+    if let Some(evidence) = source.downcast_ref::<PrelaunchEvidenceError>() {
+        return candidate_quiescence_receipt(&evidence.primary);
+    }
+    source
+        .downcast_ref::<CompositeSupervisedCleanupError>()
+        .and_then(|composite| {
+            candidate_quiescence_receipt(&composite.cleanup)
+                .or_else(|| candidate_quiescence_receipt(&composite.primary))
+        })
+}
+
+struct SupervisedIoTasks {
+    stdout: CompletionTask<std::io::Result<BoundedCapture>>,
+    stderr: CompletionTask<std::io::Result<BoundedCapture>>,
+    stdin: CompletionTask<std::io::Result<()>>,
+    receipt: SupervisedIoReceipt,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SupervisedIoProbe {
+    None,
+    FailStderrLaunch,
+    FailStdinLaunch,
+    PanicStdout,
+}
+
+fn spawn_supervised_io_with_probe(
+    child: &mut SupervisedChild,
+    input: &[u8],
+    progress: Option<SupervisedProgressObserver>,
+    probe: SupervisedIoProbe,
+) -> std::io::Result<SupervisedIoTasks> {
+    let cleanup = child.cleanup_lease()?;
+    let receipt = SupervisedIoReceipt::new();
+    let stdout = child.take_stdout().ok_or_else(|| {
+        receipt.set_state(
+            Some(SupervisedOutputStream::Stdout),
+            SupervisedIoTaskState::LaunchFailed,
+        );
+        receipt.abort_not_started();
+        with_supervised_io_receipt(
+            std::io::Error::other("piped child stdout was unavailable"),
+            &receipt,
+        )
+    })?;
+    let stderr = child.take_stderr().ok_or_else(|| {
+        receipt.set_state(
+            Some(SupervisedOutputStream::Stderr),
+            SupervisedIoTaskState::LaunchFailed,
+        );
+        receipt.abort_not_started();
+        with_supervised_io_receipt(
+            std::io::Error::other("piped child stderr was unavailable"),
+            &receipt,
+        )
+    })?;
+    let stdout = spawn_supervised_reader(
+        "hell-supervised-stdout",
+        stdout,
+        SupervisedOutputStream::Stdout,
+        cleanup.clone(),
+        progress.clone(),
+        &receipt,
+        probe == SupervisedIoProbe::PanicStdout,
+    )?;
+    if probe == SupervisedIoProbe::FailStderrLaunch {
+        receipt.set_state(
+            Some(SupervisedOutputStream::Stderr),
+            SupervisedIoTaskState::LaunchFailed,
+        );
+        receipt.abort_not_started();
+        return Err(with_supervised_io_receipt(
+            std::io::Error::other("injected supervised stderr worker launch failure"),
+            &receipt,
+        ));
+    }
+    let stderr = spawn_supervised_reader(
+        "hell-supervised-stderr",
+        stderr,
+        SupervisedOutputStream::Stderr,
+        cleanup.clone(),
+        progress,
+        &receipt,
+        false,
+    )?;
+    if probe == SupervisedIoProbe::FailStdinLaunch {
+        receipt.set_state(None, SupervisedIoTaskState::LaunchFailed);
+        receipt.abort_not_started();
+        return Err(with_supervised_io_receipt(
+            std::io::Error::other("injected supervised stdin worker launch failure"),
+            &receipt,
+        ));
+    }
+    let stdin = spawn_supervised_writer(child.take_stdin(), input, cleanup, &receipt)?;
+    Ok(SupervisedIoTasks {
+        stdout,
+        stderr,
+        stdin,
+        receipt,
+    })
+}
+
+fn spawn_supervised_reader<R: Read + Send + 'static>(
+    name: &str,
+    reader: R,
+    stream: SupervisedOutputStream,
+    cleanup: CleanupLease,
+    progress: Option<SupervisedProgressObserver>,
+    receipt: &SupervisedIoReceipt,
+    panic_before_read: bool,
+) -> std::io::Result<CompletionTask<std::io::Result<BoundedCapture>>> {
+    let task_receipt = receipt.clone();
+    receipt.set_state(Some(stream), SupervisedIoTaskState::Owned);
+    CompletionTask::spawn(name, cleanup, move || {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(!panic_before_read, "injected supervised reader panic");
+            read_bounded_with_progress(reader, stream, progress.as_ref())
+        })) {
+            Ok(result) => {
+                task_receipt.finish_capture(stream, &result);
+                result
+            }
+            Err(panic) => {
+                task_receipt.mark_panicked(Some(stream));
+                std::panic::resume_unwind(panic)
+            }
+        }
+    })
+    .map_err(|error| {
+        receipt.set_state(Some(stream), SupervisedIoTaskState::LaunchFailed);
+        receipt.abort_not_started();
+        with_supervised_io_receipt(error, receipt)
+    })
+}
+
+fn spawn_supervised_writer(
+    stdin: Option<ChildStdin>,
+    input: &[u8],
+    cleanup: CleanupLease,
+    receipt: &SupervisedIoReceipt,
+) -> std::io::Result<CompletionTask<std::io::Result<()>>> {
+    let input = input.to_vec();
+    let task_receipt = receipt.clone();
+    receipt.set_state(None, SupervisedIoTaskState::Owned);
+    CompletionTask::spawn("hell-supervised-stdin", cleanup, move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_supervised_input(stdin, &input)
+        }));
+        match outcome {
+            Ok(result) => {
+                task_receipt.finish_stdin(&result);
+                result
+            }
+            Err(panic) => {
+                task_receipt.mark_panicked(None);
+                std::panic::resume_unwind(panic)
+            }
+        }
+    })
+    .map_err(|error| {
+        receipt.set_state(None, SupervisedIoTaskState::LaunchFailed);
+        receipt.abort_not_started();
+        with_supervised_io_receipt(error, receipt)
+    })
+}
+
+fn write_supervised_input(mut stdin: Option<ChildStdin>, input: &[u8]) -> std::io::Result<()> {
+    let Some(stdin) = stdin.as_mut() else {
+        return Ok(());
+    };
+    match stdin.write_all(input) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Verifies deterministic bounded progress-loss accounting through an external test seam.
+///
+/// # Errors
+///
+/// Returns an error when the retained chunk or exact loss receipt differs.
+#[doc(hidden)]
+pub fn verify_supervised_progress_loss_for_integration() -> Result<(), String> {
+    let (progress, receiver) = SupervisedProgressObserver::bounded(1);
+    progress.observe(SupervisedOutputStream::Stdout, b"first");
+    progress.observe(SupervisedOutputStream::Stderr, b"second");
+    let retained = receiver
+        .try_recv()
+        .map_err(|error| format!("bounded progress queue lost retained chunk: {error}"))?;
+    if retained.stream != SupervisedOutputStream::Stdout
+        || retained.bytes != b"first"
+        || progress.loss()
+            != (SupervisedProgressLoss {
+                chunks: 1,
+                bytes: 6,
+            })
+    {
+        return Err("bounded progress queue loss accounting drifted".to_owned());
+    }
+    Ok(())
+}
+
+/// Verifies bounded supervised-process diagnostics through an external test seam.
+///
+/// # Errors
+///
+/// Returns an error when escaping, truncation, status, or phase-order evidence drifts.
+#[doc(hidden)]
+pub fn verify_supervised_diagnostics_for_integration() -> Result<(), String> {
+    let mut bytes = vec![b'x'; PROBE_DIAGNOSTIC_EDGE_BYTES * 3];
+    bytes.extend_from_slice(b"\n\x1b[31mchild-control\r\n");
+    let diagnostic = bounded_probe_capture_diagnostic(&BoundedCapture::from_bytes(bytes));
+    if !diagnostic.contains("bytes=")
+        || !diagnostic.contains("sha256=")
+        || !diagnostic.contains("<TRUNCATED>")
+        || diagnostic.contains('\n')
+        || diagnostic.len() >= PROBE_DIAGNOSTIC_EDGE_BYTES * 5
+        || supervised_status_diagnostic(Some(-1_073_740_791)) != "-1073740791 (0xc0000409)"
+        || supervised_status_diagnostic(None) != "none"
+    {
+        return Err("bounded supervised capture diagnostic drifted".to_owned());
+    }
+    let phases = [
+        SupervisedPhaseTiming {
+            name: "prelaunch-evidence-attached",
+            elapsed: Duration::from_millis(2),
+        },
+        SupervisedPhaseTiming {
+            name: "deadline-started",
+            elapsed: Duration::from_millis(9),
+        },
+    ];
+    if supervised_phase_diagnostic(&phases)
+        != "prelaunch-evidence-attached=2ms,deadline-started=9ms"
+    {
+        return Err("supervised phase diagnostic lost typed order or elapsed time".to_owned());
+    }
+    verify_supervised_progress_loss_for_integration()?;
+    #[cfg(unix)]
+    verify_supervised_io_failure_receipts_for_integration()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_supervised_io_failure_receipts_for_integration() -> Result<(), String> {
+    for (probe, expected_stderr, expected_stdin) in [
+        (
+            SupervisedIoProbe::FailStderrLaunch,
+            SupervisedIoTaskState::LaunchFailed,
+            SupervisedIoTaskState::AbortedBeforeLaunch,
+        ),
+        (
+            SupervisedIoProbe::FailStdinLaunch,
+            SupervisedIoTaskState::Completed,
+            SupervisedIoTaskState::LaunchFailed,
+        ),
+    ] {
+        let mut command = Command::new("/usr/bin/true");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = SupervisedChild::spawn(&mut command)
+            .map_err(|error| format!("cannot spawn supervised I/O launch fixture: {error}"))?;
+        let Err(error) = spawn_supervised_io_with_probe(&mut child, &[], None, probe) else {
+            return Err("injected supervised I/O launch unexpectedly succeeded".to_owned());
+        };
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or_else(|| "supervised I/O launch fixture deadline overflowed".to_owned())?;
+        child
+            .terminate_until(deadline)
+            .map_err(|error| format!("cannot terminate supervised I/O launch fixture: {error}"))?;
+        let receipt = supervised_io_receipt(&error)
+            .ok_or_else(|| "supervised I/O launch failure lost its typed receipt".to_owned())?;
+        let snapshot = receipt.wait_until(deadline);
+        if snapshot.stdout.state != SupervisedIoTaskState::Completed
+            || snapshot.stderr.state != expected_stderr
+            || snapshot.stdin.state != expected_stdin
+        {
+            return Err("partial supervised I/O launch lost its exact terminal states".to_owned());
+        }
+    }
+
+    let mut command = Command::new("/usr/bin/true");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = SupervisedChild::spawn(&mut command)
+        .map_err(|error| format!("cannot spawn supervised I/O panic fixture: {error}"))?;
+    let tasks =
+        spawn_supervised_io_with_probe(&mut child, &[], None, SupervisedIoProbe::PanicStdout)
+            .map_err(|error| format!("cannot launch supervised I/O panic fixture: {error}"))?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "supervised I/O panic fixture deadline overflowed".to_owned())?;
+    child
+        .terminate_until(deadline)
+        .map_err(|error| format!("cannot terminate supervised I/O panic fixture: {error}"))?;
+    let stdout = join_reader_until(tasks.stdout, "stdout", Some(deadline));
+    let _ = join_reader_until(tasks.stderr, "stderr", Some(deadline));
+    let _ = join_writer_until(tasks.stdin, Some(deadline));
+    let snapshot = tasks.receipt.wait_until(deadline);
+    if stdout.is_ok()
+        || snapshot.stdout.state != SupervisedIoTaskState::Panicked
+        || snapshot.stderr.state != SupervisedIoTaskState::Completed
+        || snapshot.stdin.state != SupervisedIoTaskState::Completed
+    {
+        return Err("supervised I/O worker panic lost its typed terminal receipt".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -15044,6 +20416,14 @@ fn typed_result_target(case: &DifferentialCase) -> std::io::Result<Option<TypedR
 }
 
 fn read_bounded(mut reader: impl Read) -> std::io::Result<BoundedCapture> {
+    read_bounded_with_progress(&mut reader, SupervisedOutputStream::Stdout, None)
+}
+
+fn read_bounded_with_progress(
+    mut reader: impl Read,
+    stream: SupervisedOutputStream,
+    progress: Option<&SupervisedProgressObserver>,
+) -> std::io::Result<BoundedCapture> {
     let mut digest = Sha256::new();
     let mut complete = Vec::new();
     let mut prefix = Vec::with_capacity(CAPTURE_EDGE_BYTES);
@@ -15056,6 +20436,9 @@ fn read_bounded(mut reader: impl Read) -> std::io::Result<BoundedCapture> {
             break;
         }
         let bytes = &buffer[..read];
+        if let Some(progress) = progress {
+            progress.observe(stream, bytes);
+        }
         digest.update(bytes);
         total_bytes = total_bytes
             .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
@@ -15083,13 +20466,131 @@ fn read_bounded(mut reader: impl Read) -> std::io::Result<BoundedCapture> {
     })
 }
 
-fn join_reader(
-    reader: std::thread::JoinHandle<std::io::Result<BoundedCapture>>,
+struct CompletionTask<T: Send + 'static> {
+    completion: mpsc::Receiver<()>,
+    handle: Option<std::thread::JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> CompletionTask<T> {
+    fn spawn(
+        name: &str,
+        cleanup: CleanupLease,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (sender, completion) = mpsc::sync_channel(1);
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _cleanup = cleanup;
+                let result = operation();
+                let _ = sender.send(());
+                result
+            })?;
+        Ok(Self {
+            completion,
+            handle: Some(handle),
+        })
+    }
+
+    fn join_until(mut self, deadline: Option<Instant>, phase: &str) -> std::io::Result<T> {
+        let timed_out = deadline.is_some_and(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            remaining.is_zero()
+                || matches!(
+                    self.completion.recv_timeout(remaining),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                )
+        });
+        if timed_out {
+            retain_late_completion(
+                self.handle
+                    .take()
+                    .unwrap_or_else(|| panic!("supervised completion handle was already consumed")),
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("supervised {phase} exceeded its absolute deadline"),
+            ));
+        }
+        self.handle
+            .take()
+            .unwrap_or_else(|| panic!("supervised completion handle was already consumed"))
+            .join()
+            .map_err(|_| std::io::Error::other(format!("{phase} thread panicked")))
+    }
+}
+
+impl<T: Send + 'static> Drop for CompletionTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            retain_late_completion(handle);
+        }
+    }
+}
+
+type LateCompletion = Box<dyn FnOnce() + Send>;
+
+fn completion_reaper_sender() -> std::io::Result<&'static mpsc::Sender<LateCompletion>> {
+    static REAPER: OnceLock<Result<mpsc::Sender<LateCompletion>, String>> = OnceLock::new();
+    match REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<LateCompletion>();
+        std::thread::Builder::new()
+            .name("hell-supervised-completion-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(completion) = receiver.recv() {
+                    completion();
+                }
+            })
+            .map_err(|error| format!("cannot start supervised completion reaper: {error}"))?;
+        Ok(sender)
+    }) {
+        Ok(sender) => Ok(sender),
+        Err(error) => Err(std::io::Error::other(error.clone())),
+    }
+}
+
+fn retain_late_completion<T: Send + 'static>(handle: std::thread::JoinHandle<T>) {
+    let completion: LateCompletion = Box::new(move || {
+        let _ = handle.join();
+    });
+    if let Ok(reaper) = completion_reaper_sender()
+        && let Err(disconnected) = reaper.send(completion)
+    {
+        // The executor thread has no panic path and its sender is retained for
+        // process lifetime. If the runtime is already tearing down, the I/O
+        // task itself still owns the lifecycle lease until it exits.
+        std::mem::forget(disconnected.0);
+    }
+}
+
+fn require_before_deadline(deadline: Instant, phase: &str) -> std::io::Result<()> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("supervised {phase} exceeded its absolute deadline"),
+        ))
+    }
+}
+
+fn join_reader_until(
+    reader: CompletionTask<std::io::Result<BoundedCapture>>,
     stream: &str,
+    deadline: Option<Instant>,
 ) -> std::io::Result<BoundedCapture> {
-    reader
-        .join()
-        .map_err(|_| std::io::Error::other(format!("{stream} reader thread panicked")))?
+    reader.join_until(deadline, stream)?
+}
+
+fn join_writer_until(
+    writer: CompletionTask<std::io::Result<()>>,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
+    match writer.join_until(deadline, "stdin writer")? {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn snapshot_filesystem(root: &Path) -> std::io::Result<Vec<FilesystemEntry>> {
@@ -15310,227 +20811,6 @@ impl Iterator for DeterministicUtf8 {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_restricted_environment_tests {
-    use super::{
-        CandidateLaunchPolicy, Command, WindowsLaunchAuthorities, WindowsToolchainAuthority,
-        WindowsToolchainExecutableAuthority, configure_windows_restricted_child_environment,
-        decode_windows_argv, sha256_file,
-    };
-    use std::collections::BTreeMap;
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    struct Fixture {
-        root: PathBuf,
-        stack: PathBuf,
-        cargo_proxy: PathBuf,
-        staged_cargo: PathBuf,
-        restricted_path: OsString,
-        system_root: OsString,
-        toolchain: WindowsToolchainAuthority,
-    }
-
-    impl Fixture {
-        fn new(label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "hell-windows-restricted-environment-{}-{label}",
-                std::process::id()
-            ));
-            fs::create_dir(&root).unwrap();
-            let tool_file = |directory: &str, name: &str, bytes: &[u8]| {
-                let directory = root.join(directory);
-                fs::create_dir_all(&directory).unwrap();
-                let path = directory.join(name);
-                fs::write(&path, bytes).unwrap();
-                fs::canonicalize(path).unwrap()
-            };
-            let cargo_proxy = tool_file("proxy-cargo", "cargo.exe", b"cargo proxy");
-            let rustc_proxy = tool_file("proxy-rustc", "rustc.exe", b"rustc proxy");
-            let source_cargo = tool_file("source-cargo", "cargo.exe", b"cargo");
-            let staged_cargo = tool_file("stage/bin", "cargo.exe", b"cargo");
-            let source_rustc = tool_file("source-rustc", "rustc.exe", b"rustc");
-            let staged_rustc = tool_file("stage/bin", "rustc.exe", b"rustc");
-            let stack = tool_file("unmapped", "stack.exe", b"stack");
-            let first = cargo_proxy.parent().unwrap().to_path_buf();
-            let second = source_cargo.parent().unwrap().to_path_buf();
-            let system32 = tool_file("Windows/System32", "kernel32.dll", b"system kernel")
-                .parent()
-                .unwrap()
-                .to_path_buf();
-            let system_root_path = system32.parent().unwrap().to_path_buf();
-            let entries = vec![
-                first.clone(),
-                second,
-                first,
-                system32,
-                system_root_path.clone(),
-            ];
-            let trusted_path = std::env::join_paths(&entries).unwrap();
-            let system_root = system_root_path.into_os_string();
-            let (inventory_root, inventory_files, inventory_directories) =
-                inventory(&root.join("stage"));
-            let mapping = |proxy: &Path, source: &Path, staged: &Path| {
-                WindowsToolchainExecutableAuthority::rustup_proxy(
-                    proxy.to_path_buf(),
-                    proxy.to_path_buf(),
-                    source.to_path_buf(),
-                    staged.to_path_buf(),
-                )
-            };
-            let toolchain = WindowsToolchainAuthority::new(
-                mapping(&cargo_proxy, &source_cargo, &staged_cargo),
-                mapping(&rustc_proxy, &source_rustc, &staged_rustc),
-                inventory_root,
-                inventory_files,
-                inventory_directories,
-                trusted_path.clone(),
-                system_root.clone(),
-            )
-            .unwrap();
-            let restricted_path = toolchain.restricted_child_path(&trusted_path).unwrap();
-
-            Self {
-                root,
-                stack,
-                cargo_proxy,
-                staged_cargo,
-                restricted_path,
-                system_root,
-                toolchain,
-            }
-        }
-
-        fn launch_policy(&self, label: &str) -> CandidateLaunchPolicy {
-            let launcher = self.root.join(format!("{label}-hell-ci.exe"));
-            let adapter = self.root.join(format!("{label}-hell-test-helper.exe"));
-            fs::write(&launcher, b"launcher").unwrap();
-            fs::write(&adapter, b"adapter").unwrap();
-            let launcher_sha256 = sha256_file(&launcher).unwrap();
-            let adapter_sha256 = sha256_file(&adapter).unwrap();
-            let authorities = WindowsLaunchAuthorities::new(
-                launcher,
-                launcher_sha256,
-                adapter,
-                adapter_sha256,
-                self.toolchain.clone(),
-            );
-            CandidateLaunchPolicy::windows(authorities, vec![self.root.clone()]).unwrap()
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.root).unwrap();
-        }
-    }
-
-    fn inventory(root: &Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
-        let root = fs::canonicalize(root).unwrap();
-        let mut files = Vec::new();
-        let mut directories = vec![root.clone()];
-        let mut pending = vec![root.clone()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(directory).unwrap() {
-                let path = fs::canonicalize(entry.unwrap().path()).unwrap();
-                if path.is_dir() {
-                    directories.push(path.clone());
-                    pending.push(path);
-                } else {
-                    files.push(path);
-                }
-            }
-        }
-        (root, files, directories)
-    }
-
-    fn explicit_environment(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
-        command
-            .get_envs()
-            .map(|(name, value)| (name.to_owned(), value.map(|value| value.to_owned())))
-            .collect()
-    }
-
-    #[test]
-    fn unmapped_stack_launch_keeps_system_root_without_inheriting_path() {
-        let fixture = Fixture::new("unmapped");
-        let policy = fixture.launch_policy("unmapped");
-        let mut command = Command::new(&fixture.stack);
-        policy.wrap(&mut command, None).unwrap();
-        let environment = explicit_environment(&command);
-
-        assert_eq!(environment.len(), 1);
-        assert_eq!(
-            environment.get(OsStr::new("PATH")).map(Option::as_ref),
-            None
-        );
-        assert_eq!(
-            environment
-                .get(OsStr::new("SystemRoot"))
-                .map(Option::as_ref),
-            Some(Some(&fixture.system_root))
-        );
-    }
-
-    #[test]
-    fn mapped_cargo_launch_rewrites_path_and_keeps_system_root() {
-        let fixture = Fixture::new("mapped");
-        let policy = fixture.launch_policy("mapped");
-        let mut command = Command::new(&fixture.cargo_proxy);
-        policy.wrap(&mut command, None).unwrap();
-        let environment = explicit_environment(&command);
-
-        assert_eq!(environment.len(), 2);
-        assert_eq!(
-            environment.get(OsStr::new("PATH")).map(Option::as_ref),
-            Some(Some(&fixture.restricted_path))
-        );
-        assert_eq!(
-            environment
-                .get(OsStr::new("SystemRoot"))
-                .map(Option::as_ref),
-            Some(Some(&fixture.system_root))
-        );
-        let encoded = command.get_args().nth(1).unwrap();
-        let target = decode_windows_argv(encoded).unwrap()[2].clone();
-        assert_eq!(target, fixture.staged_cargo.as_os_str());
-    }
-
-    #[test]
-    fn malformed_system_root_is_rejected_for_unmapped_launches() {
-        let fixture = Fixture::new("malformed");
-        let rejected = [
-            vec![(OsString::from("SystemRoot"), None)],
-            vec![(
-                OsString::from("SystemRoot"),
-                Some(OsString::from(r"D:\ForgedWindows")),
-            )],
-            vec![(OsString::from("SystemRoot"), Some(OsString::new()))],
-            vec![
-                (
-                    OsString::from("SystemRoot"),
-                    Some(fixture.system_root.clone()),
-                ),
-                (
-                    OsString::from("SYSTEMROOT"),
-                    Some(fixture.system_root.clone()),
-                ),
-            ],
-        ];
-        for mut environment in rejected {
-            assert!(
-                configure_windows_restricted_child_environment(
-                    &fixture.toolchain,
-                    &mut environment,
-                    false,
-                )
-                .is_err()
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod authority_environment_tests {
     #[cfg(unix)]
@@ -15538,8 +20818,10 @@ mod authority_environment_tests {
     use super::{
         Command, WINDOWS_ARGV_TOKEN_LIMIT, WINDOWS_ARGV_TOKEN_PREFIX,
         configure_evidence_native_environment, decode_windows_argv_units,
-        encode_windows_argv_units,
+        encode_windows_argv_units, windows_program_requires_trusted_path,
     };
+    use std::ffi::OsStr;
+    use std::path::Path;
 
     #[test]
     fn windows_adapter_token_round_trips_adversarial_argv() {
@@ -15553,6 +20835,25 @@ mod authority_environment_tests {
         let token = encode_windows_argv_units(&arguments).unwrap();
         assert!(!token.chars().any(char::is_whitespace));
         assert_eq!(decode_windows_argv_units(&token).unwrap(), arguments);
+    }
+
+    #[test]
+    fn windows_stack_and_mapped_toolchains_require_the_closed_trusted_path() {
+        assert!(windows_program_requires_trusted_path(
+            OsStr::new("stack.exe"),
+            Path::new(r"C:\tools\stack.exe"),
+            false,
+        ));
+        assert!(windows_program_requires_trusted_path(
+            OsStr::new("cargo.exe"),
+            Path::new(r"C:\tools\cargo.exe"),
+            true,
+        ));
+        assert!(!windows_program_requires_trusted_path(
+            OsStr::new("git.exe"),
+            Path::new(r"C:\tools\git.exe"),
+            false,
+        ));
     }
 
     #[test]
@@ -16494,62 +21795,6 @@ mod evidence_catalog_tests {
             eq_ids.difference(&required).copied().collect::<Vec<_>>(),
             ["runtime-typed-eq-false", "runtime-typed-eq-true",]
         );
-    }
-
-    #[test]
-    fn ord_targets_require_both_boolean_paths_for_every_registry_instance() {
-        let committed = committed_differential_cases();
-        for builtin in ["Ord.lt", "Ord.gt"] {
-            for instance in [
-                "Bool",
-                "ByteString",
-                "CI",
-                "Char",
-                "Day",
-                "DayOfWeek",
-                "Double",
-                "Either",
-                "ExitCode",
-                "Int",
-                "Integer",
-                "Maybe",
-                "Set",
-                "Text",
-                "TimeOfDay",
-                "Tree",
-                "UTCTime",
-                "Vector",
-                "[]",
-                "(,)",
-            ] {
-                for result in [true, false] {
-                    let digest = boolean_typed_result_digest(result);
-                    let mut cases = committed.clone();
-                    cases.retain(|case| {
-                        !case.claim_evidence.as_ref().is_some_and(|descriptor| {
-                            descriptor.semantic_targets.iter().any(|target| {
-                                target.builtin.as_ref() == builtin
-                                    && target.expected_instance_target.as_deref() == Some(instance)
-                                    && target.expected_typed_result_sha256 == Some(digest)
-                            })
-                        })
-                    });
-                    let error = validate_runtime_obligation_coverage(&cases)
-                        .expect_err("removing an Ord boolean path must reopen its scope");
-                    let cell = error
-                        .split("; ")
-                        .find(|cell| cell.starts_with(&format!("{builtin}/PureRuntime:")))
-                        .unwrap_or_else(|| {
-                            panic!("missing {builtin} after removing {instance}/{result}")
-                        });
-                    assert!(
-                        cell.contains(&format!("{instance}:missing=["))
-                            && cell.contains("bool-partition=true"),
-                        "{cell}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]

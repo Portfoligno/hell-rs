@@ -402,7 +402,7 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
         let limits = &context.policy.limits;
         let connection_budget = Arc::clone(&context.budget);
         let cancellation_propagates = !crate::semantic_mutant_active("process-stream-cancellation");
-        let config = ServerConfig {
+        let mut config = ServerConfig {
             port,
             loopback_only: !context.policy.capabilities.network_external,
             max_connections: limits.http_connections.value(),
@@ -430,7 +430,16 @@ fn run_server(port: ThunkRef, application: ThunkRef) -> IoAction {
                     .map_err(|error| HostError::new(error.to_string()))
             }),
         };
-        let result = hell_http_host::serve(config, application);
+        let result = match context.take_http_listener()? {
+            Some((listener, startup, embedding_shutdown)) => {
+                let runtime_shutdown = Arc::clone(&config.shutdown_requested);
+                config.shutdown_requested = Arc::new(move || {
+                    runtime_shutdown() || embedding_shutdown.load(Ordering::Acquire)
+                });
+                hell_http_host::serve_with_listener(config, application, listener, &startup)
+            }
+            None => hell_http_host::serve(config, application),
+        };
         server_resource
             .resource()
             .closed

@@ -1,13 +1,20 @@
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use hell_compiler::{CompilerSession, compile_source};
+use hell_http_host::{
+    Application, BoundServerListener, HostRequest, HostResponse, HostResult, ServerConfig,
+    ServerStartupEvent, ServerStartupObserver,
+};
 use hell_runtime::policy::{Limit, RuntimePolicy};
-use hell_runtime::{RuntimeContext, run_main};
+use hell_runtime::{RuntimeContext, RuntimeHttpServerControl, run_main};
+
+const HTTP_FIXTURE_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct OneShotGateReader {
     receiver: mpsc::Receiver<()>,
@@ -42,73 +49,295 @@ impl Read for OneShotGateReader {
     }
 }
 
-fn available_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+static NEXT_HTTP_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+struct ReservedHttpListener {
+    listener: BoundServerListener,
+    address: SocketAddr,
 }
 
-fn start_server(
-    source: &str,
-    cwd: PathBuf,
-) -> (JoinHandle<()>, mpsc::Receiver<Result<(), String>>) {
-    start_server_with_limit(source, cwd, 1)
+impl ReservedHttpListener {
+    fn bind() -> Self {
+        let listener = BoundServerListener::bind_loopback().expect("HTTP test listener reserves");
+        let address = listener.address();
+        Self { listener, address }
+    }
+
+    const fn port(&self) -> u16 {
+        self.address.port()
+    }
+}
+
+fn next_http_fixture() -> u64 {
+    NEXT_HTTP_FIXTURE.fetch_add(1, Ordering::Relaxed)
+}
+
+fn start_server(listener: ReservedHttpListener, source: &str, cwd: PathBuf) -> HttpTestServer {
+    start_server_with_limit(listener, source, cwd, 1)
 }
 
 fn start_server_with_limit(
+    listener: ReservedHttpListener,
     source: &str,
     cwd: PathBuf,
     request_limit: usize,
-) -> (JoinHandle<()>, mpsc::Receiver<Result<(), String>>) {
-    let program = compile_source(&mut CompilerSession::default(), "http.hell", source)
-        .expect("HTTP source compiles");
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
-        let context = RuntimeContext::with_host(Vec::new(), Vec::new(), Vec::new(), cwd, true)
-            .with_http_request_limit(request_limit);
-        let result = run_main(program, context).map_err(|error| error.to_string());
-        sender.send(result).unwrap();
-    });
-    (worker, receiver)
+) -> HttpTestServer {
+    let context = RuntimeContext::with_host(Vec::new(), Vec::new(), Vec::new(), cwd, true)
+        .with_http_request_limit(request_limit);
+    start_server_in_context(listener, source, context)
 }
 
 fn start_server_observed(
+    listener: ReservedHttpListener,
     source: &str,
     cwd: PathBuf,
-) -> (
-    JoinHandle<()>,
-    mpsc::Receiver<Result<(), String>>,
-    RuntimeContext,
-) {
+) -> HttpTestServer {
     let context = RuntimeContext::with_host(Vec::new(), Vec::new(), Vec::new(), cwd, true)
         .with_http_request_limit(1);
-    start_server_in_context(source, context)
+    start_server_in_context(listener, source, context)
 }
 
 fn start_server_in_context(
+    listener: ReservedHttpListener,
     source: &str,
     context: RuntimeContext,
-) -> (
-    JoinHandle<()>,
-    mpsc::Receiver<Result<(), String>>,
-    RuntimeContext,
-) {
+) -> HttpTestServer {
+    let mut server = launch_server_in_context(listener, source, context, None);
+    server.await_readiness();
+    server
+}
+
+fn launch_server_in_context(
+    listener: ReservedHttpListener,
+    source: &str,
+    mut context: RuntimeContext,
+    before_run: Option<mpsc::Receiver<()>>,
+) -> HttpTestServer {
+    let deadline = Instant::now() + HTTP_FIXTURE_TIMEOUT;
     let program = compile_source(&mut CompilerSession::default(), "http.hell", source)
         .expect("HTTP source compiles");
-    let observer = context.clone();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
-        let result = run_main(program, context).map_err(|error| error.to_string());
-        sender.send(result).unwrap();
+    let address = listener.address;
+    let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+    let startup_emitted = Arc::new(AtomicBool::new(false));
+    let event_emitted = Arc::clone(&startup_emitted);
+    let event_sender = startup_sender.clone();
+    let startup: ServerStartupObserver = Arc::new(move |event| {
+        if event_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = event_sender.try_send(event);
+        }
     });
-    (worker, receiver, observer)
+    let (configured_context, control) = context.with_http_listener(listener.listener, startup);
+    context = configured_context;
+    let returned_context = context.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let completion = Arc::new(HttpWorkerCompletion::default());
+    let worker_completion = Arc::clone(&completion);
+    let worker = std::thread::spawn(move || {
+        let _completion_guard = HttpWorkerCompletionGuard(worker_completion);
+        let result = if before_run.is_some_and(|gate| gate.recv().is_err()) {
+            Err("HTTP server startup gate disconnected".into())
+        } else {
+            run_main(program, context).map_err(|error| error.to_string())
+        };
+        if startup_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let message = match &result {
+                Ok(()) => Arc::from("HTTP server completed before readiness"),
+                Err(error) => Arc::from(error.as_str()),
+            };
+            let _ = startup_sender.try_send(ServerStartupEvent::Failed {
+                phase: "runtime",
+                message,
+            });
+        }
+        let _ = sender.send(result);
+    });
+    HttpTestServer {
+        address,
+        control,
+        startup: Some(startup_receiver),
+        terminal: receiver,
+        terminal_result: None,
+        worker: Some(worker),
+        observer: returned_context,
+        completion,
+        deadline,
+    }
+}
+
+#[derive(Default)]
+struct HttpWorkerCompletion {
+    completed: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl HttpWorkerCompletion {
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (completed, _) = self
+            .changed
+            .wait_timeout_while(completed, remaining, |completed| !*completed)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *completed
+    }
+}
+
+struct HttpWorkerCompletionGuard(Arc<HttpWorkerCompletion>);
+
+impl Drop for HttpWorkerCompletionGuard {
+    fn drop(&mut self) {
+        let mut completed = self
+            .0
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *completed = true;
+        self.0.changed.notify_all();
+    }
+}
+
+struct HttpTestServer {
+    address: SocketAddr,
+    control: RuntimeHttpServerControl,
+    startup: Option<mpsc::Receiver<ServerStartupEvent>>,
+    terminal: mpsc::Receiver<Result<(), String>>,
+    terminal_result: Option<Result<(), String>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    observer: RuntimeContext,
+    completion: Arc<HttpWorkerCompletion>,
+    deadline: Instant,
+}
+
+impl HttpTestServer {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn await_readiness(&mut self) {
+        let startup = self.startup.take().expect("HTTP startup is awaited once");
+        match startup
+            .recv_timeout(self.remaining())
+            .expect("HTTP server startup reached a terminal state")
+        {
+            ServerStartupEvent::Ready { address } => {
+                assert_eq!(address, self.address, "HTTP server ready address changed");
+            }
+            ServerStartupEvent::Failed { phase, message } => {
+                panic!("HTTP test server failed before readiness: phase={phase}; failure={message}")
+            }
+        }
+    }
+
+    fn connect(&self) -> TcpStream {
+        let remaining = self.remaining();
+        assert!(
+            !remaining.is_zero(),
+            "HTTP fixture deadline expired before connect"
+        );
+        let stream = TcpStream::connect_timeout(&self.address, remaining)
+            .expect("ready HTTP test server accepts a connection");
+        let remaining = self.remaining();
+        assert!(
+            !remaining.is_zero(),
+            "HTTP fixture deadline expired after connect"
+        );
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        stream.set_write_timeout(Some(remaining)).unwrap();
+        stream
+    }
+
+    fn terminal_result(&mut self) -> Result<(), String> {
+        if self.terminal_result.is_none() {
+            let remaining = self.remaining();
+            match self.terminal.recv_timeout(remaining) {
+                Ok(result) => self.terminal_result = Some(result),
+                Err(error) => {
+                    return Err(format!(
+                        "HTTP server terminal state was unavailable: {error}"
+                    ));
+                }
+            }
+        }
+        self.join_completed_worker();
+        self.terminal_result
+            .as_ref()
+            .expect("HTTP terminal result is retained")
+            .clone()
+    }
+
+    fn finish(&mut self) {
+        self.terminal_result().unwrap();
+    }
+
+    fn observer(&self) -> &RuntimeContext {
+        &self.observer
+    }
+
+    fn completion(&self) -> Arc<HttpWorkerCompletion> {
+        Arc::clone(&self.completion)
+    }
+
+    fn try_terminal(&self) -> Result<Result<(), String>, mpsc::TryRecvError> {
+        self.terminal.try_recv()
+    }
+
+    fn join_completed_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("HTTP server worker joins");
+        }
+    }
+}
+
+impl Drop for HttpTestServer {
+    fn drop(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        self.control.cancel();
+        if self.terminal_result.is_none() {
+            self.terminal_result = self.terminal.recv_timeout(self.remaining()).ok();
+        }
+        if self.terminal_result.is_some() {
+            self.join_completed_worker();
+        } else if let Some(worker) = self.worker.take() {
+            reap_http_worker(worker);
+        }
+    }
+}
+
+fn reap_http_worker(worker: std::thread::JoinHandle<()>) {
+    static REAPER: std::sync::OnceLock<mpsc::Sender<std::thread::JoinHandle<()>>> =
+        std::sync::OnceLock::new();
+    let sender = REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<std::thread::JoinHandle<()>>();
+        std::thread::Builder::new()
+            .name("hell-http-test-reaper".into())
+            .spawn(move || {
+                while let Ok(worker) = receiver.recv() {
+                    let _ = worker.join();
+                }
+            })
+            .expect("HTTP test worker reaper starts");
+        sender
+    });
+    sender
+        .send(worker)
+        .expect("HTTP test worker reaper retains timed-out worker");
 }
 
 #[test]
 fn supplied_example_43_takes_all_three_response_branches() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond ->\n",
@@ -136,24 +365,24 @@ fn supplied_example_43_takes_all_three_response_branches() {
     let directory = std::env::temp_dir().join(format!(
         "hell-http-example-{}-{}",
         std::process::id(),
-        available_port()
+        next_http_fixture()
     ));
     std::fs::create_dir_all(directory.join("docs")).unwrap();
     std::fs::write(directory.join("docs").join("readme.md"), b"example file\n").unwrap();
-    let (worker, receiver) = start_server_with_limit(&source, directory.clone(), 3);
+    let mut server = start_server_with_limit(listener, &source, directory.clone(), 3);
 
     let present = exchange(
-        port,
+        &server,
         b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\r\n",
     );
     assert!(present.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_eq!(response_body(&present), b"Hello, World!");
 
-    let absent = exchange(port, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let absent = exchange(&server, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(absent.starts_with(b"HTTP/1.1 500 Error\r\n"));
     assert_eq!(response_body(&absent), b"WobbleWobble");
 
-    let file = exchange(port, b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let file = exchange(&server, b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(file.starts_with(b"HTTP/1.1 400 Not Found\r\n"));
     assert!(
         file.windows(b"Content-Type: text/markdown\r\n".len())
@@ -161,34 +390,254 @@ fn supplied_example_43_takes_all_three_response_branches() {
     );
     assert_eq!(response_body(&file), b"example file\n");
 
-    finish(worker, &receiver);
+    server.finish();
     std::fs::remove_file(directory.join("docs").join("readme.md")).unwrap();
     std::fs::remove_dir(directory.join("docs")).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }
 
-fn exchange(port: u16, request: &[u8]) -> Vec<u8> {
-    let mut stream = connect(port);
+fn exchange(server: &HttpTestServer, request: &[u8]) -> Vec<u8> {
+    let mut stream = server.connect();
     // Requests are self-delimiting; a half-close races the server's response close on macOS.
     stream.write_all(request).unwrap();
     read_response(&mut stream)
 }
 
-fn connect(port: u16) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let stream = loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => break stream,
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("HTTP test server did not start: {error}"),
-        }
+struct UnreachableHttpApplication;
+
+impl Application for UnreachableHttpApplication {
+    fn call(&self, _request: HostRequest) -> HostResult<HostResponse> {
+        panic!("listener-policy rejection must precede HTTP application dispatch")
+    }
+}
+
+#[test]
+fn prebound_listener_remains_owned_through_exact_readiness() {
+    let listener = ReservedHttpListener::bind();
+    let address = listener.address;
+    let port = listener.port();
+    assert!(
+        TcpListener::bind(address).is_err(),
+        "a competitor acquired the retained HTTP listener address"
+    );
+    let source = format!(
+        concat!(
+            "main = Http.run {port} \\_request respond ->\n",
+            "  respond $ Http.responseBuilder (Http.mkStatus 200 \"OK\") []\n",
+            "    (Builder.byteString $ Text.encodeUtf8 \"owned\")\n",
+        ),
+        port = port
+    );
+    let mut server = start_server(listener, &source, std::env::temp_dir());
+    let response = exchange(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(response_body(&response), b"owned");
+    server.finish();
+}
+
+#[test]
+fn prebound_listener_policy_failure_is_typed_before_readiness() {
+    let listener = BoundServerListener::bind_loopback().expect("HTTP test listener reserves");
+    let address = listener.address();
+    let requested_port = if address.port() == u16::MAX {
+        address.port() - 1
+    } else {
+        address.port() + 1
     };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    stream
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let startup: ServerStartupObserver = Arc::new(move |event| {
+        let _ = sender.try_send(event);
+    });
+    let config = ServerConfig {
+        port: requested_port,
+        loopback_only: true,
+        max_connections: Some(1),
+        max_headers: None,
+        max_header_bytes: None,
+        max_body_bytes: None,
+        idle_timeout: None,
+        graceful_shutdown: Duration::from_secs(1),
+        request_limit: Some(1),
+        shutdown_requested: Arc::new(|| false),
+        acquire_connection: Arc::new(|| Ok(Box::new(()))),
+    };
+    let error = hell_http_host::serve_with_listener(
+        config,
+        Arc::new(UnreachableHttpApplication),
+        listener,
+        &startup,
+    )
+    .expect_err("mismatched listener port fails before readiness");
+    assert!(error.message().contains("differs from policy"));
+    match receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("typed listener-policy failure arrives")
+    {
+        ServerStartupEvent::Failed { phase, message } => {
+            assert_eq!(phase, "listener-policy");
+            assert!(message.contains("differs from policy"));
+        }
+        ServerStartupEvent::Ready { address } => {
+            panic!("mismatched listener unexpectedly became ready at {address}")
+        }
+    }
+}
+
+fn fixture_response_source(port: u16, body: &str) -> String {
+    format!(
+        concat!(
+            "main = Http.run {port} \\_request respond ->\n",
+            "  respond $ Http.responseBuilder (Http.mkStatus 200 \"OK\") []\n",
+            "    (Builder.byteString $ Text.encodeUtf8 \"{body}\")\n",
+        ),
+        port = port,
+        body = body,
+    )
+}
+
+#[test]
+fn delayed_http_fixture_waits_for_exact_readiness_without_polling() {
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
+    let context = RuntimeContext::with_host(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        true,
+    )
+    .with_http_request_limit(1);
+    let (release, gate) = mpsc::sync_channel(0);
+    let mut server = launch_server_in_context(
+        listener,
+        &fixture_response_source(port, "delayed"),
+        context,
+        Some(gate),
+    );
+    assert!(matches!(
+        server
+            .startup
+            .as_ref()
+            .expect("startup remains pending")
+            .try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    server.await_readiness();
+    let response = exchange(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(response_body(&response), b"delayed");
+    server.finish();
+}
+
+#[test]
+fn independently_prebound_http_fixtures_are_parallel_and_isolated() {
+    let workers = (0..4)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let listener = ReservedHttpListener::bind();
+                let port = listener.port();
+                let body = format!("fixture-{index}");
+                let mut server = start_server(
+                    listener,
+                    &fixture_response_source(port, &body),
+                    std::env::temp_dir(),
+                );
+                let response = exchange(
+                    &server,
+                    b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                );
+                assert_eq!(response_body(&response), body.as_bytes());
+                server.finish();
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn prebound_http_listener_authority_rejects_second_use() {
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
+    let source = fixture_response_source(port, "once");
+    let mut server = start_server(listener, &source, std::env::temp_dir());
+    let reused_context = server.observer().clone();
+    let response = exchange(
+        &server,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(response_body(&response), b"once");
+    server.finish();
+    let program = compile_source(
+        &mut CompilerSession::default(),
+        "http-second.hell",
+        source.as_str(),
+    )
+    .expect("second-use source compiles");
+    let error = run_main(program, reused_context).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("listener authority was already used")
+    );
+}
+
+#[test]
+fn post_ready_panic_cancels_and_joins_the_http_worker() {
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
+    let server = start_server(
+        listener,
+        &fixture_response_source(port, "unused"),
+        std::env::temp_dir(),
+    );
+    let completion = server.completion();
+    let observer = server.observer().clone();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _server = server;
+        panic!("post-ready fixture assertion failed");
+    }));
+    assert!(panic.is_err());
+    assert!(completion.wait_until(Instant::now() + HTTP_FIXTURE_TIMEOUT));
+    let resources = observer.budget().snapshot();
+    assert_eq!(resources.live_http_connections, 0);
+    assert_eq!(resources.live_tasks, 0);
+}
+
+#[test]
+fn readiness_timeout_transfers_stuck_worker_to_the_bounded_reaper() {
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
+    let context = RuntimeContext::with_host(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        std::env::temp_dir(),
+        true,
+    )
+    .with_http_request_limit(1);
+    let (release, gate) = mpsc::sync_channel(0);
+    let mut server = launch_server_in_context(
+        listener,
+        &fixture_response_source(port, "unused"),
+        context,
+        Some(gate),
+    );
+    let completion = server.completion();
+    server.deadline = Instant::now();
+    let timeout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server.await_readiness();
+    }));
+    assert!(timeout.is_err());
+    drop(release);
+    drop(server);
+    assert!(completion.wait_until(Instant::now() + HTTP_FIXTURE_TIMEOUT));
 }
 
 fn read_response(stream: &mut TcpStream) -> Vec<u8> {
@@ -285,17 +734,10 @@ fn response_body(response: &[u8]) -> &[u8] {
     &response[boundary + 4..]
 }
 
-fn finish(worker: JoinHandle<()>, receiver: &mpsc::Receiver<Result<(), String>>) {
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("HTTP server completed")
-        .unwrap();
-    worker.join().unwrap();
-}
-
 #[test]
 fn request_metadata_and_body_streaming_round_trip_raw_bytes() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond ->\n",
@@ -324,14 +766,14 @@ fn request_metadata_and_body_streaming_round_trip_raw_bytes() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&source, std::env::temp_dir());
+    let mut server = start_server(listener, &source, std::env::temp_dir());
     let body = vec![b'a'; 9_000];
     let request_head = format!(
         "POST /hello%20world?novalue&empty=&plus=a+b HTTP/1.1\r\nHost: localhost\r\nX-Test: present\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )
     .into_bytes();
-    let mut stream = connect(port);
+    let mut stream = server.connect();
     stream.write_all(&request_head).unwrap();
     let split = body.len() / 2;
     stream.write_all(&body[..split]).unwrap();
@@ -340,12 +782,13 @@ fn request_metadata_and_body_streaming_round_trip_raw_bytes() {
     let response = read_response(&mut stream);
     assert!(response.starts_with(b"HTTP/1.1 201 Created\r\n"));
     assert_eq!(response_body(&response), body);
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
 fn empty_request_body_repeats_eof_without_blocking() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond -> do\n",
@@ -358,14 +801,14 @@ fn empty_request_body_repeats_eof_without_blocking() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&source, std::env::temp_dir());
+    let mut server = start_server(listener, &source, std::env::temp_dir());
     let response = exchange(
-        port,
+        &server,
         b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
     );
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_eq!(response_body(&response), b"");
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
@@ -373,12 +816,13 @@ fn file_parts_and_stream_callbacks_have_exact_wire_bodies() {
     let directory = std::env::temp_dir().join(format!(
         "hell-http-test-{}-{}",
         std::process::id(),
-        available_port()
+        next_http_fixture()
     ));
     std::fs::create_dir(&directory).unwrap();
     std::fs::write(directory.join("body.bin"), b"01234567").unwrap();
 
-    let file_port = available_port();
+    let file_listener = ReservedHttpListener::bind();
+    let file_port = file_listener.port();
     let file_source = format!(
         concat!(
             "main = Http.run {file_port} \\_request respond ->\n",
@@ -388,8 +832,8 @@ fn file_parts_and_stream_callbacks_have_exact_wire_bodies() {
         ),
         file_port = file_port
     );
-    let (worker, receiver) = start_server_with_limit(&file_source, directory.clone(), 2);
-    let mut head_stream = connect(file_port);
+    let mut server = start_server_with_limit(file_listener, &file_source, directory.clone(), 2);
+    let mut head_stream = server.connect();
     head_stream
         .write_all(b"HEAD /file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -399,12 +843,13 @@ fn file_parts_and_stream_callbacks_have_exact_wire_bodies() {
         head.windows(b"Content-Length: 4\r\n".len())
             .any(|window| { window == b"Content-Length: 4\r\n" })
     );
-    let response = exchange(file_port, b"GET /file HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let response = exchange(&server, b"GET /file HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with(b"HTTP/1.1 206 Partial Content\r\n"));
     assert_eq!(response_body(&response), b"2345");
-    finish(worker, &receiver);
+    server.finish();
 
-    let stream_port = available_port();
+    let stream_listener = ReservedHttpListener::bind();
+    let stream_port = stream_listener.port();
     let stream_source = format!(
         concat!(
             "main = Http.run {stream_port} \\_request respond ->\n",
@@ -416,18 +861,15 @@ fn file_parts_and_stream_callbacks_have_exact_wire_bodies() {
         ),
         stream_port = stream_port
     );
-    let (worker, receiver) = start_server(&stream_source, directory.clone());
-    let response = exchange(
-        stream_port,
-        b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    );
+    let mut server = start_server(stream_listener, &stream_source, directory.clone());
+    let response = exchange(&server, b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(
         response
             .windows(b"3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n".len())
             .any(|window| window == b"3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n")
     );
-    finish(worker, &receiver);
+    server.finish();
 
     std::fs::remove_file(directory.join("body.bin")).unwrap();
     std::fs::remove_dir(directory).unwrap();
@@ -438,7 +880,7 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
     let directory = std::env::temp_dir().join(format!(
         "hell-http-file-mutation-{}-{}",
         std::process::id(),
-        available_port()
+        next_http_fixture()
     ));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("changing.bin");
@@ -446,7 +888,8 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
     file.set_len(64 * 1024 * 1024).unwrap();
     drop(file);
 
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\_request respond ->\n",
@@ -455,8 +898,8 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
         ),
         port = port
     );
-    let (worker, receiver, observer) = start_server_observed(&source, directory.clone());
-    let mut stream = connect(port);
+    let mut server = start_server_observed(listener, &source, directory.clone());
+    let mut stream = server.connect();
     stream
         .write_all(b"GET /file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -471,13 +914,9 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
         .unwrap();
     let mut partial_body = Vec::new();
     let _closed = stream.read_to_end(&mut partial_body);
-    let error = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("file mutation reached the server scope")
-        .unwrap_err();
+    let error = server.terminal_result().unwrap_err();
     assert!(error.contains("file ended before the requested range"));
-    worker.join().unwrap();
-    let resources = observer.budget().snapshot();
+    let resources = server.observer().budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
 
@@ -487,7 +926,8 @@ fn response_file_mutation_after_headers_is_structured_and_leak_free() {
 
 #[test]
 fn streaming_client_disconnect_is_connection_local_and_releases_resource_permits() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let chunk = "x".repeat(1024);
     let source = format!(
         concat!(
@@ -499,8 +939,8 @@ fn streaming_client_disconnect_is_connection_local_and_releases_resource_permits
         port = port,
         chunk = chunk,
     );
-    let (worker, receiver, observer) = start_server_observed(&source, std::env::temp_dir());
-    let mut stream = connect(port);
+    let mut server = start_server_observed(listener, &source, std::env::temp_dir());
+    let mut stream = server.connect();
     stream
         .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
@@ -509,12 +949,10 @@ fn streaming_client_disconnect_is_connection_local_and_releases_resource_permits
     stream.shutdown(Shutdown::Both).unwrap();
     drop(stream);
 
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("client disconnect unwound the response stream")
+    server
+        .terminal_result()
         .expect("client disconnect must not fail the HTTP application");
-    worker.join().unwrap();
-    let resources = observer.budget().snapshot();
+    let resources = server.observer().budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
 }
@@ -524,7 +962,7 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
     let directory = std::env::temp_dir().join(format!(
         "hell-http-peer-abort-{}-{}",
         std::process::id(),
-        available_port()
+        next_http_fixture()
     ));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("large.bin");
@@ -532,7 +970,8 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
     file.set_len(64 * 1024 * 1024).unwrap();
     drop(file);
 
-    let file_port = available_port();
+    let file_listener = ReservedHttpListener::bind();
+    let file_port = file_listener.port();
     let file_source = format!(
         concat!(
             "main = Http.run {file_port} \\_request respond ->\n",
@@ -541,8 +980,8 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
         ),
         file_port = file_port
     );
-    let (worker, receiver, observer) = start_server_observed(&file_source, directory.clone());
-    let mut stream = connect(file_port);
+    let mut server = start_server_observed(file_listener, &file_source, directory.clone());
+    let mut stream = server.connect();
     stream
         .write_all(b"GET /file HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
@@ -550,16 +989,15 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
     assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
     stream.shutdown(Shutdown::Both).unwrap();
     drop(stream);
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("file disconnect unwound the response")
+    server
+        .terminal_result()
         .expect("file disconnect must not fail the HTTP application");
-    worker.join().unwrap();
-    let resources = observer.budget().snapshot();
+    let resources = server.observer().budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
 
-    let fixed_port = available_port();
+    let fixed_listener = ReservedHttpListener::bind();
+    let fixed_port = fixed_listener.port();
     let fixed_source = format!(
         concat!(
             "main = Http.run {fixed_port} \\_request respond -> do\n",
@@ -570,8 +1008,8 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
         ),
         fixed_port = fixed_port
     );
-    let (worker, receiver, observer) = start_server_observed(&fixed_source, directory.clone());
-    let mut stream = connect(fixed_port);
+    let mut server = start_server_observed(fixed_listener, &fixed_source, directory.clone());
+    let mut stream = server.connect();
     stream
         .write_all(b"GET /fixed HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
@@ -579,12 +1017,10 @@ fn file_and_chunked_fixed_disconnects_are_connection_local() {
     assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
     stream.shutdown(Shutdown::Both).unwrap();
     drop(stream);
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("fixed disconnect unwound the response")
+    server
+        .terminal_result()
         .expect("fixed disconnect must not fail the HTTP application");
-    worker.join().unwrap();
-    let resources = observer.budget().snapshot();
+    let resources = server.observer().budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
 
@@ -631,7 +1067,8 @@ fn incomplete_request_failure_classification_is_closed_world() {
 
 #[test]
 fn incomplete_request_before_response_remains_server_fatal() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond -> do\n",
@@ -641,30 +1078,25 @@ fn incomplete_request_before_response_remains_server_fatal() {
         ),
         port = port
     );
-    let (worker, receiver, observer) = start_server_observed(&source, std::env::temp_dir());
-    let mut stream = connect(port);
+    let mut server = start_server_observed(listener, &source, std::env::temp_dir());
+    let mut stream = server.connect();
     stream
         .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\npartial")
         .unwrap();
     stream.shutdown(Shutdown::Write).unwrap();
 
-    let error = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("incomplete request reached the server scope")
-        .unwrap_err();
+    let error = server.terminal_result().unwrap_err();
     assert!(
         is_incomplete_request_failure(&error),
         "unexpected incomplete-request error: {error}"
     );
-    worker.join().unwrap();
-
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
     assert!(
         response.is_empty(),
         "incomplete request unexpectedly produced a response: {response:?}"
     );
-    let resources = observer.budget().snapshot();
+    let resources = server.observer().budget().snapshot();
     assert_eq!(resources.live_http_connections, 0);
     assert_eq!(resources.live_tasks, 0);
 }
@@ -683,7 +1115,8 @@ fn network_capability_and_invalid_status_fail_explicitly() {
     assert_eq!(error.code, "H0908");
     assert!(error.message.contains("network capability is disabled"));
 
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let invalid = format!(
         concat!(
             "main = Http.run {port} \\_request respond ->\n",
@@ -692,20 +1125,17 @@ fn network_capability_and_invalid_status_fail_explicitly() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&invalid, std::env::temp_dir());
-    let response = exchange(port, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let mut server = start_server(listener, &invalid, std::env::temp_dir());
+    let response = exchange(&server, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.is_empty());
-    let error = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("HTTP server completed")
-        .unwrap_err();
+    let error = server.terminal_result().unwrap_err();
     assert!(error.starts_with("H0908:"));
-    worker.join().unwrap();
 }
 
 #[test]
 fn keep_alive_reuses_connections_and_drains_unconsumed_request_bodies() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond ->\n",
@@ -717,8 +1147,8 @@ fn keep_alive_reuses_connections_and_drains_unconsumed_request_bodies() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server_with_limit(&source, std::env::temp_dir(), 2);
-    let mut stream = connect(port);
+    let mut server = start_server_with_limit(listener, &source, std::env::temp_dir(), 2);
+    let mut stream = server.connect();
     stream
         .write_all(
             concat!(
@@ -743,14 +1173,15 @@ fn keep_alive_reuses_connections_and_drains_unconsumed_request_bodies() {
         .unwrap();
     let second = read_response(&mut stream);
     assert_eq!(response_body(&second), b"two");
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
 fn chunked_extensions_and_trailers_preserve_exact_body_bytes() {
     // The guest API has no trailer accessor; the host must still validate and drain them so the
     // next keep-alive request starts at the exact framing boundary.
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond -> do\n",
@@ -760,8 +1191,8 @@ fn chunked_extensions_and_trailers_preserve_exact_body_bytes() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server_with_limit(&source, std::env::temp_dir(), 2);
-    let mut stream = connect(port);
+    let mut server = start_server_with_limit(listener, &source, std::env::temp_dir(), 2);
+    let mut stream = server.connect();
     stream
         .write_all(
             concat!(
@@ -783,7 +1214,7 @@ fn chunked_extensions_and_trailers_preserve_exact_body_bytes() {
         .unwrap();
     let second = read_response(&mut stream);
     assert_eq!(response_body(&second), b"");
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
@@ -809,16 +1240,13 @@ fn ambiguous_request_framing_is_rejected_without_running_the_application() {
             "Content-Length: 4\r\nContent-Length: 5\r\n\r\n",
         ),
     ] {
-        let port = available_port();
-        let (worker, receiver) = start_server(&source_for(port), std::env::temp_dir());
-        let mut stream = connect(port);
+        let listener = ReservedHttpListener::bind();
+        let port = listener.port();
+        let mut server = start_server(listener, &source_for(port), std::env::temp_dir());
+        let mut stream = server.connect();
         stream.write_all(request.as_bytes()).unwrap();
-        let error = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .expect("HTTP server rejected ambiguous framing")
-            .unwrap_err();
+        let error = server.terminal_result().unwrap_err();
         assert!(error.contains("H0908:"));
-        worker.join().unwrap();
     }
 }
 
@@ -846,7 +1274,8 @@ fn sandbox_http_header_and_body_limits_are_explicit_policy() {
             "too large",
         ),
     ] {
-        let port = available_port();
+        let listener = ReservedHttpListener::bind();
+        let port = listener.port();
         let mut policy = RuntimePolicy::sandboxed();
         policy.limits.http_header_bytes = Limit::At(header_limit);
         policy.limits.http_body_bytes = Limit::At(4);
@@ -859,15 +1288,11 @@ fn sandbox_http_header_and_body_limits_are_explicit_policy() {
         )
         .with_policy(policy)
         .with_http_request_limit(1);
-        let (worker, receiver, _observer) = start_server_in_context(&source_for(port), context);
-        let mut stream = connect(port);
+        let mut server = start_server_in_context(listener, &source_for(port), context);
+        let mut stream = server.connect();
         stream.write_all(request).unwrap();
-        let error = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .expect("sandbox HTTP policy rejected an oversized request")
-            .unwrap_err();
+        let error = server.terminal_result().unwrap_err();
         assert!(error.contains(expected), "unexpected error: {error}");
-        worker.join().unwrap();
     }
 }
 
@@ -880,7 +1305,8 @@ fn malformed_request_targets_match_the_pinned_warp_oracle() {
         (b"/%FF".as_slice(), "�"),
         (b"/\xff".as_slice(), "�"),
     ] {
-        let port = available_port();
+        let listener = ReservedHttpListener::bind();
+        let port = listener.port();
         let source = format!(
             concat!(
                 "main = Http.run {port} \\request respond ->\n",
@@ -893,20 +1319,21 @@ fn malformed_request_targets_match_the_pinned_warp_oracle() {
             port = port,
             expected = expected,
         );
-        let (worker, receiver) = start_server(&source, std::env::temp_dir());
+        let mut server = start_server(listener, &source, std::env::temp_dir());
         let mut request = b"GET ".to_vec();
         request.extend_from_slice(target);
         request.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        let response = exchange(port, &request);
+        let response = exchange(&server, &request);
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert_eq!(response_body(&response), b"exact");
-        finish(worker, &receiver);
+        server.finish();
     }
 }
 
 #[test]
 fn path_query_and_duplicate_header_shapes_are_preserved() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond ->\n",
@@ -929,9 +1356,9 @@ fn path_query_and_duplicate_header_shapes_are_preserved() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&source, std::env::temp_dir());
+    let mut server = start_server(listener, &source, std::env::temp_dir());
     let response = exchange(
-        port,
+        &server,
         concat!(
             "GET /a//%2F/%E2%98%83/?bad=%ZZ&again HTTP/1.1\r\n",
             "Host: localhost\r\nX-Dupe: first\r\nx-dupe: second\r\n\r\n",
@@ -940,12 +1367,13 @@ fn path_query_and_duplicate_header_shapes_are_preserved() {
     );
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert_eq!(response_body(&response), b"exact");
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
 fn http_10_keep_alive_and_head_and_no_body_statuses_are_framed() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\request respond ->\n",
@@ -963,8 +1391,8 @@ fn http_10_keep_alive_and_head_and_no_body_statuses_are_framed() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server_with_limit(&source, std::env::temp_dir(), 4);
-    let mut stream = connect(port);
+    let mut server = start_server_with_limit(listener, &source, std::env::temp_dir(), 4);
+    let mut stream = server.connect();
     stream
         .write_all(b"HEAD /head HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
         .unwrap();
@@ -993,12 +1421,13 @@ fn http_10_keep_alive_and_head_and_no_body_statuses_are_framed() {
         .unwrap();
     let informational = read_response_head(&mut stream);
     assert!(informational.starts_with(b"HTTP/1.0 103 Early Hints\r\n"));
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
 fn response_stream_flush_is_visible_before_callback_completion() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "main = Http.run {port} \\_request respond ->\n",
@@ -1011,8 +1440,8 @@ fn response_stream_flush_is_visible_before_callback_completion() {
         ),
         port = port
     );
-    let (worker, receiver) = start_server(&source, std::env::temp_dir());
-    let mut stream = connect(port);
+    let mut server = start_server(listener, &source, std::env::temp_dir());
+    let mut stream = server.connect();
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -1032,7 +1461,7 @@ fn response_stream_flush_is_visible_before_callback_completion() {
             .any(|window| { window == b"two" })
     );
     assert!(matches!(
-        receiver.try_recv(),
+        server.try_terminal(),
         Err(mpsc::TryRecvError::Empty)
     ));
     stream.read_to_end(&mut before_completion).unwrap();
@@ -1041,12 +1470,13 @@ fn response_stream_flush_is_visible_before_callback_completion() {
             .windows(b"3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n".len())
             .any(|window| window == b"3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n")
     );
-    finish(worker, &receiver);
+    server.finish();
 }
 
 #[test]
 fn timed_cancellation_wakes_a_partial_request_body_read() {
-    let port = available_port();
+    let listener = ReservedHttpListener::bind();
+    let port = listener.port();
     let source = format!(
         concat!(
             "server = Http.run {port} \\request respond -> do\n",
@@ -1072,17 +1502,13 @@ fn timed_cancellation_wakes_a_partial_request_body_read() {
     )
     .with_http_request_limit(100)
     .with_stdin(OneShotGateReader::new(cancel_receiver));
-    let (worker, receiver, _) = start_server_in_context(&source, context);
-    let mut stream = connect(port);
+    let mut server = start_server_in_context(listener, &source, context);
+    let mut stream = server.connect();
     stream
         .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\npartial")
         .unwrap();
     cancel_sender.send(()).unwrap();
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("timed cancellation woke the partial HTTP request body")
-        .unwrap();
-    worker.join().unwrap();
+    server.finish();
 }
 
 #[cfg(feature = "mutation-testing")]
@@ -1143,19 +1569,16 @@ fn responder_is_one_shot_and_application_failures_are_visible() {
             false,
         ),
     ] {
-        let port = available_port();
+        let listener = ReservedHttpListener::bind();
+        let port = listener.port();
         let source = format!("main = Http.run {port} \\_request respond -> {application}");
-        let (worker, receiver) = start_server(&source, std::env::temp_dir());
-        let mut stream = connect(port);
+        let mut server = start_server(listener, &source, std::env::temp_dir());
+        let mut stream = server.connect();
         stream
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .unwrap();
-        let error = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .expect("HTTP application failure reached the server scope")
-            .unwrap_err();
+        let error = server.terminal_result().unwrap_err();
         assert!(error.contains(expected), "unexpected error: {error}");
-        worker.join().unwrap();
         if assert_no_response {
             stream.set_nonblocking(true).unwrap();
             let mut response = [0_u8; 1];
