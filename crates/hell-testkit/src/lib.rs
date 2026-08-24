@@ -198,6 +198,8 @@ pub use runtime_obligations::{
 };
 
 static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
+static NEXT_WINDOWS_CHILD_TEMP_AUTHORITY: AtomicU64 = AtomicU64::new(0);
 const MAX_DIFFERENTIAL_WORKERS: usize = 4;
 const COMPLETE_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CAPTURE_EDGE_BYTES: usize = 256 * 1024;
@@ -213,6 +215,12 @@ pub const fn complete_capture_byte_limit_for_integration() -> usize {
 }
 #[cfg(windows)]
 const WINDOWS_PROGRAM_AUTHORITY_ACQUISITION_BUDGET: Duration = Duration::from_secs(30);
+
+#[cfg(windows)]
+const WINDOWS_GIT_VERSION_COMPLETION_BUDGET: Duration = Duration::from_mins(1);
+
+#[cfg(windows)]
+const WINDOWS_CHILD_TEMP_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 
 #[cfg(windows)]
 fn windows_program_authority_acquisition_deadline() -> std::io::Result<Instant> {
@@ -267,22 +275,255 @@ struct WindowsLaunchControlAuthority {
     program: Option<BoundProgramInvocation>,
     current_directory: PathBuf,
     current_directory_identity: same_file::Handle,
+    writable_presentations: Vec<WindowsChildPathPresentation>,
+    temporary: Option<WindowsChildTempAuthority>,
+    stack: Option<WindowsStackRuntimeAuthority>,
 }
 
 #[cfg(windows)]
-const WINDOWS_LAUNCH_CONTROL_PHASES: [&str; 12] = [
+#[derive(Clone, Debug)]
+struct WindowsChildPathPresentation {
+    canonical: PathBuf,
+    presentation: PathBuf,
+    identity: Arc<same_file::Handle>,
+}
+
+#[cfg(windows)]
+impl WindowsChildPathPresentation {
+    fn bind(canonical: &Path) -> std::io::Result<Self> {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::path::{Component, Prefix};
+
+        let Some(Component::Prefix(prefix)) = canonical.components().next() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows child writable authority has no path prefix",
+            ));
+        };
+        if !matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+            || path_has_lexical_dot_component(canonical)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows child writable authority is not one verbatim drive path",
+            ));
+        }
+        let wide = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+        if !wide.starts_with(&[
+            u16::from(b'\\'),
+            u16::from(b'\\'),
+            u16::from(b'?'),
+            u16::from(b'\\'),
+        ]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows child writable authority has malformed verbatim syntax",
+            ));
+        }
+        let presentation = PathBuf::from(OsString::from_wide(&wide[4..]));
+        if !presentation.is_absolute()
+            || path_has_lexical_dot_component(&presentation)
+            || !matches!(
+                presentation.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows child writable presentation is not one absolute drive path",
+            ));
+        }
+        let canonical_metadata = fs::symlink_metadata(canonical)?;
+        let presentation_metadata = fs::symlink_metadata(&presentation)?;
+        let identity = same_file::Handle::from_path(canonical)?;
+        if canonical_metadata.file_type().is_symlink()
+            || !canonical_metadata.is_dir()
+            || presentation_metadata.file_type().is_symlink()
+            || !presentation_metadata.is_dir()
+            || fs::canonicalize(canonical)? != canonical
+            || fs::canonicalize(&presentation)? != canonical
+            || same_file::Handle::from_path(&presentation)? != identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child writable presentation differs from its canonical authority",
+            ));
+        }
+        Ok(Self {
+            canonical: canonical.to_path_buf(),
+            presentation,
+            identity: Arc::new(identity),
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        let rebound = Self::bind(&self.canonical)?;
+        if rebound.presentation != self.presentation || rebound.identity != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child writable presentation identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Returns the closed non-verbatim drive presentation of one canonical Windows directory.
+///
+/// # Errors
+///
+/// Returns an error for UNC/device/relative/lexically redirected paths, reparse points, or an
+/// ordinary presentation that does not round-trip to the same native directory identity.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_child_path_presentation_for_integration(
+    canonical: &Path,
+) -> std::io::Result<PathBuf> {
+    WindowsChildPathPresentation::bind(canonical).map(|bound| bound.presentation)
+}
+
+#[cfg(windows)]
+struct WindowsChildTempAuthority {
+    path: PathBuf,
+    path_identity: same_file::Handle,
+    parent: PathBuf,
+    parent_identity: same_file::Handle,
+    cleanup_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl WindowsChildTempAuthority {
+    fn reserve(target: &Path) -> std::io::Result<Self> {
+        let target_metadata = fs::symlink_metadata(target)?;
+        if !target.is_absolute()
+            || target_metadata.file_type().is_symlink()
+            || !target_metadata.is_dir()
+            || fs::canonicalize(target)? != target
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows child temp target is not one canonical directory",
+            ));
+        }
+        let parent = target.join("release-child-environment").join("tmp");
+        fs::create_dir_all(&parent)?;
+        let parent = fs::canonicalize(parent)?;
+        if parent.parent().and_then(Path::parent) != Some(target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp parent escaped its target authority",
+            ));
+        }
+        let parent_metadata = fs::symlink_metadata(&parent)?;
+        if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp parent is redirected",
+            ));
+        }
+        let sequence = NEXT_WINDOWS_CHILD_TEMP_AUTHORITY.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!("child-{}-{sequence}", std::process::id()));
+        fs::create_dir(&path)?;
+        let path = fs::canonicalize(path)?;
+        if path.parent() != Some(parent.as_path()) || fs::read_dir(&path)?.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp authority is not one empty direct directory",
+            ));
+        }
+        Ok(Self {
+            path_identity: same_file::Handle::from_path(&path)?,
+            parent_identity: same_file::Handle::from_path(&parent)?,
+            path,
+            parent,
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn bind_environment(&self, environment: &mut Vec<(OsString, Option<OsString>)>) {
+        environment.retain(|(name, _)| {
+            !["TEMP", "TMP", "TMPDIR"]
+                .iter()
+                .any(|expected| name.eq_ignore_ascii_case(OsStr::new(expected)))
+        });
+        environment.extend(
+            ["TEMP", "TMP", "TMPDIR"]
+                .map(|name| (OsString::from(name), Some(self.path.as_os_str().to_owned()))),
+        );
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        if fs::canonicalize(&self.parent)? != self.parent
+            || same_file::Handle::from_path(&self.parent)? != self.parent_identity
+            || fs::canonicalize(&self.path)? != self.path
+            || same_file::Handle::from_path(&self.path)? != self.path_identity
+            || self.path.parent() != Some(self.parent.as_path())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp authority identity changed",
+            ));
+        }
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp authority is redirected",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_cleaned(&self) -> std::io::Result<()> {
+        if fs::canonicalize(&self.parent)? != self.parent
+            || same_file::Handle::from_path(&self.parent)? != self.parent_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp parent identity changed before cleanup receipt",
+            ));
+        }
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp authority remained after cleanup",
+            )),
+        }
+    }
+
+    fn relinquish_cleanup(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsChildTempAuthority {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop && self.path.exists() {
+            let _ignored = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_LAUNCH_CONTROL_PHASES: [&str; 15] = [
     "request-parsed",
     "adapter-revalidated",
+    "temp-authority-bound",
     "token-duplicated",
     "supported-canary-start",
     "supported-canary-complete",
     "argv-helper-start",
     "helper-entry",
     "request-decoded",
+    "temp-probe-complete",
     "target-spawned",
     "target-terminal",
     "argv-helper-complete",
     "job-closed",
+    "temp-cleanup-complete",
 ];
 
 #[cfg(windows)]
@@ -302,6 +543,12 @@ impl WindowsLaunchControlAuthority {
                 "Windows restricted launch current-directory identity changed",
             ));
         }
+        for presentation in &self.writable_presentations {
+            presentation.revalidate()?;
+        }
+        if let Some(stack) = &self.stack {
+            stack.revalidate()?;
+        }
         let (program, program_bytes, program_sha256) = match self.program {
             Some(program) => {
                 program.revalidate(program.invocation_path.as_os_str())?;
@@ -313,10 +560,15 @@ impl WindowsLaunchControlAuthority {
             }
             None => (None, None, None),
         };
-        let termination_forced = termination.is_some_and(|report| report.forced);
-        let termination_reaped = termination.is_some_and(|report| report.reaped);
+        let termination = WindowsLaunchTerminationReceipt {
+            forced: termination.is_some_and(|report| report.forced),
+            reaped: termination.is_some_and(|report| report.reaped),
+        };
+        if let Some(temporary) = self.temporary {
+            temporary.require_cleaned()?;
+        }
         let completed =
-            status.success() && !timed_out && termination_reaped && candidate_quiescence_complete;
+            status.success() && !timed_out && termination.reaped && candidate_quiescence_complete;
         let state = if completed { "completed" } else { "failed" };
         let mut receipt = WindowsLaunchControlReceipt {
             schema_version: 1,
@@ -331,8 +583,7 @@ impl WindowsLaunchControlAuthority {
             sha256: Digest::default(),
             status_code: status.code(),
             timed_out,
-            termination_forced,
-            termination_reaped,
+            termination,
             candidate_quiescence_complete,
             program,
             program_bytes,
@@ -591,6 +842,18 @@ struct WindowsReleaseBinaryObservation {
 }
 
 #[cfg(windows)]
+struct WindowsReleaseBinaryDiagnostic<'a> {
+    checkpoint: &'a str,
+    target: &'a Path,
+    binary: &'a Path,
+    candidate_target_binding: Option<&'a Path>,
+    release_build_passed: bool,
+    expected: Option<&'a WindowsReleaseBinaryObservation>,
+    observed: Option<&'a WindowsReleaseBinaryObservation>,
+    detail: &'a str,
+}
+
+#[cfg(windows)]
 impl WindowsReleaseBinaryCheckpoint {
     /// Captures a release binary after a successful build.
     ///
@@ -608,54 +871,56 @@ impl WindowsReleaseBinaryCheckpoint {
     ) -> Result<Self, String> {
         let observation =
             windows_release_binary_observation(&target, &binary).map_err(|detail| {
-                windows_release_binary_diagnostic(
+                windows_release_binary_diagnostic(&WindowsReleaseBinaryDiagnostic {
                     checkpoint,
-                    &target,
-                    &binary,
-                    candidate_target_binding.as_deref(),
+                    target: &target,
+                    binary: &binary,
+                    candidate_target_binding: candidate_target_binding.as_deref(),
                     release_build_passed,
-                    None,
-                    None,
-                    &detail,
-                )
+                    expected: None,
+                    observed: None,
+                    detail: &detail,
+                })
             })?;
         if candidate_target_binding.as_deref() != Some(target.as_path()) {
             return Err(windows_release_binary_diagnostic(
-                checkpoint,
-                &target,
-                &binary,
-                candidate_target_binding.as_deref(),
-                release_build_passed,
-                Some(&observation),
-                Some(&observation),
-                "candidate target environment binding differs from the expected output directory",
+                &WindowsReleaseBinaryDiagnostic {
+                    checkpoint,
+                    target: &target,
+                    binary: &binary,
+                    candidate_target_binding: candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    expected: Some(&observation),
+                    observed: Some(&observation),
+                    detail: "candidate target environment binding differs from the expected output directory",
+                },
             ));
         }
         let release_receipt = release_receipt.ok_or_else(|| {
-            windows_release_binary_diagnostic(
+            windows_release_binary_diagnostic(&WindowsReleaseBinaryDiagnostic {
                 checkpoint,
-                &target,
-                &binary,
-                candidate_target_binding.as_deref(),
+                target: &target,
+                binary: &binary,
+                candidate_target_binding: candidate_target_binding.as_deref(),
                 release_build_passed,
-                Some(&observation),
-                Some(&observation),
-                "successful restricted Cargo release receipt is absent",
-            )
+                expected: Some(&observation),
+                observed: Some(&observation),
+                detail: "successful restricted Cargo release receipt is absent",
+            })
         })?;
         release_receipt
             .validate(&target, &binary)
             .map_err(|detail| {
-                windows_release_binary_diagnostic(
+                windows_release_binary_diagnostic(&WindowsReleaseBinaryDiagnostic {
                     checkpoint,
-                    &target,
-                    &binary,
-                    candidate_target_binding.as_deref(),
+                    target: &target,
+                    binary: &binary,
+                    candidate_target_binding: candidate_target_binding.as_deref(),
                     release_build_passed,
-                    Some(&observation),
-                    Some(&observation),
-                    &detail,
-                )
+                    expected: Some(&observation),
+                    observed: Some(&observation),
+                    detail: &detail,
+                })
             })?;
         Ok(Self {
             target,
@@ -676,40 +941,42 @@ impl WindowsReleaseBinaryCheckpoint {
         self.release_receipt
             .validate(&self.target, &self.binary)
             .map_err(|detail| {
-                windows_release_binary_diagnostic(
+                windows_release_binary_diagnostic(&WindowsReleaseBinaryDiagnostic {
                     checkpoint,
-                    &self.target,
-                    &self.binary,
-                    self.candidate_target_binding.as_deref(),
+                    target: &self.target,
+                    binary: &self.binary,
+                    candidate_target_binding: self.candidate_target_binding.as_deref(),
                     release_build_passed,
-                    Some(&self.observation),
-                    None,
-                    &detail,
-                )
+                    expected: Some(&self.observation),
+                    observed: None,
+                    detail: &detail,
+                })
             })?;
         let observed =
             windows_release_binary_observation(&self.target, &self.binary).map_err(|detail| {
-                windows_release_binary_diagnostic(
+                windows_release_binary_diagnostic(&WindowsReleaseBinaryDiagnostic {
                     checkpoint,
-                    &self.target,
-                    &self.binary,
-                    self.candidate_target_binding.as_deref(),
+                    target: &self.target,
+                    binary: &self.binary,
+                    candidate_target_binding: self.candidate_target_binding.as_deref(),
                     release_build_passed,
-                    Some(&self.observation),
-                    None,
-                    &detail,
-                )
+                    expected: Some(&self.observation),
+                    observed: None,
+                    detail: &detail,
+                })
             })?;
         if observed != self.observation {
             return Err(windows_release_binary_diagnostic(
-                checkpoint,
-                &self.target,
-                &self.binary,
-                self.candidate_target_binding.as_deref(),
-                release_build_passed,
-                Some(&self.observation),
-                Some(&observed),
-                "release binary identity or content changed after the successful build",
+                &WindowsReleaseBinaryDiagnostic {
+                    checkpoint,
+                    target: &self.target,
+                    binary: &self.binary,
+                    candidate_target_binding: self.candidate_target_binding.as_deref(),
+                    release_build_passed,
+                    expected: Some(&self.observation),
+                    observed: Some(&observed),
+                    detail: "release binary identity or content changed after the successful build",
+                },
             ));
         }
         Ok(())
@@ -717,6 +984,10 @@ impl WindowsReleaseBinaryCheckpoint {
 
     /// Returns the exact executable path while this authority retains a
     /// Windows handle that denies write, delete, and replacement access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained binary identity or content changed.
     pub fn bound_binary_path(&self) -> Result<&Path, String> {
         self.validate("before retained-path consumption", true)?;
         Ok(&self.binary)
@@ -759,6 +1030,11 @@ impl WindowsReleaseBinaryCheckpoint {
 #[cfg(windows)]
 impl WindowsCargoReleaseReceipt {
     /// Loads and binds the helper-produced receipt for an exact release target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receipt or release binary is absent, redirected,
+    /// substituted, malformed, or differs from the attested artifact.
     pub fn load(target: &Path) -> Result<Self, String> {
         let binary = target.join("release").join("hell.exe");
         let receipt = target.join(WINDOWS_CARGO_RELEASE_RECEIPT);
@@ -1046,6 +1322,11 @@ fn bind_windows_program_parent(path: &Path) -> std::io::Result<Arc<same_file::Ha
 }
 
 #[cfg(windows)]
+/// Hashes a retained Windows file before an absolute deadline.
+///
+/// # Errors
+///
+/// Returns an error if the deadline expires or the retained file cannot be read.
 pub fn sha256_retained_windows_file_until(
     mut file: &fs::File,
     deadline: Instant,
@@ -1105,26 +1386,26 @@ fn require_real_windows_release_binary(target: &Path, binary: &Path) -> Result<(
 }
 
 #[cfg(windows)]
-fn windows_release_binary_diagnostic(
-    checkpoint: &str,
-    target: &Path,
-    binary: &Path,
-    candidate_target_binding: Option<&Path>,
-    release_build_passed: bool,
-    expected: Option<&WindowsReleaseBinaryObservation>,
-    observed: Option<&WindowsReleaseBinaryObservation>,
-    detail: &str,
-) -> String {
+fn windows_release_binary_diagnostic(input: &WindowsReleaseBinaryDiagnostic<'_>) -> String {
+    let WindowsReleaseBinaryDiagnostic {
+        checkpoint,
+        target,
+        binary,
+        candidate_target_binding,
+        release_build_passed,
+        expected,
+        observed,
+        detail,
+    } = input;
     format!(
         "Windows release binary checkpoint failed: checkpoint={checkpoint:?} expectedPath={} \
          candidateTargetBinding={} releaseBuildPassed={release_build_passed} \
          expectedIdentity={} observedIdentity={} targetInventory={} releaseInventory={} detail={detail}",
         binary.display(),
         candidate_target_binding
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<absent>".to_owned()),
-        windows_release_binary_identity_text(expected),
-        windows_release_binary_identity_text(observed),
+            .map_or_else(|| "<absent>".to_owned(), |path| path.display().to_string(),),
+        windows_release_binary_identity_text(*expected),
+        windows_release_binary_identity_text(*observed),
         bounded_windows_directory_inventory(target),
         bounded_windows_directory_inventory(&target.join("release")),
     )
@@ -1174,9 +1455,12 @@ fn bounded_windows_directory_inventory(directory: &Path) -> String {
                     } else {
                         "special"
                     };
-                    format!("{:?}:{kind}", entry.file_name())
+                    format!("{}:{kind}", Path::new(&entry.file_name()).display())
                 }
-                Err(error) => format!("{:?}:<unavailable:{error}>", entry.file_name()),
+                Err(error) => format!(
+                    "{}:<unavailable:{error}>",
+                    Path::new(&entry.file_name()).display()
+                ),
             },
             Err(error) => format!("<unavailable:{error}>"),
         };
@@ -1223,8 +1507,116 @@ pub struct WindowsToolchainAuthority {
     trusted_parent_path: OsString,
     trusted_path_entries: Arc<[WindowsTrustedPathEntry]>,
     system_root: WindowsSystemRootAuthority,
+    git: Option<WindowsGitExecutableAuthority>,
+    stack: Option<WindowsStackRuntimeAuthority>,
     inventory_full_hash_passes: usize,
     lifecycle_execution_deadline: Option<Instant>,
+}
+
+/// Exact staged Stack executable and target-owned Windows runtime authority.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsStackRuntimeAuthority {
+    source: BoundProgramInvocation,
+    staged: BoundProgramInvocation,
+    ghc_shim: WindowsGhcupShimAuthority,
+    ghc_source: BoundProgramInvocation,
+    staged_ghc: BoundProgramInvocation,
+    staged_strip: BoundProgramInvocation,
+    runtime_root: PathBuf,
+    runtime_root_identity: Arc<same_file::Handle>,
+    stack_root: PathBuf,
+    stack_root_identity: Arc<same_file::Handle>,
+    stack_root_presentation: WindowsChildPathPresentation,
+    temporary: PathBuf,
+    temporary_identity: Arc<same_file::Handle>,
+    temporary_presentation: WindowsChildPathPresentation,
+    immutable_root: PathBuf,
+    ghc_bin: PathBuf,
+    mingw_bin: PathBuf,
+    immutable_files: WindowsStackImmutableFiles,
+    immutable_directories: WindowsStackImmutableDirectories,
+}
+
+#[cfg(windows)]
+type WindowsStackImmutableFiles = Arc<[BoundProgramInvocation]>;
+#[cfg(windows)]
+type WindowsStackImmutableDirectories = Arc<[(PathBuf, Arc<same_file::Handle>)]>;
+
+/// Exact filesystem roots used to construct a staged Windows Stack authority.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsStackRuntimeAuthorityInput {
+    source: BoundProgramInvocation,
+    staged: PathBuf,
+    system_ghc: WindowsStackGhcRuntimeInput,
+    writable_target: PathBuf,
+    runtime_root: PathBuf,
+    stack_root: PathBuf,
+    temporary: PathBuf,
+}
+
+/// Exact native-GHC source receipt and target-owned staged distribution layout.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsStackGhcRuntimeInput {
+    shim: WindowsGhcupShimAuthority,
+    source: BoundProgramInvocation,
+    staged: PathBuf,
+    strip: PathBuf,
+    immutable_root: PathBuf,
+    ghc_bin: PathBuf,
+    mingw_bin: PathBuf,
+}
+
+/// Retained Windows `GHCup` public shim, descriptor, and exact distribution target.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsGhcupShimAuthority {
+    public: BoundProgramInvocation,
+    descriptor: WindowsGhcupShimDescriptor,
+    target: BoundProgramInvocation,
+}
+
+/// One bounded semantic receipt emitted by a retained Windows `GHC` executable.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsGhcSemanticReceipt {
+    version: Arc<str>,
+    output_sha256: Digest,
+    requested_libdir: PathBuf,
+    canonical_libdir: PathBuf,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WindowsGhcupShimDescriptor {
+    path: PathBuf,
+    target: PathBuf,
+    contents: Arc<[u8]>,
+    identity: BoundProgramFileIdentity,
+}
+
+/// Retained executable, directory, and bounded version receipt for Git on Windows.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsGitExecutableAuthority {
+    program: BoundProgramInvocation,
+    directory: WindowsPresentTrustedPathEntry,
+    version: WindowsGitVersionReceipt,
+}
+
+/// Bounded evidence produced while acquiring the exact Windows Git executable.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsGitVersionReceipt {
+    pub executable_sha256: Digest,
+    pub output_sha256: Digest,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub version: Arc<str>,
+    pub termination_forced: bool,
+    pub termination_reaped: bool,
 }
 
 #[cfg(windows)]
@@ -1331,6 +1723,254 @@ impl WindowsPresentTrustedPathEntry {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn bind_windows_git_parent_authority_until(
+    trusted_parent_path: &OsStr,
+    trusted_parent_pathext: &OsStr,
+    deadline: Instant,
+) -> std::io::Result<(BoundProgramInvocation, WindowsPresentTrustedPathEntry)> {
+    let search = std::env::split_paths(trusted_parent_path).collect::<Vec<_>>();
+    if search.is_empty() || search.len() > 128 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trusted Windows Git PATH has an invalid entry count",
+        ));
+    }
+    let extensions = windows_native_executable_extensions(trusted_parent_pathext);
+    if extensions.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trusted Windows Git PATHEXT has no native executable extension",
+        ));
+    }
+    let invocation = resolve_windows_parent_program_from(OsStr::new("git"), &search, &extensions)?;
+    let program = BoundProgramInvocation::new_until(
+        invocation.clone(),
+        fs::canonicalize(&invocation)?,
+        deadline,
+    )?;
+    let directory = WindowsPresentTrustedPathEntry::bind(
+        invocation
+            .parent()
+            .ok_or_else(|| std::io::Error::other("Windows Git executable has no parent"))?
+            .to_path_buf(),
+    )?;
+    let mut directory_occurrences = 0_usize;
+    for path in search {
+        let entry = WindowsTrustedPathEntry::bind(path)?;
+        if matches!(
+            entry,
+            WindowsTrustedPathEntry::Present(ref present)
+                if *present.identity == *directory.identity
+        ) {
+            directory_occurrences = directory_occurrences
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("Windows Git PATH count overflowed"))?;
+        }
+    }
+    if directory_occurrences != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "trusted Windows PATH must contain the exact Git directory once",
+        ));
+    }
+    Ok((program, directory))
+}
+
+#[cfg(windows)]
+fn acquire_windows_git_version_until(
+    program: &BoundProgramInvocation,
+    directory: &Path,
+    trusted_parent_system_root: &OsStr,
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+) -> std::io::Result<WindowsGitVersionReceipt> {
+    const MAX_GIT_VERSION_BYTES: u64 = 256;
+
+    let mut command = Command::new(&program.invocation_path);
+    command
+        .arg("version")
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::join_paths([directory])
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        )
+        .env("SystemRoot", trusted_parent_system_root)
+        .current_dir(directory);
+    let output = run_supervised_command_with_bound_program_until(
+        &mut command,
+        &[],
+        execution_deadline,
+        completion_deadline,
+        program,
+        None,
+    )?;
+    let termination = output
+        .termination
+        .ok_or_else(|| std::io::Error::other("Windows Git version has no terminal receipt"))?;
+    if output.timed_out
+        || !output.status.success()
+        || output.stdout.truncated
+        || output.stderr.truncated
+        || output.stdout.total_bytes > MAX_GIT_VERSION_BYTES
+        || output.stderr.total_bytes != 0
+        || !termination.reaped
+    {
+        return Err(std::io::Error::other(format!(
+            "Windows Git version did not complete cleanly: status={:?} timedOut={} stdoutBytes={} stdoutSha256={} stdoutTruncated={} stderrBytes={} stderrSha256={} stderrTruncated={} forced={} reaped={}",
+            output.status.code(),
+            output.timed_out,
+            output.stdout.total_bytes,
+            output.stdout.sha256.hex(),
+            output.stdout.truncated,
+            output.stderr.total_bytes,
+            output.stderr.sha256.hex(),
+            output.stderr.truncated,
+            termination.forced,
+            termination.reaped,
+        )));
+    }
+    let stdout_bytes = output.stdout.total_bytes;
+    let stderr_bytes = output.stderr.total_bytes;
+    let stdout = output.stdout.complete.ok_or_else(|| {
+        std::io::Error::other("Windows Git version lacks complete bounded stdout")
+    })?;
+    let stderr = output.stderr.complete.ok_or_else(|| {
+        std::io::Error::other("Windows Git version lacks complete bounded stderr")
+    })?;
+    let version_output = std::str::from_utf8(&stdout).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows Git version output is not UTF-8",
+        )
+    })?;
+    let version = version_output
+        .strip_suffix("\r\n")
+        .or_else(|| version_output.strip_suffix('\n'))
+        .filter(|value| {
+            value.starts_with("git version ")
+                && !value["git version ".len()..].is_empty()
+                && !value.contains(['\r', '\n'])
+                && !value.ends_with(char::is_whitespace)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows Git version output is not one canonical line",
+            )
+        })?;
+    let mut version_output = stdout.clone();
+    version_output.push(0);
+    version_output.extend_from_slice(&stderr);
+    Ok(WindowsGitVersionReceipt {
+        executable_sha256: program.sha256(),
+        output_sha256: sha256_bytes(&version_output),
+        stdout_bytes,
+        stderr_bytes,
+        version: Arc::from(version),
+        termination_forced: termination.forced,
+        termination_reaped: termination.reaped,
+    })
+}
+
+#[cfg(windows)]
+impl WindowsGitExecutableAuthority {
+    /// Resolves and binds Git from exact parent environment authorities, then
+    /// records one bounded, supervised `git version` execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Git is missing, redirected, duplicated in the
+    /// trusted path, substituted, or does not produce one clean bounded
+    /// version receipt before the supplied deadlines.
+    pub fn resolve_until(
+        trusted_parent_path: &OsStr,
+        trusted_parent_pathext: &OsStr,
+        trusted_parent_system_root: &OsStr,
+        execution_deadline: Instant,
+        completion_deadline: Instant,
+    ) -> std::io::Result<Self> {
+        let started = Instant::now();
+        if execution_deadline > completion_deadline || started >= execution_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Windows Git authority deadline expired before acquisition",
+            ));
+        }
+        let bounded_execution_deadline = started
+            .checked_add(WINDOWS_PROGRAM_AUTHORITY_ACQUISITION_BUDGET)
+            .unwrap_or(execution_deadline)
+            .min(execution_deadline);
+        let bounded_completion_deadline = started
+            .checked_add(WINDOWS_GIT_VERSION_COMPLETION_BUDGET)
+            .unwrap_or(completion_deadline)
+            .min(completion_deadline);
+        if bounded_execution_deadline >= bounded_completion_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows Git execution/completion envelope has no cleanup reserve",
+            ));
+        }
+        let (program, directory) = bind_windows_git_parent_authority_until(
+            trusted_parent_path,
+            trusted_parent_pathext,
+            bounded_execution_deadline,
+        )?;
+        let version = acquire_windows_git_version_until(
+            &program,
+            &directory.canonical_identity,
+            trusted_parent_system_root,
+            bounded_execution_deadline,
+            bounded_completion_deadline,
+        )?;
+        let authority = Self {
+            program,
+            directory,
+            version,
+        };
+        authority.revalidate()?;
+        Ok(authority)
+    }
+
+    fn revalidate(&self) -> std::io::Result<PathBuf> {
+        self.directory.revalidate()?;
+        let program = self
+            .program
+            .revalidate(self.program.invocation_path.as_os_str())?;
+        if program.parent() != Some(self.directory.canonical_identity.as_path())
+            || self.version.executable_sha256 != self.program.sha256()
+            || !self.version.termination_reaped
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows Git executable authority changed",
+            ));
+        }
+        Ok(program)
+    }
+
+    /// Returns the immutable version receipt acquired for this Git authority.
+    #[must_use]
+    pub const fn version_receipt(&self) -> &WindowsGitVersionReceipt {
+        &self.version
+    }
+
+    /// Returns the exact canonical Git executable retained by this authority.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn program_for_integration(&self) -> &Path {
+        &self.program.invocation_path
+    }
+
+    /// Returns the exact direct directory admitted to the restricted child PATH.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn directory_for_integration(&self) -> &Path {
+        &self.directory.canonical_identity
     }
 }
 
@@ -1489,6 +2129,931 @@ pub struct WindowsToolchainExecutableAuthority {
     staged: PathBuf,
 }
 
+/// Closed inputs shared by Windows Rust toolchain authority constructors.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct WindowsToolchainAuthorityInput {
+    cargo: WindowsToolchainExecutableAuthority,
+    rustc: WindowsToolchainExecutableAuthority,
+    inventory_root: PathBuf,
+    inventory_directories: Vec<PathBuf>,
+    trusted_parent_path: OsString,
+    trusted_parent_system_root: OsString,
+    git: Option<WindowsGitExecutableAuthority>,
+    stack: Option<WindowsStackRuntimeAuthority>,
+}
+
+#[cfg(windows)]
+impl WindowsToolchainAuthorityInput {
+    /// Captures the two executable mappings, closed inventory root/directories,
+    /// and trusted parent environment authority as one construction input.
+    #[must_use]
+    pub fn new(
+        cargo: WindowsToolchainExecutableAuthority,
+        rustc: WindowsToolchainExecutableAuthority,
+        inventory_root: PathBuf,
+        inventory_directories: Vec<PathBuf>,
+        trusted_parent_path: OsString,
+        trusted_parent_system_root: OsString,
+    ) -> Self {
+        Self {
+            cargo,
+            rustc,
+            inventory_root,
+            inventory_directories,
+            trusted_parent_path,
+            trusted_parent_system_root,
+            git: None,
+            stack: None,
+        }
+    }
+
+    /// Adds the Git executable authority acquired from the trusted parent environment.
+    #[must_use]
+    pub fn with_git_authority(mut self, git: WindowsGitExecutableAuthority) -> Self {
+        self.git = Some(git);
+        self
+    }
+
+    /// Adds the exact staged Stack executable and target-owned runtime authority.
+    #[must_use]
+    pub fn with_stack_authority(mut self, stack: WindowsStackRuntimeAuthority) -> Self {
+        self.stack = Some(stack);
+        self
+    }
+}
+
+#[cfg(windows)]
+fn bind_windows_stack_directory(path: &Path) -> std::io::Result<Arc<same_file::Handle>> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let metadata = fs::symlink_metadata(path)?;
+    if !path.is_absolute()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.is_dir()
+        || fs::canonicalize(path)? != path
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Stack directory authority is redirected",
+        ));
+    }
+    same_file::Handle::from_path(path).map(Arc::new)
+}
+
+#[cfg(windows)]
+fn revalidate_windows_stack_directory(
+    path: &Path,
+    identity: &same_file::Handle,
+) -> std::io::Result<()> {
+    if *bind_windows_stack_directory(path)? != *identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows Stack directory identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn bind_windows_stack_child_presentation(
+    canonical: &Path,
+) -> std::io::Result<WindowsChildPathPresentation> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const WINDOWS_LEGACY_PATH_UTF16_LIMIT_WITHOUT_NUL: usize = 259;
+    const MAX_DECIMAL_USIZE_UTF16_LEN: usize = "18446744073709551615".len();
+    const GHC_TEMP_DIRECTORY_FIXED_UTF16_LEN: usize = "ghc__".len();
+    const GHC_ASSEMBLER_FILE_FIXED_UTF16_LEN: usize = "ghc_.s".len();
+    const GHC_TEMP_DESCENDANT_UTF16_RESERVE: usize = GHC_TEMP_DIRECTORY_FIXED_UTF16_LEN
+        + MAX_DECIMAL_USIZE_UTF16_LEN * 2
+        + 1
+        + GHC_ASSEMBLER_FILE_FIXED_UTF16_LEN
+        + MAX_DECIMAL_USIZE_UTF16_LEN;
+
+    let presentation = WindowsChildPathPresentation::bind(canonical)?;
+    let presented_length = presentation.presentation.as_os_str().encode_wide().count();
+    if presented_length
+        .checked_add(GHC_TEMP_DESCENDANT_UTF16_RESERVE)
+        .is_none_or(|length| length > WINDOWS_LEGACY_PATH_UTF16_LIMIT_WITHOUT_NUL)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Stack child writable presentation exceeds its downstream path bound",
+        ));
+    }
+    Ok(presentation)
+}
+
+#[cfg(windows)]
+fn revalidate_windows_stack_child_presentation(
+    canonical: &Path,
+    identity: &same_file::Handle,
+    presentation: &WindowsChildPathPresentation,
+) -> std::io::Result<()> {
+    presentation.revalidate()?;
+    if presentation.canonical != canonical || *presentation.identity != *identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows Stack child writable presentation authority changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn revalidate_windows_stack_writable_directories(
+    authority: &WindowsStackRuntimeAuthority,
+) -> std::io::Result<()> {
+    revalidate_windows_stack_directory(&authority.runtime_root, &authority.runtime_root_identity)?;
+    revalidate_windows_stack_directory(&authority.stack_root, &authority.stack_root_identity)?;
+    revalidate_windows_stack_child_presentation(
+        &authority.stack_root,
+        &authority.stack_root_identity,
+        &authority.stack_root_presentation,
+    )?;
+    revalidate_windows_stack_directory(&authority.temporary, &authority.temporary_identity)?;
+    revalidate_windows_stack_child_presentation(
+        &authority.temporary,
+        &authority.temporary_identity,
+        &authority.temporary_presentation,
+    )
+}
+
+#[cfg(windows)]
+fn read_windows_ghcup_shim_descriptor_until(
+    identity: &BoundProgramFileIdentity,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    const DESCRIPTOR_BYTE_LIMIT: u64 = 4096;
+    if identity.length == 0 || identity.length > DESCRIPTOR_BYTE_LIMIT || Instant::now() >= deadline
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor is empty, oversized, or expired",
+        ));
+    }
+    let length = usize::try_from(identity.length).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor length is not representable",
+        )
+    })?;
+    let mut retained = identity.guard.as_file();
+    retained.seek(SeekFrom::Start(0))?;
+    let mut contents = vec![0_u8; length];
+    retained.read_exact(&mut contents)?;
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Windows GHCup shim descriptor read exceeded its deadline",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(windows)]
+fn parse_windows_ghcup_shim_target(contents: &[u8]) -> std::io::Result<PathBuf> {
+    const PREFIX: &str = "path = ";
+    let text = std::str::from_utf8(contents).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor is not UTF-8",
+        )
+    })?;
+    let target = text.strip_prefix(PREFIX).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor has no exact path field",
+        )
+    })?;
+    if target.is_empty()
+        || target != target.trim()
+        || target.chars().any(char::is_control)
+        || target.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor is not one exact path field",
+        ));
+    }
+    let target = PathBuf::from(target);
+    if !target.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup shim descriptor target is not absolute",
+        ));
+    }
+    Ok(target)
+}
+
+#[cfg(windows)]
+fn normalize_windows_ghcup_shim_target(path: &Path) -> std::io::Result<PathBuf> {
+    use std::os::windows::fs::MetadataExt as _;
+    use std::path::Component;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let mut normalized = PathBuf::new();
+    let mut normal_components = 0_usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normal_components == 0 || !normalized.pop() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Windows GHCup shim target escapes its absolute root",
+                    ));
+                }
+                normal_components -= 1;
+            }
+            Component::Normal(name) => {
+                normalized.push(name);
+                normal_components += 1;
+            }
+        }
+    }
+    for member in normalized.ancestors() {
+        let metadata = fs::symlink_metadata(member)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows GHCup shim target traverses a reparse point",
+            ));
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(windows)]
+impl WindowsGhcupShimDescriptor {
+    fn bind_until(path: PathBuf, deadline: Instant) -> std::io::Result<Self> {
+        if fs::canonicalize(&path)? != path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows GHCup shim descriptor path is not canonical",
+            ));
+        }
+        let identity = BoundProgramFileIdentity::bind_until(&path, deadline)?;
+        let contents = read_windows_ghcup_shim_descriptor_until(&identity, deadline)?;
+        let target =
+            normalize_windows_ghcup_shim_target(&parse_windows_ghcup_shim_target(&contents)?)?;
+        Ok(Self {
+            path,
+            target,
+            contents: contents.into(),
+            identity,
+        })
+    }
+
+    fn revalidate_until(&self, deadline: Instant) -> std::io::Result<()> {
+        self.identity.revalidate(&self.path)?;
+        let contents = read_windows_ghcup_shim_descriptor_until(&self.identity, deadline)?;
+        if contents.as_slice() != self.contents.as_ref()
+            || normalize_windows_ghcup_shim_target(&parse_windows_ghcup_shim_target(&contents)?)?
+                != self.target
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows GHCup shim descriptor bytes changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl WindowsGhcupShimAuthority {
+    /// Binds one public `GHCup` shim, its exact adjacent descriptor, and target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any member is redirected, substituted, malformed,
+    /// or the descriptor does not target the retained distribution executable.
+    pub fn new_until(
+        public: BoundProgramInvocation,
+        descriptor: PathBuf,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        public.revalidate(public.invocation_path.as_os_str())?;
+        if public.invocation_path.file_name() != Some(OsStr::new("ghc.exe"))
+            || descriptor != public.invocation_path.with_extension("shim")
+            || descriptor.parent() != public.invocation_path.parent()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows GHCup shim members do not have the exact public layout",
+            ));
+        }
+        let descriptor = WindowsGhcupShimDescriptor::bind_until(descriptor, deadline)?;
+        let canonical_target = fs::canonicalize(&descriptor.target)?;
+        let target = BoundProgramInvocation::new_until(
+            canonical_target.clone(),
+            canonical_target,
+            deadline,
+        )?;
+        if target.invocation_path.file_name() != Some(OsStr::new("ghc.exe"))
+            || public.invocation_path == target.invocation_path
+            || *public.file_identity.guard == *target.file_identity.guard
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows GHCup shim target is not a distinct ghc.exe",
+            ));
+        }
+        let authority = Self {
+            public,
+            descriptor,
+            target,
+        };
+        authority.revalidate_until(deadline)?;
+        Ok(authority)
+    }
+
+    /// Revalidates the public shim, descriptor bytes, and exact target relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a member changed, was redirected, or the deadline expired.
+    pub fn revalidate_until(&self, deadline: Instant) -> std::io::Result<()> {
+        self.public
+            .revalidate(self.public.invocation_path.as_os_str())?;
+        self.target
+            .revalidate(self.target.invocation_path.as_os_str())?;
+        self.descriptor.revalidate_until(deadline)?;
+        let canonical_target = fs::canonicalize(&self.descriptor.target)?;
+        if canonical_target != self.target.canonical_identity
+            || same_file::Handle::from_path(&canonical_target)? != *self.target.file_identity.guard
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows GHCup shim target relationship changed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Attests that a separately derived distribution authority is the shim target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either authority changed or their native identities differ.
+    pub fn attest_target_until(
+        &self,
+        target: &BoundProgramInvocation,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        self.revalidate_until(deadline)?;
+        target.revalidate(target.invocation_path.as_os_str())?;
+        if self.target != *target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows GHCup shim target differs from the distribution authority",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Attests the exact distribution target and matching public/distribution receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if target attestation fails or the semantic receipts differ.
+    pub fn attest_distribution_until(
+        &self,
+        target: &BoundProgramInvocation,
+        public: &WindowsGhcSemanticReceipt,
+        distribution: &WindowsGhcSemanticReceipt,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        self.attest_target_until(target, deadline)?;
+        if public != distribution {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows public and distribution GHC semantic receipts differ",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl WindowsGhcSemanticReceipt {
+    /// Binds one parsed version/output digest and its exact canonical library path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed version/digest data or a redirected libdir.
+    pub fn new(
+        version: impl Into<Arc<str>>,
+        output_sha256: &str,
+        requested_libdir: PathBuf,
+        canonical_libdir: PathBuf,
+    ) -> std::io::Result<Self> {
+        let version = version.into();
+        if version.is_empty()
+            || version.as_ref() != version.trim()
+            || version.chars().any(char::is_control)
+            || !requested_libdir.is_absolute()
+            || fs::canonicalize(&requested_libdir)? != canonical_libdir
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows GHC semantic receipt is malformed or redirected",
+            ));
+        }
+        let output_sha256 = Digest::from_hex(output_sha256).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows GHC semantic output digest is malformed: {error}"),
+            )
+        })?;
+        Ok(Self {
+            version,
+            output_sha256,
+            requested_libdir,
+            canonical_libdir,
+        })
+    }
+}
+
+#[cfg(windows)]
+struct WindowsStackImmutableInventoryInput<'a> {
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+    root: &'a Path,
+    ghc_bin: &'a Path,
+    mingw_bin: &'a Path,
+    ghc: &'a BoundProgramInvocation,
+    strip: &'a BoundProgramInvocation,
+}
+
+#[cfg(windows)]
+struct BoundWindowsStackGhcRuntime {
+    shim: WindowsGhcupShimAuthority,
+    source: BoundProgramInvocation,
+    staged: BoundProgramInvocation,
+    strip: BoundProgramInvocation,
+    immutable_root: PathBuf,
+    ghc_bin: PathBuf,
+    mingw_bin: PathBuf,
+}
+
+#[cfg(windows)]
+fn bind_windows_stack_ghc_runtime(
+    input: WindowsStackGhcRuntimeInput,
+    deadline: Instant,
+) -> std::io::Result<BoundWindowsStackGhcRuntime> {
+    input.shim.revalidate_until(deadline)?;
+    input
+        .source
+        .revalidate(input.source.invocation_path.as_os_str())?;
+    let staged = fs::canonicalize(input.staged)?;
+    let staged = BoundProgramInvocation::new_until(staged.clone(), staged, deadline)?;
+    if input.shim.target != input.source
+        || input.source.length() != staged.length()
+        || input.source.sha256() != staged.sha256()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows GHCup target, distribution, and staged GHC authorities differ",
+        ));
+    }
+    let strip = fs::canonicalize(input.strip)?;
+    let strip = BoundProgramInvocation::new_until(strip.clone(), strip, deadline)?;
+    let immutable_root = fs::canonicalize(input.immutable_root)?;
+    let ghc_bin = fs::canonicalize(input.ghc_bin)?;
+    let mingw_bin = fs::canonicalize(input.mingw_bin)?;
+    if ghc_bin != immutable_root.join("bin")
+        || mingw_bin != immutable_root.join("mingw").join("bin")
+        || staged.invocation_path.parent() != Some(ghc_bin.as_path())
+        || staged.invocation_path.file_name() != Some(OsStr::new("ghc.exe"))
+        || strip.invocation_path.parent() != Some(mingw_bin.as_path())
+        || strip.invocation_path.file_name() != Some(OsStr::new("strip.exe"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Stack GHC/MinGW layout differs from its exact staged authority",
+        ));
+    }
+    Ok(BoundWindowsStackGhcRuntime {
+        shim: input.shim,
+        source: input.source,
+        staged,
+        strip,
+        immutable_root,
+        ghc_bin,
+        mingw_bin,
+    })
+}
+
+#[cfg(windows)]
+fn bind_windows_stack_immutable_inventory(
+    input: WindowsStackImmutableInventoryInput<'_>,
+    deadline: Instant,
+) -> std::io::Result<(WindowsStackImmutableFiles, WindowsStackImmutableDirectories)> {
+    let immutable_files = input
+        .files
+        .into_iter()
+        .map(|path| {
+            let path = fs::canonicalize(path)?;
+            if !path.starts_with(input.root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows Stack immutable file escaped its root",
+                ));
+            }
+            BoundProgramInvocation::new_until(path.clone(), path, deadline)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let immutable_directories = input
+        .directories
+        .into_iter()
+        .map(|path| {
+            let path = fs::canonicalize(path)?;
+            if !path.starts_with(input.root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows Stack immutable directory escaped its root",
+                ));
+            }
+            Ok((path.clone(), bind_windows_stack_directory(&path)?))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if !immutable_directories
+        .iter()
+        .any(|(path, _)| path == input.root)
+        || !immutable_directories
+            .iter()
+            .any(|(path, _)| path == input.ghc_bin)
+        || !immutable_directories
+            .iter()
+            .any(|(path, _)| path == input.mingw_bin)
+        || !immutable_files
+            .iter()
+            .any(|file| file.invocation_path == input.ghc.invocation_path)
+        || !immutable_files
+            .iter()
+            .any(|file| file.invocation_path == input.strip.invocation_path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Stack immutable inventory lacks its exact GHC/MinGW closure",
+        ));
+    }
+    Ok((immutable_files.into(), immutable_directories.into()))
+}
+
+#[cfg(windows)]
+impl WindowsStackRuntimeAuthority {
+    /// Describes the exact native-GHC source and staged distribution layout.
+    #[must_use]
+    pub fn system_ghc_input(
+        shim: WindowsGhcupShimAuthority,
+        source: BoundProgramInvocation,
+        staged: PathBuf,
+        strip: PathBuf,
+        immutable_root: PathBuf,
+        ghc_bin: PathBuf,
+        mingw_bin: PathBuf,
+    ) -> WindowsStackGhcRuntimeInput {
+        WindowsStackGhcRuntimeInput {
+            shim,
+            source,
+            staged,
+            strip,
+            immutable_root,
+            ghc_bin,
+            mingw_bin,
+        }
+    }
+
+    /// Describes the exact source executable and target-owned runtime layout.
+    #[must_use]
+    pub fn input(
+        source: BoundProgramInvocation,
+        staged: PathBuf,
+        system_ghc: WindowsStackGhcRuntimeInput,
+        writable_target: PathBuf,
+        runtime_root: PathBuf,
+        stack_root: PathBuf,
+        temporary: PathBuf,
+    ) -> WindowsStackRuntimeAuthorityInput {
+        WindowsStackRuntimeAuthorityInput {
+            source,
+            staged,
+            system_ghc,
+            writable_target,
+            runtime_root,
+            stack_root,
+            temporary,
+        }
+    }
+
+    /// Binds one staged Stack executable, its immutable GHC/MinGW closure, and
+    /// the exact mutable runtime directories owned by the candidate target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a path is redirected, outside the writable target,
+    /// substituted, or differs from the staged source executable.
+    pub fn new_until(
+        input: WindowsStackRuntimeAuthorityInput,
+        immutable_files: Vec<PathBuf>,
+        immutable_directories: Vec<PathBuf>,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        let WindowsStackRuntimeAuthorityInput {
+            source,
+            staged,
+            system_ghc,
+            writable_target,
+            runtime_root,
+            stack_root,
+            temporary,
+        } = input;
+        let BoundWindowsStackGhcRuntime {
+            shim: ghc_shim,
+            source: ghc_source,
+            staged: staged_ghc,
+            strip: staged_strip,
+            immutable_root,
+            ghc_bin,
+            mingw_bin,
+        } = bind_windows_stack_ghc_runtime(system_ghc, deadline)?;
+        let writable_target = fs::canonicalize(writable_target)?;
+        if runtime_root.parent().and_then(Path::parent) != Some(writable_target.as_path())
+            || runtime_root.parent().and_then(Path::file_name)
+                != Some(OsStr::new("release-child-environment"))
+            || stack_root.parent() != Some(runtime_root.as_path())
+            || temporary.parent() != Some(runtime_root.as_path())
+            || stack_root == temporary
+            || staged.parent() != Some(runtime_root.join("bin").as_path())
+            || staged.file_name() != Some(OsStr::new("stack.exe"))
+            || immutable_root.parent() != Some(runtime_root.as_path())
+            || immutable_root == stack_root
+            || immutable_root == temporary
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows Stack runtime is outside its exact candidate target",
+            ));
+        }
+        let staged = fs::canonicalize(staged)?;
+        source.revalidate(source.invocation_path.as_os_str())?;
+        let staged = BoundProgramInvocation::new_until(staged.clone(), staged, deadline)?;
+        if source.length() != staged.length() || source.sha256() != staged.sha256() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows Stack executable differs from its source",
+            ));
+        }
+        let runtime_root_identity = bind_windows_stack_directory(&runtime_root)?;
+        let stack_root_identity = bind_windows_stack_directory(&stack_root)?;
+        let stack_root_presentation = bind_windows_stack_child_presentation(&stack_root)?;
+        let temporary_identity = bind_windows_stack_directory(&temporary)?;
+        let temporary_presentation = bind_windows_stack_child_presentation(&temporary)?;
+        if fs::read_dir(&stack_root)?.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "target-owned Windows STACK_ROOT was not initially empty",
+            ));
+        }
+        let (immutable_files, immutable_directories) = bind_windows_stack_immutable_inventory(
+            WindowsStackImmutableInventoryInput {
+                files: immutable_files,
+                directories: immutable_directories,
+                root: &immutable_root,
+                ghc_bin: &ghc_bin,
+                mingw_bin: &mingw_bin,
+                ghc: &staged_ghc,
+                strip: &staged_strip,
+            },
+            deadline,
+        )?;
+        let authority = Self {
+            source,
+            staged,
+            ghc_shim,
+            ghc_source,
+            staged_ghc,
+            staged_strip,
+            runtime_root,
+            runtime_root_identity,
+            stack_root,
+            stack_root_identity,
+            stack_root_presentation,
+            temporary,
+            temporary_identity,
+            temporary_presentation,
+            immutable_root,
+            ghc_bin,
+            mingw_bin,
+            immutable_files,
+            immutable_directories,
+        };
+        authority.revalidate()?;
+        Ok(authority)
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        self.source
+            .revalidate(self.source.invocation_path.as_os_str())?;
+        self.staged
+            .revalidate(self.staged.invocation_path.as_os_str())?;
+        if self.source.length() != self.staged.length()
+            || self.source.sha256() != self.staged.sha256()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows Stack executable changed",
+            ));
+        }
+        self.ghc_source
+            .revalidate(self.ghc_source.invocation_path.as_os_str())?;
+        self.ghc_shim
+            .revalidate_until(windows_program_authority_acquisition_deadline()?)?;
+        self.staged_ghc
+            .revalidate(self.staged_ghc.invocation_path.as_os_str())?;
+        self.staged_strip
+            .revalidate(self.staged_strip.invocation_path.as_os_str())?;
+        if self.ghc_shim.target != self.ghc_source
+            || self.ghc_source.length() != self.staged_ghc.length()
+            || self.ghc_source.sha256() != self.staged_ghc.sha256()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged Windows GHC executable changed",
+            ));
+        }
+        revalidate_windows_stack_writable_directories(self)?;
+        for file in self.immutable_files.iter() {
+            file.revalidate(file.invocation_path.as_os_str())?;
+        }
+        for (path, identity) in self.immutable_directories.iter() {
+            revalidate_windows_stack_directory(path, identity)?;
+        }
+        let expected = self
+            .immutable_directories
+            .iter()
+            .map(|(path, _)| (path.clone(), true))
+            .chain(
+                self.immutable_files
+                    .iter()
+                    .map(|file| (file.invocation_path.clone(), false)),
+            )
+            .collect::<BTreeSet<_>>();
+        if expected.len() != self.immutable_directories.len() + self.immutable_files.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows Stack immutable inventory contains duplicates",
+            ));
+        }
+        let mut observed = BTreeSet::new();
+        let mut pending = vec![self.immutable_root.clone()];
+        while let Some(directory) = pending.pop() {
+            observed.insert((directory.clone(), true));
+            for entry in fs::read_dir(&directory)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Windows Stack immutable inventory gained a reparse point",
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    observed.insert((path, false));
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Windows Stack immutable inventory gained a special entry",
+                    ));
+                }
+                if observed.len() + pending.len() > expected.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Windows Stack immutable inventory exceeds its closed bound",
+                    ));
+                }
+            }
+        }
+        if observed != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows Stack immutable inventory changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bind_environment(
+        &self,
+        environment: &mut Vec<(OsString, Option<OsString>)>,
+    ) -> std::io::Result<()> {
+        self.revalidate()?;
+        if environment.iter().any(|(candidate, _)| {
+            ["APPDATA", "LOCALAPPDATA", "HOME", "USERPROFILE"]
+                .iter()
+                .any(|name| candidate.eq_ignore_ascii_case(OsStr::new(name)))
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Windows Stack child attempted to inherit a profile environment",
+            ));
+        }
+        for (name, expected) in [
+            (
+                "STACK_ROOT",
+                self.stack_root_presentation.presentation.as_os_str(),
+            ),
+            ("TEMP", self.temporary_presentation.presentation.as_os_str()),
+            ("TMP", self.temporary_presentation.presentation.as_os_str()),
+            (
+                "TMPDIR",
+                self.temporary_presentation.presentation.as_os_str(),
+            ),
+        ] {
+            let indices = environment
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate, _))| candidate.eq_ignore_ascii_case(OsStr::new(name)))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if indices.len() > 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Windows Stack child has duplicate {name} entries"),
+                ));
+            }
+            match indices.first().copied() {
+                Some(index) if environment[index].1.as_deref() == Some(expected) => {}
+                Some(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Windows Stack child {name} differs from its authority"),
+                    ));
+                }
+                None => environment.push((OsString::from(name), Some(expected.to_owned()))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Exercises the exact Stack environment-vector boundary.
+    #[doc(hidden)]
+    pub fn bind_environment_for_integration(
+        &self,
+        environment: &mut Vec<(OsString, Option<OsString>)>,
+    ) -> std::io::Result<()> {
+        self.bind_environment(environment)
+    }
+
+    /// Exercises the exact staged Stack/GHC/MinGW PATH boundary.
+    #[doc(hidden)]
+    pub fn prepend_path_for_integration(
+        &self,
+        environment: &mut [(OsString, OsString)],
+    ) -> std::io::Result<()> {
+        prepend_windows_stack_path(environment, self)
+    }
+
+    /// Exercises the exact system-GHC policy argument boundary.
+    #[doc(hidden)]
+    pub fn bind_arguments_for_integration(
+        &self,
+        arguments: Vec<OsString>,
+    ) -> std::io::Result<Vec<OsString>> {
+        self.revalidate()?;
+        windows_stack_arguments(arguments)
+    }
+}
+
+#[cfg(windows)]
+struct WindowsToolchainBindInput {
+    authority: WindowsToolchainAuthorityInput,
+    inventory: WindowsToolchainInventoryInput,
+    acquisition_deadline: Instant,
+    lifecycle_execution_deadline: Option<Instant>,
+}
+
+#[cfg(windows)]
+struct BoundWindowsToolchainPrograms {
+    cargo_source: BoundProgramInvocation,
+    rustc_source: BoundProgramInvocation,
+    selected_cargo: BoundProgramInvocation,
+    selected_rustc: BoundProgramInvocation,
+    staged_cargo_path: PathBuf,
+    staged_rustc_path: PathBuf,
+}
+
 /// Closed operation labels for failures while binding a staged Windows Rust
 /// toolchain. These labels keep hosted diagnostics actionable without changing
 /// which paths or identities the authority accepts.
@@ -1593,6 +3158,224 @@ impl WindowsToolchainExecutableAuthority {
 }
 
 #[cfg(windows)]
+fn bind_windows_toolchain_parent_authorities(
+    trusted_parent_path: &OsStr,
+    trusted_parent_system_root: OsString,
+) -> std::io::Result<(Vec<WindowsTrustedPathEntry>, WindowsSystemRootAuthority)> {
+    let mut trusted_path_entries = Vec::new();
+    for path in std::env::split_paths(trusted_parent_path) {
+        let entry = WindowsTrustedPathEntry::bind(path.clone()).map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::BindTrustedPathEntry,
+                &path,
+                &error,
+            )
+        })?;
+        trusted_path_entries.push(entry);
+    }
+    if trusted_path_entries.is_empty()
+        || trusted_path_entries.len() > 128
+        || !trusted_path_entries
+            .iter()
+            .any(|entry| entry.canonical_identity().is_some())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trusted Windows PATH has an invalid entry count",
+        ));
+    }
+    let system_root_path = PathBuf::from(&trusted_parent_system_root);
+    let system_root =
+        WindowsSystemRootAuthority::bind(trusted_parent_system_root, &trusted_path_entries)
+            .map_err(|error| {
+                windows_toolchain_bind_failure(
+                    WindowsToolchainBindOperation::BindSystemRoot,
+                    &system_root_path,
+                    &error,
+                )
+            })?;
+    Ok((trusted_path_entries, system_root))
+}
+
+#[cfg(windows)]
+fn bind_windows_toolchain_programs(
+    cargo: WindowsToolchainExecutableAuthority,
+    rustc: WindowsToolchainExecutableAuthority,
+    acquisition_deadline: Instant,
+) -> std::io::Result<BoundWindowsToolchainPrograms> {
+    let cargo_source_path = cargo.source_identity.clone();
+    let rustc_source_path = rustc.source_identity.clone();
+    let selected_cargo_path = cargo.selected.clone();
+    let staged_cargo_path = cargo.staged;
+    let selected_rustc_path = rustc.selected.clone();
+    let staged_rustc_path = rustc.staged;
+    let cargo_source = BoundProgramInvocation::new_until(
+        cargo.source_invocation,
+        cargo.source_identity,
+        acquisition_deadline,
+    )
+    .map_err(|error| {
+        windows_toolchain_bind_failure(
+            WindowsToolchainBindOperation::BindCargoSource,
+            &cargo_source_path,
+            &error,
+        )
+    })?;
+    let rustc_source = BoundProgramInvocation::new_until(
+        rustc.source_invocation,
+        rustc.source_identity,
+        acquisition_deadline,
+    )
+    .map_err(|error| {
+        windows_toolchain_bind_failure(
+            WindowsToolchainBindOperation::BindRustcSource,
+            &rustc_source_path,
+            &error,
+        )
+    })?;
+    let selected_cargo = BoundProgramInvocation::new_until(
+        selected_cargo_path.clone(),
+        selected_cargo_path.clone(),
+        acquisition_deadline,
+    )
+    .map_err(|error| {
+        windows_toolchain_bind_failure(
+            WindowsToolchainBindOperation::BindSelectedCargo,
+            &selected_cargo_path,
+            &error,
+        )
+    })?;
+    let selected_rustc = BoundProgramInvocation::new_until(
+        selected_rustc_path.clone(),
+        selected_rustc_path.clone(),
+        acquisition_deadline,
+    )
+    .map_err(|error| {
+        windows_toolchain_bind_failure(
+            WindowsToolchainBindOperation::BindSelectedRustc,
+            &selected_rustc_path,
+            &error,
+        )
+    })?;
+    Ok(BoundWindowsToolchainPrograms {
+        cargo_source,
+        rustc_source,
+        selected_cargo,
+        selected_rustc,
+        staged_cargo_path,
+        staged_rustc_path,
+    })
+}
+
+#[cfg(windows)]
+fn bind_windows_toolchain_inventory(
+    inventory: WindowsToolchainInventoryInput,
+    inventory_root: &Path,
+    acquisition_deadline: Instant,
+) -> std::io::Result<(Vec<BoundProgramInvocation>, usize)> {
+    let (files, full_hash_passes) = match inventory {
+        WindowsToolchainInventoryInput::Paths(paths) => (
+            paths
+                .into_iter()
+                .map(|path| {
+                    BoundProgramInvocation::new_until(
+                        path.clone(),
+                        path.clone(),
+                        acquisition_deadline,
+                    )
+                    .map_err(|error| {
+                        windows_toolchain_bind_failure(
+                            WindowsToolchainBindOperation::BindInventoryFile,
+                            &path,
+                            &error,
+                        )
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>()?,
+            1,
+        ),
+        WindowsToolchainInventoryInput::Promoted(files) => {
+            for file in &files {
+                if Instant::now() >= acquisition_deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "staged Windows toolchain promotion exceeded its absolute deadline",
+                    ));
+                }
+                if file.invocation_path != file.canonical_identity
+                    || !file.invocation_path.starts_with(inventory_root)
+                    || file.invocation_path == inventory_root
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "promoted Windows toolchain member is outside the staged inventory",
+                    ));
+                }
+                file.revalidate(file.invocation_path.as_os_str())?;
+            }
+            (files, 0)
+        }
+    };
+    let unique_files = files
+        .iter()
+        .map(|file| file.invocation_path.clone())
+        .collect::<BTreeSet<_>>();
+    if unique_files.len() != files.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "staged Windows toolchain inventory contains duplicate files",
+        ));
+    }
+    Ok((files, full_hash_passes))
+}
+
+#[cfg(windows)]
+fn windows_staged_toolchain_member(
+    inventory_files: &[BoundProgramInvocation],
+    path: &Path,
+    operation: WindowsToolchainBindOperation,
+) -> std::io::Result<BoundProgramInvocation> {
+    inventory_files
+        .iter()
+        .find(|file| file.invocation_path == path)
+        .cloned()
+        .ok_or_else(|| {
+            windows_toolchain_bind_failure(
+                operation,
+                path,
+                &std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "selected staged executable is absent from the promoted inventory",
+                ),
+            )
+        })
+}
+
+#[cfg(windows)]
+fn validate_new_windows_toolchain_authority(
+    authority: &WindowsToolchainAuthority,
+    acquisition_deadline: Instant,
+) -> std::io::Result<()> {
+    if authority.selected_cargo.sha256() != authority.staged_cargo.sha256()
+        || authority.selected_rustc.sha256() != authority.staged_rustc.sha256()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "staged Windows Rust executable differs from selected source",
+        ));
+    }
+    authority
+        .revalidate_inventory_until(acquisition_deadline)
+        .map_err(|error| {
+            windows_toolchain_bind_failure(
+                WindowsToolchainBindOperation::RevalidateInventory,
+                &authority.inventory_root,
+                &error,
+            )
+        })
+}
+
+#[cfg(windows)]
 impl WindowsToolchainAuthority {
     /// Binds the two typed Rust tool sources and exact selected/staged executables.
     ///
@@ -1611,13 +3394,15 @@ impl WindowsToolchainAuthority {
     ) -> std::io::Result<Self> {
         let acquisition_deadline = windows_program_authority_acquisition_deadline()?;
         Self::new_until(
-            cargo,
-            rustc,
-            inventory_root,
+            WindowsToolchainAuthorityInput::new(
+                cargo,
+                rustc,
+                inventory_root,
+                inventory_directories,
+                trusted_parent_path,
+                trusted_parent_system_root,
+            ),
             inventory_files,
-            inventory_directories,
-            trusted_parent_path,
-            trusted_parent_system_root,
             acquisition_deadline,
         )
     }
@@ -1629,26 +3414,16 @@ impl WindowsToolchainAuthority {
     /// Returns an error if the deadline expires or any path is redirected,
     /// substituted, or differs from the closed staged inventory.
     pub fn new_until(
-        cargo: WindowsToolchainExecutableAuthority,
-        rustc: WindowsToolchainExecutableAuthority,
-        inventory_root: PathBuf,
+        authority: WindowsToolchainAuthorityInput,
         inventory_files: Vec<PathBuf>,
-        inventory_directories: Vec<PathBuf>,
-        trusted_parent_path: OsString,
-        trusted_parent_system_root: OsString,
         acquisition_deadline: Instant,
     ) -> std::io::Result<Self> {
-        Self::new_with_inventory_until(
-            cargo,
-            rustc,
-            inventory_root,
-            WindowsToolchainInventoryInput::Paths(inventory_files),
-            inventory_directories,
-            trusted_parent_path,
-            trusted_parent_system_root,
+        Self::new_with_inventory_until(WindowsToolchainBindInput {
+            authority,
+            inventory: WindowsToolchainInventoryInput::Paths(inventory_files),
             acquisition_deadline,
-            None,
-        )
+            lifecycle_execution_deadline: None,
+        })
     }
 
     /// Promotes an already-hashed staged inventory into the selected toolchain authority.
@@ -1660,40 +3435,36 @@ impl WindowsToolchainAuthority {
     /// mappings name exact promoted members.
     #[doc(hidden)]
     pub fn new_from_promoted_inventory_until(
-        cargo: WindowsToolchainExecutableAuthority,
-        rustc: WindowsToolchainExecutableAuthority,
-        inventory_root: PathBuf,
+        authority: WindowsToolchainAuthorityInput,
         inventory_files: Vec<BoundProgramInvocation>,
-        inventory_directories: Vec<PathBuf>,
-        trusted_parent_path: OsString,
-        trusted_parent_system_root: OsString,
         acquisition_deadline: Instant,
         lifecycle_execution_deadline: Instant,
     ) -> std::io::Result<Self> {
-        Self::new_with_inventory_until(
-            cargo,
-            rustc,
-            inventory_root,
-            WindowsToolchainInventoryInput::Promoted(inventory_files),
-            inventory_directories,
-            trusted_parent_path,
-            trusted_parent_system_root,
+        Self::new_with_inventory_until(WindowsToolchainBindInput {
+            authority,
+            inventory: WindowsToolchainInventoryInput::Promoted(inventory_files),
             acquisition_deadline,
-            Some(lifecycle_execution_deadline),
-        )
+            lifecycle_execution_deadline: Some(lifecycle_execution_deadline),
+        })
     }
 
-    fn new_with_inventory_until(
-        cargo: WindowsToolchainExecutableAuthority,
-        rustc: WindowsToolchainExecutableAuthority,
-        inventory_root: PathBuf,
-        inventory: WindowsToolchainInventoryInput,
-        inventory_directories: Vec<PathBuf>,
-        trusted_parent_path: OsString,
-        trusted_parent_system_root: OsString,
-        acquisition_deadline: Instant,
-        lifecycle_execution_deadline: Option<Instant>,
-    ) -> std::io::Result<Self> {
+    fn new_with_inventory_until(input: WindowsToolchainBindInput) -> std::io::Result<Self> {
+        let WindowsToolchainBindInput {
+            authority:
+                WindowsToolchainAuthorityInput {
+                    cargo,
+                    rustc,
+                    inventory_root,
+                    inventory_directories,
+                    trusted_parent_path,
+                    trusted_parent_system_root,
+                    git,
+                    stack,
+                },
+            inventory,
+            acquisition_deadline,
+            lifecycle_execution_deadline,
+        } = input;
         if lifecycle_execution_deadline
             .is_some_and(|lifecycle_deadline| lifecycle_deadline < acquisition_deadline)
         {
@@ -1715,168 +3486,27 @@ impl WindowsToolchainAuthority {
                 &error,
             )
         })?;
-        let mut trusted_path_entries = Vec::new();
-        for path in std::env::split_paths(&trusted_parent_path) {
-            let entry = WindowsTrustedPathEntry::bind(path.clone()).map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::BindTrustedPathEntry,
-                    &path,
-                    &error,
-                )
-            })?;
-            trusted_path_entries.push(entry);
-        }
-        if trusted_path_entries.is_empty()
-            || trusted_path_entries.len() > 128
-            || !trusted_path_entries
-                .iter()
-                .any(|entry| entry.canonical_identity().is_some())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "trusted Windows PATH has an invalid entry count",
-            ));
-        }
-        let system_root_path = PathBuf::from(&trusted_parent_system_root);
-        let system_root =
-            WindowsSystemRootAuthority::bind(trusted_parent_system_root, &trusted_path_entries)
-                .map_err(|error| {
-                    windows_toolchain_bind_failure(
-                        WindowsToolchainBindOperation::BindSystemRoot,
-                        &system_root_path,
-                        &error,
-                    )
-                })?;
-        let cargo_source_path = cargo.source_identity.clone();
-        let rustc_source_path = rustc.source_identity.clone();
-        let selected_cargo_path = cargo.selected.clone();
-        let staged_cargo_path = cargo.staged.clone();
-        let selected_rustc_path = rustc.selected.clone();
-        let staged_rustc_path = rustc.staged.clone();
-        let cargo_source = BoundProgramInvocation::new_until(
-            cargo.source_invocation,
-            cargo.source_identity,
-            acquisition_deadline,
-        )
-        .map_err(|error| {
-            windows_toolchain_bind_failure(
-                WindowsToolchainBindOperation::BindCargoSource,
-                &cargo_source_path,
-                &error,
-            )
-        })?;
-        let rustc_source = BoundProgramInvocation::new_until(
-            rustc.source_invocation,
-            rustc.source_identity,
-            acquisition_deadline,
-        )
-        .map_err(|error| {
-            windows_toolchain_bind_failure(
-                WindowsToolchainBindOperation::BindRustcSource,
-                &rustc_source_path,
-                &error,
-            )
-        })?;
-        let selected_cargo = BoundProgramInvocation::new_until(
-            selected_cargo_path.clone(),
-            selected_cargo_path.clone(),
-            acquisition_deadline,
-        )
-        .map_err(|error| {
-            windows_toolchain_bind_failure(
-                WindowsToolchainBindOperation::BindSelectedCargo,
-                &selected_cargo_path,
-                &error,
-            )
-        })?;
-        let selected_rustc = BoundProgramInvocation::new_until(
-            selected_rustc_path.clone(),
-            selected_rustc_path.clone(),
-            acquisition_deadline,
-        )
-        .map_err(|error| {
-            windows_toolchain_bind_failure(
-                WindowsToolchainBindOperation::BindSelectedRustc,
-                &selected_rustc_path,
-                &error,
-            )
-        })?;
-        let (inventory_files, inventory_full_hash_passes) = match inventory {
-            WindowsToolchainInventoryInput::Paths(paths) => (
-                paths
-                    .into_iter()
-                    .map(|path| {
-                        BoundProgramInvocation::new_until(
-                            path.clone(),
-                            path.clone(),
-                            acquisition_deadline,
-                        )
-                        .map_err(|error| {
-                            windows_toolchain_bind_failure(
-                                WindowsToolchainBindOperation::BindInventoryFile,
-                                &path,
-                                &error,
-                            )
-                        })
-                    })
-                    .collect::<std::io::Result<Vec<_>>>()?,
-                1,
-            ),
-            WindowsToolchainInventoryInput::Promoted(files) => {
-                for file in &files {
-                    if Instant::now() >= acquisition_deadline {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "staged Windows toolchain promotion exceeded its absolute deadline",
-                        ));
-                    }
-                    if file.invocation_path != file.canonical_identity
-                        || !file.invocation_path.starts_with(&inventory_root)
-                        || file.invocation_path == inventory_root
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "promoted Windows toolchain member is outside the staged inventory",
-                        ));
-                    }
-                    file.revalidate(file.invocation_path.as_os_str())?;
-                }
-                (files, 0)
-            }
-        };
-        let unique_files = inventory_files
-            .iter()
-            .map(|file| file.invocation_path.clone())
-            .collect::<BTreeSet<_>>();
-        if unique_files.len() != inventory_files.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "staged Windows toolchain inventory contains duplicate files",
-            ));
-        }
-        let staged_member = |path: &Path,
-                             operation: WindowsToolchainBindOperation|
-         -> std::io::Result<BoundProgramInvocation> {
-            inventory_files
-                .iter()
-                .find(|file| file.invocation_path == path)
-                .cloned()
-                .ok_or_else(|| {
-                    windows_toolchain_bind_failure(
-                        operation,
-                        path,
-                        &std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "selected staged executable is absent from the promoted inventory",
-                        ),
-                    )
-                })
-        };
-        let staged_cargo = staged_member(
+        let (trusted_path_entries, system_root) = bind_windows_toolchain_parent_authorities(
+            &trusted_parent_path,
+            trusted_parent_system_root,
+        )?;
+        let BoundWindowsToolchainPrograms {
+            cargo_source,
+            rustc_source,
+            selected_cargo,
+            selected_rustc,
+            staged_cargo_path,
+            staged_rustc_path,
+        } = bind_windows_toolchain_programs(cargo, rustc, acquisition_deadline)?;
+        let (inventory_files, inventory_full_hash_passes) =
+            bind_windows_toolchain_inventory(inventory, &inventory_root, acquisition_deadline)?;
+        let staged_cargo = windows_staged_toolchain_member(
+            &inventory_files,
             &staged_cargo_path,
             WindowsToolchainBindOperation::BindStagedCargo,
         )?;
-        let staged_rustc = staged_member(
+        let staged_rustc = windows_staged_toolchain_member(
+            &inventory_files,
             &staged_rustc_path,
             WindowsToolchainBindOperation::BindStagedRustc,
         )?;
@@ -1893,28 +3523,12 @@ impl WindowsToolchainAuthority {
             trusted_parent_path,
             trusted_path_entries: trusted_path_entries.into(),
             system_root,
+            git,
+            stack,
             inventory_full_hash_passes,
             lifecycle_execution_deadline,
         };
-        let selected_cargo_sha = authority.selected_cargo.sha256();
-        let staged_cargo_sha = authority.staged_cargo.sha256();
-        let selected_rustc_sha = authority.selected_rustc.sha256();
-        let staged_rustc_sha = authority.staged_rustc.sha256();
-        if selected_cargo_sha != staged_cargo_sha || selected_rustc_sha != staged_rustc_sha {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "staged Windows Rust executable differs from selected source",
-            ));
-        }
-        authority
-            .revalidate_inventory_until(acquisition_deadline)
-            .map_err(|error| {
-                windows_toolchain_bind_failure(
-                    WindowsToolchainBindOperation::RevalidateInventory,
-                    &authority.inventory_root,
-                    &error,
-                )
-            })?;
+        validate_new_windows_toolchain_authority(&authority, acquisition_deadline)?;
         Ok(authority)
     }
 
@@ -1929,6 +3543,12 @@ impl WindowsToolchainAuthority {
             entry.revalidate()?;
         }
         self.system_root.revalidate()?;
+        if let Some(git) = &self.git {
+            git.revalidate()?;
+        }
+        if let Some(stack) = &self.stack {
+            stack.revalidate()?;
+        }
         Ok(())
     }
 
@@ -1943,6 +3563,29 @@ impl WindowsToolchainAuthority {
         requested: &OsStr,
         resolved: &Path,
     ) -> std::io::Result<Option<PathBuf>> {
+        if windows_executable_has_logical_name(requested, "stack")
+            || windows_executable_has_logical_name(resolved.as_os_str(), "stack")
+        {
+            let stack = self.stack.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows Stack request has no staged runtime authority",
+                )
+            })?;
+            stack.revalidate()?;
+            let logical_request = (requested == OsStr::new("stack")
+                || requested == OsStr::new("stack.exe"))
+                && resolved == stack.source.canonical_identity;
+            let exact_request = Path::new(requested) == stack.source.invocation_path
+                && resolved == stack.source.canonical_identity;
+            if !logical_request && !exact_request {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows Stack request differs from its exact source authority",
+                ));
+            }
+            return Ok(Some(stack.staged.canonical_identity.clone()));
+        }
         let request_matches = |logical: &str, authority: &BoundProgramInvocation| {
             (requested == authority.invocation_path.as_os_str()
                 && resolved == authority.invocation_path)
@@ -1976,8 +3619,29 @@ impl WindowsToolchainAuthority {
             .map(Some)
     }
 
-    /// Produces the closed child PATH containing only the staged Rust bin,
-    /// System32, and SystemRoot after revalidating the trusted parent capture.
+    fn git_program(&self, requested: &OsStr) -> std::io::Result<BoundProgramInvocation> {
+        let git = self.git.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Windows Git request has no bound executable authority",
+            )
+        })?;
+        let program = git.revalidate()?;
+        let requested_path = Path::new(requested);
+        let exact_logical_name =
+            requested_path.components().count() == 1 && windows_program_is_logical_git(requested);
+        if !exact_logical_name && requested_path != program {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Windows Git request differs from its bound executable authority",
+            ));
+        }
+        Ok(git.program.clone())
+    }
+
+    /// Produces the closed child `PATH` containing only the staged Rust bin,
+    /// optional exact Git directory, `System32`, and `SystemRoot` after
+    /// revalidating the trusted parent capture.
     ///
     /// # Errors
     ///
@@ -2011,12 +3675,39 @@ impl WindowsToolchainAuthority {
                 "staged Windows Cargo and rustc do not share the inventoried bin directory",
             ));
         }
-        std::env::join_paths([
-            staged_bin.to_path_buf(),
+        let mut child_path = vec![staged_bin.to_path_buf()];
+        if let Some(git) = &self.git {
+            let git_program = git.revalidate()?;
+            let git_directory = git_program.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bound Windows Git executable has no parent",
+                )
+            })?;
+            if child_path.iter().any(|entry| entry == git_directory) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "bound Windows Git directory duplicates a restricted PATH entry",
+                ));
+            }
+            child_path.push(git_directory.to_path_buf());
+        }
+        child_path.extend([
             self.system_root.system32.canonical_identity.clone(),
             self.system_root.root.canonical_identity.clone(),
-        ])
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        ]);
+        for (index, entry) in child_path.iter().enumerate() {
+            for prior in &child_path[..index] {
+                if same_file::is_same_file(prior, entry)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "restricted Windows child PATH contains duplicate directory authority",
+                    ));
+                }
+            }
+        }
+        std::env::join_paths(child_path)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
     }
 
     fn revalidate_inventory(&self) -> std::io::Result<()> {
@@ -2115,11 +3806,11 @@ impl WindowsToolchainAuthority {
     }
 }
 
-/// Selects the one standard Windows SystemRoot value from the parent process.
+/// Selects the one standard Windows `SystemRoot` value from the parent process.
 ///
 /// # Errors
 ///
-/// Returns an error unless exactly one nonempty case-insensitive SystemRoot
+/// Returns an error unless exactly one nonempty case-insensitive `SystemRoot`
 /// entry is present.
 #[cfg(windows)]
 pub fn capture_windows_standard_system_root() -> std::io::Result<OsString> {
@@ -2277,6 +3968,76 @@ pub fn configure_windows_restricted_child_environment(
     configure_windows_standard_system_root_value(environment, &toolchain.system_root.value, true)
 }
 
+#[cfg(windows)]
+fn prepend_windows_stack_path(
+    environment: &mut [(OsString, OsString)],
+    stack: &WindowsStackRuntimeAuthority,
+) -> std::io::Result<()> {
+    stack.revalidate()?;
+    let stack_bin = stack
+        .staged
+        .canonical_identity
+        .parent()
+        .ok_or_else(|| std::io::Error::other("staged Windows Stack has no parent"))?;
+    let (_, value) = environment
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("PATH")))
+        .ok_or_else(|| std::io::Error::other("Windows Stack child PATH is absent"))?;
+    let retained = std::env::split_paths(value).collect::<Vec<_>>();
+    let staged = [
+        stack_bin,
+        stack.ghc_bin.as_path(),
+        stack.mingw_bin.as_path(),
+    ];
+    if retained
+        .iter()
+        .any(|entry| staged.iter().any(|staged| entry == staged))
+        || staged.iter().collect::<BTreeSet<_>>().len() != staged.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staged Windows Stack/GHC PATH authority is duplicated",
+        ));
+    }
+    *value = std::env::join_paths(staged.into_iter().map(Path::to_path_buf).chain(retained))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_stack_arguments(mut arguments: Vec<OsString>) -> std::io::Result<Vec<OsString>> {
+    if arguments.iter().any(|argument| {
+        argument == OsStr::new("--system-ghc")
+            || argument == OsStr::new("--no-system-ghc")
+            || argument == OsStr::new("--install-ghc")
+            || argument == OsStr::new("--no-install-ghc")
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows Stack request attempts to replace its bound system-GHC policy",
+        ));
+    }
+    arguments.splice(
+        0..0,
+        [
+            OsString::from("--system-ghc"),
+            OsString::from("--no-install-ghc"),
+        ],
+    );
+    Ok(arguments)
+}
+
+#[cfg(windows)]
+fn bind_windows_stack_arguments(
+    stack: Option<&WindowsStackRuntimeAuthority>,
+    arguments: Vec<OsString>,
+) -> std::io::Result<Vec<OsString>> {
+    match stack {
+        Some(_) => windows_stack_arguments(arguments),
+        None => Ok(arguments),
+    }
+}
+
 #[cfg(any(windows, test))]
 fn windows_executable_has_logical_name(path: &OsStr, expected: &str) -> bool {
     let path = Path::new(path);
@@ -2292,6 +4053,15 @@ fn windows_executable_has_logical_name(path: &OsStr, expected: &str) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn windows_program_is_logical_git(path: &OsStr) -> bool {
+    Path::new(path).file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case(OsStr::new("git"))
+            || name.eq_ignore_ascii_case(OsStr::new("git.exe"))
+            || name.eq_ignore_ascii_case(OsStr::new("git.com"))
+    })
+}
+
+#[cfg(any(windows, test))]
 fn windows_program_requires_trusted_path(
     requested: &OsStr,
     resolved: &Path,
@@ -2300,6 +4070,8 @@ fn windows_program_requires_trusted_path(
     mapped_toolchain_program
         || windows_executable_has_logical_name(requested, "stack")
         || windows_executable_has_logical_name(resolved.as_os_str(), "stack")
+        || windows_program_is_logical_git(requested)
+        || windows_program_is_logical_git(resolved.as_os_str())
 }
 
 #[cfg(windows)]
@@ -3375,11 +5147,11 @@ impl BoundProgramInvocation {
     pub fn new(invocation_path: PathBuf, canonical_identity: PathBuf) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
-            return Self::new_until(
+            Self::new_until(
                 invocation_path,
                 canonical_identity,
                 windows_program_authority_acquisition_deadline()?,
-            );
+            )
         }
         #[cfg(not(windows))]
         {
@@ -3411,6 +5183,54 @@ impl BoundProgramInvocation {
         Ok(identity)
     }
 
+    /// Binds one exact, direct executable member of a canonical Windows directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory or requested member is noncanonical,
+    /// reparsed, not a regular file, substituted while binding, or past deadline.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn new_windows_direct_member_until(
+        parent: &Path,
+        file_name: &OsStr,
+        deadline: Instant,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        let requested = parent.join(file_name);
+        let requested_metadata = fs::symlink_metadata(&requested)?;
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "direct Windows program member binding exceeded its absolute deadline",
+            ));
+        }
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || fs::canonicalize(parent)? != parent
+            || requested.parent() != Some(parent)
+            || requested.file_name() != Some(file_name)
+            || !requested_metadata.is_file()
+            || requested_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows program is not one direct member of its canonical directory",
+            ));
+        }
+        let canonical = fs::canonicalize(&requested)?;
+        if canonical != requested {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows program direct member canonical identity differs",
+            ));
+        }
+        Self::new_until(requested, canonical, deadline)
+    }
+
     /// Promotes an already-hashed retained Windows file into a program receipt.
     ///
     /// This constructor never reads file contents. The caller must supply the
@@ -3432,16 +5252,18 @@ impl BoundProgramInvocation {
             ));
         }
         let invocation_parent_identity = bind_windows_program_parent(&path)?;
+        let canonical_identity = path.clone();
+        let file_identity = BoundProgramFileIdentity::promote_until(
+            &path,
+            retained_file,
+            length,
+            sha256,
+            deadline,
+        )?;
         let identity = Self {
-            invocation_path: path.clone(),
-            canonical_identity: path.clone(),
-            file_identity: BoundProgramFileIdentity::promote_until(
-                &path,
-                retained_file,
-                length,
-                sha256,
-                deadline,
-            )?,
+            invocation_path: path,
+            canonical_identity,
+            file_identity,
             invocation_parent_identity,
         };
         if Instant::now() >= deadline {
@@ -3523,6 +5345,14 @@ impl BoundProgramInvocation {
         self.revalidate(self.invocation_path.as_os_str())
             .map(|_| ())
     }
+
+    /// Returns the digest retained by this exact Windows program authority.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn windows_sha256_for_integration(&self) -> Digest {
+        self.sha256()
+    }
 }
 
 thread_local! {
@@ -3569,6 +5399,11 @@ fn resolve_standard_posix_process_authorities(
             Path::new("/usr/bin/pkill"),
         )?,
     )
+}
+
+trait CandidateLaunchPlatformPolicy {
+    fn require_quiescence(&self, deadline: Instant) -> std::io::Result<()>;
+    fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()>;
 }
 
 impl CandidateLaunchPolicy {
@@ -3979,16 +5814,29 @@ impl CandidateLaunchPolicy {
         bound_program: Option<&BoundProgramInvocation>,
         deadline: Instant,
     ) -> std::io::Result<WindowsLaunchControlAuthority> {
+        require_before_deadline(deadline, "Windows launch authority revalidation")?;
         let launcher = self
             .launcher
             .revalidate(self.launcher.invocation_path.as_os_str())?;
         let restricted_adapter = self
             .restricted_adapter
             .revalidate(self.restricted_adapter.invocation_path.as_os_str())?;
-        let program = resolve_parent_program_for_launch(command.get_program(), bound_program)?;
+        let git_authority = if windows_program_is_logical_git(command.get_program()) {
+            Some(self.toolchain.git_program(command.get_program())?)
+        } else {
+            None
+        };
+        let program = match &git_authority {
+            Some(git) => git.revalidate(git.invocation_path.as_os_str())?,
+            None => resolve_parent_program_for_launch(command.get_program(), bound_program)?,
+        };
         let mapped_program = self
             .toolchain
             .mapped_program(command.get_program(), &program)?;
+        let stack_authority = mapped_program
+            .as_deref()
+            .filter(|mapped| windows_executable_has_logical_name(mapped.as_os_str(), "stack"))
+            .and(self.toolchain.stack.as_ref());
         let requires_trusted_path = windows_program_requires_trusted_path(
             command.get_program(),
             &program,
@@ -3997,74 +5845,46 @@ impl CandidateLaunchPolicy {
         let mapped_cargo = mapped_program.is_some()
             && windows_executable_has_logical_name(program.as_os_str(), "cargo");
         let program = mapped_program.unwrap_or(program);
-        let git_inventory = program.file_name().is_some_and(|name| {
-            name.eq_ignore_ascii_case(OsStr::new("git.exe"))
-                || name.eq_ignore_ascii_case(OsStr::new("git"))
-        }) && command
-            .get_args()
-            .eq([OsStr::new("ls-files"), OsStr::new("-z")]);
-        let program_authority = git_inventory
-            .then(|| {
-                BoundProgramInvocation::new_until(
-                    program.clone(),
-                    fs::canonicalize(&program)?,
-                    deadline,
-                )
-            })
-            .transpose()?;
+        let program_authority =
+            git_authority.or_else(|| stack_authority.map(|stack| stack.staged.clone()));
         let arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let arguments = bind_windows_stack_arguments(stack_authority, arguments)?;
         let target_subcommand = if mapped_cargo {
             windows_cargo_target_subcommand(&arguments)?
         } else {
             None
         };
-        let (arguments, required_target) = if let Some(subcommand) = target_subcommand {
-            let [target] = self.writable_roots.as_ref() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "target-producing Windows Cargo requires one exact writable authority",
-                ));
-            };
-            (
-                windows_bound_cargo_arguments(arguments, subcommand, target)?,
-                Some(target.as_path()),
-            )
-        } else {
-            (arguments, None)
-        };
+        let (arguments, required_target, target_presentation) =
+            prepare_windows_bound_cargo_target(arguments, target_subcommand, &self.writable_roots)?;
         let target_arguments = std::iter::once(program.as_os_str())
             .chain(arguments.iter().map(OsString::as_os_str))
             .map(OsString::from)
             .collect::<Vec<_>>();
-        let directory = if let Some(requested) = command.get_current_dir() {
-            let metadata = fs::symlink_metadata(requested)?;
-            let canonical = fs::canonicalize(requested)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() || canonical != requested {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Windows release child current directory is redirected",
-                ));
-            }
-            canonical
-        } else {
-            fs::canonicalize(std::env::current_dir()?)?
-        };
+        let directory = windows_release_child_current_directory(command)?;
         let mut environment = command
             .get_envs()
             .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
             .collect::<Vec<_>>();
-        configure_windows_restricted_child_environment(
+        if let Some(stack) = stack_authority {
+            stack.bind_environment(&mut environment)?;
+        }
+        let PreparedWindowsTargetChildEnvironment {
+            entries: mut environment,
+            temporary,
+            writable_presentations,
+        } = prepare_windows_target_child_environment(
             &self.toolchain,
-            &mut environment,
-            requires_trusted_path,
-        )?;
-        let environment = windows_release_child_environment(
             environment,
+            requires_trusted_path,
             &self.writable_roots,
-            required_target,
-            Some(&directory),
+            required_target.as_deref(),
+            target_presentation,
+            &directory,
         )?;
-        validate_windows_cargo_target_binding(&environment, &target_arguments)?;
+        if let Some(stack) = stack_authority {
+            prepend_windows_stack_path(&mut environment, stack)?;
+        }
+        validate_windows_cargo_child_authorities(&environment, &target_arguments)?;
         let request = windows_restricted_launch_request_with_environment(
             &restricted_adapter,
             self.restricted_adapter.sha256(),
@@ -4090,11 +5910,14 @@ impl CandidateLaunchPolicy {
             program: program_authority,
             current_directory: directory,
             current_directory_identity,
+            writable_presentations,
+            temporary,
+            stack: stack_authority.cloned(),
         })
     }
 
     #[cfg(unix)]
-    fn require_quiescence(&self, deadline: Instant) -> std::io::Result<()> {
+    fn require_posix_quiescence(&self, deadline: Instant) -> std::io::Result<()> {
         self.posix_quiescence_receipt_until(deadline).map(|_| ())
     }
 
@@ -4186,14 +6009,9 @@ impl CandidateLaunchPolicy {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    fn require_quiescence(&self, _deadline: Instant) -> std::io::Result<()> {
-        Ok(())
-    }
-
     /// Grants the already-created sandbox to the exact candidate group.
     #[cfg(unix)]
-    fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()> {
+    fn prepare_posix_writable_directory(&self, path: &Path) -> std::io::Result<()> {
         prepare_posix_writable_directory(
             &self.process_authorities.sudo.revalidate()?,
             self.primary_gid,
@@ -4201,8 +6019,25 @@ impl CandidateLaunchPolicy {
             path,
         )
     }
+}
 
-    #[cfg(not(unix))]
+#[cfg(unix)]
+impl CandidateLaunchPlatformPolicy for CandidateLaunchPolicy {
+    fn require_quiescence(&self, deadline: Instant) -> std::io::Result<()> {
+        self.require_posix_quiescence(deadline)
+    }
+
+    fn prepare_writable_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.prepare_posix_writable_directory(path)
+    }
+}
+
+#[cfg(not(unix))]
+impl CandidateLaunchPlatformPolicy for CandidateLaunchPolicy {
+    fn require_quiescence(&self, _deadline: Instant) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn prepare_writable_directory(&self, _path: &Path) -> std::io::Result<()> {
         Ok(())
     }
@@ -4660,7 +6495,67 @@ fn windows_restricted_launch_request(
 }
 
 #[cfg(windows)]
-const WINDOWS_RELEASE_CHILD_REQUEST_V1: &str = "hell-windows-release-child-v1";
+const WINDOWS_RELEASE_CHILD_REQUEST_V2: &str = "hell-windows-release-child-v2";
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsSerializedDirectoryIdentity {
+    path: PathBuf,
+    identity_hash: u64,
+}
+
+#[cfg(windows)]
+impl WindowsSerializedDirectoryIdentity {
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let metadata = fs::symlink_metadata(path)?;
+        let canonical = fs::canonicalize(path)?;
+        let canonical_metadata = fs::symlink_metadata(&canonical)?;
+        if !path.is_absolute()
+            || path_has_lexical_dot_component(path)
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || canonical_metadata.file_type().is_symlink()
+            || !canonical_metadata.is_dir()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp directory identity is redirected",
+            ));
+        }
+        let identity = same_file::Handle::from_path(&canonical)?;
+        if same_file::Handle::from_path(path)? != identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp directory presentation identity differs",
+            ));
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        identity.hash(&mut hasher);
+        Ok(Self {
+            path: canonical,
+            identity_hash: hasher.finish(),
+        })
+    }
+
+    fn revalidate(&self) -> std::io::Result<()> {
+        if Self::capture(&self.path)? != *self {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp serialized identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsSerializedChildTempAuthority {
+    parent: WindowsSerializedDirectoryIdentity,
+    temporary: WindowsSerializedDirectoryIdentity,
+}
 
 #[cfg(windows)]
 const WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT: &[&str] = &[
@@ -4671,6 +6566,7 @@ const WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT: &[&str] = &[
     "GIT_CONFIG_VALUE_0",
     "RUSTDOCFLAGS",
     "SOURCE_DATE_EPOCH",
+    "STACK_ROOT",
 ];
 
 #[cfg(windows)]
@@ -4682,6 +6578,59 @@ fn windows_release_child_environment_name_allowed(name: &OsStr) -> bool {
         .iter()
         .chain(WINDOWS_RELEASE_CHILD_ADDITIONAL_ENVIRONMENT)
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+#[cfg(windows)]
+fn windows_release_child_current_directory(command: &Command) -> std::io::Result<PathBuf> {
+    let inherited = std::env::current_dir()?;
+    resolve_windows_release_child_current_directory(command.get_current_dir(), &inherited)
+}
+
+/// Resolves the distinct explicit and inherited Windows release-child cwd contracts.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn resolve_windows_release_child_current_directory(
+    explicit: Option<&Path>,
+    inherited: &Path,
+) -> std::io::Result<PathBuf> {
+    let canonical = match explicit {
+        Some(requested) => {
+            let metadata = fs::symlink_metadata(requested)?;
+            let canonical = fs::canonicalize(requested)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || canonical != requested {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows release child current directory is redirected",
+                ));
+            }
+            canonical
+        }
+        None => fs::canonicalize(inherited)?,
+    };
+    let canonical_metadata = fs::symlink_metadata(&canonical)?;
+    if !canonical.is_absolute()
+        || canonical_metadata.file_type().is_symlink()
+        || !canonical_metadata.is_dir()
+        || fs::canonicalize(&canonical)? != canonical
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child current directory is redirected",
+        ));
+    }
+    let identity = WindowsSerializedDirectoryIdentity::capture(&canonical).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child current directory is redirected",
+        )
+    })?;
+    identity.revalidate().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child current directory identity changed",
+        )
+    })?;
+    Ok(canonical)
 }
 
 #[cfg(windows)]
@@ -4742,6 +6691,31 @@ fn windows_bound_cargo_arguments(
         ],
     );
     Ok(arguments)
+}
+
+#[cfg(windows)]
+fn prepare_windows_bound_cargo_target(
+    arguments: Vec<OsString>,
+    target_subcommand: Option<usize>,
+    writable_roots: &[PathBuf],
+) -> std::io::Result<(
+    Vec<OsString>,
+    Option<PathBuf>,
+    Option<WindowsChildPathPresentation>,
+)> {
+    let Some(subcommand) = target_subcommand else {
+        return Ok((arguments, None, None));
+    };
+    let [target] = writable_roots else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target-producing Windows Cargo requires one exact writable authority",
+        ));
+    };
+    let presentation = WindowsChildPathPresentation::bind(target)?;
+    let arguments =
+        windows_bound_cargo_arguments(arguments, subcommand, &presentation.presentation)?;
+    Ok((arguments, Some(target.clone()), Some(presentation)))
 }
 
 #[cfg(windows)]
@@ -4806,10 +6780,10 @@ fn windows_release_child_environment(
         let metadata = fs::symlink_metadata(target)?;
         let canonical = fs::canonicalize(target)?;
         if !target.is_absolute()
+            || path_has_lexical_dot_component(target)
             || metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || canonical != target
-            || (!writable_roots.is_empty() && !writable_roots.iter().any(|root| root == target))
+            || (!writable_roots.is_empty() && !writable_roots.iter().any(|root| root == &canonical))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -4824,6 +6798,246 @@ fn windows_release_child_environment(
             .cmp(&right.to_string_lossy().to_ascii_uppercase())
     });
     Ok(retained)
+}
+
+#[cfg(windows)]
+struct PreparedWindowsTargetChildEnvironment {
+    entries: Vec<(OsString, OsString)>,
+    temporary: Option<WindowsChildTempAuthority>,
+    writable_presentations: Vec<WindowsChildPathPresentation>,
+}
+
+#[cfg(windows)]
+fn windows_child_writable_environment_index(
+    environment: &[(OsString, Option<OsString>)],
+    name: &str,
+) -> std::io::Result<Option<usize>> {
+    let mut indices = environment
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (candidate, _))| {
+            candidate
+                .eq_ignore_ascii_case(OsStr::new(name))
+                .then_some(index)
+        });
+    let index = indices.next();
+    if indices.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Windows child writable environment {name} is duplicated"),
+        ));
+    }
+    Ok(index)
+}
+
+#[cfg(windows)]
+fn prepare_windows_child_writable_presentations(
+    environment: &mut Vec<(OsString, Option<OsString>)>,
+    required_target: Option<&Path>,
+    target_presentation: Option<WindowsChildPathPresentation>,
+    temporary: Option<&WindowsChildTempAuthority>,
+) -> std::io::Result<Vec<WindowsChildPathPresentation>> {
+    let Some(target) = required_target else {
+        if target_presentation.is_some() || temporary.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "target-free Windows child retained writable presentations",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let target_presentation = target_presentation.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo target presentation is absent",
+        )
+    })?;
+    let temporary = temporary.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo temporary presentation is absent",
+        )
+    })?;
+    if target_presentation.canonical != target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo target presentation differs from its writable authority",
+        ));
+    }
+    target_presentation.revalidate()?;
+    temporary.revalidate()?;
+
+    let environment_root = target.join("release-child-environment");
+    let home = environment_root.join("home");
+    let cargo = environment_root.join("cargo");
+    let sccache = environment_root.join("sccache");
+    let specifications = [
+        ("CARGO_TARGET_DIR", target, true, false),
+        ("HOME", home.as_path(), false, false),
+        ("USERPROFILE", home.as_path(), false, false),
+        ("CARGO_HOME", cargo.as_path(), false, false),
+        ("SCCACHE_DIR", sccache.as_path(), false, false),
+        ("TEMP", temporary.path.as_path(), false, true),
+        ("TMP", temporary.path.as_path(), false, true),
+        ("TMPDIR", temporary.path.as_path(), false, true),
+    ];
+    let mut retained = vec![target_presentation.clone()];
+    for (name, expected, required, cleanup_expected) in specifications {
+        let index = match windows_child_writable_environment_index(environment, name)? {
+            Some(index) => index,
+            None if required => {
+                environment.push((
+                    OsString::from(name),
+                    Some(target_presentation.presentation.as_os_str().to_owned()),
+                ));
+                continue;
+            }
+            None => continue,
+        };
+        let configured = environment[index].1.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows child writable environment {name} is removed"),
+            )
+        })?;
+        if Path::new(configured) != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows child writable environment {name} differs from its authority"),
+            ));
+        }
+        if !expected.exists() {
+            fs::create_dir_all(expected)?;
+        }
+        let presentation = if expected == target {
+            target_presentation.clone()
+        } else {
+            WindowsChildPathPresentation::bind(expected)?
+        };
+        environment[index].1 = Some(presentation.presentation.as_os_str().to_owned());
+        if !cleanup_expected
+            && retained
+                .iter()
+                .all(|bound| bound.canonical != presentation.canonical)
+        {
+            retained.push(presentation);
+        }
+    }
+    temporary.revalidate()?;
+    Ok(retained)
+}
+
+#[cfg(windows)]
+fn prepare_windows_target_child_environment(
+    toolchain: &WindowsToolchainAuthority,
+    mut environment: Vec<(OsString, Option<OsString>)>,
+    requires_trusted_path: bool,
+    writable_roots: &[PathBuf],
+    required_target: Option<&Path>,
+    target_presentation: Option<WindowsChildPathPresentation>,
+    current_directory: &Path,
+) -> std::io::Result<PreparedWindowsTargetChildEnvironment> {
+    let temporary = required_target
+        .map(WindowsChildTempAuthority::reserve)
+        .transpose()?;
+    if let Some(temporary) = &temporary {
+        temporary.bind_environment(&mut environment);
+    }
+    configure_windows_restricted_child_environment(
+        toolchain,
+        &mut environment,
+        requires_trusted_path,
+    )?;
+    let writable_presentations = prepare_windows_child_writable_presentations(
+        &mut environment,
+        required_target,
+        target_presentation,
+        temporary.as_ref(),
+    )?;
+    let environment = windows_release_child_environment(
+        environment,
+        writable_roots,
+        required_target,
+        Some(current_directory),
+    )?;
+    if let (Some(temporary), Some(target)) = (&temporary, required_target) {
+        temporary.revalidate()?;
+        validate_windows_child_temp_environment(&environment, target, Some(&temporary.path))?;
+    }
+    Ok(PreparedWindowsTargetChildEnvironment {
+        entries: environment,
+        temporary,
+        writable_presentations,
+    })
+}
+
+#[cfg(windows)]
+fn validate_windows_child_temp_environment(
+    environment: &[(OsString, OsString)],
+    target: &Path,
+    expected: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let value = |name: &str| {
+        environment
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(OsStr::new(name)))
+            .map(|(_, value)| PathBuf::from(value))
+    };
+    let (Some(temporary), Some(tmp), Some(tmpdir)) = (value("TEMP"), value("TMP"), value("TMPDIR"))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo child temp environment is incomplete",
+        ));
+    };
+    if temporary != tmp || temporary != tmpdir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows Cargo child temp environment differs from its authority",
+        ));
+    }
+    let parent = target.join("release-child-environment").join("tmp");
+    let metadata = fs::symlink_metadata(&temporary)?;
+    let canonical_temporary = fs::canonicalize(&temporary)?;
+    let canonical_parent = fs::canonicalize(&parent)?;
+    let canonical_target = fs::canonicalize(target)?;
+    if !temporary.is_absolute()
+        || path_has_lexical_dot_component(&temporary)
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || expected.is_some_and(|path| path != canonical_temporary)
+        || canonical_parent.parent().and_then(Path::parent) != Some(canonical_target.as_path())
+        || canonical_temporary.parent() != Some(canonical_parent.as_path())
+        || fs::read_dir(&canonical_temporary)?.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows Cargo child temp authority is redirected, nonempty, or outside its target",
+        ));
+    }
+    Ok(canonical_temporary)
+}
+
+#[cfg(windows)]
+fn validate_windows_cargo_child_authorities(
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<bool> {
+    let has_bound_target = validate_windows_cargo_target_binding(environment, target_arguments)?;
+    if has_bound_target {
+        let target = environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+            .map(|(_, value)| Path::new(value))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows Cargo child target authority is absent",
+                )
+            })?;
+        validate_windows_child_temp_environment(environment, target, None)?;
+    }
+    Ok(has_bound_target)
 }
 
 #[cfg(windows)]
@@ -4871,6 +7085,22 @@ fn windows_release_child_request_fields(
     environment: &[(OsString, OsString)],
     target_arguments: &[OsString],
 ) -> std::io::Result<Vec<OsString>> {
+    let temporary = capture_windows_serialized_child_temp(environment, target_arguments)?;
+    windows_release_child_request_fields_with_temp(
+        current_directory,
+        temporary.as_ref(),
+        environment,
+        target_arguments,
+    )
+}
+
+#[cfg(windows)]
+fn windows_release_child_request_fields_with_temp(
+    current_directory: &Path,
+    temporary: Option<&WindowsSerializedChildTempAuthority>,
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<Vec<OsString>> {
     let metadata = fs::symlink_metadata(current_directory)?;
     if !current_directory.is_absolute()
         || metadata.file_type().is_symlink()
@@ -4883,9 +7113,23 @@ fn windows_release_child_request_fields(
             "Windows release child current directory or target argv differs from policy",
         ));
     }
-    let mut fields = Vec::with_capacity(3 + environment.len() * 2 + target_arguments.len());
-    fields.push(OsString::from(WINDOWS_RELEASE_CHILD_REQUEST_V1));
+    let mut fields = Vec::with_capacity(8 + environment.len() * 2 + target_arguments.len());
+    fields.push(OsString::from(WINDOWS_RELEASE_CHILD_REQUEST_V2));
     fields.push(current_directory.as_os_str().to_owned());
+    match temporary {
+        Some(temporary) => {
+            temporary.parent.revalidate()?;
+            temporary.temporary.revalidate()?;
+            fields.extend([
+                OsString::from("present"),
+                temporary.parent.path.as_os_str().to_owned(),
+                OsString::from(temporary.parent.identity_hash.to_string()),
+                temporary.temporary.path.as_os_str().to_owned(),
+                OsString::from(temporary.temporary.identity_hash.to_string()),
+            ]);
+        }
+        None => fields.extend(std::iter::repeat_n(OsString::from("absent"), 5)),
+    }
     fields.push(OsString::from(environment.len().to_string()));
     for (name, value) in environment {
         fields.push(name.clone());
@@ -4893,6 +7137,28 @@ fn windows_release_child_request_fields(
     }
     fields.extend(target_arguments.iter().cloned());
     Ok(fields)
+}
+
+#[cfg(windows)]
+fn capture_windows_serialized_child_temp(
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> std::io::Result<Option<WindowsSerializedChildTempAuthority>> {
+    if !validate_windows_cargo_child_authorities(environment, target_arguments)? {
+        return Ok(None);
+    }
+    let temporary = environment
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("TEMP")))
+        .map(|(_, value)| Path::new(value))
+        .ok_or_else(|| std::io::Error::other("Windows child temp path is absent"))?;
+    let parent = temporary
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Windows child temp parent is absent"))?;
+    Ok(Some(WindowsSerializedChildTempAuthority {
+        parent: WindowsSerializedDirectoryIdentity::capture(parent)?,
+        temporary: WindowsSerializedDirectoryIdentity::capture(temporary)?,
+    }))
 }
 
 /// Builds one canonical restricted-child wire request for external lifecycle coverage.
@@ -4951,16 +7217,110 @@ pub fn windows_nightly_child_request_fields_for_integration(
             windows_bound_cargo_arguments(target_arguments, subcommand, writable_target)?;
         target_arguments.insert(0, program);
     }
+    let mut environment = environment
+        .into_iter()
+        .map(|(name, value)| (name, Some(value)))
+        .collect::<Vec<_>>();
+    let mut temporary = target_is_cargo
+        .then(|| WindowsChildTempAuthority::reserve(writable_target))
+        .transpose()?;
+    if let Some(temporary) = &temporary {
+        temporary.bind_environment(&mut environment);
+    }
     let environment = windows_release_child_environment(
-        environment
-            .into_iter()
-            .map(|(name, value)| (name, Some(value)))
-            .collect(),
+        environment,
         &[writable_target.to_path_buf()],
         target_is_cargo.then_some(writable_target),
         None,
     )?;
-    windows_release_child_request_fields(current_directory, &environment, &target_arguments)
+    let fields =
+        windows_release_child_request_fields(current_directory, &environment, &target_arguments);
+    if fields.is_ok()
+        && let Some(temporary) = &mut temporary
+    {
+        temporary.relinquish_cleanup();
+    }
+    fields
+}
+
+#[cfg(windows)]
+fn parse_windows_serialized_child_temp(
+    fields: &mut std::vec::IntoIter<OsString>,
+) -> std::io::Result<Option<WindowsSerializedChildTempAuthority>> {
+    let mut next = || {
+        fields
+            .next()
+            .ok_or_else(|| std::io::Error::other("Windows child temp receipt is incomplete"))
+    };
+    let state = next()?;
+    let parent = next()?;
+    let parent_identity_hash = next()?;
+    let temporary = next()?;
+    let temporary_identity_hash = next()?;
+    if state == "absent" {
+        if [
+            parent,
+            parent_identity_hash,
+            temporary,
+            temporary_identity_hash,
+        ]
+        .iter()
+        .any(|value| value != "absent")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "absent Windows child temp receipt has retained fields",
+            ));
+        }
+        return Ok(None);
+    }
+    if state != "present" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows child temp receipt state differs",
+        ));
+    }
+    let parse_number = |value: OsString, label: &str| {
+        let value = value.into_string().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows child temp {label} is not UTF-8"),
+            )
+        })?;
+        let parsed = value.parse::<u64>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows child temp {label} is malformed"),
+            )
+        })?;
+        if value != parsed.to_string() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Windows child temp {label} is noncanonical"),
+            ));
+        }
+        Ok(parsed)
+    };
+    let parent = WindowsSerializedDirectoryIdentity {
+        path: PathBuf::from(parent),
+        identity_hash: parse_number(parent_identity_hash, "parent identity hash")?,
+    };
+    let temporary = WindowsSerializedDirectoryIdentity {
+        path: PathBuf::from(temporary),
+        identity_hash: parse_number(temporary_identity_hash, "identity hash")?,
+    };
+    parent.revalidate()?;
+    temporary.revalidate()?;
+    if temporary.path.parent() != Some(parent.path.as_path()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows child temp serialized parent binding differs",
+        ));
+    }
+    Ok(Some(WindowsSerializedChildTempAuthority {
+        parent,
+        temporary,
+    }))
 }
 
 #[cfg(windows)]
@@ -5040,6 +7400,7 @@ fn validate_windows_cargo_target_binding(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsReleaseChildRequest {
     current_directory: PathBuf,
+    temporary: Option<WindowsSerializedChildTempAuthority>,
     environment: Vec<(OsString, OsString)>,
     target_arguments: Vec<OsString>,
 }
@@ -5128,8 +7489,9 @@ impl WindowsReleaseChildRequest {
     ///
     /// Returns an error when the retained target argv is empty.
     pub fn fields(&self) -> std::io::Result<Vec<OsString>> {
-        windows_release_child_request_fields(
+        windows_release_child_request_fields_with_temp(
             &self.current_directory,
+            self.temporary.as_ref(),
             &self.environment,
             &self.target_arguments,
         )
@@ -5148,7 +7510,7 @@ pub fn parse_windows_release_child_request(
     fields: Vec<OsString>,
 ) -> std::io::Result<WindowsReleaseChildRequest> {
     let mut fields = fields.into_iter();
-    if fields.next().as_deref() != Some(OsStr::new(WINDOWS_RELEASE_CHILD_REQUEST_V1)) {
+    if fields.next().as_deref() != Some(OsStr::new(WINDOWS_RELEASE_CHILD_REQUEST_V2)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Windows release child request version differs",
@@ -5168,6 +7530,59 @@ pub fn parse_windows_release_child_request(
             "Windows release child current directory is redirected",
         ));
     }
+    let temporary = parse_windows_serialized_child_temp(&mut fields)?;
+    let environment = parse_windows_release_child_environment(&mut fields, &current_directory)?;
+    let target_arguments = fields.collect::<Vec<_>>();
+    let has_target = environment
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")));
+    let has_release_epoch = environment
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("SOURCE_DATE_EPOCH")));
+    let has_bound_cargo_target =
+        validate_windows_cargo_child_authorities(&environment, &target_arguments)?;
+    if has_bound_cargo_target != temporary.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows child temp receipt applicability differs from Cargo target binding",
+        ));
+    }
+    if let Some(temporary) = &temporary {
+        temporary.parent.revalidate()?;
+        temporary.temporary.revalidate()?;
+        let observed = capture_windows_serialized_child_temp(&environment, &target_arguments)?;
+        if observed.as_ref() != Some(temporary) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows child temp serialized receipt differs from live authority",
+            ));
+        }
+    }
+    if (has_bound_cargo_target || has_release_epoch) && !has_target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child target and epoch bindings are incomplete",
+        ));
+    }
+    if target_arguments.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows release child target argv is empty",
+        ));
+    }
+    Ok(WindowsReleaseChildRequest {
+        current_directory,
+        temporary,
+        environment,
+        target_arguments,
+    })
+}
+
+#[cfg(windows)]
+fn parse_windows_release_child_environment(
+    fields: &mut std::vec::IntoIter<OsString>,
+    current_directory: &Path,
+) -> std::io::Result<Vec<(OsString, OsString)>> {
     let count_text = fields
         .next()
         .ok_or_else(|| std::io::Error::other("Windows release child environment count is absent"))?
@@ -5215,34 +7630,129 @@ pub fn parse_windows_release_child_request(
         previous_name = Some(canonical_name);
         environment.push((name, Some(value)));
     }
-    let environment =
-        windows_release_child_environment(environment, &[], None, Some(&current_directory))?;
-    let target_arguments = fields.collect::<Vec<_>>();
-    let has_target = environment
+    windows_release_child_environment(environment, &[], None, Some(current_directory))
+}
+
+/// Proves create/write/flush/rename/delete access to the exact typed Windows
+/// Cargo-child temporary authority under the current child token.
+///
+/// # Errors
+///
+/// Returns an error when the request binding changed or any filesystem phase
+/// is unavailable. Target-free requests perform no probe.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn probe_windows_release_child_temp_authority(
+    request: &WindowsReleaseChildRequest,
+) -> std::io::Result<()> {
+    if !validate_windows_cargo_child_authorities(&request.environment, &request.target_arguments)? {
+        return Ok(());
+    }
+    let target = request
+        .environment
         .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")));
-    let has_release_epoch = environment
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("SOURCE_DATE_EPOCH")));
-    let has_bound_cargo_target =
-        validate_windows_cargo_target_binding(&environment, &target_arguments)?;
-    if (has_bound_cargo_target || has_release_epoch) && !has_target {
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+        .map(|(_, value)| Path::new(value))
+        .ok_or_else(|| std::io::Error::other("Windows Cargo child target authority is absent"))?;
+    let temporary = validate_windows_child_temp_environment(&request.environment, target, None)?;
+    let staging = temporary.join("authority-probe.partial");
+    let published = temporary.join("authority-probe.complete");
+    let bytes = b"hell-windows-child-temp-v1\n";
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&staging, &published)?;
+    if fs::read(&published)? != bytes {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Windows release child target and epoch bindings are incomplete",
+            std::io::ErrorKind::InvalidData,
+            "Windows Cargo child temp probe bytes changed",
         ));
     }
-    if target_arguments.is_empty() {
+    fs::remove_file(&published)?;
+    if fs::read_dir(&temporary)?.next().is_some() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Windows release child target argv is empty",
+            std::io::ErrorKind::InvalidData,
+            "Windows Cargo child temp probe did not restore empty membership",
         ));
     }
-    Ok(WindowsReleaseChildRequest {
-        current_directory,
-        environment,
-        target_arguments,
-    })
+    Ok(())
+}
+
+/// Removes the exact typed Windows Cargo-child temporary authority after the
+/// child job is terminal.
+///
+/// # Errors
+///
+/// Returns an error when identity changed, membership is nonempty, or exact
+/// removal cannot be receipted. Target-free requests require no cleanup.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn cleanup_windows_release_child_temp_authority(
+    request: &WindowsReleaseChildRequest,
+) -> std::io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(WINDOWS_CHILD_TEMP_CLEANUP_BUDGET)
+        .ok_or_else(|| std::io::Error::other("Windows child temp cleanup deadline overflowed"))?;
+    cleanup_windows_release_child_temp_authority_until(request, deadline)
+}
+
+/// Removes the exact typed Windows Cargo-child temporary authority before an
+/// absolute cleanup deadline.
+///
+/// # Errors
+///
+/// Returns an error when the deadline expires, identity changes, membership is
+/// nonempty, or exact removal cannot be receipted.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn cleanup_windows_release_child_temp_authority_until(
+    request: &WindowsReleaseChildRequest,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let Some(temporary) = &request.temporary else {
+        return Ok(());
+    };
+    require_windows_child_temp_cleanup_deadline(deadline, "identity revalidation")?;
+    temporary.parent.revalidate()?;
+    temporary.temporary.revalidate()?;
+    require_windows_child_temp_cleanup_deadline(deadline, "membership receipt")?;
+    if fs::read_dir(&temporary.temporary.path)?.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows child temp cleanup found an unexpected member",
+        ));
+    }
+    require_windows_child_temp_cleanup_deadline(deadline, "exact removal")?;
+    fs::remove_dir(&temporary.temporary.path)?;
+    require_windows_child_temp_cleanup_deadline(deadline, "absence receipt")?;
+    let result = match fs::symlink_metadata(&temporary.temporary.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows child temp authority remained after exact cleanup",
+        )),
+    };
+    require_windows_child_temp_cleanup_deadline(deadline, "completion")?;
+    result
+}
+
+#[cfg(windows)]
+fn require_windows_child_temp_cleanup_deadline(
+    deadline: Instant,
+    phase: &str,
+) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Windows child temp cleanup deadline expired before {phase}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -5254,10 +7764,20 @@ const POSIX_CARGO_CACHE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PosixRustupAccessRequirement {
-    AncestorDirectory,
     AuthorityDirectory,
     ReadableFile,
     ExecutableFile,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixRustupTraversalIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
 }
 
 #[cfg(unix)]
@@ -6474,6 +8994,7 @@ struct BoundPosixRustupAuthority {
     compiler_mapping: BoundPosixRustupCompilerMapping,
     candidate_uid: u32,
     candidate_group_ids: Arc<[u32]>,
+    traversal_ancestors: Arc<[PosixRustupTraversalIdentity]>,
     critical_entries: Arc<[PosixRustupEntryIdentity]>,
     tree_entries: Arc<[PosixRustupEntryIdentity]>,
 }
@@ -6500,6 +9021,8 @@ impl BoundPosixRustupAuthority {
             &toolchain,
             &compiler_mapping,
         )?;
+        let traversal_ancestors =
+            posix_rustup_traversal_ancestors(&home, candidate_uid, &candidate_group_ids)?;
         let critical_entries =
             posix_rustup_critical_entries(&home, &toolchain, candidate_uid, &candidate_group_ids)?;
         let tree_entries = posix_rustup_tree_entries(&home, candidate_uid, &candidate_group_ids)?;
@@ -6518,6 +9041,7 @@ impl BoundPosixRustupAuthority {
             compiler_mapping,
             candidate_uid,
             candidate_group_ids,
+            traversal_ancestors: traversal_ancestors.into(),
             critical_entries: critical_entries.into(),
             tree_entries: tree_entries.into(),
         })
@@ -6529,6 +9053,19 @@ impl BoundPosixRustupAuthority {
             self.candidate_uid,
             &self.candidate_group_ids,
         )?;
+        for expected in &*self.traversal_ancestors {
+            let observed = posix_rustup_traversal_identity(
+                &expected.path,
+                self.candidate_uid,
+                &self.candidate_group_ids,
+            )?;
+            if let Some(detail) = posix_rustup_traversal_mismatch(expected, &observed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("POSIX Rustup traversal authority changed before spawn: {detail}"),
+                ));
+            }
+        }
         for expected in &*self.critical_entries {
             let observed = posix_rustup_entry_identity(
                 &expected.path,
@@ -6536,19 +9073,19 @@ impl BoundPosixRustupAuthority {
                 &self.candidate_group_ids,
                 expected.requirement,
             )?;
-            if observed != *expected {
+            if let Some(detail) = posix_rustup_entry_mismatch(expected, &observed) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "POSIX Rustup authority identity changed before spawn",
+                    format!("POSIX Rustup authority identity changed before spawn: {detail}"),
                 ));
             }
         }
-        if posix_rustup_tree_entries(&self.home, self.candidate_uid, &self.candidate_group_ids)?
-            != *self.tree_entries
-        {
+        let observed_tree =
+            posix_rustup_tree_entries(&self.home, self.candidate_uid, &self.candidate_group_ids)?;
+        if let Some(detail) = posix_rustup_tree_mismatch(&self.tree_entries, &observed_tree) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "POSIX Rustup authority inventory changed before spawn",
+                format!("POSIX Rustup authority inventory changed before spawn: {detail}"),
             ));
         }
         self.compiler_mapping
@@ -6642,6 +9179,20 @@ fn validate_posix_rustup_compiler_mapping_paths(
 }
 
 #[cfg(unix)]
+fn posix_rustup_traversal_ancestors(
+    home: &Path,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> std::io::Result<Vec<PosixRustupTraversalIdentity>> {
+    home.ancestors()
+        .skip(1)
+        .map(|ancestor| {
+            posix_rustup_traversal_identity(ancestor, candidate_uid, candidate_group_ids)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 fn posix_rustup_critical_entries(
     home: &Path,
     toolchain: &OsStr,
@@ -6672,17 +9223,7 @@ fn posix_rustup_critical_entries(
     let update_hash = update_hashes.join(toolchain);
     let cargo = bin.join("cargo");
     let rustc = bin.join("rustc");
-    let mut entries = home
-        .ancestors()
-        .map(|ancestor| {
-            posix_rustup_entry_identity(
-                ancestor,
-                candidate_uid,
-                candidate_group_ids,
-                PosixRustupAccessRequirement::AncestorDirectory,
-            )
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut entries = Vec::with_capacity(9);
     for (path, requirement) in [
         (home, PosixRustupAccessRequirement::AuthorityDirectory),
         (&settings, PosixRustupAccessRequirement::ReadableFile),
@@ -6770,10 +9311,12 @@ impl BoundPosixRustupCompilerMapping {
                 candidate_uid,
                 candidate_group_ids,
             )?;
-            if observed != *expected {
+            if let Some(detail) = posix_rustup_mapped_executable_mismatch(expected, &observed) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "source or staged Rust compiler identity changed before spawn",
+                    format!(
+                        "source or staged Rust compiler identity changed before spawn: {detail}"
+                    ),
                 ));
             }
         }
@@ -6802,7 +9345,12 @@ impl PosixRustupMappedExecutableIdentity {
         if sha256 != expected_sha256 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "mapped Rust compiler digest changed",
+                format!(
+                    "mapped Rust compiler identity changed: path={} field=sha256 expected={} observed={}",
+                    path.display(),
+                    expected_sha256.hex(),
+                    sha256.hex()
+                ),
             ));
         }
         Ok(Self {
@@ -6820,10 +9368,196 @@ impl PosixRustupMappedExecutableIdentity {
 }
 
 #[cfg(unix)]
-fn posix_rustup_entry_identity(
+fn posix_rustup_mapped_executable_mismatch(
+    expected: &PosixRustupMappedExecutableIdentity,
+    observed: &PosixRustupMappedExecutableIdentity,
+) -> Option<String> {
+    if let Some(detail) = posix_rustup_entry_mismatch(
+        &PosixRustupEntryIdentity {
+            path: expected.path.clone(),
+            device: expected.device,
+            inode: expected.inode,
+            links: expected.links,
+            uid: expected.uid,
+            gid: expected.gid,
+            mode: expected.mode,
+            requirement: PosixRustupAccessRequirement::ExecutableFile,
+        },
+        &PosixRustupEntryIdentity {
+            path: observed.path.clone(),
+            device: observed.device,
+            inode: observed.inode,
+            links: observed.links,
+            uid: observed.uid,
+            gid: observed.gid,
+            mode: observed.mode,
+            requirement: PosixRustupAccessRequirement::ExecutableFile,
+        },
+    ) {
+        return Some(detail);
+    }
+    if expected.size != observed.size {
+        return Some(format!(
+            "path={} requirement=executable-file field=size expected={} observed={}",
+            expected.path.display(),
+            expected.size,
+            observed.size
+        ));
+    }
+    (expected.sha256 != observed.sha256).then(|| {
+        format!(
+            "path={} requirement=executable-file field=sha256 expected={} observed={}",
+            expected.path.display(),
+            expected.sha256.hex(),
+            observed.sha256.hex()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn posix_rustup_traversal_identity(
     path: &Path,
     candidate_uid: u32,
     candidate_group_ids: &[u32],
+) -> std::io::Result<PosixRustupTraversalIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || fs::canonicalize(path)? != path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "POSIX Rustup traversal ancestor is redirected or not a directory",
+        ));
+    }
+    let identity = PosixRustupTraversalIdentity {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    };
+    if !posix_rustup_owner_is_trusted(identity.uid, candidate_uid)
+        || !posix_rustup_ancestor_access_is_safe(identity.mode, identity.gid, candidate_group_ids)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            posix_rustup_ancestor_rejection(
+                &identity.path,
+                identity.mode,
+                identity.uid,
+                identity.gid,
+                true,
+                candidate_uid,
+                candidate_group_ids,
+            ),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn posix_rustup_traversal_mismatch(
+    expected: &PosixRustupTraversalIdentity,
+    observed: &PosixRustupTraversalIdentity,
+) -> Option<String> {
+    let (field, expected_value, observed_value) = if expected.path != observed.path {
+        (
+            "path",
+            expected.path.display().to_string(),
+            observed.path.display().to_string(),
+        )
+    } else if expected.device != observed.device {
+        (
+            "device",
+            expected.device.to_string(),
+            observed.device.to_string(),
+        )
+    } else if expected.inode != observed.inode {
+        (
+            "inode",
+            expected.inode.to_string(),
+            observed.inode.to_string(),
+        )
+    } else if expected.uid != observed.uid {
+        ("uid", expected.uid.to_string(), observed.uid.to_string())
+    } else if expected.gid != observed.gid {
+        ("gid", expected.gid.to_string(), observed.gid.to_string())
+    } else if expected.mode != observed.mode {
+        (
+            "mode",
+            format!("0o{:04o}", expected.mode),
+            format!("0o{:04o}", observed.mode),
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "path={} requirement=ancestor-directory field={field} expected={expected_value} observed={observed_value}",
+        expected.path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn posix_rustup_entry_mismatch(
+    expected: &PosixRustupEntryIdentity,
+    observed: &PosixRustupEntryIdentity,
+) -> Option<String> {
+    let (field, expected_value, observed_value) = if expected.path != observed.path {
+        (
+            "path",
+            expected.path.display().to_string(),
+            observed.path.display().to_string(),
+        )
+    } else if expected.device != observed.device {
+        (
+            "device",
+            expected.device.to_string(),
+            observed.device.to_string(),
+        )
+    } else if expected.inode != observed.inode {
+        (
+            "inode",
+            expected.inode.to_string(),
+            observed.inode.to_string(),
+        )
+    } else if expected.links != observed.links {
+        (
+            "links",
+            expected.links.to_string(),
+            observed.links.to_string(),
+        )
+    } else if expected.uid != observed.uid {
+        ("uid", expected.uid.to_string(), observed.uid.to_string())
+    } else if expected.gid != observed.gid {
+        ("gid", expected.gid.to_string(), observed.gid.to_string())
+    } else if expected.mode != observed.mode {
+        (
+            "mode",
+            format!("0o{:04o}", expected.mode),
+            format!("0o{:04o}", observed.mode),
+        )
+    } else if expected.requirement != observed.requirement {
+        (
+            "requirement",
+            format!("{:?}", expected.requirement),
+            format!("{:?}", observed.requirement),
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "path={} requirement={:?} field={field} expected={expected_value} observed={observed_value}",
+        expected.path.display(),
+        expected.requirement,
+    ))
+}
+
+#[cfg(unix)]
+fn posix_rustup_entry_identity(
+    path: &Path,
+    candidate_uid: u32,
+    _candidate_group_ids: &[u32],
     requirement: PosixRustupAccessRequirement,
 ) -> std::io::Result<PosixRustupEntryIdentity> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -6859,21 +9593,6 @@ fn posix_rustup_entry_identity(
         ));
     }
     match requirement {
-        PosixRustupAccessRequirement::AncestorDirectory => {
-            if !metadata.is_dir()
-                || !posix_rustup_ancestor_access_is_safe(mode, metadata.gid(), candidate_group_ids)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    posix_rustup_ancestor_rejection(
-                        &identity,
-                        metadata.is_dir(),
-                        candidate_uid,
-                        candidate_group_ids,
-                    ),
-                ));
-            }
-        }
         PosixRustupAccessRequirement::AuthorityDirectory => {
             if !metadata.is_dir() || mode & 0o005 != 0o005 || mode & 0o022 != 0 {
                 return Err(std::io::Error::new(
@@ -6935,17 +9654,17 @@ fn posix_rustup_effective_access(
 
 #[cfg(unix)]
 fn posix_rustup_ancestor_rejection(
-    identity: &PosixRustupEntryIdentity,
+    path: &Path,
+    mode: u32,
+    file_owner: u32,
+    owning_group: u32,
     is_directory: bool,
     candidate_uid: u32,
     candidate_group_ids: &[u32],
 ) -> String {
     let (access_class, effective) =
-        posix_rustup_effective_access(identity.mode, identity.gid, candidate_group_ids);
-    let path = identity.path.display();
-    let mode = identity.mode;
-    let file_owner = identity.uid;
-    let owning_group = identity.gid;
+        posix_rustup_effective_access(mode, owning_group, candidate_group_ids);
+    let path = path.display();
     format!(
         "POSIX Rustup ancestor rejected: path={path},isDirectory={is_directory},mode=0o{mode:04o},ownerUid={file_owner},ownerGid={owning_group},candidateUid={candidate_uid},candidateGroups={candidate_group_ids:?},accessClass={access_class},effectiveBits=0o{effective:o}"
     )
@@ -7001,6 +9720,76 @@ fn posix_rustup_tree_entries(
     }
     identities.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(identities)
+}
+
+#[cfg(unix)]
+fn posix_rustup_tree_mismatch(
+    expected: &[PosixRustupEntryIdentity],
+    observed: &[PosixRustupEntryIdentity],
+) -> Option<String> {
+    for expected_entry in expected {
+        match observed.binary_search_by(|entry| entry.path.cmp(&expected_entry.path)) {
+            Ok(index) => {
+                if let Some(detail) = posix_rustup_entry_mismatch(expected_entry, &observed[index])
+                {
+                    return Some(detail);
+                }
+            }
+            Err(_) => {
+                return Some(format!(
+                    "path={} requirement={:?} field=inventory expected=present observed=absent",
+                    expected_entry.path.display(),
+                    expected_entry.requirement
+                ));
+            }
+        }
+    }
+    observed.iter().find_map(|observed_entry| {
+        expected
+            .binary_search_by(|entry| entry.path.cmp(&observed_entry.path))
+            .is_err()
+            .then(|| {
+                format!(
+                    "path={} requirement={:?} field=inventory expected=absent observed=present",
+                    observed_entry.path.display(),
+                    observed_entry.requirement
+                )
+            })
+    })
+}
+
+/// Opaque frozen Rustup authority used by external identity regressions.
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct PosixRustupAuthorityReceiptForIntegration(BoundPosixRustupAuthority);
+
+/// Binds the same complete staged Rustup authority used by candidate launch policy.
+///
+/// # Errors
+///
+/// Returns an error unless traversal ancestry, private inventory, compiler mapping,
+/// and standard Rust identities are all exact and candidate-accessible.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn bind_posix_rustup_authority_for_integration(
+    authority: PosixRustupAuthority,
+    candidate_uid: u32,
+    candidate_group_ids: Vec<u32>,
+) -> std::io::Result<PosixRustupAuthorityReceiptForIntegration> {
+    BoundPosixRustupAuthority::new(authority, candidate_uid, candidate_group_ids.into())
+        .map(PosixRustupAuthorityReceiptForIntegration)
+}
+
+#[cfg(unix)]
+impl PosixRustupAuthorityReceiptForIntegration {
+    /// Revalidates the frozen authority using the production pre-spawn path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed path and field evidence for the first authority mismatch.
+    pub fn revalidate(&self) -> std::io::Result<()> {
+        self.0.revalidate()
+    }
 }
 
 #[cfg(unix)]
@@ -7261,7 +10050,6 @@ fn run_bounded_posix_authority_command(
     })
 }
 
-#[cfg(unix)]
 fn without_candidate_launch_policy<T>(operation: impl FnOnce() -> T) -> T {
     CANDIDATE_LAUNCH_POLICY.with(|slot| {
         struct Restore<'a> {
@@ -8111,6 +10899,13 @@ pub fn with_candidate_launch_policy<T>(
     })
 }
 
+/// Reports whether the current thread retains candidate launch authority.
+#[doc(hidden)]
+#[must_use]
+pub fn candidate_launch_policy_is_installed_for_integration() -> bool {
+    CANDIDATE_LAUNCH_POLICY.with(|slot| slot.borrow().is_some())
+}
+
 fn resolve_parent_program(program: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
@@ -8124,14 +10919,15 @@ fn resolve_parent_program(program: &std::ffi::OsStr) -> std::io::Result<PathBuf>
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is unavailable"))?;
     #[cfg(windows)]
     {
-        let extensions = std::env::var_os("PATHEXT")
-            .map(|value| windows_native_executable_extensions(&value))
-            .unwrap_or_else(|| vec![OsString::from(".COM"), OsString::from(".EXE")]);
-        return resolve_windows_parent_program_from(
+        let extensions = std::env::var_os("PATHEXT").map_or_else(
+            || vec![OsString::from(".COM"), OsString::from(".EXE")],
+            |value| windows_native_executable_extensions(&value),
+        );
+        resolve_windows_parent_program_from(
             program,
             &std::env::split_paths(&search).collect::<Vec<_>>(),
             &extensions,
-        );
+        )
     }
     #[cfg(not(windows))]
     {
@@ -8385,18 +11181,24 @@ mod candidate_launch_policy_tests {
 
     #[test]
     fn rustup_ancestor_rejection_binds_exact_authority_state() {
-        let identity = PosixRustupEntryIdentity {
+        let identity = PosixRustupTraversalIdentity {
             path: PathBuf::from("/trusted/rustup"),
             device: 17,
             inode: 29,
-            links: 1,
             uid: 501,
             gid: 20,
             mode: 0o775,
-            requirement: PosixRustupAccessRequirement::AncestorDirectory,
         };
         assert_eq!(
-            posix_rustup_ancestor_rejection(&identity, true, 61_001, &[61_001, 20]),
+            posix_rustup_ancestor_rejection(
+                &identity.path,
+                identity.mode,
+                identity.uid,
+                identity.gid,
+                true,
+                61_001,
+                &[61_001, 20]
+            ),
             "POSIX Rustup ancestor rejected: path=/trusted/rustup,isDirectory=true,mode=0o0775,ownerUid=501,ownerGid=20,candidateUid=61001,candidateGroups=[61001, 20],accessClass=group,effectiveBits=0o7"
         );
     }
@@ -11284,9 +14086,14 @@ fn same_executable_file(left: &Path, right: &Path) -> std::io::Result<bool> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn same_executable_file(left: &Path, right: &Path) -> std::io::Result<bool> {
-    Ok(left == right)
+    Ok(same_file::Handle::from_path(left)? == same_file::Handle::from_path(right)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_executable_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    Ok(fs::canonicalize(left)? == fs::canonicalize(right)?)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19216,13 +22023,20 @@ pub struct WindowsLaunchControlReceipt {
     pub sha256: Digest,
     pub status_code: Option<i32>,
     pub timed_out: bool,
-    pub termination_forced: bool,
-    pub termination_reaped: bool,
+    pub termination: WindowsLaunchTerminationReceipt,
     pub candidate_quiescence_complete: bool,
     pub program: Option<PathBuf>,
     pub program_bytes: Option<u64>,
     pub program_sha256: Option<Digest>,
     pub current_directory: PathBuf,
+}
+
+/// Independent terminal process-tree facts authenticated by a Windows launch receipt.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsLaunchTerminationReceipt {
+    pub forced: bool,
+    pub reaped: bool,
 }
 
 #[cfg(windows)]
@@ -19258,8 +22072,8 @@ impl WindowsLaunchControlReceipt {
             &mut encoded,
             &[
                 u8::from(self.timed_out),
-                u8::from(self.termination_forced),
-                u8::from(self.termination_reaped),
+                u8::from(self.termination.forced),
+                u8::from(self.termination.reaped),
                 u8::from(self.candidate_quiescence_complete),
             ],
         );
@@ -19290,7 +22104,7 @@ impl WindowsLaunchControlReceipt {
             || (self.state == "completed"
                 && (self.status_code != Some(0)
                     || self.timed_out
-                    || !self.termination_reaped
+                    || !self.termination.reaped
                     || !self.candidate_quiescence_complete))
             || fs::canonicalize(&self.current_directory)? != self.current_directory
             || self.program.is_some() != self.program_bytes.is_some()
@@ -19350,28 +22164,54 @@ impl SupervisedProgressLossReceipt {
 }
 
 /// Nonblocking bounded progress sink used by supervised capture readers.
+type SupervisedAttributionTap = dyn Fn(SupervisedOutputStream, &[u8]) + Send + Sync;
+
 #[derive(Clone)]
 pub struct SupervisedProgressObserver {
     sender: mpsc::SyncSender<SupervisedProgressChunk>,
     dropped_chunks: Arc<AtomicU64>,
     dropped_bytes: Arc<AtomicU64>,
+    attribution_tap: Option<Arc<SupervisedAttributionTap>>,
 }
 
 impl SupervisedProgressObserver {
     #[must_use]
     pub fn bounded(capacity: usize) -> (Self, mpsc::Receiver<SupervisedProgressChunk>) {
+        Self::bounded_inner(capacity, None)
+    }
+
+    /// Creates a bounded advisory queue plus one synchronous attribution tap.
+    ///
+    /// The tap must retain only bounded semantic state. It observes every capture
+    /// chunk before the advisory queue can omit that chunk under backpressure.
+    #[must_use]
+    pub fn bounded_with_attribution_tap(
+        capacity: usize,
+        tap: impl Fn(SupervisedOutputStream, &[u8]) + Send + Sync + 'static,
+    ) -> (Self, mpsc::Receiver<SupervisedProgressChunk>) {
+        Self::bounded_inner(capacity, Some(Arc::new(tap)))
+    }
+
+    fn bounded_inner(
+        capacity: usize,
+        attribution_tap: Option<Arc<SupervisedAttributionTap>>,
+    ) -> (Self, mpsc::Receiver<SupervisedProgressChunk>) {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (
             Self {
                 sender,
                 dropped_chunks: Arc::new(AtomicU64::new(0)),
                 dropped_bytes: Arc::new(AtomicU64::new(0)),
+                attribution_tap,
             },
             receiver,
         )
     }
 
     fn observe(&self, stream: SupervisedOutputStream, bytes: &[u8]) {
+        if let Some(tap) = &self.attribution_tap {
+            tap(stream, bytes);
+        }
         let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self
             .sender
@@ -19384,6 +22224,12 @@ impl SupervisedProgressObserver {
             self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
             self.dropped_bytes.fetch_add(length, Ordering::Relaxed);
         }
+    }
+
+    /// Feeds one deterministic capture chunk through this observer.
+    #[doc(hidden)]
+    pub fn observe_for_integration(&self, stream: SupervisedOutputStream, bytes: &[u8]) {
+        self.observe(stream, bytes);
     }
 
     #[must_use]
@@ -19423,6 +22269,25 @@ pub fn run_supervised_command(
         .checked_add(timeout)
         .ok_or_else(|| std::io::Error::other("process deadline overflowed"))?;
     run_supervised_command_inner(command, input, deadline, None, None, None, None)
+}
+
+/// Runs one bounded trusted-host command without inheriting an ambient
+/// candidate launch policy.
+///
+/// The prior policy is restored on success, error, or unwind. This entry point
+/// is for typed host-authority operations which must not be relabeled as
+/// candidate execution; candidate commands must use [`run_supervised_command`].
+///
+/// # Errors
+///
+/// Returns an error when the process tree, input writer, capture reader, or
+/// cleanup operation fails.
+pub fn run_supervised_host_command(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+) -> std::io::Result<SupervisedOutput> {
+    without_candidate_launch_policy(|| run_supervised_command(command, input, timeout))
 }
 
 /// Runs a structured command while preserving one separately bound logical
@@ -20153,6 +23018,40 @@ pub fn verify_supervised_progress_loss_for_integration() -> Result<(), String> {
     {
         return Err("bounded progress queue loss accounting drifted".to_owned());
     }
+    let tapped = Arc::new(Mutex::new(Vec::new()));
+    let tapped_observer = Arc::clone(&tapped);
+    let (progress, receiver) =
+        SupervisedProgressObserver::bounded_with_attribution_tap(1, move |stream, bytes| {
+            tapped_observer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((stream, bytes.to_vec()));
+        });
+    progress.observe(SupervisedOutputStream::Stdout, b"retained");
+    progress.observe(SupervisedOutputStream::Stderr, b"queue-overflow-tail");
+    let retained = receiver
+        .try_recv()
+        .map_err(|error| format!("attributed progress queue lost retained chunk: {error}"))?;
+    let tapped = tapped
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if retained.bytes != b"retained"
+        || progress.loss()
+            != (SupervisedProgressLoss {
+                chunks: 1,
+                bytes: 19,
+            })
+        || tapped.as_slice()
+            != [
+                (SupervisedOutputStream::Stdout, b"retained".to_vec()),
+                (
+                    SupervisedOutputStream::Stderr,
+                    b"queue-overflow-tail".to_vec(),
+                ),
+            ]
+    {
+        return Err("lossless attribution tap followed advisory queue loss".to_owned());
+    }
     Ok(())
 }
 
@@ -20879,11 +23778,29 @@ mod authority_environment_tests {
             Path::new(r"C:\tools\cargo.exe"),
             true,
         ));
-        assert!(!windows_program_requires_trusted_path(
-            OsStr::new("git.exe"),
-            Path::new(r"C:\tools\git.exe"),
+        for git in ["git", "git.exe", "git.com"] {
+            assert!(windows_program_requires_trusted_path(
+                OsStr::new(git),
+                Path::new(r"C:\unresolved\program.exe"),
+                false,
+            ));
+        }
+        assert!(windows_program_requires_trusted_path(
+            OsStr::new("program.exe"),
+            Path::new("C:/tools/git.exe"),
             false,
         ));
+        for (requested, resolved) in [
+            ("program.exe", "C:/missing/program.exe"),
+            ("git-helper.exe", "C:/wrong/git-helper.exe"),
+            ("stack-helper.exe", "C:/wrong/stack-helper.exe"),
+        ] {
+            assert!(!windows_program_requires_trusted_path(
+                OsStr::new(requested),
+                Path::new(resolved),
+                false,
+            ));
+        }
     }
 
     #[test]
@@ -21478,6 +24395,126 @@ mod typed_target_tests {
 }
 
 #[cfg(test)]
+pub(crate) struct RuntimeObligationMutationFixture {
+    cases: Vec<DifferentialCase>,
+    baseline: RuntimeCoverageObservations,
+    obligation_support: HashMap<(RuntimeCoverageKey, Arc<str>), usize>,
+}
+
+#[cfg(test)]
+pub(crate) fn committed_runtime_obligation_mutation_fixture(
+    family: &str,
+) -> RuntimeObligationMutationFixture {
+    let cases = committed_differential_cases();
+    validate_evidence_catalog(&cases)
+        .unwrap_or_else(|error| panic!("committed {family} evidence catalog: {error}"));
+    let baseline = runtime_coverage_observations(&cases)
+        .unwrap_or_else(|error| panic!("committed {family} runtime observation index: {error}"));
+    let mut obligation_support = HashMap::<(RuntimeCoverageKey, Arc<str>), usize>::new();
+    for case in &cases {
+        let Some(descriptor) = &case.claim_evidence else {
+            continue;
+        };
+        for target in &descriptor.semantic_targets {
+            let Some(scope) = runtime_target_instance_scope(target) else {
+                continue;
+            };
+            let key = (Arc::clone(&target.builtin), target.dimension, scope);
+            for obligation in target.obligations.iter().filter(|obligation| {
+                obligation.0.as_ref() != "callback-order"
+                    || descriptor.callback_contracts.iter().any(|contract| {
+                        contract.builtin == target.builtin && !contract.invocations.is_empty()
+                    })
+            }) {
+                *obligation_support
+                    .entry((key.clone(), Arc::clone(&obligation.0)))
+                    .or_default() += 1;
+            }
+        }
+    }
+    RuntimeObligationMutationFixture {
+        cases,
+        baseline,
+        obligation_support,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_runtime_obligation_case_reopens(
+    fixture: &RuntimeObligationMutationFixture,
+    family: &str,
+    builtin: &str,
+    dimension: CompatibilityDimension,
+    removed: &str,
+) {
+    let mut matching_cases = fixture
+        .cases
+        .iter()
+        .filter(|case| case.id.as_ref() == removed);
+    let removed_case = matching_cases
+        .next()
+        .unwrap_or_else(|| panic!("{family} path {removed} is absent"));
+    assert!(
+        matching_cases.next().is_none(),
+        "{family} path {removed} is duplicated"
+    );
+    let descriptor = removed_case
+        .claim_evidence
+        .as_ref()
+        .unwrap_or_else(|| panic!("{family} path {removed} has no claim evidence"));
+    let [removed_target] = descriptor.semantic_targets.as_slice() else {
+        panic!("{family} path {removed} has unrelated semantic authority");
+    };
+    assert!(
+        removed_target.builtin.as_ref() == builtin && removed_target.dimension == dimension,
+        "{family} path {removed} does not bind its exact typed target"
+    );
+    assert!(
+        removed_target.boundary_classes.is_empty()
+            && removed_target.interaction_obligations.is_empty(),
+        "{family} path {removed} gained non-obligation coverage"
+    );
+    let scope = runtime_target_instance_scope(removed_target)
+        .unwrap_or_else(|| panic!("{family} path {removed} has no typed runtime scope"));
+    let key = (Arc::<str>::from(builtin), dimension, scope.clone());
+    let mut omitted = fixture.baseline.clone();
+    let obligations = omitted
+        .obligations
+        .get_mut(&key)
+        .unwrap_or_else(|| panic!("{family} path {removed} has no typed baseline"));
+    let mut removed_obligations = 0_usize;
+    for obligation in &removed_target.obligations {
+        if fixture
+            .obligation_support
+            .get(&(key.clone(), Arc::clone(&obligation.0)))
+            == Some(&1)
+        {
+            assert!(
+                obligations.remove(&obligation.0),
+                "{family} path {removed} unique obligation is absent"
+            );
+            removed_obligations += 1;
+        }
+    }
+    assert_ne!(
+        removed_obligations, 0,
+        "{family} path {removed} contributes no unique typed obligation"
+    );
+    let Err(error) = validate_runtime_obligation_observations(&omitted) else {
+        panic!("missing a {family} path did not reopen its scope");
+    };
+    let cell_prefix = format!("{builtin}/{dimension:?}:");
+    let cell = error
+        .split("; ")
+        .find(|cell| cell.starts_with(&cell_prefix))
+        .unwrap_or_else(|| panic!("missing {builtin} cell after removing {removed}"));
+    assert!(
+        cell.contains(&format!("{}:missing=[", scope.label())),
+        "{cell}"
+    );
+}
+
+#[cfg(test)]
 mod evidence_catalog_tests {
     use super::*;
 
@@ -21706,7 +24743,10 @@ mod evidence_catalog_tests {
 
     #[test]
     fn eq_requires_both_boolean_paths_for_every_registry_instance() {
-        let committed = committed_differential_cases();
+        let cases = committed_differential_cases();
+        validate_evidence_catalog(&cases).expect("committed Eq evidence catalog");
+        let baseline =
+            runtime_coverage_observations(&cases).expect("committed Eq runtime observation index");
         for instance in [
             "Bool",
             "ByteString",
@@ -21730,18 +24770,27 @@ mod evidence_catalog_tests {
             "(,)",
         ] {
             for result in [true, false] {
-                let digest = boolean_typed_result_digest(result);
-                let mut cases = committed.clone();
-                cases.retain(|case| {
-                    !case.claim_evidence.as_ref().is_some_and(|descriptor| {
-                        descriptor.semantic_targets.iter().any(|target| {
-                            target.builtin.as_ref() == "Eq.eq"
-                                && target.expected_instance_target.as_deref() == Some(instance)
-                                && target.expected_typed_result_sha256 == Some(digest)
-                        })
-                    })
+                let key = (
+                    Arc::<str>::from("Eq.eq"),
+                    RuntimeInstanceScope::Resolved(Arc::from(instance)),
+                );
+                let baseline_outcomes = baseline.boolean_outcomes.get(&key).unwrap_or_else(|| {
+                    panic!("committed Eq.eq/{instance} has no Boolean outcomes")
                 });
-                let error = validate_runtime_obligation_coverage(&cases)
+                assert!(
+                    baseline_outcomes.contains(&result),
+                    "committed Eq.eq/{instance} omits Boolean outcome {result}"
+                );
+                let mut omitted = baseline.clone();
+                assert!(
+                    omitted
+                        .boolean_outcomes
+                        .get_mut(&key)
+                        .expect("baseline Eq outcome key was cloned")
+                        .remove(&result),
+                    "Eq.eq/{instance}/{result} outcome was not removed"
+                );
+                let error = validate_runtime_obligation_observations(&omitted)
                     .expect_err("removing an Eq boolean path must reopen its instance scope");
                 let eq_cell = error
                     .split("; ")
@@ -21912,19 +24961,21 @@ mod evidence_catalog_tests {
 
     #[test]
     fn monad_return_requires_every_direct_registry_instance() {
-        let mut cases = committed_differential_cases();
-        cases.retain(|case| case.id.as_ref() != "runtime-typed-monad-return-either");
-        let error = validate_runtime_obligation_coverage(&cases)
-            .expect_err("missing one direct Monad instance must reopen Monad.return");
-        let return_cell = error
-            .split("; ")
-            .find(|cell| cell.starts_with("Monad.return/PureRuntime:"))
-            .unwrap_or_else(|| panic!("missing Monad.return cell in {error}"));
-        assert!(return_cell.contains("Either:missing="), "{return_cell}");
+        let fixture = committed_runtime_obligation_fixture("Monad");
+        assert_runtime_path_reopens(
+            &fixture.cases,
+            &fixture.baseline,
+            &fixture.obligation_support,
+            "Monad",
+            "Monad.return",
+            "Either",
+            "runtime-typed-monad-return-either",
+        );
     }
 
     #[test]
     fn monad_when_requires_both_branches_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Monad");
         for (instance, target) in [
             ("io", "IO"),
             ("maybe", "Maybe"),
@@ -21934,17 +24985,14 @@ mod evidence_catalog_tests {
         ] {
             for branch in ["selected", "unselected"] {
                 let removed = format!("runtime-typed-monad-when-{instance}-{branch}");
-                let mut cases = committed_differential_cases();
-                cases.retain(|case| case.id.as_ref() != removed);
-                let error = validate_runtime_obligation_coverage(&cases)
-                    .expect_err("missing a Monad.when branch must reopen its instance scope");
-                let when_cell = error
-                    .split("; ")
-                    .find(|cell| cell.starts_with("Monad.when/PureRuntime:"))
-                    .unwrap_or_else(|| panic!("missing Monad.when cell after removing {removed}"));
-                assert!(
-                    when_cell.contains(&format!("{target}:missing=[")),
-                    "{when_cell}"
+                assert_runtime_path_reopens(
+                    &fixture.cases,
+                    &fixture.baseline,
+                    &fixture.obligation_support,
+                    "Monad",
+                    "Monad.when",
+                    target,
+                    &removed,
                 );
             }
         }
@@ -21952,6 +25000,7 @@ mod evidence_catalog_tests {
 
     #[test]
     fn monad_then_requires_both_paths_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Monad");
         for (instance, target, paths) in [
             ("io", "IO", ["success", "short-circuit"]),
             ("maybe", "Maybe", ["success", "short-circuit"]),
@@ -21961,17 +25010,14 @@ mod evidence_catalog_tests {
         ] {
             for path in paths {
                 let removed = format!("runtime-typed-monad-then-{instance}-{path}");
-                let mut cases = committed_differential_cases();
-                cases.retain(|case| case.id.as_ref() != removed);
-                let error = validate_runtime_obligation_coverage(&cases)
-                    .expect_err("missing a Monad.then path must reopen its instance scope");
-                let then_cell = error
-                    .split("; ")
-                    .find(|cell| cell.starts_with("Monad.then/PureRuntime:"))
-                    .unwrap_or_else(|| panic!("missing Monad.then cell after removing {removed}"));
-                assert!(
-                    then_cell.contains(&format!("{target}:missing=[")),
-                    "{then_cell}"
+                assert_runtime_path_reopens(
+                    &fixture.cases,
+                    &fixture.baseline,
+                    &fixture.obligation_support,
+                    "Monad",
+                    "Monad.then",
+                    target,
+                    &removed,
                 );
             }
         }
@@ -21979,6 +25025,7 @@ mod evidence_catalog_tests {
 
     #[test]
     fn monad_bind_requires_both_paths_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Monad");
         for (instance, target, paths) in [
             ("io", "IO", ["success", "short-circuit"]),
             ("maybe", "Maybe", ["success", "short-circuit"]),
@@ -21988,17 +25035,14 @@ mod evidence_catalog_tests {
         ] {
             for path in paths {
                 let removed = format!("runtime-typed-monad-bind-{instance}-{path}");
-                let mut cases = committed_differential_cases();
-                cases.retain(|case| case.id.as_ref() != removed);
-                let error = validate_runtime_obligation_coverage(&cases)
-                    .expect_err("missing a Monad.bind path must reopen its instance scope");
-                let bind_cell = error
-                    .split("; ")
-                    .find(|cell| cell.starts_with("Monad.bind/PureRuntime:"))
-                    .unwrap_or_else(|| panic!("missing Monad.bind cell after removing {removed}"));
-                assert!(
-                    bind_cell.contains(&format!("{target}:missing=[")),
-                    "{bind_cell}"
+                assert_runtime_path_reopens(
+                    &fixture.cases,
+                    &fixture.baseline,
+                    &fixture.obligation_support,
+                    "Monad",
+                    "Monad.bind",
+                    target,
+                    &removed,
                 );
             }
         }
@@ -22006,6 +25050,7 @@ mod evidence_catalog_tests {
 
     #[test]
     fn monad_sequence_requires_both_paths_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Monad");
         for (instance, target, paths) in [
             ("io", "IO", ["finite", "short-circuit"]),
             ("maybe", "Maybe", ["finite", "short-circuit"]),
@@ -22015,19 +25060,14 @@ mod evidence_catalog_tests {
         ] {
             for path in paths {
                 let removed = format!("runtime-typed-monad-sequence-{instance}-{path}");
-                let mut cases = committed_differential_cases();
-                cases.retain(|case| case.id.as_ref() != removed);
-                let error = validate_runtime_obligation_coverage(&cases)
-                    .expect_err("missing a Monad.sequence path must reopen its instance scope");
-                let sequence_cell = error
-                    .split("; ")
-                    .find(|cell| cell.starts_with("Monad.sequence/PureRuntime:"))
-                    .unwrap_or_else(|| {
-                        panic!("missing Monad.sequence cell after removing {removed}")
-                    });
-                assert!(
-                    sequence_cell.contains(&format!("{target}:missing=[")),
-                    "{sequence_cell}"
+                assert_runtime_path_reopens(
+                    &fixture.cases,
+                    &fixture.baseline,
+                    &fixture.obligation_support,
+                    "Monad",
+                    "Monad.sequence",
+                    target,
+                    &removed,
                 );
             }
         }
@@ -22035,6 +25075,7 @@ mod evidence_catalog_tests {
 
     #[test]
     fn monad_traversals_require_both_paths_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Monad");
         for (builtin, slug) in [
             ("Monad.mapM", "monad-mapm"),
             ("Monad.forM", "monad-form"),
@@ -22050,24 +25091,144 @@ mod evidence_catalog_tests {
             ] {
                 for path in paths {
                     let removed = format!("runtime-typed-{slug}-{instance}-{path}");
-                    let mut cases = committed_differential_cases();
-                    cases.retain(|case| case.id.as_ref() != removed);
-                    let error = validate_runtime_obligation_coverage(&cases)
-                        .expect_err("missing a Monad traversal path must reopen its instance");
-                    let cell = error
-                        .split("; ")
-                        .find(|cell| cell.starts_with(&format!("{builtin}/PureRuntime:")))
-                        .unwrap_or_else(|| {
-                            panic!("missing {builtin} cell after removing {removed}")
-                        });
-                    assert!(cell.contains(&format!("{target}:missing=[")), "{cell}");
+                    assert_runtime_path_reopens(
+                        &fixture.cases,
+                        &fixture.baseline,
+                        &fixture.obligation_support,
+                        "Monad",
+                        builtin,
+                        target,
+                        &removed,
+                    );
                 }
             }
         }
     }
 
+    fn runtime_obligation_support(
+        cases: &[DifferentialCase],
+    ) -> HashMap<(RuntimeCoverageKey, Arc<str>), usize> {
+        let mut obligation_support = HashMap::<(RuntimeCoverageKey, Arc<str>), usize>::new();
+        for case in cases {
+            let Some(descriptor) = &case.claim_evidence else {
+                continue;
+            };
+            for target in &descriptor.semantic_targets {
+                let Some(scope) = runtime_target_instance_scope(target) else {
+                    continue;
+                };
+                let key = (Arc::clone(&target.builtin), target.dimension, scope);
+                for obligation in target.obligations.iter().filter(|obligation| {
+                    obligation.0.as_ref() != "callback-order"
+                        || descriptor.callback_contracts.iter().any(|contract| {
+                            contract.builtin == target.builtin && !contract.invocations.is_empty()
+                        })
+                }) {
+                    *obligation_support
+                        .entry((key.clone(), Arc::clone(&obligation.0)))
+                        .or_default() += 1;
+                }
+            }
+        }
+        obligation_support
+    }
+
+    struct RuntimeObligationFixture {
+        cases: Vec<DifferentialCase>,
+        baseline: RuntimeCoverageObservations,
+        obligation_support: HashMap<(RuntimeCoverageKey, Arc<str>), usize>,
+    }
+
+    fn committed_runtime_obligation_fixture(family: &str) -> RuntimeObligationFixture {
+        let cases = committed_differential_cases();
+        validate_evidence_catalog(&cases)
+            .unwrap_or_else(|error| panic!("committed {family} evidence catalog: {error}"));
+        let baseline = runtime_coverage_observations(&cases).unwrap_or_else(|error| {
+            panic!("committed {family} runtime observation index: {error}")
+        });
+        let obligation_support = runtime_obligation_support(&cases);
+        RuntimeObligationFixture {
+            cases,
+            baseline,
+            obligation_support,
+        }
+    }
+
+    fn assert_runtime_path_reopens(
+        cases: &[DifferentialCase],
+        baseline: &RuntimeCoverageObservations,
+        obligation_support: &HashMap<(RuntimeCoverageKey, Arc<str>), usize>,
+        family: &str,
+        builtin: &str,
+        target: &str,
+        removed: &str,
+    ) {
+        let mut matching_cases = cases.iter().filter(|case| case.id.as_ref() == removed);
+        let removed_case = matching_cases
+            .next()
+            .unwrap_or_else(|| panic!("{family} path {removed} is absent"));
+        assert!(
+            matching_cases.next().is_none(),
+            "{family} path {removed} is duplicated"
+        );
+        let descriptor = removed_case
+            .claim_evidence
+            .as_ref()
+            .unwrap_or_else(|| panic!("{family} path {removed} has no claim evidence"));
+        let mut matching_targets = descriptor.semantic_targets.iter().filter(|candidate| {
+            candidate.builtin.as_ref() == builtin
+                && candidate.dimension == CompatibilityDimension::PureRuntime
+                && candidate.expected_instance_target.as_deref() == Some(target)
+        });
+        let removed_target = matching_targets
+            .next()
+            .unwrap_or_else(|| panic!("{family} path {removed} does not bind its runtime target"));
+        assert!(
+            matching_targets.next().is_none(),
+            "{family} path {removed} duplicates its runtime target"
+        );
+        assert!(
+            removed_target.boundary_classes.is_empty()
+                && removed_target.interaction_obligations.is_empty(),
+            "{family} path {removed} gained non-obligation coverage"
+        );
+        let key = (
+            Arc::<str>::from(builtin),
+            CompatibilityDimension::PureRuntime,
+            RuntimeInstanceScope::Resolved(Arc::from(target)),
+        );
+        let mut omitted = baseline.clone();
+        let obligations = omitted
+            .obligations
+            .get_mut(&key)
+            .unwrap_or_else(|| panic!("{family} path {removed} has no typed baseline"));
+        let mut removed_obligations = 0_usize;
+        for obligation in &removed_target.obligations {
+            if obligation_support.get(&(key.clone(), Arc::clone(&obligation.0))) == Some(&1) {
+                assert!(
+                    obligations.remove(&obligation.0),
+                    "{family} path {removed} unique obligation is absent"
+                );
+                removed_obligations += 1;
+            }
+        }
+        assert_ne!(
+            removed_obligations, 0,
+            "{family} path {removed} contributes no unique typed obligation"
+        );
+        let Err(error) = validate_runtime_obligation_observations(&omitted) else {
+            panic!("missing a {family} path did not reopen its scope");
+        };
+        let cell = error
+            .split("; ")
+            .find(|cell| cell.starts_with(&format!("{builtin}/PureRuntime:")))
+            .unwrap_or_else(|| panic!("missing {builtin} cell after removing {removed}"));
+        assert!(cell.contains(&format!("{target}:missing=[")), "{cell}");
+    }
+
     #[test]
     fn functor_adapters_require_both_paths_for_every_direct_instance() {
+        let fixture = committed_runtime_obligation_fixture("Functor");
         for (builtin, slug) in [("Functor.fmap", "fmap"), ("<$>", "operator")] {
             for (instance, target) in [
                 ("list", "[]"),
@@ -22080,17 +25241,15 @@ mod evidence_catalog_tests {
             ] {
                 for path in ["mapped", "short"] {
                     let removed = format!("runtime-typed-functor-{slug}-{instance}-{path}");
-                    let mut cases = committed_differential_cases();
-                    cases.retain(|case| case.id.as_ref() != removed);
-                    let error = validate_runtime_obligation_coverage(&cases)
-                        .expect_err("missing a Functor path must reopen its instance scope");
-                    let cell = error
-                        .split("; ")
-                        .find(|cell| cell.starts_with(&format!("{builtin}/PureRuntime:")))
-                        .unwrap_or_else(|| {
-                            panic!("missing {builtin} cell after removing {removed}")
-                        });
-                    assert!(cell.contains(&format!("{target}:missing=[")), "{cell}");
+                    assert_runtime_path_reopens(
+                        &fixture.cases,
+                        &fixture.baseline,
+                        &fixture.obligation_support,
+                        "Functor",
+                        builtin,
+                        target,
+                        &removed,
+                    );
                 }
             }
         }

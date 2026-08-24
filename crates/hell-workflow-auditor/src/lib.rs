@@ -635,6 +635,8 @@ fn audit_document(
             format!("{}: workflow-level env is forbidden", context.filename),
         ));
     }
+    validate_cargo_deny_authority_scope(context.filename, root)?;
+    validate_windows_ghc_authority(context.filename, root)?;
     compare_scalar(root, "name", projected, "name", "workflow.generated.drift")?;
     validate_profile(
         root.get("permissions"),
@@ -673,6 +675,144 @@ fn audit_document(
     }
     validate_privilege_split(context.filename, root, jobs)?;
     Ok((jobs.len(), steps_count))
+}
+
+fn validate_cargo_deny_authority_scope(
+    filename: &str,
+    root: &BTreeMap<String, Yaml>,
+) -> Result<(), Failure> {
+    if !matches!(filename, "ci.yml" | "nightly.yml" | "release.yml") {
+        return Ok(());
+    }
+    let jobs = required_yaml_map(root, "jobs", "workflow.cargo-deny.scope")?;
+    for (job_id, job) in jobs {
+        if job_id == "linux" {
+            continue;
+        }
+        let job = job.map("workflow.cargo-deny.scope")?;
+        let Some(steps) = job.get("steps") else {
+            continue;
+        };
+        if yaml_contains(steps, "cargo-deny") {
+            return Err(Failure::new(
+                "workflow.cargo-deny.scope",
+                format!(
+                    "{filename}: non-Linux job {job_id:?} contains the Linux-only cargo-deny authority"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn yaml_contains(value: &Yaml, needle: &str) -> bool {
+    match value {
+        Yaml::Scalar(value) => value.contains(needle),
+        Yaml::Map(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(needle) || yaml_contains(value, needle)),
+        Yaml::Sequence(values) => values.iter().any(|value| yaml_contains(value, needle)),
+    }
+}
+
+fn validate_windows_ghc_authority(
+    filename: &str,
+    root: &BTreeMap<String, Yaml>,
+) -> Result<(), Failure> {
+    if !matches!(filename, "ci.yml" | "nightly.yml" | "release.yml") {
+        return Ok(());
+    }
+    let jobs = required_yaml_map(root, "jobs", "workflow.windows-ghc.authority")?;
+    let Some(windows) = jobs.get("windows") else {
+        return Ok(());
+    };
+    let windows = windows.map("workflow.windows-ghc.authority")?;
+    let steps = required_yaml_sequence(windows, "steps", "workflow.windows-ghc.authority")?;
+    let mut setup = None;
+    for step in steps {
+        let step = step.map("workflow.windows-ghc.authority")?;
+        if step.get("uses").is_some_and(|uses| {
+            uses.scalar("workflow.windows-ghc.authority")
+                .is_ok_and(|uses| uses.starts_with("haskell-actions/setup@"))
+        }) && setup.replace(step).is_some()
+        {
+            return Err(Failure::new(
+                "workflow.windows-ghc.authority",
+                "Windows job repeats the Haskell setup authority",
+            ));
+        }
+    }
+    let setup = setup.ok_or_else(|| {
+        Failure::new(
+            "workflow.windows-ghc.authority",
+            "Windows Haskell setup authority is absent",
+        )
+    })?;
+    let with = optional_yaml_map(setup.get("with"), "workflow.windows-ghc.authority")?;
+    if yaml_map_scalar(&with, "enable-stack") != Some("true")
+        || yaml_map_scalar(&with, "ghc-version") != Some("9.8.2")
+        || yaml_map_scalar(&with, "stack-version") != Some("3.11.1")
+        || with.contains_key("stack-no-global")
+    {
+        return Err(Failure::new(
+            "workflow.windows-ghc.authority",
+            "Windows Haskell setup differs from pinned GHC 9.8.2 and Stack 3.11.1 authority",
+        ));
+    }
+    if filename == "nightly.yml" {
+        validate_nightly_windows_ghc_cache(steps)?;
+    }
+    Ok(())
+}
+
+fn validate_nightly_windows_ghc_cache(steps: &[Yaml]) -> Result<(), Failure> {
+    let mut restore = None;
+    let mut save = None;
+    for step in steps {
+        let step = step.map("workflow.windows-ghc.cache")?;
+        let Some(uses) = step.get("uses") else {
+            continue;
+        };
+        let uses = uses.scalar("workflow.windows-ghc.cache")?;
+        if !matches!(
+            uses.split_once('@').map(|(repository, _)| repository),
+            Some("actions/cache/restore" | "actions/cache/save")
+        ) {
+            continue;
+        }
+        let with = optional_yaml_map(step.get("with"), "workflow.windows-ghc.cache")?;
+        let Some(path) = yaml_map_scalar(&with, "path") else {
+            continue;
+        };
+        if !path.contains("steps.setup-stack.outputs.stack-root")
+            || !path.contains("oracle-source/.stack-work")
+        {
+            continue;
+        }
+        let key = yaml_map_scalar(&with, "key").ok_or_else(|| {
+            Failure::new("workflow.windows-ghc.cache", "Stack cache key is absent")
+        })?;
+        let target = if uses.starts_with("actions/cache/restore@") {
+            &mut restore
+        } else {
+            &mut save
+        };
+        if target.replace(key.to_owned()).is_some() {
+            return Err(Failure::new(
+                "workflow.windows-ghc.cache",
+                "Nightly Windows repeats a Stack cache direction",
+            ));
+        }
+    }
+    if restore != save
+        || restore.is_none_or(|key| !key.starts_with("nightly-windows-stack-3.11.1-ghc-9.8.2-"))
+    {
+        return Err(Failure::new(
+            "workflow.windows-ghc.cache",
+            "Nightly Windows Stack restore/save keys differ or omit pinned GHC 9.8.2",
+        ));
+    }
+    Ok(())
 }
 
 fn audit_job(
@@ -2263,7 +2403,7 @@ fn validate_vector_manifest_bindings(
     Ok(())
 }
 
-const EXPECTED_VECTORS: [(&str, bool, &str, Option<&str>); 19] = [
+const EXPECTED_VECTORS: [(&str, bool, &str, Option<&str>); 25] = [
     ("known-good-workflows", true, "none", None),
     (
         "workflow-command-chain",
@@ -2373,13 +2513,49 @@ const EXPECTED_VECTORS: [(&str, bool, &str, Option<&str>); 19] = [
         "add-disabled-merge-group",
         Some("workflow.trigger.merge-group"),
     ),
+    (
+        "workflow-non-linux-cargo-deny",
+        false,
+        "add-macos-cargo-deny",
+        Some("workflow.cargo-deny.scope"),
+    ),
+    (
+        "workflow-windows-ghc-missing",
+        false,
+        "remove-windows-ghc-version",
+        Some("workflow.windows-ghc.authority"),
+    ),
+    (
+        "workflow-windows-ghc-latest",
+        false,
+        "set-windows-ghc-version-latest",
+        Some("workflow.windows-ghc.authority"),
+    ),
+    (
+        "workflow-windows-ghc-wrong",
+        false,
+        "set-windows-ghc-version-wrong",
+        Some("workflow.windows-ghc.authority"),
+    ),
+    (
+        "workflow-windows-stack-no-global",
+        false,
+        "retain-windows-stack-no-global",
+        Some("workflow.windows-ghc.authority"),
+    ),
+    (
+        "workflow-nightly-windows-ghc-cache-mismatch",
+        false,
+        "mismatch-nightly-windows-ghc-cache-key",
+        Some("workflow.windows-ghc.cache"),
+    ),
 ];
 
 fn validate_vector_catalog(vectors: &[Vector]) -> Result<(), Failure> {
     if vectors.len() != EXPECTED_VECTORS.len() {
         return Err(Failure::new(
             "workflow.vector-manifest.coverage",
-            "workflow vector catalog must contain exactly known-good plus 18 invalid vectors",
+            "workflow vector catalog must contain exactly known-good plus 24 invalid vectors",
         ));
     }
     for (vector, (id, valid, mutation, diagnostic)) in vectors.iter().zip(EXPECTED_VECTORS) {
@@ -2519,6 +2695,16 @@ fn apply_mutation(
             b"on:\n",
             b"  merge_group:\n    types: [checks_requested]\n",
         )?,
+        "add-macos-cargo-deny" => {
+            mutate_named_job_segment(&mut files, "ci.yml", "macos", |segment| {
+                replace_once(
+                    segment,
+                    b"    steps:\n",
+                    b"    steps:\n      - name: Unexpected cargo-deny authority\n        run: cargo-deny --version\n",
+                )
+            })?;
+        }
+        _ if apply_windows_ghc_mutation(&mut files, mutation)? => {}
         _ => {
             return Err(Failure::new(
                 "workflow.vector.mutation",
@@ -2527,6 +2713,57 @@ fn apply_mutation(
         }
     }
     Ok(files)
+}
+
+fn apply_windows_ghc_mutation(
+    files: &mut BTreeMap<String, Vec<u8>>,
+    mutation: &str,
+) -> Result<bool, Failure> {
+    match mutation {
+        "remove-windows-ghc-version" => {
+            mutate_named_job_segment(files, "ci.yml", "windows", |segment| {
+                replace_once(segment, b"          ghc-version: 9.8.2\n", b"")
+            })?;
+        }
+        "set-windows-ghc-version-latest" => {
+            mutate_named_job_segment(files, "ci.yml", "windows", |segment| {
+                replace_once(
+                    segment,
+                    b"          ghc-version: 9.8.2\n",
+                    b"          ghc-version: latest\n",
+                )
+            })?;
+        }
+        "set-windows-ghc-version-wrong" => {
+            mutate_named_job_segment(files, "release.yml", "windows", |segment| {
+                replace_once(
+                    segment,
+                    b"          ghc-version: 9.8.2\n",
+                    b"          ghc-version: 9.6.7\n",
+                )
+            })?;
+        }
+        "retain-windows-stack-no-global" => {
+            mutate_named_job_segment(files, "nightly.yml", "windows", |segment| {
+                replace_once(
+                    segment,
+                    b"          enable-stack: 'true'\n",
+                    b"          enable-stack: 'true'\n          stack-no-global: 'true'\n",
+                )
+            })?;
+        }
+        "mismatch-nightly-windows-ghc-cache-key" => {
+            mutate_named_job_segment(files, "nightly.yml", "windows", |segment| {
+                replace_last(
+                    segment,
+                    b"nightly-windows-stack-3.11.1-ghc-9.8.2-",
+                    b"nightly-windows-stack-3.11.1-",
+                )
+            })?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn mutate_first(
@@ -2710,8 +2947,17 @@ fn mutate_job_segment(
     job: &str,
     mutate: impl FnOnce(&mut Vec<u8>) -> bool,
 ) -> Result<(), Failure> {
+    mutate_named_job_segment(files, "release.yml", job, mutate)
+}
+
+fn mutate_named_job_segment(
+    files: &mut BTreeMap<String, Vec<u8>>,
+    filename: &str,
+    job: &str,
+    mutate: impl FnOnce(&mut Vec<u8>) -> bool,
+) -> Result<(), Failure> {
     let bytes = files
-        .get_mut("release.yml")
+        .get_mut(filename)
         .ok_or_else(|| Failure::new("workflow.vector.mutation", "release workflow is absent"))?;
     let marker = format!("  {job}:\n");
     let start = find_bytes(bytes, marker.as_bytes()).ok_or_else(|| {
@@ -2749,6 +2995,20 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn replace_once(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) -> bool {
     let Some(position) = find_bytes(bytes, needle) else {
+        return false;
+    };
+    bytes.splice(
+        position..position + needle.len(),
+        replacement.iter().copied(),
+    );
+    true
+}
+
+fn replace_last(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) -> bool {
+    let Some(position) = bytes
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+    else {
         return false;
     };
     bytes.splice(
@@ -2885,19 +3145,36 @@ fn write_report(path: &Path, value: &Json) -> Result<(), Failure> {
                 format!("cannot publish workflow audit report: {error}"),
             )
         })?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                Failure::new(
-                    "workflow.report.write",
-                    format!("cannot sync report directory: {error}"),
-                )
-            })
+        let sync_result = sync_published_report(&file, path, parent);
+        drop(file);
+        sync_result
     })();
     if result.is_err() {
         let _cleanup_result = fs::remove_file(&staging);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_published_report(_report: &File, _path: &Path, parent: &Path) -> Result<(), Failure> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            Failure::new(
+                "workflow.report.write",
+                format!("cannot sync report directory: {error}"),
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_published_report(report: &File, _path: &Path, _parent: &Path) -> Result<(), Failure> {
+    report.sync_all().map_err(|error| {
+        Failure::new(
+            "workflow.report.write",
+            format!("cannot sync published workflow report: {error}"),
+        )
+    })
 }
 
 fn object<'a>(value: &'a Json, code: &'static str) -> Result<&'a Map<String, Json>, Failure> {

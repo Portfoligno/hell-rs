@@ -22020,7 +22020,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(targets, manifest);
 
-        let committed = crate::committed_differential_cases();
+        let fixture = crate::committed_runtime_obligation_mutation_fixture("Options Presentation");
         for omitted in &expected {
             let target = cases
                 .iter()
@@ -22032,16 +22032,12 @@ mod tests {
                 .semantic_targets[0]
                 .builtin
                 .clone();
-            let reduced = committed
-                .iter()
-                .filter(|case| case.id.as_ref() != omitted)
-                .cloned()
-                .collect::<Vec<_>>();
-            let error = crate::validate_runtime_obligation_coverage(&reduced)
-                .expect_err("remaining runtime scope is intentionally incomplete");
-            assert!(
-                error.contains(&format!("{target}/Presentation")),
-                "omitting {omitted} did not reopen {target}/Presentation: {error}"
+            crate::assert_runtime_obligation_case_reopens(
+                &fixture,
+                "Options Presentation",
+                &target,
+                CompatibilityDimension::Presentation,
+                omitted,
             );
         }
     }

@@ -139,6 +139,16 @@ fn require_terminal_receipt(
     );
 }
 
+fn require_passed_phase(receipt: &Path, phase: &str) {
+    let receipt = fs::read_to_string(receipt).expect("read native archiver phase receipt");
+    assert!(
+        receipt.lines().any(|line| {
+            line.contains(&format!(" phase={phase} ")) && line.contains(" state=passed ")
+        }),
+        "native archiver receipt lacks passed phase {phase}"
+    );
+}
+
 #[test]
 fn homebrew_real_positive_acquires_stages_executes_and_cleans_once() {
     let fixture = Fixture::new();
@@ -149,6 +159,8 @@ fn homebrew_real_positive_acquires_stages_executes_and_cleans_once() {
         "homebrew-real-positive-acquire-stage-execute-cleanup",
         &output,
     );
+    require_passed_phase(&receipt, "restricted-staging-search-authority");
+    require_passed_phase(&receipt, "authorization-broker-receipt");
     assert!(output.status.success(), "{}", stderr(&output));
 }
 

@@ -116,3 +116,39 @@ id = "workflow-merge-group-while-disabled"
 valid = false
 mutation = "add-disabled-merge-group"
 diagnostic = "workflow.trigger.merge-group"
+
+[[vector]]
+id = "workflow-non-linux-cargo-deny"
+valid = false
+mutation = "add-macos-cargo-deny"
+diagnostic = "workflow.cargo-deny.scope"
+
+[[vector]]
+id = "workflow-windows-ghc-missing"
+valid = false
+mutation = "remove-windows-ghc-version"
+diagnostic = "workflow.windows-ghc.authority"
+
+[[vector]]
+id = "workflow-windows-ghc-latest"
+valid = false
+mutation = "set-windows-ghc-version-latest"
+diagnostic = "workflow.windows-ghc.authority"
+
+[[vector]]
+id = "workflow-windows-ghc-wrong"
+valid = false
+mutation = "set-windows-ghc-version-wrong"
+diagnostic = "workflow.windows-ghc.authority"
+
+[[vector]]
+id = "workflow-windows-stack-no-global"
+valid = false
+mutation = "retain-windows-stack-no-global"
+diagnostic = "workflow.windows-ghc.authority"
+
+[[vector]]
+id = "workflow-nightly-windows-ghc-cache-mismatch"
+valid = false
+mutation = "mismatch-nightly-windows-ghc-cache-key"
+diagnostic = "workflow.windows-ghc.cache"

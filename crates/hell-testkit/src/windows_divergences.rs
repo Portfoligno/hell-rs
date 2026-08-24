@@ -129,14 +129,11 @@ pub(crate) fn reviewed_windows_divergence_projection(
     if !case.claim_evidence.as_ref().is_some_and(|descriptor| {
         descriptor.semantic_targets.iter().any(|target| {
             target.builtin.as_ref() == authority.builtin
-                && target
-                    .platforms
-                    .iter()
-                    .any(|platform| *platform == ClaimPlatform::Windows)
+                && target.platforms.contains(&ClaimPlatform::Windows)
         })
     }) || oracle.timed_out == candidate.timed_out
         || oracle.status.success
-        || !candidate.semantic.is_some()
+        || candidate.semantic.is_none()
         || !super::applied_claim_normalizers(case).is_empty()
     {
         return None;

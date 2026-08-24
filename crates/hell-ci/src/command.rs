@@ -1,8 +1,8 @@
-#[cfg(target_os = "macos")]
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(unix)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(any(unix, windows))]
@@ -20,12 +20,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(unix, windows))]
 use hell_digest::Sha256;
-#[cfg(target_os = "macos")]
 use hell_testkit::sha256_bytes;
 use hell_testkit::{
     BoundProgramInvocation, Digest, SupervisedProgressObserver, run_supervised_command,
     run_supervised_command_until, run_supervised_command_with_bound_program,
-    run_supervised_command_with_bound_program_until, sha256_file,
+    run_supervised_command_with_bound_program_until, run_supervised_host_command, sha256_file,
 };
 
 use crate::process_environment::{ChildEnvironment, ProcessEnvironment, StandardVariable};
@@ -52,6 +51,12 @@ pub struct CommandSpec {
     native_archiver: Option<BoundNativeArchiver>,
     #[cfg(target_os = "macos")]
     native_archiver_deadlines: Option<(Instant, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandLaunchAuthority {
+    AmbientCandidate,
+    TrustedHost,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1262,6 +1267,22 @@ enum NativeArchiverOwnerAuthority {
 
 #[cfg(target_os = "macos")]
 impl NativeArchiverOwnerAuthority {
+    fn effective_permissions(&self, owner: u32, group: u32, mode: u32) -> u32 {
+        match self {
+            Self::RestrictedConsumer { uid, groups } if owner == *uid => (mode >> 6) & 0o7,
+            Self::RestrictedConsumer { groups, .. } if groups.contains(&group) => (mode >> 3) & 0o7,
+            Self::TrustedPublisher { .. } | Self::RestrictedConsumer { .. } => mode & 0o7,
+        }
+    }
+
+    fn permits_read(&self, owner: u32, group: u32, mode: u32) -> bool {
+        self.effective_permissions(owner, group, mode) & 0o4 != 0
+    }
+
+    fn permits_execute(&self, owner: u32, group: u32, mode: u32) -> bool {
+        self.effective_permissions(owner, group, mode) & 0o1 != 0
+    }
+
     fn admits_owner(&self, owner: u32) -> bool {
         match self {
             Self::TrustedPublisher { uid } => owner == 0 || owner == *uid,
@@ -2165,7 +2186,7 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn require_optional_native_deadline(deadline: Option<Instant>, phase: &str) -> Result<(), String> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         Err(format!(
@@ -2176,17 +2197,16 @@ fn require_optional_native_deadline(deadline: Option<Instant>, phase: &str) -> R
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 fn require_native_acl_free_until<'a, I>(
-    paths: I,
+    _paths: I,
     label: &str,
     deadline: Option<Instant>,
 ) -> Result<(), String>
 where
     I: IntoIterator<Item = &'a Path>,
 {
-    require_optional_native_deadline(deadline, label)?;
-    require_native_acl_free(paths, label)
+    require_optional_native_deadline(deadline, label)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2194,9 +2214,7 @@ pub(crate) fn require_native_acl_free<'a, I>(paths: I, label: &str) -> Result<()
 where
     I: IntoIterator<Item = &'a Path>,
 {
-    let _ = paths.into_iter();
-    let _ = label;
-    Ok(())
+    require_native_acl_free_until(paths, label, None)
 }
 
 #[cfg(target_os = "macos")]
@@ -2276,8 +2294,13 @@ fn run_with_optional_native_deadline(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn strip_staged_native_acls(_root: &Path) -> Result<(), String> {
-    Ok(())
+fn strip_staged_native_acls(root: &Path) -> Result<(), String> {
+    strip_staged_native_acls_until(root, None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn strip_staged_native_acls_until(_root: &Path, deadline: Option<Instant>) -> Result<(), String> {
+    require_optional_native_deadline(deadline, "remove staged native toolchain ACLs")
 }
 
 #[cfg(target_os = "macos")]
@@ -3069,6 +3092,86 @@ impl BoundNativeArchiver {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    fn revalidate_restricted_access_until(
+        &self,
+        adapter: &Path,
+        uid: u32,
+        groups: &[u32],
+        transaction: NativeArchiverTransaction,
+    ) -> Result<(), String> {
+        let authority = NativeArchiverOwnerAuthority::RestrictedConsumer {
+            uid,
+            groups: groups.to_vec(),
+        };
+        for entry in &self.distribution.entries {
+            transaction.require_execution("restricted LLVM distribution access")?;
+            if !authority.admits_owner(entry.uid) {
+                return Err("restricted principal owns a staged LLVM member".to_owned());
+            }
+            match entry.kind {
+                BoundNativeManifestEntryKind::Directory => {
+                    if !authority.permits_ancestor_mode(entry.uid, entry.gid, entry.mode, true)
+                        || !authority.permits_execute(entry.uid, entry.gid, entry.mode)
+                    {
+                        return Err(
+                            "restricted principal cannot safely traverse the staged LLVM closure"
+                                .to_owned(),
+                        );
+                    }
+                }
+                BoundNativeManifestEntryKind::File { .. } => {
+                    if !authority.permits_file_mode(entry.uid, entry.gid, entry.mode)
+                        || !authority.permits_read(entry.uid, entry.gid, entry.mode)
+                        || (entry.mode & 0o111 != 0
+                            && !authority.permits_execute(entry.uid, entry.gid, entry.mode))
+                    {
+                        return Err(
+                            "restricted principal cannot safely load a staged LLVM member"
+                                .to_owned(),
+                        );
+                    }
+                }
+                BoundNativeManifestEntryKind::Symlink { .. } => {}
+            }
+        }
+        for dependency in &self.external_dependencies {
+            let rebound = BoundNativeArchiverDependency::bind_until(
+                &dependency.path,
+                transaction,
+                &authority,
+            )?;
+            rebound.require_restricted_access(&authority, false)?;
+            if rebound.canonical != dependency.canonical
+                || rebound.device != dependency.device
+                || rebound.inode != dependency.inode
+                || rebound.uid != dependency.uid
+                || rebound.gid != dependency.gid
+                || rebound.mode != dependency.mode
+                || rebound.size != dependency.size
+                || rebound.sha256 != dependency.sha256
+            {
+                return Err(
+                    "restricted Mach-O dependency receipt differs from the staged receipt"
+                        .to_owned(),
+                );
+            }
+        }
+        let launcher = BoundNativeArchiverDependency::bind_until(
+            &adapter.join("ar"),
+            transaction,
+            &authority,
+        )?;
+        launcher.require_restricted_access(&authority, true)?;
+        if launcher.canonical
+            != fs::canonicalize(adapter.join("ar"))
+                .map_err(|error| format!("cannot canonicalize restricted adapter: {error}"))?
+        {
+            return Err("restricted adapter launcher identity changed".to_owned());
+        }
+        Ok(())
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }
@@ -3089,6 +3192,28 @@ impl BoundNativeArchiver {
 
 #[cfg(target_os = "macos")]
 impl BoundNativeArchiverDependency {
+    fn require_restricted_access(
+        &self,
+        authority: &NativeArchiverOwnerAuthority,
+        executable: bool,
+    ) -> Result<(), String> {
+        if !authority.permits_read(self.uid, self.gid, self.mode)
+            || (executable && !authority.permits_execute(self.uid, self.gid, self.mode))
+        {
+            return Err("restricted principal cannot read a Mach-O dependency".to_owned());
+        }
+        for ancestor in &self.ancestors {
+            if ancestor.symlink_target.is_none()
+                && !authority.permits_execute(ancestor.uid, ancestor.gid, ancestor.mode)
+            {
+                return Err(
+                    "restricted principal cannot traverse a Mach-O dependency authority".to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn bind_until(
         path: &Path,
         transaction: NativeArchiverTransaction,
@@ -7002,57 +7127,49 @@ impl NativeArchiveAdapter {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     pub(crate) fn retain_sealed_authority(
         &mut self,
         trusted_group: u32,
         candidate_uid: u32,
         authorization_deadline: Option<Instant>,
     ) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(llvm_ar) = &self.llvm_ar {
-                llvm_ar.revalidate()?;
-            }
-            let mut rebound = self
-                .bound_toolchain
-                .as_deref()
-                .ok_or_else(|| "native archive adapter toolchain authority is absent".to_owned())?
-                .clone();
-            rebound.retain_sealed_adapter_authority(trusted_group)?;
-            self.bound_toolchain = Some(Arc::new(rebound));
-            let adapter_root = self
-                .directory
-                .as_ref()
-                .ok_or_else(|| "native archive adapter directory is absent".to_owned())?
-                .path();
-            if self.input_broker.is_some() {
-                return Err("native archive input broker was started more than once".to_owned());
-            }
-            let archiver = self
-                .llvm_ar
-                .as_ref()
-                .ok_or_else(|| "native archive broker archiver authority is absent".to_owned())?
-                .clone();
-            let authorization_deadline = authorization_deadline.ok_or_else(|| {
-                "native archive broker parent authorization deadline is absent".to_owned()
-            })?;
-            self.input_broker = Some(NativeArchiveInputBroker::start(
-                &adapter_root.join(".authority/inputs"),
-                candidate_uid,
-                archiver,
-                authorization_deadline,
-            )?);
-            if let Some(llvm_ar) = &self.llvm_ar {
-                llvm_ar.revalidate()?;
-            }
-            Ok(())
+        if let Some(llvm_ar) = &self.llvm_ar {
+            llvm_ar.revalidate()?;
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (trusted_group, candidate_uid, authorization_deadline);
-            Err("the sealed native archive authority requires a macOS host".to_owned())
+        let mut rebound = self
+            .bound_toolchain
+            .as_deref()
+            .ok_or_else(|| "native archive adapter toolchain authority is absent".to_owned())?
+            .clone();
+        rebound.retain_sealed_adapter_authority(trusted_group)?;
+        self.bound_toolchain = Some(Arc::new(rebound));
+        let adapter_root = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| "native archive adapter directory is absent".to_owned())?
+            .path();
+        if self.input_broker.is_some() {
+            return Err("native archive input broker was started more than once".to_owned());
         }
+        let archiver = self
+            .llvm_ar
+            .as_ref()
+            .ok_or_else(|| "native archive broker archiver authority is absent".to_owned())?
+            .clone();
+        let authorization_deadline = authorization_deadline.ok_or_else(|| {
+            "native archive broker parent authorization deadline is absent".to_owned()
+        })?;
+        self.input_broker = Some(start_retained_native_archive_input_broker(
+            adapter_root,
+            candidate_uid,
+            archiver,
+            authorization_deadline,
+        )?);
+        if let Some(llvm_ar) = &self.llvm_ar {
+            llvm_ar.revalidate()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn apply(&self, mut command: CommandSpec) -> CommandSpec {
@@ -7376,6 +7493,7 @@ fn verify_native_archive_identity_policy() -> Result<(), String> {
             reaped: false,
             candidate_quiescence_complete: false,
         },
+        phase_timings: Vec::new(),
     };
     let truncated_error =
         require_complete_native_archiver_stdout("truncated-identity-verifier", &truncated)
@@ -7403,10 +7521,50 @@ fn verify_native_archive_identity_policy() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+fn start_retained_native_archive_input_broker(
+    adapter: &Path,
+    candidate_uid: u32,
+    archiver: BoundNativeArchiver,
+    authorization_deadline: Instant,
+) -> Result<NativeArchiveInputBroker, String> {
+    archiver.revalidate_until(authorization_deadline, authorization_deadline)?;
+    let mut broker = NativeArchiveInputBroker::start(
+        &adapter.join(".authority/inputs"),
+        candidate_uid,
+        archiver,
+        authorization_deadline,
+    )?;
+    let capability = NativeArchiveInputBrokerCapability::bind(adapter, authorization_deadline)
+        .and_then(|capability| {
+            capability.revalidate(authorization_deadline)?;
+            Ok(capability)
+        })
+        .map_err(|error| format!("cannot retain native archive broker capability: {error}"));
+    match capability {
+        Ok(_) if broker.authorization_count() == 0 => Ok(broker),
+        Ok(_) => {
+            let primary = "native archive broker was authorized before restricted execution";
+            match broker.close_until(authorization_deadline) {
+                Ok(()) => Err(primary.to_owned()),
+                Err(cleanup) => Err(format!("{primary}; broker cleanup also failed: {cleanup}")),
+            }
+        }
+        Err(primary) => match broker.close_until(authorization_deadline) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(format!("{primary}; broker cleanup also failed: {cleanup}")),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn verify_restricted_native_archiver_launch(
     adapter: &Path,
+    principal: &crate::release::platform::MacosRestrictedArchivePrincipal,
     transaction: &NativeArchiverTransaction,
 ) -> Result<(), String> {
+    if principal.name != "nobody" {
+        return Err("restricted staged archiver principal differs from policy".to_owned());
+    }
     transaction.require_execution("restricted archiver launch")?;
     let sudo = resolve_absolute_standard_executable(Path::new("/usr/bin/sudo"))?;
     sudo.revalidate()?;
@@ -7414,7 +7572,7 @@ fn verify_restricted_native_archiver_launch(
         CommandSpec::new(sudo.invocation_path(), Duration::from_secs(30)).arguments([
             OsString::from("-n"),
             OsString::from("-u"),
-            OsString::from("nobody"),
+            OsString::from(&principal.name),
             OsString::from("--"),
             adapter.join("ar").into_os_string(),
             OsString::from("--version"),
@@ -7429,6 +7587,44 @@ fn verify_restricted_native_archiver_launch(
         .map_err(|_| "restricted staged archiver identity is not UTF-8".to_owned())?;
     if !accepted_llvm_ar_version(version) {
         return Err("restricted staged archiver identity differs from policy".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_restricted_native_archive_search_retention(
+    adapter: &Path,
+    launcher: &Path,
+    principal: &crate::release::platform::MacosRestrictedArchivePrincipal,
+    transaction: &NativeArchiverTransaction,
+) -> Result<(), String> {
+    if principal.name != "nobody" {
+        return Err("restricted staging search principal differs from policy".to_owned());
+    }
+    transaction.require_execution("restricted staging search retention")?;
+    let sudo = resolve_absolute_standard_executable(Path::new("/usr/bin/sudo"))?;
+    sudo.revalidate()?;
+    let mut command =
+        CommandSpec::new(sudo.invocation_path(), Duration::from_secs(30)).arguments([
+            OsString::from("-n"),
+            OsString::from("-u"),
+            OsString::from(&principal.name),
+            OsString::from("--"),
+            launcher.into(),
+            OsString::from("__native-archiver-search-only-child"),
+            adapter.join(".authority/inputs").into_os_string(),
+        ]);
+    command.canonical_executable_identity = Some(sudo.canonical_identity().to_owned());
+    command.invocation_name = Some(OsString::from("sudo"));
+    let result = transaction
+        .run(command.current_directory(Path::new("/private/tmp")))
+        .map_err(|error| format!("cannot launch restricted staging search verifier: {error}"))?;
+    require_complete_native_archiver_stdout("restricted-staging-search-retention", &result)?;
+    if result.stdout != b"search-only-retained-read-denied\n" || !result.stderr.is_empty() {
+        return Err(command_result_failure(
+            "restricted-staging-search-retention",
+            &result,
+        ));
     }
     Ok(())
 }
@@ -7669,6 +7865,8 @@ pub(crate) fn verify_macos_native_archiver_acquisition_for_integration(
 struct NativeArchiverAcquisitionVerifierState {
     launcher_receipt: Option<BoundNativeCleanupFile>,
     directory: Option<AdapterDirectory>,
+    sealed_authorities: Vec<BoundNativeDirectory>,
+    input_broker: Option<NativeArchiveInputBroker>,
 }
 
 #[cfg(target_os = "macos")]
@@ -7698,8 +7896,10 @@ fn run_native_archiver_acquisition_verifier(
         evidence,
         envelope,
         &positive_directory,
+        launcher,
         &acquired,
         &staged,
+        state,
     )?;
     verify_staged_native_archive_operations(evidence, envelope, &positive_directory, &staged)?;
     run_native_archiver_verifier_phase(evidence, "validation-pass-receipt", || {
@@ -7708,7 +7908,7 @@ fn run_native_archiver_acquisition_verifier(
             != (NativeArchiverValidationPassCounts {
                 full_closure: 1,
                 load_graph: 1,
-                spawn_preflight: 4,
+                spawn_preflight: 5,
             })
         {
             return Err(format!(
@@ -7772,8 +7972,10 @@ fn verify_positive_native_archiver_closure(
     evidence: &mut NativeArchiverVerifierEvidence,
     envelope: &NativeArchiverVerifierEnvelope,
     directory: &Path,
+    launcher: &Path,
     acquired: &AcquiredNativeArchiverSource,
     staged: &BoundNativeArchiver,
+    state: &mut NativeArchiverAcquisitionVerifierState,
 ) -> Result<(), String> {
     let validation_transaction = envelope.transaction("positive graph validation")?;
     run_native_archiver_verifier_phase(evidence, "positive-graph-validation", || {
@@ -7814,10 +8016,111 @@ fn verify_positive_native_archiver_closure(
         }
         Ok(())
     })?;
+    let principal = prepare_restricted_native_archiver_verifier(
+        evidence, envelope, directory, launcher, staged, state,
+    )?;
     let restricted_transaction = envelope.transaction("restricted staged identity")?;
     run_native_archiver_verifier_phase(evidence, "restricted-staged-execution", || {
-        verify_restricted_native_archiver_launch(directory, &restricted_transaction)
+        verify_restricted_native_archiver_launch(directory, &principal, &restricted_transaction)
+    })?;
+    run_native_archiver_verifier_phase(evidence, "authorization-broker-receipt", || {
+        let authorizations = state
+            .input_broker
+            .as_ref()
+            .ok_or_else(|| "native archive verifier broker is absent after execution".to_owned())?
+            .authorization_count();
+        if authorizations != 1 {
+            return Err(format!(
+                "native archive verifier broker authorization count differs: {authorizations}"
+            ));
+        }
+        Ok(())
     })
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_restricted_native_archiver_verifier(
+    evidence: &mut NativeArchiverVerifierEvidence,
+    envelope: &NativeArchiverVerifierEnvelope,
+    directory: &Path,
+    launcher: &Path,
+    staged: &BoundNativeArchiver,
+    state: &mut NativeArchiverAcquisitionVerifierState,
+) -> Result<crate::release::platform::MacosRestrictedArchivePrincipal, String> {
+    let principal =
+        run_native_archiver_verifier_phase(evidence, "restricted-principal-resolution", || {
+            crate::release::platform::resolve_macos_restricted_archive_principal(
+                "nobody",
+                envelope.primary,
+            )
+        })?;
+    run_native_archiver_verifier_phase(evidence, "restricted-authority-transition", || {
+        let initial = bind_native_adapter_authorities(directory)?;
+        crate::release::platform::transition_macos_restricted_archive_adapter(
+            directory,
+            &principal,
+            envelope.primary,
+        )?;
+        if initial.iter().all(|receipt| {
+            receipt
+                .revalidate("pre-seal native archive adapter authority")
+                .is_ok()
+        }) {
+            return Err("pre-seal adapter receipts accepted the authority transition".to_owned());
+        }
+        state.sealed_authorities =
+            rebind_sealed_native_adapter_authorities(&initial, principal.primary_gid)?;
+        for receipt in &state.sealed_authorities {
+            receipt.revalidate_until(
+                "restricted native archive adapter authority",
+                envelope.primary,
+            )?;
+        }
+        let work = directory.join(".stack-work");
+        let temporary = work.join("tmp");
+        let inputs = directory.join(".authority/inputs");
+        require_native_acl_free_until(
+            [
+                directory,
+                work.as_path(),
+                temporary.as_path(),
+                inputs.as_path(),
+            ],
+            "restricted native archive adapter authority",
+            Some(envelope.primary),
+        )
+    })?;
+    let restricted_access_transaction = envelope.transaction("restricted loader preflight")?;
+    run_native_archiver_verifier_phase(evidence, "restricted-loader-preflight", || {
+        staged.revalidate_restricted_access_until(
+            directory,
+            principal.uid,
+            &principal.groups,
+            restricted_access_transaction,
+        )
+    })?;
+    let search_transaction = envelope.transaction("restricted staging search retention")?;
+    run_native_archiver_verifier_phase(evidence, "restricted-staging-search-authority", || {
+        verify_restricted_native_archive_search_retention(
+            directory,
+            launcher,
+            &principal,
+            &search_transaction,
+        )
+    })?;
+    run_native_archiver_verifier_phase(evidence, "authorization-broker-start", || {
+        if state.input_broker.is_some() {
+            return Err("native archive verifier broker was started more than once".to_owned());
+        }
+        state.input_broker = Some(start_retained_native_archive_input_broker(
+            directory,
+            principal.uid,
+            staged.clone(),
+            envelope.primary,
+        )?);
+        Ok(())
+    })?;
+    Ok(principal)
 }
 
 #[cfg(target_os = "macos")]
@@ -7905,9 +8208,37 @@ fn finish_native_archiver_acquisition_verifier(
     if let Err(error) = result {
         failures.push(error);
     }
-    let adapter_cleanup = state.directory.as_mut().map_or(Ok(()), |directory| {
-        directory.close_until(envelope.adapter_cleanup)
+    let broker_cleanup = state.input_broker.as_mut().map_or(Ok(()), |broker| {
+        broker.close_until(envelope.command_completion)
     });
+    let broker_closed = broker_cleanup.is_ok();
+    record_native_archiver_cleanup_result(
+        evidence,
+        &mut failures,
+        "cleanup-broker",
+        "authorization-broker",
+        "authorization-broker cleanup",
+        broker_cleanup,
+    );
+    let adapter_cleanup = if broker_closed {
+        state
+            .sealed_authorities
+            .iter()
+            .try_for_each(|authority| {
+                authority.revalidate_until(
+                    "sealed native archive adapter authority before cleanup",
+                    envelope.adapter_cleanup,
+                )
+            })
+            .and_then(|()| {
+                state.directory.as_mut().map_or(Ok(()), |directory| {
+                    directory.close_until(envelope.adapter_cleanup)
+                })
+            })
+    } else {
+        Err("adapter cleanup skipped while the authorization broker remains retained".to_owned())
+    };
+    let adapter_closed = adapter_cleanup.is_ok();
     record_native_archiver_cleanup_result(
         evidence,
         &mut failures,
@@ -7916,9 +8247,14 @@ fn finish_native_archiver_acquisition_verifier(
         "adapter-directory cleanup",
         adapter_cleanup,
     );
-    let launcher_cleanup = state.launcher_receipt.as_ref().map_or(Ok(()), |receipt| {
-        receipt.remove_until(envelope.root_cleanup)
-    });
+    let launcher_cleanup = if adapter_closed {
+        state.launcher_receipt.as_ref().map_or(Ok(()), |receipt| {
+            receipt.remove_until(envelope.root_cleanup)
+        })
+    } else {
+        Err("launcher cleanup skipped while the adapter remains retained".to_owned())
+    };
+    let launcher_removed = launcher_cleanup.is_ok();
     record_native_archiver_cleanup_result(
         evidence,
         &mut failures,
@@ -7927,7 +8263,11 @@ fn finish_native_archiver_acquisition_verifier(
         "confined-launcher cleanup",
         launcher_cleanup,
     );
-    let root_cleanup = verifier_root.close_until(envelope.root_cleanup);
+    let root_cleanup = if launcher_removed {
+        verifier_root.close_until(envelope.root_cleanup)
+    } else {
+        Err("verifier root cleanup skipped while a child authority remains retained".to_owned())
+    };
     record_native_archiver_cleanup_result(
         evidence,
         &mut failures,
@@ -8422,38 +8762,91 @@ fn create_native_archiver_dependency_fixture(path: &Path, bytes: &[u8]) -> Resul
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct NativeArchiverReceiptVerifierEnvelope {
+    construction: NativeArchiveAdapterConstructionEnvelope,
+}
+
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVER_RECEIPT_VERIFIER_PRIMARY_BUDGET: Duration = Duration::from_mins(5);
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVER_RECEIPT_VERIFIER_CLEANUP_RESERVE: Duration = Duration::from_mins(1);
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVER_RECEIPT_PHASE_EXECUTION_BUDGET: Duration = Duration::from_secs(45);
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVER_RECEIPT_PHASE_COMPLETION_BUDGET: Duration = Duration::from_mins(1);
+
+#[cfg(target_os = "macos")]
+impl NativeArchiverReceiptVerifierEnvelope {
+    fn new() -> Result<Self, String> {
+        let started = Instant::now();
+        let execution = started
+            .checked_add(NATIVE_ARCHIVER_RECEIPT_VERIFIER_PRIMARY_BUDGET)
+            .ok_or_else(|| {
+                "native archiver construction verifier deadline overflowed".to_owned()
+            })?;
+        let completion = execution
+            .checked_add(NATIVE_ARCHIVER_RECEIPT_VERIFIER_CLEANUP_RESERVE)
+            .ok_or_else(|| {
+                "native archiver construction verifier cleanup deadline overflowed".to_owned()
+            })?;
+        Ok(Self {
+            construction: NativeArchiveAdapterConstructionEnvelope {
+                execution,
+                completion,
+                archiver_execution: started
+                    .checked_add(NATIVE_ARCHIVER_RECEIPT_PHASE_EXECUTION_BUDGET)
+                    .ok_or_else(|| "native archiver receipt deadline overflowed".to_owned())?,
+                archiver_completion: started
+                    .checked_add(NATIVE_ARCHIVER_RECEIPT_PHASE_COMPLETION_BUDGET)
+                    .ok_or_else(|| {
+                        "native archiver receipt completion deadline overflowed".to_owned()
+                    })?,
+            },
+        })
+    }
+
+    fn transaction(&self, phase: &str) -> Result<NativeArchiverTransaction, String> {
+        let started = Instant::now();
+        let execution_deadline = started
+            .checked_add(NATIVE_ARCHIVER_RECEIPT_PHASE_EXECUTION_BUDGET)
+            .unwrap_or(self.construction.execution)
+            .min(self.construction.execution);
+        let completion_deadline = started
+            .checked_add(NATIVE_ARCHIVER_RECEIPT_PHASE_COMPLETION_BUDGET)
+            .unwrap_or(self.construction.completion)
+            .min(self.construction.completion);
+        if started >= execution_deadline || execution_deadline >= completion_deadline {
+            return Err(format!(
+                "native archiver receipt verifier envelope expired before {phase}"
+            ));
+        }
+        Ok(NativeArchiverTransaction {
+            execution_deadline,
+            completion_deadline,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn verify_macos_native_archiver_receipt_for_integration() -> Result<(), String> {
     let mut source_directory = create_adapter_directory(Path::new("/private/tmp"))?;
     let mut directory = create_adapter_directory(Path::new("/private/tmp"))?;
     let source_root = source_directory.path().to_owned();
     let root = directory.path().to_owned();
-    let started = Instant::now();
-    let construction_envelope = NativeArchiveAdapterConstructionEnvelope {
-        execution: started.checked_add(Duration::from_mins(1)).ok_or_else(|| {
-            "native archiver construction verifier deadline overflowed".to_owned()
-        })?,
-        completion: started.checked_add(Duration::from_mins(3)).ok_or_else(|| {
-            "native archiver construction verifier cleanup deadline overflowed".to_owned()
-        })?,
-        archiver_execution: started
-            .checked_add(Duration::from_secs(45))
-            .ok_or_else(|| "native archiver receipt deadline overflowed".to_owned())?,
-        archiver_completion: started
-            .checked_add(Duration::from_mins(1))
-            .ok_or_else(|| "native archiver receipt completion deadline overflowed".to_owned())?,
-    };
-    let transaction = NativeArchiverTransaction {
-        execution_deadline: started
-            .checked_add(Duration::from_secs(45))
-            .ok_or_else(|| "native archiver receipt deadline overflowed".to_owned())?,
-        completion_deadline: started
-            .checked_add(Duration::from_mins(1))
-            .ok_or_else(|| "native archiver receipt completion deadline overflowed".to_owned())?,
-    };
+    let envelope = NativeArchiverReceiptVerifierEnvelope::new()?;
     let mut brokers = Vec::<NativeArchiveInputBroker>::new();
     let result = (|| {
-        let staged = stage_native_archiver_receipt_fixture(&source_root, &root, transaction)?;
-        verify_native_archiver_receipt_deadlines(&staged, transaction, construction_envelope)?;
+        let staged = stage_native_archiver_receipt_fixture(
+            &source_root,
+            &root,
+            envelope.transaction("fixture staging")?,
+        )?;
+        verify_native_archiver_receipt_deadlines(
+            &staged,
+            envelope.transaction("sealed receipt revalidation")?,
+            envelope.construction,
+        )?;
         let staging_root = root.join(".authority/inputs");
         let work = root.join(".stack-work");
         verify_native_archiver_broker_authorizations(
@@ -8461,8 +8854,7 @@ pub(crate) fn verify_macos_native_archiver_receipt_for_integration() -> Result<(
             &staging_root,
             &work,
             &staged,
-            transaction,
-            construction_envelope,
+            envelope,
             &mut brokers,
         )?;
 
@@ -8471,44 +8863,51 @@ pub(crate) fn verify_macos_native_archiver_receipt_for_integration() -> Result<(
             &staging_root,
             &work,
             &staged,
-            construction_envelope,
+            envelope.transaction("mid-authorization expiry")?,
             &mut brokers,
         )?;
 
         verify_native_archiver_drip_expiry(
             &staging_root,
             &staged,
-            construction_envelope,
+            envelope.transaction("authorization drip expiry")?,
             &mut brokers,
         )?;
 
         verify_native_archiver_magic_expiry(
             &staging_root,
             &staged,
-            construction_envelope,
+            envelope.transaction("broker magic expiry")?,
             &mut brokers,
         )?;
 
         verify_native_archiver_input_expiry(
             &staging_root,
             &staged,
-            construction_envelope,
+            envelope.transaction("input path expiry")?,
             &mut brokers,
         )?;
 
-        verify_expired_and_mutated_native_archiver_receipt(&staged, transaction)?;
-        verify_native_archiver_finalizer_contract(&staging_root, &mut brokers)?;
+        verify_expired_and_mutated_native_archiver_receipt(
+            &staged,
+            envelope.transaction("expired and mutated receipt negatives")?,
+        )?;
+        verify_native_archiver_finalizer_contract(
+            &staging_root,
+            envelope.transaction("finalizer contract")?,
+            &mut brokers,
+        )?;
         Ok(())
     })();
     let broker_cleanup = cleanup_native_archiver_verifier_brokers(
         &root,
         &mut brokers,
-        construction_envelope.completion,
+        envelope.construction.completion,
     );
     let cleanup = cleanup_native_archiver_verifier_directories(
         &mut directory,
         &mut source_directory,
-        construction_envelope.completion,
+        envelope.construction.completion,
     );
     compose_native_archiver_verifier_completion(result, broker_cleanup, cleanup)
 }
@@ -8549,8 +8948,10 @@ fn verify_expired_and_mutated_native_archiver_receipt(
 #[cfg(target_os = "macos")]
 fn verify_native_archiver_finalizer_contract(
     staging_root: &Path,
+    transaction: NativeArchiverTransaction,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
+    transaction.require_execution("native archiver finalizer contract")?;
     brokers.push(NativeArchiveInputBroker::start_for_integration(
         staging_root,
         nix::unistd::geteuid().as_raw(),
@@ -8647,7 +9048,7 @@ fn verify_mid_authorization_expiry(
     staging_root: &Path,
     work: &Path,
     staged: &BoundNativeArchiver,
-    envelope: NativeArchiveAdapterConstructionEnvelope,
+    transaction: NativeArchiverTransaction,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
     let before = staged.validation_passes.counts();
@@ -8656,18 +9057,19 @@ fn verify_mid_authorization_expiry(
             staging_root,
             nix::unistd::geteuid().as_raw(),
             staged.clone(),
-            envelope.completion,
+            transaction.completion_deadline,
         )?,
     );
     let broker = brokers
         .last_mut()
         .ok_or_else(|| "expiring archiver verifier broker owner is absent".to_owned())?;
-    let capability = NativeArchiveInputBrokerCapability::bind(root, envelope.completion)
-        .map_err(|error| format!("cannot bind expiring archiver verifier: {error}"))?;
+    let capability =
+        NativeArchiveInputBrokerCapability::bind(root, transaction.completion_deadline)
+            .map_err(|error| format!("cannot bind expiring archiver verifier: {error}"))?;
     let Err(error) = capability.authorize_archiver(
         &[OsString::from("__native-archiver-receipt-child")],
         work,
-        envelope.completion,
+        transaction.execution_deadline,
     ) else {
         return Err(
             "an authorization expiring after request receipt unexpectedly succeeded".to_owned(),
@@ -8683,14 +9085,14 @@ fn verify_mid_authorization_expiry(
             "mid-authorization expiry performed late authority work: {error}"
         ));
     }
-    broker.close_until(envelope.completion)
+    broker.close_until(transaction.completion_deadline)
 }
 
 #[cfg(target_os = "macos")]
 fn verify_native_archiver_drip_expiry(
     staging_root: &Path,
     staged: &BoundNativeArchiver,
-    envelope: NativeArchiveAdapterConstructionEnvelope,
+    transaction: NativeArchiverTransaction,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
     let before = staged.validation_passes.counts();
@@ -8699,7 +9101,7 @@ fn verify_native_archiver_drip_expiry(
             staging_root,
             nix::unistd::geteuid().as_raw(),
             staged.clone(),
-            envelope.completion,
+            transaction.completion_deadline,
         )?,
     );
     let broker = brokers
@@ -8707,7 +9109,7 @@ fn verify_native_archiver_drip_expiry(
         .ok_or_else(|| "drip-expiry broker owner is absent".to_owned())?;
     let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
         .map_err(|error| format!("cannot connect drip-expiry verifier: {error}"))?;
-    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    configure_native_archive_broker_stream(&stream, transaction.completion_deadline)?;
     stream
         .write_all(NATIVE_ARCHIVE_AUTH_BROKER_MAGIC)
         .map_err(|error| format!("cannot write drip-expiry verifier magic: {error}"))?;
@@ -8715,7 +9117,7 @@ fn verify_native_archiver_drip_expiry(
     read_native_archive_broker_exact_until(
         &mut stream,
         &mut readiness,
-        envelope.completion,
+        transaction.completion_deadline,
         "drip-expiry readiness",
         false,
     )?;
@@ -8723,8 +9125,8 @@ fn verify_native_archiver_drip_expiry(
         return Err("drip-expiry broker readiness differs".to_owned());
     }
     let remaining_millis = u64::try_from(
-        envelope
-            .completion
+        transaction
+            .execution_deadline
             .saturating_duration_since(Instant::now())
             .min(NATIVE_ARCHIVE_AUTHORIZATION_BUDGET)
             .as_millis(),
@@ -8742,7 +9144,7 @@ fn verify_native_archiver_drip_expiry(
     let error = read_native_archive_broker_exact_until(
         &mut stream,
         &mut state,
-        envelope.completion,
+        transaction.completion_deadline,
         "drip-expiry authorization state",
         false,
     )
@@ -8755,14 +9157,14 @@ fn verify_native_archiver_drip_expiry(
             "drip-fed authorization expiry performed late authority work: {error}"
         ));
     }
-    broker.close_until(envelope.completion)
+    broker.close_until(transaction.completion_deadline)
 }
 
 #[cfg(target_os = "macos")]
 fn verify_native_archiver_magic_expiry(
     staging_root: &Path,
     staged: &BoundNativeArchiver,
-    envelope: NativeArchiveAdapterConstructionEnvelope,
+    transaction: NativeArchiverTransaction,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
     let before = staged.validation_passes.counts();
@@ -8771,7 +9173,7 @@ fn verify_native_archiver_magic_expiry(
             staging_root,
             nix::unistd::geteuid().as_raw(),
             staged.clone(),
-            envelope.completion,
+            transaction.completion_deadline,
         )?,
     );
     let broker = brokers
@@ -8779,7 +9181,7 @@ fn verify_native_archiver_magic_expiry(
         .ok_or_else(|| "magic-expiry broker owner is absent".to_owned())?;
     let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
         .map_err(|error| format!("cannot connect magic-expiry verifier: {error}"))?;
-    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    configure_native_archive_broker_stream(&stream, transaction.completion_deadline)?;
     stream
         .write_all(&NATIVE_ARCHIVE_AUTH_BROKER_MAGIC[..1])
         .map_err(|error| format!("cannot write magic-expiry prefix: {error}"))?;
@@ -8787,7 +9189,7 @@ fn verify_native_archiver_magic_expiry(
     let error = read_native_archive_broker_exact_until(
         &mut stream,
         &mut readiness,
-        envelope.completion,
+        transaction.completion_deadline,
         "magic-expiry readiness",
         false,
     )
@@ -8800,14 +9202,14 @@ fn verify_native_archiver_magic_expiry(
             "drip-fed broker magic expiry performed late authority work: {error}"
         ));
     }
-    broker.close_until(envelope.completion)
+    broker.close_until(transaction.completion_deadline)
 }
 
 #[cfg(target_os = "macos")]
 fn verify_native_archiver_input_expiry(
     staging_root: &Path,
     staged: &BoundNativeArchiver,
-    envelope: NativeArchiveAdapterConstructionEnvelope,
+    transaction: NativeArchiverTransaction,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
     let before = staged.validation_passes.counts();
@@ -8822,7 +9224,7 @@ fn verify_native_archiver_input_expiry(
         .ok_or_else(|| "input-expiry broker owner is absent".to_owned())?;
     let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
         .map_err(|error| format!("cannot connect input-expiry verifier: {error}"))?;
-    configure_native_archive_broker_stream(&stream, envelope.completion)?;
+    configure_native_archive_broker_stream(&stream, transaction.completion_deadline)?;
     stream
         .write_all(NATIVE_ARCHIVE_INPUT_BROKER_MAGIC)
         .map_err(|error| format!("cannot write input-expiry magic: {error}"))?;
@@ -8835,7 +9237,7 @@ fn verify_native_archiver_input_expiry(
     let error = read_native_archive_broker_exact_until(
         &mut stream,
         &mut state,
-        envelope.completion,
+        transaction.completion_deadline,
         "input-expiry response state",
         false,
     )
@@ -8850,7 +9252,7 @@ fn verify_native_archiver_input_expiry(
             "drip-fed input expiry performed late copy or authority work: {error}"
         ));
     }
-    broker.close_until(envelope.completion)?;
+    broker.close_until(transaction.completion_deadline)?;
     if fs::read_dir(staging_root)
         .map_err(|error| format!("cannot inspect input-expiry cleanup: {error}"))?
         .next()
@@ -8895,7 +9297,10 @@ fn verify_native_archiver_receipt_deadlines(
             "native toolchain sub-budget differs from its construction envelope".to_owned(),
         );
     }
-    staged.revalidate_until(envelope.execution, envelope.completion)?;
+    staged.revalidate_until(
+        transaction.execution_deadline,
+        transaction.completion_deadline,
+    )?;
     if staged.validation_passes.counts()
         != (NativeArchiverValidationPassCounts {
             full_closure: 1,
@@ -8914,8 +9319,7 @@ fn verify_native_archiver_broker_authorizations(
     staging_root: &Path,
     work: &Path,
     staged: &BoundNativeArchiver,
-    transaction: NativeArchiverTransaction,
-    envelope: NativeArchiveAdapterConstructionEnvelope,
+    envelope: NativeArchiverReceiptVerifierEnvelope,
     brokers: &mut Vec<NativeArchiveInputBroker>,
 ) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8924,7 +9328,7 @@ fn verify_native_archiver_broker_authorizations(
         staging_root,
         nix::unistd::geteuid().as_raw(),
         staged.clone(),
-        envelope.execution,
+        envelope.construction.execution,
     )?);
     let broker = brokers
         .last_mut()
@@ -8939,12 +9343,14 @@ fn verify_native_archiver_broker_authorizations(
         .and_then(|()| fs::set_permissions(&authority_root, fs::Permissions::from_mode(0o555)))
         .and_then(|()| fs::set_permissions(staging_root, fs::Permissions::from_mode(0o2710)))
         .map_err(|error| format!("cannot seal brokered archiver verifier: {error}"))?;
-    let capability = NativeArchiveInputBrokerCapability::bind(root, envelope.execution)
-        .map_err(|error| format!("cannot bind brokered archiver verifier: {error}"))?;
+    let capability =
+        NativeArchiveInputBrokerCapability::bind(root, envelope.construction.execution)
+            .map_err(|error| format!("cannot bind brokered archiver verifier: {error}"))?;
     for expected_authorizations in 1..=3 {
+        let transaction = envelope.transaction("broker-authorized execution")?;
         let arguments = vec![OsString::from("__native-archiver-receipt-child")];
         let authorized = capability
-            .authorize_archiver(&arguments, work, envelope.execution)
+            .authorize_archiver(&arguments, work, transaction.execution_deadline)
             .map_err(|error| format!("cannot authorize brokered archiver verifier: {error}"))?;
         let result = transaction
             .run(authorized.command(arguments, work))
@@ -8977,7 +9383,7 @@ fn verify_native_archiver_broker_authorizations(
     {
         return Err("expired brokered archiver request reached authority binding".to_owned());
     }
-    broker.close_until(envelope.completion)
+    broker.close_until(envelope.construction.completion)
 }
 
 #[cfg(target_os = "macos")]
@@ -9212,6 +9618,179 @@ struct ReleaseCandidateEnvironment {
 
 thread_local! {
     static RELEASE_CANDIDATE_ENVIRONMENT: RefCell<Option<ReleaseCandidateEnvironment>> = const { RefCell::new(None) };
+    static AMBIENT_CANDIDATE_OUTPUT: Cell<AmbientCandidateOutput> = const { Cell::new(AmbientCandidateOutput::Relay) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbientCandidateOutput {
+    Relay,
+    Captured,
+}
+
+/// Captures every ambient-candidate command result produced by one synchronous
+/// orchestration without relaying its streams into the orchestration protocol.
+///
+/// Each command still returns its complete bounded `CommandResult`, including
+/// status, stream digests, truncation state, and cleanup receipts. Trusted-host
+/// authority is not installed by this scope.
+pub(crate) fn with_ambient_candidate_commands_captured<T>(operation: impl FnOnce() -> T) -> T {
+    AMBIENT_CANDIDATE_OUTPUT.with(|slot| {
+        struct Restore<'a> {
+            slot: &'a Cell<AmbientCandidateOutput>,
+            previous: AmbientCandidateOutput,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+        let previous = slot.replace(AmbientCandidateOutput::Captured);
+        let _restore = Restore { slot, previous };
+        operation()
+    })
+}
+
+const CAPTURED_COMMAND_TERMINAL_PHASES: [&str; 4] = [
+    "quiescence-complete",
+    "stdout-joined",
+    "stderr-joined",
+    "stdin-joined",
+];
+
+pub(crate) fn require_captured_command_terminal_receipt(
+    result: &CommandResult,
+    candidate_quiescence_complete: bool,
+    label: &str,
+) -> Result<(), String> {
+    let terminal_start = result
+        .phase_timings
+        .len()
+        .checked_sub(CAPTURED_COMMAND_TERMINAL_PHASES.len())
+        .ok_or_else(|| format!("{label} lacks the complete terminal phase receipt"))?;
+    let terminal = &result.phase_timings[terminal_start..];
+    if terminal
+        .iter()
+        .map(|phase| phase.name)
+        .ne(CAPTURED_COMMAND_TERMINAL_PHASES)
+        || result
+            .phase_timings
+            .windows(2)
+            .any(|phases| phases[0].elapsed > phases[1].elapsed)
+        || result.termination.cleanup_id.is_none()
+        || !result.termination.reaped
+        || result.termination.candidate_quiescence_complete != candidate_quiescence_complete
+    {
+        return Err(format!(
+            "{label} terminal receipt differs: phases={},cleanupId={:?},reaped={},candidateQuiescenceComplete={}",
+            result
+                .phase_timings
+                .iter()
+                .map(|phase| format!("{}:{}ms", phase.name, phase.elapsed.as_millis()))
+                .collect::<Vec<_>>()
+                .join(","),
+            result.termination.cleanup_id,
+            result.termination.reaped,
+            result.termination.candidate_quiescence_complete,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct AmbientCandidateCaptureReceipt {
+    cleanup_id: u64,
+    reaped: bool,
+    candidate_quiescence_complete: bool,
+    terminal_phases: Vec<&'static str>,
+    stdout_bytes: u64,
+    stdout_sha256: Digest,
+    stderr_bytes: u64,
+    stderr_sha256: Digest,
+}
+
+impl AmbientCandidateCaptureReceipt {
+    pub(crate) fn encoded(&self) -> String {
+        let terminal_phases = self
+            .terminal_phases
+            .iter()
+            .map(|phase| format!("\"{phase}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"candidateQuiescenceComplete\":{},\"cleanupId\":{},\"phaseTimings\":[{}],\"reaped\":{},\"schemaVersion\":1,\"state\":\"verified\",\"stderrBytes\":{},\"stderrSha256\":\"{}\",\"stdoutBytes\":{},\"stdoutSha256\":\"{}\"}}",
+            self.candidate_quiescence_complete,
+            self.cleanup_id,
+            terminal_phases,
+            self.reaped,
+            self.stderr_bytes,
+            self.stderr_sha256.hex(),
+            self.stdout_bytes,
+            self.stdout_sha256.hex(),
+        )
+    }
+}
+
+pub(crate) fn verify_ambient_candidate_command_capture_for_integration()
+-> Result<AmbientCandidateCaptureReceipt, String> {
+    const STDOUT: &[u8] = b"ambient-candidate-captured-stdout\n";
+    const STDERR: &[u8] = b"ambient-candidate-captured-stderr\n";
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve ambient-candidate capture verifier: {error}"))?;
+    let execution_deadline = Instant::now()
+        .checked_add(Duration::from_secs(15))
+        .ok_or_else(|| "ambient-candidate capture execution deadline overflowed".to_owned())?;
+    let completion_deadline = execution_deadline
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "ambient-candidate capture completion deadline overflowed".to_owned())?;
+    let result = with_ambient_candidate_commands_captured(|| {
+        CommandSpec::new(executable.as_os_str(), Duration::from_secs(15))
+            .argument("__ambient-candidate-capture-fixture")
+            .run_ambient_candidate_captured_until(execution_deadline, completion_deadline)
+    })
+    .map_err(|error| format!("cannot execute ambient-candidate capture fixture: {error}"))?;
+    if result.timed_out
+        || !result.status.success()
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || result.stdout != STDOUT
+        || result.stderr != STDERR
+        || result.stdout_bytes != u64::try_from(STDOUT.len()).unwrap_or(u64::MAX)
+        || result.stderr_bytes != u64::try_from(STDERR.len()).unwrap_or(u64::MAX)
+        || result.stdout_sha256 != sha256_bytes(STDOUT)
+        || result.stderr_sha256 != sha256_bytes(STDERR)
+    {
+        return Err(format!(
+            "ambient-candidate captured result differs: status={:?},timedOut={},stdoutBytes={},stdoutSha256={},stderrBytes={},stderrSha256={},stdoutTruncated={},stderrTruncated={},cleanupId={:?},reaped={},quiescence={}",
+            result.status.code(),
+            result.timed_out,
+            result.stdout_bytes,
+            result.stdout_sha256.hex(),
+            result.stderr_bytes,
+            result.stderr_sha256.hex(),
+            result.stdout_truncated,
+            result.stderr_truncated,
+            result.termination.cleanup_id,
+            result.termination.reaped,
+            result.termination.candidate_quiescence_complete,
+        ));
+    }
+    require_captured_command_terminal_receipt(&result, false, "ambient-candidate captured result")?;
+    Ok(AmbientCandidateCaptureReceipt {
+        cleanup_id: result
+            .termination
+            .cleanup_id
+            .ok_or_else(|| "ambient-candidate capture cleanup receipt is absent".to_owned())?,
+        reaped: result.termination.reaped,
+        candidate_quiescence_complete: result.termination.candidate_quiescence_complete,
+        terminal_phases: result.phase_timings[result.phase_timings.len() - 4..]
+            .iter()
+            .map(|phase| phase.name)
+            .collect(),
+        stdout_bytes: result.stdout_bytes,
+        stdout_sha256: result.stdout_sha256,
+        stderr_bytes: result.stderr_bytes,
+        stderr_sha256: result.stderr_sha256,
+    })
 }
 
 pub(crate) fn with_release_candidate_environment<T>(
@@ -9264,6 +9843,7 @@ pub struct CommandResult {
     pub stdout_sha256: Digest,
     pub stderr_sha256: Digest,
     pub termination: CommandTerminationResult,
+    pub phase_timings: Vec<hell_testkit::SupervisedPhaseTiming>,
     #[cfg(windows)]
     pub windows_launch_control: Option<hell_testkit::WindowsLaunchControlReceipt>,
 }
@@ -9527,6 +10107,13 @@ impl CommandSpec {
         self
     }
 
+    #[cfg(windows)]
+    pub(crate) fn cleared_environment(mut self) -> Self {
+        self.environment.clear();
+        self.clear_environment = true;
+        self
+    }
+
     pub fn environment(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         let name = name.into();
         assert!(
@@ -9588,7 +10175,52 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<CommandResult, CommandRunError> {
-        self.run_inner(None, None)
+        self.run_inner(None, None, CommandLaunchAuthority::AmbientCandidate)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn run_ambient_candidate_captured(&self) -> Result<CommandResult, CommandRunError> {
+        let started = Instant::now();
+        self.validate_run_authority(None)?;
+        let mut command = self.construct_command()?;
+        self.execute_command(
+            &mut command,
+            None,
+            None,
+            CommandLaunchAuthority::AmbientCandidate,
+            started,
+        )
+    }
+
+    pub(crate) fn run_ambient_candidate_captured_until(
+        &self,
+        execution_deadline: Instant,
+        completion_deadline: Instant,
+    ) -> Result<CommandResult, CommandRunError> {
+        let started = Instant::now();
+        let deadlines = Some((execution_deadline, completion_deadline));
+        self.validate_run_authority(deadlines)?;
+        let mut command = self.construct_command()?;
+        self.execute_command(
+            &mut command,
+            deadlines,
+            None,
+            CommandLaunchAuthority::AmbientCandidate,
+            started,
+        )
+    }
+
+    pub(crate) fn run_trusted_host_captured(&self) -> Result<CommandResult, CommandRunError> {
+        let started = Instant::now();
+        self.validate_run_authority(None)?;
+        let mut command = self.construct_command()?;
+        self.execute_command(
+            &mut command,
+            None,
+            None,
+            CommandLaunchAuthority::TrustedHost,
+            started,
+        )
     }
 
     pub(crate) fn run_until(
@@ -9600,6 +10232,7 @@ impl CommandSpec {
         self.run_inner(
             Some((execution_deadline, completion_deadline)),
             Some(progress),
+            CommandLaunchAuthority::AmbientCandidate,
         )
     }
 
@@ -9607,13 +10240,18 @@ impl CommandSpec {
         &self,
         deadlines: Option<(Instant, Instant)>,
         progress: Option<SupervisedProgressObserver>,
+        launch_authority: CommandLaunchAuthority,
     ) -> Result<CommandResult, CommandRunError> {
         let started = Instant::now();
-        let live_relay = progress.is_some();
+        let output_already_presented = progress.is_some()
+            || (launch_authority == CommandLaunchAuthority::AmbientCandidate
+                && AMBIENT_CANDIDATE_OUTPUT
+                    .with(|slot| slot.get() == AmbientCandidateOutput::Captured));
         self.validate_run_authority(deadlines)?;
         let mut command = self.construct_command()?;
-        let result = self.execute_command(&mut command, deadlines, progress, started)?;
-        relay_command_output(result, live_relay)
+        let result =
+            self.execute_command(&mut command, deadlines, progress, launch_authority, started)?;
+        relay_command_output(result, output_already_presented)
     }
 
     fn validate_run_authority(
@@ -9720,9 +10358,24 @@ impl CommandSpec {
         command: &mut Command,
         deadlines: Option<(Instant, Instant)>,
         progress: Option<SupervisedProgressObserver>,
+        launch_authority: CommandLaunchAuthority,
         started: Instant,
     ) -> Result<CommandResult, CommandRunError> {
-        let output = if let Some(expected) = &self.canonical_executable_identity {
+        let output = if launch_authority == CommandLaunchAuthority::TrustedHost {
+            if deadlines.is_some()
+                || progress.is_some()
+                || self.canonical_executable_identity.is_some()
+            {
+                return Err(CommandRunError::new(
+                    CommandRunPhase::SupervisedExecution,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "trusted-host command requires the bounded unobserved execution path",
+                    ),
+                ));
+            }
+            run_supervised_host_command(command, &[], self.timeout)
+        } else if let Some(expected) = &self.canonical_executable_identity {
             let identity =
                 BoundProgramInvocation::new(PathBuf::from(&self.program), expected.clone())
                     .map_err(|error| {
@@ -9772,6 +10425,7 @@ impl CommandSpec {
                 reaped: output.termination.is_some_and(|report| report.reaped),
                 candidate_quiescence_complete: output.candidate_quiescence_complete,
             },
+            phase_timings: output.phase_timings,
             #[cfg(windows)]
             windows_launch_control: output.windows_launch_control,
         };
@@ -9781,16 +10435,16 @@ impl CommandSpec {
 
 fn relay_command_output(
     result: CommandResult,
-    live_relay: bool,
+    output_already_presented: bool,
 ) -> Result<CommandResult, CommandRunError> {
-    if !live_relay && let Err(error) = std::io::stdout().write_all(&result.stdout) {
+    if !output_already_presented && let Err(error) = std::io::stdout().write_all(&result.stdout) {
         return Err(CommandRunError::after_completion(
             CommandRunPhase::StdoutRelay,
             error,
             result,
         ));
     }
-    if !live_relay && let Err(error) = std::io::stderr().write_all(&result.stderr) {
+    if !output_already_presented && let Err(error) = std::io::stderr().write_all(&result.stderr) {
         return Err(CommandRunError::after_completion(
             CommandRunPhase::StderrRelay,
             error,
@@ -10986,6 +11640,137 @@ fn revalidate_resolved_cargo(invocation: &Path, expected: &Path) -> std::io::Res
 }
 
 #[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CargoMulticallFixtureDirectory {
+    requested: PathBuf,
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl CargoMulticallFixtureDirectory {
+    fn create(path: &Path, label: &str) -> Result<Self, String> {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(path)
+            .map_err(|error| format!("cannot create {label}: {error}"))?;
+        let result = fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot establish private {label} mode: {error}"))
+            .and_then(|()| Self::bind(path, label));
+        if result.is_err() {
+            let _ = fs::remove_dir(path);
+        }
+        result
+    }
+
+    fn bind(path: &Path, label: &str) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let before = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {label}: {error}"))?;
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| format!("cannot canonicalize {label}: {error}"))?;
+        let canonical_metadata = fs::symlink_metadata(&canonical)
+            .map_err(|error| format!("cannot inspect canonical {label}: {error}"))?;
+        let after = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot revalidate {label}: {error}"))?;
+        if before.file_type().is_symlink()
+            || !before.is_dir()
+            || !canonical_metadata.is_dir()
+            || before.uid() != nix::unistd::geteuid().as_raw()
+            || before.mode() & 0o7777 != 0o700
+            || before.dev() != canonical_metadata.dev()
+            || before.ino() != canonical_metadata.ino()
+            || before.uid() != canonical_metadata.uid()
+            || before.gid() != canonical_metadata.gid()
+            || before.mode() != canonical_metadata.mode()
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.uid() != after.uid()
+            || before.gid() != after.gid()
+            || before.mode() != after.mode()
+        {
+            return Err(format!(
+                "{label} is not one stable private fixture-owned directory"
+            ));
+        }
+        Ok(Self {
+            requested: path.to_path_buf(),
+            canonical,
+            device: before.dev(),
+            inode: before.ino(),
+            owner: before.uid(),
+            group: before.gid(),
+            mode: before.mode(),
+        })
+    }
+
+    fn revalidate(&self, label: &str) -> Result<(), String> {
+        let observed = Self::bind(&self.requested, label)?;
+        if observed != *self {
+            return Err(format!(
+                "{label} identity or mode changed during verification"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct CargoMulticallFixtureDirectories {
+    root: CargoMulticallFixtureDirectory,
+    cargo: CargoMulticallFixtureDirectory,
+    standard: CargoMulticallFixtureDirectory,
+}
+
+#[cfg(unix)]
+impl CargoMulticallFixtureDirectories {
+    fn create(root: &Path) -> Result<Self, String> {
+        let root_identity =
+            CargoMulticallFixtureDirectory::create(root, "Cargo multicall verifier root")?;
+        let result = (|| {
+            let cargo = CargoMulticallFixtureDirectory::create(
+                &root.join("cargo-bin"),
+                "Cargo multicall directory",
+            )?;
+            let standard = CargoMulticallFixtureDirectory::create(
+                &root.join("standard-bin"),
+                "standard multicall directory",
+            )?;
+            if cargo.canonical.parent() != Some(root_identity.canonical.as_path())
+                || standard.canonical.parent() != Some(root_identity.canonical.as_path())
+            {
+                return Err(
+                    "Cargo multicall fixture directories escaped their private root".to_owned(),
+                );
+            }
+            Ok(Self {
+                root: root_identity,
+                cargo,
+                standard,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(root);
+        }
+        result
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        self.root.revalidate("Cargo multicall verifier root")?;
+        self.cargo.revalidate("Cargo multicall directory")?;
+        self.standard.revalidate("standard multicall directory")
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn verify_cargo_multicall_argv_for_integration() -> Result<(), String> {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
@@ -10997,16 +11782,10 @@ pub(crate) fn verify_cargo_multicall_argv_for_integration() -> Result<(), String
     if root.exists() {
         return Err("Cargo multicall verifier root already exists".to_owned());
     }
-    fs::create_dir(&root)
-        .map_err(|error| format!("cannot create Cargo multicall verifier root: {error}"))?;
+    let fixture = CargoMulticallFixtureDirectories::create(&root)?;
     let result = (|| {
         let cargo_root = root.join("cargo-bin");
         let standard_root = root.join("standard-bin");
-        fs::create_dir(&cargo_root)
-            .map_err(|error| format!("cannot create Cargo multicall directory: {error}"))?;
-        fs::create_dir(&standard_root)
-            .map_err(|error| format!("cannot create standard multicall directory: {error}"))?;
-
         let target = fs::canonicalize(std::env::current_exe().map_err(|error| {
             format!("cannot identify Cargo multicall verifier executable: {error}")
         })?)
@@ -11020,6 +11799,7 @@ pub(crate) fn verify_cargo_multicall_argv_for_integration() -> Result<(), String
             .map_err(|error| format!("cannot create Rustup multicall alias: {error}"))?;
         symlink(&target, &rustc)
             .map_err(|error| format!("cannot create Rustc multicall alias: {error}"))?;
+        fixture.revalidate()?;
         let child_arguments = ["__verify-cargo-multicall-argv-child"];
 
         let direct = CommandSpec::new(&target, Duration::from_secs(5))
@@ -11064,6 +11844,7 @@ pub(crate) fn verify_cargo_multicall_argv_for_integration() -> Result<(), String
             .map_err(|error| format!("cannot remove substituted Cargo alias: {error}"))?;
         symlink(&target, &alias)
             .map_err(|error| format!("cannot restore Cargo multicall alias: {error}"))?;
+        fixture.revalidate()?;
         identity.revalidate()?;
 
         let mut forged_invocation_name = resolved.clone();
@@ -11089,6 +11870,7 @@ pub(crate) fn verify_cargo_multicall_argv_for_integration() -> Result<(), String
         {
             return Err("bound Cargo multicall alias did not preserve exact argv[0]".to_owned());
         }
+        fixture.revalidate()?;
         Ok(())
     })();
     let cleanup = fs::remove_dir_all(&root)
@@ -11442,7 +12224,7 @@ const NATIVE_ARCHIVE_RESPONSE_BYTE_LIMIT: u64 = 1024 * 1024;
 #[cfg(unix)]
 const NATIVE_ARCHIVE_MEMBER_LIMIT: usize = 100_000;
 #[cfg(target_os = "macos")]
-const NATIVE_ARCHIVE_INPUT_BROKER_MAGIC: &[u8; 24] = b"hell-archive-input-v1\0\0\0";
+const NATIVE_ARCHIVE_INPUT_BROKER_MAGIC: &[u8; 24] = b"hell-archive-input-v2\0\0\0";
 #[cfg(target_os = "macos")]
 const NATIVE_ARCHIVE_AUTH_BROKER_MAGIC: &[u8; 24] = b"hell-archive-auth-v1\0\0\0\0";
 #[cfg(target_os = "macos")]
@@ -11451,6 +12233,15 @@ const NATIVE_ARCHIVE_AUTH_BROKER_READY: u8 = 0xa5;
 pub(crate) const NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER: &[u8; 32] =
     b"hell-fake-broker-connectable-v1\n";
 #[cfg(target_os = "macos")]
+pub(crate) const NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_REQUEST_ROOT_LIMIT: usize = 4;
+#[cfg(target_os = "macos")]
+pub(crate) const NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_STAGED_BYTE_LIMIT: usize = 64;
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_V1: &str =
+    "native-archive-broker-descendant-receipt-v1";
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_BYTE_LIMIT: usize = 256;
+#[cfg(target_os = "macos")]
 const NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 const NATIVE_ARCHIVE_INPUT_STAGE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
@@ -11458,6 +12249,152 @@ const NATIVE_ARCHIVE_INPUT_STAGE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 const NATIVE_ARCHIVE_INPUT_REQUEST_ROOT_LIMIT: usize = NATIVE_ARCHIVE_MEMBER_LIMIT;
 #[cfg(target_os = "macos")]
 static NATIVE_ARCHIVE_INPUT_BROKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeArchiveBrokerDescendantReceipt {
+    successful_requests: usize,
+    rejected_requests: usize,
+    total_requests: usize,
+    committed_bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeArchiveBrokerDescendantReceipt {
+    fn new() -> Self {
+        Self {
+            successful_requests: 0,
+            rejected_requests: 0,
+            total_requests: 0,
+            committed_bytes: 0,
+        }
+    }
+
+    fn record_success(&mut self, committed_bytes: usize) -> Result<(), String> {
+        self.successful_requests = self
+            .successful_requests
+            .checked_add(1)
+            .ok_or_else(|| "broker descendant success count overflowed".to_owned())?;
+        self.total_requests = self
+            .total_requests
+            .checked_add(1)
+            .ok_or_else(|| "broker descendant request count overflowed".to_owned())?;
+        self.committed_bytes = self
+            .committed_bytes
+            .checked_add(committed_bytes)
+            .ok_or_else(|| "broker descendant committed byte count overflowed".to_owned())?;
+        Ok(())
+    }
+
+    fn record_rejection(&mut self) -> Result<(), String> {
+        self.rejected_requests = self
+            .rejected_requests
+            .checked_add(1)
+            .ok_or_else(|| "broker descendant rejection count overflowed".to_owned())?;
+        self.total_requests = self
+            .total_requests
+            .checked_add(1)
+            .ok_or_else(|| "broker descendant request count overflowed".to_owned())?;
+        Ok(())
+    }
+
+    fn record_file_success(&mut self, path: &Path, role: &str) -> Result<(), String> {
+        let bytes = usize::try_from(
+            fs::metadata(path)
+                .map_err(|error| format!("cannot inspect broker {role} input: {error}"))?
+                .len(),
+        )
+        .map_err(|_| format!("broker {role} input length does not fit usize"))?;
+        self.record_success(bytes)
+    }
+
+    pub(crate) fn render(self) -> String {
+        format!(
+            "{NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_V1}|success={}|rejected={}|requests={}|committedBytes={}\n",
+            self.successful_requests,
+            self.rejected_requests,
+            self.total_requests,
+            self.committed_bytes,
+        )
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_BYTE_LIMIT {
+            return Err("broker descendant receipt exceeds its byte bound".to_owned());
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| "broker descendant receipt is not UTF-8".to_owned())?;
+        let fields = text
+            .strip_suffix('\n')
+            .ok_or_else(|| "broker descendant receipt lacks its terminal newline".to_owned())?
+            .split('|')
+            .collect::<Vec<_>>();
+        let [protocol, success, rejected, requests, committed_bytes] = fields.as_slice() else {
+            return Err("broker descendant receipt field count differs".to_owned());
+        };
+        if *protocol != NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_V1 {
+            return Err("broker descendant receipt protocol differs".to_owned());
+        }
+        let parse = |field: &str, prefix: &str| {
+            field
+                .strip_prefix(prefix)
+                .ok_or_else(|| "broker descendant receipt field order differs".to_owned())?
+                .parse::<usize>()
+                .map_err(|error| format!("broker descendant receipt count is invalid: {error}"))
+        };
+        let receipt = Self {
+            successful_requests: parse(success, "success=")?,
+            rejected_requests: parse(rejected, "rejected=")?,
+            total_requests: parse(requests, "requests=")?,
+            committed_bytes: parse(committed_bytes, "committedBytes=")?,
+        };
+        if receipt.render().as_bytes() != bytes {
+            return Err("broker descendant receipt is not canonical".to_owned());
+        }
+        Ok(receipt)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_native_archive_broker_descendant_receipt_for_integration() -> Result<(), String>
+{
+    let receipt = NativeArchiveBrokerDescendantReceipt {
+        successful_requests: NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_REQUEST_ROOT_LIMIT,
+        rejected_requests: 6,
+        total_requests: 10,
+        committed_bytes: NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_STAGED_BYTE_LIMIT,
+    };
+    let canonical = receipt.render();
+    if canonical.len() > NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_BYTE_LIMIT
+        || NativeArchiveBrokerDescendantReceipt::parse(canonical.as_bytes())? != receipt
+    {
+        return Err("broker descendant receipt round trip differs".to_owned());
+    }
+    let trailing = format!("{canonical}x");
+    for (label, invalid) in [
+        ("missing terminal newline", canonical.trim_end().as_bytes()),
+        ("trailing byte", trailing.as_bytes()),
+        (
+            "reordered fields",
+            b"native-archive-broker-descendant-receipt-v1|rejected=6|success=4|requests=10|committedBytes=64\n"
+                as &[u8],
+        ),
+        (
+            "non-canonical count",
+            b"native-archive-broker-descendant-receipt-v1|success=04|rejected=6|requests=10|committedBytes=64\n"
+                as &[u8],
+        ),
+    ] {
+        if NativeArchiveBrokerDescendantReceipt::parse(invalid).is_ok() {
+            return Err(format!("broker descendant receipt accepted {label}"));
+        }
+    }
+    let oversized = vec![b'x'; NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_BYTE_LIMIT + 1];
+    if NativeArchiveBrokerDescendantReceipt::parse(&oversized).is_ok() {
+        return Err("broker descendant receipt accepted an oversized frame".to_owned());
+    }
+    Ok(())
+}
 #[cfg(target_os = "macos")]
 pub(crate) struct NativeArchiveInputBroker {
     socket: PathBuf,
@@ -11673,7 +12610,7 @@ impl NativeArchiveInputBroker {
         let socket_root = socket_root
             .ok_or_else(|| "native archive broker authority allocation exhausted".to_owned())?;
         let socket = socket_root.join("s");
-        let capability = staging_root.join(".broker-v1");
+        let capability = staging_root.join(".broker-v2");
         let setup = (|| {
             fs::set_permissions(&socket_root, fs::Permissions::from_mode(0o711)).map_err(
                 |error| format!("cannot confine native archive broker authority: {error}"),
@@ -11746,6 +12683,11 @@ impl NativeArchiveInputBroker {
 
     fn authorization_count(&self) -> u64 {
         self.authorizations.load(Ordering::Acquire)
+    }
+
+    fn published_request_root_count_until(&self, deadline: Instant) -> Result<usize, String> {
+        count_native_archive_request_roots(&self.staging_root, deadline)
+            .map_err(|error| format!("trusted broker staging inventory failed: {error}"))
     }
 
     pub(crate) fn close_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -11887,6 +12829,7 @@ fn run_native_archive_input_broker(
         if let Some(authorization_deadline) = worker.authorization_deadline {
             request_deadline = request_deadline.min(authorization_deadline);
         }
+        let request_sequence = accounting.request_sequence;
         let mut magic = [0_u8; NATIVE_ARCHIVE_INPUT_BROKER_MAGIC.len()];
         let response = read_native_archive_broker_exact_until(
             &mut stream,
@@ -11932,7 +12875,7 @@ fn run_native_archive_input_broker(
             .request_sequence
             .checked_add(1)
             .ok_or_else(|| "native archive input request sequence overflowed".to_owned())?;
-        if let Err(error) = response {
+        if let Err(primary) = response {
             if magic == *NATIVE_ARCHIVE_AUTH_BROKER_MAGIC
                 || worker.limits.integration_fault
                     == NativeArchiveInputBrokerFault::ExpireDuringMagicRead
@@ -11941,32 +12884,47 @@ fn run_native_archive_input_broker(
             {
                 continue;
             }
-            let detail = error.as_bytes();
-            let bounded = &detail[..detail.len().min(4096)];
-            let _ = write_native_archive_broker_exact_until(
+            deliver_native_archive_input_error_receipt(
                 &mut stream,
-                &[1],
+                request_sequence,
+                &primary,
                 request_deadline,
-                "input error state",
-            )
-            .and_then(|()| {
-                write_native_archive_broker_u32_until(
-                    &mut stream,
-                    bounded.len(),
-                    request_deadline,
-                    "input error length",
-                )
-            })
-            .and_then(|()| {
-                write_native_archive_broker_exact_until(
-                    &mut stream,
-                    bounded,
-                    request_deadline,
-                    "input error detail",
-                )
-            });
+            )?;
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn deliver_native_archive_input_error_receipt(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_sequence: u64,
+    primary: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let detail = primary.as_bytes();
+    let bounded = &detail[..detail.len().min(4096)];
+    write_native_archive_broker_exact_until(stream, &[1], deadline, "input error state")
+        .and_then(|()| {
+            write_native_archive_broker_u32_until(
+                stream,
+                bounded.len(),
+                deadline,
+                "input error length",
+            )
+        })
+        .and_then(|()| {
+            write_native_archive_broker_exact_until(
+                stream,
+                bounded,
+                deadline,
+                "input error detail",
+            )
+        })
+        .map_err(|delivery| {
+            format!(
+                "native archive input request {request_sequence} failed: {primary}; terminal error receipt delivery failed: {delivery}"
+            )
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -12049,6 +13007,100 @@ struct NativeArchiveInputStaging<'a> {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct NativeArchiveInputWireReceipt {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+#[cfg(target_os = "macos")]
+struct ReceivedNativeArchiveInputMember {
+    source: PathBuf,
+    name: OsString,
+    input: ReceivedNativeArchiveInputFd,
+    expected: NativeArchiveInputWireReceipt,
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_archive_input_wire_receipt(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<NativeArchiveInputWireReceipt, String> {
+    let device = read_native_archive_broker_u64_until(stream, deadline, "input device receipt")?;
+    let inode = read_native_archive_broker_u64_until(stream, deadline, "input inode receipt")?;
+    let read_u32 =
+        |stream: &mut std::os::unix::net::UnixStream, phase: &str| -> Result<u32, String> {
+            u32::try_from(read_native_archive_broker_u32_until(
+                stream, deadline, phase,
+            )?)
+            .map_err(|_| format!("native archive {phase} does not fit u32"))
+        };
+    let uid = read_u32(stream, "input uid receipt")?;
+    let gid = read_u32(stream, "input gid receipt")?;
+    let mode = read_u32(stream, "input mode receipt")?;
+    let size = read_native_archive_broker_u64_until(stream, deadline, "input size receipt")?;
+    let mut sha256 = [0_u8; 32];
+    read_native_archive_broker_exact_until(
+        stream,
+        &mut sha256,
+        deadline,
+        "input digest receipt",
+        false,
+    )?;
+    Ok(NativeArchiveInputWireReceipt {
+        device,
+        inode,
+        uid,
+        gid,
+        mode,
+        size,
+        sha256,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_archive_input_wire_receipt(
+    stream: &mut std::os::unix::net::UnixStream,
+    receipt: NativeArchiveInputWireReceipt,
+    deadline: Instant,
+) -> Result<(), String> {
+    let write_u32 = |stream: &mut std::os::unix::net::UnixStream,
+                     value: u32,
+                     phase: &str|
+     -> Result<(), String> {
+        write_native_archive_broker_u32_until(
+            stream,
+            usize::try_from(value)
+                .map_err(|_| format!("native archive {phase} does not fit usize"))?,
+            deadline,
+            phase,
+        )
+    };
+    write_native_archive_broker_u64_until(
+        stream,
+        receipt.device,
+        deadline,
+        "input device receipt",
+    )?;
+    write_native_archive_broker_u64_until(stream, receipt.inode, deadline, "input inode receipt")?;
+    write_u32(stream, receipt.uid, "input uid receipt")?;
+    write_u32(stream, receipt.gid, "input gid receipt")?;
+    write_u32(stream, receipt.mode, "input mode receipt")?;
+    write_native_archive_broker_u64_until(stream, receipt.size, deadline, "input size receipt")?;
+    write_native_archive_broker_exact_until(
+        stream,
+        &receipt.sha256,
+        deadline,
+        "input digest receipt",
+    )
+}
+
+#[cfg(target_os = "macos")]
 impl NativeArchiveInputStaging<'_> {
     fn stage(mut self) -> Result<(), String> {
         let count = read_native_archive_broker_u32_until(
@@ -12056,62 +13108,88 @@ impl NativeArchiveInputStaging<'_> {
             self.deadline,
             "input request count",
         )?;
-        self.admit_request_root(count)?;
-        let mut staged = Vec::with_capacity(count);
+        self.validate_request_topology(count)?;
+        let mut received = Vec::with_capacity(count);
         for position in 0..count {
-            staged.push(self.stage_member(position)?);
+            received.push(self.receive_member(position)?);
+        }
+        require_native_archive_input_request_eof_until(self.stream, self.deadline)?;
+        self.admit_request_root(&received)?;
+        let mut staged = Vec::with_capacity(count);
+        for (position, member) in received.iter().enumerate() {
+            staged.push(self.stage_member(position, member)?);
         }
         self.write_response(staged)
     }
 
-    fn admit_request_root(&mut self, count: usize) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    fn validate_request_topology(&self, count: usize) -> Result<(), String> {
         if count == 0 {
             return Err("native archive input request does not contain members".to_owned());
+        }
+        if count != 1 {
+            return Err("native archive input request is not exactly one member".to_owned());
         }
         if count > self.limits.staged_entries {
             return Err("native archive input request exceeds its member bound".to_owned());
         }
-        let admitted = self
+        Ok(())
+    }
+
+    fn admit_request_root(
+        &mut self,
+        received: &[ReceivedNativeArchiveInputMember],
+    ) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let request_roots = self
             .accounting
             .request_roots
             .checked_add(1)
             .ok_or_else(|| "native archive input request root count overflowed".to_owned())?;
-        if admitted > self.limits.request_roots {
+        if request_roots > self.limits.request_roots {
             return Err("native archive input request root count exceeds its bound".to_owned());
         }
-        self.accounting.request_roots = admitted;
-        if let Err(error) = fs::create_dir(self.request_root) {
-            self.accounting.request_roots = self
-                .accounting
-                .request_roots
-                .checked_sub(1)
-                .ok_or_else(|| {
-                    "native archive input request root rollback underflowed".to_owned()
+        let staged_entries = self
+            .accounting
+            .staged_entries
+            .checked_add(received.len())
+            .ok_or_else(|| "native archive staged entry count overflowed".to_owned())?;
+        if staged_entries > self.limits.staged_entries {
+            return Err("native archive staged entry count exceeds its bound".to_owned());
+        }
+        let staged_bytes =
+            received
+                .iter()
+                .try_fold(self.accounting.staged_bytes, |total, member| {
+                    total
+                        .checked_add(member.expected.size)
+                        .ok_or_else(|| "native archive staged byte count overflowed".to_owned())
                 })?;
+        if staged_bytes > self.limits.staged_bytes {
+            return Err("native archive staged byte count exceeds its bound".to_owned());
+        }
+        if let Err(error) = fs::create_dir(self.request_root) {
             return Err(format!(
                 "cannot create native archive input request root: {error}"
             ));
         }
-        fs::set_permissions(self.request_root, fs::Permissions::from_mode(0o2750))
-            .map_err(|error| format!("cannot confine native archive input request root: {error}"))
+        fs::set_permissions(self.request_root, fs::Permissions::from_mode(0o2750)).map_err(
+            |error| format!("cannot confine native archive input request root: {error}"),
+        )?;
+        self.accounting.request_roots = request_roots;
+        self.accounting.staged_entries = staged_entries;
+        self.accounting.staged_bytes = staged_bytes;
+        Ok(())
     }
 
-    fn stage_member(&mut self, position: usize) -> Result<PathBuf, String> {
+    fn receive_member(
+        &mut self,
+        position: usize,
+    ) -> Result<ReceivedNativeArchiveInputMember, String> {
         use std::os::unix::ffi::OsStringExt as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
         require_native_archive_deadline(self.deadline, "trusted archive input staging")
             .map_err(|error| error.to_string())?;
-        self.accounting.staged_entries = self
-            .accounting
-            .staged_entries
-            .checked_add(1)
-            .ok_or_else(|| "native archive staged entry count overflowed".to_owned())?;
-        if self.accounting.staged_entries > self.limits.staged_entries {
-            return Err("native archive staged entry count exceeds its bound".to_owned());
-        }
         let path_len =
             read_native_archive_broker_u32_until(self.stream, self.deadline, "input path length")?;
         if path_len == 0 || path_len > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
@@ -12127,56 +13205,47 @@ impl NativeArchiveInputStaging<'_> {
                 == NativeArchiveInputBrokerFault::ExpireInputDuringPathRead
                 && position == 0,
         )?;
-        let mut expected_sha256 = [0_u8; 32];
-        read_native_archive_broker_exact_until(
-            self.stream,
-            &mut expected_sha256,
-            self.deadline,
-            "input digest",
-            false,
-        )?;
+        let expected = read_native_archive_input_wire_receipt(self.stream, self.deadline)?;
+        let input = receive_native_archive_input_fd_until(self.stream, self.deadline)?;
         let source = PathBuf::from(OsString::from_vec(path));
         let name = source
             .file_name()
-            .ok_or_else(|| "native archive input name is absent".to_owned())?;
+            .ok_or_else(|| "native archive input name is absent".to_owned())?
+            .to_owned();
+        validate_received_native_archive_input(&input, &source, expected, self.candidate_uid)?;
+        Ok(ReceivedNativeArchiveInputMember {
+            source,
+            name,
+            input,
+            expected,
+        })
+    }
+
+    fn stage_member(
+        &self,
+        position: usize,
+        member: &ReceivedNativeArchiveInputMember,
+    ) -> Result<PathBuf, String> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
         let member_root = self.request_root.join(format!("member-{position}"));
         fs::create_dir(&member_root)
             .map_err(|error| format!("cannot create native archive member root: {error}"))?;
         fs::set_permissions(&member_root, fs::Permissions::from_mode(0o2750))
             .map_err(|error| format!("cannot confine native archive member root: {error}"))?;
-        let destination = member_root.join(name);
-        let mut input = fs::File::open(&source)
-            .map_err(|error| format!("cannot open retained native archive input: {error}"))?;
-        let metadata = input
-            .metadata()
-            .map_err(|error| format!("cannot inspect retained native archive input: {error}"))?;
-        if !metadata.is_file() {
-            return Err("retained native archive input is not regular".to_owned());
-        }
-        if metadata.uid() != self.candidate_uid {
-            return Err("native archive input is not owned by the candidate principal".to_owned());
-        }
-        self.accounting.staged_bytes = self
-            .accounting
-            .staged_bytes
-            .checked_add(metadata.len())
-            .ok_or_else(|| "native archive staged byte count overflowed".to_owned())?;
-        if self.accounting.staged_bytes > self.limits.staged_bytes {
-            return Err("native archive staged byte count exceeds its bound".to_owned());
-        }
+        let destination = member_root.join(&member.name);
         let mut output = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o440)
             .open(&destination)
             .map_err(|error| format!("cannot create trusted native archive input: {error}"))?;
-        self.inject_copy_growth(&source, name)?;
-        copy_native_archive_input(
-            &mut input,
+        self.inject_copy_growth(&member.source, &member.name)?;
+        copy_received_native_archive_input(
+            &member.input,
             &mut output,
             &destination,
-            &metadata,
-            expected_sha256,
+            member.expected,
             self.deadline,
         )?;
         destination
@@ -12239,28 +13308,107 @@ impl NativeArchiveInputStaging<'_> {
 }
 
 #[cfg(target_os = "macos")]
-fn copy_native_archive_input(
-    input: &mut fs::File,
+fn native_archive_received_fd_identity(
+    input: &ReceivedNativeArchiveInputFd,
+) -> Result<(u64, u64, u32, u32, u32, u64), String> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::sys::stat::{SFlag, fstat};
+
+    let flags = OFlag::from_bits_truncate(
+        fcntl(input.0, FcntlArg::F_GETFL)
+            .map_err(|error| format!("cannot inspect retained native archive access: {error}"))?,
+    );
+    if flags & OFlag::O_ACCMODE != OFlag::O_RDONLY {
+        return Err("retained native archive descriptor is not read-only".to_owned());
+    }
+    let stat = fstat(input.0)
+        .map_err(|error| format!("cannot inspect retained native archive descriptor: {error}"))?;
+    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+        return Err("retained native archive descriptor is not regular".to_owned());
+    }
+    Ok((
+        u64::try_from(stat.st_dev)
+            .map_err(|_| "retained native archive device does not fit u64".to_owned())?,
+        stat.st_ino,
+        stat.st_uid,
+        stat.st_gid,
+        u32::from(stat.st_mode & 0o7777),
+        u64::try_from(stat.st_size)
+            .map_err(|_| "retained native archive size does not fit u64".to_owned())?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_received_native_archive_input(
+    input: &ReceivedNativeArchiveInputFd,
+    source: &Path,
+    expected: NativeArchiveInputWireReceipt,
+    candidate_uid: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let observed = native_archive_received_fd_identity(input)?;
+    let expected_identity = (
+        expected.device,
+        expected.inode,
+        expected.uid,
+        expected.gid,
+        expected.mode,
+        expected.size,
+    );
+    if observed != expected_identity {
+        return Err("retained native archive descriptor identity differs from receipt".to_owned());
+    }
+    if expected.uid != candidate_uid {
+        return Err("native archive input is not owned by the candidate principal".to_owned());
+    }
+    match fs::symlink_metadata(source) {
+        Ok(metadata) => {
+            let current = (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode() & 0o7777,
+                metadata.len(),
+            );
+            if metadata.file_type().is_symlink() || !metadata.is_file() || current != observed {
+                return Err("native archive input path identity differs from receipt".to_owned());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect retained native archive input path: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn copy_received_native_archive_input(
+    input: &ReceivedNativeArchiveInputFd,
     output: &mut fs::File,
     destination: &Path,
-    metadata: &fs::Metadata,
-    expected_sha256: [u8; 32],
+    expected: NativeArchiveInputWireReceipt,
     deadline: Instant,
 ) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
 
+    nix::unistd::lseek(input.0, 0, nix::unistd::Whence::SeekSet)
+        .map_err(|error| format!("cannot rewind retained native archive input: {error}"))?;
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
     let buffer_len = u64::try_from(buffer.len())
         .map_err(|_| "native archive copy buffer length does not fit u64".to_owned())?;
-    while copied < metadata.len() {
+    while copied < expected.size {
         require_native_archive_deadline(deadline, "trusted archive input copy")
             .map_err(|error| error.to_string())?;
-        let remaining = usize::try_from((metadata.len() - copied).min(buffer_len))
+        let remaining = usize::try_from((expected.size - copied).min(buffer_len))
             .map_err(|_| "native archive copy remainder does not fit usize".to_owned())?;
-        let read = input
-            .read(&mut buffer[..remaining])
+        let read = nix::unistd::read(input.0, &mut buffer[..remaining])
             .map_err(|error| format!("cannot read native archive input: {error}"))?;
         if read == 0 {
             break;
@@ -12277,8 +13425,7 @@ fn copy_native_archive_input(
             .ok_or_else(|| "native archive copy length overflowed".to_owned())?;
     }
     let mut growth = [0_u8; 1];
-    let grew = input
-        .read(&mut growth)
+    let grew = nix::unistd::read(input.0, &mut growth)
         .map_err(|error| format!("cannot probe native archive input growth: {error}"))?
         != 0;
     output
@@ -12286,7 +13433,19 @@ fn copy_native_archive_input(
         .map_err(|error| format!("cannot sync trusted native archive input: {error}"))?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o440))
         .map_err(|error| format!("cannot freeze trusted native archive input: {error}"))?;
-    if copied != metadata.len() || grew || digest.finish() != Digest(expected_sha256) {
+    if copied != expected.size
+        || grew
+        || digest.finish() != Digest(expected.sha256)
+        || native_archive_received_fd_identity(input)?
+            != (
+                expected.device,
+                expected.inode,
+                expected.uid,
+                expected.gid,
+                expected.mode,
+                expected.size,
+            )
+    {
         return Err("native archive input changed while it was staged".to_owned());
     }
     Ok(())
@@ -12727,6 +13886,185 @@ fn read_native_archive_broker_u64_until(
 }
 
 #[cfg(target_os = "macos")]
+fn write_native_archive_broker_u64_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    value: u64,
+    deadline: Instant,
+    phase: &str,
+) -> Result<(), String> {
+    write_native_archive_broker_exact_until(stream, &value.to_le_bytes(), deadline, phase)
+}
+
+#[cfg(target_os = "macos")]
+struct ReceivedNativeArchiveInputFd(std::os::fd::RawFd);
+
+#[cfg(target_os = "macos")]
+impl Drop for ReceivedNativeArchiveInputFd {
+    fn drop(&mut self) {
+        let _ = nix::unistd::close(self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_native_archive_input_fd_until(
+    stream: &std::os::unix::net::UnixStream,
+    input: &fs::File,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+
+    send_native_archive_input_fds_until(stream, &[input.as_raw_fd()], deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn send_native_archive_input_fds_until(
+    stream: &std::os::unix::net::UnixStream,
+    descriptors: &[std::os::fd::RawFd],
+    deadline: Instant,
+) -> Result<(), String> {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use std::io::IoSlice;
+    use std::os::fd::AsRawFd as _;
+
+    require_native_archive_deadline(deadline, "input descriptor transfer")
+        .map_err(|error| error.to_string())?;
+    stream.set_nonblocking(false).map_err(|error| {
+        format!("cannot make native archive descriptor transfer blocking: {error}")
+    })?;
+    configure_native_archive_broker_stream(stream, deadline)?;
+    let marker = [0xa5_u8];
+    let buffers = [IoSlice::new(&marker)];
+    let control = (!descriptors.is_empty()).then_some(ControlMessage::ScmRights(descriptors));
+    let control = control.as_slice();
+    let written = sendmsg::<()>(
+        stream.as_raw_fd(),
+        &buffers,
+        control,
+        MsgFlags::empty(),
+        None,
+    )
+    .map_err(|error| format!("cannot transfer retained native archive input: {error}"))?;
+    if written != marker.len() {
+        return Err("retained native archive input descriptor frame was truncated".to_owned());
+    }
+    require_native_archive_deadline(deadline, "input descriptor transfer")
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn receive_native_archive_input_fd_until(
+    stream: &std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<ReceivedNativeArchiveInputFd, String> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::io::IoSliceMut;
+    use std::os::fd::AsRawFd as _;
+
+    require_native_archive_deadline(deadline, "input descriptor receipt")
+        .map_err(|error| error.to_string())?;
+    stream.set_nonblocking(false).map_err(|error| {
+        format!("cannot make native archive descriptor receipt blocking: {error}")
+    })?;
+    configure_native_archive_broker_stream(stream, deadline)?;
+    let mut marker = [0_u8; 1];
+    let mut buffers = [IoSliceMut::new(&mut marker)];
+    let mut control_space = nix::cmsg_space!([std::os::fd::RawFd; 2]);
+    let message = recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut buffers,
+        Some(&mut control_space),
+        MsgFlags::empty(),
+    )
+    .map_err(|error| format!("cannot receive retained native archive input: {error}"))?;
+    let bytes = message.bytes;
+    let flags = message.flags;
+    let mut received = Vec::new();
+    let mut unexpected_control = false;
+    for control in message.cmsgs() {
+        match control {
+            ControlMessageOwned::ScmRights(descriptors) => {
+                received.extend(descriptors.into_iter().map(ReceivedNativeArchiveInputFd));
+            }
+            _ => unexpected_control = true,
+        }
+    }
+    if bytes != 1
+        || marker != [0xa5]
+        || flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+        || unexpected_control
+        || received.len() != 1
+    {
+        return Err("native archive input descriptor frame differs from protocol".to_owned());
+    }
+    let descriptor = received
+        .pop()
+        .ok_or_else(|| "native archive input descriptor is absent".to_owned())?;
+    let current =
+        FdFlag::from_bits_truncate(fcntl(descriptor.0, FcntlArg::F_GETFD).map_err(|error| {
+            format!("cannot inspect retained native archive descriptor: {error}")
+        })?);
+    fcntl(
+        descriptor.0,
+        FcntlArg::F_SETFD(current | FdFlag::FD_CLOEXEC),
+    )
+    .map_err(|error| format!("cannot seal retained native archive descriptor: {error}"))?;
+    require_native_archive_deadline(deadline, "input descriptor receipt")
+        .map_err(|error| error.to_string())?;
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "macos")]
+fn require_native_archive_input_request_eof_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<(), String> {
+    stream.set_nonblocking(true).map_err(|error| {
+        format!("cannot make native archive input EOF receipt nonblocking: {error}")
+    })?;
+    loop {
+        require_native_archive_deadline(deadline, "input request EOF")
+            .map_err(|error| error.to_string())?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let mut descriptors = [nix::poll::PollFd::new(
+            &*stream,
+            nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP,
+        )];
+        if nix::poll::poll(&mut descriptors, timeout)
+            .map_err(|error| format!("cannot poll native archive input request EOF: {error}"))?
+            == 0
+        {
+            return Err(
+                "native archive adapter deadline expired during input request EOF".to_owned(),
+            );
+        }
+        let events = descriptors[0]
+            .revents()
+            .unwrap_or_else(nix::poll::PollFlags::empty);
+        if events.intersects(nix::poll::PollFlags::POLLERR | nix::poll::PollFlags::POLLNVAL) {
+            return Err("native archive input request EOF poll failed closed".to_owned());
+        }
+        let mut trailing = [0_u8; 1];
+        match stream.read(&mut trailing) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err("native archive input request contains trailing data".to_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot receive native archive input request EOF: {error}"
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn count_native_archive_request_roots(
     staging_root: &Path,
     deadline: Instant,
@@ -12828,8 +14166,30 @@ struct NativeArchiveDirectoryReceipt {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum NativeArchiveDirectoryRetention {
+    Readable,
+    #[cfg(target_os = "macos")]
+    SearchOnly,
+}
+
+#[cfg(unix)]
 impl NativeArchiveDirectoryReceipt {
     fn bind(label: &'static str, path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        Self::bind_with_retention(
+            label,
+            path,
+            deadline,
+            NativeArchiveDirectoryRetention::Readable,
+        )
+    }
+
+    fn bind_with_retention(
+        label: &'static str,
+        path: &Path,
+        deadline: Instant,
+        retention: NativeArchiveDirectoryRetention,
+    ) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
 
         require_native_archive_deadline(deadline, label)?;
@@ -12840,8 +14200,19 @@ impl NativeArchiveDirectoryReceipt {
         if metadata.file_type().is_symlink() || !metadata.is_dir() || canonical != path {
             return Err(std::io::Error::other(format!("{label} is redirected")));
         }
-        let guard = fs::File::open(path)
-            .map_err(|error| std::io::Error::other(format!("cannot retain {label}: {error}")))?;
+        let guard = match retention {
+            NativeArchiveDirectoryRetention::Readable => fs::File::open(path),
+            #[cfg(target_os = "macos")]
+            NativeArchiveDirectoryRetention::SearchOnly => {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_SEARCH | nix::libc::O_CLOEXEC)
+                    .open(path)
+            }
+        }
+        .map_err(|error| std::io::Error::other(format!("cannot retain {label}: {error}")))?;
         let retained = guard.metadata().map_err(|error| {
             std::io::Error::other(format!("cannot retain {label} identity: {error}"))
         })?;
@@ -12903,11 +14274,77 @@ impl NativeArchiveDirectoryReceipt {
 }
 
 #[cfg(target_os = "macos")]
+struct NativeArchiveSearchOnlyDirectoryReceipt(NativeArchiveDirectoryReceipt);
+
+#[cfg(target_os = "macos")]
+impl NativeArchiveSearchOnlyDirectoryReceipt {
+    fn bind(label: &'static str, path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        NativeArchiveDirectoryReceipt::bind_with_retention(
+            label,
+            path,
+            deadline,
+            NativeArchiveDirectoryRetention::SearchOnly,
+        )
+        .map(Self)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::ops::Deref for NativeArchiveSearchOnlyDirectoryReceipt {
+    type Target = NativeArchiveDirectoryReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_native_archive_search_only_child_for_integration(
+    staging_root: &Path,
+) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "native archive search-only child deadline overflowed".to_owned())?;
+    let receipt = NativeArchiveSearchOnlyDirectoryReceipt::bind(
+        "sealed archive input staging root",
+        staging_root,
+        deadline,
+    )
+    .map_err(|error| format!("cannot retain search-only staging root: {error}"))?;
+    if receipt.mode != 0o2710 {
+        return Err("search-only staging root mode differs from policy".to_owned());
+    }
+    match fs::File::open(staging_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "search-only staging root read failed with a non-permission error: {error}"
+            ));
+        }
+        Ok(_) => return Err("search-only staging root granted read authority".to_owned()),
+    }
+    match fs::read_dir(staging_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "search-only staging root enumeration failed with a non-permission error: {error}"
+            ));
+        }
+        Ok(_) => return Err("search-only staging root granted enumeration authority".to_owned()),
+    }
+    receipt
+        .revalidate(deadline)
+        .map_err(|error| format!("cannot revalidate search-only staging root: {error}"))?;
+    println!("search-only-retained-read-denied");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 struct NativeArchiveInputBrokerCapability {
     adapter_root: NativeArchiveDirectoryReceipt,
     authority_root: NativeArchiveDirectoryReceipt,
-    staging_root: NativeArchiveDirectoryReceipt,
-    socket_root: NativeArchiveDirectoryReceipt,
+    staging_root: NativeArchiveSearchOnlyDirectoryReceipt,
+    socket_root: NativeArchiveSearchOnlyDirectoryReceipt,
     capability: PathBuf,
     capability_target: PathBuf,
     capability_device: u64,
@@ -12939,12 +14376,12 @@ impl NativeArchiveInputBrokerCapability {
             deadline,
         )?;
         let staging_path = authority_path.join("inputs");
-        let staging_root = NativeArchiveDirectoryReceipt::bind(
+        let staging_root = NativeArchiveSearchOnlyDirectoryReceipt::bind(
             "sealed archive input staging root",
             &staging_path,
             deadline,
         )?;
-        let capability = staging_path.join(".broker-v1");
+        let capability = staging_path.join(".broker-v2");
         let capability_metadata = fs::symlink_metadata(&capability).map_err(|error| {
             std::io::Error::other(format!(
                 "cannot inspect sealed archive input broker capability: {error}"
@@ -12958,7 +14395,7 @@ impl NativeArchiveInputBrokerCapability {
         let socket_root_path = socket.parent().ok_or_else(|| {
             std::io::Error::other("sealed archive input broker has no socket authority")
         })?;
-        let socket_root = NativeArchiveDirectoryReceipt::bind(
+        let socket_root = NativeArchiveSearchOnlyDirectoryReceipt::bind(
             "sealed archive input broker socket root",
             socket_root_path,
             deadline,
@@ -13718,27 +15155,35 @@ impl NativeArchiveInvocation {
         let authority = self.authority.as_mut().ok_or_else(|| {
             std::io::Error::other("native archive input staging authority is absent")
         })?;
-        let mut stream = UnixStream::connect(&broker.socket).map_err(|error| {
-            std::io::Error::other(format!(
-                "cannot connect to native archive input broker: {error}"
-            ))
-        })?;
-        broker.revalidate(deadline)?;
-        write_native_archive_input_request(&mut stream, &flattened, authority, deadline)?;
-        read_native_archive_input_response_state(&mut stream, deadline)?;
-        let (staged_paths, staged_receipts) = read_staged_native_archive_inputs(
-            &mut stream,
-            &broker,
-            &flattened,
-            authority,
-            deadline,
-        )?;
+        let mut staged_paths = Vec::with_capacity(flattened.len());
+        let mut staged_receipts = Vec::with_capacity(flattened.len());
+        for input_index in &flattened {
+            let mut stream = UnixStream::connect(&broker.socket).map_err(|error| {
+                std::io::Error::other(format!(
+                    "cannot connect to native archive input broker: {error}"
+                ))
+            })?;
+            broker.revalidate(deadline)?;
+            write_native_archive_input_request(&mut stream, *input_index, authority, deadline)?;
+            read_native_archive_input_response_state(&mut stream, deadline)?;
+            let single = [*input_index];
+            let (mut member_paths, mut member_receipts) = read_staged_native_archive_inputs(
+                &mut stream,
+                &broker,
+                &single,
+                authority,
+                deadline,
+            )?;
+            staged_paths.append(&mut member_paths);
+            staged_receipts.append(&mut member_receipts);
+        }
         authority.inputs.extend(staged_receipts);
         self.replace_staged_input_arguments(&staged_paths)?;
         self.input_groups.clear();
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn replace_staged_input_arguments(&mut self, staged_paths: &[OsString]) -> std::io::Result<()> {
         let mut replacements = BTreeMap::<usize, Vec<OsString>>::new();
         let mut staged_position = 0_usize;
@@ -13781,7 +15226,7 @@ impl NativeArchiveInvocation {
 #[cfg(target_os = "macos")]
 fn write_native_archive_input_request(
     stream: &mut std::os::unix::net::UnixStream,
-    flattened: &[usize],
+    input_index: usize,
     authority: &NativeArchiveWorkAuthority,
     deadline: Instant,
 ) -> std::io::Result<()> {
@@ -13794,36 +15239,122 @@ fn write_native_archive_input_request(
         "input request magic",
     )
     .map_err(std::io::Error::other)?;
-    write_native_archive_broker_u32_until(stream, flattened.len(), deadline, "input request count")
+    write_native_archive_broker_u32_until(stream, 1, deadline, "input request count")
         .map_err(std::io::Error::other)?;
-    for input_index in flattened {
-        let input = authority.inputs.get(*input_index).ok_or_else(|| {
-            std::io::Error::other("native archive input receipt index is invalid")
-        })?;
-        let path = input.path.as_os_str().as_bytes();
-        if path.is_empty() || path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
-            return Err(std::io::Error::other(
-                "native archive input path length is outside its bound",
-            ));
-        }
+    let input = authority
+        .inputs
+        .get(input_index)
+        .ok_or_else(|| std::io::Error::other("native archive input receipt index is invalid"))?;
+    let path = input.path.as_os_str().as_bytes();
+    if path.is_empty() || path.len() > NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT {
+        return Err(std::io::Error::other(
+            "native archive input path length is outside its bound",
+        ));
+    }
+    write_native_archive_broker_u32_until(
+        stream,
+        path.len(),
+        deadline,
+        "input request path length",
+    )
+    .map_err(std::io::Error::other)?;
+    write_native_archive_broker_exact_until(stream, path, deadline, "input request path")
+        .map_err(std::io::Error::other)?;
+    input.revalidate(deadline)?;
+    write_native_archive_input_wire_receipt(
+        stream,
+        NativeArchiveInputWireReceipt {
+            device: input.device,
+            inode: input.inode,
+            uid: input.uid,
+            gid: input.gid,
+            mode: input.mode,
+            size: input.size,
+            sha256: input.sha256.0,
+        },
+        deadline,
+    )
+    .map_err(std::io::Error::other)?;
+    send_native_archive_input_fd_until(stream, &input.guard, deadline)
+        .map_err(std::io::Error::other)?;
+    stream.shutdown(std::net::Shutdown::Write).map_err(|error| {
+        std::io::Error::other(format!(
+            "cannot close native archive input request direction: {error}"
+        ))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_archive_input_request_with_fds_for_integration(
+    stream: &mut std::os::unix::net::UnixStream,
+    input: &NativeArchiveFileReceipt,
+    descriptors: &[std::os::fd::RawFd],
+    trailing: &[u8],
+    shutdown_write: bool,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = input.path.as_os_str().as_bytes();
+    write_native_archive_broker_exact_until(
+        stream,
+        NATIVE_ARCHIVE_INPUT_BROKER_MAGIC,
+        deadline,
+        "integration input request magic",
+    )
+    .and_then(|()| {
+        write_native_archive_broker_u32_until(
+            stream,
+            1,
+            deadline,
+            "integration input request count",
+        )
+    })
+    .and_then(|()| {
         write_native_archive_broker_u32_until(
             stream,
             path.len(),
             deadline,
-            "input request path length",
+            "integration input path length",
         )
-        .map_err(std::io::Error::other)?;
-        write_native_archive_broker_exact_until(stream, path, deadline, "input request path")
-            .map_err(std::io::Error::other)?;
+    })
+    .and_then(|()| {
+        write_native_archive_broker_exact_until(stream, path, deadline, "integration input path")
+    })
+    .and_then(|()| {
+        write_native_archive_input_wire_receipt(
+            stream,
+            NativeArchiveInputWireReceipt {
+                device: input.device,
+                inode: input.inode,
+                uid: input.uid,
+                gid: input.gid,
+                mode: input.mode,
+                size: input.size,
+                sha256: input.sha256.0,
+            },
+            deadline,
+        )
+    })
+    .and_then(|()| send_native_archive_input_fds_until(stream, descriptors, deadline))
+    .and_then(|()| {
         write_native_archive_broker_exact_until(
             stream,
-            &input.sha256.0,
+            trailing,
             deadline,
-            "input request digest",
+            "integration trailing input frame",
         )
-        .map_err(std::io::Error::other)?;
-    }
-    Ok(())
+    })
+    .and_then(|()| {
+        if shutdown_write {
+            stream.shutdown(std::net::Shutdown::Write).map_err(|error| {
+                format!("cannot close integration native archive input request: {error}")
+            })
+        } else {
+            Ok(())
+        }
+    })
+    .map_err(std::io::Error::other)
 }
 
 #[cfg(target_os = "macos")]
@@ -13938,6 +15469,46 @@ fn require_native_archive_deadline(deadline: Instant, phase: &str) -> std::io::R
 }
 
 #[cfg(unix)]
+fn relay_native_archive_adapter_result(
+    result: &CommandResult,
+    completion_deadline: Instant,
+) -> std::io::Result<()> {
+    let stdout_len = u64::try_from(result.stdout.len())
+        .map_err(|_| std::io::Error::other("native archive stdout length overflowed"))?;
+    let stderr_len = u64::try_from(result.stderr.len())
+        .map_err(|_| std::io::Error::other("native archive stderr length overflowed"))?;
+    if result.timed_out
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || result.stdout_bytes != stdout_len
+        || result.stderr_bytes != stderr_len
+        || result.stdout_sha256 != sha256_bytes(&result.stdout)
+        || result.stderr_sha256 != sha256_bytes(&result.stderr)
+    {
+        return Err(std::io::Error::other(format!(
+            "native archive adapter authorized capture is incomplete: timedOut={},stdoutBytes={},stdoutRetained={},stdoutTruncated={},stderrBytes={},stderrRetained={},stderrTruncated={}",
+            result.timed_out,
+            result.stdout_bytes,
+            result.stdout.len(),
+            result.stdout_truncated,
+            result.stderr_bytes,
+            result.stderr.len(),
+            result.stderr_truncated,
+        )));
+    }
+
+    require_native_archive_deadline(completion_deadline, "authorized stdout relay")?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&result.stdout)?;
+    stdout.flush()?;
+    require_native_archive_deadline(completion_deadline, "authorized stderr relay")?;
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(&result.stderr)?;
+    stderr.flush()?;
+    require_native_archive_deadline(completion_deadline, "authorized output relay completion")
+}
+
+#[cfg(unix)]
 pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process::ExitCode {
     let result: std::io::Result<ExitStatus> = (|| {
         let completion_deadline = Instant::now()
@@ -13999,21 +15570,24 @@ pub(crate) fn run_native_archive_adapter(arguments: &[OsString]) -> std::process
             } else {
                 invocation.revalidate_before_launch(completion_deadline)?;
             }
+            relay_native_archive_adapter_result(&result, completion_deadline)?;
             Ok(result.status)
         }
         #[cfg(all(unix, not(target_os = "macos")))]
-        let status = Command::new(&bound_llvm_ar)
-            .args(&invocation.arguments)
-            .current_dir(&current_directory)
-            .status()?;
-        #[cfg(all(unix, not(target_os = "macos")))]
         {
-            if status.success() {
+            let (progress, _progress_receiver) = SupervisedProgressObserver::bounded(1);
+            let result = CommandSpec::new(&bound_llvm_ar, NATIVE_ARCHIVE_ADAPTER_COMPLETION_BUDGET)
+                .arguments(invocation.arguments.clone())
+                .current_directory(&current_directory)
+                .run_until(execution_deadline, completion_deadline, progress)
+                .map_err(std::io::Error::other)?;
+            if result.status.success() {
                 invocation.revalidate_after_launch(completion_deadline)?;
             } else {
                 invocation.revalidate_before_launch(completion_deadline)?;
             }
-            Ok(status)
+            relay_native_archive_adapter_result(&result, completion_deadline)?;
+            Ok(result.status)
         }
     })();
     match result {
@@ -14519,7 +16093,7 @@ pub(crate) fn run_posix_release_child(arguments: &[OsString]) -> std::process::E
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_native_archive_broker_descendant_launcher(
     arguments: &[OsString],
-) -> Result<(), String> {
+) -> Result<NativeArchiveBrokerDescendantReceipt, String> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let [adapter_root, fake_broker, writable_root] = arguments else {
@@ -14530,11 +16104,31 @@ pub(crate) fn verify_native_archive_broker_descendant_launcher(
     };
     let source = Path::new(writable_root).join("broker-budget-input.o");
     let growing = Path::new(writable_root).join("append-during-copy.o");
-    let oversize = Path::new(writable_root).join("broker-oversize-input.o");
+    let remaining_boundary = Path::new(writable_root).join("broker-remaining-boundary-input.o");
+    let over_remaining = Path::new(writable_root).join("broker-over-remaining-input.o");
+    let source_contents = b"data".as_slice();
+    let committed_before_growth = source_contents
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| "broker committed byte fixture length overflowed".to_owned())?;
+    let remaining_after_growth_rollback = NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_STAGED_BYTE_LIMIT
+        .checked_sub(committed_before_growth)
+        .ok_or_else(|| "broker remaining byte fixture length underflowed".to_owned())?;
+    let boundary_prefix_len = remaining_after_growth_rollback
+        .checked_sub(source_contents.len())
+        .ok_or_else(|| "broker boundary prefix fixture length underflowed".to_owned())?;
+    let boundary_contents = vec![b'b'; boundary_prefix_len];
+    let over_remaining_contents = vec![
+        b'o';
+        remaining_after_growth_rollback.checked_add(1).ok_or_else(
+            || "broker over-remaining fixture length overflowed".to_owned()
+        )?
+    ];
     for (path, contents) in [
-        (&source, b"data".as_slice()),
+        (&source, source_contents),
         (&growing, b"grow".as_slice()),
-        (&oversize, &[b'o'; 53]),
+        (&remaining_boundary, boundary_contents.as_slice()),
+        (&over_remaining, over_remaining_contents.as_slice()),
     ] {
         fs::write(path, contents)
             .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(0o666)))
@@ -14561,26 +16155,45 @@ pub(crate) fn verify_native_archive_broker_descendant_launcher(
         .argument(fake_broker)
         .argument(&source)
         .argument(&growing)
-        .argument(&oversize)
-        .run()
+        .argument(&remaining_boundary)
+        .argument(&over_remaining)
+        .run_ambient_candidate_captured()
         .map_err(|error| format!("cannot execute broker descendant consumer: {error}"))?;
-    if result.timed_out || !result.status.success() {
+    if result.timed_out
+        || !result.status.success()
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || !result.stderr.is_empty()
+    {
         return Err(format!(
-            "broker descendant consumer failed: status={:?}; stderr={}",
+            "broker descendant consumer failed: status={:?},timedOut={},stdoutBytes={},stdoutSha256={},stderrBytes={},stderrSha256={},stderr={}",
             result.status.code(),
+            result.timed_out,
+            result.stdout_bytes,
+            result.stdout_sha256.hex(),
+            result.stderr_bytes,
+            result.stderr_sha256.hex(),
             String::from_utf8_lossy(&result.stderr)
         ));
     }
-    Ok(())
+    NativeArchiveBrokerDescendantReceipt::parse(&result.stdout)
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_native_archive_broker_descendant_consumer(
     arguments: &[OsString],
-) -> Result<(), String> {
+) -> Result<NativeArchiveBrokerDescendantReceipt, String> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let [adapter_root, fake_broker, source, growing, oversize] = arguments else {
+    let [
+        adapter_root,
+        fake_broker,
+        source,
+        growing,
+        remaining_boundary,
+        over_remaining,
+    ] = arguments
+    else {
         return Err(
             "native archive broker descendant consumer requires adapter, typed decoy, and input paths"
                 .to_owned(),
@@ -14591,6 +16204,7 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
         .ok_or_else(|| "broker descendant deadline overflowed".to_owned())?;
     let capability = NativeArchiveInputBrokerCapability::bind(Path::new(adapter_root), deadline)
         .map_err(|error| format!("cannot bind descendant broker capability: {error}"))?;
+    require_native_archive_broker_socket_search_only(&capability, deadline)?;
     let decoy = fs::symlink_metadata(fake_broker)
         .map_err(|error| format!("cannot bind typed decoy broker receipt: {error}"))?;
     if capability.socket == Path::new(fake_broker)
@@ -14601,6 +16215,7 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
     capability
         .revalidate(deadline)
         .map_err(|error| format!("cannot revalidate descendant broker capability: {error}"))?;
+    let mut receipt = NativeArchiveBrokerDescendantReceipt::new();
     for _ in 0..3 {
         require_native_archive_broker_test_rejection(
             &capability.socket,
@@ -14608,6 +16223,7 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
             "native archive input request does not contain members",
             deadline,
         )?;
+        receipt.record_rejection()?;
     }
     for _ in 0..2 {
         require_native_archive_broker_test_success(
@@ -14615,6 +16231,7 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
             Path::new(source),
             deadline,
         )?;
+        receipt.record_file_success(Path::new(source), "success")?;
     }
     require_native_archive_broker_test_rejection(
         &capability.socket,
@@ -14622,21 +16239,51 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
         "native archive input changed while it was staged",
         deadline,
     )?;
+    receipt.record_rejection()?;
     require_native_archive_broker_test_rejection(
         &capability.socket,
-        Some(Path::new(oversize)),
+        Some(Path::new(over_remaining)),
         "native archive staged byte count exceeds its bound",
         deadline,
     )?;
+    receipt.record_rejection()?;
+    require_native_archive_broker_test_success(
+        &capability.socket,
+        Path::new(remaining_boundary),
+        deadline,
+    )?;
+    receipt.record_file_success(Path::new(remaining_boundary), "boundary")?;
+    require_native_archive_broker_test_success(&capability.socket, Path::new(source), deadline)?;
+    receipt.record_file_success(Path::new(source), "repeated success")?;
     require_native_archive_broker_test_rejection(
         &capability.socket,
         Some(Path::new(source)),
         "native archive input request root count exceeds its bound",
         deadline,
     )?;
-    let staging_root = Path::new(adapter_root).join(".authority/inputs");
+    receipt.record_rejection()?;
+    if receipt.successful_requests != NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_REQUEST_ROOT_LIMIT
+        || receipt.rejected_requests != 6
+        || receipt.total_requests != 10
+        || receipt.committed_bytes != NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_STAGED_BYTE_LIMIT
+    {
+        return Err(
+            "broker descendant response accounting differs from its exact bound".to_owned(),
+        );
+    }
+    capability.revalidate(deadline).map_err(|error| {
+        format!("cannot terminally revalidate descendant broker capability: {error}")
+    })?;
+    Ok(receipt)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn require_native_archive_broker_test_staging_for_integration(
+    staging_root: &Path,
+    receipt: &NativeArchiveBrokerDescendantReceipt,
+) -> Result<(), String> {
     let mut request_roots = 0_usize;
-    for entry in fs::read_dir(&staging_root)
+    for entry in fs::read_dir(staging_root)
         .map_err(|error| format!("cannot enumerate descendant broker staging: {error}"))?
     {
         let entry =
@@ -14646,30 +16293,103 @@ pub(crate) fn verify_native_archive_broker_descendant_consumer(
             request_roots = request_roots
                 .checked_add(1)
                 .ok_or_else(|| "descendant broker request count overflowed".to_owned())?;
-        } else if name != OsStr::new(".broker-v1") {
+        } else if name != OsStr::new(".broker-v2") {
             return Err("descendant broker staging contains an unexpected entry".to_owned());
         }
     }
-    if request_roots != 4 || staging_root.join("request-7").exists() {
+    if request_roots != receipt.successful_requests
+        || receipt.successful_requests != NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_REQUEST_ROOT_LIMIT
+        || receipt.rejected_requests != 6
+        || receipt.total_requests != 10
+    {
         return Err("descendant broker request-root admission differs from its bound".to_owned());
     }
-    let bounded_growth = fs::read(
-        staging_root
-            .join("request-5/member-0")
-            .join("append-during-copy.o"),
-    )
-    .map_err(|error| format!("cannot inspect bounded growing input staging: {error}"))?;
-    if bounded_growth != b"grow" {
-        return Err("growing native archive input exceeded its admitted copy length".to_owned());
+    for sequence in [3_u64, 4, 7, 8] {
+        let request = staging_root.join(format!("request-{sequence}"));
+        if !request.is_dir() {
+            return Err(format!(
+                "committed descendant broker request root {sequence} is absent"
+            ));
+        }
     }
-    if fs::read_dir(staging_root.join("request-6/member-0"))
-        .map_err(|error| format!("cannot inspect rejected oversized staging: {error}"))?
-        .next()
-        .is_some()
+    for sequence in [5_u64, 6, 9] {
+        match fs::symlink_metadata(staging_root.join(format!("request-{sequence}"))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect rejected descendant broker request root {sequence}: {error}"
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "rejected descendant broker request root {sequence} remains staged"
+                ));
+            }
+        }
+    }
+    let committed = [
+        staging_root.join("request-3/member-0/broker-budget-input.o"),
+        staging_root.join("request-4/member-0/broker-budget-input.o"),
+        staging_root.join("request-7/member-0/broker-remaining-boundary-input.o"),
+        staging_root.join("request-8/member-0/broker-budget-input.o"),
+    ];
+    let mut committed_bytes = 0_usize;
+    for path in committed {
+        committed_bytes = committed_bytes
+            .checked_add(
+                usize::try_from(
+                    fs::metadata(&path)
+                        .map_err(|error| {
+                            format!(
+                                "cannot inspect committed descendant broker input {}: {error}",
+                                path.display()
+                            )
+                        })?
+                        .len(),
+                )
+                .map_err(|_| "committed descendant broker input length does not fit usize")?,
+            )
+            .ok_or_else(|| "committed descendant broker byte count overflowed".to_owned())?;
+    }
+    if committed_bytes != receipt.committed_bytes
+        || receipt.committed_bytes != NATIVE_ARCHIVE_INPUT_BROKER_INTEGRATION_STAGED_BYTE_LIMIT
     {
-        return Err("oversized native archive input wrote beyond its admitted budget".to_owned());
+        return Err("descendant broker did not accept its exact staged-byte boundary".to_owned());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn require_native_archive_broker_socket_search_only(
+    capability: &NativeArchiveInputBrokerCapability,
+    deadline: Instant,
+) -> Result<(), String> {
+    if capability.socket_root.mode != 0o711 {
+        return Err("descendant broker socket root mode differs from policy".to_owned());
+    }
+    match fs::File::open(&capability.socket_root.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "search-only broker socket root read failed with a non-permission error: {error}"
+            ));
+        }
+        Ok(_) => return Err("search-only broker socket root granted read authority".to_owned()),
+    }
+    match fs::read_dir(&capability.socket_root.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "search-only broker socket root enumeration failed with a non-permission error: {error}"
+            ));
+        }
+        Ok(_) => {
+            return Err("search-only broker socket root granted enumeration authority".to_owned());
+        }
+    }
+    capability
+        .revalidate(deadline)
+        .map_err(|error| format!("cannot revalidate search-only broker socket root: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -14768,21 +16488,54 @@ fn write_native_archive_broker_test_request(
     stream
         .write_all(NATIVE_ARCHIVE_INPUT_BROKER_MAGIC)
         .map_err(|error| format!("cannot write descendant broker magic: {error}"))?;
-    write_native_archive_broker_u32(&mut stream, usize::from(source.is_some()))?;
+    write_native_archive_broker_u32_until(
+        &mut stream,
+        usize::from(source.is_some()),
+        deadline,
+        "descendant input request count",
+    )?;
     if let Some(source) = source {
+        let receipt = NativeArchiveFileReceipt::bind(
+            "descendant native archive broker input",
+            source,
+            deadline,
+        )
+        .map_err(|error| format!("cannot bind descendant broker input: {error}"))?;
         let path = source.as_os_str().as_bytes();
-        write_native_archive_broker_u32(&mut stream, path.len())?;
-        stream
-            .write_all(path)
-            .map_err(|error| format!("cannot write descendant broker path: {error}"))?;
-        let contents = fs::read(source)
-            .map_err(|error| format!("cannot read descendant broker input: {error}"))?;
-        let mut digest = Sha256::new();
-        digest.update(&contents);
-        stream
-            .write_all(&digest.finish().0)
-            .map_err(|error| format!("cannot write descendant broker digest: {error}"))?;
+        write_native_archive_broker_u32_until(
+            &mut stream,
+            path.len(),
+            deadline,
+            "descendant input path length",
+        )?;
+        write_native_archive_broker_exact_until(
+            &mut stream,
+            path,
+            deadline,
+            "descendant input path",
+        )?;
+        write_native_archive_input_wire_receipt(
+            &mut stream,
+            NativeArchiveInputWireReceipt {
+                device: receipt.device,
+                inode: receipt.inode,
+                uid: receipt.uid,
+                gid: receipt.gid,
+                mode: receipt.mode,
+                size: receipt.size,
+                sha256: receipt.sha256.0,
+            },
+            deadline,
+        )?;
+        send_native_archive_input_fd_until(&stream, &receipt.guard, deadline)?;
     }
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| {
+            format!(
+                "cannot half-close descendant broker request after descriptor transfer: {error}"
+            )
+        })?;
     Ok(stream)
 }
 
@@ -15405,6 +17158,17 @@ fn windows_restricted_child(
         &mut launcher_plan.command_line,
     )?;
     drop(job);
+    let cleanup_deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| std::io::Error::other("Windows child temp cleanup deadline overflowed"))?;
+    if let Err(cleanup) = hell_testkit::cleanup_windows_release_child_temp_authority_until(
+        child_request,
+        cleanup_deadline,
+    ) {
+        return Err(std::io::Error::other(format!(
+            "restricted target terminal status={status}; Windows child temp cleanup failed: {cleanup}"
+        )));
+    }
     Ok((status, prelaunch_evidence))
 }
 
@@ -15579,6 +17343,503 @@ fn verify_native_archive_stack_package_authority_for_integration(
             "{primary}; Stack archive authority verifier cleanup also failed: {cleanup}"
         )),
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_native_archive_descriptor_broker_for_integration(
+    base: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(90))
+        .ok_or_else(|| "native archive descriptor verifier deadline overflowed".to_owned())?;
+    let mut directory = create_adapter_directory(base)?;
+    let adapter = directory.path().to_owned();
+    let result = (|| {
+        prepare_adapter_work_directory(&adapter)?;
+        let authority = adapter.join(".authority");
+        let staging = authority.join("inputs");
+        fs::create_dir(&authority)
+            .and_then(|()| fs::create_dir(&staging))
+            .map_err(|error| format!("cannot create descriptor broker authority: {error}"))?;
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o555))
+            .and_then(|()| fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)))
+            .map_err(|error| format!("cannot initialize descriptor broker authority: {error}"))?;
+        let executable = stage_native_archive_descriptor_client(&adapter, deadline)?;
+        let principal = crate::release::platform::resolve_macos_restricted_archive_principal(
+            "nobody", deadline,
+        )?;
+        crate::release::platform::transition_macos_restricted_archive_adapter(
+            &adapter, &principal, deadline,
+        )?;
+        exercise_native_archive_descriptor_broker(
+            &adapter,
+            &staging,
+            &executable,
+            &principal,
+            deadline,
+        )
+    })();
+    let cleanup = directory.close_until(deadline);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; descriptor broker directory cleanup also failed: {cleanup}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_native_archive_limit_rejection_receipt_for_integration(
+    base: &Path,
+) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| "native archive limit-rejection verifier deadline overflowed".to_owned())?;
+    let mut directory = create_adapter_directory(base)?;
+    let staging = directory.path().join("limit-rejection-staging");
+    let source = directory.path().join("limit-rejection-input.o");
+    let result = (|| {
+        fs::create_dir(&staging)
+            .map_err(|error| format!("cannot create limit-rejection staging: {error}"))?;
+        fs::write(&source, b"bounded\n")
+            .map_err(|error| format!("cannot create limit-rejection input: {error}"))?;
+        let mut broker = NativeArchiveInputBroker::start_for_integration(
+            &staging,
+            nix::unistd::geteuid().as_raw(),
+            1,
+            64,
+        )?;
+        let primary = (|| {
+            require_native_archive_broker_test_success(&broker.socket, &source, deadline)?;
+            require_native_archive_broker_test_rejection(
+                &broker.socket,
+                Some(&source),
+                "native archive input request root count exceeds its bound",
+                deadline,
+            )?;
+            if count_native_archive_request_roots(&staging, deadline)? != 1 {
+                return Err(
+                    "limit-rejection terminal receipt changed published request roots".to_owned(),
+                );
+            }
+            Ok(())
+        })();
+        let cleanup = broker.close_until(deadline);
+        match (primary, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(format!(
+                "{primary}; limit-rejection broker cleanup also failed: {cleanup}"
+            )),
+        }
+    })();
+    let cleanup = directory.close_until(deadline);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; limit-rejection verifier cleanup also failed: {cleanup}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_archive_descriptor_client(
+    adapter: &Path,
+    deadline: Instant,
+) -> Result<NativeArchiveFileReceipt, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let source = fs::canonicalize(std::env::current_exe().map_err(|error| {
+        format!("cannot identify descriptor broker verifier executable: {error}")
+    })?)
+    .map_err(|error| {
+        format!("cannot canonicalize descriptor broker verifier executable: {error}")
+    })?;
+    let destination = adapter.join("descriptor-client-v2");
+    fs::copy(source, &destination)
+        .map_err(|error| format!("cannot stage descriptor broker verifier executable: {error}"))?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o555))
+        .map_err(|error| format!("cannot seal descriptor broker verifier executable: {error}"))?;
+    NativeArchiveFileReceipt::bind(
+        "descriptor broker verifier executable",
+        &destination,
+        deadline,
+    )
+    .map_err(|error| format!("cannot bind descriptor broker verifier executable: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn exercise_native_archive_descriptor_broker(
+    adapter: &Path,
+    staging: &Path,
+    executable: &NativeArchiveFileReceipt,
+    principal: &crate::release::platform::MacosRestrictedArchivePrincipal,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut broker = NativeArchiveInputBroker::start_with_limits(
+        staging,
+        principal.uid,
+        NativeArchiveInputBrokerLimits::PRODUCTION,
+        None,
+        None,
+    )?;
+    let primary =
+        verify_native_archive_descriptor_success(&broker, adapter, executable, principal, deadline);
+    let broker_cleanup = broker.close_until(deadline);
+    let session = adapter.join(".stack-work/tmp/stack-fedcba");
+    let mutable_cleanup = run_native_archive_descriptor_fixture_command(
+        "/usr/bin/sudo",
+        [
+            OsString::from("-n"),
+            OsString::from("/bin/rm"),
+            OsString::from("-rf"),
+            OsString::from("--"),
+            session.into_os_string(),
+        ],
+        deadline,
+        "private Stack descriptor fixture cleanup",
+    );
+    match (primary, broker_cleanup, mutable_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (primary, broker_cleanup, mutable_cleanup) => Err([
+            primary.err().map(|error| format!("primary: {error}")),
+            broker_cleanup
+                .err()
+                .map(|error| format!("broker-cleanup: {error}")),
+            mutable_cleanup
+                .err()
+                .map(|error| format!("fixture-cleanup: {error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archive_descriptor_success(
+    broker: &NativeArchiveInputBroker,
+    adapter: &Path,
+    executable: &NativeArchiveFileReceipt,
+    principal: &crate::release::platform::MacosRestrictedArchivePrincipal,
+    deadline: Instant,
+) -> Result<(), String> {
+    verify_native_archive_descriptor_rejections(broker, adapter, principal.uid, deadline)?;
+    executable
+        .revalidate(deadline)
+        .map_err(|error| format!("cannot revalidate descriptor broker verifier: {error}"))?;
+    let temporary = adapter.join(".stack-work/tmp");
+    let child = CommandSpec::new("/usr/bin/sudo", Duration::from_secs(45))
+        .arguments([
+            OsString::from("-n"),
+            OsString::from("-u"),
+            OsString::from(&principal.name),
+            OsString::from("--"),
+            executable.path.as_os_str().to_owned(),
+            OsString::from("__native-archive-descriptor-client-v2"),
+            adapter.as_os_str().to_owned(),
+            temporary.as_os_str().to_owned(),
+        ])
+        .run()
+        .map_err(|error| format!("cannot launch restricted descriptor client: {error}"))?;
+    if child.timed_out || !child.status.success() {
+        return Err(format!(
+            "restricted descriptor client failed: status={:?}, timedOut={}, stderr={}",
+            child.status.code(),
+            child.timed_out,
+            String::from_utf8_lossy(&child.stderr)
+        ));
+    }
+    let member = temporary
+        .join("stack-fedcba/Private-1.0/.stack-work/dist/aarch64-osx/ghc-9.8.2/build/member.o");
+    match fs::File::open(&member) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => {
+            return Err(format!(
+                "private Stack member path reopen failed with wrong error: {error}"
+            ));
+        }
+        Ok(_) => {
+            return Err(
+                "trusted runner reopened a member below the candidate-private ancestor".to_owned(),
+            );
+        }
+    }
+    if broker.published_request_root_count_until(deadline)? != 1 {
+        return Err("descriptor broker did not publish one successful request".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_archive_descriptor_fixture_command(
+    program: &str,
+    arguments: impl IntoIterator<Item = OsString>,
+    deadline: Instant,
+    label: &str,
+) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("{label} deadline expired"));
+    }
+    let result = CommandSpec::new(program, remaining)
+        .arguments(arguments)
+        .run()
+        .map_err(|error| format!("cannot run {label}: {error}"))?;
+    if result.timed_out || !result.status.success() {
+        return Err(format!(
+            "{label} failed: status={:?}, timedOut={}, stderr={}",
+            result.status.code(),
+            result.timed_out,
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archive_descriptor_rejections(
+    broker: &NativeArchiveInputBroker,
+    adapter: &Path,
+    candidate_uid: u32,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let source = adapter.join("descriptor-source.o");
+    let replacement = adapter.join("descriptor-replacement.o");
+    fs::write(&source, b"source\n")
+        .and_then(|()| fs::write(&replacement, b"replacement\n"))
+        .map_err(|error| format!("cannot create descriptor rejection fixture: {error}"))?;
+    let receipt = NativeArchiveFileReceipt::bind("descriptor rejection source", &source, deadline)
+        .map_err(|error| format!("cannot bind descriptor rejection source: {error}"))?;
+    let replacement = fs::File::open(&replacement)
+        .map_err(|error| format!("cannot open descriptor substitution fixture: {error}"))?;
+    let directory = fs::File::open(adapter)
+        .map_err(|error| format!("cannot open descriptor directory fixture: {error}"))?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot drift descriptor rejection fixture mode: {error}"))?;
+    for (label, descriptors, expected) in [
+        (
+            "missing descriptor",
+            Vec::new(),
+            "descriptor frame differs from protocol",
+        ),
+        (
+            "multiple descriptors",
+            vec![receipt.guard.as_raw_fd(), receipt.guard.as_raw_fd()],
+            "descriptor frame differs from protocol",
+        ),
+        (
+            "truncated ancillary descriptors",
+            vec![
+                receipt.guard.as_raw_fd(),
+                receipt.guard.as_raw_fd(),
+                receipt.guard.as_raw_fd(),
+            ],
+            "descriptor frame differs from protocol",
+        ),
+        (
+            "substituted descriptor",
+            vec![replacement.as_raw_fd()],
+            "descriptor identity differs from receipt",
+        ),
+        (
+            "nonregular descriptor",
+            vec![directory.as_raw_fd()],
+            "descriptor is not regular",
+        ),
+        (
+            "mode-drift descriptor",
+            vec![receipt.guard.as_raw_fd()],
+            "descriptor identity differs from receipt",
+        ),
+    ] {
+        let mut stream = std::os::unix::net::UnixStream::connect(&broker.socket)
+            .map_err(|error| format!("cannot connect {label} verifier: {error}"))?;
+        write_native_archive_input_request_with_fds_for_integration(
+            &mut stream,
+            &receipt,
+            &descriptors,
+            &[],
+            true,
+            deadline,
+        )
+        .map_err(|error| format!("cannot write {label} request: {error}"))?;
+        let error = read_native_archive_input_response_state(&mut stream, deadline)
+            .expect_err("a malformed descriptor request must be rejected");
+        if !error.to_string().contains(expected) {
+            return Err(format!("{label} diagnostic differs: {error}"));
+        }
+        if count_native_archive_request_roots(&broker.staging_root, deadline)? != 0 {
+            return Err(format!("{label} retained a partial request root"));
+        }
+    }
+    if receipt.uid == candidate_uid {
+        return Err("descriptor rejection fixture unexpectedly has candidate ownership".to_owned());
+    }
+    fs::remove_file(source)
+        .map_err(|error| format!("cannot remove descriptor rejection fixture: {error}"))?;
+    fs::remove_file(adapter.join("descriptor-replacement.o"))
+        .map_err(|error| format!("cannot remove descriptor substitution fixture: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_native_archive_descriptor_client_for_integration(
+    arguments: &[OsString],
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let [adapter, temporary] = arguments else {
+        return Err("descriptor client requires adapter and temporary roots".to_owned());
+    };
+    let adapter = Path::new(adapter);
+    let temporary = Path::new(temporary);
+    let package = temporary.join("stack-fedcba/Private-1.0");
+    let source = package.join("src");
+    let write = package.join(".stack-work/dist/aarch64-osx/ghc-9.8.2/build");
+    fs::create_dir_all(&source)
+        .and_then(|()| fs::create_dir_all(&write))
+        .map_err(|error| format!("cannot create private Stack descriptor fixture: {error}"))?;
+    fs::write(write.join("member.o"), b"private-object\n")
+        .map_err(|error| format!("cannot create private Stack descriptor member: {error}"))?;
+    fs::set_permissions(&package, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot seal private Stack package ancestor: {error}"))?;
+    let relative_target = Path::new("../.stack-work/dist/aarch64-osx/ghc-9.8.2/build/archive.a");
+    let relative_member = Path::new("../.stack-work/dist/aarch64-osx/ghc-9.8.2/build/member.o");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| "descriptor client deadline overflowed".to_owned())?;
+    let member = write.join("member.o");
+    let receipt =
+        NativeArchiveFileReceipt::bind("private Stack descriptor framing input", &member, deadline)
+            .map_err(|error| format!("cannot bind private descriptor framing input: {error}"))?;
+    verify_native_archive_input_eof_rejections(adapter, &receipt, deadline)?;
+    let package_metadata = fs::symlink_metadata(&package)
+        .map_err(|error| format!("cannot revalidate private Stack package mode: {error}"))?;
+    if package_metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err("private Stack package mode widened during descriptor framing".to_owned());
+    }
+    let mut invocation = bind_native_archive_invocation(
+        &[
+            OsString::from("q"),
+            relative_target.as_os_str().to_owned(),
+            relative_member.as_os_str().to_owned(),
+        ],
+        adapter,
+        &source,
+        Some(temporary),
+        deadline,
+    )
+    .map_err(|error| format!("cannot bind private Stack descriptor invocation: {error}"))?;
+    invocation
+        .revalidate_before_launch(deadline)
+        .map_err(|error| {
+            format!("cannot revalidate private Stack descriptor invocation: {error}")
+        })?;
+    invocation
+        .stage_inputs_with_broker(adapter, deadline)
+        .map_err(|error| format!("cannot stage private Stack descriptor invocation: {error}"))?;
+    invocation
+        .revalidate_before_launch(deadline)
+        .map_err(|error| {
+            format!("cannot revalidate staged private Stack descriptor invocation: {error}")
+        })?;
+    println!("private-stack-descriptor-staged");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_native_archive_input_eof_rejections(
+    adapter: &Path,
+    receipt: &NativeArchiveFileReceipt,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+
+    let (mut eof_receiver, eof_writer) = std::os::unix::net::UnixStream::pair()
+        .map_err(|error| format!("cannot create missing-EOF verifier pair: {error}"))?;
+    let eof_deadline = Instant::now()
+        .checked_add(Duration::from_millis(100))
+        .ok_or_else(|| "missing-EOF verifier deadline overflowed".to_owned())?
+        .min(deadline);
+    let error = require_native_archive_input_request_eof_until(&mut eof_receiver, eof_deadline)
+        .expect_err("an open request direction must reach its EOF deadline");
+    if !error.contains("deadline expired during input request EOF") {
+        return Err(format!("missing-EOF verifier diagnostic differs: {error}"));
+    }
+    drop(eof_writer);
+
+    let socket = adapter.join(".authority/inputs/.broker-v2");
+    let mut missing_eof = std::os::unix::net::UnixStream::connect(&socket)
+        .map_err(|error| format!("cannot connect missing-EOF descriptor verifier: {error}"))?;
+    write_native_archive_input_request_with_fds_for_integration(
+        &mut missing_eof,
+        receipt,
+        &[receipt.guard.as_raw_fd()],
+        &[],
+        false,
+        deadline,
+    )
+    .map_err(|error| format!("cannot write missing-EOF descriptor request: {error}"))?;
+    let response_deadline = Instant::now()
+        .checked_add(Duration::from_millis(100))
+        .ok_or_else(|| "missing-EOF response deadline overflowed".to_owned())?
+        .min(deadline);
+    let error = read_native_archive_input_response_state(&mut missing_eof, response_deadline)
+        .expect_err("a request without a write half-close must not receive a response");
+    if !error
+        .to_string()
+        .contains("deadline expired during input response state")
+    {
+        return Err(format!(
+            "missing-EOF descriptor diagnostic differs: {error}"
+        ));
+    }
+    write_native_archive_broker_exact_until(
+        &mut missing_eof,
+        &[0x5a],
+        deadline,
+        "missing-EOF verifier terminal trailing data",
+    )?;
+    missing_eof
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| format!("cannot close missing-EOF verifier request: {error}"))?;
+    let error = read_native_archive_input_response_state(&mut missing_eof, deadline)
+        .expect_err("a recovered missing-EOF request with trailing data must be rejected");
+    if !error.to_string().contains("request contains trailing data") {
+        return Err(format!(
+            "missing-EOF terminal receipt diagnostic differs: {error}"
+        ));
+    }
+    let mut trailing = std::os::unix::net::UnixStream::connect(&socket)
+        .map_err(|error| format!("cannot connect trailing-byte descriptor verifier: {error}"))?;
+    write_native_archive_input_request_with_fds_for_integration(
+        &mut trailing,
+        receipt,
+        &[receipt.guard.as_raw_fd()],
+        &[0x5a],
+        true,
+        deadline,
+    )
+    .map_err(|error| format!("cannot write trailing-byte descriptor request: {error}"))?;
+    let error = read_native_archive_input_response_state(&mut trailing, deadline)
+        .expect_err("a descriptor frame with a trailing byte must be rejected");
+    if !error.to_string().contains("request contains trailing data") {
+        return Err(format!(
+            "trailing-byte descriptor diagnostic differs: {error}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -15767,10 +18028,15 @@ fn verify_expired_stack_package_authority(
 struct StackPackageMutationFixture {
     deadline: Instant,
     response_path: PathBuf,
+    #[cfg(target_os = "macos")]
     member_path: PathBuf,
+    #[cfg(target_os = "macos")]
     response_bytes: Vec<u8>,
+    #[cfg(target_os = "macos")]
     member_bytes: Vec<u8>,
+    #[cfg(target_os = "macos")]
     changed_response: Vec<u8>,
+    #[cfg(target_os = "macos")]
     changed_member: Vec<u8>,
 }
 
@@ -15802,6 +18068,7 @@ fn verify_stack_package_in_place_mutations(
         .map_err(|error| format!("cannot retain Stack response fixture bytes: {error}"))?;
     let member_bytes = fs::read(&member_path)
         .map_err(|error| format!("cannot retain Stack member fixture bytes: {error}"))?;
+    #[cfg(target_os = "macos")]
     let changed_response = verify_stack_response_in_place_mutation(
         adapter_root,
         temporary,
@@ -15811,7 +18078,28 @@ fn verify_stack_package_in_place_mutations(
         &response_path,
         &response_bytes,
     )?;
+    #[cfg(not(target_os = "macos"))]
+    verify_stack_response_in_place_mutation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        deadline,
+        &response_path,
+        &response_bytes,
+    )?;
+    #[cfg(target_os = "macos")]
     let changed_member = verify_stack_member_in_place_mutation(
+        adapter_root,
+        temporary,
+        source,
+        arguments,
+        deadline,
+        &member_path,
+        &member_bytes,
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    verify_stack_member_in_place_mutation(
         adapter_root,
         temporary,
         source,
@@ -15823,10 +18111,15 @@ fn verify_stack_package_in_place_mutations(
     Ok(StackPackageMutationFixture {
         deadline,
         response_path,
+        #[cfg(target_os = "macos")]
         member_path,
+        #[cfg(target_os = "macos")]
         response_bytes,
+        #[cfg(target_os = "macos")]
         member_bytes,
+        #[cfg(target_os = "macos")]
         changed_response,
+        #[cfg(target_os = "macos")]
         changed_member,
     })
 }
@@ -16539,7 +18832,9 @@ struct GhcConfigureProbeFixture {
     target: PathBuf,
     arguments: [OsString; 3],
     execution_deadline: Instant,
+    #[cfg(target_os = "macos")]
     command_completion_deadline: Instant,
+    #[cfg(target_os = "macos")]
     cleanup_deadline: Instant,
 }
 
@@ -16576,7 +18871,9 @@ fn prepare_ghc_configure_probe_fixture(
             OsString::from("conftest.o"),
         ],
         execution_deadline,
+        #[cfg(target_os = "macos")]
         command_completion_deadline,
+        #[cfg(target_os = "macos")]
         cleanup_deadline,
     })
 }
@@ -19037,40 +21334,114 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    struct TrackedCheckoutDirectory(Option<PathBuf>);
+
+    impl TrackedCheckoutDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hell-oracle-checkout-{}-{}",
+                std::process::id(),
+                ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("cannot create tracked-checkout fixture");
+            Self(Some(path))
+        }
+
+        fn path(&self) -> &Path {
+            self.0
+                .as_deref()
+                .expect("tracked-checkout fixture was already closed")
+        }
+
+        fn close(mut self) {
+            let path = self
+                .0
+                .take()
+                .expect("tracked-checkout fixture was already closed");
+            fs::remove_dir_all(path).expect("cannot remove tracked-checkout fixture");
+        }
+    }
+
+    impl Drop for TrackedCheckoutDirectory {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    fn run_git_fixture_stage(
+        root: &Path,
+        stage: &str,
+        arguments: impl IntoIterator<Item = &'static str>,
+    ) -> CommandResult {
+        let result = CommandSpec::new("git", Duration::from_secs(30))
+            .arguments(arguments)
+            .current_directory(root)
+            .run()
+            .unwrap_or_else(|error| panic!("tracked-checkout {stage} could not run: {error}"));
+        assert!(
+            result.status.success()
+                && !result.timed_out
+                && !result.stdout_truncated
+                && !result.stderr_truncated,
+            "tracked-checkout {stage} failed: status={:?}, timed_out={}, stdout_bytes={}, stderr_bytes={}, stdout_sha256={}, stderr_sha256={}, stdout_truncated={}, stderr_truncated={}, stdout={:?}, stderr={:?}",
+            result.status.code(),
+            result.timed_out,
+            result.stdout_bytes,
+            result.stderr_bytes,
+            result.stdout_sha256.hex(),
+            result.stderr_sha256.hex(),
+            result.stdout_truncated,
+            result.stderr_truncated,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        result
+    }
+
     #[test]
     fn tracked_oracle_checkout_rejects_modified_tracked_files() {
-        let root = std::env::temp_dir().join(format!(
-            "hell-oracle-checkout-{}-{}",
-            std::process::id(),
-            ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let source = fs::canonicalize(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .unwrap(),
-        )
-        .unwrap();
-        let clone = CommandSpec::new("git", Duration::from_secs(30))
-            .arguments(["clone", "--quiet", "--shared"])
-            .argument(&source)
-            .argument(&root)
-            .run()
-            .unwrap();
-        assert!(clone.status.success() && !clone.timed_out);
-        let head = CommandSpec::new("git", Duration::from_secs(30))
-            .arguments(["rev-parse", "HEAD"])
-            .current_directory(&root)
-            .run()
-            .unwrap();
-        assert!(head.status.success() && !head.timed_out);
+        let fixture = TrackedCheckoutDirectory::new();
+        let root = fixture.path();
+        run_git_fixture_stage(root, "initialize", ["init", "--quiet"]);
+        run_git_fixture_stage(
+            root,
+            "disable line-ending conversion",
+            ["config", "core.autocrlf", "false"],
+        );
+        run_git_fixture_stage(
+            root,
+            "configure author name",
+            ["config", "user.name", "hell-ci"],
+        );
+        run_git_fixture_stage(
+            root,
+            "configure author email",
+            ["config", "user.email", "hell-ci@example.invalid"],
+        );
+        fs::write(root.join("tracked"), b"original\n")
+            .expect("cannot write tracked-checkout fixture file");
+        run_git_fixture_stage(root, "stage fixture", ["add", "--", "tracked"]);
+        run_git_fixture_stage(
+            root,
+            "commit fixture",
+            ["commit", "--quiet", "-m", "tracked checkout fixture"],
+        );
+        let head = run_git_fixture_stage(root, "identify fixture", ["rev-parse", "HEAD"]);
         let head = std::str::from_utf8(&head.stdout).unwrap().trim();
-        verify_tracked_checkout(&root, head).unwrap();
+        verify_tracked_checkout(root, head).expect("synthetic tracked checkout was not pristine");
         fs::write(root.join("untracked"), b"rejected\n").unwrap();
-        assert!(verify_tracked_checkout(&root, head).is_err());
+        assert_eq!(
+            verify_tracked_checkout(root, head),
+            Err("oracle source has tracked or staged changes".to_owned())
+        );
         fs::remove_file(root.join("untracked")).unwrap();
-        fs::write(root.join("Cargo.toml"), b"changed\n").unwrap();
-        assert!(verify_tracked_checkout(&root, head).is_err());
-        fs::remove_dir_all(root).unwrap();
+        fs::write(root.join("tracked"), b"changed\n").unwrap();
+        assert_eq!(
+            verify_tracked_checkout(root, head),
+            Err("oracle source has tracked or staged changes".to_owned())
+        );
+        fixture.close();
     }
 }

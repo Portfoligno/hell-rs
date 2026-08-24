@@ -3,23 +3,53 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::windows::fs::symlink_dir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hell_testkit::{
-    CandidateLaunchPolicy, WindowsLaunchAuthorities, WindowsToolchainAuthority,
-    WindowsToolchainExecutableAuthority, decode_windows_argv, parse_windows_release_child_request,
+    CandidateLaunchPolicy, WindowsGitExecutableAuthority, WindowsLaunchAuthorities,
+    WindowsToolchainAuthority, WindowsToolchainAuthorityInput, WindowsToolchainExecutableAuthority,
+    decode_windows_argv, parse_windows_release_child_request, resolve_windows_parent_program_from,
+    resolve_windows_release_child_current_directory,
+    windows_child_path_presentation_for_integration,
 };
 
 struct Fixture {
     root: PathBuf,
     stack: PathBuf,
     cargo_proxy: PathBuf,
+    rustc_proxy: PathBuf,
+    source_cargo: PathBuf,
+    source_rustc: PathBuf,
     staged_cargo: PathBuf,
+    staged_rustc: PathBuf,
     restricted_path: OsString,
     system_root: OsString,
     toolchain: Option<WindowsToolchainAuthority>,
+}
+
+fn real_git_parent_authorities() -> (PathBuf, OsString, PathBuf) {
+    let parent_path = std::env::var_os("PATH").expect("Windows parent PATH must exist");
+    let pathext = std::env::var_os("PATHEXT").expect("Windows parent PATHEXT must exist");
+    let extensions = pathext
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let git = resolve_windows_parent_program_from(
+        OsStr::new("git"),
+        &std::env::split_paths(&parent_path).collect::<Vec<_>>(),
+        &extensions,
+    )
+    .expect("Windows test host must provide Git");
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| fs::canonicalize(root).unwrap())
+        .expect("Windows SystemRoot must exist");
+    (git, pathext, system_root)
 }
 
 impl Fixture {
@@ -86,7 +116,11 @@ impl Fixture {
             root,
             stack,
             cargo_proxy,
+            rustc_proxy,
+            source_cargo,
+            source_rustc,
             staged_cargo,
+            staged_rustc,
             restricted_path,
             system_root,
             toolchain: Some(toolchain),
@@ -107,6 +141,59 @@ impl Fixture {
                 .clone(),
         )?;
         CandidateLaunchPolicy::windows(authorities, vec![self.root.clone()])
+    }
+
+    fn bind_real_git(&mut self) -> WindowsGitExecutableAuthority {
+        let (git, pathext, system_root) = real_git_parent_authorities();
+        let git_directory = git.parent().unwrap().to_path_buf();
+        let system32 = system_root.join("System32");
+        let trusted_path = std::env::join_paths([
+            git_directory.as_path(),
+            system32.as_path(),
+            system_root.as_path(),
+        ])
+        .unwrap();
+        let execution_deadline = Instant::now().checked_add(Duration::from_secs(10)).unwrap();
+        let completion_deadline = execution_deadline
+            .checked_add(Duration::from_secs(10))
+            .unwrap();
+        let git = WindowsGitExecutableAuthority::resolve_until(
+            &trusted_path,
+            &pathext,
+            system_root.as_os_str(),
+            execution_deadline,
+            completion_deadline,
+        )
+        .unwrap();
+        self.release_toolchain();
+        let (inventory_root, inventory_files, inventory_directories) =
+            inventory(&self.root.join("stage"));
+        let mapping = |proxy: &Path, source: &Path, staged: &Path| {
+            WindowsToolchainExecutableAuthority::rustup_proxy(
+                proxy.to_path_buf(),
+                proxy.to_path_buf(),
+                source.to_path_buf(),
+                staged.to_path_buf(),
+            )
+        };
+        let toolchain = WindowsToolchainAuthority::new_until(
+            WindowsToolchainAuthorityInput::new(
+                mapping(&self.cargo_proxy, &self.source_cargo, &self.staged_cargo),
+                mapping(&self.rustc_proxy, &self.source_rustc, &self.staged_rustc),
+                inventory_root,
+                inventory_directories,
+                trusted_path.clone(),
+                system_root.as_os_str().to_os_string(),
+            )
+            .with_git_authority(git.clone()),
+            inventory_files,
+            completion_deadline,
+        )
+        .unwrap();
+        self.restricted_path = toolchain.restricted_child_path(&trusted_path).unwrap();
+        self.system_root = system_root.into_os_string();
+        self.toolchain = Some(toolchain);
+        git
     }
 
     fn release_toolchain(&mut self) {
@@ -169,6 +256,85 @@ fn release_child_fields(command: &Command) -> Vec<OsString> {
         .expect("restricted launcher retains one encoded request");
     let outer = decode_windows_argv(encoded).expect("restricted request must decode");
     outer[2..].to_vec()
+}
+
+fn child_presentation(path: &Path) -> PathBuf {
+    windows_child_path_presentation_for_integration(path).unwrap()
+}
+
+#[test]
+fn inherited_current_directory_accepts_raw_and_verbatim_identity_but_explicit_redirects_fail() {
+    let fixture = Fixture::new("current-directory-identity");
+    let verbatim = fixture.root.clone();
+    let rendered = verbatim.to_string_lossy();
+    let raw = PathBuf::from(
+        rendered
+            .strip_prefix(r"\\?\")
+            .expect("canonical Windows fixture root must use verbatim syntax"),
+    );
+
+    assert_eq!(
+        resolve_windows_release_child_current_directory(None, &raw).unwrap(),
+        verbatim
+    );
+    assert_eq!(
+        resolve_windows_release_child_current_directory(None, &verbatim).unwrap(),
+        verbatim
+    );
+    let raw_explicit = resolve_windows_release_child_current_directory(Some(&raw), &verbatim)
+        .expect_err("an explicit noncanonical cwd must retain the strict caller contract");
+    assert_eq!(raw_explicit.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        raw_explicit.to_string(),
+        "Windows release child current directory is redirected"
+    );
+
+    let component = verbatim.join("cwd-component");
+    fs::create_dir(&component).unwrap();
+    let lexical_redirect = component.join("..");
+    let lexical_error =
+        resolve_windows_release_child_current_directory(Some(&lexical_redirect), &verbatim)
+            .expect_err("an explicit lexical cwd redirect must be rejected");
+    assert_eq!(lexical_error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        lexical_error.to_string(),
+        "Windows release child current directory is redirected"
+    );
+
+    let substitute = verbatim.join("cwd-substitute");
+    symlink_dir(&component, &substitute)
+        .expect("Windows hosted verifier must permit its cwd substitution fixture");
+    let substitution_error =
+        resolve_windows_release_child_current_directory(Some(&substitute), &verbatim)
+            .expect_err("an explicit substituted cwd must be rejected");
+    assert_eq!(substitution_error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        substitution_error.to_string(),
+        "Windows release child current directory is redirected"
+    );
+}
+
+#[test]
+fn writable_path_presentation_accepts_only_same_identity_verbatim_drive_authorities() {
+    let fixture = Fixture::new("writable-presentation-identity");
+    let presentation = child_presentation(&fixture.root);
+    assert!(!presentation.to_string_lossy().starts_with(r"\\?\"));
+    assert_eq!(fs::canonicalize(&presentation).unwrap(), fixture.root);
+
+    let raw = presentation.clone();
+    assert!(windows_child_path_presentation_for_integration(&raw).is_err());
+    assert!(
+        windows_child_path_presentation_for_integration(Path::new(r"\\?\UNC\server\share"))
+            .is_err()
+    );
+    assert!(windows_child_path_presentation_for_integration(Path::new(r"\\.\C:\device")).is_err());
+
+    let component = fixture.root.join("presentation-component");
+    fs::create_dir(&component).unwrap();
+    assert!(windows_child_path_presentation_for_integration(&component.join("..")).is_err());
+    let substitute = fixture.root.join("presentation-substitute");
+    symlink_dir(&component, &substitute).unwrap();
+    assert!(windows_child_path_presentation_for_integration(&substitute).is_err());
 }
 
 #[test]
@@ -276,6 +442,141 @@ fn mapped_cargo_identity_launch_is_target_free_and_keeps_system_root() {
 }
 
 #[test]
+fn git_authority_preserves_three_real_argv_and_current_directory_contracts() {
+    let mut fixture = Fixture::new("git-authority");
+    let git = fixture.bind_real_git();
+    let receipt = git.version_receipt();
+    assert!(receipt.version.starts_with("git version "));
+    assert!(receipt.stdout_bytes <= 256);
+    assert_eq!(receipt.stderr_bytes, 0);
+    assert!(receipt.termination_reaped);
+    let restricted_entries = std::env::split_paths(&fixture.restricted_path).collect::<Vec<_>>();
+    assert_eq!(
+        restricted_entries
+            .iter()
+            .filter(|entry| entry.as_path() == git.directory_for_integration())
+            .count(),
+        1
+    );
+
+    let tracked_checkout = fixture.root.join("tracked-checkout");
+    let manifest_root = fixture.root.join("manifest-root");
+    fs::create_dir(&tracked_checkout).unwrap();
+    fs::create_dir(&manifest_root).unwrap();
+    let tracked_checkout = fs::canonicalize(tracked_checkout).unwrap();
+    let manifest_root = fs::canonicalize(manifest_root).unwrap();
+    let inherited_root = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let policy = fixture.launch_policy("git-authority-adapter.exe").unwrap();
+    let cases = [
+        (
+            vec![OsString::from("init"), OsString::from("--quiet")],
+            Some(tracked_checkout.as_path()),
+            tracked_checkout.as_path(),
+        ),
+        (
+            vec![
+                OsString::from("ls-files"),
+                OsString::from("-z"),
+                OsString::from("--"),
+                OsString::from("fixtures/v1"),
+            ],
+            Some(manifest_root.as_path()),
+            manifest_root.as_path(),
+        ),
+        (
+            vec![
+                OsString::from("check-ref-format"),
+                OsString::from("--branch"),
+                OsString::from("main"),
+            ],
+            None,
+            inherited_root.as_path(),
+        ),
+    ];
+    for (arguments, configured_directory, expected_directory) in cases {
+        let mut command = Command::new("git");
+        command.args(&arguments);
+        if let Some(directory) = configured_directory {
+            command.current_dir(directory);
+        }
+        policy.apply_unbound_windows_command(&mut command).unwrap();
+        let request = parse_windows_release_child_request(release_child_fields(&command)).unwrap();
+        assert_eq!(request.current_directory(), expected_directory);
+        assert_eq!(
+            request.target_arguments(),
+            std::iter::once(git.program_for_integration().as_os_str().to_os_string())
+                .chain(arguments)
+                .collect::<Vec<_>>()
+        );
+        let path = request
+            .environment()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("PATH")))
+            .map(|(_, value)| value)
+            .unwrap();
+        assert_eq!(path, &fixture.restricted_path);
+    }
+
+    let wrong_git = fixture.root.join("substituted/git.exe");
+    fs::create_dir_all(wrong_git.parent().unwrap()).unwrap();
+    fs::copy(git.program_for_integration(), &wrong_git).unwrap();
+    let wrong_git = fs::canonicalize(wrong_git).unwrap();
+    let mut wrong = Command::new(wrong_git);
+    wrong.args(["check-ref-format", "--branch", "main"]);
+    assert!(policy.apply_unbound_windows_command(&mut wrong).is_err());
+}
+
+#[test]
+fn git_requests_reject_missing_duplicate_and_reparse_authority() {
+    let fixture = Fixture::new("git-missing");
+    let policy = fixture.launch_policy("git-missing-adapter.exe").unwrap();
+    let mut missing = Command::new("git");
+    missing.args(["init", "--quiet"]).current_dir(&fixture.root);
+    assert!(policy.apply_unbound_windows_command(&mut missing).is_err());
+
+    let (git, pathext, system_root) = real_git_parent_authorities();
+    let git_directory = git.parent().unwrap();
+    let system32 = system_root.join("System32");
+    let duplicate = std::env::join_paths([
+        git_directory,
+        git_directory,
+        system32.as_path(),
+        system_root.as_path(),
+    ])
+    .unwrap();
+    let execution_deadline = Instant::now().checked_add(Duration::from_secs(10)).unwrap();
+    let completion_deadline = execution_deadline
+        .checked_add(Duration::from_secs(10))
+        .unwrap();
+    assert!(
+        WindowsGitExecutableAuthority::resolve_until(
+            &duplicate,
+            &pathext,
+            system_root.as_os_str(),
+            execution_deadline,
+            completion_deadline,
+        )
+        .is_err()
+    );
+
+    let reparse = fixture.root.join("git-reparse");
+    symlink_dir(git_directory, &reparse).unwrap();
+    let redirected =
+        std::env::join_paths([reparse.as_path(), system32.as_path(), system_root.as_path()])
+            .unwrap();
+    assert!(
+        WindowsGitExecutableAuthority::resolve_until(
+            &redirected,
+            &pathext,
+            system_root.as_os_str(),
+            execution_deadline,
+            completion_deadline,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn mapped_cargo_build_target_is_subcommand_scoped_and_cannot_be_replaced() {
     let fixture = Fixture::new("mapped-target-authority");
     let policy = fixture.launch_policy("hell-test-helper.exe").unwrap();
@@ -314,13 +615,17 @@ fn mapped_cargo_build_target_is_subcommand_scoped_and_cannot_be_replaced() {
     let mut fields = release_child_fields(&valid);
     let environment_count = fields[2].to_str().unwrap().parse::<usize>().unwrap();
     let target_arguments = 3 + environment_count * 2;
+    let target_presentation = child_presentation(&fixture.root);
     assert_eq!(fields[target_arguments], fixture.staged_cargo);
     assert_eq!(fields[target_arguments + 1], OsStr::new("build"));
     assert_eq!(fields[target_arguments + 2], OsStr::new("--target-dir"));
-    assert_eq!(fields[target_arguments + 3], fixture.root);
+    assert_eq!(fields[target_arguments + 3], target_presentation);
     assert_eq!(fields[target_arguments + 4], OsStr::new("--release"));
     let exact = parse_windows_release_child_request(fields.clone()).unwrap();
-    assert_eq!(exact.cargo_release_target(), Some(fixture.root.as_path()));
+    assert_eq!(
+        exact.cargo_release_target(),
+        Some(target_presentation.as_path())
+    );
 
     fields[target_arguments + 3] = fixture.root.join("replacement").into_os_string();
     assert!(parse_windows_release_child_request(fields).is_err());
@@ -342,15 +647,16 @@ fn mapped_cargo_test_target_binding_rejects_duplicates_and_environment_conflicts
     let fields = release_child_fields(&valid);
     let environment_count = fields[2].to_str().unwrap().parse::<usize>().unwrap();
     let target_arguments = 3 + environment_count * 2;
+    let target_presentation = child_presentation(&fixture.root);
     assert_eq!(fields[target_arguments], fixture.staged_cargo);
     assert_eq!(fields[target_arguments + 1], OsStr::new("test"));
     assert_eq!(fields[target_arguments + 2], OsStr::new("--target-dir"));
-    assert_eq!(fields[target_arguments + 3], fixture.root);
+    assert_eq!(fields[target_arguments + 3], target_presentation);
     parse_windows_release_child_request(fields.clone()).unwrap();
 
     let mut duplicate = fields.clone();
     duplicate.push(OsString::from("--target-dir"));
-    duplicate.push(fixture.root.as_os_str().to_owned());
+    duplicate.push(target_presentation.into_os_string());
     assert!(parse_windows_release_child_request(duplicate).is_err());
 
     let mut duplicate_equals = fields.clone();
@@ -367,6 +673,90 @@ fn mapped_cargo_test_target_binding_rejects_duplicates_and_environment_conflicts
     conflicting_environment[target_environment + 1] =
         fixture.root.join("replacement").into_os_string();
     assert!(parse_windows_release_child_request(conflicting_environment).is_err());
+}
+
+#[test]
+fn mapped_cargo_build_presents_every_writable_child_path_without_verbatim_syntax() {
+    let fixture = Fixture::new("mapped-native-tool-presentations");
+    let policy = fixture.launch_policy("hell-test-helper.exe").unwrap();
+    let environment_root = fixture.root.join("release-child-environment");
+    let home = environment_root.join("home");
+    let cargo = environment_root.join("cargo");
+    let sccache = environment_root.join("sccache");
+    let mut command = Command::new(&fixture.cargo_proxy);
+    command.args(["test", "--workspace", "--locked"]).envs([
+        ("HOME", home.as_os_str()),
+        ("USERPROFILE", home.as_os_str()),
+        ("CARGO_HOME", cargo.as_os_str()),
+        ("SCCACHE_DIR", sccache.as_os_str()),
+    ]);
+    policy.apply_unbound_windows_command(&mut command).unwrap();
+    let request = parse_windows_release_child_request(release_child_fields(&command)).unwrap();
+    let environment = request
+        .environment()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().to_ascii_uppercase(),
+                PathBuf::from(value),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let canonical_target = fs::canonicalize(&fixture.root).unwrap();
+    for name in [
+        "CARGO_TARGET_DIR",
+        "HOME",
+        "USERPROFILE",
+        "CARGO_HOME",
+        "SCCACHE_DIR",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    ] {
+        let value = &environment[name];
+        assert!(value.is_absolute(), "{name} presentation is relative");
+        assert!(
+            !value.to_string_lossy().starts_with(r"\\?\"),
+            "{name} retained verbatim syntax: {value:?}"
+        );
+        assert!(
+            fs::canonicalize(value)
+                .unwrap()
+                .starts_with(&canonical_target),
+            "{name} escaped the target authority"
+        );
+    }
+    assert_eq!(environment["HOME"], environment["USERPROFILE"]);
+    assert_eq!(environment["TEMP"], environment["TMP"]);
+    assert_eq!(environment["TEMP"], environment["TMPDIR"]);
+    assert_eq!(
+        request.target_arguments()[3],
+        environment["CARGO_TARGET_DIR"]
+    );
+}
+
+#[test]
+fn mapped_cargo_build_rejects_writable_environment_substitution_and_reparse() {
+    let fixture = Fixture::new("mapped-native-tool-presentation-negatives");
+    let policy = fixture.launch_policy("hell-test-helper.exe").unwrap();
+    let environment_root = fixture.root.join("release-child-environment");
+    let substitute = fixture.root.join("cargo-substitute");
+    fs::create_dir(&substitute).unwrap();
+
+    let mut changed = Command::new(&fixture.cargo_proxy);
+    changed
+        .arg("build")
+        .env("CARGO_HOME", substitute.as_os_str());
+    assert!(policy.apply_unbound_windows_command(&mut changed).is_err());
+
+    fs::create_dir_all(&environment_root).unwrap();
+    let redirected = environment_root.join("cargo");
+    symlink_dir(&substitute, &redirected).unwrap();
+    let mut reparse = Command::new(&fixture.cargo_proxy);
+    reparse
+        .arg("build")
+        .env("CARGO_HOME", redirected.as_os_str());
+    assert!(policy.apply_unbound_windows_command(&mut reparse).is_err());
 }
 
 #[test]

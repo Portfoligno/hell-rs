@@ -22,6 +22,37 @@ mod report;
 mod repository;
 mod strict_toml;
 
+#[cfg(target_os = "linux")]
+pub const LINUX_BASE_INVENTORY_SUITE_EXECUTION_BUDGET: std::time::Duration =
+    release::platform::LINUX_BASE_INVENTORY_SUITE_EXECUTION_BUDGET;
+#[cfg(target_os = "linux")]
+pub const LINUX_BASE_INVENTORY_SUITE_COMPLETION_RESERVE: std::time::Duration =
+    release::platform::LINUX_BASE_INVENTORY_SUITE_COMPLETION_RESERVE;
+
+#[doc(hidden)]
+pub fn native_environment_external_inputs_sha256_for_integration(
+    path: &Path,
+) -> Result<String, String> {
+    release::native_environment::external_inputs_sha256(path)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsNativeGhcIntegrationReceipt {
+    pub parsed_version: String,
+    pub executable_sha256: String,
+    pub output_sha256: String,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_native_ghc_authority_for_integration(
+    external_inputs: &Path,
+) -> Result<WindowsNativeGhcIntegrationReceipt, String> {
+    release::native_environment::windows_native_ghc_authority_for_integration(external_inputs)
+}
+
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -629,6 +660,39 @@ fn dispatch_supervisor_verifications(
             }
         };
     }
+    dispatch_command_capture_children(arguments)
+}
+
+fn dispatch_command_capture_children(arguments: Vec<OsString>) -> ExitCode {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__ambient-candidate-capture-fixture")
+    {
+        if arguments.len() != 1 {
+            eprintln!("ambient-candidate capture fixture accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        println!("ambient-candidate-captured-stdout");
+        eprintln!("ambient-candidate-captured-stderr");
+        return ExitCode::SUCCESS;
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-ambient-candidate-command-capture")
+    {
+        if arguments.len() != 1 {
+            eprintln!("ambient-candidate command capture verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_ambient_candidate_command_capture_for_integration() {
+            Ok(receipt) => {
+                println!("{}", receipt.encoded());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     dispatch_portability_children(arguments)
 }
 
@@ -656,7 +720,10 @@ fn dispatch_portability_children(arguments: Vec<OsString>) -> ExitCode {
         == Some("__verify-native-archive-broker-descendant-launcher")
     {
         return match command::verify_native_archive_broker_descendant_launcher(&arguments[1..]) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(receipt) => {
+                print!("{}", receipt.render());
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 eprintln!("{error}");
                 ExitCode::FAILURE
@@ -668,6 +735,22 @@ fn dispatch_portability_children(arguments: Vec<OsString>) -> ExitCode {
         == Some("__verify-native-archive-broker-descendant-consumer")
     {
         return match command::verify_native_archive_broker_descendant_consumer(&arguments[1..]) {
+            Ok(receipt) => {
+                print!("{}", receipt.render());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__native-archive-descriptor-client-v2")
+    {
+        return match command::run_native_archive_descriptor_client_for_integration(&arguments[1..])
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
@@ -869,6 +952,18 @@ fn dispatch_posix_authority_verifications(arguments: Vec<OsString>) -> ExitCode 
 }
 
 fn dispatch_posix_candidate_verifications(arguments: Vec<OsString>) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(exit) = dispatch_linux_base_inventory_failure_evidence(&arguments) {
+        return exit;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(exit) = dispatch_linux_base_inventory_verification(&arguments) {
+        return exit;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(exit) = dispatch_derived_archive_broker_staging_verification(&arguments) {
+        return exit;
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-posix-candidate-driver-receipt")
@@ -891,7 +986,11 @@ fn dispatch_posix_candidate_verifications(arguments: Vec<OsString>) -> ExitCode 
             eprintln!("POSIX candidate target verification accepts no arguments");
             return ExitCode::FAILURE;
         }
-        return match release::platform::verify_posix_candidate_target_authority_for_integration() {
+        let result = release::platform::verify_posix_candidate_target_authority_for_integration();
+        #[cfg(target_os = "macos")]
+        return finish_macos_native_archive_verifier("candidate-target", result);
+        #[cfg(target_os = "linux")]
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
@@ -951,7 +1050,113 @@ fn dispatch_posix_candidate_verifications(arguments: Vec<OsString>) -> ExitCode 
     dispatch_tool_resolution_verifications(arguments)
 }
 
+#[cfg(target_os = "linux")]
+fn dispatch_linux_base_inventory_failure_evidence(arguments: &[OsString]) -> Option<ExitCode> {
+    if arguments.first().and_then(|value| value.to_str())
+        != Some("__verify-linux-base-inventory-failure-evidence")
+    {
+        return None;
+    }
+    let [_, root] = arguments else {
+        eprintln!("Linux base inventory failure-evidence verification requires one root");
+        return Some(ExitCode::FAILURE);
+    };
+    Some(
+        match policy::verify_base_repository_inventory_failure_evidence_for_integration(Path::new(
+            root,
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_derived_archive_broker_staging_verification(
+    arguments: &[OsString],
+) -> Option<ExitCode> {
+    if arguments.first().and_then(|value| value.to_str())
+        != Some("__verify-derived-archive-broker-staging-authority-v1")
+    {
+        return None;
+    }
+    if arguments.len() != 1 {
+        eprintln!("derived archive broker staging authority v1 accepts no arguments");
+        return Some(ExitCode::FAILURE);
+    }
+    Some(
+        match release::platform::verify_derived_archive_broker_staging_authority_v1_for_integration(
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_linux_base_inventory_verification(arguments: &[OsString]) -> Option<ExitCode> {
+    if arguments.first().and_then(|value| value.to_str())
+        != Some("__verify-linux-base-inventory-candidate-scope")
+    {
+        return None;
+    }
+    if arguments.len() > 2 {
+        eprintln!("Linux base inventory candidate-scope verification accepts one scenario");
+        return Some(ExitCode::FAILURE);
+    }
+    if arguments.get(1).and_then(|value| value.to_str()) == Some("suite-v1") {
+        return Some(
+            match release::platform::verify_linux_base_inventory_candidate_scope_suite_v1_for_integration(
+            ) {
+                Ok(receipt) => {
+                    println!("{}", receipt.trim_end());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            },
+        );
+    }
+    Some(
+        match release::platform::verify_linux_base_inventory_candidate_scope_for_integration(
+            arguments.get(1).map(OsString::as_os_str),
+        ) {
+            Ok(receipt) => {
+                println!("{}", receipt.trim_end());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
+    )
+}
+
 fn dispatch_tool_resolution_verifications(arguments: Vec<OsString>) -> ExitCode {
+    #[cfg(unix)]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__verify-fuzz-toolchain-command")
+    {
+        if arguments.len() != 1 {
+            eprintln!("fuzz toolchain command verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match fuzz::verify_fuzz_toolchain_command_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__verify-cargo-multicall-argv") {
         if arguments.len() != 1 {
@@ -1027,6 +1232,24 @@ fn dispatch_tool_resolution_verifications(arguments: Vec<OsString>) -> ExitCode 
 }
 
 fn dispatch_macos_archive_verifications(arguments: Vec<OsString>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__native-archiver-search-only-child")
+    {
+        if arguments.len() != 2 {
+            eprintln!("native archiver search-only child requires STAGING_ROOT");
+            return ExitCode::FAILURE;
+        }
+        return match command::verify_native_archive_search_only_child_for_integration(Path::new(
+            &arguments[1],
+        )) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(target_os = "macos")]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__verify-macos-native-archiver-acquisition")
@@ -1135,6 +1358,10 @@ fn dispatch_native_archive_ghc_verifications(arguments: Vec<OsString>) -> ExitCo
 }
 
 fn dispatch_archive_policy_verifications(arguments: Vec<OsString>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(status) = dispatch_native_archive_descriptor_verification(&arguments) {
+        return status;
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str()) == Some("__verify-native-archive-policy")
     {
@@ -1223,6 +1450,203 @@ fn dispatch_archive_policy_verifications(arguments: Vec<OsString>) -> ExitCode {
             }
         };
     }
+    dispatch_supervision_children(arguments)
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_native_archive_descriptor_verification(arguments: &[OsString]) -> Option<ExitCode> {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-native-archive-broker-terminal-receipts")
+    {
+        let [base] = &arguments[1..] else {
+            eprintln!("native archive broker terminal-receipt verification requires one base path");
+            return Some(ExitCode::FAILURE);
+        };
+        return Some(
+            match command::verify_native_archive_broker_descendant_receipt_for_integration()
+                .and_then(|()| {
+                    command::verify_native_archive_limit_rejection_receipt_for_integration(
+                        Path::new(base),
+                    )
+                })
+                .and_then(|()| {
+                    release::platform::verify_fake_archive_broker_observer_for_integration()
+                }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            },
+        );
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        != Some("__verify-native-archive-descriptor-broker-v2")
+    {
+        return None;
+    }
+    let [base] = &arguments[1..] else {
+        eprintln!("native archive descriptor broker verification requires one base path");
+        return Some(ExitCode::FAILURE);
+    };
+    Some(finish_macos_native_archive_verifier(
+        "descriptor-broker-v2",
+        command::verify_native_archive_descriptor_broker_for_integration(Path::new(base)),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_NATIVE_ARCHIVE_TERMINAL_PREFIX: &str = "hell-ci-macos-native-archive-terminal-v2:";
+#[cfg(target_os = "macos")]
+const MACOS_NATIVE_ARCHIVE_PRIMARY_LIMIT: usize = 192;
+
+#[cfg(target_os = "macos")]
+fn finish_macos_native_archive_verifier(
+    verifier: &'static str,
+    result: Result<(), String>,
+) -> ExitCode {
+    let (state, primary, status) = match result {
+        Ok(()) => ("passed", String::new(), ExitCode::SUCCESS),
+        Err(primary) => ("failed", primary, ExitCode::FAILURE),
+    };
+    if !primary.is_empty() {
+        eprintln!("{primary}");
+    }
+    match encode_macos_native_archive_terminal_receipt(verifier, state, &primary) {
+        Ok(receipt) => eprintln!("{MACOS_NATIVE_ARCHIVE_TERMINAL_PREFIX}{receipt}"),
+        Err(error) => {
+            eprintln!("cannot encode macOS native archive terminal receipt: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    status
+}
+
+#[cfg(target_os = "macos")]
+fn encode_macos_native_archive_terminal_receipt(
+    verifier: &'static str,
+    state: &'static str,
+    primary: &str,
+) -> Result<String, String> {
+    let mut end = primary.len().min(MACOS_NATIVE_ARCHIVE_PRIMARY_LIMIT);
+    while !primary.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let bounded = &primary[..end];
+    let receipt = crate::json::JsonValue::Object(std::collections::BTreeMap::from([
+        (
+            "primary".to_owned(),
+            crate::json::JsonValue::String(bounded.to_owned()),
+        ),
+        (
+            "primaryBytes".to_owned(),
+            crate::json::JsonValue::Number(u64::try_from(primary.len()).unwrap_or(u64::MAX)),
+        ),
+        (
+            "primarySha256".to_owned(),
+            crate::json::JsonValue::String(hell_testkit::sha256_bytes(primary.as_bytes()).hex()),
+        ),
+        (
+            "primaryTruncated".to_owned(),
+            crate::json::JsonValue::Bool(bounded.len() != primary.len()),
+        ),
+        (
+            "schemaVersion".to_owned(),
+            crate::json::JsonValue::Number(2),
+        ),
+        (
+            "state".to_owned(),
+            crate::json::JsonValue::String(state.to_owned()),
+        ),
+        ("terminal".to_owned(), crate::json::JsonValue::Bool(true)),
+        (
+            "verifier".to_owned(),
+            crate::json::JsonValue::String(verifier.to_owned()),
+        ),
+    ]));
+    let mut encoded = crate::json::canonical_json_bytes(&receipt)?;
+    if encoded.pop() != Some(b'\n') {
+        return Err("canonical JSON terminal receipt is not newline-terminated".to_owned());
+    }
+    String::from_utf8(encoded)
+        .map_err(|_| "canonical JSON terminal receipt is not UTF-8".to_owned())
+}
+
+fn dispatch_supervision_children(arguments: Vec<OsString>) -> ExitCode {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-assurance-command-failure-receipts")
+    {
+        if arguments.len() != 1 {
+            eprintln!("assurance command failure receipt verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match mutation::verify_assurance_command_failure_receipts_for_integration() {
+            Ok(summary) => {
+                println!("{summary}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-assurance-command-failure-receipt-child")
+    {
+        if arguments.len() != 2 {
+            eprintln!("assurance command failure receipt child requires one mode");
+            return ExitCode::FAILURE;
+        }
+        return arguments[1].to_str().map_or(ExitCode::FAILURE, |mode| {
+            mutation::run_assurance_receipt_child_for_integration(mode)
+        });
+    }
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-assurance-supervision-timeout-child")
+    {
+        if arguments.len() != 1 {
+            eprintln!("assurance supervision timeout child accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+    dispatch_msvc_children(arguments)
+}
+
+fn dispatch_msvc_children(arguments: Vec<OsString>) -> ExitCode {
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-msvc-discovery-primary-deadline")
+    {
+        if arguments.len() != 1 {
+            eprintln!("MSVC discovery deadline verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::native_environment::verify_msvc_primary_deadline_expiry_for_integration()
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if arguments.first().and_then(|value| value.to_str()) == Some("__verify-msvc-discovery-policy")
+    {
+        if arguments.len() != 1 {
+            eprintln!("MSVC discovery policy verification accepts no arguments");
+            return ExitCode::FAILURE;
+        }
+        return match release::native_environment::verify_msvc_discovery_for_integration() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     dispatch_platform_children(arguments)
 }
 
@@ -1270,6 +1694,22 @@ fn dispatch_platform_children(arguments: Vec<OsString>) -> ExitCode {
         == Some("__repository-inventory-target-stderr-child")
     {
         return release::platform::run_repository_inventory_target_stderr_child(&arguments[1..]);
+    }
+    #[cfg(windows)]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__verify-base-repository-inventory-authority")
+    {
+        let [_, root] = arguments.as_slice() else {
+            eprintln!("base repository inventory verifier requires one root path");
+            return ExitCode::FAILURE;
+        };
+        return match policy::verify_base_repository_inventory_for_integration(Path::new(root)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())

@@ -5,13 +5,20 @@ use std::fs;
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hell_testkit::{
-    WindowsCargoReleaseReceipt, WindowsReleaseBinaryCheckpoint, encode_windows_argv,
-    prepare_windows_cargo_release_receipt, publish_windows_cargo_release_receipt,
+    BoundedCapture, SupervisedOutput, WindowsCargoReleaseReceipt, WindowsReleaseBinaryCheckpoint,
+    cleanup_windows_release_child_temp_authority, encode_windows_argv,
+    parse_windows_release_child_request, prepare_windows_cargo_release_receipt,
+    publish_windows_cargo_release_receipt, run_supervised_command_until,
     windows_release_child_request_fields_for_integration,
 };
+
+static CHILD_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+const CHILD_EXECUTION_BUDGET: Duration = Duration::from_secs(30);
+const CHILD_COMPLETION_RESERVE: Duration = Duration::from_secs(15);
 
 struct Fixture {
     root: PathBuf,
@@ -20,20 +27,36 @@ struct Fixture {
 
 fn release_child_output(
     current_directory: &std::path::Path,
-    environment: Vec<(OsString, OsString)>,
-    target_arguments: Vec<OsString>,
-) -> std::process::Output {
+    environment: &[(OsString, OsString)],
+    target_arguments: &[OsString],
+) -> SupervisedOutput {
+    let mut environment = environment.to_vec();
+    if let Some(target) = environment
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(OsStr::new("CARGO_TARGET_DIR")))
+        .map(|(_, value)| PathBuf::from(value))
+    {
+        let parent = target.join("release-child-environment").join("tmp");
+        fs::create_dir_all(&parent).unwrap();
+        let sequence = CHILD_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!("child-{}-{sequence}", std::process::id()));
+        fs::create_dir(&temporary).unwrap();
+        environment.extend(
+            ["TEMP", "TMP", "TMPDIR"]
+                .map(|name| (OsString::from(name), temporary.as_os_str().to_owned())),
+        );
+    }
     let fields = windows_release_child_request_fields_for_integration(
         current_directory,
         environment,
-        &target_arguments,
+        target_arguments,
     )
     .unwrap();
     let encoded = encode_windows_argv(&fields).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_hell-test-helper"))
-        .args([OsStr::new("__release-argv-child"), encoded.as_os_str()])
-        .output()
-        .unwrap()
+    let helper = fs::canonicalize(env!("CARGO_BIN_EXE_hell-test-helper")).unwrap();
+    let mut command = Command::new(helper);
+    command.args([OsStr::new("__release-argv-child"), encoded.as_os_str()]);
+    run_terminal_command(&mut command)
 }
 
 fn system_root_environment() -> Vec<(OsString, OsString)> {
@@ -42,27 +65,136 @@ fn system_root_environment() -> Vec<(OsString, OsString)> {
         .unwrap_or_default()
 }
 
+fn exact_cargo_arguments(cargo: &std::path::Path, target: &std::path::Path) -> Vec<OsString> {
+    [
+        cargo.as_os_str().to_owned(),
+        OsString::from("build"),
+        OsString::from("--target-dir"),
+        target.as_os_str().to_owned(),
+        OsString::from("--release"),
+        OsString::from("--locked"),
+        OsString::from("--package"),
+        OsString::from("hell-cli"),
+        OsString::from("--bin"),
+        OsString::from("hell"),
+        OsString::from("--features"),
+        OsString::from("compat-tracing"),
+    ]
+    .into()
+}
+
+fn cargo_child_fields(fixture: &Fixture) -> (Vec<OsString>, PathBuf) {
+    let helper = fs::canonicalize(env!("CARGO_BIN_EXE_hell-test-helper")).unwrap();
+    let cargo_directory = fixture.root.join(format!(
+        "cargo-fields-{}",
+        CHILD_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&cargo_directory).unwrap();
+    let cargo = cargo_directory.join("cargo.exe");
+    fs::copy(helper, &cargo).unwrap();
+    let cargo = fs::canonicalize(cargo).unwrap();
+    let target = fixture.root.join(format!(
+        "fields-target-{}",
+        CHILD_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&target).unwrap();
+    let target = fs::canonicalize(target).unwrap();
+    let parent = target.join("release-child-environment").join("tmp");
+    fs::create_dir_all(&parent).unwrap();
+    let temporary = parent.join(format!(
+        "child-{}-{}",
+        std::process::id(),
+        CHILD_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&temporary).unwrap();
+    let temporary = fs::canonicalize(temporary).unwrap();
+    let mut environment = system_root_environment();
+    environment.push((
+        OsString::from("CARGO_TARGET_DIR"),
+        target.as_os_str().to_owned(),
+    ));
+    environment.push((OsString::from("SOURCE_DATE_EPOCH"), OsString::from("1")));
+    environment.extend(
+        ["TEMP", "TMP", "TMPDIR"]
+            .map(|name| (OsString::from(name), temporary.as_os_str().to_owned())),
+    );
+    let fields = windows_release_child_request_fields_for_integration(
+        &fixture.root,
+        environment,
+        &exact_cargo_arguments(&cargo, &target),
+    )
+    .unwrap();
+    (fields, temporary)
+}
+
+fn release_child_output_from_fields(fields: &[OsString]) -> SupervisedOutput {
+    let encoded = encode_windows_argv(fields).unwrap();
+    let helper = fs::canonicalize(env!("CARGO_BIN_EXE_hell-test-helper")).unwrap();
+    let mut command = Command::new(helper);
+    command.args([OsStr::new("__release-argv-child"), encoded.as_os_str()]);
+    run_terminal_command(&mut command)
+}
+
+fn run_terminal_command(command: &mut Command) -> SupervisedOutput {
+    let execution_deadline = Instant::now()
+        .checked_add(CHILD_EXECUTION_BUDGET)
+        .expect("Windows checkpoint execution deadline overflowed");
+    let completion_deadline = execution_deadline
+        .checked_add(CHILD_COMPLETION_RESERVE)
+        .expect("Windows checkpoint completion deadline overflowed");
+    let output =
+        run_supervised_command_until(command, &[], execution_deadline, completion_deadline, None)
+            .expect("supervise Windows checkpoint command");
+    assert!(!output.timed_out, "Windows checkpoint command timed out");
+    assert!(
+        output
+            .termination
+            .as_ref()
+            .is_some_and(|termination| termination.reaped),
+        "Windows checkpoint command was not reaped"
+    );
+    let mut previous = None;
+    for expected in [
+        "leader-exited",
+        "tree-terminated",
+        "quiescence-complete",
+        "stdout-joined",
+        "stderr-joined",
+        "stdin-joined",
+    ] {
+        let position = output
+            .phase_timings
+            .iter()
+            .position(|phase| phase.name == expected)
+            .unwrap_or_else(|| panic!("Windows checkpoint command lacks {expected} receipt"));
+        assert!(
+            previous.is_none_or(|previous| previous < position),
+            "Windows checkpoint command receipt order differs at {expected}"
+        );
+        previous = Some(position);
+    }
+    assert_eq!(
+        output.phase_timings.last().map(|phase| phase.name),
+        Some("stdin-joined")
+    );
+    output
+}
+
+fn complete_capture(capture: &BoundedCapture) -> &[u8] {
+    assert!(
+        !capture.truncated,
+        "Windows checkpoint capture was truncated"
+    );
+    capture
+        .complete
+        .as_deref()
+        .expect("Windows checkpoint capture is incomplete")
+}
+
 #[test]
 fn restricted_helper_publishes_receipt_only_for_successful_exact_cargo_artifact() {
     let fixture = Fixture::new();
     let helper = fs::canonicalize(env!("CARGO_BIN_EXE_hell-test-helper")).unwrap();
-    let exact_arguments = |cargo: &std::path::Path, target: &std::path::Path| {
-        [
-            cargo.as_os_str().to_owned(),
-            OsString::from("build"),
-            OsString::from("--target-dir"),
-            target.as_os_str().to_owned(),
-            OsString::from("--release"),
-            OsString::from("--locked"),
-            OsString::from("--package"),
-            OsString::from("hell-cli"),
-            OsString::from("--bin"),
-            OsString::from("hell"),
-            OsString::from("--features"),
-            OsString::from("compat-tracing"),
-        ]
-        .into()
-    };
     let environment = |target: &std::path::Path| {
         let mut environment = system_root_environment();
         environment.push((
@@ -83,12 +215,12 @@ fn restricted_helper_publishes_receipt_only_for_successful_exact_cargo_artifact(
     let target = fs::canonicalize(target).unwrap();
     let successful = release_child_output(
         &fixture.root,
-        environment(&target),
-        exact_arguments(&cargo, &target),
+        &environment(&target),
+        &exact_cargo_arguments(&cargo, &target),
     );
     assert!(successful.status.success());
     assert!(
-        String::from_utf8(successful.stderr)
+        String::from_utf8(complete_capture(&successful.stderr).to_vec())
             .unwrap()
             .contains("windows argv adapter phase=release-target-attested")
     );
@@ -105,8 +237,8 @@ fn restricted_helper_publishes_receipt_only_for_successful_exact_cargo_artifact(
     assert!(
         !release_child_output(
             &fixture.root,
-            environment(&missing_target),
-            exact_arguments(&no_output_cargo, &missing_target),
+            &environment(&missing_target),
+            &exact_cargo_arguments(&no_output_cargo, &missing_target),
         )
         .status
         .success()
@@ -120,8 +252,8 @@ fn restricted_helper_publishes_receipt_only_for_successful_exact_cargo_artifact(
     assert!(
         release_child_output(
             &fixture.root,
-            system_root_environment(),
-            vec![
+            &system_root_environment(),
+            &[
                 fs::canonicalize(stack).unwrap().into_os_string(),
                 OsString::from("__windows-status-zero"),
             ],
@@ -130,6 +262,78 @@ fn restricted_helper_publishes_receipt_only_for_successful_exact_cargo_artifact(
         .success()
     );
     assert!(WindowsCargoReleaseReceipt::load(&unrelated_target).is_err());
+}
+
+#[test]
+fn cargo_child_temp_request_rejects_split_environment_and_identity_substitution() {
+    let fixture = Fixture::new();
+    let (fields, temporary) = cargo_child_fields(&fixture);
+
+    let mut split = fields.clone();
+    let tmpdir = split
+        .iter()
+        .position(|field| field == "TMPDIR")
+        .expect("typed request contains TMPDIR");
+    split[tmpdir + 1] = temporary
+        .parent()
+        .expect("temp authority has parent")
+        .join("sibling")
+        .into_os_string();
+    let error = parse_windows_release_child_request(split).unwrap_err();
+    assert!(error.to_string().contains("temp environment differs"));
+
+    let displaced = temporary.with_file_name("displaced-child-temp");
+    fs::rename(&temporary, &displaced).unwrap();
+    fs::create_dir(&temporary).unwrap();
+    let error = parse_windows_release_child_request(fields).unwrap_err();
+    assert!(error.to_string().contains("serialized identity changed"));
+}
+
+#[test]
+fn cargo_child_temp_cleanup_rejects_unexpected_members_then_receipts_absence() {
+    let fixture = Fixture::new();
+    let (fields, temporary) = cargo_child_fields(&fixture);
+    let request = parse_windows_release_child_request(fields).unwrap();
+    let unexpected = temporary.join("unexpected-linker-member.tmp");
+    fs::write(&unexpected, b"retained").unwrap();
+    let error = cleanup_windows_release_child_temp_authority(&request).unwrap_err();
+    assert!(error.to_string().contains("unexpected member"));
+    fs::remove_file(unexpected).unwrap();
+    cleanup_windows_release_child_temp_authority(&request).unwrap();
+    assert!(!temporary.exists());
+}
+
+#[test]
+fn cargo_child_temp_probe_rejects_a_dacl_without_child_write_authority() {
+    let fixture = Fixture::new();
+    let (fields, temporary) = cargo_child_fields(&fixture);
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let whoami = fs::canonicalize(system_root.join("System32/whoami.exe")).unwrap();
+    let mut command = Command::new(whoami);
+    command.args(["/user", "/fo", "csv", "/nh"]);
+    let identity = run_terminal_command(&mut command);
+    assert!(identity.status.success());
+    let identity = String::from_utf8(complete_capture(&identity.stdout).to_vec()).unwrap();
+    let sid = identity
+        .trim()
+        .split(',')
+        .nth(1)
+        .expect("whoami CSV contains SID")
+        .trim_matches('"');
+    let icacls = fs::canonicalize(system_root.join("System32/icacls.exe")).unwrap();
+    let deny = format!("*{sid}:(F)");
+    let mut command = Command::new(&icacls);
+    command
+        .arg(&temporary)
+        .args(["/inheritance:r", "/deny", &deny]);
+    let denied = run_terminal_command(&mut command);
+    assert!(denied.status.success());
+    let output = release_child_output_from_fields(&fields);
+    let mut command = Command::new(icacls);
+    command.arg(&temporary).arg("/reset");
+    let reset = run_terminal_command(&mut command);
+    assert!(reset.status.success());
+    assert!(!output.status.success());
 }
 
 impl Fixture {
@@ -158,7 +362,7 @@ impl Fixture {
         (target, binary)
     }
 
-    fn receipt(&self, target: &PathBuf) -> WindowsCargoReleaseReceipt {
+    fn receipt(target: &std::path::Path) -> WindowsCargoReleaseReceipt {
         prepare_windows_cargo_release_receipt(target).unwrap();
         publish_windows_cargo_release_receipt(target).unwrap();
         WindowsCargoReleaseReceipt::load(target).unwrap()
@@ -196,7 +400,7 @@ fn release_binary_checkpoint_denies_mutation_and_remains_exact() {
         target.clone(),
         binary.clone(),
         Some(target.clone()),
-        Some(fixture.receipt(&target)),
+        Some(Fixture::receipt(&target)),
         "after release-build",
         true,
     )
@@ -276,7 +480,7 @@ fn release_binary_checkpoint_rejects_missing_and_mismatched_build_receipts() {
     assert!(error.contains("successful restricted Cargo release receipt is absent"));
 
     let (other_target, _) = fixture.artifact("other-receipt-target");
-    let other_receipt = fixture.receipt(&other_target);
+    let other_receipt = Fixture::receipt(&other_target);
     let error = WindowsReleaseBinaryCheckpoint::capture(
         target.clone(),
         binary,
@@ -298,7 +502,7 @@ fn release_binary_checkpoint_rejects_target_binding_mismatch_and_redirect() {
         target.clone(),
         binary,
         Some(other.clone()),
-        Some(fixture.receipt(&target)),
+        Some(Fixture::receipt(&target)),
         "after release-build",
         true,
     )
@@ -433,7 +637,7 @@ fn release_binary_checkpoint_blocks_identity_replacement_and_in_place_mutation()
         target.clone(),
         binary.clone(),
         Some(target.clone()),
-        Some(fixture.receipt(&target)),
+        Some(Fixture::receipt(&target)),
         "after release-build",
         true,
     )
@@ -448,7 +652,7 @@ fn release_binary_checkpoint_blocks_identity_replacement_and_in_place_mutation()
         target.clone(),
         binary.clone(),
         Some(target.clone()),
-        Some(fixture.receipt(&target)),
+        Some(Fixture::receipt(&target)),
         "after release-build",
         true,
     )

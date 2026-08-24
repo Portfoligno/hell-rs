@@ -7,9 +7,11 @@ use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::sync::Arc;
 
+#[cfg(not(windows))]
 mod process_environment;
 mod process_tree;
 
+#[cfg(not(windows))]
 use process_environment::ProcessEnvironment;
 
 #[cfg(unix)]
@@ -32,18 +34,30 @@ impl HostServices {
     /// Captures the current process environment without Unicode conversion.
     #[must_use]
     pub fn process() -> Self {
-        Self::from_environment(ProcessEnvironment::from_process().into_entries())
+        #[cfg(not(windows))]
+        {
+            Self::from_environment(ProcessEnvironment::from_process().into_entries())
+        }
+        #[cfg(windows)]
+        {
+            Self {}
+        }
     }
 
     /// Creates services from an explicit native environment snapshot.
     #[must_use]
+    #[cfg(not(windows))]
     pub fn from_environment(environment: Vec<(OsString, OsString)>) -> Self {
-        #[cfg(windows)]
-        let _ = environment;
         Self {
-            #[cfg(not(windows))]
             environment: environment.into(),
         }
+    }
+
+    /// Creates Windows services without retaining environment overrides.
+    #[must_use]
+    #[cfg(windows)]
+    pub fn from_environment(_environment: &[(OsString, OsString)]) -> Self {
+        Self {}
     }
 
     /// Resolves the platform home directory from the captured environment.

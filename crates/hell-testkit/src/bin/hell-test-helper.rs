@@ -7,8 +7,16 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::ExitStatus;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+use hell_platform::{SupervisedChild, TerminationReport, WaitOutcome};
 
 fn main() -> ExitCode {
     #[cfg(unix)]
@@ -181,6 +189,7 @@ fn run_windows_release_argv_child(arguments: &[OsString]) -> ExitCode {
         let request = hell_testkit::parse_windows_release_child_request(
             hell_testkit::decode_windows_argv(encoded)?,
         )?;
+        hell_testkit::probe_windows_release_child_temp_authority(&request)?;
         let cargo_release_target = request.cargo_release_target().map(Path::to_path_buf);
         if let Some(target) = cargo_release_target.as_deref() {
             hell_testkit::prepare_windows_cargo_release_receipt(target)?;
@@ -357,9 +366,19 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     if command == "spawn-grandchild-and-exit" {
         return spawn_marker_child(arguments, false);
     }
+    if command == "spawn-capture-holder-and-exit" {
+        return spawn_capture_holder_and_exit(arguments);
+    }
+    if command == "hold-inherited-capture-pipes" {
+        return hold_inherited_capture_pipes(arguments);
+    }
     #[cfg(unix)]
     if command == "escape-session-double-fork" {
         return escape_session_double_fork(arguments);
+    }
+    #[cfg(target_os = "linux")]
+    if command == "verify-inherited-supervision-timeout" {
+        return verify_inherited_supervision_timeout(arguments);
     }
     Err(format!(
         "unknown helper subcommand {}",
@@ -398,6 +417,9 @@ fn run_unprofiled_oracle_script(
 
 #[cfg(target_os = "linux")]
 fn escape_session_double_fork(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
+    const CLEANUP_RESERVE: Duration = Duration::from_secs(1);
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
+
     let milliseconds = parse_usize(arguments.next(), "MILLISECONDS")?;
     let marker = arguments
         .next()
@@ -408,21 +430,120 @@ fn escape_session_double_fork(mut arguments: impl Iterator<Item = OsString>) -> 
     // escaping the original process group. Release supervision must sweep the
     // unique candidate UID before joining its capture readers.
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let status = Command::new("/usr/bin/setsid")
+    let mut command = Command::new("/usr/bin/setsid");
+    command
         .arg(executable)
         .arg("spawn-grandchild-and-exit")
         .arg(milliseconds.to_string())
         .arg(marker)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() {
+        .stderr(Stdio::inherit());
+    let started = Instant::now();
+    let completion_deadline = started
+        .checked_add(TOTAL_TIMEOUT)
+        .ok_or_else(|| "setsid fixture completion deadline overflowed".to_owned())?;
+    let execution_deadline = completion_deadline
+        .checked_sub(CLEANUP_RESERVE)
+        .ok_or_else(|| "setsid fixture has no cleanup reserve".to_owned())?;
+    let output = run_inherited_supervised_command_until(
+        &mut command,
+        execution_deadline,
+        completion_deadline,
+    )?;
+    if output.timed_out {
+        Err("setsid fixture exceeded its execution deadline".to_owned())
+    } else if output.status.success() {
         Ok(())
     } else {
-        Err(format!("setsid fixture exited with status {status}"))
+        Err(format!(
+            "setsid fixture exited with status {}",
+            output.status
+        ))
     }
+}
+
+#[cfg(target_os = "linux")]
+struct InheritedSupervisedOutput {
+    status: ExitStatus,
+    timed_out: bool,
+    termination: TerminationReport,
+}
+
+#[cfg(target_os = "linux")]
+fn run_inherited_supervised_command_until(
+    command: &mut Command,
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+) -> Result<InheritedSupervisedOutput, String> {
+    if execution_deadline >= completion_deadline {
+        return Err("inherited supervision has no cleanup reserve".to_owned());
+    }
+    let mut child = SupervisedChild::spawn(command)
+        .map_err(|error| format!("cannot spawn inherited supervised child: {error}"))?;
+    let wait = child.wait_until(execution_deadline);
+    let cleanup = child.terminate_until(completion_deadline);
+    match (wait, cleanup) {
+        (Err(primary), Ok((_, termination))) if termination.reaped => Err(format!(
+            "cannot wait for inherited supervised child: {primary}"
+        )),
+        (Err(primary), Ok((_, _))) => Err(format!(
+            "cannot wait for inherited supervised child: {primary}; cleanup did not reap the leader"
+        )),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "cannot wait for inherited supervised child: {primary}; cleanup also failed: {cleanup}"
+        )),
+        (Ok(_), Ok((_, termination))) if !termination.reaped => {
+            Err("inherited supervised child cleanup did not reap the leader".to_owned())
+        }
+        (Ok(WaitOutcome::Exited(status)), Ok((_, termination))) => Ok(InheritedSupervisedOutput {
+            status,
+            timed_out: false,
+            termination,
+        }),
+        (Ok(WaitOutcome::DeadlineExpired), Ok((status, termination))) => {
+            Ok(InheritedSupervisedOutput {
+                status,
+                timed_out: true,
+                termination,
+            })
+        }
+        (Ok(_), Err(error)) => Err(format!(
+            "cannot clean inherited supervised child before its reserved deadline: {error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_inherited_supervision_timeout(
+    arguments: impl Iterator<Item = OsString>,
+) -> Result<(), String> {
+    ensure_empty(arguments)?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = Command::new(executable);
+    command
+        .arg("sleep-ms")
+        .arg("30000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let started = Instant::now();
+    let execution_deadline = started
+        .checked_add(Duration::from_millis(20))
+        .ok_or_else(|| "timeout fixture execution deadline overflowed".to_owned())?;
+    let completion_deadline = started
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| "timeout fixture completion deadline overflowed".to_owned())?;
+    let output = run_inherited_supervised_command_until(
+        &mut command,
+        execution_deadline,
+        completion_deadline,
+    )?;
+    if !output.timed_out || !output.termination.forced || !output.termination.reaped {
+        return Err("timeout fixture lost its forced, reaped cleanup receipt".to_owned());
+    }
+    println!("timedOut=true terminationForced=true terminationReaped=true");
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -624,6 +745,93 @@ fn spawn_marker_child(
         std::thread::sleep(Duration::from_secs(30));
     }
     Ok(())
+}
+
+const CAPTURE_HOLDER_NONCE_SCHEMA: &str = "hell-capture-holder-ready-v1";
+const CAPTURE_HOLDER_STDOUT_READY: &str = "capture-holder-stdout-ready-v1\n";
+const CAPTURE_HOLDER_STDERR_READY: &str = "capture-holder-stderr-ready-v1\n";
+const CAPTURE_HOLDER_NONCE_MAX_BYTES: usize = 128;
+
+fn spawn_capture_holder_and_exit(arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
+    ensure_empty(arguments)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let nonce = format!(
+        "{CAPTURE_HOLDER_NONCE_SCHEMA}-{}-{port}",
+        std::process::id()
+    );
+    if nonce.len() > CAPTURE_HOLDER_NONCE_MAX_BYTES {
+        return Err("capture-holder nonce exceeds its byte bound".to_owned());
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Command::new(executable)
+        .arg("hold-inherited-capture-pipes")
+        .arg(port.to_string())
+        .arg(&nonce)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    let (stream, peer) = listener.accept().map_err(|error| error.to_string())?;
+    if !peer.ip().is_loopback() {
+        return Err("capture-holder readiness peer is not loopback".to_owned());
+    }
+    let mut observed = Vec::with_capacity(nonce.len().saturating_add(1));
+    stream
+        .take(u64::try_from(nonce.len().saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut observed)
+        .map_err(|error| error.to_string())?;
+    if observed != nonce.as_bytes() {
+        return Err("capture-holder readiness nonce differs".to_owned());
+    }
+    Ok(())
+}
+
+fn hold_inherited_capture_pipes(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<(), String> {
+    let port = parse_u16(arguments.next(), "PORT")?;
+    let nonce = parse_capture_holder_nonce(arguments.next())?;
+    ensure_empty(arguments)?;
+
+    print!("{CAPTURE_HOLDER_STDOUT_READY}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    eprint!("{CAPTURE_HOLDER_STDERR_READY}");
+    std::io::stderr()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
+    stream
+        .write_all(nonce.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    drop(stream);
+    loop {
+        std::thread::park();
+    }
+}
+
+fn parse_capture_holder_nonce(value: Option<OsString>) -> Result<String, String> {
+    let nonce = value
+        .ok_or_else(|| "capture-holder fixture requires NONCE".to_owned())?
+        .into_string()
+        .map_err(|_| "capture-holder nonce is not UTF-8".to_owned())?;
+    if nonce.len() > CAPTURE_HOLDER_NONCE_MAX_BYTES
+        || !nonce.starts_with(CAPTURE_HOLDER_NONCE_SCHEMA)
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("capture-holder nonce is invalid".to_owned());
+    }
+    Ok(nonce)
 }
 
 fn parse_named_usize(

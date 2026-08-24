@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::Duration;
 
 #[test]
-fn deterministic_command_failure_persists_typed_bounded_evidence() {
+fn long_command_failure_persists_typed_bounded_prefix_and_suffix_evidence() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
     command.arg("__verify-platform-command-failure-report");
     let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(45))

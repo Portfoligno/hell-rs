@@ -30,7 +30,7 @@ fn nightly_attributed_supervision_preserves_typed_cleanup_and_no_live_descendant
 }
 
 #[test]
-fn nightly_status_failure_preserves_the_causal_failed_case() {
+fn nightly_status_failures_preserve_distinct_primaries_outside_bounded_aggregate_evidence() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
     command.arg("__verify-nightly-failed-case-attribution");
     let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(15))

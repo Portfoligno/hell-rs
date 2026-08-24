@@ -1133,9 +1133,9 @@ with.path = "readiness-input"
 name = "Install pinned Stack"
 kind = "action"
 action = "haskell-setup"
-with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with-order = ["enable-stack", "ghc-version", "stack-version"]
 with.enable-stack = "true"
-with.stack-no-global = "true"
+with.ghc-version = "9.8.2"
 with.stack-version = "3.11.1"
 
 [physical.step.ci.windows.s005]
@@ -2124,9 +2124,9 @@ name = "Install pinned Stack"
 id = "setup-stack"
 kind = "action"
 action = "haskell-setup"
-with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with-order = ["enable-stack", "ghc-version", "stack-version"]
 with.enable-stack = "true"
-with.stack-no-global = "true"
+with.ghc-version = "9.8.2"
 with.stack-version = "3.11.1"
 
 [physical.step.nightly.windows.s003]
@@ -2154,7 +2154,7 @@ kind = "action"
 action = "cache-restore"
 with-order = ["path", "key"]
 with.path = "${{ steps.setup-stack.outputs.stack-root }}\noracle-source/.stack-work\n"
-with.key = "nightly-windows-stack-3.11.1-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
+with.key = "nightly-windows-stack-3.11.1-ghc-9.8.2-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
 
 [physical.step.nightly.windows.s006]
 name = "Build CI driver"
@@ -2227,7 +2227,7 @@ kind = "action"
 action = "cache-save"
 with-order = ["path", "key"]
 with.path = "${{ steps.setup-stack.outputs.stack-root }}\noracle-source/.stack-work\n"
-with.key = "nightly-windows-stack-3.11.1-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
+with.key = "nightly-windows-stack-3.11.1-ghc-9.8.2-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
 
 [physical.workflow.regression-corpus]
 permission = "contents-read"
@@ -2816,9 +2816,9 @@ name = "Install pinned Stack"
 id = "setup-stack"
 kind = "action"
 action = "haskell-setup"
-with-order = ["enable-stack", "stack-no-global", "stack-version"]
+with-order = ["enable-stack", "ghc-version", "stack-version"]
 with.enable-stack = "true"
-with.stack-no-global = "true"
+with.ghc-version = "9.8.2"
 with.stack-version = "3.11.1"
 
 [physical.step.release.windows.s005]

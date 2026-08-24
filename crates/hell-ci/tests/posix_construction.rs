@@ -40,6 +40,7 @@ fn stderr(output: &hell_testkit::SupervisedOutput) -> String {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "requires trusted POSIX host authority"]
 fn candidate_environment_and_sandbox_use_privileged_exact_construction() {
     let mut command = hell_ci();
     command.arg("__verify-posix-candidate-environment-construction");

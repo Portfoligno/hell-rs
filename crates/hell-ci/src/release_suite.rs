@@ -76,6 +76,16 @@ const NIGHTLY_SUPERVISOR_TERMINAL_LIMIT: usize = 32 * 1024;
 #[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE: u8 = 5;
 #[cfg(any(unix, windows))]
+const NIGHTLY_SUPERVISOR_TERMINAL_SCHEMA_VERSION: u8 = 3;
+#[cfg(any(unix, windows))]
+const NIGHTLY_SUPERVISOR_OUTPUT_EVIDENCE_LIMIT: usize = 4 * 1024;
+#[cfg(any(unix, windows))]
+const NIGHTLY_SUPERVISOR_OUTPUT_TRUNCATION_MARKER: &str = "\n<hell-ci-output-middle-truncated>\n";
+#[cfg(any(unix, windows))]
+const NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT: usize = 4;
+#[cfg(any(unix, windows))]
+const NIGHTLY_SUPERVISOR_FAILED_CASE_PRIMARY_LIMIT: usize = 512;
+#[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_PROGRESS_FRAME_CAPACITY: u64 = 32;
 #[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_PROGRESS_LIMIT: usize = 2048;
@@ -88,6 +98,8 @@ const NIGHTLY_CORE_DATA_TEST_TARGET: &str = "core_data_production_bundle";
 const WINDOWS_PARALLEL_WORKSPACE_TEST_TIMEOUT: Duration = Duration::from_mins(40);
 #[cfg(windows)]
 const WINDOWS_HELL_TESTKIT_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_mins(5);
+#[cfg(windows)]
+const WINDOWS_SUPERVISOR_REQUEST_FIELD_COUNT: usize = 43;
 const PORTABILITY_SUITE_TIMEOUT: Duration = Duration::from_mins(40);
 const PORTABILITY_CLEANUP_RESERVE: Duration = Duration::from_mins(5);
 const PORTABILITY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -101,7 +113,7 @@ static PORTABILITY_PARTITION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MACOS_STAGED_NATIVE_TOOLCHAIN_CASE: &str =
     "staged_native_toolchain_accepts_real_ghc_without_inner_launcher_aliases";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PortabilityChildProgress {
     suite: &'static str,
     stdout_observed: u64,
@@ -120,16 +132,27 @@ struct PortabilityChildProgress {
     observed_started: Option<Instant>,
     last_transition_elapsed: Option<Duration>,
     failed_case: Option<CausalFailedCase>,
+    failed_cases: Vec<CausalFailedCaseReceipt>,
+    active_failed_case_output: Option<usize>,
+    failed_cases_dropped: u64,
     case_line_truncated: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CausalFailedCase {
     sequence: u64,
     transition_elapsed: Option<Duration>,
     target: Option<String>,
     case: String,
     stream: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CausalFailedCaseReceipt {
+    failed: CausalFailedCase,
+    primary: String,
+    primary_observed: bool,
+    primary_truncated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -657,8 +680,8 @@ fn windows_write_restricted_supervisor_command(
             .as_deref()
             .and_then(Path::parent)
             .ok_or_else(|| "imported Windows rustc has no staged bin".to_owned())?;
-        let environment = ProcessEnvironment::from_process();
-        let system_root = environment
+        let process_environment = ProcessEnvironment::from_process();
+        let system_root = process_environment
             .value(StandardVariable::SystemRoot)
             .map(PathBuf::from)
             .ok_or_else(|| "Windows SystemRoot is unavailable".to_owned())?;
@@ -880,6 +903,7 @@ impl ExternalSupervisorFixtureControl {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone)]
 struct ExternalSupervisorTerminal {
     execution: ExternalSupervisorExecutionState,
     exit_code: Option<i32>,
@@ -887,6 +911,8 @@ struct ExternalSupervisorTerminal {
     stdout_sha256: Digest,
     stderr_bytes: u64,
     stderr_sha256: Digest,
+    stdout_evidence: Option<ExternalSupervisorOutputEvidence>,
+    stderr_evidence: Option<ExternalSupervisorOutputEvidence>,
     capture: ExternalSupervisorCaptureState,
     cleanup: ExternalSupervisorCleanupState,
     cleanup_id: Option<u64>,
@@ -898,17 +924,30 @@ struct ExternalSupervisorTerminal {
     attribution: ActivePhaseAttribution,
     failed_case: Option<CausalFailedCase>,
     failed_case_unavailable: Option<String>,
+    failed_cases: Vec<CausalFailedCaseReceipt>,
+    failed_cases_truncated: bool,
     dropped_chunks: u64,
     dropped_bytes: u64,
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalSupervisorOutputEvidence {
+    rendered_utf8_bytes: u64,
+    prefix: String,
+    suffix: String,
+    omitted_utf8_bytes: u64,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone)]
 struct ExternalSupervisorExecutionState {
     success: bool,
     timed_out: bool,
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone)]
 struct ExternalSupervisorCaptureState {
     stdout_truncated: bool,
     stderr_truncated: bool,
@@ -916,6 +955,7 @@ struct ExternalSupervisorCaptureState {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone)]
 struct ExternalSupervisorCleanupState {
     terminal: bool,
     termination_requested: bool,
@@ -1141,6 +1181,120 @@ impl SupervisionEnvelope {
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsNoGoEnvelope {
+    phase_started: Instant,
+    supervision: SupervisionEnvelope,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsSupervisorEnvelopeProfile {
+    Command,
+    NoGo,
+}
+
+#[cfg(windows)]
+impl WindowsSupervisorEnvelopeProfile {
+    fn code(self) -> u8 {
+        match self {
+            Self::Command => 1,
+            Self::NoGo => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            1 => Ok(Self::Command),
+            2 => Ok(Self::NoGo),
+            _ => Err("Windows supervisor envelope profile differs".to_owned()),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsSupervisorStartupSchedule {
+    ready_deadline: Instant,
+    cleanup_deadline: Instant,
+}
+
+#[cfg(windows)]
+impl WindowsSupervisorStartupSchedule {
+    fn within(phase_started: Instant, execution_deadline: Instant) -> Result<Self, String> {
+        let composed_startup = NIGHTLY_SUPERVISOR_START_TIMEOUT
+            .checked_mul(2)
+            .ok_or_else(|| "Windows supervisor composed startup budget overflowed".to_owned())?;
+        let cleanup_deadline = phase_started
+            .checked_add(composed_startup)
+            .unwrap_or(execution_deadline)
+            .min(execution_deadline);
+        let ready_deadline = cleanup_deadline
+            .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+            .ok_or_else(|| "Windows supervisor startup cleanup reserve underflowed".to_owned())?;
+        if ready_deadline <= phase_started || ready_deadline >= cleanup_deadline {
+            return Err("Windows supervisor startup schedule has no cleanup reserve".to_owned());
+        }
+        Ok(Self {
+            ready_deadline,
+            cleanup_deadline,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsSupervisorChildStartupSchedule {
+    subordinate_ready_deadline: Instant,
+    ready_deadline: Instant,
+}
+
+#[cfg(windows)]
+impl WindowsSupervisorChildStartupSchedule {
+    fn within(phase_started: Instant, caller_ready_deadline: Instant) -> Result<Self, String> {
+        let ready_deadline = phase_started
+            .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+            .unwrap_or(caller_ready_deadline)
+            .min(caller_ready_deadline);
+        let subordinate_ready_deadline = ready_deadline
+            .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+            .ok_or_else(|| {
+                "Windows subordinate supervisor startup reserve underflowed".to_owned()
+            })?;
+        if subordinate_ready_deadline <= phase_started
+            || subordinate_ready_deadline >= ready_deadline
+        {
+            return Err(
+                "Windows subordinate supervisor startup schedule has no completion reserve"
+                    .to_owned(),
+            );
+        }
+        Ok(Self {
+            subordinate_ready_deadline,
+            ready_deadline,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl WindowsNoGoEnvelope {
+    fn within(phase_started: Instant, cleanup_deadline: Instant) -> Result<Self, String> {
+        let total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
+        let supervision = SupervisionEnvelope::within(
+            phase_started,
+            total,
+            NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2),
+            NIGHTLY_SUPERVISOR_START_TIMEOUT,
+            cleanup_deadline,
+        )?;
+        Ok(Self {
+            phase_started,
+            supervision,
+        })
+    }
+}
+
 fn terminal_receipt_deadline(
     child_completion_deadline: Instant,
     report_completion_deadline: Instant,
@@ -1288,6 +1442,25 @@ impl PortabilityChildProgress {
     }
 
     fn observe(&mut self, phase: &str, stream: SupervisedOutputStream, bytes: &[u8]) {
+        self.observe_with_publication(phase, stream, bytes, true);
+    }
+
+    fn observe_attribution_tap(
+        &mut self,
+        phase: &str,
+        stream: SupervisedOutputStream,
+        bytes: &[u8],
+    ) {
+        self.observe_with_publication(phase, stream, bytes, false);
+    }
+
+    fn observe_with_publication(
+        &mut self,
+        phase: &str,
+        stream: SupervisedOutputStream,
+        bytes: &[u8],
+        publish: bool,
+    ) {
         let observed = match stream {
             SupervisedOutputStream::Stdout => &mut self.stdout_observed,
             SupervisedOutputStream::Stderr => &mut self.stderr_observed,
@@ -1309,8 +1482,12 @@ impl PortabilityChildProgress {
                 };
                 if truncated {
                     self.case_line_truncated = true;
-                } else if let Some(event) = parse_portability_child_attribution(&line) {
-                    self.record_observed_attribution(phase, stream, event);
+                    self.record_truncated_failed_case_output(stream, &line);
+                } else {
+                    if let Some(event) = parse_portability_child_attribution(&line) {
+                        self.record_observed_attribution(phase, stream, event, publish);
+                    }
+                    self.record_failed_case_output(stream, &line);
                 }
             } else {
                 let line = match stream {
@@ -1334,12 +1511,17 @@ impl PortabilityChildProgress {
         phase: &str,
         stream: SupervisedOutputStream,
         event: PortabilityAttributionEvent,
+        publish: bool,
     ) {
         let failed = matches!(
             &event,
             PortabilityAttributionEvent::Case(_, PortabilityCaseState::Failed)
         );
-        self.record_attribution(phase, event);
+        if publish {
+            self.record_attribution(phase, event);
+        } else {
+            self.record_attribution_state(event);
+        }
         if failed {
             let attribution = self.attribution();
             self.failed_case = attribution.case.map(|case| CausalFailedCase {
@@ -1353,10 +1535,88 @@ impl PortabilityChildProgress {
                 }
                 .to_owned(),
             });
+            if let Some(failed) = &self.failed_case {
+                if self.failed_cases.len() < NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+                    self.failed_cases.push(CausalFailedCaseReceipt {
+                        failed: failed.clone(),
+                        primary: String::new(),
+                        primary_observed: false,
+                        primary_truncated: false,
+                    });
+                } else {
+                    self.failed_cases_dropped = self.failed_cases_dropped.saturating_add(1);
+                }
+            }
         }
     }
 
+    fn record_failed_case_output(&mut self, stream: SupervisedOutputStream, line: &[u8]) {
+        if !matches!(stream, SupervisedOutputStream::Stdout) {
+            return;
+        }
+        if let Some(case) = parse_libtest_failed_case_output_header(line) {
+            self.active_failed_case_output = self
+                .failed_cases
+                .iter()
+                .rposition(|receipt| receipt.failed.case == case);
+            return;
+        }
+        if line == b"failures:" || line.starts_with(b"---- ") {
+            self.active_failed_case_output = None;
+            return;
+        }
+        let Some(index) = self.active_failed_case_output else {
+            return;
+        };
+        self.append_failed_case_primary(index, line, false);
+    }
+
+    fn record_truncated_failed_case_output(
+        &mut self,
+        stream: SupervisedOutputStream,
+        retained_prefix: &[u8],
+    ) {
+        if !matches!(stream, SupervisedOutputStream::Stdout) {
+            return;
+        }
+        let Some(index) = self.active_failed_case_output else {
+            return;
+        };
+        self.append_failed_case_primary(index, retained_prefix, true);
+    }
+
+    fn append_failed_case_primary(&mut self, index: usize, line: &[u8], line_truncated: bool) {
+        let receipt = &mut self.failed_cases[index];
+        if line.starts_with(b"thread '")
+            && line
+                .windows(b" panicked at ".len())
+                .any(|window| window == b" panicked at ")
+        {
+            receipt.primary.clear();
+            receipt.primary_truncated = false;
+        }
+        receipt.primary_observed = true;
+        let remaining =
+            NIGHTLY_SUPERVISOR_FAILED_CASE_PRIMARY_LIMIT.saturating_sub(receipt.primary.len());
+        if remaining == 0 {
+            receipt.primary_truncated = true;
+            return;
+        }
+        let mut rendered = String::from_utf8_lossy(line).into_owned();
+        rendered.push('\n');
+        let rendered_characters = rendered.chars().count();
+        let bounded = bounded_external_supervisor_text(&rendered, remaining);
+        let bounded_characters = bounded.chars().count();
+        receipt.primary.push_str(&bounded);
+        receipt.primary_truncated |= line_truncated || bounded_characters != rendered_characters;
+    }
+
     fn record_attribution(&mut self, phase: &str, event: PortabilityAttributionEvent) {
+        self.record_attribution_state(event);
+        self.publish_attribution(phase);
+    }
+
+    fn record_attribution_state(&mut self, event: PortabilityAttributionEvent) {
         let started = *self.observed_started.get_or_insert_with(Instant::now);
         self.sequence = self.sequence.saturating_add(1);
         self.last_transition_elapsed =
@@ -1376,6 +1636,9 @@ impl PortabilityChildProgress {
                 self.subphase = Some(subphase);
             }
         }
+    }
+
+    fn publish_attribution(&self, phase: &str) {
         let snapshot = self.attribution();
         let mut stderr = std::io::stderr().lock();
         let _ = write!(
@@ -1496,6 +1759,12 @@ impl PortabilityChildProgress {
             loss.bytes,
         )
     }
+}
+
+fn parse_libtest_failed_case_output_header(bytes: &[u8]) -> Option<String> {
+    let header = std::str::from_utf8(bytes).ok()?;
+    let case = header.strip_prefix("---- ")?.strip_suffix(" stdout ----")?;
+    (!case.is_empty()).then(|| sanitize_portability_attribution(case))
 }
 
 fn parse_portability_child_attribution(bytes: &[u8]) -> Option<PortabilityAttributionEvent> {
@@ -2161,8 +2430,140 @@ pub(crate) fn verify_nightly_failed_case_attribution_for_integration() -> Result
         Duration::from_secs(2),
         outer,
     )?;
+    verify_nightly_saturated_progress_tail(envelope)?;
     verify_nightly_failed_case_terminal(started, envelope)?;
     verify_nightly_missing_case_attribution(envelope)
+}
+
+#[cfg(unix)]
+fn verify_nightly_saturated_progress_tail(envelope: SupervisionEnvelope) -> Result<(), String> {
+    verify_nightly_fragmented_overflow_tail()?;
+    let executable = fs::canonicalize(
+        std::env::current_exe()
+            .map_err(|error| format!("cannot locate saturated progress fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot canonicalize saturated progress fixture: {error}"))?;
+    let spec = CommandSpec::new(
+        executable,
+        envelope.execution.saturating_duration_since(Instant::now()),
+    )
+    .argument("__nightly-failed-case-child");
+    let (authoritative, observer, held_receiver) = supervised_portability_progress(
+        PortabilityChildProgress::seeded(
+            "nightly",
+            "saturated-progress-target",
+            "saturated-progress-case",
+            "fixture",
+        ),
+        "nightly-workspace-tests",
+        1,
+    );
+    let loss = observer.loss_receipt();
+    let result = spec
+        .run_until(
+            envelope.execution,
+            envelope.child_completion_deadline,
+            observer,
+        )
+        .map_err(|error| format!("cannot run saturated progress fixture: {error}"))?;
+    let progress = portability_progress_snapshot(&authoritative);
+    let loss = loss.snapshot();
+    let retained_chunks = held_receiver.try_iter().count();
+    let failed = progress
+        .failed_case
+        .as_ref()
+        .ok_or_else(|| "saturated progress tap omitted the causal tail case".to_owned())?;
+    if result.status.code() != Some(1)
+        || result.timed_out
+        || loss.chunks == 0
+        || loss.bytes == 0
+        || retained_chunks != 1
+        || failed.target.as_deref() != Some("failed-case-target")
+        || failed.case != "second_failure"
+        || failed.stream != "stdout"
+        || progress.failed_cases.len() != 2
+        || progress.case.as_deref() != Some("later_success")
+        || progress.case_state.map(PortabilityCaseState::as_str) != Some("passed")
+    {
+        return Err(
+            "saturated advisory progress queue changed authoritative tail attribution".to_owned(),
+        );
+    }
+    validate_portability_failed_case_receipt_report(
+        &progress,
+        result,
+        envelope.report_completion_deadline,
+    )
+}
+
+#[cfg(unix)]
+fn validate_portability_failed_case_receipt_report(
+    progress: &PortabilityChildProgress,
+    result: crate::command::CommandResult,
+    observation_deadline: Instant,
+) -> Result<(), String> {
+    let mut report = Report::new("portability-failed-case-receipt-verifier");
+    retain_portability_failed_case_receipts(
+        &mut report,
+        "portability",
+        "portable-workspace-tests",
+        progress,
+        &Ok(result),
+        observation_deadline,
+    );
+    let durable = report.to_json();
+    if !durable.contains("\"failedCases\"")
+        || !durable.contains("first exact retained primary")
+        || !durable.contains("second exact retained primary")
+        || !durable.contains("\"cleanupState\":\"completed\"")
+        || !durable.contains("\"leaderReaped\":true")
+        || !durable.contains("\"workerState\":\"failed\"")
+    {
+        return Err("portability report omitted ordered failed-case receipts".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_nightly_fragmented_overflow_tail() -> Result<(), String> {
+    let (authoritative, observer, held_receiver) = supervised_portability_progress(
+        PortabilityChildProgress::seeded(
+            "nightly",
+            "fragmented-progress-target",
+            "fragmented-progress-case",
+            "fixture",
+        ),
+        "nightly-workspace-tests",
+        1,
+    );
+    observer.observe_for_integration(SupervisedOutputStream::Stdout, b"retained-padding\n");
+    observer.observe_for_integration(
+        SupervisedOutputStream::Stdout,
+        b"hell-progress-target=failed-case-target\ntest causal_",
+    );
+    observer.observe_for_integration(
+        SupervisedOutputStream::Stdout,
+        b"failure ... FAILED\ntest later_success ... ok\n",
+    );
+    let loss = observer.loss();
+    let retained_chunks = held_receiver.try_iter().count();
+    let progress = portability_progress_snapshot(&authoritative);
+    let failed = progress
+        .failed_case
+        .as_ref()
+        .ok_or_else(|| "fragmented overflow tail omitted the causal case".to_owned())?;
+    if loss.chunks != 2
+        || loss.bytes == 0
+        || retained_chunks != 1
+        || failed.target.as_deref() != Some("failed-case-target")
+        || failed.case != "causal_failure"
+        || failed.stream != "stdout"
+        || progress.case.as_deref() != Some("later_success")
+        || progress.case_state.map(PortabilityCaseState::as_str) != Some("passed")
+    {
+        return Err("fragmented attribution tail followed the saturated advisory queue".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2193,6 +2594,15 @@ fn verify_nightly_failed_case_terminal(
         loss,
         envelope.report_completion_deadline,
     );
+    validate_nightly_failed_case_terminal(&terminal)?;
+    let decoded = round_trip_nightly_failed_case_terminal(&terminal)?;
+    validate_nightly_failed_case_report(started, decoded)
+}
+
+#[cfg(unix)]
+fn validate_nightly_failed_case_terminal(
+    terminal: &ExternalSupervisorTerminal,
+) -> Result<(), String> {
     if terminal.execution.success || terminal.execution.timed_out || terminal.exit_code != Some(1) {
         return Err("nightly failed-case fixture did not produce bounded status 1".to_owned());
     }
@@ -2200,21 +2610,85 @@ fn verify_nightly_failed_case_terminal(
         .failed_case
         .as_ref()
         .ok_or_else(|| "nightly terminal omitted its causal failed case".to_owned())?;
+    let [first, second] = terminal.failed_cases.as_slice() else {
+        return Err("nightly terminal did not retain exactly two failed cases".to_owned());
+    };
+    if first.failed.case != "causal_failure"
+        || second.failed.case != "second_failure"
+        || failed != &second.failed
+    {
+        return Err("nightly terminal failed-case identities differ".to_owned());
+    }
+    if !first.primary_observed {
+        return Err("nightly terminal first primary was not observed".to_owned());
+    }
+    if !first.primary.contains("first exact retained primary") {
+        return Err("nightly terminal first primary text differs".to_owned());
+    }
+    if first.primary_truncated {
+        return Err("nightly terminal first primary was unexpectedly truncated".to_owned());
+    }
+    if !second.primary_observed {
+        return Err("nightly terminal second primary was not observed".to_owned());
+    }
+    if !second.primary.contains("second exact retained primary") {
+        return Err("nightly terminal second primary text differs".to_owned());
+    }
+    if !second
+        .primary
+        .contains("oversized exact assertion diagnostic")
+    {
+        return Err("nightly terminal oversized primary prefix differs".to_owned());
+    }
+    if !second.primary_truncated {
+        return Err("nightly terminal oversized primary was not marked truncated".to_owned());
+    }
     if failed.target.as_deref() != Some("failed-case-target")
-        || failed.case != "causal_failure"
+        || failed.case != "second_failure"
         || failed.stream != "stdout"
+        || terminal.failed_cases_truncated
         || terminal.attribution.case.as_deref() != Some("later_success")
         || terminal.failed_case_unavailable.is_some()
         || !terminal
             .detail
             .contains("failed case: target=failed-case-target")
-        || !terminal.detail.contains("case=causal_failure")
+        || !terminal.detail.contains("case=second_failure")
     {
         return Err("nightly causal failed-case receipt differs from its exact event".to_owned());
     }
+    let stdout_evidence = terminal
+        .stdout_evidence
+        .as_ref()
+        .ok_or_else(|| "nightly terminal omitted stdout diagnostic evidence".to_owned())?;
+    let stderr_evidence = terminal
+        .stderr_evidence
+        .as_ref()
+        .ok_or_else(|| "nightly terminal omitted stderr diagnostic evidence".to_owned())?;
+    if stdout_evidence.omitted_utf8_bytes == 0
+        || stderr_evidence.omitted_utf8_bytes == 0
+        || !stderr_evidence
+            .prefix
+            .starts_with("nightly-terminal-stderr-prefix")
+        || !stderr_evidence
+            .suffix
+            .contains("nightly-terminal-stderr-tail-diagnostic")
+    {
+        return Err("nightly terminal did not retain both bounded diagnostic edges".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn round_trip_nightly_failed_case_terminal(
+    terminal: &ExternalSupervisorTerminal,
+) -> Result<ExternalSupervisorTerminal, String> {
+    let failed = terminal
+        .failed_case
+        .as_ref()
+        .ok_or_else(|| "nightly terminal omitted its causal failed case".to_owned())?;
     let request_sha256 = sha256_bytes(b"nightly-failed-case-request");
     let nonce = sha256_bytes(b"nightly-failed-case-nonce");
-    let encoded = encode_external_supervisor_terminal(request_sha256, nonce, &terminal)?;
+    let encoded = encode_external_supervisor_terminal(request_sha256, nonce, terminal)?;
     let decoded = decode_external_supervisor_terminal(&encoded, request_sha256, nonce)?;
     let decoded_failed = decoded
         .failed_case
@@ -2225,9 +2699,202 @@ fn verify_nightly_failed_case_terminal(
         || decoded_failed.transition_elapsed != failed.transition_elapsed
         || decoded_failed.target != failed.target
         || decoded_failed.stream != failed.stream
+        || decoded.failed_cases != terminal.failed_cases
+        || decoded.failed_cases_truncated != terminal.failed_cases_truncated
+        || decoded.stdout_evidence != terminal.stdout_evidence
+        || decoded.stderr_evidence != terminal.stderr_evidence
     {
         return Err("nightly durable failed-case receipt changed during framing".to_owned());
     }
+    let schema_offset = NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC.len().saturating_add(1);
+    let mut incompatible = encoded.clone();
+    incompatible[schema_offset] = NIGHTLY_SUPERVISOR_TERMINAL_SCHEMA_VERSION.wrapping_add(1);
+    if !decode_external_supervisor_terminal(&incompatible, request_sha256, nonce)
+        .is_err_and(|error| error.contains("schema version differs"))
+    {
+        return Err("nightly terminal accepted an incompatible evidence schema".to_owned());
+    }
+    verify_nightly_failed_case_frame_rejections(terminal, request_sha256, nonce)?;
+    Ok(decoded)
+}
+
+#[cfg(unix)]
+fn reject_nightly_failed_case_frame(
+    terminal: &ExternalSupervisorTerminal,
+    request_sha256: Digest,
+    nonce: Digest,
+    expected: &str,
+) -> Result<(), String> {
+    let encoded = encode_external_supervisor_terminal_frame(request_sha256, nonce, terminal)?;
+    if !decode_external_supervisor_terminal(&encoded, request_sha256, nonce)
+        .is_err_and(|error| error.contains(expected))
+    {
+        return Err(format!(
+            "nightly terminal accepted malformed failed-case state: {expected}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn truncated_nightly_failed_case_fixture(
+    terminal: &ExternalSupervisorTerminal,
+) -> ExternalSupervisorTerminal {
+    let mut malformed = terminal.clone();
+    while malformed.failed_cases.len() < NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+        let prior = malformed
+            .failed_cases
+            .last()
+            .expect("nightly fixture has a retained failure")
+            .failed
+            .clone();
+        let sequence = prior.sequence.saturating_add(1);
+        malformed.failed_cases.push(CausalFailedCaseReceipt {
+            failed: CausalFailedCase {
+                sequence,
+                transition_elapsed: prior
+                    .transition_elapsed
+                    .and_then(|elapsed| elapsed.checked_add(Duration::from_millis(1))),
+                target: prior.target,
+                case: format!("retained_failure_{sequence}"),
+                stream: prior.stream,
+            },
+            primary: format!("retained primary {sequence}\n"),
+            primary_observed: true,
+            primary_truncated: false,
+        });
+    }
+    let retained_last = malformed
+        .failed_cases
+        .last()
+        .expect("nightly fixture fills its retained bound")
+        .failed
+        .clone();
+    let dropped_sequence = retained_last.sequence.saturating_add(1);
+    let dropped_elapsed = retained_last
+        .transition_elapsed
+        .and_then(|elapsed| elapsed.checked_add(Duration::from_millis(1)));
+    malformed.failed_case = Some(CausalFailedCase {
+        sequence: dropped_sequence,
+        transition_elapsed: dropped_elapsed,
+        target: retained_last.target,
+        case: format!("dropped_failure_{dropped_sequence}"),
+        stream: retained_last.stream,
+    });
+    malformed.failed_cases_truncated = true;
+    malformed.attribution.sequence = dropped_sequence.saturating_add(1);
+    malformed.attribution.transition_elapsed =
+        dropped_elapsed.and_then(|elapsed| elapsed.checked_add(Duration::from_millis(1)));
+    malformed
+}
+
+#[cfg(unix)]
+fn verify_nightly_failed_case_frame_rejections(
+    terminal: &ExternalSupervisorTerminal,
+    request_sha256: Digest,
+    nonce: Digest,
+) -> Result<(), String> {
+    let mut duplicate = terminal.clone();
+    let (first, remaining) = duplicate.failed_cases.split_at_mut(1);
+    remaining[0]
+        .failed
+        .target
+        .clone_from(&first[0].failed.target);
+    remaining[0].failed.case.clone_from(&first[0].failed.case);
+    duplicate.failed_case = Some(duplicate.failed_cases[1].failed.clone());
+    reject_nightly_failed_case_frame(&duplicate, request_sha256, nonce, "identity is duplicated")?;
+
+    let mut unobserved_nonempty = terminal.clone();
+    unobserved_nonempty.failed_cases[0].primary_observed = false;
+    reject_nightly_failed_case_frame(
+        &unobserved_nonempty,
+        request_sha256,
+        nonce,
+        "primary state is inconsistent",
+    )?;
+    let mut unobserved_truncated = terminal.clone();
+    unobserved_truncated.failed_cases[0].primary.clear();
+    unobserved_truncated.failed_cases[0].primary_observed = false;
+    unobserved_truncated.failed_cases[0].primary_truncated = true;
+    reject_nightly_failed_case_frame(
+        &unobserved_truncated,
+        request_sha256,
+        nonce,
+        "primary state is inconsistent",
+    )?;
+    let mut observed_empty = terminal.clone();
+    observed_empty.failed_cases[0].primary.clear();
+    reject_nightly_failed_case_frame(
+        &observed_empty,
+        request_sha256,
+        nonce,
+        "primary state is inconsistent",
+    )?;
+
+    let mut short_truncation = terminal.clone();
+    short_truncation.failed_cases_truncated = true;
+    reject_nightly_failed_case_frame(
+        &short_truncation,
+        request_sha256,
+        nonce,
+        "do not fill their bound",
+    )?;
+    let complete_truncation = truncated_nightly_failed_case_fixture(terminal);
+    let mut absent_legacy = complete_truncation.clone();
+    absent_legacy.failed_case = None;
+    reject_nightly_failed_case_frame(
+        &absent_legacy,
+        request_sha256,
+        nonce,
+        "omit the legacy last case",
+    )?;
+    let mut stale_legacy = complete_truncation;
+    stale_legacy
+        .failed_case
+        .as_mut()
+        .expect("truncated fixture has a legacy last case")
+        .sequence = stale_legacy
+        .failed_cases
+        .last()
+        .expect("truncated fixture fills its retained bound")
+        .failed
+        .sequence;
+    reject_nightly_failed_case_frame(
+        &stale_legacy,
+        request_sha256,
+        nonce,
+        "legacy last is not newer",
+    )?;
+
+    let mut decreasing_elapsed = terminal.clone();
+    decreasing_elapsed.failed_cases[0].failed.transition_elapsed = Some(Duration::from_millis(10));
+    decreasing_elapsed.failed_cases[1].failed.transition_elapsed = Some(Duration::from_millis(9));
+    decreasing_elapsed.failed_case = Some(decreasing_elapsed.failed_cases[1].failed.clone());
+    decreasing_elapsed.attribution.transition_elapsed = Some(Duration::from_millis(11));
+    reject_nightly_failed_case_frame(
+        &decreasing_elapsed,
+        request_sha256,
+        nonce,
+        "elapsed times moved backward",
+    )?;
+    let mut future_sequence = terminal.clone();
+    future_sequence.failed_cases[1].failed.sequence =
+        future_sequence.attribution.sequence.saturating_add(1);
+    future_sequence.failed_case = Some(future_sequence.failed_cases[1].failed.clone());
+    reject_nightly_failed_case_frame(
+        &future_sequence,
+        request_sha256,
+        nonce,
+        "follows terminal attribution",
+    )
+}
+
+#[cfg(unix)]
+fn validate_nightly_failed_case_report(
+    started: Instant,
+    decoded: ExternalSupervisorTerminal,
+) -> Result<(), String> {
+    let request_sha256 = sha256_bytes(b"nightly-failed-case-request");
     let evidence = external_supervisor_terminal_evidence(
         ExternalSupervisorPlan::NightlyWorkspace,
         &decoded,
@@ -2243,11 +2910,22 @@ fn verify_nightly_failed_case_terminal(
     let durable = report.to_json();
     if !durable.contains("\"failedCase\"")
         || !durable.contains("\"case\":\"causal_failure\"")
+        || !durable.contains("\"case\":\"second_failure\"")
+        || !durable.contains("\"failedCases\"")
+        || !durable.contains("first exact retained primary")
+        || !durable.contains("second exact retained primary")
         || !durable.contains("\"stream\":\"stdout\"")
         || !durable.contains("\"target\":\"failed-case-target\"")
         || !durable.contains("\"transitionElapsedMillis\"")
+        || !durable.contains("\"terminalSchemaVersion\":3")
         || !durable.contains("\"stdoutObservedBytes\"")
         || !durable.contains("\"stdoutSha256\"")
+        || !durable.contains("\"stdoutEvidencePrefix\"")
+        || !durable.contains("\"stdoutEvidenceOmittedUtf8Bytes\"")
+        || !durable.contains("\"stderrEvidenceSuffix\"")
+        || !durable.contains("\"stderrEvidenceTruncated\":true")
+        || !durable.contains("hell-ci-output-middle-truncated")
+        || !durable.contains("nightly-terminal-stderr-tail-diagnostic")
         || !durable.contains("\"cleanupTerminal\":true")
         || !durable.contains("failed case: target=failed-case-target")
     {
@@ -2306,9 +2984,74 @@ fn verify_nightly_missing_case_attribution(envelope: SupervisionEnvelope) -> Res
 
 #[cfg(unix)]
 pub(crate) fn run_nightly_failed_case_child() {
-    println!("hell-progress-target=failed-case-target");
-    println!("test causal_failure ... FAILED");
-    println!("test later_success ... ok");
+    let mut stdout = std::io::stdout().lock();
+    let mut padding = vec![b'p'; 8 * 1024 - 1];
+    padding.push(b'\n');
+    for _ in 0..96 {
+        stdout
+            .write_all(&padding)
+            .expect("nightly progress fixture padding must be writable");
+    }
+    writeln!(stdout, "hell-progress-target=failed-case-target")
+        .expect("nightly progress fixture target must be writable");
+    write!(stdout, "test causal_")
+        .expect("nightly progress fixture failed case prefix must be writable");
+    stdout
+        .flush()
+        .expect("nightly progress fixture failed case prefix must flush");
+    writeln!(stdout, "failure ... FAILED")
+        .expect("nightly progress fixture failed case suffix must be writable");
+    writeln!(stdout, "test second_failure ... FAILED")
+        .expect("nightly progress fixture second failed case must be writable");
+    writeln!(stdout, "\n---- causal_failure stdout ----")
+        .expect("nightly progress fixture first failure header must be writable");
+    writeln!(
+        stdout,
+        "thread 'causal_failure' panicked at fixture.rs:1:1:"
+    )
+    .expect("nightly progress fixture first panic header must be writable");
+    writeln!(stdout, "first exact retained primary")
+        .expect("nightly progress fixture first primary must be writable");
+    writeln!(stdout, "\n---- second_failure stdout ----")
+        .expect("nightly progress fixture second failure header must be writable");
+    writeln!(
+        stdout,
+        "thread 'second_failure' panicked at fixture.rs:2:1:"
+    )
+    .expect("nightly progress fixture second panic header must be writable");
+    writeln!(stdout, "second exact retained primary")
+        .expect("nightly progress fixture second primary must be writable");
+    let mut oversized = b"oversized exact assertion diagnostic: ".to_vec();
+    oversized.resize(PORTABILITY_ATTRIBUTION_LINE_LIMIT.saturating_add(1), b'x');
+    oversized.push(b'\n');
+    stdout
+        .write_all(&oversized)
+        .expect("nightly progress fixture oversized primary must be writable");
+    for _ in 0..96 {
+        stdout
+            .write_all(&padding)
+            .expect("nightly progress fixture tail padding must be writable");
+    }
+    writeln!(stdout, "test later_success ... ok")
+        .expect("nightly progress fixture tail case must be writable");
+    stdout
+        .flush()
+        .expect("nightly progress fixture output must flush");
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "nightly-terminal-stderr-prefix")
+        .expect("nightly terminal stderr prefix must be writable");
+    let mut stderr_padding = vec![b'e'; 4 * 1024 - 1];
+    stderr_padding.push(b'\n');
+    for _ in 0..3 {
+        stderr
+            .write_all(&stderr_padding)
+            .expect("nightly terminal stderr padding must be writable");
+    }
+    writeln!(stderr, "nightly-terminal-stderr-tail-diagnostic")
+        .expect("nightly terminal stderr suffix must be writable");
+    stderr
+        .flush()
+        .expect("nightly terminal stderr evidence must flush");
 }
 
 #[cfg(unix)]
@@ -2420,6 +3163,16 @@ fn verify_nightly_checkpoint_fields(checkpoint: &Path) -> Result<(), String> {
         "stdoutSha256",
         "stderrSha256",
         "stdoutTruncated",
+        "stdoutEvidenceAvailable\":true",
+        "stdoutEvidencePrefix",
+        "stdoutEvidenceSuffix",
+        "stdoutEvidenceOmittedUtf8Bytes",
+        "stdoutEvidenceTruncated",
+        "stderrEvidenceAvailable\":true",
+        "stderrEvidencePrefix",
+        "stderrEvidenceSuffix",
+        "stderrEvidenceOmittedUtf8Bytes",
+        "stderrEvidenceTruncated",
         "droppedChunks",
         "droppedBytes",
         "blocked-without-newline",
@@ -3474,6 +4227,21 @@ fn encode_external_supervisor_terminal(
     nonce: Digest,
     terminal: &ExternalSupervisorTerminal,
 ) -> Result<Vec<u8>, String> {
+    validate_external_supervisor_failed_case_state(
+        &terminal.attribution,
+        terminal.failed_case.as_ref(),
+        &terminal.failed_cases,
+        terminal.failed_cases_truncated,
+    )?;
+    encode_external_supervisor_terminal_frame(request_sha256, nonce, terminal)
+}
+
+#[cfg(any(unix, windows))]
+fn encode_external_supervisor_terminal_frame(
+    request_sha256: Digest,
+    nonce: Digest,
+    terminal: &ExternalSupervisorTerminal,
+) -> Result<Vec<u8>, String> {
     const FIXED_RECEIPT_RESERVE: usize = 8 * 1024;
     let mut text_budget = NIGHTLY_SUPERVISOR_TERMINAL_LIMIT
         .checked_sub(FIXED_RECEIPT_RESERVE)
@@ -3481,9 +4249,20 @@ fn encode_external_supervisor_terminal(
     let mut bytes = Vec::with_capacity(NIGHTLY_SUPERVISOR_TERMINAL_LIMIT);
     bytes.extend_from_slice(NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC);
     bytes.push(NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE);
+    bytes.push(NIGHTLY_SUPERVISOR_TERMINAL_SCHEMA_VERSION);
     bytes.extend_from_slice(&request_sha256.0);
     bytes.extend_from_slice(&nonce.0);
     encode_external_supervisor_terminal_fixed(&mut bytes, terminal);
+    encode_external_supervisor_output_evidence(
+        &mut bytes,
+        terminal.stdout_evidence.as_ref(),
+        &mut text_budget,
+    )?;
+    encode_external_supervisor_output_evidence(
+        &mut bytes,
+        terminal.stderr_evidence.as_ref(),
+        &mut text_budget,
+    )?;
     push_supervisor_optional_text_with_budget(
         &mut bytes,
         Some(&terminal.cleanup_state),
@@ -3502,7 +4281,13 @@ fn encode_external_supervisor_terminal(
     for failure in &terminal.cleanup_failures {
         push_supervisor_optional_text_with_budget(&mut bytes, Some(failure), &mut text_budget)?;
     }
-    let detail = bounded_external_supervisor_text(&terminal.detail, text_budget);
+    let attribution_reserve = external_supervisor_attribution_text_reserve(terminal);
+    let detail_budget = text_budget
+        .checked_sub(attribution_reserve)
+        .ok_or_else(|| {
+            "nightly supervisor failed-case receipts exceed the terminal text budget".to_owned()
+        })?;
+    let detail = bounded_external_supervisor_text(&terminal.detail, detail_budget);
     text_budget = text_budget.saturating_sub(detail.len());
     let detail = detail.as_bytes();
     let detail_length = u32::try_from(detail.len())
@@ -3516,6 +4301,60 @@ fn encode_external_supervisor_terminal(
         return Err("nightly supervisor terminal receipt exceeds its byte limit".to_owned());
     }
     Ok(bytes)
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_attribution_text_reserve(terminal: &ExternalSupervisorTerminal) -> usize {
+    let optional_len = |value: Option<&str>| value.map_or(0, str::len);
+    let mut reserve = optional_len(terminal.attribution.target.as_deref())
+        .saturating_add(optional_len(terminal.attribution.case.as_deref()))
+        .saturating_add(optional_len(terminal.attribution.case_state.as_deref()))
+        .saturating_add(optional_len(terminal.attribution.subphase.as_deref()))
+        .saturating_add(optional_len(terminal.failed_case_unavailable.as_deref()));
+    if let Some(failed) = &terminal.failed_case {
+        reserve = reserve
+            .saturating_add(optional_len(failed.target.as_deref()))
+            .saturating_add(failed.case.len())
+            .saturating_add(failed.stream.len());
+    }
+    for receipt in &terminal.failed_cases {
+        reserve = reserve
+            .saturating_add(optional_len(receipt.failed.target.as_deref()))
+            .saturating_add(receipt.failed.case.len())
+            .saturating_add(receipt.failed.stream.len())
+            .saturating_add(receipt.primary.len());
+    }
+    reserve
+}
+
+#[cfg(any(unix, windows))]
+fn encode_external_supervisor_output_evidence(
+    bytes: &mut Vec<u8>,
+    evidence: Option<&ExternalSupervisorOutputEvidence>,
+    text_budget: &mut usize,
+) -> Result<(), String> {
+    bytes.push(u8::from(evidence.is_some()));
+    let Some(evidence) = evidence else {
+        return Ok(());
+    };
+    validate_external_supervisor_output_evidence(evidence)?;
+    let retained_bytes = evidence.prefix.len().saturating_add(evidence.suffix.len());
+    *text_budget = text_budget
+        .checked_sub(retained_bytes)
+        .ok_or_else(|| "nightly supervisor output evidence exceeds its text budget".to_owned())?;
+    push_supervisor_u64(bytes, evidence.rendered_utf8_bytes);
+    push_supervisor_u64(bytes, evidence.omitted_utf8_bytes);
+    push_external_supervisor_output_edge(bytes, &evidence.prefix)?;
+    push_external_supervisor_output_edge(bytes, &evidence.suffix)
+}
+
+#[cfg(any(unix, windows))]
+fn push_external_supervisor_output_edge(bytes: &mut Vec<u8>, edge: &str) -> Result<(), String> {
+    let length = u32::try_from(edge.len())
+        .map_err(|_| "nightly supervisor output evidence edge is too long".to_owned())?;
+    push_supervisor_u32(bytes, length);
+    bytes.extend_from_slice(edge.as_bytes());
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -3591,6 +4430,57 @@ fn encode_external_supervisor_attribution(
         terminal.failed_case_unavailable.as_deref(),
         text_budget,
     )?;
+    encode_external_supervisor_failed_case_receipts(bytes, terminal, text_budget)?;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn encode_external_supervisor_failed_case_receipts(
+    bytes: &mut Vec<u8>,
+    terminal: &ExternalSupervisorTerminal,
+    text_budget: &mut usize,
+) -> Result<(), String> {
+    if terminal.failed_cases.len() > NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+        return Err("nightly supervisor failed-case receipt count exceeds its bound".to_owned());
+    }
+    push_supervisor_u32(
+        bytes,
+        u32::try_from(terminal.failed_cases.len())
+            .map_err(|_| "nightly supervisor failed-case receipt count is too large".to_owned())?,
+    );
+    let mut previous_sequence = None;
+    for receipt in &terminal.failed_cases {
+        if previous_sequence.is_some_and(|previous| previous >= receipt.failed.sequence) {
+            return Err(
+                "nightly supervisor failed-case receipts are not strictly ordered".to_owned(),
+            );
+        }
+        previous_sequence = Some(receipt.failed.sequence);
+        push_supervisor_u64(bytes, receipt.failed.sequence);
+        push_supervisor_u64(
+            bytes,
+            encode_external_supervisor_elapsed(receipt.failed.transition_elapsed),
+        );
+        push_supervisor_optional_text_with_budget(
+            bytes,
+            receipt.failed.target.as_deref(),
+            text_budget,
+        )?;
+        push_supervisor_optional_text_with_budget(bytes, Some(&receipt.failed.case), text_budget)?;
+        push_supervisor_optional_text_with_budget(
+            bytes,
+            Some(&receipt.failed.stream),
+            text_budget,
+        )?;
+        bytes.push(u8::from(receipt.primary_observed));
+        push_supervisor_optional_text_with_budget(
+            bytes,
+            (!receipt.primary.is_empty()).then_some(receipt.primary.as_str()),
+            text_budget,
+        )?;
+        bytes.push(u8::from(receipt.primary_truncated));
+    }
+    bytes.push(u8::from(terminal.failed_cases_truncated));
     Ok(())
 }
 
@@ -3792,6 +4682,10 @@ fn decode_external_supervisor_terminal(
     let leader_reaped = take_supervisor_bool(&mut remaining, "leader reap")?;
     let candidate_quiescence_complete =
         take_supervisor_bool(&mut remaining, "candidate quiescence")?;
+    let stdout_evidence =
+        decode_external_supervisor_output_evidence(&mut remaining, "stdout evidence")?;
+    let stderr_evidence =
+        decode_external_supervisor_output_evidence(&mut remaining, "stderr evidence")?;
     let cleanup_state = take_supervisor_optional_text(&mut remaining, "cleanup state name")?
         .ok_or_else(|| "nightly supervisor cleanup state name is unavailable".to_owned())?;
     let cleanup_error = take_supervisor_optional_text(&mut remaining, "cleanup error")?;
@@ -3801,27 +4695,7 @@ fn decode_external_supervisor_terminal(
     let detail =
         String::from_utf8(take_supervisor_bytes(&mut remaining, detail_length, "detail")?.to_vec())
             .map_err(|_| "nightly supervisor terminal detail is not UTF-8".to_owned())?;
-    let sequence = take_supervisor_u64(&mut remaining, "attribution sequence")?;
-    let transition_millis = take_supervisor_u64(&mut remaining, "transition elapsed")?;
-    let attribution = ActivePhaseAttribution {
-        sequence,
-        transition_elapsed: decode_external_supervisor_elapsed(transition_millis),
-        target: take_supervisor_optional_text(&mut remaining, "attribution target")?,
-        case: take_supervisor_optional_text(&mut remaining, "attribution case")?,
-        case_state: take_supervisor_optional_text(&mut remaining, "attribution case state")?,
-        subphase: take_supervisor_optional_text(&mut remaining, "attribution subphase")?,
-    };
-    let failed_case = decode_external_supervisor_failed_case(&mut remaining)?;
-    let failed_case_unavailable =
-        take_supervisor_optional_text(&mut remaining, "failed case unavailable reason")?;
-    if failed_case
-        .as_ref()
-        .is_some_and(|failed| !matches!(failed.stream.as_str(), "stdout" | "stderr"))
-    {
-        return Err("nightly supervisor failed case stream is invalid".to_owned());
-    }
-    let dropped_chunks = take_supervisor_u64(&mut remaining, "dropped progress chunks")?;
-    let dropped_bytes = take_supervisor_u64(&mut remaining, "dropped progress bytes")?;
+    let decoded = decode_external_supervisor_terminal_attribution(&mut remaining)?;
     if !remaining.is_empty() {
         return Err("nightly supervisor terminal receipt has trailing bytes".to_owned());
     }
@@ -3832,6 +4706,8 @@ fn decode_external_supervisor_terminal(
         stdout_sha256,
         stderr_bytes,
         stderr_sha256,
+        stdout_evidence,
+        stderr_evidence,
         capture: ExternalSupervisorCaptureState {
             stdout_truncated,
             stderr_truncated,
@@ -3848,11 +4724,60 @@ fn decode_external_supervisor_terminal(
         cleanup_error,
         cleanup_failures,
         detail,
+        attribution: decoded.attribution,
+        failed_case: decoded.failed_case,
+        failed_case_unavailable: decoded.failed_case_unavailable,
+        failed_cases: decoded.failed_cases,
+        failed_cases_truncated: decoded.failed_cases_truncated,
+        dropped_chunks: decoded.dropped_chunks,
+        dropped_bytes: decoded.dropped_bytes,
+    })
+}
+
+#[cfg(any(unix, windows))]
+struct DecodedExternalSupervisorAttribution {
+    attribution: ActivePhaseAttribution,
+    failed_case: Option<CausalFailedCase>,
+    failed_case_unavailable: Option<String>,
+    failed_cases: Vec<CausalFailedCaseReceipt>,
+    failed_cases_truncated: bool,
+    dropped_chunks: u64,
+    dropped_bytes: u64,
+}
+
+#[cfg(any(unix, windows))]
+fn decode_external_supervisor_terminal_attribution(
+    remaining: &mut &[u8],
+) -> Result<DecodedExternalSupervisorAttribution, String> {
+    let sequence = take_supervisor_u64(remaining, "attribution sequence")?;
+    let transition_millis = take_supervisor_u64(remaining, "transition elapsed")?;
+    let attribution = ActivePhaseAttribution {
+        sequence,
+        transition_elapsed: decode_external_supervisor_elapsed(transition_millis),
+        target: take_supervisor_optional_text(remaining, "attribution target")?,
+        case: take_supervisor_optional_text(remaining, "attribution case")?,
+        case_state: take_supervisor_optional_text(remaining, "attribution case state")?,
+        subphase: take_supervisor_optional_text(remaining, "attribution subphase")?,
+    };
+    let failed_case = decode_external_supervisor_failed_case(remaining)?;
+    let failed_case_unavailable =
+        take_supervisor_optional_text(remaining, "failed case unavailable reason")?;
+    let (failed_cases, failed_cases_truncated) =
+        decode_external_supervisor_failed_case_receipts(remaining)?;
+    validate_external_supervisor_failed_case_state(
+        &attribution,
+        failed_case.as_ref(),
+        &failed_cases,
+        failed_cases_truncated,
+    )?;
+    Ok(DecodedExternalSupervisorAttribution {
         attribution,
         failed_case,
         failed_case_unavailable,
-        dropped_chunks,
-        dropped_bytes,
+        failed_cases,
+        failed_cases_truncated,
+        dropped_chunks: take_supervisor_u64(remaining, "dropped progress chunks")?,
+        dropped_bytes: take_supervisor_u64(remaining, "dropped progress bytes")?,
     })
 }
 
@@ -3870,13 +4795,54 @@ fn decode_external_supervisor_terminal_binding(
     )? != NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC
         || take_supervisor_bytes(&mut remaining, 1, "terminal message")?[0]
             != NIGHTLY_SUPERVISOR_TERMINAL_MESSAGE
-        || take_supervisor_bytes(&mut remaining, request_sha256.0.len(), "request digest")?
-            != request_sha256.0
+    {
+        return Err("nightly supervisor terminal receipt binding differs".to_owned());
+    }
+    if take_supervisor_bytes(&mut remaining, 1, "terminal schema version")?[0]
+        != NIGHTLY_SUPERVISOR_TERMINAL_SCHEMA_VERSION
+    {
+        return Err("nightly supervisor terminal schema version differs".to_owned());
+    }
+    if take_supervisor_bytes(&mut remaining, request_sha256.0.len(), "request digest")?
+        != request_sha256.0
         || take_supervisor_bytes(&mut remaining, nonce.0.len(), "nonce")? != nonce.0
     {
         return Err("nightly supervisor terminal receipt binding differs".to_owned());
     }
     Ok(remaining)
+}
+
+#[cfg(any(unix, windows))]
+fn decode_external_supervisor_output_evidence(
+    remaining: &mut &[u8],
+    field: &str,
+) -> Result<Option<ExternalSupervisorOutputEvidence>, String> {
+    if !take_supervisor_bool(remaining, &format!("{field} availability"))? {
+        return Ok(None);
+    }
+    let rendered_utf8_bytes = take_supervisor_u64(remaining, &format!("{field} rendered bytes"))?;
+    let omitted_utf8_bytes = take_supervisor_u64(remaining, &format!("{field} omitted bytes"))?;
+    let prefix = take_external_supervisor_output_edge(remaining, &format!("{field} prefix"))?;
+    let suffix = take_external_supervisor_output_edge(remaining, &format!("{field} suffix"))?;
+    let evidence = ExternalSupervisorOutputEvidence {
+        rendered_utf8_bytes,
+        prefix,
+        suffix,
+        omitted_utf8_bytes,
+    };
+    validate_external_supervisor_output_evidence(&evidence)?;
+    Ok(Some(evidence))
+}
+
+#[cfg(any(unix, windows))]
+fn take_external_supervisor_output_edge(
+    remaining: &mut &[u8],
+    field: &str,
+) -> Result<String, String> {
+    let length = usize::try_from(take_supervisor_u32(remaining, field)?)
+        .map_err(|_| format!("nightly supervisor {field} length is not representable"))?;
+    String::from_utf8(take_supervisor_bytes(remaining, length, field)?.to_vec())
+        .map_err(|_| format!("nightly supervisor {field} is not UTF-8"))
 }
 
 #[cfg(any(unix, windows))]
@@ -3920,6 +4886,157 @@ fn decode_external_supervisor_failed_case(
         None
     };
     Ok(failed_case)
+}
+
+#[cfg(any(unix, windows))]
+fn decode_external_supervisor_failed_case_receipts(
+    remaining: &mut &[u8],
+) -> Result<(Vec<CausalFailedCaseReceipt>, bool), String> {
+    let count = usize::try_from(take_supervisor_u32(remaining, "failed-case receipt count")?)
+        .map_err(|_| {
+            "nightly supervisor failed-case receipt count is not representable".to_owned()
+        })?;
+    if count > NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+        return Err("nightly supervisor failed-case receipt count exceeds its bound".to_owned());
+    }
+    let mut receipts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sequence = take_supervisor_u64(remaining, "failed-case receipt sequence")?;
+        let transition_elapsed = decode_external_supervisor_elapsed(take_supervisor_u64(
+            remaining,
+            "failed-case receipt transition",
+        )?);
+        let target = take_supervisor_optional_text(remaining, "failed-case receipt target")?;
+        let case = take_supervisor_optional_text(remaining, "failed-case receipt name")?
+            .ok_or_else(|| {
+                "nightly supervisor failed-case receipt name is unavailable".to_owned()
+            })?;
+        let stream = take_supervisor_optional_text(remaining, "failed-case receipt stream")?
+            .ok_or_else(|| {
+                "nightly supervisor failed-case receipt stream is unavailable".to_owned()
+            })?;
+        if !matches!(stream.as_str(), "stdout" | "stderr") {
+            return Err("nightly supervisor failed-case receipt stream is invalid".to_owned());
+        }
+        let primary_observed = take_supervisor_bool(remaining, "failed-case primary availability")?;
+        let primary =
+            take_supervisor_optional_text(remaining, "failed-case primary")?.unwrap_or_default();
+        if primary.len() > NIGHTLY_SUPERVISOR_FAILED_CASE_PRIMARY_LIMIT {
+            return Err("nightly supervisor failed-case primary exceeds its bound".to_owned());
+        }
+        let primary_truncated = take_supervisor_bool(remaining, "failed-case primary truncation")?;
+        receipts.push(CausalFailedCaseReceipt {
+            failed: CausalFailedCase {
+                sequence,
+                transition_elapsed,
+                target,
+                case,
+                stream,
+            },
+            primary,
+            primary_observed,
+            primary_truncated,
+        });
+    }
+    let truncated = take_supervisor_bool(remaining, "failed-case receipt truncation")?;
+    Ok((receipts, truncated))
+}
+
+#[cfg(any(unix, windows))]
+fn validate_external_supervisor_failed_case_state(
+    attribution: &ActivePhaseAttribution,
+    failed_case: Option<&CausalFailedCase>,
+    receipts: &[CausalFailedCaseReceipt],
+    receipts_truncated: bool,
+) -> Result<(), String> {
+    if receipts.len() > NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+        return Err("nightly supervisor failed-case receipt count exceeds its bound".to_owned());
+    }
+    let mut previous_sequence = None;
+    let mut previous_elapsed = None;
+    for (index, receipt) in receipts.iter().enumerate() {
+        if previous_sequence.is_some_and(|previous| previous >= receipt.failed.sequence) {
+            return Err(
+                "nightly supervisor failed-case receipts are not strictly ordered".to_owned(),
+            );
+        }
+        if previous_elapsed.is_some_and(|previous| receipt.failed.transition_elapsed < previous) {
+            return Err(
+                "nightly supervisor failed-case receipt elapsed times moved backward".to_owned(),
+            );
+        }
+        if receipt.failed.sequence > attribution.sequence {
+            return Err(
+                "nightly supervisor failed-case receipt follows terminal attribution".to_owned(),
+            );
+        }
+        if receipts[..index].iter().any(|prior| {
+            prior.failed.target == receipt.failed.target && prior.failed.case == receipt.failed.case
+        }) {
+            return Err("nightly supervisor failed-case receipt identity is duplicated".to_owned());
+        }
+        if !matches!(receipt.failed.stream.as_str(), "stdout" | "stderr") {
+            return Err("nightly supervisor failed-case receipt stream is invalid".to_owned());
+        }
+        if (!receipt.primary_observed && (!receipt.primary.is_empty() || receipt.primary_truncated))
+            || (receipt.primary_observed && receipt.primary.is_empty())
+        {
+            return Err("nightly supervisor failed-case primary state is inconsistent".to_owned());
+        }
+        if receipt.primary.len() > NIGHTLY_SUPERVISOR_FAILED_CASE_PRIMARY_LIMIT {
+            return Err("nightly supervisor failed-case primary exceeds its bound".to_owned());
+        }
+        previous_sequence = Some(receipt.failed.sequence);
+        previous_elapsed = Some(receipt.failed.transition_elapsed);
+    }
+    if let Some(failed) = failed_case {
+        if !matches!(failed.stream.as_str(), "stdout" | "stderr") {
+            return Err("nightly supervisor failed case stream is invalid".to_owned());
+        }
+        if failed.sequence > attribution.sequence {
+            return Err("nightly supervisor failed case follows terminal attribution".to_owned());
+        }
+        if failed.transition_elapsed > attribution.transition_elapsed {
+            return Err(
+                "nightly supervisor failed case elapsed time follows attribution".to_owned(),
+            );
+        }
+    }
+    if receipts_truncated {
+        if receipts.len() != NIGHTLY_SUPERVISOR_FAILED_CASE_LIMIT {
+            return Err(
+                "nightly supervisor truncated failed-case receipts do not fill their bound"
+                    .to_owned(),
+            );
+        }
+        let retained_last = receipts.last().ok_or_else(|| {
+            "nightly supervisor truncated failed-case receipts are empty".to_owned()
+        })?;
+        let failed = failed_case.ok_or_else(|| {
+            "nightly supervisor truncated failed-case receipts omit the legacy last case".to_owned()
+        })?;
+        if failed.sequence <= retained_last.failed.sequence
+            || failed.transition_elapsed < retained_last.failed.transition_elapsed
+        {
+            return Err(
+                "nightly supervisor truncated failed-case legacy last is not newer".to_owned(),
+            );
+        }
+        if receipts.iter().any(|receipt| {
+            receipt.failed.target == failed.target && receipt.failed.case == failed.case
+        }) {
+            return Err(
+                "nightly supervisor truncated failed-case legacy identity is duplicated".to_owned(),
+            );
+        }
+    } else if receipts.last().map(|receipt| &receipt.failed) != failed_case
+        && !(receipts.is_empty() && failed_case.is_none())
+    {
+        return Err(
+            "nightly supervisor legacy failed case differs from its ordered receipts".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -4062,6 +5179,29 @@ fn external_supervisor_command(
 }
 
 #[cfg(any(unix, windows))]
+fn supervised_portability_progress(
+    initial: PortabilityChildProgress,
+    phase: &str,
+    capacity: usize,
+) -> (
+    Arc<Mutex<PortabilityChildProgress>>,
+    SupervisedProgressObserver,
+    mpsc::Receiver<hell_testkit::SupervisedProgressChunk>,
+) {
+    let authoritative = Arc::new(Mutex::new(initial));
+    let tap_progress = Arc::clone(&authoritative);
+    let phase = phase.to_owned();
+    let (observer, receiver) =
+        SupervisedProgressObserver::bounded_with_attribution_tap(capacity, move |stream, bytes| {
+            tap_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe_attribution_tap(&phase, stream, bytes);
+        });
+    (authoritative, observer, receiver)
+}
+
+#[cfg(any(unix, windows))]
 fn execute_external_supervisor_command(
     spec: CommandSpec,
     plan: ExternalSupervisorPlan,
@@ -4079,8 +5219,12 @@ fn execute_external_supervisor_command(
     let worker = attributed_worker_sender()?;
     let permit = PortabilityWorkerPermit::acquire()?;
     let receipt = AttributedWorkerReceipt::new(permit.id);
-    let (progress, progress_receiver) =
-        SupervisedProgressObserver::bounded(PORTABILITY_PROGRESS_QUEUE_CAPACITY);
+    let seed = plan.seed();
+    let (authoritative_progress, progress, progress_receiver) = supervised_portability_progress(
+        PortabilityChildProgress::seeded("nightly", seed.0, case, seed.2),
+        plan.name(),
+        PORTABILITY_PROGRESS_QUEUE_CAPACITY,
+    );
     let loss = progress.loss_receipt();
     let (terminal, terminal_receiver) = mpsc::sync_channel(1);
     let worker_receipt = receipt.clone();
@@ -4095,18 +5239,14 @@ fn execute_external_supervisor_command(
             permit,
         })
         .map_err(|_| "nightly supervisor command executor disconnected before launch".to_owned())?;
-    let seed = plan.seed();
-    let mut observed = PortabilityChildProgress::seeded("nightly", seed.0, case, seed.2);
     let mut published_sequence = u64::MAX;
     let mut published_frames = 0_u64;
-    let mut suppressed_frames = 0_u64;
     loop {
-        drain_portability_progress(&progress_receiver, &mut observed, plan.name());
+        drain_portability_progress_relay(&progress_receiver, &authoritative_progress);
+        let observed = portability_progress_snapshot(&authoritative_progress);
         if observed.sequence != published_sequence {
             if published_frames < NIGHTLY_SUPERVISOR_PROGRESS_FRAME_CAPACITY && publish(&observed) {
                 published_frames = published_frames.saturating_add(1);
-            } else {
-                suppressed_frames = suppressed_frames.saturating_add(1);
             }
             published_sequence = observed.sequence;
         }
@@ -4124,10 +5264,9 @@ fn execute_external_supervisor_command(
             }
             match terminal_receiver.try_recv() {
                 Ok(AttributedWorkerTerminal::Complete(result)) => {
-                    drain_portability_progress(&progress_receiver, &mut observed, plan.name());
-                    let mut loss = loss.snapshot();
-                    loss.chunks = loss.chunks.saturating_add(suppressed_frames);
-                    return Ok((result, observed, loss));
+                    drain_portability_progress_relay(&progress_receiver, &authoritative_progress);
+                    let observed = portability_progress_snapshot(&authoritative_progress);
+                    return Ok((result, observed, loss.snapshot()));
                 }
                 Ok(AttributedWorkerTerminal::Panicked) => {
                     let _ = hell_testkit::CleanupLifecycleReceipt::wait_for_all_until(
@@ -4148,10 +5287,9 @@ fn execute_external_supervisor_command(
         }
         match terminal_receiver.recv_timeout(receive_for) {
             Ok(AttributedWorkerTerminal::Complete(result)) => {
-                drain_portability_progress(&progress_receiver, &mut observed, plan.name());
-                let mut loss = loss.snapshot();
-                loss.chunks = loss.chunks.saturating_add(suppressed_frames);
-                return Ok((result, observed, loss));
+                drain_portability_progress_relay(&progress_receiver, &authoritative_progress);
+                let observed = portability_progress_snapshot(&authoritative_progress);
+                return Ok((result, observed, loss.snapshot()));
             }
             Ok(AttributedWorkerTerminal::Panicked) => {
                 let _ = hell_testkit::CleanupLifecycleReceipt::wait_for_all_until(
@@ -4187,6 +5325,83 @@ fn bounded_external_supervisor_text(detail: &str, limit: usize) -> String {
         bounded.push(character);
     }
     bounded
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_output_evidence(bytes: &[u8]) -> ExternalSupervisorOutputEvidence {
+    let rendered = String::from_utf8_lossy(bytes);
+    let rendered_utf8_bytes = u64::try_from(rendered.len()).unwrap_or(u64::MAX);
+    if rendered.len() <= NIGHTLY_SUPERVISOR_OUTPUT_EVIDENCE_LIMIT {
+        return ExternalSupervisorOutputEvidence {
+            rendered_utf8_bytes,
+            prefix: rendered.into_owned(),
+            suffix: String::new(),
+            omitted_utf8_bytes: 0,
+        };
+    }
+
+    let retained_limit = NIGHTLY_SUPERVISOR_OUTPUT_EVIDENCE_LIMIT
+        .saturating_sub(NIGHTLY_SUPERVISOR_OUTPUT_TRUNCATION_MARKER.len());
+    let mut prefix_end = retained_limit / 2;
+    while !rendered.is_char_boundary(prefix_end) {
+        prefix_end = prefix_end.saturating_sub(1);
+    }
+    let suffix_budget = retained_limit.saturating_sub(prefix_end);
+    let mut suffix_start = rendered.len().saturating_sub(suffix_budget);
+    while !rendered.is_char_boundary(suffix_start) {
+        suffix_start = suffix_start.saturating_add(1);
+    }
+    ExternalSupervisorOutputEvidence {
+        rendered_utf8_bytes,
+        prefix: rendered[..prefix_end].to_owned(),
+        suffix: rendered[suffix_start..].to_owned(),
+        omitted_utf8_bytes: u64::try_from(suffix_start.saturating_sub(prefix_end))
+            .unwrap_or(u64::MAX),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn validate_external_supervisor_output_evidence(
+    evidence: &ExternalSupervisorOutputEvidence,
+) -> Result<(), String> {
+    let retained_bytes = evidence.prefix.len().saturating_add(evidence.suffix.len());
+    let rendered_bytes = u64::try_from(retained_bytes)
+        .unwrap_or(u64::MAX)
+        .checked_add(evidence.omitted_utf8_bytes)
+        .ok_or_else(|| "nightly supervisor output evidence length overflowed".to_owned())?;
+    if rendered_bytes != evidence.rendered_utf8_bytes {
+        return Err("nightly supervisor output evidence lengths differ".to_owned());
+    }
+    if evidence.omitted_utf8_bytes == 0 && !evidence.suffix.is_empty() {
+        return Err("nightly supervisor complete output evidence has a suffix".to_owned());
+    }
+    if evidence.omitted_utf8_bytes != 0
+        && (evidence.prefix.is_empty() || evidence.suffix.is_empty())
+    {
+        return Err("nightly supervisor truncated output evidence lacks an edge".to_owned());
+    }
+    let truncation_marker_bytes = if evidence.omitted_utf8_bytes == 0 {
+        0
+    } else {
+        NIGHTLY_SUPERVISOR_OUTPUT_TRUNCATION_MARKER.len()
+    };
+    let encoded_bytes = retained_bytes.saturating_add(truncation_marker_bytes);
+    if encoded_bytes > NIGHTLY_SUPERVISOR_OUTPUT_EVIDENCE_LIMIT {
+        return Err("nightly supervisor output evidence exceeds its byte limit".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn render_external_supervisor_output_evidence(
+    evidence: &ExternalSupervisorOutputEvidence,
+) -> String {
+    let mut rendered = evidence.prefix.clone();
+    if evidence.omitted_utf8_bytes != 0 {
+        rendered.push_str(NIGHTLY_SUPERVISOR_OUTPUT_TRUNCATION_MARKER);
+        rendered.push_str(&evidence.suffix);
+    }
+    rendered
 }
 
 #[cfg(any(unix, windows))]
@@ -4238,6 +5453,23 @@ fn failed_case_unavailable_reason(
 }
 
 #[cfg(any(unix, windows))]
+fn authoritative_failed_case_unavailable_reason(
+    progress: &PortabilityChildProgress,
+    failed_case_present: bool,
+) -> Option<String> {
+    if failed_case_present {
+        None
+    } else if progress.case_line_truncated
+        || progress.stdout_line_truncated
+        || progress.stderr_line_truncated
+    {
+        Some("authoritative-case-line-truncated".to_owned())
+    } else {
+        Some("no-failed-case-observed".to_owned())
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn external_supervisor_completed_terminal(
     result: &crate::command::CommandResult,
     progress: &PortabilityChildProgress,
@@ -4257,7 +5489,9 @@ fn external_supervisor_completed_terminal(
         )
     };
     let failed_case_unavailable = (!success)
-        .then(|| failed_case_unavailable_reason(progress, loss, causal_failed_case.is_some()))
+        .then(|| {
+            authoritative_failed_case_unavailable_reason(progress, causal_failed_case.is_some())
+        })
         .flatten();
     ExternalSupervisorTerminal {
         execution: ExternalSupervisorExecutionState {
@@ -4269,6 +5503,8 @@ fn external_supervisor_completed_terminal(
         stdout_sha256: result.stdout_sha256,
         stderr_bytes: result.stderr_bytes,
         stderr_sha256: result.stderr_sha256,
+        stdout_evidence: Some(external_supervisor_output_evidence(&result.stdout)),
+        stderr_evidence: Some(external_supervisor_output_evidence(&result.stderr)),
         capture: ExternalSupervisorCaptureState {
             stdout_truncated: result.stdout_truncated,
             stderr_truncated: result.stderr_truncated,
@@ -4292,6 +5528,12 @@ fn external_supervisor_completed_terminal(
         attribution,
         failed_case: causal_failed_case,
         failed_case_unavailable,
+        failed_cases: if success {
+            Vec::new()
+        } else {
+            progress.failed_cases.clone()
+        },
+        failed_cases_truncated: !success && progress.failed_cases_dropped != 0,
         dropped_chunks: loss.chunks,
         dropped_bytes: loss.bytes,
     }
@@ -4327,7 +5569,7 @@ fn external_supervisor_error_terminal(
         })
         .or(cleanup.stderr);
     let failed_case_unavailable =
-        failed_case_unavailable_reason(progress, loss, failed_case.is_some());
+        authoritative_failed_case_unavailable_reason(progress, failed_case.is_some());
     ExternalSupervisorTerminal {
         execution: ExternalSupervisorExecutionState {
             success: false,
@@ -4339,6 +5581,10 @@ fn external_supervisor_error_terminal(
         stdout_sha256: stdout.map_or_else(Digest::default, |capture| capture.1),
         stderr_bytes: stderr.map_or(0, |capture| capture.0),
         stderr_sha256: stderr.map_or_else(Digest::default, |capture| capture.1),
+        stdout_evidence: completed
+            .map(|result| external_supervisor_output_evidence(&result.stdout)),
+        stderr_evidence: completed
+            .map(|result| external_supervisor_output_evidence(&result.stderr)),
         capture: ExternalSupervisorCaptureState {
             stdout_truncated: stdout.is_some_and(|capture| capture.2),
             stderr_truncated: stderr.is_some_and(|capture| capture.2),
@@ -4373,6 +5619,8 @@ fn external_supervisor_error_terminal(
         attribution,
         failed_case,
         failed_case_unavailable,
+        failed_cases: progress.failed_cases.clone(),
+        failed_cases_truncated: progress.failed_cases_dropped != 0,
         dropped_chunks: loss.chunks,
         dropped_bytes: loss.bytes,
     }
@@ -4431,6 +5679,8 @@ fn external_supervisor_failure_terminal(
         stdout_sha256: Digest::default(),
         stderr_bytes: 0,
         stderr_sha256: Digest::default(),
+        stdout_evidence: None,
+        stderr_evidence: None,
         capture: ExternalSupervisorCaptureState {
             stdout_truncated: false,
             stderr_truncated: false,
@@ -4467,6 +5717,8 @@ fn external_supervisor_failure_terminal(
         },
         failed_case: None,
         failed_case_unavailable: Some("infrastructure-failure-before-case-observation".to_owned()),
+        failed_cases: Vec::new(),
+        failed_cases_truncated: false,
         dropped_chunks: 0,
         dropped_bytes: 0,
     }
@@ -8174,16 +9426,11 @@ fn run_attributed_command(
     );
     drain_portability_progress(&progress_receiver, &mut child_progress, name);
     child_progress.retain_partial_line_evidence(report, name);
-    retain_attributed_worker_receipt(
-        report,
-        suite,
-        name,
-        &worker_receipt,
-        cleanup_observation_deadline(
-            terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
-            report_completion_deadline,
-        ),
+    let observation_deadline = cleanup_observation_deadline(
+        terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
+        report_completion_deadline,
     );
+    retain_attributed_worker_receipt(report, suite, name, &worker_receipt, observation_deadline);
     let (worker_state, case_state) = attributed_worker_terminal_state(&result);
     child_progress.record_terminal(name, case_state);
     if checkpoint_error.is_none()
@@ -8208,15 +9455,12 @@ fn run_attributed_command(
         worker_state,
     );
     let result = resolve_attributed_worker_outcome(report, context, command_started, result)?;
-    retain_portability_terminal_capture(
+    retain_attributed_terminal_result(
         report,
-        suite,
-        name,
+        (suite, name),
+        &child_progress,
         &result,
-        cleanup_observation_deadline(
-            terminal_receipt_deadline(child_completion_deadline, report_completion_deadline),
-            report_completion_deadline,
-        ),
+        observation_deadline,
     );
     let result = match result {
         Ok(result) => {
@@ -8558,6 +9802,14 @@ fn retain_portability_terminal_attribution(
             ("droppedChunks".to_owned(), JsonValue::Number(loss.chunks)),
             ("failedCase".to_owned(), failed_case),
             ("failedCaseUnavailable".to_owned(), failed_case_unavailable),
+            (
+                "failedCases".to_owned(),
+                portability_failed_cases_evidence(progress, worker_state),
+            ),
+            (
+                "failedCasesTruncated".to_owned(),
+                JsonValue::Bool(progress.failed_cases_dropped != 0),
+            ),
             ("phase".to_owned(), JsonValue::String(phase.to_owned())),
             (
                 "sequence".to_owned(),
@@ -8609,6 +9861,22 @@ fn retain_portability_terminal_attribution(
             ),
         ])),
     );
+}
+
+fn portability_failed_cases_evidence(
+    progress: &PortabilityChildProgress,
+    worker_state: &str,
+) -> JsonValue {
+    if worker_state != "failed" {
+        return JsonValue::Array(Vec::new());
+    }
+    JsonValue::Array(
+        progress
+            .failed_cases
+            .iter()
+            .map(|receipt| failed_case_receipt_identity_evidence(receipt, None))
+            .collect(),
+    )
 }
 
 fn portability_failed_case_evidence(
@@ -8705,6 +9973,93 @@ fn retain_portability_terminal_capture(
     );
 }
 
+fn retain_attributed_terminal_result(
+    report: &mut Report,
+    identity: (&str, &str),
+    progress: &PortabilityChildProgress,
+    result: &Result<crate::command::CommandResult, crate::command::CommandRunError>,
+    observation_deadline: Instant,
+) {
+    let (suite, phase) = identity;
+    retain_portability_terminal_capture(report, suite, phase, result, observation_deadline);
+    retain_portability_failed_case_receipts(
+        report,
+        suite,
+        phase,
+        progress,
+        result,
+        observation_deadline,
+    );
+}
+
+struct FailedCaseTerminalEvidence {
+    worker_state: &'static str,
+    cleanup_state: String,
+    cleanup_id: Option<u64>,
+    cleanup: ExternalSupervisorCleanupState,
+    candidate_quiescence_complete: bool,
+}
+
+fn retain_portability_failed_case_receipts(
+    report: &mut Report,
+    suite: &str,
+    phase: &str,
+    progress: &PortabilityChildProgress,
+    result: &Result<crate::command::CommandResult, crate::command::CommandRunError>,
+    observation_deadline: Instant,
+) {
+    let terminal = match result {
+        Ok(result) => FailedCaseTerminalEvidence {
+            worker_state: if result.status.success() && !result.timed_out {
+                "completed"
+            } else {
+                "failed"
+            },
+            cleanup_state: "completed".to_owned(),
+            cleanup_id: result.termination.cleanup_id,
+            cleanup: ExternalSupervisorCleanupState {
+                terminal: true,
+                termination_requested: result.termination.forced,
+                leader_reaped: result.termination.reaped,
+            },
+            candidate_quiescence_complete: result.termination.candidate_quiescence_complete,
+        },
+        Err(error) => {
+            let cleanup = external_supervisor_cleanup_outcome(error, observation_deadline);
+            FailedCaseTerminalEvidence {
+                worker_state: "failed",
+                cleanup_state: cleanup.state,
+                cleanup_id: cleanup.cleanup_id,
+                cleanup: cleanup.lifecycle,
+                candidate_quiescence_complete: cleanup.candidate_quiescence_complete,
+            }
+        }
+    };
+    report.evidence(
+        format!("{suite}-failed-case-receipts"),
+        JsonValue::Object(BTreeMap::from([
+            (
+                "failedCases".to_owned(),
+                JsonValue::Array(
+                    progress
+                        .failed_cases
+                        .iter()
+                        .map(|receipt| {
+                            failed_case_receipt_identity_evidence(receipt, Some(&terminal))
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "failedCasesTruncated".to_owned(),
+                JsonValue::Bool(progress.failed_cases_dropped != 0),
+            ),
+            ("phase".to_owned(), JsonValue::String(phase.to_owned())),
+            ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        ])),
+    );
+}
+
 fn retain_completed_portability_capture(
     evidence: &mut BTreeMap<String, JsonValue>,
     capture: &crate::command::CommandResult,
@@ -8737,6 +10092,16 @@ fn retain_completed_portability_capture(
         "stderrTruncated".to_owned(),
         JsonValue::Bool(capture.stderr_truncated),
     );
+    let stdout_evidence = external_supervisor_output_evidence(&capture.stdout);
+    let stderr_evidence = external_supervisor_output_evidence(&capture.stderr);
+    evidence.extend(external_supervisor_output_evidence_fields(
+        "stdout",
+        Some(&stdout_evidence),
+    ));
+    evidence.extend(external_supervisor_output_evidence_fields(
+        "stderr",
+        Some(&stderr_evidence),
+    ));
     evidence.insert(
         "cleanupReceiptId".to_owned(),
         capture
@@ -8906,6 +10271,45 @@ fn drain_portability_progress(
         };
         progress.observe(phase, chunk.stream, &chunk.bytes);
     }
+}
+
+#[cfg(any(unix, windows))]
+fn drain_portability_progress_relay(
+    receiver: &mpsc::Receiver<hell_testkit::SupervisedProgressChunk>,
+    progress: &Arc<Mutex<PortabilityChildProgress>>,
+) {
+    let mut stdout = 0_usize;
+    let mut stderr = 0_usize;
+    for _ in 0..PORTABILITY_PROGRESS_QUEUE_CAPACITY {
+        let Ok(chunk) = receiver.try_recv() else {
+            break;
+        };
+        match chunk.stream {
+            SupervisedOutputStream::Stdout => {
+                stdout = stdout.saturating_add(chunk.bytes.len());
+            }
+            SupervisedOutputStream::Stderr => {
+                stderr = stderr.saturating_add(chunk.bytes.len());
+            }
+        }
+    }
+    if stdout != 0 || stderr != 0 {
+        let mut progress = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.stdout_relayed = progress.stdout_relayed.saturating_add(stdout);
+        progress.stderr_relayed = progress.stderr_relayed.saturating_add(stderr);
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn portability_progress_snapshot(
+    progress: &Arc<Mutex<PortabilityChildProgress>>,
+) -> PortabilityChildProgress {
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 #[cfg(windows)]
@@ -9228,7 +10632,28 @@ fn external_supervisor_terminal_evidence(
     terminal: &ExternalSupervisorTerminal,
     request_sha256: Digest,
 ) -> JsonValue {
-    let mut evidence = BTreeMap::from([
+    let mut evidence =
+        external_supervisor_terminal_identity_evidence(plan, terminal, request_sha256);
+    evidence.extend(external_supervisor_capture_evidence(terminal));
+    evidence.extend(external_supervisor_output_evidence_fields(
+        "stdout",
+        terminal.stdout_evidence.as_ref(),
+    ));
+    evidence.extend(external_supervisor_output_evidence_fields(
+        "stderr",
+        terminal.stderr_evidence.as_ref(),
+    ));
+    evidence.extend(external_supervisor_cleanup_evidence(terminal));
+    JsonValue::Object(evidence)
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_terminal_identity_evidence(
+    plan: ExternalSupervisorPlan,
+    terminal: &ExternalSupervisorTerminal,
+    request_sha256: Digest,
+) -> BTreeMap<String, JsonValue> {
+    BTreeMap::from([
         (
             "detail".to_owned(),
             JsonValue::String(terminal.detail.clone()),
@@ -9249,6 +10674,14 @@ fn external_supervisor_terminal_evidence(
                 .map_or(JsonValue::Null, JsonValue::String),
         ),
         (
+            "failedCases".to_owned(),
+            external_supervisor_failed_case_receipts_evidence(terminal),
+        ),
+        (
+            "failedCasesTruncated".to_owned(),
+            JsonValue::Bool(terminal.failed_cases_truncated),
+        ),
+        (
             "droppedProgressBytes".to_owned(),
             JsonValue::Number(terminal.dropped_bytes),
         ),
@@ -9267,6 +10700,54 @@ fn external_supervisor_terminal_evidence(
             "requestSha256".to_owned(),
             JsonValue::String(request_sha256.hex()),
         ),
+        (
+            "terminalSchemaVersion".to_owned(),
+            JsonValue::Number(u64::from(NIGHTLY_SUPERVISOR_TERMINAL_SCHEMA_VERSION)),
+        ),
+        (
+            "success".to_owned(),
+            JsonValue::Bool(terminal.execution.success),
+        ),
+        (
+            "timedOut".to_owned(),
+            JsonValue::Bool(terminal.execution.timed_out),
+        ),
+    ])
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_failed_case_receipts_evidence(
+    terminal: &ExternalSupervisorTerminal,
+) -> JsonValue {
+    let terminal_evidence = FailedCaseTerminalEvidence {
+        worker_state: if terminal.execution.success {
+            "completed"
+        } else {
+            "failed"
+        },
+        cleanup_state: terminal.cleanup_state.clone(),
+        cleanup_id: terminal.cleanup_id,
+        cleanup: ExternalSupervisorCleanupState {
+            terminal: terminal.cleanup.terminal,
+            termination_requested: terminal.cleanup.termination_requested,
+            leader_reaped: terminal.cleanup.leader_reaped,
+        },
+        candidate_quiescence_complete: terminal.candidate_quiescence_complete,
+    };
+    JsonValue::Array(
+        terminal
+            .failed_cases
+            .iter()
+            .map(|receipt| failed_case_receipt_identity_evidence(receipt, Some(&terminal_evidence)))
+            .collect(),
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_capture_evidence(
+    terminal: &ExternalSupervisorTerminal,
+) -> BTreeMap<String, JsonValue> {
+    BTreeMap::from([
         (
             "stderrBytes".to_owned(),
             JsonValue::Number(terminal.stderr_bytes),
@@ -9316,17 +10797,65 @@ fn external_supervisor_terminal_evidence(
             "stdoutTruncated".to_owned(),
             JsonValue::Bool(terminal.capture.stdout_truncated),
         ),
+    ])
+}
+
+#[cfg(any(unix, windows))]
+fn external_supervisor_output_evidence_fields(
+    stream: &str,
+    evidence: Option<&ExternalSupervisorOutputEvidence>,
+) -> BTreeMap<String, JsonValue> {
+    let key = |field: &str| format!("{stream}Evidence{field}");
+    let rendered = evidence.map(render_external_supervisor_output_evidence);
+    BTreeMap::from([
+        (key("Available"), JsonValue::Bool(evidence.is_some())),
         (
-            "success".to_owned(),
-            JsonValue::Bool(terminal.execution.success),
+            key("Rendered"),
+            rendered.map_or(JsonValue::Null, JsonValue::String),
         ),
         (
-            "timedOut".to_owned(),
-            JsonValue::Bool(terminal.execution.timed_out),
+            key("RenderedUtf8Bytes"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::Number(value.rendered_utf8_bytes)
+            }),
         ),
-    ]);
-    evidence.extend(external_supervisor_cleanup_evidence(terminal));
-    JsonValue::Object(evidence)
+        (
+            key("Prefix"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::String(value.prefix.clone())
+            }),
+        ),
+        (
+            key("PrefixUtf8Bytes"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::Number(u64::try_from(value.prefix.len()).unwrap_or(u64::MAX))
+            }),
+        ),
+        (
+            key("Suffix"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::String(value.suffix.clone())
+            }),
+        ),
+        (
+            key("SuffixUtf8Bytes"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::Number(u64::try_from(value.suffix.len()).unwrap_or(u64::MAX))
+            }),
+        ),
+        (
+            key("OmittedUtf8Bytes"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::Number(value.omitted_utf8_bytes)
+            }),
+        ),
+        (
+            key("Truncated"),
+            evidence.map_or(JsonValue::Null, |value| {
+                JsonValue::Bool(value.omitted_utf8_bytes != 0)
+            }),
+        ),
+    ])
 }
 
 #[cfg(any(unix, windows))]
@@ -9477,6 +11006,102 @@ fn external_supervisor_failed_case_evidence(terminal: &ExternalSupervisorTermina
         })
 }
 
+fn failed_case_receipt_identity_evidence(
+    receipt: &CausalFailedCaseReceipt,
+    terminal: Option<&FailedCaseTerminalEvidence>,
+) -> JsonValue {
+    let mut evidence = BTreeMap::from([
+        (
+            "case".to_owned(),
+            JsonValue::String(receipt.failed.case.clone()),
+        ),
+        (
+            "caseState".to_owned(),
+            JsonValue::String("failed".to_owned()),
+        ),
+        (
+            "primary".to_owned(),
+            if receipt.primary_observed {
+                JsonValue::String(receipt.primary.clone())
+            } else {
+                JsonValue::Null
+            },
+        ),
+        (
+            "primaryTruncated".to_owned(),
+            JsonValue::Bool(receipt.primary_truncated),
+        ),
+        (
+            "primaryUnavailable".to_owned(),
+            if receipt.primary_observed {
+                JsonValue::Null
+            } else {
+                JsonValue::String("libtest-failure-section-unobserved".to_owned())
+            },
+        ),
+        (
+            "sequence".to_owned(),
+            JsonValue::Number(receipt.failed.sequence),
+        ),
+        (
+            "stream".to_owned(),
+            JsonValue::String(receipt.failed.stream.clone()),
+        ),
+        (
+            "target".to_owned(),
+            receipt
+                .failed
+                .target
+                .clone()
+                .map_or(JsonValue::Null, JsonValue::String),
+        ),
+        (
+            "transitionElapsedMillis".to_owned(),
+            receipt
+                .failed
+                .transition_elapsed
+                .map_or(JsonValue::Null, |elapsed| {
+                    JsonValue::Number(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                }),
+        ),
+    ]);
+    if let Some(terminal) = terminal {
+        evidence.extend([
+            (
+                "candidateQuiescenceComplete".to_owned(),
+                JsonValue::Bool(terminal.candidate_quiescence_complete),
+            ),
+            (
+                "cleanupId".to_owned(),
+                terminal
+                    .cleanup_id
+                    .map_or(JsonValue::Null, JsonValue::Number),
+            ),
+            (
+                "cleanupState".to_owned(),
+                JsonValue::String(terminal.cleanup_state.clone()),
+            ),
+            (
+                "cleanupTerminal".to_owned(),
+                JsonValue::Bool(terminal.cleanup.terminal),
+            ),
+            (
+                "leaderReaped".to_owned(),
+                JsonValue::Bool(terminal.cleanup.leader_reaped),
+            ),
+            (
+                "processGroupTerminationRequested".to_owned(),
+                JsonValue::Bool(terminal.cleanup.termination_requested),
+            ),
+            (
+                "workerState".to_owned(),
+                JsonValue::String(terminal.worker_state.to_owned()),
+            ),
+        ]);
+    }
+    JsonValue::Object(evidence)
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowsFileReceipt {
@@ -9487,7 +11112,14 @@ struct WindowsFileReceipt {
 }
 
 #[cfg(windows)]
-fn windows_file_receipt(file: &fs::File) -> Result<WindowsFileReceipt, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsStableObjectIdentity {
+    volume: u64,
+    index: u64,
+}
+
+#[cfg(windows)]
+fn windows_stable_object_identity(file: &fs::File) -> Result<WindowsStableObjectIdentity, String> {
     use std::hash::{Hash as _, Hasher as _};
 
     let identity = same_file::Handle::from_file(
@@ -9495,19 +11127,35 @@ fn windows_file_receipt(file: &fs::File) -> Result<WindowsFileReceipt, String> {
             .map_err(|error| format!("cannot clone Windows supervisor file handle: {error}"))?,
     )
     .map_err(|error| format!("cannot bind Windows supervisor file identity: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect Windows supervisor file: {error}"))?;
     let mut volume = std::hash::DefaultHasher::new();
     identity.hash(&mut volume);
     let mut index = std::hash::DefaultHasher::new();
     "hell-windows-file-id-v1".hash(&mut index);
     identity.hash(&mut index);
-    Ok(WindowsFileReceipt {
+    Ok(WindowsStableObjectIdentity {
         volume: volume.finish(),
         index: index.finish(),
-        size: metadata.len(),
-        attributes: metadata.file_attributes(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_receipt(file: &fs::File) -> Result<WindowsFileReceipt, String> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    let identity = windows_stable_object_identity(file)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect Windows supervisor file: {error}"))?;
+    let (size, attributes) = if metadata.is_dir() {
+        (0, FILE_ATTRIBUTE_DIRECTORY)
+    } else {
+        (metadata.len(), metadata.file_attributes())
+    };
+    Ok(WindowsFileReceipt {
+        volume: identity.volume,
+        index: identity.index,
+        size,
+        attributes,
     })
 }
 
@@ -9827,33 +11475,77 @@ impl WindowsSupervisorSession {
         Err("Windows supervisor session collision budget exhausted".to_owned())
     }
 
-    fn revalidate(&self) -> Result<(), String> {
+    fn revalidate_retained_receipts(&self) -> Result<(), String> {
         if windows_file_receipt(&self.parent)? != self.parent_receipt
             || windows_file_receipt(&self.root)? != self.root_receipt
             || windows_file_receipt(&self.request)? != self.request_receipt
-            || windows_bind_path(&self.parent_path, true)?.1 != self.parent_receipt
+        {
+            return Err("retained Windows supervisor session receipt changed".to_owned());
+        }
+        match (&self.request_digest, self.request_digest_receipt) {
+            (Some(request_digest), Some(receipt)) => {
+                if windows_file_receipt(request_digest)? != receipt {
+                    return Err(
+                        "retained Windows supervisor request digest receipt changed".to_owned()
+                    );
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "retained Windows supervisor request digest authority is incomplete".to_owned(),
+                );
+            }
+        }
+        match (&self.authority_manifest, self.authority_manifest_receipt) {
+            (Some(manifest), Some(receipt)) => {
+                if windows_file_receipt(manifest)? != receipt {
+                    return Err("retained Windows supervisor authority manifest changed".to_owned());
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "retained Windows supervisor manifest authority is incomplete".to_owned(),
+                );
+            }
+        }
+        match (&self.late_receipt, self.late_receipt_receipt) {
+            (Some(late_receipt), Some(receipt)) => {
+                if windows_file_receipt(late_receipt)? != receipt {
+                    return Err("retained Windows supervisor late receipt changed".to_owned());
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "retained Windows supervisor late-receipt authority is incomplete".to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        self.revalidate_retained_receipts()?;
+        if windows_bind_path(&self.parent_path, true)?.1 != self.parent_receipt
             || windows_bind_path(&self.root_path, true)?.1 != self.root_receipt
             || windows_bind_path(&self.request_path, false)?.1 != self.request_receipt
         {
             return Err("Windows supervisor session receipt changed".to_owned());
         }
-        if let (Some(request_digest), Some(request_digest_receipt)) =
-            (&self.request_digest, self.request_digest_receipt)
-            && (windows_file_receipt(request_digest)? != request_digest_receipt
-                || windows_bind_path(&self.request_digest_path, false)?.1 != request_digest_receipt)
+        if let Some(receipt) = self.request_digest_receipt
+            && windows_bind_path(&self.request_digest_path, false)?.1 != receipt
         {
             return Err("Windows supervisor request digest receipt changed".to_owned());
         }
-        if let (Some(manifest), Some(receipt)) =
-            (&self.authority_manifest, self.authority_manifest_receipt)
-            && (windows_file_receipt(manifest)? != receipt
-                || windows_bind_path(&self.authority_manifest_path, false)?.1 != receipt)
+        if let Some(receipt) = self.authority_manifest_receipt
+            && windows_bind_path(&self.authority_manifest_path, false)?.1 != receipt
         {
             return Err("Windows supervisor authority manifest changed".to_owned());
         }
-        if let (Some(late_receipt), Some(receipt)) = (&self.late_receipt, self.late_receipt_receipt)
-            && (windows_file_receipt(late_receipt)? != receipt
-                || windows_bind_shared_late_receipt(&self.late_receipt_path)?.1 != receipt)
+        if let Some(receipt) = self.late_receipt_receipt
+            && windows_bind_shared_late_receipt(&self.late_receipt_path)?.1 != receipt
         {
             return Err("Windows supervisor late receipt changed".to_owned());
         }
@@ -9949,7 +11641,7 @@ impl WindowsSupervisorSession {
         Ok(())
     }
 
-    fn retain_read_only_receipts(&mut self) -> Result<(), String> {
+    fn promote_receipts_before_confinement(&mut self) -> Result<(), String> {
         self.revalidate()?;
         let (request, request_receipt) = windows_bind_path(&self.request_path, false)?;
         if request_receipt != self.request_receipt {
@@ -9978,7 +11670,7 @@ impl WindowsSupervisorSession {
         if Instant::now() >= deadline {
             return Err("Windows supervisor session cleanup deadline expired".to_owned());
         }
-        self.revalidate()?;
+        self.revalidate_retained_receipts()?;
         if !terminal_imported {
             return Err(format!(
                 "Windows supervisor session retained until its terminal receipt is imported: {}",
@@ -10062,7 +11754,7 @@ impl WindowsSupervisorSession {
     }
 
     fn transfer_session_cleanup(self) -> Result<WindowsLateReceiptAuthority, String> {
-        self.revalidate()?;
+        self.revalidate_retained_receipts()?;
         let late_receipt = self
             .late_receipt
             .ok_or_else(|| "Windows supervisor late receipt is absent".to_owned())?;
@@ -10193,6 +11885,123 @@ fn windows_validate_frame(
         return Err("Windows supervisor frame authority differs".to_owned());
     }
     Ok(&frame[1 + digest_width * 2..])
+}
+
+#[cfg(windows)]
+const WINDOWS_PRE_READY_FAILURE_FRAME: u8 = 16;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsPreReadyPhase {
+    Request = 1,
+    Envelope = 2,
+    FilesystemAuthority = 3,
+    ReceiptStaging = 4,
+    CleanupSuccessor = 5,
+    Confinement = 6,
+    ReadyPublication = 7,
+}
+
+#[cfg(windows)]
+impl WindowsPreReadyPhase {
+    fn from_byte(value: u8) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::Request),
+            2 => Ok(Self::Envelope),
+            3 => Ok(Self::FilesystemAuthority),
+            4 => Ok(Self::ReceiptStaging),
+            5 => Ok(Self::CleanupSuccessor),
+            6 => Ok(Self::Confinement),
+            7 => Ok(Self::ReadyPublication),
+            _ => Err("Windows supervisor pre-Ready phase differs".to_owned()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Envelope => "envelope",
+            Self::FilesystemAuthority => "filesystem-authority",
+            Self::ReceiptStaging => "receipt-staging",
+            Self::CleanupSuccessor => "cleanup-successor",
+            Self::Confinement => "confinement",
+            Self::ReadyPublication => "ready-publication",
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsPreReadyFailureContext {
+    phase: WindowsPreReadyPhase,
+    authority: Option<(Digest, Digest)>,
+    ready_published: bool,
+}
+
+#[cfg(windows)]
+impl WindowsPreReadyFailureContext {
+    fn new() -> Self {
+        Self {
+            phase: WindowsPreReadyPhase::Request,
+            authority: None,
+            ready_published: false,
+        }
+    }
+
+    fn bind(&mut self, request_sha256: Digest, nonce: Digest) {
+        self.authority = Some((request_sha256, nonce));
+    }
+
+    fn enter(&mut self, phase: WindowsPreReadyPhase) {
+        self.phase = phase;
+    }
+
+    fn mark_ready(&mut self) {
+        self.ready_published = true;
+    }
+
+    fn publish(&self, detail: &str) -> Result<(), String> {
+        if self.ready_published {
+            return Ok(());
+        }
+        let (request_sha256, nonce) = self.authority.ok_or_else(|| {
+            "Windows supervisor pre-Ready failure lacks request authority".to_owned()
+        })?;
+        let detail = bounded_external_supervisor_detail(detail);
+        let mut payload = Vec::with_capacity(1 + detail.len());
+        payload.push(self.phase as u8);
+        payload.extend_from_slice(detail.as_bytes());
+        let frame = windows_supervisor_frame(
+            WINDOWS_PRE_READY_FAILURE_FRAME,
+            request_sha256,
+            nonce,
+            &payload,
+        )?;
+        windows_write_inherited_frame(&mut std::io::stdout().lock(), &frame)
+    }
+}
+
+#[cfg(windows)]
+fn decode_windows_pre_ready_failure_frame(
+    frame: &[u8],
+    request_sha256: Digest,
+    nonce: Digest,
+) -> Result<(WindowsPreReadyPhase, String), String> {
+    let payload = windows_validate_frame(
+        frame,
+        WINDOWS_PRE_READY_FAILURE_FRAME,
+        request_sha256,
+        nonce,
+    )?;
+    let (&phase, detail) = payload
+        .split_first()
+        .ok_or_else(|| "Windows supervisor pre-Ready failure frame is empty".to_owned())?;
+    let phase = WindowsPreReadyPhase::from_byte(phase)?;
+    let detail = String::from_utf8(detail.to_vec())
+        .map_err(|_| "Windows supervisor pre-Ready failure detail is not UTF-8".to_owned())?;
+    if detail.is_empty() || detail != bounded_external_supervisor_detail(&detail) {
+        return Err("Windows supervisor pre-Ready failure detail is not bounded".to_owned());
+    }
+    Ok((phase, detail))
 }
 
 #[cfg(windows)]
@@ -10360,17 +12169,18 @@ struct WindowsAuthorityCleanupStart<'a> {
     session_receipt: WindowsFileReceipt,
     request_sha256: Digest,
     nonce: Digest,
-    deadline: Instant,
+    ready_deadline: Instant,
+    lifetime_deadline: Instant,
 }
 
 #[cfg(windows)]
 fn start_windows_authority_cleanup_successor(
-    start: WindowsAuthorityCleanupStart<'_>,
+    start: &WindowsAuthorityCleanupStart<'_>,
 ) -> Result<WindowsAuthorityCleanupSuccessor, String> {
     let mut launch =
         spawn_windows_pipe_supervisor(start.executable, "windows-authority-cleanup-v1")?;
     let remaining = start
-        .deadline
+        .lifetime_deadline
         .saturating_duration_since(Instant::now())
         .saturating_sub(NIGHTLY_SUPERVISOR_START_TIMEOUT);
     if remaining <= NIGHTLY_SUPERVISOR_START_TIMEOUT {
@@ -10399,8 +12209,9 @@ fn start_windows_authority_cleanup_successor(
     let ready = launch
         .observations
         .recv_timeout(
-            NIGHTLY_SUPERVISOR_START_TIMEOUT
-                .min(start.deadline.saturating_duration_since(Instant::now())),
+            start
+                .ready_deadline
+                .saturating_duration_since(Instant::now()),
         )
         .map_err(|error| format!("cannot receive Windows cleanup successor Ready: {error}"))??;
     let payload = windows_validate_frame(&ready, 1, start.request_sha256, start.nonce)?;
@@ -10550,6 +12361,42 @@ fn close_unstarted_windows_supervisor_session(
 }
 
 #[cfg(windows)]
+fn await_windows_pre_ready_supervisor_exit(
+    child: &WindowsSupervisorProcess,
+    cleanup_deadline: Instant,
+) -> Result<u32, String> {
+    let started = Instant::now();
+    let receipt_deadline = started
+        .checked_add(cleanup_deadline.saturating_duration_since(started) / 2)
+        .unwrap_or(cleanup_deadline)
+        .min(cleanup_deadline);
+    loop {
+        if let Some(exit_code) = child.try_wait()? {
+            return Ok(exit_code);
+        }
+        if Instant::now() >= receipt_deadline {
+            return Err(
+                "Windows pre-Ready supervisor exact exit receipt exceeded its bounded reserve"
+                    .to_owned(),
+            );
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(windows)]
+fn retain_windows_pre_ready_exit_detail(
+    child: &WindowsSupervisorProcess,
+    cleanup_deadline: Instant,
+    primary: String,
+) -> String {
+    match await_windows_pre_ready_supervisor_exit(child, cleanup_deadline) {
+        Ok(exit_code) => format!("{primary}; exitCode={exit_code}"),
+        Err(exit_error) => format!("{primary}; additionally, {exit_error}"),
+    }
+}
+
+#[cfg(windows)]
 fn close_prelaunch_windows_supervisor(
     child: WindowsSupervisorProcess,
     session: WindowsSupervisorSession,
@@ -10648,6 +12495,7 @@ fn windows_parse_receipt(
 #[cfg(windows)]
 struct WindowsSupervisorRequestFields<'a> {
     plan: ExternalSupervisorPlan,
+    envelope_profile: WindowsSupervisorEnvelopeProfile,
     root: (&'a Path, WindowsFileReceipt),
     writable_target: (&'a Path, WindowsFileReceipt),
     session: &'a WindowsSupervisorSession,
@@ -10667,6 +12515,7 @@ fn windows_supervisor_request_fields(
 ) -> Result<Vec<std::ffi::OsString>, String> {
     let WindowsSupervisorRequestFields {
         plan,
+        envelope_profile,
         root,
         writable_target,
         session,
@@ -10696,6 +12545,7 @@ fn windows_supervisor_request_fields(
         fixture_exit_observer.unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let mut fields = vec![
         plan.code().to_string().into(),
+        envelope_profile.code().to_string().into(),
         root.as_os_str().to_owned(),
         writable_target.as_os_str().to_owned(),
         session.root_path.as_os_str().to_owned(),
@@ -11555,6 +13405,7 @@ fn verify_windows_nightly_authority_manifest_for_integration(
     fs::create_dir(&root)
         .map_err(|error| format!("cannot create manifest verifier root: {error}"))?;
     let (root_guard, root_receipt) = windows_bind_path(&root, true)?;
+    let mut serialized_child = None;
     let primary = (|| {
         let bin = root.join("bin");
         fs::create_dir(&bin)
@@ -11610,17 +13461,50 @@ fn verify_windows_nightly_authority_manifest_for_integration(
             return Err("manifest verifier executable mapping differs".to_owned());
         }
         let wrapped = windows_write_restricted_supervisor_command(
-            CommandSpec::cargo(Duration::from_secs(1)).current_directory(&parent),
-            &parent,
+            CommandSpec::cargo(Duration::from_secs(1))
+                .arguments(["check", "--package", "hell-ci", "--lib", "--locked"])
+                .current_directory(&parent),
+            &root,
             Some(&imported),
             deadline,
         )?;
-        if Path::new(&wrapped.program) != cargo {
+        let [selector, encoded] = wrapped.arguments.as_slice() else {
+            return Err("manifest verifier wrapped command width differs".to_owned());
+        };
+        if selector != "__nightly-write-restricted-child" {
+            return Err("manifest verifier wrapped command selector differs".to_owned());
+        }
+        let request = hell_testkit::decode_windows_argv(encoded)
+            .map_err(|error| format!("cannot decode manifest verifier request: {error}"))?;
+        let [_, _, child_fields @ ..] = request.as_slice() else {
+            return Err("manifest verifier request width differs".to_owned());
+        };
+        serialized_child = Some(
+            hell_testkit::parse_windows_release_child_request(child_fields.to_vec()).map_err(
+                |error| format!("cannot parse manifest verifier child request: {error}"),
+            )?,
+        );
+        let child = serialized_child
+            .as_ref()
+            .ok_or_else(|| "manifest verifier child cleanup authority is absent".to_owned())?;
+        let expected_arguments = [
+            cargo.as_os_str().to_owned(),
+            "check".into(),
+            "--target-dir".into(),
+            root.as_os_str().to_owned(),
+            "--package".into(),
+            "hell-ci".into(),
+            "--lib".into(),
+            "--locked".into(),
+        ];
+        if child.current_directory() != parent || child.target_arguments() != expected_arguments {
             return Err("manifest verifier did not launch the retained staged Cargo".to_owned());
         }
         if windows_write_restricted_supervisor_command(
-            CommandSpec::cargo(Duration::from_secs(1)).current_directory(&parent),
-            &parent,
+            CommandSpec::cargo(Duration::from_secs(1))
+                .arguments(["check", "--package", "hell-ci", "--lib", "--locked"])
+                .current_directory(&parent),
+            &root,
             Some(&imported),
             Instant::now(),
         )
@@ -11745,6 +13629,70 @@ fn verify_windows_nightly_authority_manifest_for_integration(
         {
             return Err("manifest verifier ownership changed before cleanup".to_owned());
         }
+        if let Some(child) = serialized_child.as_ref() {
+            let environment_root = root.join("release-child-environment");
+            let temporary_parent = environment_root.join("tmp");
+            let (environment_guard, environment_receipt) =
+                windows_bind_path(&environment_root, true)?;
+            let (temporary_parent_guard, temporary_parent_receipt) =
+                windows_bind_path(&temporary_parent, true)?;
+            hell_testkit::cleanup_windows_release_child_temp_authority_until(
+                child,
+                cleanup_deadline,
+            )
+            .map_err(|error| {
+                format!("cannot clean manifest verifier serialized child temp: {error}")
+            })?;
+            if Instant::now() >= cleanup_deadline
+                || windows_file_receipt(&environment_guard)? != environment_receipt
+                || windows_bind_path(&environment_root, true)?.1 != environment_receipt
+                || windows_file_receipt(&temporary_parent_guard)? != temporary_parent_receipt
+                || windows_bind_path(&temporary_parent, true)?.1 != temporary_parent_receipt
+                || fs::read_dir(&temporary_parent)
+                    .map_err(|error| {
+                        format!("cannot enumerate manifest verifier temp parent: {error}")
+                    })?
+                    .next()
+                    .is_some()
+            {
+                return Err(
+                    "manifest verifier serialized child temp parent changed before cleanup"
+                        .to_owned(),
+                );
+            }
+            drop(temporary_parent_guard);
+            fs::remove_dir(&temporary_parent)
+                .map_err(|error| format!("cannot remove manifest verifier temp parent: {error}"))?;
+            if fs::read_dir(&environment_root)
+                .map_err(|error| {
+                    format!("cannot enumerate manifest verifier environment root: {error}")
+                })?
+                .next()
+                .is_some()
+            {
+                return Err("manifest verifier environment root is not empty".to_owned());
+            }
+            drop(environment_guard);
+            fs::remove_dir(&environment_root).map_err(|error| {
+                format!("cannot remove manifest verifier environment root: {error}")
+            })?;
+            for (label, path) in [
+                ("temp parent", temporary_parent.as_path()),
+                ("environment root", environment_root.as_path()),
+            ] {
+                match fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot attest manifest verifier {label} absence: {error}"
+                        ));
+                    }
+                    Ok(_) => {
+                        return Err(format!("manifest verifier {label} remains after cleanup"));
+                    }
+                }
+            }
+        }
         for relative in ["bin/extra.exe", "bin/rustc.exe", "bin/cargo.exe"] {
             if Instant::now() >= cleanup_deadline {
                 return Err(
@@ -11815,6 +13763,18 @@ struct WindowsPipeSupervisorLaunch {
 }
 
 #[cfg(windows)]
+struct WindowsSupervisorPipes {
+    control_read: firehazard::io::ReadPipe,
+    control_write: firehazard::io::WritePipe,
+    observation_read: firehazard::io::ReadPipe,
+    observation_write: firehazard::io::WritePipe,
+    null_file: firehazard::io::File,
+}
+
+#[cfg(windows)]
+type WindowsSupervisorObservations = (mpsc::Receiver<Result<Vec<u8>, String>>, Arc<AtomicU64>);
+
+#[cfg(windows)]
 fn windows_read_inherited_frame(
     reader: &mut impl std::io::Read,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -11860,12 +13820,142 @@ fn windows_write_inherited_frame(
 }
 
 #[cfg(windows)]
-fn spawn_windows_pipe_supervisor(
-    executable: &Path,
-    protocol: &str,
-) -> Result<WindowsPipeSupervisorLaunch, String> {
-    const STARTF_USE_STD_HANDLES: u32 = 0x0000_0100;
+fn terminate_suspended_windows_supervisor_by_id(
+    process_id: u32,
+    deadline: Instant,
+) -> Result<(), String> {
+    let environment = ProcessEnvironment::from_process();
+    let system_root = environment
+        .value(StandardVariable::SystemRoot)
+        .map(PathBuf::from)
+        .ok_or_else(|| "SystemRoot is absent during Windows startup cleanup".to_owned())?;
+    let system32 = fs::canonicalize(system_root.join("System32")).map_err(|error| {
+        format!("cannot canonicalize System32 during Windows startup cleanup: {error}")
+    })?;
+    let taskkill = fs::canonicalize(system32.join("taskkill.exe")).map_err(|error| {
+        format!("cannot canonicalize taskkill.exe during Windows startup cleanup: {error}")
+    })?;
+    if taskkill.parent() != Some(system32.as_path()) {
+        return Err("Windows startup cleanup taskkill.exe escapes System32".to_owned());
+    }
+    let (taskkill_guard, taskkill_receipt) = windows_bind_path(&taskkill, false)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("Windows startup cleanup deadline expired before taskkill".to_owned());
+    }
+    let execution_deadline = Instant::now()
+        .checked_add(remaining / 2)
+        .unwrap_or(deadline)
+        .min(deadline);
+    let (progress, _receiver) = SupervisedProgressObserver::bounded(1);
+    let result = CommandSpec::trusted_absolute(taskkill.clone(), remaining)?
+        .arguments([
+            std::ffi::OsString::from("/PID"),
+            std::ffi::OsString::from(process_id.to_string()),
+            std::ffi::OsString::from("/F"),
+        ])
+        .run_until(execution_deadline, deadline, progress)
+        .map_err(|error| format!("cannot execute Windows startup cleanup taskkill.exe: {error}"))?;
+    if result.timed_out
+        || !result.status.success()
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || !result.stderr.is_empty()
+        || (result.termination.forced && !result.termination.reaped)
+    {
+        return Err(format!(
+            "Windows startup cleanup taskkill.exe did not complete cleanly: status={} timedOut={} stdoutTruncated={} stderrTruncated={} stderrBytes={} forced={} reaped={}",
+            result.status,
+            result.timed_out,
+            result.stdout_truncated,
+            result.stderr_truncated,
+            result.stderr.len(),
+            result.termination.forced,
+            result.termination.reaped
+        ));
+    }
+    if windows_file_receipt(&taskkill_guard)? != taskkill_receipt
+        || windows_bind_path(&taskkill, false)?.1 != taskkill_receipt
+    {
+        return Err("Windows startup cleanup taskkill.exe authority changed".to_owned());
+    }
+    Ok(())
+}
 
+#[cfg(windows)]
+fn cleanup_failed_suspended_windows_supervisor(
+    process: &firehazard::process::OwnedHandle,
+    process_id: u32,
+    supervisor_job: &firehazard::job::OwnedHandle,
+    primary: String,
+) -> String {
+    let deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+        .unwrap_or_else(Instant::now);
+    let mut cleanup_failures = Vec::new();
+    if let Err(error) = firehazard::terminate_job_object(supervisor_job, 1) {
+        cleanup_failures.push(format!(
+            "cannot terminate failed Windows supervisor Job: {error:?}"
+        ));
+    }
+    if firehazard::process::is_process_running(process)
+        && let Err(error) = terminate_suspended_windows_supervisor_by_id(process_id, deadline)
+    {
+        cleanup_failures.push(error);
+    }
+    while Instant::now() < deadline && firehazard::process::is_process_running(process) {
+        std::thread::yield_now();
+    }
+    if firehazard::process::is_process_running(process) {
+        cleanup_failures
+            .push("failed suspended Windows supervisor was not reaped before deadline".to_owned());
+    } else if let Err(error) = firehazard::process::get_exit_code_process(process) {
+        cleanup_failures.push(format!(
+            "cannot attest failed suspended Windows supervisor exit: {error:?}"
+        ));
+    }
+    if cleanup_failures.is_empty() {
+        primary
+    } else {
+        format!(
+            "{primary}; additionally, startup cleanup failed: {}",
+            cleanup_failures.join("; ")
+        )
+    }
+}
+
+#[cfg(windows)]
+fn bind_suspended_windows_supervisor_to_job(
+    process: &firehazard::process::Information,
+    supervisor_job: &firehazard::job::OwnedHandle,
+) -> Result<(), String> {
+    firehazard::assign_process_to_job_object(supervisor_job, &process.process).map_err(
+        |error| format!("cannot assign suspended Windows supervisor to nested Job: {error:?}"),
+    )?;
+    match firehazard::is_process_in_job(&process.process, Some(supervisor_job)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("Windows supervisor is absent from its retained Job".to_owned()),
+        Err(error) => Err(format!(
+            "cannot attest Windows supervisor Job membership: {error:?}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_windows_supervisor(
+    process: &firehazard::process::Information,
+) -> Result<(), String> {
+    match firehazard::thread::resume_thread(&process.thread) {
+        Ok(1) => Ok(()),
+        Ok(previous) => Err(format!(
+            "Windows supervisor suspension count differs before resume: {previous}"
+        )),
+        Err(error) => Err(format!("cannot resume Windows supervisor: {error:?}")),
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_supervisor_pipes() -> Result<WindowsSupervisorPipes, String> {
     let inheritable = firehazard::security::Attributes::new(None, true);
     let pipe_capacity =
         u32::try_from(NIGHTLY_SUPERVISOR_TERMINAL_LIMIT.saturating_add(size_of::<u32>()))
@@ -11895,12 +13985,74 @@ fn spawn_windows_pipe_supervisor(
         .open("NUL")
         .map(firehazard::io::File::from)
         .map_err(|error| format!("cannot open Windows supervisor null diagnostic sink: {error}"))?;
-    firehazard::handle::set_handle_information(&null_file, (), firehazard::handle::FLAG_INHERIT)
-        .map_err(|error| {
-            format!("cannot make Windows supervisor null sink inheritable: {error:?}")
-        })?;
+    firehazard::handle::set_handle_information(
+        &null_file,
+        firehazard::handle::FLAG_INHERIT,
+        firehazard::handle::FLAG_INHERIT,
+    )
+    .map_err(|error| format!("cannot make Windows supervisor null sink inheritable: {error:?}"))?;
+    let pipes = WindowsSupervisorPipes {
+        control_read,
+        control_write,
+        observation_read,
+        observation_write,
+        null_file,
+    };
+    validate_windows_supervisor_handle_topology(
+        &pipes.control_read,
+        &pipes.observation_write,
+        &pipes.null_file,
+        &pipes.control_write,
+        &pipes.observation_read,
+    )?;
+    Ok(pipes)
+}
 
-    let supervisor_job = firehazard::create_job_object_w(None, ())
+#[cfg(windows)]
+fn validate_windows_supervisor_handle_inheritance<'a>(
+    handle: impl AsRef<firehazard::handle::Borrowed<'a>>,
+    role: &str,
+    expected: bool,
+) -> Result<(), String> {
+    let flags = firehazard::handle::get_handle_information(handle).map_err(|error| {
+        format!("cannot inspect Windows supervisor {role} handle flags: {error:?}")
+    })?;
+    let inherited = flags & firehazard::handle::FLAG_INHERIT == firehazard::handle::FLAG_INHERIT;
+    if inherited != expected {
+        return Err(format!(
+            "Windows supervisor {role} handle inheritance differs: expected={expected} actual={inherited}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_supervisor_handle_topology<'a>(
+    control_read: impl AsRef<firehazard::handle::Borrowed<'a>>,
+    observation_write: impl AsRef<firehazard::handle::Borrowed<'a>>,
+    null_file: impl AsRef<firehazard::handle::Borrowed<'a>>,
+    control_write: impl AsRef<firehazard::handle::Borrowed<'a>>,
+    observation_read: impl AsRef<firehazard::handle::Borrowed<'a>>,
+) -> Result<(), String> {
+    validate_windows_supervisor_handle_inheritance(control_read, "child control-read", true)?;
+    validate_windows_supervisor_handle_inheritance(
+        observation_write,
+        "child observation-write",
+        true,
+    )?;
+    validate_windows_supervisor_handle_inheritance(null_file, "child null-sink", true)?;
+    validate_windows_supervisor_handle_inheritance(control_write, "parent control-write", false)?;
+    validate_windows_supervisor_handle_inheritance(
+        observation_read,
+        "parent observation-read",
+        false,
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_windows_supervisor_job() -> Result<firehazard::job::OwnedHandle, String> {
+    let job = firehazard::create_job_object_w(None, ())
         .map_err(|error| format!("cannot create Windows supervisor Job: {error:?}"))?;
     let limits = firehazard::job::object::ExtendedLimitInformation {
         basic_limit_information: firehazard::job::object::BasicLimitInformation {
@@ -11909,28 +14061,76 @@ fn spawn_windows_pipe_supervisor(
         },
         ..Default::default()
     };
-    firehazard::set_information_job_object(&supervisor_job, limits)
+    firehazard::set_information_job_object(&job, limits)
         .map_err(|error| format!("cannot configure Windows supervisor Job: {error:?}"))?;
+    Ok(job)
+}
+
+#[cfg(windows)]
+fn start_windows_supervisor_observer(
+    observation_read: firehazard::io::ReadPipe,
+) -> Result<WindowsSupervisorObservations, String> {
+    let (observation_sender, observations) = mpsc::sync_channel(8);
+    let observer_dropped = Arc::new(AtomicU64::new(0));
+    let observer_drop_counter = Arc::clone(&observer_dropped);
+    std::thread::Builder::new()
+        .name("hell-windows-supervisor-observer".to_owned())
+        .spawn(move || {
+            let mut observation_read = observation_read;
+            loop {
+                match windows_read_inherited_frame(&mut observation_read) {
+                    Ok(Some(frame)) if frame.first() == Some(&6) => {
+                        match observation_sender.try_send(Ok(frame)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                observer_drop_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+                    Ok(Some(frame)) => {
+                        if observation_sender.send(Ok(frame)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = observation_sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("cannot start Windows supervisor observer: {error}"))?;
+    Ok((observations, observer_dropped))
+}
+
+#[cfg(windows)]
+fn create_suspended_windows_supervisor_process(
+    executable: &Path,
+    protocol: &str,
+    pipes: &WindowsSupervisorPipes,
+) -> Result<firehazard::process::Information, String> {
+    const STARTF_USE_STD_HANDLES: u32 = 0x0000_0100;
+
     let protocol_token = hell_testkit::encode_windows_argv(&[std::ffi::OsString::from(protocol)])
         .map_err(|error| {
         format!("cannot encode Windows supervisor protocol selector: {error}")
     })?;
 
     let inherited_handles = [
-        (&control_read).into(),
-        (&observation_write).into(),
-        (&null_file).into(),
+        (&pipes.control_read).into(),
+        (&pipes.observation_write).into(),
+        (&pipes.null_file).into(),
     ];
-    let supervisor_jobs = [(&supervisor_job).into()];
-    let attributes = [
-        firehazard::process::ThreadAttributeRef::job_list(&supervisor_jobs),
-        firehazard::process::ThreadAttributeRef::handle_list(&inherited_handles),
-    ];
+    let attributes = [firehazard::process::ThreadAttributeRef::handle_list(
+        &inherited_handles,
+    )];
     let mut startup = firehazard::process::StartupInfoExW::default();
     startup.startup_info.flags = STARTF_USE_STD_HANDLES;
-    startup.startup_info.std_input = Some((&control_read).into());
-    startup.startup_info.std_output = Some((&observation_write).into());
-    startup.startup_info.std_error = Some((&null_file).into());
+    startup.startup_info.std_input = Some((&pipes.control_read).into());
+    startup.startup_info.std_output = Some((&pipes.observation_write).into());
+    startup.startup_info.std_error = Some((&pipes.null_file).into());
     startup.attribute_list = Some(
         firehazard::process::ThreadAttributeList::try_from(attributes.as_slice())
             .map_err(|error| format!("cannot bind Windows supervisor handle list: {error:?}"))?,
@@ -11957,27 +14157,27 @@ fn spawn_windows_pipe_supervisor(
             firehazard::access::GENERIC_ALL.into(),
             &owner_rights,
         )
-        .and_then(|acl| {
-            acl.add_access_denied_ace(
-                firehazard::acl::REVISION,
-                firehazard::access::GENERIC_ALL.into(),
-                &restricted_code,
-            )
-        })
-        .and_then(|acl| {
-            acl.add_access_allowed_ace(
-                firehazard::acl::REVISION,
-                firehazard::access::GENERIC_ALL.into(),
-                &administrators,
-            )
-        })
-        .and_then(|acl| {
-            acl.add_access_allowed_ace(
-                firehazard::acl::REVISION,
-                firehazard::access::GENERIC_ALL.into(),
-                &system,
-            )
-        })
+        .map_err(|error| format!("cannot build Windows supervisor process ACL: {error:?}"))?;
+    process_acl
+        .add_access_denied_ace(
+            firehazard::acl::REVISION,
+            firehazard::access::GENERIC_ALL.into(),
+            &restricted_code,
+        )
+        .map_err(|error| format!("cannot build Windows supervisor process ACL: {error:?}"))?;
+    process_acl
+        .add_access_allowed_ace(
+            firehazard::acl::REVISION,
+            firehazard::access::GENERIC_ALL.into(),
+            &administrators,
+        )
+        .map_err(|error| format!("cannot build Windows supervisor process ACL: {error:?}"))?;
+    process_acl
+        .add_access_allowed_ace(
+            firehazard::acl::REVISION,
+            firehazard::access::GENERIC_ALL.into(),
+            &system,
+        )
         .and_then(firehazard::acl::Builder::finish)
         .map_err(|error| format!("cannot build Windows supervisor process ACL: {error:?}"))?;
     let process_security = firehazard::security::DescriptorBuilder::new()
@@ -11988,70 +14188,66 @@ fn spawn_windows_pipe_supervisor(
             format!("cannot build Windows supervisor process descriptor: {error:?}")
         })?;
     let process_attributes = firehazard::security::Attributes::new(Some(&process_security), false);
-    let process = firehazard::create_process_w(
+    firehazard::create_process_w(
         application,
         Some(&mut command_line),
         Some(&process_attributes),
         None,
         true,
-        firehazard::process::CREATE_BREAKAWAY_FROM_JOB
-            | firehazard::process::CREATE_SUSPENDED
-            | firehazard::process::EXTENDED_STARTUPINFO_PRESENT,
+        firehazard::process::CREATE_SUSPENDED | firehazard::process::EXTENDED_STARTUPINFO_PRESENT,
         firehazard::process::environment::Inherit,
         (),
         &startup,
     )
-    .map_err(|error| format!("cannot create suspended breakaway Windows supervisor: {error:?}"))?;
-    if !firehazard::is_process_in_job(&process.process, Some(&supervisor_job))
-        .map_err(|error| format!("cannot attest Windows supervisor Job membership: {error:?}"))?
-    {
-        return Err("Windows supervisor is absent from its retained Job".to_owned());
-    }
-    drop(startup);
-    drop(control_read);
-    drop(observation_write);
-    drop(null_file);
+    .map_err(|error| format!("cannot create suspended nested-Job Windows supervisor: {error:?}"))
+}
 
-    let (observation_sender, observations) = mpsc::sync_channel(8);
-    let observer_dropped = Arc::new(AtomicU64::new(0));
-    let observer_drop_counter = Arc::clone(&observer_dropped);
-    std::thread::Builder::new()
-        .name("hell-windows-supervisor-observer".to_owned())
-        .spawn(move || {
-            let mut observation_read = observation_read;
-            loop {
-                match windows_read_inherited_frame(&mut observation_read) {
-                    Ok(Some(frame)) => {
-                        if frame.first() == Some(&6) {
-                            match observation_sender.try_send(Ok(frame)) {
-                                Ok(()) => {}
-                                Err(mpsc::TrySendError::Full(_)) => {
-                                    observer_drop_counter.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(mpsc::TrySendError::Disconnected(_)) => return,
-                            }
-                        } else if observation_sender.send(Ok(frame)).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        let _ = observation_sender.send(Err(error));
-                        return;
-                    }
-                }
+#[cfg(windows)]
+fn spawn_windows_pipe_supervisor(
+    executable: &Path,
+    protocol: &str,
+) -> Result<WindowsPipeSupervisorLaunch, String> {
+    let pipes = create_windows_supervisor_pipes()?;
+    let supervisor_job = create_windows_supervisor_job()?;
+    let process = create_suspended_windows_supervisor_process(executable, protocol, &pipes)?;
+    if let Err(primary) = bind_suspended_windows_supervisor_to_job(&process, &supervisor_job) {
+        return Err(cleanup_failed_suspended_windows_supervisor(
+            &process.process,
+            process.process_id,
+            &supervisor_job,
+            primary,
+        ));
+    }
+    drop(pipes.control_read);
+    drop(pipes.observation_write);
+    drop(pipes.null_file);
+    let (observations, observer_dropped) =
+        match start_windows_supervisor_observer(pipes.observation_read) {
+            Ok(observer) => observer,
+            Err(primary) => {
+                return Err(cleanup_failed_suspended_windows_supervisor(
+                    &process.process,
+                    process.process_id,
+                    &supervisor_job,
+                    primary,
+                ));
             }
-        })
-        .map_err(|error| format!("cannot start Windows supervisor observer: {error}"))?;
-    firehazard::thread::resume_thread(&process.thread)
-        .map_err(|error| format!("cannot resume Windows supervisor: {error:?}"))?;
+        };
+    if let Err(primary) = resume_suspended_windows_supervisor(&process) {
+        return Err(cleanup_failed_suspended_windows_supervisor(
+            &process.process,
+            process.process_id,
+            &supervisor_job,
+            primary,
+        ));
+    }
     Ok(WindowsPipeSupervisorLaunch {
         child: WindowsSupervisorProcess {
             process: process.process,
             process_id: process.process_id,
             supervisor_job: Some(supervisor_job),
         },
-        control: control_write,
+        control: pipes.control_write,
         observations,
         observer_dropped,
     })
@@ -12062,19 +14258,16 @@ fn prepare_windows_external_supervisor(
     root: &Path,
     session_parent: &Path,
     plan: ExternalSupervisorPlan,
+    envelope_profile: WindowsSupervisorEnvelopeProfile,
     phase_started: Instant,
     envelope: SupervisionEnvelope,
     fixture_gate: Option<SocketAddrV4>,
     fixture_exit_observer: Option<SocketAddrV4>,
     authority: Option<&dyn WindowsNightlySupervisorAuthority>,
 ) -> Result<WindowsExternalPrepared, WindowsExternalStartFailure> {
-    let startup_cleanup_deadline = phase_started
-        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
-        .unwrap_or(envelope.execution)
-        .min(envelope.execution);
-    let startup_deadline = startup_cleanup_deadline
-        .checked_sub(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
-        .ok_or_else(|| "Windows supervisor startup cleanup reserve underflowed".to_owned())?;
+    let startup = WindowsSupervisorStartupSchedule::within(phase_started, envelope.execution)?;
+    let startup_cleanup_deadline = startup.cleanup_deadline;
+    let startup_deadline = startup.ready_deadline;
     let root = fs::canonicalize(root)
         .map_err(|error| format!("cannot canonicalize Windows supervisor workspace: {error}"))?;
     let (_root, root_receipt) = windows_bind_path(&root, true)?;
@@ -12104,6 +14297,7 @@ fn prepare_windows_external_supervisor(
             session.seal_authority_manifest(&manifest, startup_deadline)?;
         let fields = windows_supervisor_request_fields(WindowsSupervisorRequestFields {
             plan,
+            envelope_profile,
             root: (&root, root_receipt),
             writable_target: (&writable_target, writable_target_receipt),
             session: &session,
@@ -12129,6 +14323,7 @@ fn prepare_windows_external_supervisor(
             .map_err(|error| format!("cannot encode Windows supervisor request: {error}"))?;
         let request_sha256 = windows_supervisor_os_digest(&token);
         session.seal_request_digest(request_sha256, startup_deadline)?;
+        session.promote_receipts_before_confinement()?;
         let executable =
             fs::canonicalize(std::env::current_exe().map_err(|error| {
                 format!("cannot locate Windows supervisor executable: {error}")
@@ -12214,6 +14409,11 @@ fn prepare_windows_external_supervisor(
     let ready = match receive_until(startup_deadline) {
         Ok(ready) => ready,
         Err(primary) => {
+            let primary = retain_windows_pre_ready_exit_detail(
+                &child,
+                startup_cleanup_deadline,
+                format!("{primary}; preReadyFailureFrame=unavailable"),
+            );
             return Err(close_prelaunch_windows_supervisor(
                 child,
                 session,
@@ -12224,7 +14424,16 @@ fn prepare_windows_external_supervisor(
             ));
         }
     };
-    if let Err(primary) = windows_validate_frame(&ready, 1, request_sha256, nonce) {
+    if ready.first() == Some(&WINDOWS_PRE_READY_FAILURE_FRAME) {
+        let primary = match decode_windows_pre_ready_failure_frame(&ready, request_sha256, nonce) {
+            Ok((phase, detail)) => format!(
+                "Windows supervisor failed before Ready: phase={} detail={detail}",
+                phase.name()
+            ),
+            Err(error) => format!("Windows supervisor pre-Ready failure frame differs: {error}"),
+        };
+        let primary =
+            retain_windows_pre_ready_exit_detail(&child, startup_cleanup_deadline, primary);
         return Err(close_prelaunch_windows_supervisor(
             child,
             session,
@@ -12234,7 +14443,22 @@ fn prepare_windows_external_supervisor(
             primary,
         ));
     }
-    if let Err(primary) = session.retain_read_only_receipts() {
+    if let Err(primary) = windows_validate_frame(&ready, 1, request_sha256, nonce) {
+        let primary = retain_windows_pre_ready_exit_detail(
+            &child,
+            startup_cleanup_deadline,
+            format!("{primary}; preReadyFailureFrame=invalid"),
+        );
+        return Err(close_prelaunch_windows_supervisor(
+            child,
+            session,
+            request_sha256,
+            nonce,
+            startup_cleanup_deadline,
+            primary,
+        ));
+    }
+    if let Err(primary) = session.revalidate_retained_receipts() {
         return Err(close_prelaunch_windows_supervisor(
             child,
             session,
@@ -12764,7 +14988,7 @@ fn import_windows_late_supervisor_evidence(
             .map(WindowsLateSupervisorEvidence::Abnormal)
             .map(Some);
     }
-    session.revalidate()?;
+    session.revalidate_retained_receipts()?;
     let abnormal = read_windows_supervisor_receipt(&session.root_path.join("abnormal.receipt"))?;
     if !abnormal.is_empty() {
         return decode_windows_supervisor_abnormal(&abnormal, request_sha256, nonce)
@@ -13082,6 +15306,25 @@ fn run_windows_authority_cleanup_successor(
 pub(crate) fn run_external_nightly_supervisor(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), String> {
+    let mut pre_ready = WindowsPreReadyFailureContext::new();
+    match run_windows_external_nightly_supervisor(arguments, &mut pre_ready) {
+        Err(primary) if pre_ready.authority.is_some() && !pre_ready.ready_published => {
+            Err(match pre_ready.publish(&primary) {
+                Ok(()) => primary,
+                Err(publication) => format!(
+                    "{primary}; additionally, pre-Ready failure frame publication failed: {publication}"
+                ),
+            })
+        }
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_external_nightly_supervisor(
+    arguments: &[std::ffi::OsString],
+    pre_ready: &mut WindowsPreReadyFailureContext,
+) -> Result<(), String> {
     let [protocol_token] = arguments else {
         return Err("Windows nightly supervisor requires one structured request token".to_owned());
     };
@@ -13106,8 +15349,12 @@ pub(crate) fn run_external_nightly_supervisor(
     let request_sha256 = windows_supervisor_os_digest(&token);
     let fields = hell_testkit::decode_windows_argv(&token)
         .map_err(|error| format!("cannot decode Windows supervisor request: {error}"))?;
+    if fields.len() != WINDOWS_SUPERVISOR_REQUEST_FIELD_COUNT {
+        return Err("Windows supervisor request field count differs".to_owned());
+    }
     let [
         plan,
+        envelope_profile,
         root,
         writable_target,
         session_path,
@@ -13153,21 +15400,27 @@ pub(crate) fn run_external_nightly_supervisor(
     else {
         return Err("Windows supervisor request field count differs".to_owned());
     };
-    let plan = ExternalSupervisorPlan::from_code(
-        u8::try_from(windows_parse_u64(plan, "plan")?)
-            .map_err(|_| "Windows supervisor plan is too large".to_owned())?,
-    )?;
-    let root = PathBuf::from(root);
-    let writable_target = PathBuf::from(writable_target);
-    let session_path = PathBuf::from(session_path);
-    let request_path = PathBuf::from(request_path);
-    let late_receipt_path = PathBuf::from(late_receipt_path);
     let nonce = Digest::from_hex(
         nonce
             .to_str()
             .ok_or_else(|| "Windows supervisor nonce is not UTF-8".to_owned())?,
     )
     .map_err(|error| format!("Windows supervisor nonce is invalid: {error}"))?;
+    pre_ready.bind(request_sha256, nonce);
+    pre_ready.enter(WindowsPreReadyPhase::Request);
+    let plan = ExternalSupervisorPlan::from_code(
+        u8::try_from(windows_parse_u64(plan, "plan")?)
+            .map_err(|_| "Windows supervisor plan is too large".to_owned())?,
+    )?;
+    let envelope_profile = WindowsSupervisorEnvelopeProfile::from_code(
+        u8::try_from(windows_parse_u64(envelope_profile, "envelope profile")?)
+            .map_err(|_| "Windows supervisor envelope profile is too large".to_owned())?,
+    )?;
+    let root = PathBuf::from(root);
+    let writable_target = PathBuf::from(writable_target);
+    let session_path = PathBuf::from(session_path);
+    let request_path = PathBuf::from(request_path);
+    let late_receipt_path = PathBuf::from(late_receipt_path);
     let fixture = match windows_parse_u64(fixture, "fixture")? {
         0 => None,
         1 => Some(parse_loopback_address(fixture_address, fixture_port)?),
@@ -13181,6 +15434,7 @@ pub(crate) fn run_external_nightly_supervisor(
         )?),
         _ => return Err("Windows supervisor exit fixture flag is invalid".to_owned()),
     };
+    pre_ready.enter(WindowsPreReadyPhase::Envelope);
     let received = Instant::now();
     let deadline_from_remaining = |value: &std::ffi::OsStr, field: &str| {
         let remaining = Duration::from_millis(windows_parse_u64(value, field)?);
@@ -13227,13 +15481,34 @@ pub(crate) fn run_external_nightly_supervisor(
     let received_report_reserve = envelope
         .report_completion_deadline
         .saturating_duration_since(envelope.child_completion_deadline);
-    if received_total > plan.total()
-        || received_lifetime > allowed_lifetime
-        || received_cleanup_reserve < NIGHTLY_COMMAND_CLEANUP_RESERVE
-        || received_report_reserve < NIGHTLY_REPORT_RESERVE
-    {
-        return Err("Windows supervisor relative envelope exceeds its fixed plan".to_owned());
+    match envelope_profile {
+        WindowsSupervisorEnvelopeProfile::Command => {
+            if received_total > plan.total()
+                || received_lifetime > allowed_lifetime
+                || received_cleanup_reserve < NIGHTLY_COMMAND_CLEANUP_RESERVE
+                || received_report_reserve < NIGHTLY_REPORT_RESERVE
+            {
+                return Err(
+                    "Windows supervisor relative envelope exceeds its fixed plan".to_owned(),
+                );
+            }
+        }
+        WindowsSupervisorEnvelopeProfile::NoGo => {
+            let no_go_total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
+            let no_go_cleanup = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2);
+            if plan != ExternalSupervisorPlan::NightlyCoreData
+                || received_total > no_go_total
+                || received_lifetime > no_go_total
+                || received_cleanup_reserve != no_go_cleanup
+                || received_report_reserve != NIGHTLY_SUPERVISOR_START_TIMEOUT
+            {
+                return Err(
+                    "Windows supervisor no-Go envelope differs from its fixed plan".to_owned(),
+                );
+            }
+        }
     }
+    let startup = WindowsSupervisorChildStartupSchedule::within(received, envelope.execution)?;
     let supervisor_hard_exit_reserve = NIGHTLY_SUPERVISOR_START_TIMEOUT
         .checked_mul(2)
         .ok_or_else(|| "Windows supervisor hard-exit reserve overflowed".to_owned())?;
@@ -13253,6 +15528,7 @@ pub(crate) fn run_external_nightly_supervisor(
             }
         })
         .map_err(|error| format!("cannot start Windows supervisor deadline watchdog: {error}"))?;
+    pre_ready.enter(WindowsPreReadyPhase::FilesystemAuthority);
     let root_receipt = windows_parse_receipt(
         &[
             root_volume.clone(),
@@ -13353,6 +15629,7 @@ pub(crate) fn run_external_nightly_supervisor(
     {
         return Err("Windows supervisor filesystem receipt differs".to_owned());
     }
+    pre_ready.enter(WindowsPreReadyPhase::ReceiptStaging);
     let terminal_path = session_path.join("terminal.receipt");
     let mut terminal_file = fs::OpenOptions::new()
         .read(true)
@@ -13416,24 +15693,27 @@ pub(crate) fn run_external_nightly_supervisor(
         return Err("Windows authority cleanup receipt was not empty at creation".to_owned());
     }
     drop(cleanup_file);
+    pre_ready.enter(WindowsPreReadyPhase::CleanupSuccessor);
     let supervisor_executable = fs::canonicalize(
         std::env::current_exe()
             .map_err(|error| format!("cannot locate Windows cleanup successor: {error}"))?,
     )
     .map_err(|error| format!("cannot canonicalize Windows cleanup successor: {error}"))?;
-    let mut cleanup_successor =
-        start_windows_authority_cleanup_successor(WindowsAuthorityCleanupStart {
-            executable: &supervisor_executable,
-            manifest_path: &authority_manifest_path,
-            manifest_sha256,
-            commit_path: &cleanup_commit_path,
-            cleanup_path: &cleanup_path,
-            session_path: &session_path,
-            session_receipt,
-            request_sha256,
-            nonce,
-            deadline: lifetime_deadline,
-        })?;
+    let cleanup_start = WindowsAuthorityCleanupStart {
+        executable: &supervisor_executable,
+        manifest_path: &authority_manifest_path,
+        manifest_sha256,
+        commit_path: &cleanup_commit_path,
+        cleanup_path: &cleanup_path,
+        session_path: &session_path,
+        session_receipt,
+        request_sha256,
+        nonce,
+        ready_deadline: startup.subordinate_ready_deadline,
+        lifetime_deadline,
+    };
+    let mut cleanup_successor = start_windows_authority_cleanup_successor(&cleanup_start)?;
+    pre_ready.enter(WindowsPreReadyPhase::Confinement);
     protect_windows_supervisor_session(&session_path, envelope.execution)?;
     protect_windows_supervisor_receipt(&late_receipt_path, envelope.execution)?;
     if windows_file_receipt(&root_guard)? != root_receipt
@@ -13449,10 +15729,15 @@ pub(crate) fn run_external_nightly_supervisor(
     {
         return Err("Windows supervisor receipt changed during DACL confinement".to_owned());
     }
+    if Instant::now() >= startup.ready_deadline {
+        return Err("Windows supervisor exceeded its composed pre-Ready deadline".to_owned());
+    }
+    pre_ready.enter(WindowsPreReadyPhase::ReadyPublication);
     windows_write_inherited_frame(
         &mut observations,
         &windows_supervisor_frame(1, request_sha256, nonce, &[])?,
     )?;
+    pre_ready.mark_ready();
     drop(observations);
     let imported_authority =
         import_windows_nightly_authority_manifest(&authority_manifest_bytes, envelope.execution)?;
@@ -13463,9 +15748,7 @@ pub(crate) fn run_external_nightly_supervisor(
     .map_err(|error| format!("cannot canonicalize Windows session probe: {error}"))?;
     let probe = CommandSpec::new(
         probe_executable,
-        envelope
-            .execution_deadline
-            .saturating_duration_since(Instant::now()),
+        envelope.execution.saturating_duration_since(Instant::now()),
     )
     .arguments([
         std::ffi::OsString::from("__nightly-windows-session-access-probe"),
@@ -13614,11 +15897,7 @@ pub(crate) fn run_external_nightly_supervisor(
         windows_write_inherited_frame(&mut cleanup_successor.control, &successor_commit)?;
         let successor_commit_receipt = cleanup_successor
             .observations
-            .recv_timeout(
-                envelope
-                    .execution_deadline
-                    .saturating_duration_since(Instant::now()),
-            )
+            .recv_timeout(envelope.execution.saturating_duration_since(Instant::now()))
             .map_err(|error| format!("cannot receive Windows cleanup commit receipt: {error}"))??;
         windows_validate_frame(&successor_commit_receipt, 11, request_sha256, nonce)?;
         Ok(())
@@ -13744,9 +16023,7 @@ pub(crate) fn run_external_nightly_supervisor(
                 .map_err(|_| {
                     "Windows supervisor progress relay disconnected before Started".to_owned()
                 })?;
-            let timeout = envelope
-                .execution_deadline
-                .saturating_duration_since(Instant::now());
+            let timeout = envelope.execution.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
                 return Err(
                     "Windows supervisor execution deadline expired before payload launch"
@@ -13866,7 +16143,7 @@ pub(crate) fn run_external_nightly_supervisor(
                     core_command_deadline,
                 )?;
                 let core_timeout = core_envelope
-                    .execution_deadline
+                    .execution
                     .saturating_duration_since(Instant::now());
                 if core_timeout.is_zero() {
                     return Err(
@@ -14102,7 +16379,7 @@ fn retain_windows_external_supervisor(
     );
     let (state, late_detail, terminal_imported, supervisor_live) = match late {
         Ok(None) => (
-            "owned-by-breakaway-windows-supervisor",
+            "owned-by-creation-time-job-assigned-windows-supervisor",
             "supervisor process remains live".to_owned(),
             false,
             true,
@@ -14148,7 +16425,7 @@ fn retain_windows_external_supervisor(
         JsonValue::Object(BTreeMap::from([
             (
                 "containmentScope".to_owned(),
-                JsonValue::String("breakaway-supervisor-owning-payload-job".to_owned()),
+                JsonValue::String("creation-time-supervisor-job-owning-payload-job".to_owned()),
             ),
             (
                 "requestSha256".to_owned(),
@@ -14272,7 +16549,7 @@ fn retain_windows_external_supervisor_start(
         JsonValue::Object(BTreeMap::from([
             (
                 "containmentScope".to_owned(),
-                JsonValue::String("breakaway-supervisor-owning-payload-job".to_owned()),
+                JsonValue::String("creation-time-supervisor-job-owning-payload-job".to_owned()),
             ),
             (
                 "requestSha256".to_owned(),
@@ -14495,6 +16772,7 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
         root,
         session_parent,
         plan,
+        WindowsSupervisorEnvelopeProfile::Command,
         phase_started,
         envelope,
         fixture.map(|fixture| fixture.gate),
@@ -14527,14 +16805,14 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
         JsonValue::Object(BTreeMap::from([
             (
                 "containmentScope".to_owned(),
-                JsonValue::String("breakaway-supervisor-owning-payload-job".to_owned()),
+                JsonValue::String("creation-time-supervisor-job-owning-payload-job".to_owned()),
             ),
             (
                 "executionRemainingMillis".to_owned(),
                 JsonValue::Number(
                     u64::try_from(
                         envelope
-                            .execution_deadline
+                            .execution
                             .saturating_duration_since(Instant::now())
                             .as_millis(),
                     )
@@ -14931,10 +17209,13 @@ fn run_windows_externally_supervised_nightly_command_with_fixture(
     if let Err(error) = progress.apply_external_attribution(terminal.attribution.clone()) {
         return retain_windows_external_supervisor(report, context, &mut progress, started, &error);
     }
-    started.session.revalidate().map_err(|error| {
-        report.check(plan.name(), suite_started.elapsed(), Err(error));
-        FailureKind::Fixture
-    })?;
+    started
+        .session
+        .revalidate_retained_receipts()
+        .map_err(|error| {
+            report.check(plan.name(), suite_started.elapsed(), Err(error));
+            FailureKind::Fixture
+        })?;
     let terminal_path = started.session.root_path.join("terminal.receipt");
     let (mut terminal_guard, terminal_receipt) =
         windows_bind_path(&terminal_path, false).map_err(|error| {
@@ -15374,7 +17655,11 @@ fn verify_windows_supervisor_report(
         .ok_or_else(|| "Windows verifier report external receipt is absent".to_owned())?;
     let expected_session = session_path.display().to_string();
     if receipt.get("state").and_then(serde_yaml::Value::as_str)
-        != Some("owned-by-breakaway-windows-supervisor")
+        != Some("owned-by-creation-time-job-assigned-windows-supervisor")
+        || receipt
+            .get("containmentScope")
+            .and_then(serde_yaml::Value::as_str)
+            != Some("creation-time-supervisor-job-owning-payload-job")
         || receipt.get("session").and_then(serde_yaml::Value::as_str)
             != Some(expected_session.as_str())
         || receipt
@@ -15495,21 +17780,18 @@ fn require_windows_process_absent(pid: u32, deadline: Instant) -> Result<(), Str
 fn verify_windows_external_supervisor_no_go_for_integration(
     root: &Path,
     session_parent: &Path,
-    deadline: Instant,
+    no_go: WindowsNoGoEnvelope,
     authority: Option<&crate::release::platform::NightlyWindowsLaunchAuthority>,
 ) -> Result<(), String> {
-    let phase_started = Instant::now();
-    let envelope = SupervisionEnvelope::within(
+    let WindowsNoGoEnvelope {
         phase_started,
-        ExternalSupervisorPlan::NightlyCoreData.total(),
-        NIGHTLY_COMMAND_CLEANUP_RESERVE,
-        NIGHTLY_REPORT_RESERVE,
-        deadline,
-    )?;
+        supervision: envelope,
+    } = no_go;
     let prepared = prepare_windows_external_supervisor(
         root,
         session_parent,
         ExternalSupervisorPlan::NightlyCoreData,
+        WindowsSupervisorEnvelopeProfile::NoGo,
         phase_started,
         envelope,
         None,
@@ -15539,11 +17821,15 @@ fn verify_windows_external_supervisor_no_go_for_integration(
     }
     marker?;
     if let Some(authority) = authority {
-        encode_windows_nightly_authority_manifest(Some(authority), deadline).map_err(|error| {
+        encode_windows_nightly_authority_manifest(
+            Some(authority),
+            envelope.report_completion_deadline,
+        )
+        .map_err(|error| {
             format!("Windows no-Go authority was not retained by the reporter: {error}")
         })?;
     }
-    require_windows_process_absent(supervisor_pid, deadline)?;
+    require_windows_process_absent(supervisor_pid, envelope.report_completion_deadline)?;
     match fs::symlink_metadata(&session_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -15560,7 +17846,7 @@ fn verify_windows_cargo_authority_for_integration(
     deadline: Instant,
 ) -> Result<(), String> {
     let phase_started = Instant::now();
-    let envelope = SupervisionEnvelope::within(
+    let authority_envelope = SupervisionEnvelope::within(
         phase_started,
         ExternalSupervisorPlan::WindowsAuthorityProbe.total(),
         NIGHTLY_COMMAND_CLEANUP_RESERVE,
@@ -15572,16 +17858,19 @@ fn verify_windows_cargo_authority_for_integration(
     let mut authority = crate::release::platform::NightlyWindowsLaunchAuthority::acquire_until(
         root,
         &target,
-        envelope.execution,
-        envelope.child_completion_deadline,
+        authority_envelope.execution,
+        authority_envelope.child_completion_deadline,
     )?;
     let staged_root = authority.staged_root().to_path_buf();
+    let no_go =
+        WindowsNoGoEnvelope::within(Instant::now(), authority_envelope.child_completion_deadline)?;
     verify_windows_external_supervisor_no_go_for_integration(
         root,
         session_parent,
-        envelope.execution,
+        no_go,
         Some(&authority),
     )?;
+    let command_started = Instant::now();
     let mut report = Report::new("windows-nightly-authority-probe");
     let primary = run_windows_externally_supervised_nightly_command(
         WindowsNightlyRunContext {
@@ -15590,7 +17879,7 @@ fn verify_windows_cargo_authority_for_integration(
             plan: ExternalSupervisorPlan::WindowsAuthorityProbe,
             suite_started: phase_started,
             outer_deadline: deadline,
-            phase_started,
+            phase_started: command_started,
             fixture: None,
         },
         &mut report,
@@ -15655,7 +17944,7 @@ fn verify_windows_cargo_authority_for_integration(
             Ok(_) => Err("staged Cargo probe authority remains after terminal cleanup".to_owned()),
         }
     } else {
-        authority.close_until(envelope.report_completion_deadline)
+        authority.close_until(deadline)
     };
     match (primary, receipts, cleanup) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
@@ -16061,17 +18350,17 @@ fn start_windows_reporter_exit_observation_typed(
             );
         }
     }
-    let observer = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let receipt_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind Windows reporter-exit observer: {error}"))?;
-    let observer_address = observer
+    let receipt_address = receipt_listener
         .local_addr()
         .map_err(|error| format!("cannot inspect Windows reporter-exit observer: {error}"))?;
-    let std::net::SocketAddr::V4(observer_address) = observer_address else {
+    let std::net::SocketAddr::V4(receipt_address) = receipt_address else {
         return Err("Windows reporter-exit observer is not IPv4"
             .to_owned()
             .into());
     };
-    let observer_receiver = submit_external_supervisor_accept(observer)?;
+    let receipt_receiver = submit_external_supervisor_accept(receipt_listener)?;
     let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind Windows reporter-exit gate: {error}"))?;
     let gate_address = gate
@@ -16128,8 +18417,8 @@ fn start_windows_reporter_exit_observation_typed(
         root.as_os_str().to_owned(),
         session_parent.as_os_str().to_owned(),
         report_path.as_os_str().to_owned(),
-        std::ffi::OsString::from(observer_address.ip().to_string()),
-        std::ffi::OsString::from(observer_address.port().to_string()),
+        std::ffi::OsString::from(receipt_address.ip().to_string()),
+        std::ffi::OsString::from(receipt_address.port().to_string()),
         std::ffi::OsString::from(gate_address.ip().to_string()),
         std::ffi::OsString::from(gate_address.port().to_string()),
         std::ffi::OsString::from(exit_observer_address.ip().to_string()),
@@ -16174,15 +18463,15 @@ fn start_windows_reporter_exit_observation_typed(
         verifier_nonce,
         injection == WindowsReporterConstructionInjection::MalformedParseFinalizerFailure,
     );
-    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let observer = observer_receiver
+    let construction_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let reporter_control = receipt_receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|error| format!("Windows reporter-exit observer exceeded deadline: {error}"))?
             .map_err(|error| format!("cannot accept Windows reporter-exit observer: {error}"))?;
-        observer
+        reporter_control
             .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
             .map_err(|error| format!("cannot bound Windows reporter fixture receipt: {error}"))?;
-        launch_owner.retain_reporter_control(observer);
+        launch_owner.retain_reporter_control(reporter_control);
         let cleanup_authority = windows_read_inherited_frame(
             launch_owner
                 .reporter_control
@@ -16216,13 +18505,13 @@ fn start_windows_reporter_exit_observation_typed(
             ));
         }
         let (session, late, supervisor_pid, request_sha256, nonce, staged_root) = semantic?;
-        let observed = launch_owner.observation_mut()?;
-        if session != observed.session_path
-            || late != observed.late_receipt_path
-            || supervisor_pid != observed.supervisor_pid
-            || request_sha256 != observed.request_sha256
-            || nonce != observed.nonce
-            || staged_root != observed.staged_root
+        let bound_observation = launch_owner.observation_mut()?;
+        if session != bound_observation.session_path
+            || late != bound_observation.late_receipt_path
+            || supervisor_pid != bound_observation.supervisor_pid
+            || request_sha256 != bound_observation.request_sha256
+            || nonce != bound_observation.nonce
+            || staged_root != bound_observation.staged_root
         {
             return Err(
                 "Windows reporter semantic receipt differs from cleanup authority".to_owned(),
@@ -16260,8 +18549,8 @@ fn start_windows_reporter_exit_observation_typed(
         launch_owner.transfer_observation()
     }))
     .unwrap_or_else(|_| Err("Windows reporter observation construction panicked".to_owned()));
-    match observed {
-        Ok(observed) => Ok(observed),
+    match construction_result {
+        Ok(observation) => Ok(observation),
         Err(primary) => Err(launch_owner.finish_failure(primary)),
     }
 }
@@ -17086,6 +19375,229 @@ fn verify_windows_cleanup_successor_exit_receipt(deadline: Instant) -> Result<()
 }
 
 #[cfg(windows)]
+fn verify_windows_nested_supervisor_job_for_integration() -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2))
+        .ok_or_else(|| "Windows nested-Job verifier deadline overflowed".to_owned())?;
+    let mut held = start_windows_cleanup_exit_fixture("held", deadline)?;
+    let supervisor_job =
+        held.child.supervisor_job.as_ref().ok_or_else(|| {
+            "Windows nested-Job verifier lost supervisor Job ownership".to_owned()
+        })?;
+    if !firehazard::is_process_in_job(&held.child.process, Some(supervisor_job))
+        .map_err(|error| format!("cannot revalidate Windows supervisor Job: {error:?}"))?
+    {
+        return Err("Windows supervisor is absent from its retained nested Job".to_owned());
+    }
+    let foreign_job = firehazard::create_job_object_w(None, ())
+        .map_err(|error| format!("cannot create foreign Windows verifier Job: {error:?}"))?;
+    if firehazard::is_process_in_job(&held.child.process, Some(&foreign_job))
+        .map_err(|error| format!("cannot inspect foreign Windows verifier Job: {error:?}"))?
+    {
+        return Err("foreign Windows Job substituted for the supervisor Job".to_owned());
+    }
+    windows_write_inherited_frame(&mut held.control, b"release")?;
+    loop {
+        match held.child.try_wait()? {
+            Some(0) => return Ok(()),
+            Some(code) => {
+                return Err(format!(
+                    "Windows nested-Job fixture exited with code {code}"
+                ));
+            }
+            None if Instant::now() < deadline => std::thread::yield_now(),
+            None => return Err("Windows nested-Job fixture did not exit".to_owned()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_supervisor_handle_topology_for_integration() -> Result<(), String> {
+    let pipes = create_windows_supervisor_pipes()?;
+    validate_windows_supervisor_handle_topology(
+        &pipes.control_read,
+        &pipes.observation_write,
+        &pipes.null_file,
+        &pipes.control_write,
+        &pipes.observation_read,
+    )?;
+
+    firehazard::handle::set_handle_information(
+        &pipes.null_file,
+        firehazard::handle::FLAG_INHERIT,
+        (),
+    )
+    .map_err(|error| format!("cannot clear Windows verifier null inheritance: {error:?}"))?;
+    let cleared = validate_windows_supervisor_handle_topology(
+        &pipes.control_read,
+        &pipes.observation_write,
+        &pipes.null_file,
+        &pipes.control_write,
+        &pipes.observation_read,
+    )
+    .expect_err("cleared Windows child handle inheritance must be rejected");
+    if !cleared.contains("child null-sink") {
+        return Err(format!(
+            "cleared Windows child handle diagnostic differs: {cleared}"
+        ));
+    }
+    firehazard::handle::set_handle_information(
+        &pipes.null_file,
+        firehazard::handle::FLAG_INHERIT,
+        firehazard::handle::FLAG_INHERIT,
+    )
+    .map_err(|error| format!("cannot restore Windows verifier null inheritance: {error:?}"))?;
+
+    let substituted = validate_windows_supervisor_handle_topology(
+        &pipes.observation_read,
+        &pipes.observation_write,
+        &pipes.null_file,
+        &pipes.control_write,
+        &pipes.control_read,
+    )
+    .expect_err("substituted Windows child handle must be rejected");
+    if !substituted.contains("child control-read") {
+        return Err(format!(
+            "substituted Windows child handle diagnostic differs: {substituted}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsDirectoryIdentityFixture {
+    parent: PathBuf,
+    root: PathBuf,
+    first: PathBuf,
+    second: PathBuf,
+}
+
+#[cfg(windows)]
+fn verify_windows_mutable_directory_identity_fixture(
+    fixture: &WindowsDirectoryIdentityFixture,
+    deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("Windows directory identity verifier deadline expired".to_owned());
+    }
+    let (parent_guard, parent_identity) = windows_bind_path(&fixture.parent, true)?;
+    fs::create_dir(&fixture.root)
+        .map_err(|error| format!("cannot create Windows identity fixture session: {error}"))?;
+    if windows_file_receipt(&parent_guard)? != parent_identity
+        || windows_bind_path(&fixture.parent, true)?.1 != parent_identity
+    {
+        return Err(
+            "Windows traversal parent identity changed after authorized child creation".to_owned(),
+        );
+    }
+    let (root_guard, root_identity) = windows_bind_path(&fixture.root, true)?;
+    fs::write(&fixture.first, b"same-byte-receipt")
+        .map_err(|error| format!("cannot create first Windows identity receipt: {error}"))?;
+    let (first_guard, first_receipt) = windows_bind_path(&fixture.first, false)?;
+    fs::write(&fixture.second, b"same-byte-receipt")
+        .map_err(|error| format!("cannot create second Windows identity receipt: {error}"))?;
+    let (second_guard, second_receipt) = windows_bind_path(&fixture.second, false)?;
+    if first_receipt == second_receipt
+        || windows_file_receipt(&first_guard)? != first_receipt
+        || windows_file_receipt(&second_guard)? != second_receipt
+    {
+        return Err("Windows exact child receipt accepted substituted identity".to_owned());
+    }
+    if windows_file_receipt(&parent_guard)? != parent_identity
+        || windows_bind_path(&fixture.parent, true)?.1 != parent_identity
+        || windows_file_receipt(&root_guard)? != root_identity
+        || windows_bind_path(&fixture.root, true)?.1 != root_identity
+    {
+        return Err(
+            "Windows traversal directory identity changed after exact child creation".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_windows_directory_identity_child(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let (guard, receipt) = windows_bind_path(path, false)?;
+            if windows_file_receipt(&guard)? != receipt {
+                return Err("Windows identity fixture child changed before cleanup".to_owned());
+            }
+            drop(guard);
+            fs::remove_file(path)
+                .map_err(|error| format!("cannot remove Windows identity fixture child: {error}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect Windows identity fixture child before cleanup: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_windows_mutable_directory_identity_fixture(
+    fixture: &WindowsDirectoryIdentityFixture,
+    deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("Windows directory identity cleanup deadline expired".to_owned());
+    }
+    cleanup_windows_directory_identity_child(&fixture.second)?;
+    cleanup_windows_directory_identity_child(&fixture.first)?;
+    match fs::symlink_metadata(&fixture.root) {
+        Ok(_) => {
+            let (guard, receipt) = windows_bind_path(&fixture.root, true)?;
+            if windows_file_receipt(&guard)? != receipt {
+                return Err("Windows identity fixture session changed before cleanup".to_owned());
+            }
+            drop(guard);
+            fs::remove_dir(&fixture.root).map_err(|error| {
+                format!("cannot remove Windows identity fixture session: {error}")
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect Windows identity fixture session before cleanup: {error}"
+            ));
+        }
+    }
+    let (guard, receipt) = windows_bind_path(&fixture.parent, true)?;
+    if windows_file_receipt(&guard)? != receipt {
+        return Err("Windows identity fixture parent changed before cleanup".to_owned());
+    }
+    drop(guard);
+    fs::remove_dir(&fixture.parent)
+        .map_err(|error| format!("cannot remove Windows identity fixture parent: {error}"))
+}
+
+#[cfg(windows)]
+fn verify_windows_mutable_directory_identity_for_integration() -> Result<(), String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+        .ok_or_else(|| "Windows directory identity verifier deadline overflowed".to_owned())?;
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let parent = std::env::temp_dir().join(format!(
+        "hell-windows-directory-identity-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&parent)
+        .map_err(|error| format!("cannot create Windows identity fixture parent: {error}"))?;
+    let root = parent.join("session");
+    let fixture = WindowsDirectoryIdentityFixture {
+        first: root.join("first.receipt"),
+        second: root.join("second.receipt"),
+        parent,
+        root,
+    };
+    let primary = verify_windows_mutable_directory_identity_fixture(&fixture, deadline);
+    let cleanup = cleanup_windows_mutable_directory_identity_fixture(&fixture, deadline);
+    compose_windows_reporter_fixture_results(primary, cleanup)
+}
+
+#[cfg(windows)]
 fn verify_windows_payload_started_reporter_exit(
     root: &Path,
     session_parent: &Path,
@@ -17258,12 +19770,8 @@ fn verify_windows_sealed_authority_matrix(
         execution_deadline,
         child_completion_deadline,
     )?;
-    verify_windows_external_supervisor_no_go_for_integration(
-        root,
-        session_parent,
-        execution_deadline,
-        None,
-    )?;
+    let no_go = WindowsNoGoEnvelope::within(Instant::now(), child_completion_deadline)?;
+    verify_windows_external_supervisor_no_go_for_integration(root, session_parent, no_go, None)?;
 
     let mut completed = 0_usize;
     record_windows_supervisor_matrix_case(
@@ -17385,11 +19893,159 @@ fn verify_windows_sealed_authority_matrix(
     Ok(())
 }
 
+#[cfg(windows)]
+fn verify_windows_pre_ready_request_rejection_for_integration(
+    fields: &[std::ffi::OsString],
+    nonce: Digest,
+    expected_phase: WindowsPreReadyPhase,
+    expected_detail: &str,
+) -> Result<(), String> {
+    let executable = fs::canonicalize(
+        std::env::current_exe()
+            .map_err(|error| format!("cannot locate Windows pre-Ready verifier: {error}"))?,
+    )
+    .map_err(|error| format!("cannot canonicalize Windows pre-Ready verifier: {error}"))?;
+    let mut launch = spawn_windows_pipe_supervisor(&executable, "windows-inherited-pipe-v1")?;
+    let token = hell_testkit::encode_windows_argv(fields)
+        .map_err(|error| format!("cannot encode Windows pre-Ready verifier request: {error}"))?;
+    let request_sha256 = windows_supervisor_os_digest(&token);
+    windows_write_inherited_frame(&mut launch.control, &windows_supervisor_os_bytes(&token))?;
+    let deadline = Instant::now()
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT)
+        .ok_or_else(|| "Windows pre-Ready verifier deadline overflowed".to_owned())?;
+    let frame = launch
+        .observations
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| format!("cannot receive Windows pre-Ready failure frame: {error}"))??;
+    let (phase, detail) = decode_windows_pre_ready_failure_frame(&frame, request_sha256, nonce)?;
+    if phase != expected_phase || !detail.contains(expected_detail) {
+        return Err(format!(
+            "Windows pre-Ready failure attribution differs: phase={} detail={detail}",
+            phase.name()
+        ));
+    }
+    let exit_code = await_windows_pre_ready_supervisor_exit(&launch.child, deadline)?;
+    if exit_code != 1 {
+        return Err(format!(
+            "Windows pre-Ready supervisor exit code differs: {exit_code}"
+        ));
+    }
+    match launch
+        .observations
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Ok(Err(error)) if error.contains("cannot read Windows supervisor pipe frame") => {}
+        Ok(Err(error)) => {
+            return Err(format!(
+                "Windows pre-Ready observer terminal differs: {error}"
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err("Windows pre-Ready observation pipe retained a writer".to_owned());
+        }
+        Ok(Ok(_)) => {
+            return Err("Windows pre-Ready supervisor published more than one frame".to_owned());
+        }
+    }
+    if launch.observer_dropped.load(Ordering::Relaxed) != 0 {
+        return Err("Windows pre-Ready failure frame was dropped by its observer".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_pre_ready_failure_receipt_for_integration() -> Result<(), String> {
+    let request = |plan: ExternalSupervisorPlan,
+                   profile: u8,
+                   nonce: Digest,
+                   execution: &str,
+                   cleanup: &str,
+                   report: &str,
+                   lifetime: &str| {
+        let mut fields = std::iter::repeat_n(
+            std::ffi::OsString::new(),
+            WINDOWS_SUPERVISOR_REQUEST_FIELD_COUNT,
+        )
+        .collect::<Vec<_>>();
+        fields[0] = plan.code().to_string().into();
+        fields[1] = profile.to_string().into();
+        fields[7] = nonce.hex().into();
+        fields[8] = execution.into();
+        fields[9] = cleanup.into();
+        fields[10] = report.into();
+        fields[11] = lifetime.into();
+        fields[12] = "0".into();
+        fields[15] = "0".into();
+        fields
+    };
+    let invalid_execution = sha256_bytes(b"windows-pre-ready-failure-receipt-v1");
+    verify_windows_pre_ready_request_rejection_for_integration(
+        &request(
+            ExternalSupervisorPlan::WindowsAuthorityProbe,
+            WindowsSupervisorEnvelopeProfile::Command.code(),
+            invalid_execution,
+            "invalid-execution-deadline",
+            "1",
+            "2",
+            "3",
+        ),
+        invalid_execution,
+        WindowsPreReadyPhase::Envelope,
+        "Windows supervisor execution is invalid",
+    )?;
+    let wrong_no_go_plan = sha256_bytes(b"windows-no-go-profile-plan-mismatch-v1");
+    verify_windows_pre_ready_request_rejection_for_integration(
+        &request(
+            ExternalSupervisorPlan::WindowsAuthorityProbe,
+            WindowsSupervisorEnvelopeProfile::NoGo.code(),
+            wrong_no_go_plan,
+            "60000",
+            "90000",
+            "120000",
+            "120000",
+        ),
+        wrong_no_go_plan,
+        WindowsPreReadyPhase::Envelope,
+        "Windows supervisor no-Go envelope differs from its fixed plan",
+    )?;
+    let undersized_command = sha256_bytes(b"windows-command-profile-no-go-envelope-v1");
+    verify_windows_pre_ready_request_rejection_for_integration(
+        &request(
+            ExternalSupervisorPlan::NightlyCoreData,
+            WindowsSupervisorEnvelopeProfile::Command.code(),
+            undersized_command,
+            "60000",
+            "90000",
+            "120000",
+            "120000",
+        ),
+        undersized_command,
+        WindowsPreReadyPhase::Envelope,
+        "Windows supervisor relative envelope exceeds its fixed plan",
+    )?;
+    let unknown_profile = sha256_bytes(b"windows-unknown-envelope-profile-v1");
+    verify_windows_pre_ready_request_rejection_for_integration(
+        &request(
+            ExternalSupervisorPlan::NightlyCoreData,
+            255,
+            unknown_profile,
+            "60000",
+            "90000",
+            "120000",
+            "120000",
+        ),
+        unknown_profile,
+        WindowsPreReadyPhase::Request,
+        "Windows supervisor envelope profile differs",
+    )
+}
+
 /// Verifies one bounded Windows external-supervisor lifecycle case.
 ///
 /// # Errors
 ///
-/// Returns an error when the selected inherited-pipe, breakaway supervisor,
+/// Returns an error when the selected inherited-pipe, creation-time supervisor Job,
 /// payload Job, or immutable receipt invariant differs.
 #[cfg(windows)]
 #[doc(hidden)]
@@ -17402,6 +20058,24 @@ pub(crate) fn verify_windows_external_nightly_supervisor_for_integration(
     let case = case
         .to_str()
         .ok_or_else(|| "Windows external supervisor case is not UTF-8".to_owned())?;
+    if case == "deadline-chronology" {
+        return verify_windows_no_go_deadline_chronology_for_integration();
+    }
+    if case == "nested-job-launch" {
+        return verify_windows_nested_supervisor_job_for_integration();
+    }
+    if case == "handle-list-inheritance" {
+        return verify_windows_supervisor_handle_topology_for_integration();
+    }
+    if case == "directory-identity" {
+        return verify_windows_mutable_directory_identity_for_integration();
+    }
+    if case == "pre-ready-failure-frame" {
+        return verify_windows_pre_ready_failure_receipt_for_integration();
+    }
+    if case == "receipt-promotion" {
+        return verify_windows_preconfinement_receipt_promotion_for_integration();
+    }
     let started = Instant::now();
     let execution_deadline = started
         .checked_add(Duration::from_mins(12))
@@ -17439,6 +20113,167 @@ pub(crate) fn verify_windows_external_nightly_supervisor_for_integration(
         ),
         _ => Err("Windows external supervisor verification case differs".to_owned()),
     }
+}
+
+#[cfg(windows)]
+fn verify_windows_preconfinement_receipt_promotion_for_integration() -> Result<(), String> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(Duration::from_mins(2))
+        .ok_or_else(|| "Windows receipt-promotion verifier deadline overflowed".to_owned())?;
+    let root = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "cannot locate Windows receipt-promotion workspace".to_owned())?,
+    )
+    .map_err(|error| format!("cannot canonicalize Windows receipt-promotion workspace: {error}"))?;
+    let session_parent = fs::canonicalize(root.join("target"))
+        .map_err(|error| format!("cannot bind Windows receipt-promotion target: {error}"))?;
+    let mut session = WindowsSupervisorSession::create(
+        &session_parent,
+        &sha256_bytes(b"windows-receipt-promotion-v1").0,
+        deadline,
+    )?;
+    let session_path = session.root_path.clone();
+    let primary = (|| {
+        session.create_late_receipt(deadline)?;
+        session.seal_authority_manifest(b"windows-receipt-promotion-manifest-v1", deadline)?;
+        session.seal_request_digest(
+            sha256_bytes(b"windows-receipt-promotion-request-v1"),
+            deadline,
+        )?;
+        session.promote_receipts_before_confinement()?;
+        session.revalidate()?;
+
+        if fs::OpenOptions::new()
+            .write(true)
+            .open(&session.request_path)
+            .is_ok()
+        {
+            return Err(
+                "promoted Windows ownership receipt retained writable path authority".to_owned(),
+            );
+        }
+        let displaced = session.root_path.join("displaced.receipt");
+        if fs::rename(&session.request_path, &displaced).is_ok() {
+            return Err("promoted Windows ownership receipt admitted substitution".to_owned());
+        }
+        if fs::remove_file(&session.request_path).is_ok() {
+            return Err("promoted Windows ownership receipt admitted deletion".to_owned());
+        }
+        session.revalidate()?;
+        Ok(())
+    })();
+    let cleanup = session.close(true, deadline);
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            return Err(format!(
+                "{primary}; additionally, fixture cleanup failed: {cleanup}"
+            ));
+        }
+        (Err(primary), Ok(())) => return Err(primary),
+        (Ok(()), Err(cleanup)) => return Err(cleanup),
+        (Ok(()), Ok(())) => {}
+    }
+    match fs::symlink_metadata(&session_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot attest Windows receipt-promotion session absence: {error}"
+        )),
+        Ok(_) => Err("Windows receipt-promotion session remains after cleanup".to_owned()),
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_no_go_deadline_chronology_for_integration() -> Result<(), String> {
+    let started = Instant::now();
+    let verifier_deadline = started
+        .checked_add(Duration::from_mins(38))
+        .ok_or_else(|| "Windows deadline verifier outer deadline overflowed".to_owned())?;
+    let authority = SupervisionEnvelope::within(
+        started,
+        ExternalSupervisorPlan::WindowsAuthorityProbe.total(),
+        NIGHTLY_COMMAND_CLEANUP_RESERVE,
+        NIGHTLY_REPORT_RESERVE,
+        verifier_deadline,
+    )?;
+    let startup = WindowsSupervisorStartupSchedule::within(started, authority.execution)?;
+    if startup
+        .ready_deadline
+        .checked_add(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+        != Some(startup.cleanup_deadline)
+        || startup.cleanup_deadline > authority.execution
+        || startup.cleanup_deadline.saturating_duration_since(started)
+            != NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2)
+    {
+        return Err("Windows composed startup schedule differs".to_owned());
+    }
+    let exhausted_startup = started
+        .checked_add(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+        .ok_or_else(|| "Windows exhausted startup schedule overflowed".to_owned())?;
+    if WindowsSupervisorStartupSchedule::within(started, exhausted_startup).is_ok() {
+        return Err("Windows startup schedule admitted no cleanup reserve".to_owned());
+    }
+    let child_caller_ready = started
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2))
+        .ok_or_else(|| "Windows child startup schedule overflowed".to_owned())?;
+    let child_startup = WindowsSupervisorChildStartupSchedule::within(started, child_caller_ready)?;
+    if child_startup
+        .subordinate_ready_deadline
+        .checked_add(NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE)
+        != Some(child_startup.ready_deadline)
+        || child_startup
+            .ready_deadline
+            .saturating_duration_since(started)
+            != NIGHTLY_SUPERVISOR_START_TIMEOUT
+        || WindowsSupervisorChildStartupSchedule::within(started, exhausted_startup).is_ok()
+    {
+        return Err("Windows subordinate startup schedule differs".to_owned());
+    }
+    let delayed_start = started
+        .checked_add(Duration::from_secs(1))
+        .ok_or_else(|| "Windows no-Go delayed start overflowed".to_owned())?;
+    let stale = SupervisionEnvelope::within(
+        delayed_start,
+        ExternalSupervisorPlan::NightlyCoreData.total(),
+        NIGHTLY_COMMAND_CLEANUP_RESERVE,
+        NIGHTLY_REPORT_RESERVE,
+        authority.execution,
+    );
+    if !matches!(
+        stale,
+        Err(error)
+            if error == "supervised execution/completion envelope has no cleanup reserve"
+    ) {
+        return Err("Windows stale execution cutoff did not exhaust the no-Go reserve".to_owned());
+    }
+    let no_go = WindowsNoGoEnvelope::within(delayed_start, authority.child_completion_deadline)?;
+    if no_go.supervision.execution <= delayed_start
+        || no_go.supervision.execution >= no_go.supervision.child_completion_deadline
+        || no_go.supervision.child_completion_deadline
+            >= no_go.supervision.report_completion_deadline
+        || no_go.supervision.report_completion_deadline > authority.child_completion_deadline
+    {
+        return Err("Windows typed no-Go envelope chronology differs".to_owned());
+    }
+    let exhausted_deadline = delayed_start
+        .checked_add(NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(2))
+        .ok_or_else(|| "Windows no-Go exhausted deadline overflowed".to_owned())?;
+    if WindowsNoGoEnvelope::within(delayed_start, exhausted_deadline).is_ok() {
+        return Err("Windows no-Go envelope admits an exhausted cleanup reserve".to_owned());
+    }
+    let root = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "cannot locate Windows no-Go verifier workspace".to_owned())?,
+    )
+    .map_err(|error| format!("cannot canonicalize Windows no-Go verifier: {error}"))?;
+    let session_parent = fs::canonicalize(root.join("target"))
+        .map_err(|error| format!("cannot bind Windows no-Go verifier target: {error}"))?;
+    let launched = WindowsNoGoEnvelope::within(Instant::now(), verifier_deadline)?;
+    verify_windows_external_supervisor_no_go_for_integration(&root, &session_parent, launched, None)
 }
 
 #[cfg(unix)]

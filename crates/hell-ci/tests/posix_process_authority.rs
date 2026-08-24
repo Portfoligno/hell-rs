@@ -1,11 +1,32 @@
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
 use std::time::Duration;
+
+#[cfg(unix)]
+static UMASK_TRANSITION: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+struct UmaskGuard(nix::sys::stat::Mode);
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        nix::sys::stat::umask(self.0);
+    }
+}
 
 #[cfg(unix)]
 #[test]
 fn process_authorities_normalize_merged_usr_and_reject_receipt_drift() {
+    let _transition = UMASK_TRANSITION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _umask = UmaskGuard(nix::sys::stat::umask(
+        nix::sys::stat::Mode::from_bits_truncate(0o002),
+    ));
     let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
     command.arg("__verify-posix-process-authority");
     let output = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_mins(10))

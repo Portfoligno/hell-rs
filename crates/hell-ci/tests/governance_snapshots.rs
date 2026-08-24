@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -43,6 +46,9 @@ impl Drop for Fixture {
 #[test]
 fn governance_snapshots_bind_runtime_plan_baseline_and_live_controls() {
     let fixture = Fixture::new();
+    #[cfg(windows)]
+    let system_root = hell_testkit::capture_windows_standard_system_root()
+        .expect("bind exact parent SystemRoot authority");
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     require_governance_control_vector(&repository_root);
     let policy_bytes = fs::read(repository_root.join("ci/governance-policy.toml"))
@@ -59,6 +65,8 @@ fn governance_snapshots_bind_runtime_plan_baseline_and_live_controls() {
         policy: &policy,
         api_policy: &api_policy,
         plan: &plan,
+        #[cfg(windows)]
+        system_root,
     };
     let resolve = verify_resolve_snapshot(&context);
     let post_assembly = verify_post_assembly_snapshot(&context, &resolve);
@@ -67,6 +75,52 @@ fn governance_snapshots_bind_runtime_plan_baseline_and_live_controls() {
     verify_disclosed_residuals(&context);
     verify_changed_baseline_rejection(&context, &resolve, &post_assembly);
     verify_runtime_identity_rejection(&context);
+}
+
+#[test]
+fn governance_child_system_root_binding_is_exact_and_closed() {
+    let captured = OsStr::new(r"C:\Windows");
+    let mut command = Command::new("governance-child-fixture");
+    command.env_clear();
+    configure_governance_child_system_root(&mut command, captured)
+        .expect("configure exact governance child SystemRoot");
+    require_governance_child_environment(&command, captured)
+        .expect("governance child environment is exact and closed");
+
+    let mut missing = Command::new("governance-child-fixture");
+    missing.env_clear();
+    assert!(require_governance_child_environment(&missing, captured).is_err());
+
+    for mut rejected in [
+        vec![("SystemRoot".into(), None)],
+        vec![("SystemRoot".into(), Some(OsStr::new("").to_owned()))],
+        vec![(
+            "SystemRoot".into(),
+            Some(OsStr::new(r"D:\SubstitutedWindows").to_owned()),
+        )],
+        vec![
+            ("SystemRoot".into(), Some(captured.to_owned())),
+            ("SYSTEMROOT".into(), Some(captured.to_owned())),
+        ],
+    ] {
+        assert!(
+            hell_testkit::configure_windows_standard_system_root_value(
+                &mut rejected,
+                captured,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    for name in ["PATH", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+        let mut open = Command::new("governance-child-fixture");
+        open.env_clear();
+        configure_governance_child_system_root(&mut open, captured)
+            .expect("configure exact governance child SystemRoot");
+        open.env(name, "untrusted");
+        assert!(require_governance_child_environment(&open, captured).is_err());
+    }
 }
 
 fn verify_resolve_snapshot(context: &GovernanceContext<'_>) -> PathBuf {
@@ -425,6 +479,8 @@ struct GovernanceContext<'a> {
     policy: &'a Path,
     api_policy: &'a Path,
     plan: &'a Path,
+    #[cfg(windows)]
+    system_root: OsString,
 }
 
 struct SnapshotRequest<'a> {
@@ -505,6 +561,9 @@ impl GovernanceContext<'_> {
             .env("GITHUB_WORKFLOW_REF", &self.identity.workflow_ref)
             .env("GITHUB_WORKFLOW_SHA", &self.identity.workflow_sha)
             .env("GITHUB_WORKSPACE", &self.fixture.root);
+        #[cfg(windows)]
+        configure_governance_child_system_root(&mut command, &self.system_root)
+            .expect("restore exact governance child SystemRoot authority");
         if let Some(baseline) = request.baseline {
             command.arg("--baseline").arg(baseline);
         }
@@ -513,6 +572,67 @@ impl GovernanceContext<'_> {
         }
         command
     }
+}
+
+fn configure_governance_child_system_root(
+    command: &mut Command,
+    captured: &OsStr,
+) -> std::io::Result<()> {
+    if captured.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "governance child SystemRoot authority is empty",
+        ));
+    }
+    let mut environment = Vec::new();
+    hell_testkit::configure_windows_standard_system_root_value(&mut environment, captured, true)?;
+    for (name, value) in environment {
+        command.env(
+            name,
+            value.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "governance child removed its trusted SystemRoot",
+                )
+            })?,
+        );
+    }
+    require_governance_child_environment(command, captured)
+}
+
+fn require_governance_child_environment(
+    command: &Command,
+    captured: &OsStr,
+) -> std::io::Result<()> {
+    let entries = command.get_envs().collect::<Vec<_>>();
+    let system_roots = entries
+        .iter()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SystemRoot"))
+        })
+        .collect::<Vec<_>>();
+    if system_roots.len() != 1 || system_roots[0].1 != Some(captured) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "governance child SystemRoot authority differs from its exact parent capture",
+        ));
+    }
+    if entries.iter().any(|(name, _)| {
+        name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case("PATH")
+                || name.eq_ignore_ascii_case("HTTP_PROXY")
+                || name.eq_ignore_ascii_case("HTTPS_PROXY")
+                || name.eq_ignore_ascii_case("ALL_PROXY")
+                || name.eq_ignore_ascii_case("NO_PROXY")
+        })
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "governance child loader or network environment is not closed",
+        ));
+    }
+    Ok(())
 }
 
 fn run_governance_command(command: &mut Command) -> hell_testkit::SupervisedOutput {

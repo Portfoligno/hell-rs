@@ -53,9 +53,8 @@ const RETAINED_TARGETS: [&str; 5] = [
     "semantic_trace",
 ];
 
-const PRESERVED_REGRESSION_CORPORA: [&str; 9] = [
+const PRESERVED_REGRESSION_CORPORA: [&str; 8] = [
     "acquisition_receipt",
-    "claim_toml",
     "custody_receipt",
     "dsse_envelope",
     "evidence_graph_merge",
@@ -720,7 +719,7 @@ fn execute_cargo_fuzz_campaigns(
         ));
     }
     let tools = resolve_fuzz_tools()?;
-    verify_cargo_fuzz_version(repository_root, &tools)?;
+    verify_cargo_fuzz_version(repository_root, &tools, &manifest.toolchain)?;
     let source_snapshots = manifest
         .targets
         .iter()
@@ -766,11 +765,13 @@ fn execute_campaigns(
         let (command_timeout, staged_corpus, arguments) =
             prepare_campaign(manifest, repository_root, target, staged_corpora)?;
         #[cfg(unix)]
-        let command =
-            CommandSpec::trusted_standard(Duration::from_secs(command_timeout), &tools.cargo_fuzz)
-                .map_err(|message| FuzzDiagnostic::new("fuzz.tool.identity", message))?
-                .arguments(arguments)
-                .current_directory(repository_root);
+        let command = unix_cargo_fuzz_command(
+            &manifest.toolchain,
+            Duration::from_secs(command_timeout),
+            &tools.cargo_fuzz,
+            arguments,
+            repository_root,
+        )?;
         #[cfg(not(unix))]
         let command =
             CommandSpec::trusted_cargo(Duration::from_secs(command_timeout), &tools.cargo)
@@ -892,26 +893,30 @@ fn prepare_campaign(
 fn verify_cargo_fuzz_version(
     repository_root: &Path,
     tools: &FuzzToolReceipt,
+    toolchain: &str,
 ) -> Result<(), FuzzDiagnostic> {
     #[cfg(unix)]
-    let command = CommandSpec::trusted_standard(Duration::from_secs(30), &tools.cargo_fuzz)
-        .map_err(|message| FuzzDiagnostic::new("fuzz.tool.identity", message))?
-        .argument("--version");
+    let command = unix_cargo_fuzz_command(
+        toolchain,
+        Duration::from_secs(30),
+        &tools.cargo_fuzz,
+        [OsString::from("--version")],
+        repository_root,
+    )?;
     #[cfg(not(unix))]
     let command = CommandSpec::trusted_cargo(Duration::from_secs(30), &tools.cargo).arguments([
-        OsString::from("+nightly-2026-07-31"),
+        OsString::from(format!("+{toolchain}")),
         OsString::from("fuzz"),
         OsString::from("--version"),
     ]);
-    let result = command
-        .current_directory(repository_root)
-        .run()
-        .map_err(|error| {
-            FuzzDiagnostic::new(
-                "fuzz.tool.spawn",
-                format!("cannot execute pinned cargo-fuzz: {}", error.message()),
-            )
-        })?;
+    #[cfg(not(unix))]
+    let command = command.current_directory(repository_root);
+    let result = command.run().map_err(|error| {
+        FuzzDiagnostic::new(
+            "fuzz.tool.spawn",
+            format!("cannot execute pinned cargo-fuzz: {}", error.message()),
+        )
+    })?;
     if result.timed_out
         || !result.status.success()
         || result.stdout != b"cargo-fuzz 0.13.2\n"
@@ -930,6 +935,117 @@ fn verify_cargo_fuzz_version(
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_cargo_fuzz_command<I, S>(
+    toolchain: &str,
+    timeout: Duration,
+    cargo_fuzz: &ResolvedStandardExecutable,
+    arguments: I,
+    repository_root: &Path,
+) -> Result<CommandSpec, FuzzDiagnostic>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    Ok(CommandSpec::trusted_standard(timeout, cargo_fuzz)
+        .map_err(|message| FuzzDiagnostic::new("fuzz.tool.identity", message))?
+        .arguments(arguments)
+        .current_directory(repository_root)
+        .environment("RUSTUP_TOOLCHAIN", toolchain))
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_fuzz_toolchain_command_for_integration() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!(
+        "hell-ci-fuzz-toolchain-command-{}",
+        std::process::id()
+    ));
+    if root.exists() {
+        return Err("fuzz toolchain command verifier root already exists".to_owned());
+    }
+    fs::create_dir(&root)
+        .map_err(|error| format!("cannot create fuzz command verifier root: {error}"))?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot protect fuzz command verifier root: {error}"))?;
+    let result = (|| {
+        let source = fs::canonicalize(
+            std::env::current_exe()
+                .map_err(|error| format!("cannot identify fuzz verifier executable: {error}"))?,
+        )
+        .map_err(|error| format!("cannot canonicalize fuzz verifier executable: {error}"))?;
+        let cargo_fuzz_path = root.join("cargo-fuzz");
+        fs::copy(&source, &cargo_fuzz_path)
+            .map_err(|error| format!("cannot stage fuzz verifier executable: {error}"))?;
+        fs::set_permissions(&cargo_fuzz_path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot protect fuzz verifier executable: {error}"))?;
+        let cargo_fuzz = crate::command::resolve_absolute_standard_executable(&cargo_fuzz_path)?;
+        let repository_root = root.join("repository");
+        fs::create_dir(&repository_root)
+            .map_err(|error| format!("cannot create fuzz verifier repository: {error}"))?;
+        let campaign_arguments = [
+            OsString::from("fuzz"),
+            OsString::from("run"),
+            OsString::from("--fuzz-dir"),
+            OsString::from("crates/hell-ci/fuzz"),
+            OsString::from("strict_json"),
+            OsString::from("ci-out/fuzz-corpora/strict_json"),
+            OsString::from("--"),
+            OsString::from("-runs=64"),
+        ];
+        let campaign = unix_cargo_fuzz_command(
+            "nightly-2026-07-31",
+            Duration::from_secs(650),
+            &cargo_fuzz,
+            campaign_arguments.clone(),
+            &repository_root,
+        )
+        .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        let version = unix_cargo_fuzz_command(
+            "nightly-2026-07-31",
+            Duration::from_secs(30),
+            &cargo_fuzz,
+            [OsString::from("--version")],
+            &repository_root,
+        )
+        .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        for command in [&campaign, &version] {
+            if command.program != cargo_fuzz.invocation_path().as_os_str()
+                || command.display_invocation_name().as_deref() != Some("cargo-fuzz")
+                || command.current_directory.as_deref() != Some(repository_root.as_path())
+                || command.environment
+                    != vec![(
+                        OsString::from("RUSTUP_TOOLCHAIN"),
+                        OsString::from("nightly-2026-07-31"),
+                    )]
+            {
+                return Err(
+                    "Unix fuzz command did not preserve its bound tool, directory, and exact toolchain environment"
+                        .to_owned(),
+                );
+            }
+        }
+        if campaign.arguments != campaign_arguments || campaign.timeout != Duration::from_secs(650)
+        {
+            return Err(
+                "Unix fuzz campaign command differs from its typed argv or timeout".to_owned(),
+            );
+        }
+        if version.arguments != [OsString::from("--version")]
+            || version.timeout != Duration::from_secs(30)
+        {
+            return Err(
+                "Unix fuzz version command differs from its typed argv or timeout".to_owned(),
+            );
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&root)
+        .map_err(|error| format!("cannot remove fuzz command verifier root: {error}"));
+    result.and(cleanup)
 }
 
 fn resolve_fuzz_tools() -> Result<FuzzToolReceipt, FuzzDiagnostic> {

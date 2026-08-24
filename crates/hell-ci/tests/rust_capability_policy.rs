@@ -44,7 +44,12 @@ fn semantic_capability_policy_admits_exact_sites_and_rejects_ast_bypasses() {
     let admitted_report = read_json(&fixture.root.join("admitted.json"));
     assert_eq!(admitted_report["admitted"], true);
     assert_eq!(admitted_report["violations"], serde_json::json!([]));
-    assert_eq!(admitted_report["sites"].as_array().expect("sites").len(), 8);
+    let sites = admitted_report["sites"].as_array().expect("sites");
+    assert_eq!(sites.len(), 7);
+    assert!(sites.iter().all(|site| {
+        site["capabilityId"] != "executable-search-path-read"
+            && site["item"] != "process_environment::ExecutableSearchPath::from_process"
+    }));
 
     let mutations = [
         (
@@ -55,6 +60,11 @@ fn semantic_capability_policy_admits_exact_sites_and_rejects_ast_bypasses() {
         (
             "reexported",
             "pub use std::env::var as leaked;\npub struct GithubRuntime;\nimpl GithubRuntime { pub fn from_process() { let _ = std::env::var(\"GITHUB_REPOSITORY\"); } }\npub struct GithubCredential;\nimpl GithubCredential { pub fn from_process() { let _ = std::env::var(\"GITHUB_TOKEN\"); } }\nfn escape() { let _ = leaked(\"UNTRUSTED\"); }\n",
+            "capability.access.unapproved",
+        ),
+        (
+            "process-environment-snapshot-outside-boundary",
+            "pub struct GithubRuntime;\nimpl GithubRuntime { pub fn from_process() { let _ = std::env::var(\"GITHUB_REPOSITORY\"); } }\npub struct GithubCredential;\nimpl GithubCredential { pub fn from_process() { let _ = std::env::var(\"GITHUB_TOKEN\"); } }\nfn escape() { let _ = std::env::vars_os(); }\n",
             "capability.access.unapproved",
         ),
         (
@@ -244,7 +254,7 @@ fn rust_vector_inventory(repository: &Path) -> BTreeSet<PathBuf> {
 fn write_valid_fixture(fixture: &Fixture) {
     fixture.write(
         "policy.toml",
-        "schema-version = 1\npolicy-id = \"fixture-capabilities-v1\"\ndeny-broad-clippy-allow = true\ncontrol-vector-manifest = \"vectors.toml\"\n\n[[capability]]\nid = \"github-runtime-read\"\ncrate = \"hell-ci\"\nitem = \"github_runtime::GithubRuntime::from_process\"\nmethods = [\"std::env::var\", \"std::env::var_os\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"github-credential-read\"\ncrate = \"hell-ci\"\nitem = \"github_runtime::GithubCredential::from_process\"\nmethods = [\"std::env::var\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"child-environment\"\ncrate = \"hell-ci\"\nitem = \"process_environment::ChildEnvironment::apply\"\nmethods = [\"std::process::Command::envs\", \"std::process::Command::env_clear\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"executable-search-path-read\"\ncrate = \"hell-ci\"\nitem = \"process_environment::ExecutableSearchPath::from_process\"\nmethods = [\"std::env::var_os\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"standard-process-environment-read\"\ncrate = \"hell-ci\"\nitem = \"process_environment::ProcessEnvironment::from_process\"\nmethods = [\"std::env::var_os\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"publisher-github-runtime-read\"\ncrate = \"hell-release-publisher\"\nitem = \"github_runtime::GithubRuntime::from_process\"\nmethods = [\"std::env::var\"]\nreason = \"fixture\"\n\n[[compile-time-environment]]\nname = \"CARGO_MANIFEST_DIR\"\nscope = \"fixture\"\n",
+        "schema-version = 1\npolicy-id = \"fixture-capabilities-v1\"\ndeny-broad-clippy-allow = true\ncontrol-vector-manifest = \"vectors.toml\"\n\n[[capability]]\nid = \"github-runtime-read\"\ncrate = \"hell-ci\"\nitem = \"github_runtime::GithubRuntime::from_process\"\nmethods = [\"std::env::var\", \"std::env::var_os\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"github-credential-read\"\ncrate = \"hell-ci\"\nitem = \"github_runtime::GithubCredential::from_process\"\nmethods = [\"std::env::var\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"child-environment\"\ncrate = \"hell-ci\"\nitem = \"process_environment::ChildEnvironment::apply\"\nmethods = [\"std::process::Command::envs\", \"std::process::Command::env_clear\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"standard-process-environment-read\"\ncrate = \"hell-ci\"\nitem = \"process_environment::ProcessEnvironment::from_process\"\nmethods = [\"std::env::vars_os\"]\nreason = \"fixture\"\n\n[[capability]]\nid = \"publisher-github-runtime-read\"\ncrate = \"hell-release-publisher\"\nitem = \"github_runtime::GithubRuntime::from_process\"\nmethods = [\"std::env::var\"]\nreason = \"fixture\"\n\n[[compile-time-environment]]\nname = \"CARGO_MANIFEST_DIR\"\nscope = \"fixture\"\n",
     );
     fixture.write(
         "crates/hell-ci/src/github_runtime.rs",
@@ -252,7 +262,7 @@ fn write_valid_fixture(fixture: &Fixture) {
     );
     fixture.write(
         "crates/hell-ci/src/process_environment.rs",
-        "pub struct ChildEnvironment;\nimpl ChildEnvironment { pub fn apply(&self, command: &mut std::process::Command) { command.env_clear(); command.envs([] as [(&str, &str); 0]); } }\npub struct ExecutableSearchPath;\nimpl ExecutableSearchPath { pub fn from_process() { let _ = std::env::var_os(\"PATH\"); } }\npub struct ProcessEnvironment;\nimpl ProcessEnvironment { pub fn from_process() { let _ = std::env::var_os(\"TMPDIR\"); } }\n",
+        "pub struct ChildEnvironment;\nimpl ChildEnvironment { pub fn apply(&self, command: &mut std::process::Command) { command.env_clear(); command.envs([] as [(&str, &str); 0]); } }\npub struct ExecutableSearchPath;\nimpl ExecutableSearchPath { pub fn from_process() { ProcessEnvironment::from_process(); } }\npub struct ProcessEnvironment;\nimpl ProcessEnvironment { pub fn from_process() { let _ = std::env::vars_os(); } }\n",
     );
     fixture.write(
         "crates/hell-release-publisher/src/github_runtime.rs",

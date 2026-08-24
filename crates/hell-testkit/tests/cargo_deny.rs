@@ -281,7 +281,16 @@ mod linux {
                 .flatten()
                 .all(|argument| argument != "metadata")
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("failed to fetch crates"));
+        assert!(
+            String::from_utf8_lossy(
+                output
+                    .stderr
+                    .complete
+                    .as_deref()
+                    .expect("complete cargo-deny stderr")
+            )
+            .contains("failed to fetch crates")
+        );
 
         super::remove_probe_log(&helper);
         fs::remove_dir_all(temporary).expect("remove metadata fixture directory");

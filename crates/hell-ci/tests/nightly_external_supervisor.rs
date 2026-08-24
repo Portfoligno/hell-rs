@@ -49,3 +49,39 @@ fn windows_real_staged_authority_has_one_complete_supervisor_lifecycle() {
 fn windows_supervisor_failure_matrix_is_sequential_and_bounded() {
     run_external_supervisor_verifier(Some(OsStr::new("sealed-authority-matrix")));
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_no_go_deadline_chronology_rejects_a_stale_execution_cutoff() {
+    run_external_supervisor_verifier(Some(OsStr::new("deadline-chronology")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_supervisor_uses_exact_nested_job_without_breakaway() {
+    run_external_supervisor_verifier(Some(OsStr::new("nested-job-launch")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_supervisor_handle_list_has_exact_inheritance_topology() {
+    run_external_supervisor_verifier(Some(OsStr::new("handle-list-inheritance")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pre_ready_failure_retains_phase_and_exact_exit_code() {
+    run_external_supervisor_verifier(Some(OsStr::new("pre-ready-failure-frame")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_traversal_directory_identity_survives_exact_child_mutation() {
+    run_external_supervisor_verifier(Some(OsStr::new("directory-identity")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_receipt_promotion_blocks_write_substitution_and_cleans_exactly() {
+    run_external_supervisor_verifier(Some(OsStr::new("receipt-promotion")));
+}

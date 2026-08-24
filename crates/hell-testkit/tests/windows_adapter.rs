@@ -15,7 +15,7 @@ use hell_testkit::{
 };
 #[cfg(windows)]
 use hell_testkit::{
-    run_supervised_command_with_bound_program_until,
+    run_supervised_command_until, run_supervised_command_with_bound_program_until,
     windows_argv_target_prelaunch_diagnostic_with_program_until,
 };
 
@@ -212,11 +212,21 @@ fn launch_failure_remains_primary_when_diagnostic_inventory_is_unavailable() {
     let program = root.join("invalid.exe");
     std::fs::write(&program, b"not a Windows executable").unwrap();
     let diagnostic = windows_argv_target_prelaunch_diagnostic_until(&program, Instant::now());
-    let direct = Command::new(&program)
-        .arg("--version")
-        .output()
-        .unwrap_err()
-        .to_string();
+    let mut direct_command = Command::new(&program);
+    direct_command.arg("--version");
+    let direct_execution_deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+    let direct_completion_deadline = direct_execution_deadline
+        .checked_add(Duration::from_secs(5))
+        .unwrap();
+    let direct = run_supervised_command_until(
+        &mut direct_command,
+        &[],
+        direct_execution_deadline,
+        direct_completion_deadline,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
     let mut command = Command::new(&program);
     command.arg("--version");
     let execution_deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();

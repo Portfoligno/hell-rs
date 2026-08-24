@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const COMMITTED_DIGEST: &str = "f7f711210a6825d639935c13eb1bee08bd2c771ddea91a25252a07608a277d71";
+const COMMITTED_DIGEST: &str = "7f0419b74fc05ead0ada84bc399c48f8142ca0d48c7c00146ed14c68b3220a79";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn repository_root() -> PathBuf {
@@ -43,6 +43,29 @@ fn external_input_digest_changes_and_unknown_fields_fail_closed() {
         hell_release_verifier::validate_external_input_lock(&changed_path, COMMITTED_DIGEST)
             .is_err(),
         "a self-consistent substituted authority must not match the trusted plan digest"
+    );
+
+    let changed_platforms = String::from_utf8(original.clone())
+        .expect("external-input lock is UTF-8")
+        .replace(
+            "platforms = [\"linux-x86_64\"]",
+            "platforms = [\"linux-x86_64\", \"macos-aarch64\"]",
+        );
+    let changed_platforms_path =
+        fixture.write("changed-platforms.toml", changed_platforms.as_bytes());
+    assert_ne!(
+        hell_release_verifier::external_input_lock_sha256(&changed_platforms_path)
+            .expect("platform-scope mutation remains strict TOML"),
+        COMMITTED_DIGEST,
+        "changing executable applicability must change the authority digest",
+    );
+    assert!(
+        hell_release_verifier::validate_external_input_lock(
+            &changed_platforms_path,
+            COMMITTED_DIGEST,
+        )
+        .is_err(),
+        "a broadened tool platform scope must not match the trusted plan digest",
     );
 
     let unknown = String::from_utf8(original)

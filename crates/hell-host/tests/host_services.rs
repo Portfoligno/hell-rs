@@ -41,16 +41,15 @@ fn unix_home_resolution_preserves_empty_home_and_falls_back_to_effective_user() 
 fn windows_home_resolution_uses_the_profile_known_folder_not_environment_overrides() {
     let expected = known_folders::get_known_folder_path(known_folders::KnownFolder::Profile)
         .expect("Windows Known Folders API resolves the current user profile");
-    let captured = HostServices::from_environment(vec![(
+    let captured = HostServices::from_environment(&[(
         OsString::from("userprofile"),
         OsString::from(r"C:\Captured"),
     )]);
     assert_eq!(captured.home_directory(), Some(expected.clone()));
-    let empty =
-        HostServices::from_environment(vec![(OsString::from("UserProfile"), OsString::new())]);
+    let empty = HostServices::from_environment(&[(OsString::from("UserProfile"), OsString::new())]);
     assert_eq!(empty.home_directory(), Some(expected.clone()));
     assert_eq!(
-        HostServices::from_environment(Vec::new()).home_directory(),
+        HostServices::from_environment(&[]).home_directory(),
         Some(expected)
     );
 }

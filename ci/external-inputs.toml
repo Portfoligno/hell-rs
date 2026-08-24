@@ -46,6 +46,7 @@ id = "cargo-deny"
 kind = "cargo-package"
 package = "cargo-deny"
 version = "0.20.2"
+platforms = ["linux-x86_64"]
 acquisition-phase = "native-platform"
 
 [[input]]

@@ -67,9 +67,11 @@ pub(crate) fn run(arguments: &[OsString]) -> Result<String, String> {
         .ok_or_else(usage)?
         .to_str()
         .ok_or_else(|| "release subcommand must be UTF-8".to_owned())?;
-    let options = parse_options(crate::mutation::without_test_activation_suffix(
-        &arguments[2..],
-    )?)?;
+    #[cfg(feature = "mutation-testing")]
+    let option_arguments = crate::mutation::without_test_activation_suffix(&arguments[2..])?;
+    #[cfg(not(feature = "mutation-testing"))]
+    let option_arguments = crate::mutation::without_test_activation_suffix(&arguments[2..]);
+    let options = parse_options(option_arguments)?;
     match command {
         "resolve" => event::resolve(required(options.output, "--output")?),
         "plan" => plan::create(

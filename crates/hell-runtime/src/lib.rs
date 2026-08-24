@@ -478,6 +478,7 @@ impl RuntimeContext {
         allow_filesystem: bool,
         allow_process: bool,
     ) -> Self {
+        #[cfg(not(windows))]
         let host_environment = environment
             .iter()
             .map(|(name, value)| {
@@ -511,7 +512,10 @@ impl RuntimeContext {
             http_listener: None,
             policy,
             budget,
+            #[cfg(not(windows))]
             host_services: Arc::new(HostServices::from_environment(host_environment)),
+            #[cfg(windows)]
+            host_services: Arc::new(HostServices::process()),
         }
     }
 

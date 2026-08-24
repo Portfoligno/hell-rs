@@ -26,6 +26,43 @@ fn job_block<'a>(workflow: &'a str, id: &str, next: Option<&str>) -> &'a str {
     &workflow[start..end]
 }
 
+fn protocol_table<'a>(protocol: &'a str, name: &str) -> &'a str {
+    let marker = format!("[{name}]\n");
+    let start = protocol.find(&marker).map_or_else(
+        || panic!("protocol table {name:?} is missing"),
+        |offset| offset + marker.len(),
+    );
+    let end = protocol[start..]
+        .find("\n[")
+        .map_or(protocol.len(), |offset| start + offset);
+    &protocol[start..end]
+}
+
+fn external_input_table<'a>(document: &'a str, id: &str) -> &'a str {
+    let expected_id = format!("id = \"{id}\"");
+    document
+        .split("\n[[input]]\n")
+        .skip(1)
+        .find(|table| table.lines().any(|line| line == expected_id))
+        .unwrap_or_else(|| panic!("external input {id:?} is missing"))
+}
+
+fn validate_cargo_deny_lock(document: &str) -> Result<(), String> {
+    let expected = concat!(
+        "id = \"cargo-deny\"\n",
+        "kind = \"cargo-package\"\n",
+        "package = \"cargo-deny\"\n",
+        "version = \"0.20.2\"\n",
+        "platforms = [\"linux-x86_64\"]\n",
+        "acquisition-phase = \"native-platform\"",
+    );
+    let observed = external_input_table(document, "cargo-deny").trim_end();
+    if observed != expected {
+        return Err("cargo-deny external-input authority differs".to_owned());
+    }
+    Ok(())
+}
+
 #[test]
 fn release_deep_verification_attestation_and_publication_are_privilege_separated() {
     let release = workflow("release.yml");
@@ -67,7 +104,7 @@ fn assert_release_assembly_and_governance(assemble: &str, governance: &str) {
 }
 
 fn assert_final_verification(release: &str, final_verify: &str) {
-    assert!(final_verify.contains("needs:\n    - resolve\n    - assemble\n    - governance"));
+    assert!(final_verify.contains("needs:\n      - resolve\n      - assemble\n      - governance"));
     assert!(release.contains("permissions:\n  actions: read\n  contents: read"));
     assert!(!final_verify.contains("permissions:"));
     assert!(!final_verify.contains("id-token: write"));
@@ -103,7 +140,7 @@ fn assert_final_verification(release: &str, final_verify: &str) {
 }
 
 fn assert_attestation(attest: &str) {
-    assert!(attest.contains("needs:\n    - resolve\n    - final-verify"));
+    assert!(attest.contains("needs:\n      - resolve\n      - final-verify"));
     assert!(attest.contains("contents: read"));
     assert!(attest.contains("id-token: write"));
     assert!(attest.contains("attestations: write"));
@@ -132,7 +169,7 @@ fn assert_attestation(attest: &str) {
 }
 
 fn assert_publication(publish: &str) {
-    assert!(publish.contains("needs:\n    - resolve\n    - governance\n    - attest"));
+    assert!(publish.contains("needs:\n      - resolve\n      - governance\n      - attest"));
     assert!(publish.contains("contents: write"));
     assert!(!publish.contains("id-token: write"));
     assert!(!publish.contains("attestations: write"));
@@ -220,10 +257,9 @@ fn governance_receipts_are_plan_bound_chained_and_retained_at_every_phase() {
 fn readiness_summary_is_failure_terminal_and_uses_one_artifact_layout() {
     let ci = workflow("ci.yml");
     let summary = job_block(&ci, "summary", None);
-    assert!(
-        summary
-            .contains("needs:\n    - plan\n    - linux\n    - macos\n    - windows\n    - verify")
-    );
+    assert!(summary.contains(
+        "needs:\n      - plan\n      - linux\n      - macos\n      - windows\n      - verify"
+    ));
     assert!(summary.contains("if: ${{ !cancelled() }}"));
     assert!(!summary.contains("if: ${{ always() }}\n    permissions:"));
     for state in ["success", "failure", "skipped"] {
@@ -267,6 +303,259 @@ fn readiness_plan_executes_the_typed_and_independent_control_audits_before_plann
             actual.iter().map(String::as_str).collect::<Vec<_>>(),
             *expected
         );
+    }
+}
+
+#[test]
+fn cargo_deny_authority_is_linux_only_across_lock_and_workflows() {
+    let ci = workflow("ci.yml");
+    let nightly = workflow("nightly.yml");
+    let release = workflow("release.yml");
+    let ci_linux = job_block(&ci, "linux", Some("macos"));
+    let release_linux = job_block(&release, "linux", Some("macos"));
+    let external_inputs = fs::read_to_string(repository_root().join("ci/external-inputs.toml"))
+        .expect("external-input lock must be UTF-8");
+    validate_cargo_deny_lock(&external_inputs)
+        .expect("cargo-deny external-input authority must name exactly its Linux consumer");
+
+    for (label, job, cargo_key, target_key, gate) in [
+        (
+            "readiness Linux",
+            ci_linux,
+            "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('automation/rust-toolchain.toml', 'automation/Cargo.lock', 'automation/Cargo.toml', 'automation/crates/**/Cargo.toml', 'candidate/rust-toolchain.toml', 'candidate/Cargo.lock', 'candidate/Cargo.toml', 'candidate/crates/**/Cargo.toml') }}-cargo-deny-0.20.2",
+            "readiness-linux-${{ runner.os }}-${{ runner.arch }}-cargo-deny-target-0.20.2-${{ hashFiles('automation/rust-toolchain.toml') }}",
+            "Run Linux technical readiness gate",
+        ),
+        (
+            "release Linux",
+            release_linux,
+            "release-linux-cargo-${{ needs.resolve.outputs.build_inputs_digest }}-cargo-deny-0.20.2",
+            "release-linux-cargo-deny-target-${{ runner.os }}-${{ runner.arch }}-${{ needs.resolve.outputs.build_inputs_digest }}-0.20.2",
+            "Run Linux release gate, collect conformance evidence, and package",
+        ),
+    ] {
+        let restore = job
+            .find("- name: Restore cargo-deny compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not restore the cargo-deny cache"));
+        let candidate_cache = job
+            .find("- name: Restore candidate compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not restore the candidate cache"));
+        let install = job
+            .find("- name: Install pinned cargo-deny")
+            .unwrap_or_else(|| panic!("{label} does not install cargo-deny"));
+        let gate = job
+            .find(gate)
+            .unwrap_or_else(|| panic!("{label} platform gate is missing"));
+        let save = job
+            .find("- name: Save cargo-deny compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not save the cargo-deny cache"));
+        let candidate_save = job
+            .find("- name: Save candidate compilation cache")
+            .unwrap_or_else(|| panic!("{label} does not save the candidate cache"));
+
+        assert!(restore < candidate_cache, "{label} restores tools first");
+        assert!(
+            candidate_cache < install && install < gate,
+            "{label} installs before use"
+        );
+        assert!(
+            gate < save && save < candidate_save,
+            "{label} saves tools first"
+        );
+        assert_eq!(job.matches(cargo_key).count(), 2, "{label} Cargo cache key");
+        assert_eq!(job.matches(target_key).count(), 2, "{label} tool cache key");
+        assert_eq!(
+            job.matches("path: ci-tool-cache/cargo-deny-target").count(),
+            2
+        );
+        assert_eq!(
+            job.matches("run: cargo install cargo-deny --locked --version 0.20.2 --force --target-dir ../ci-tool-cache/cargo-deny-target")
+                .count(),
+            1,
+            "{label} pinned installation",
+        );
+    }
+
+    let ci_macos = job_block(&ci, "macos", Some("windows"));
+    let ci_windows = job_block(&ci, "windows", Some("verify"));
+    let nightly_linux = job_block(&nightly, "linux", Some("fuzz"));
+    let nightly_macos = job_block(&nightly, "macos", Some("windows"));
+    let nightly_windows = job_block(&nightly, "windows", None);
+    let release_macos = job_block(&release, "macos", Some("windows"));
+    let release_windows = job_block(&release, "windows", Some("assemble"));
+    assert_eq!(
+        nightly_linux.matches("Install pinned cargo-deny").count(),
+        1,
+        "Nightly Linux must retain its cargo-deny test authority",
+    );
+    for (label, job) in [
+        ("readiness macOS", ci_macos),
+        ("readiness Windows", ci_windows),
+        ("Nightly macOS", nightly_macos),
+        ("Nightly Windows", nightly_windows),
+        ("release macOS", release_macos),
+        ("release Windows", release_windows),
+    ] {
+        assert!(
+            !job.contains("cargo-deny"),
+            "{label} must not acquire or cache the Linux-only cargo-deny authority",
+        );
+    }
+}
+
+#[test]
+fn cargo_deny_scope_mutations_fail_closed() {
+    let external_inputs = fs::read_to_string(repository_root().join("ci/external-inputs.toml"))
+        .expect("external-input lock must be UTF-8");
+    for (label, mutation) in [
+        (
+            "implicit all-platform scope",
+            external_inputs.replace("platforms = [\"linux-x86_64\"]\n", ""),
+        ),
+        (
+            "macOS scope broadening",
+            external_inputs.replace(
+                "platforms = [\"linux-x86_64\"]",
+                "platforms = [\"linux-x86_64\", \"macos-aarch64\"]",
+            ),
+        ),
+        (
+            "Windows scope substitution",
+            external_inputs.replace(
+                "platforms = [\"linux-x86_64\"]",
+                "platforms = [\"windows-x86_64\"]",
+            ),
+        ),
+        (
+            "Linux scope removal",
+            external_inputs.replace(
+                "platforms = [\"linux-x86_64\"]",
+                "platforms = [\"macos-aarch64\"]",
+            ),
+        ),
+        (
+            "package substitution",
+            external_inputs.replace("package = \"cargo-deny\"", "package = \"cargo-audit\""),
+        ),
+        (
+            "version substitution",
+            external_inputs.replace("version = \"0.20.2\"", "version = \"0.20.1\""),
+        ),
+    ] {
+        assert!(
+            validate_cargo_deny_lock(&mutation).is_err(),
+            "{label} unexpectedly preserved the cargo-deny authority",
+        );
+    }
+}
+
+#[test]
+fn windows_jobs_provision_the_locked_ghc_authority_and_bind_the_nightly_cache() {
+    let protocol = fs::read_to_string(repository_root().join("ci/protocol/v1.toml"))
+        .expect("typed workflow protocol must be UTF-8");
+    let expected_inputs = concat!(
+        "with-order = [\"enable-stack\", \"ghc-version\", \"stack-version\"]\n",
+        "with.enable-stack = \"true\"\n",
+        "with.ghc-version = \"9.8.2\"\n",
+        "with.stack-version = \"3.11.1\"",
+    );
+    for table in [
+        "physical.step.ci.windows.s004",
+        "physical.step.nightly.windows.s002",
+        "physical.step.release.windows.s004",
+    ] {
+        let setup = protocol_table(&protocol, table);
+        assert!(setup.contains(expected_inputs), "{table} setup inputs");
+        assert!(!setup.contains("stack-no-global"), "{table} disabled GHC");
+    }
+    for table in [
+        "physical.step.ci.linux.s004",
+        "physical.step.release.linux.s004",
+    ] {
+        assert!(
+            protocol_table(&protocol, table).contains("with.stack-no-global = \"true\""),
+            "{table} must retain its intentional Stack-only setup",
+        );
+    }
+
+    let setup_action = "uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d";
+    let rendered_inputs = concat!(
+        "with:\n",
+        "          enable-stack: 'true'\n",
+        "          ghc-version: 9.8.2\n",
+        "          stack-version: 3.11.1",
+    );
+    for (name, job, next) in [
+        ("ci.yml", "windows", Some("verify")),
+        ("nightly.yml", "windows", None),
+        ("release.yml", "windows", Some("assemble")),
+    ] {
+        let rendered = workflow(name);
+        let windows = job_block(&rendered, job, next);
+        assert_eq!(
+            windows.matches(setup_action).count(),
+            1,
+            "{name} action pin"
+        );
+        assert!(windows.contains(rendered_inputs), "{name} setup inputs");
+        assert!(!windows.contains("stack-no-global"), "{name} disabled GHC");
+        assert!(
+            !windows.contains("ghc-version: latest"),
+            "{name} floating GHC"
+        );
+    }
+
+    let nightly_key = "nightly-windows-stack-3.11.1-ghc-9.8.2-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}";
+    let nightly = workflow("nightly.yml");
+    let windows = job_block(&nightly, "windows", None);
+    assert_eq!(windows.matches(nightly_key).count(), 2);
+    assert!(!windows.contains("nightly-windows-stack-3.11.1-${{ hashFiles("));
+
+    let projection: serde_json::Value = serde_json::from_slice(
+        &fs::read(repository_root().join("ci/protocol/v1.audit.json"))
+            .expect("audit projection must be readable"),
+    )
+    .expect("audit projection must be strict JSON");
+    for path in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/nightly.yml",
+        ".github/workflows/release.yml",
+    ] {
+        let projected_workflow = projection["workflows"]
+            .as_array()
+            .expect("projected workflows must be an array")
+            .iter()
+            .find(|workflow| workflow["path"].as_str() == Some(path))
+            .expect("Windows workflow must be projected");
+        let projected_job = projected_workflow["jobs"]
+            .as_array()
+            .expect("projected jobs must be an array")
+            .iter()
+            .find(|job| job["id"].as_str() == Some("windows"))
+            .expect("Windows job must be projected");
+        let setup = projected_job["steps"]
+            .as_array()
+            .expect("projected steps must be an array")
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Install pinned Stack"))
+            .expect("pinned Stack setup must be projected");
+        let inputs = setup["action"]["with"]
+            .as_object()
+            .expect("setup inputs must be projected");
+        assert_eq!(inputs.len(), 3, "{path} projected setup input inventory");
+        assert_eq!(
+            inputs.get("enable-stack").and_then(|value| value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            inputs.get("ghc-version").and_then(|value| value.as_str()),
+            Some("9.8.2")
+        );
+        assert_eq!(
+            inputs.get("stack-version").and_then(|value| value.as_str()),
+            Some("3.11.1")
+        );
+        assert!(!inputs.contains_key("stack-no-global"));
     }
 }
 

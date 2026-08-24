@@ -622,16 +622,22 @@ enum TerminationProbe {
 }
 
 impl TerminationProbe {
+    #[cfg(unix)]
     fn prepare(self) -> io::Result<bool> {
         match self {
             Self::None => Ok(false),
-            #[cfg(unix)]
             Self::Wait(gate) => gate
                 .recv()
                 .map(|()| false)
                 .map_err(|_| io::Error::other("process-tree cleanup probe gate disconnected")),
-            #[cfg(unix)]
             Self::PanicAfterCleanup => Ok(true),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn prepare(self) -> bool {
+        match self {
+            Self::None => false,
         }
     }
 }
@@ -665,7 +671,10 @@ fn termination_executor_sender() -> io::Result<mpsc::Sender<TerminationTask>> {
                             probe,
                         } = task;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(unix)]
                             let panic_after_cleanup = probe.prepare()?;
+                            #[cfg(not(unix))]
+                            let panic_after_cleanup = probe.prepare();
                             let result = terminate_group_child(child, cleanup);
                             assert!(
                                 !panic_after_cleanup,

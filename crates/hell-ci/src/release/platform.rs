@@ -226,6 +226,9 @@ const LINUX_PRINCIPAL_ID_SPAN_LIMIT: u32 = 100_000;
 #[cfg(windows)]
 static WINDOWS_TOOLCHAIN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
+static WINDOWS_STACK_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(any(unix, windows))]
 static PLATFORM_FAILURE_VERIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -291,6 +294,10 @@ struct PlatformRunAuthority {
     readme: Vec<u8>,
     inventory: JsonValue,
     inventory_bytes: Vec<u8>,
+    #[cfg(windows)]
+    environment: ProcessEnvironment,
+    #[cfg(windows)]
+    windows_ghc: super::native_environment::WindowsNativeGhcAuthority,
 }
 
 fn prepare_platform_run_authority(
@@ -331,7 +338,10 @@ fn prepare_platform_run_authority(
     if read_regular(&root.join("deny.toml"))? != include_bytes!("../../../../deny.toml") {
         return Err("candidate dependency policy differs from trusted automation".to_owned());
     }
-    prepare_platform_output(platform, &output)?;
+    #[cfg(windows)]
+    let native_environment = prepare_platform_output(platform, &output, &environment)?;
+    #[cfg(not(windows))]
+    prepare_platform_output(platform, &output, &environment)?;
     let output = fs::canonicalize(output)
         .map_err(|error| format!("cannot canonicalize platform output: {error}"))?;
     let workspace_target = root
@@ -360,10 +370,18 @@ fn prepare_platform_run_authority(
         readme,
         inventory,
         inventory_bytes,
+        #[cfg(windows)]
+        environment,
+        #[cfg(windows)]
+        windows_ghc: native_environment.windows_ghc().clone(),
     })
 }
 
-fn prepare_platform_output(platform: ReleasePlatform, output: &Path) -> Result<(), String> {
+fn prepare_platform_output(
+    platform: ReleasePlatform,
+    output: &Path,
+    environment: &ProcessEnvironment,
+) -> Result<super::native_environment::NativeEnvironmentCollection, String> {
     if output.exists() {
         return Err("platform output already exists".to_owned());
     }
@@ -374,12 +392,12 @@ fn prepare_platform_output(platform: ReleasePlatform, output: &Path) -> Result<(
     fs::create_dir(output.join("conformance-observations"))
         .map_err(|error| format!("cannot create conformance observation output: {error}"))?;
     let trusted_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    super::native_environment::collect_for_platform(
+    super::native_environment::collect_for_platform_from_environment(
         platform,
         &trusted_root.join("ci/external-inputs.toml"),
         &output.join("native-environment.json"),
-    )?;
-    Ok(())
+        environment,
+    )
 }
 
 pub(crate) fn run(
@@ -409,6 +427,10 @@ pub(crate) fn run(
         candidate_sha: &authority.plan.resolution.candidate_sha,
         workspace_target: &authority.workspace_target,
         output: &authority.output,
+        #[cfg(windows)]
+        environment: &authority.environment,
+        #[cfg(windows)]
+        windows_ghc: &authority.windows_ghc,
     })?;
     let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         execute_confined_platform(authority, &mut confinement)
@@ -453,6 +475,10 @@ fn execute_confined_platform(
         readme,
         inventory: _,
         inventory_bytes,
+        #[cfg(windows)]
+            environment: _,
+        #[cfg(windows)]
+            windows_ghc: _,
     } = authority;
     let mut oracle_input = ConfinedPlatformOracleInput {
         platform,
@@ -748,7 +774,10 @@ fn complete_native_oracle_setup(
 ) -> Result<NativeOraclePreparation, String> {
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
         let cleanup_deadlines = native_oracle_cleanup_deadlines(&setup);
+        #[cfg(not(target_os = "macos"))]
+        let cleanup_deadlines = native_oracle_cleanup_deadlines();
         let restoration = restore_native_oracle_authority(
             setup.confinement,
             &mut setup.archive_adapter,
@@ -766,15 +795,23 @@ fn complete_native_oracle_setup(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn native_oracle_cleanup_deadlines(
     setup: &NativeOracleSetup<'_>,
 ) -> Result<NativeOracleCleanupDeadlines, String> {
     let transition = Instant::now();
-    #[cfg(target_os = "macos")]
     if let Some(lifecycle) = setup.lifecycle {
         return Ok(lifecycle.cleanup);
     }
+    let outer = transition
+        .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
+        .ok_or_else(|| "archive cleanup outer deadline overflowed".to_owned())?;
+    transition_cleanup_deadlines(transition, outer)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn native_oracle_cleanup_deadlines() -> Result<NativeOracleCleanupDeadlines, String> {
+    let transition = Instant::now();
     let outer = transition
         .checked_add(POSIX_ARCHIVE_CLEANUP_BUDGET)
         .ok_or_else(|| "archive cleanup outer deadline overflowed".to_owned())?;
@@ -832,9 +869,9 @@ fn stop_native_archive_input_broker(
 #[cfg(all(unix, not(target_os = "macos")))]
 fn stop_native_archive_input_broker(
     _archive_adapter: &mut crate::command::NativeArchiveAdapter,
-    _deadlines: Result<NativeOracleCleanupDeadlines, String>,
+    deadlines: Result<NativeOracleCleanupDeadlines, String>,
 ) -> Result<(), String> {
-    Ok(())
+    deadlines.map(|_| ())
 }
 
 #[cfg(unix)]
@@ -965,6 +1002,11 @@ fn execute_confined_platform_gates(
         .confinement
         .require_candidate_environment("before platform gates")?;
     #[cfg(unix)]
+    run_trusted_posix_construction_verifier(
+        &input.confinement.adapter_protection,
+        input.candidate_execution_root,
+    )?;
+    #[cfg(unix)]
     let dependency_policy = match (
         input.confinement.dependency_policy_protection.as_ref(),
         input.confinement.cargo_deny_home_protection.as_ref(),
@@ -1045,6 +1087,67 @@ fn execute_confined_platform_gates(
         #[cfg(windows)]
         windows_release_binary,
     })
+}
+
+#[cfg(unix)]
+fn run_trusted_posix_construction_verifier(
+    adapter: &PosixAdapterProtection,
+    current_directory: &Path,
+) -> Result<(), String> {
+    adapter.revalidate()?;
+    let result = CommandSpec::new(adapter.adapter.as_os_str(), Duration::from_secs(30))
+        .argument("__verify-posix-candidate-environment-construction")
+        .current_directory(current_directory)
+        .run_trusted_host_captured()
+        .map_err(|error| format!("cannot run trusted POSIX construction verifier: {error}"));
+    let revalidation = adapter.revalidate();
+    let result = match (result, revalidation) {
+        (Ok(result), Ok(())) => result,
+        (Err(primary), Ok(())) => return Err(primary),
+        (Ok(_), Err(revalidation)) => {
+            return Err(format!(
+                "trusted POSIX construction verifier driver changed after execution: {revalidation}"
+            ));
+        }
+        (Err(primary), Err(revalidation)) => {
+            return Err(format!(
+                "{primary}; trusted POSIX construction verifier driver also changed after execution: {revalidation}"
+            ));
+        }
+    };
+    if !result.status.success()
+        || result.timed_out
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || !result.stdout.is_empty()
+        || !result.stderr.is_empty()
+        || result.stdout_bytes != 0
+        || result.stderr_bytes != 0
+        || result.stdout_sha256 != hell_testkit::sha256_bytes(&[])
+        || result.stderr_sha256 != hell_testkit::sha256_bytes(&[])
+        || !result.termination.forced
+    {
+        return Err(format!(
+            "trusted POSIX construction verifier did not complete cleanly: status={:?}; timedOut={}; stdoutBytes={}; stdoutSha256={}; stderrBytes={}; stderrSha256={}; stdoutTruncated={}; stderrTruncated={}; cleanupId={:?}; forced={}; reaped={}; candidateQuiescenceComplete={}",
+            result.status.code(),
+            result.timed_out,
+            result.stdout_bytes,
+            result.stdout_sha256.hex(),
+            result.stderr_bytes,
+            result.stderr_sha256.hex(),
+            result.stdout_truncated,
+            result.stderr_truncated,
+            result.termination.cleanup_id,
+            result.termination.forced,
+            result.termination.reaped,
+            result.termination.candidate_quiescence_complete,
+        ));
+    }
+    crate::command::require_captured_command_terminal_receipt(
+        &result,
+        false,
+        "trusted POSIX construction verifier",
+    )
 }
 
 fn initial_platform_gate_state(
@@ -1432,6 +1535,10 @@ struct CandidateConfinementInput<'a> {
     candidate_sha: &'a str,
     workspace_target: &'a Path,
     output: &'a Path,
+    #[cfg(windows)]
+    environment: &'a ProcessEnvironment,
+    #[cfg(windows)]
+    windows_ghc: &'a super::native_environment::WindowsNativeGhcAuthority,
 }
 
 #[cfg(unix)]
@@ -1466,7 +1573,7 @@ fn acquire_posix_candidate_principal(
     let created = match input.platform {
         ReleasePlatform::LinuxX86_64 => {
             let (principal, group, uid, cleanup) =
-                allocate_linux_candidate_principal(Arc::clone(&process_authorities), "hellrel")?;
+                allocate_linux_candidate_principal(&process_authorities, "hellrel")?;
             CreatedPosixPrincipal {
                 principal,
                 group,
@@ -2428,6 +2535,14 @@ pub(crate) fn verify_windows_candidate_target_authority_for_integration() -> Res
         let target = authority.join("candidate-target");
         verify_windows_staged_toolchain_seal_for_integration(&authority, execution_deadline)?;
         require_candidate_target(&candidate, &target)?;
+        let process_environment = ProcessEnvironment::from_process();
+        let trusted_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let windows_ghc =
+            super::native_environment::collect_windows_ghc_authority_for_integration(
+                &process_environment,
+                &trusted_root.join("ci/external-inputs.toml"),
+                execution_deadline,
+            )?;
         owner.confinement = Some(establish_candidate_process_confinement(
             &CandidateConfinementInput {
                 platform: ReleasePlatform::WindowsX86_64,
@@ -2438,6 +2553,8 @@ pub(crate) fn verify_windows_candidate_target_authority_for_integration() -> Res
                 candidate_sha: "0000000000000000000000000000000000000000",
                 workspace_target: &target,
                 output: &output,
+                environment: &process_environment,
+                windows_ghc: &windows_ghc,
             },
         )?);
         let confinement = owner
@@ -2679,6 +2796,7 @@ struct PosixAdapterProtection {
     staged_name: &'static str,
     sudo: PathBuf,
     tools: PosixAdapterTools,
+    cleanup_required: bool,
 }
 
 #[cfg(unix)]
@@ -3496,6 +3614,19 @@ struct PosixRustupProtection {
     linux_getfacl: Option<crate::command::ResolvedStandardExecutable>,
     sudo: PathBuf,
     tools: PosixAdapterTools,
+    active: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct PosixRustupCleanupAuthority<'a> {
+    platform: ReleasePlatform,
+    sudo: &'a Path,
+    tools: &'a PosixAdapterTools,
+    installation_root: &'a Path,
+    installation_root_identity: &'a PosixObjectIdentity,
+    directory: &'a Path,
+    directory_identity: &'a PosixObjectIdentity,
 }
 
 #[cfg(unix)]
@@ -6037,7 +6168,9 @@ pub(crate) fn verify_posix_post_state_metadata_for_integration() -> Result<(), S
 #[cfg(unix)]
 impl Drop for PosixRustupProtection {
     fn drop(&mut self) {
-        let _ = cleanup_posix_rustup_authority(self);
+        if self.active {
+            let _ = cleanup_posix_rustup_authority(self);
+        }
     }
 }
 
@@ -6060,17 +6193,52 @@ struct PosixRustupStage {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct PosixRustupStageDeadlines {
+    source_inventory: Instant,
+    copy: (Instant, Instant),
+    acl_clear: (Instant, Instant),
+    seal: (Instant, Instant),
+    acl_inventory: (Instant, Instant),
+    staged_inventory: (Instant, Instant),
+    completion: Instant,
+}
+
+#[cfg(unix)]
 fn stage_posix_rustup_authority(
     platform: ReleasePlatform,
     sudo: &Path,
     authority: &crate::command::ResolvedPosixRustupAuthority,
 ) -> Result<PosixRustupProtection, String> {
-    let source_inventory = posix_rustup_selected_inventory(
+    stage_posix_rustup_authority_with_deadlines(platform, sudo, authority, None)
+}
+
+#[cfg(unix)]
+fn stage_posix_rustup_authority_until(
+    platform: ReleasePlatform,
+    sudo: &Path,
+    authority: &crate::command::ResolvedPosixRustupAuthority,
+    deadlines: PosixRustupStageDeadlines,
+) -> Result<PosixRustupProtection, String> {
+    stage_posix_rustup_authority_with_deadlines(platform, sudo, authority, Some(deadlines))
+}
+
+#[cfg(unix)]
+fn stage_posix_rustup_authority_with_deadlines(
+    platform: ReleasePlatform,
+    sudo: &Path,
+    authority: &crate::command::ResolvedPosixRustupAuthority,
+    deadlines: Option<PosixRustupStageDeadlines>,
+) -> Result<PosixRustupProtection, String> {
+    let source_inventory = posix_rustup_selected_inventory_until(
         authority.home(),
         authority.toolchain(),
         "standard Rustup",
+        deadlines.map(|deadlines| deadlines.source_inventory),
     )?;
-    let stage = reserve_posix_rustup_stage(platform, sudo, authority.toolchain())?;
+    let copy_deadlines = deadlines.map(|deadlines| deadlines.copy);
+    let stage =
+        reserve_posix_rustup_stage_until(platform, sudo, authority.toolchain(), copy_deadlines)?;
     let source_toolchain = authority
         .home()
         .join("toolchains")
@@ -6082,8 +6250,9 @@ fn stage_posix_rustup_authority(
         .join(authority.toolchain());
 
     let result = (|| {
-        create_posix_rustup_stage_members(sudo, &stage)?;
-        trusted_tool_status(
+        create_posix_rustup_stage_members_until(sudo, &stage, copy_deadlines)?;
+        trusted_tool_status_maybe_until(
+            copy_deadlines,
             sudo,
             &stage.tools.copy,
             [
@@ -6092,7 +6261,8 @@ fn stage_posix_rustup_authority(
                 path_text(&stage.staged_settings, "staged Rustup settings")?,
             ],
         )?;
-        trusted_tool_status(
+        trusted_tool_status_maybe_until(
+            copy_deadlines,
             sudo,
             &stage.tools.copy,
             [
@@ -6101,7 +6271,8 @@ fn stage_posix_rustup_authority(
                 path_text(&stage.staged_update_hash, "staged Rustup update hash")?,
             ],
         )?;
-        trusted_tool_status(
+        trusted_tool_status_maybe_until(
+            copy_deadlines,
             sudo,
             &stage.tools.copy,
             [
@@ -6111,8 +6282,8 @@ fn stage_posix_rustup_authority(
                 path_text(&stage.staged_toolchain, "staged Rustup toolchain")?,
             ],
         )?;
-        protect_posix_rustup_stage(sudo, &stage)?;
-        let protection = PosixRustupProtection {
+        protect_posix_rustup_stage_until(sudo, &stage, deadlines)?;
+        let mut protection = PosixRustupProtection {
             platform,
             installation_root: stage.installation_root.clone(),
             installation_root_identity: stage.installation_root_identity.clone(),
@@ -6127,29 +6298,35 @@ fn stage_posix_rustup_authority(
             linux_getfacl: stage.acl_reader.clone(),
             sudo: sudo.to_path_buf(),
             tools: stage.tools.clone(),
+            active: false,
         };
-        validate_posix_rustup_authority(&protection)?;
+        validate_posix_rustup_authority_until(&protection, deadlines)?;
+        protection.active = true;
         Ok(protection)
     })();
     if result.is_err() {
-        let _ = cleanup_posix_rustup_paths(
-            platform,
-            sudo,
-            &stage.tools,
-            &stage.installation_root,
-            &stage.installation_root_identity,
-            &stage.directory,
-            &stage.directory_identity,
+        let _ = cleanup_posix_rustup_paths_until(
+            PosixRustupCleanupAuthority {
+                platform,
+                sudo,
+                tools: &stage.tools,
+                installation_root: &stage.installation_root,
+                installation_root_identity: &stage.installation_root_identity,
+                directory: &stage.directory,
+                directory_identity: &stage.directory_identity,
+            },
+            deadlines.map(|deadlines| deadlines.completion),
         );
     }
     result
 }
 
 #[cfg(unix)]
-fn reserve_posix_rustup_stage(
+fn reserve_posix_rustup_stage_until(
     platform: ReleasePlatform,
     sudo: &Path,
     toolchain: &OsStr,
+    deadlines: Option<(Instant, Instant)>,
 ) -> Result<PosixRustupStage, String> {
     let installation_root = posix_adapter_installation_root(platform)?;
     let installation_root_identity = posix_object_identity(&installation_root)?;
@@ -6171,7 +6348,8 @@ fn reserve_posix_rustup_stage(
         "hell-rs-posix-rustup-{}-{sequence}",
         std::process::id()
     ));
-    trusted_tool_status(
+    trusted_tool_status_maybe_until(
+        deadlines,
         sudo,
         &tools.mkdir,
         [
@@ -6182,13 +6360,14 @@ fn reserve_posix_rustup_stage(
         ],
     )
     .map_err(|error| format!("cannot reserve staged Rustup authority: {error}"))?;
-    clear_posix_rustup_acl(
+    clear_posix_rustup_acl_until(
         platform,
         sudo,
         &tools,
         acl_setter.as_ref(),
         &directory,
         false,
+        deadlines,
     )?;
     let directory_identity = posix_object_identity(&directory)?;
     let home = directory.join("rustup-home");
@@ -6211,9 +6390,14 @@ fn reserve_posix_rustup_stage(
 }
 
 #[cfg(unix)]
-fn create_posix_rustup_stage_members(sudo: &Path, stage: &PosixRustupStage) -> Result<(), String> {
+fn create_posix_rustup_stage_members_until(
+    sudo: &Path,
+    stage: &PosixRustupStage,
+    deadlines: Option<(Instant, Instant)>,
+) -> Result<(), String> {
     for path in [&stage.home, &stage.toolchains, &stage.update_hashes] {
-        trusted_tool_status(
+        trusted_tool_status_maybe_until(
+            deadlines,
             sudo,
             &stage.tools.mkdir,
             [
@@ -6228,16 +6412,18 @@ fn create_posix_rustup_stage_members(sudo: &Path, stage: &PosixRustupStage) -> R
 }
 
 #[cfg(unix)]
-fn clear_posix_rustup_acl(
+fn clear_posix_rustup_acl_until(
     platform: ReleasePlatform,
     sudo: &Path,
     tools: &PosixAdapterTools,
     acl_setter: Option<&crate::command::ResolvedStandardExecutable>,
     path: &Path,
     recursive: bool,
+    deadlines: Option<(Instant, Instant)>,
 ) -> Result<(), String> {
     if platform == ReleasePlatform::MacosAarch64 {
-        return trusted_tool_status(
+        return trusted_tool_status_maybe_until(
+            deadlines,
             sudo,
             &tools.chmod,
             posix_acl_removal_arguments(
@@ -6253,33 +6439,42 @@ fn clear_posix_rustup_acl(
             arguments.insert(0, OsString::from("-R"));
         }
         arguments.extend([OsString::from("--"), path.as_os_str().to_owned()]);
-        trusted_tool_status(sudo, setfacl, arguments)?;
+        trusted_tool_status_maybe_until(deadlines, sudo, setfacl, arguments)?;
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn protect_posix_rustup_stage(sudo: &Path, stage: &PosixRustupStage) -> Result<(), String> {
-    clear_posix_rustup_acl(
+fn protect_posix_rustup_stage_until(
+    sudo: &Path,
+    stage: &PosixRustupStage,
+    deadlines: Option<PosixRustupStageDeadlines>,
+) -> Result<(), String> {
+    let acl_deadlines = deadlines.map(|deadlines| deadlines.acl_clear);
+    clear_posix_rustup_acl_until(
         stage.platform,
         sudo,
         &stage.tools,
         stage.acl_setter.as_ref(),
         &stage.home,
         true,
+        acl_deadlines,
     )?;
+    let seal_deadlines = deadlines.map(|deadlines| deadlines.seal);
     for (path, label) in [
         (&stage.staged_settings, "staged Rustup settings"),
         (&stage.staged_update_hash, "staged Rustup update hash"),
     ] {
-        trusted_tool_status(
+        trusted_tool_status_maybe_until(
+            seal_deadlines,
             sudo,
             &stage.tools.chmod,
             posix_chmod_arguments(stage.platform, "0444", path_text(path, label)?)?,
         )?;
     }
     for mode in ["a+rX", "a-w"] {
-        trusted_tool_status(
+        trusted_tool_status_maybe_until(
+            seal_deadlines,
             sudo,
             &stage.tools.chmod,
             [
@@ -6294,6 +6489,14 @@ fn protect_posix_rustup_stage(sudo: &Path, stage: &PosixRustupStage) -> Result<(
 
 #[cfg(unix)]
 fn validate_posix_rustup_authority(protection: &PosixRustupProtection) -> Result<(), String> {
+    validate_posix_rustup_authority_until(protection, None)
+}
+
+#[cfg(unix)]
+fn validate_posix_rustup_authority_until(
+    protection: &PosixRustupProtection,
+    deadlines: Option<PosixRustupStageDeadlines>,
+) -> Result<(), String> {
     protection.proxy_identity.revalidate()?;
     protection
         .rustc_authority
@@ -6332,14 +6535,30 @@ fn validate_posix_rustup_authority(protection: &PosixRustupProtection) -> Result
         std::slice::from_ref(&protection.toolchain),
         "staged Rustup update hashes",
     )?;
-    require_posix_read_only_tree(&protection.home, "staged Rustup")?;
+    match deadlines {
+        Some(deadlines) => {
+            require_posix_read_only_tree_before(
+                &protection.home,
+                "staged Rustup",
+                deadlines.seal.0,
+            )?;
+        }
+        None => require_posix_read_only_tree(&protection.home, "staged Rustup")?,
+    }
     match (protection.platform, protection.linux_getfacl.as_ref()) {
         (ReleasePlatform::LinuxX86_64, Some(getfacl)) => {
             getfacl
                 .revalidate()
                 .map_err(|error| format!("Linux Rustup ACL verifier changed: {error}"))?;
-            require_linux_base_acl_tree(getfacl, &protection.directory, 1, false)?;
-            require_linux_base_acl_tree(
+            let acl_deadlines = deadlines.map(|deadlines| deadlines.acl_inventory);
+            require_linux_base_acl_tree_until(
+                getfacl,
+                &protection.directory,
+                1,
+                false,
+                acl_deadlines,
+            )?;
+            require_linux_base_acl_tree_until(
                 getfacl,
                 &protection.home,
                 protection
@@ -6348,6 +6567,7 @@ fn validate_posix_rustup_authority(protection: &PosixRustupProtection) -> Result
                     .checked_add(1)
                     .ok_or_else(|| "staged Rustup ACL inventory count overflowed".to_owned())?,
                 true,
+                acl_deadlines,
             )?;
         }
         (ReleasePlatform::LinuxX86_64, None) => {
@@ -6358,8 +6578,12 @@ fn validate_posix_rustup_authority(protection: &PosixRustupProtection) -> Result
         }
         (_, None) => {}
     }
-    if posix_rustup_selected_inventory(&protection.home, &protection.toolchain, "staged Rustup")?
-        != protection.inventory
+    if posix_rustup_selected_inventory_until(
+        &protection.home,
+        &protection.toolchain,
+        "staged Rustup",
+        deadlines.map(|deadlines| deadlines.staged_inventory.0),
+    )? != protection.inventory
     {
         return Err("staged Rustup bytes or closed inventory changed".to_owned());
     }
@@ -6367,26 +6591,36 @@ fn validate_posix_rustup_authority(protection: &PosixRustupProtection) -> Result
 }
 
 #[cfg(unix)]
-fn require_linux_base_acl_tree(
+fn require_linux_base_acl_tree_until(
     getfacl: &crate::command::ResolvedStandardExecutable,
     root: &Path,
     expected_entries: usize,
     recursive: bool,
+    deadlines: Option<(Instant, Instant)>,
 ) -> Result<(), String> {
-    let command = CommandSpec::new(
-        getfacl.invocation_path().as_os_str(),
-        Duration::from_mins(5),
-    );
+    let timeout = deadlines.map_or(Duration::from_mins(5), |(execution, _)| {
+        execution.saturating_duration_since(Instant::now())
+    });
+    if timeout.is_zero() {
+        return Err("staged Rustup Linux ACL inspection deadline expired".to_owned());
+    }
+    let command = CommandSpec::new(getfacl.invocation_path().as_os_str(), timeout);
     let command = if recursive {
         command.argument("-R")
     } else {
         command
     };
-    let result = command
+    let command = command
         .arguments([OsString::from("-p"), OsString::from("--")])
-        .argument(root)
-        .run()
-        .map_err(|error| format!("cannot inspect staged Rustup Linux ACLs: {error}"))?;
+        .argument(root);
+    let result = match deadlines {
+        Some((execution, completion)) => {
+            let (progress, _receiver) = hell_testkit::SupervisedProgressObserver::bounded(1);
+            command.run_until(execution, completion, progress)
+        }
+        None => command.run(),
+    }
+    .map_err(|error| format!("cannot inspect staged Rustup Linux ACLs: {error}"))?;
     if result.timed_out
         || !result.status.success()
         || result.stdout_truncated
@@ -6480,10 +6714,21 @@ fn linux_getfacl_output_is_exact_base_acl(output: &[u8], expected_entries: usize
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn posix_rustup_selected_inventory(
     home: &Path,
     toolchain: &std::ffi::OsStr,
     label: &str,
+) -> Result<Vec<PosixRustupInventoryEntry>, String> {
+    posix_rustup_selected_inventory_until(home, toolchain, label, None)
+}
+
+#[cfg(unix)]
+fn posix_rustup_selected_inventory_until(
+    home: &Path,
+    toolchain: &std::ffi::OsStr,
+    label: &str,
+    deadline: Option<Instant>,
 ) -> Result<Vec<PosixRustupInventoryEntry>, String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -6498,6 +6743,7 @@ fn posix_rustup_selected_inventory(
     let mut bytes = 0_u64;
     let mut visited = BTreeSet::new();
     while let Some(path) = pending.pop() {
+        require_posix_rustup_stage_deadline(deadline, "selected inventory")?;
         if !visited.insert(path.clone()) {
             continue;
         }
@@ -6525,7 +6771,7 @@ fn posix_rustup_selected_inventory(
             .ok_or_else(|| format!("{label} selected inventory exceeds its staging bound"))?;
         bytes = next_bytes;
         let sha256 = (!directory)
-            .then(|| hell_testkit::sha256_file(&path))
+            .then(|| posix_rustup_sha256_file_until(&path, deadline))
             .transpose()
             .map_err(|error| {
                 format!("cannot hash {label} entry {}: {error}", relative.display())
@@ -6542,6 +6788,7 @@ fn posix_rustup_selected_inventory(
             for entry in fs::read_dir(&path)
                 .map_err(|error| format!("cannot enumerate {label} entry: {error}"))?
             {
+                require_posix_rustup_stage_deadline(deadline, "selected inventory")?;
                 pending.push(
                     entry
                         .map_err(|error| format!("cannot read {label} entry: {error}"))?
@@ -6552,6 +6799,40 @@ fn posix_rustup_selected_inventory(
     }
     inventory.sort_by(|left, right| left.relative.cmp(&right.relative));
     Ok(inventory)
+}
+
+#[cfg(unix)]
+fn require_posix_rustup_stage_deadline(
+    deadline: Option<Instant>,
+    phase: &str,
+) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(format!("staged Rustup {phase} deadline expired"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn posix_rustup_sha256_file_until(
+    path: &Path,
+    deadline: Option<Instant>,
+) -> Result<hell_testkit::Digest, String> {
+    use std::io::Read as _;
+
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("cannot open staged Rustup inventory member: {error}"))?;
+    let mut digest = hell_digest::Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        require_posix_rustup_stage_deadline(deadline, "inventory hash")?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read staged Rustup inventory member: {error}"))?;
+        if read == 0 {
+            return Ok(digest.finish());
+        }
+        digest.update(&buffer[..read]);
+    }
 }
 
 #[cfg(unix)]
@@ -6625,38 +6906,46 @@ fn require_exact_directory_members(
 #[cfg(unix)]
 fn cleanup_posix_rustup_authority(protection: &PosixRustupProtection) -> Result<(), String> {
     validate_posix_rustup_authority(protection)?;
-    cleanup_posix_rustup_paths(
-        protection.platform,
-        &protection.sudo,
-        &protection.tools,
-        &protection.installation_root,
-        &protection.installation_root_identity,
-        &protection.directory,
-        &protection.directory_identity,
-    )
+    cleanup_posix_rustup_paths(PosixRustupCleanupAuthority {
+        platform: protection.platform,
+        sudo: &protection.sudo,
+        tools: &protection.tools,
+        installation_root: &protection.installation_root,
+        installation_root_identity: &protection.installation_root_identity,
+        directory: &protection.directory,
+        directory_identity: &protection.directory_identity,
+    })
 }
 
 #[cfg(unix)]
-fn cleanup_posix_rustup_paths(
-    platform: ReleasePlatform,
-    sudo: &Path,
-    tools: &PosixAdapterTools,
-    installation_root: &Path,
-    installation_root_identity: &PosixObjectIdentity,
-    directory: &Path,
-    directory_identity: &PosixObjectIdentity,
+fn cleanup_posix_rustup_paths(authority: PosixRustupCleanupAuthority<'_>) -> Result<(), String> {
+    cleanup_posix_rustup_paths_until(authority, None)
+}
+
+#[cfg(unix)]
+fn cleanup_posix_rustup_paths_until(
+    authority: PosixRustupCleanupAuthority<'_>,
+    deadline: Option<Instant>,
 ) -> Result<(), String> {
-    if validate_posix_adapter_installation_root(platform, installation_root)? != installation_root
-        || posix_object_identity(installation_root)? != *installation_root_identity
-        || !posix_rustup_cleanup_is_exact(installation_root, directory)
-        || posix_object_identity(directory)? != *directory_identity
+    require_posix_rustup_stage_deadline(deadline, "setup cleanup")?;
+    if validate_posix_adapter_installation_root(authority.platform, authority.installation_root)?
+        != authority.installation_root
+        || posix_object_identity(authority.installation_root)?
+            != *authority.installation_root_identity
+        || !posix_rustup_cleanup_is_exact(authority.installation_root, authority.directory)
+        || posix_object_identity(authority.directory)? != *authority.directory_identity
     {
         return Err("staged Rustup cleanup authority changed".to_owned());
     }
-    trusted_tool_status(
-        sudo,
-        &tools.remove_file,
-        ["-rf", "--", path_text(directory, "staged Rustup cleanup")?],
+    trusted_tool_status_maybe_before(
+        deadline,
+        authority.sudo,
+        &authority.tools.remove_file,
+        [
+            "-rf",
+            "--",
+            path_text(authority.directory, "staged Rustup cleanup")?,
+        ],
     )
 }
 
@@ -7644,13 +7933,40 @@ pub(crate) fn verify_posix_candidate_environment_construction_for_integration() 
     }
     let cleanup = fs::remove_dir_all(&fixture.root)
         .map_err(|error| format!("cannot remove candidate environment verifier: {error}"));
-    result.and(cleanup)
+    let absence = match fs::symlink_metadata(&fixture.root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot attest candidate environment verifier absence: {error}"
+        )),
+        Ok(_) => Err("candidate environment verifier remains after cleanup".to_owned()),
+    };
+    combine_candidate_environment_verifier_results(result, cleanup, absence)
+}
+
+#[cfg(unix)]
+fn combine_candidate_environment_verifier_results(
+    primary: Result<(), String>,
+    cleanup: Result<(), String>,
+    absence: Result<(), String>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for result in [primary, cleanup, absence] {
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[cfg(unix)]
 fn combine_candidate_target_verifier_results(
     primary: Result<(), String>,
     lifecycle_cleanup: Result<(), String>,
+    cargo_adapter_cleanup: Result<(), String>,
     transient_absence: Result<(), String>,
     fixture_cleanup: Result<(), String>,
 ) -> Result<(), String> {
@@ -7660,6 +7976,10 @@ fn combine_candidate_target_verifier_results(
         (
             "candidate target verifier lifecycle cleanup",
             lifecycle_cleanup,
+        ),
+        (
+            "candidate target verifier Cargo-adapter cleanup",
+            cargo_adapter_cleanup,
         ),
         (
             "candidate target verifier transient absence",
@@ -7813,10 +8133,8 @@ fn allocate_candidate_target_principal(
 ) -> Result<CandidateTargetPrincipal, String> {
     let (name, group, user_id, group_id) = match input.platform {
         ReleasePlatform::LinuxX86_64 => {
-            let (name, group, id, value) = allocate_linux_candidate_principal(
-                Arc::clone(input.process_authorities),
-                "helltgt",
-            )?;
+            let (name, group, id, value) =
+                allocate_linux_candidate_principal(input.process_authorities, "helltgt")?;
             *cleanup = Some(value);
             cleanup
                 .as_mut()
@@ -8013,6 +8331,15 @@ struct CandidateTargetLaunch {
     rustup: PosixRustupProtection,
     policy: hell_testkit::CandidateLaunchPolicy,
     isolated: PathBuf,
+    cargo_protection: PosixAdapterProtection,
+}
+
+#[cfg(unix)]
+struct RetainedCandidateTargetLaunch {
+    cargo: crate::command::ResolvedCargoExecutable,
+    rustup: PosixRustupProtection,
+    policy: hell_testkit::CandidateLaunchPolicy,
+    isolated: PathBuf,
 }
 
 #[cfg(unix)]
@@ -8030,6 +8357,22 @@ struct CandidateTargetLaunchInput<'a> {
 fn prepare_candidate_target_launch(
     input: CandidateTargetLaunchInput<'_>,
 ) -> Result<CandidateTargetLaunch, String> {
+    prepare_candidate_target_launch_with_deadlines(input, None)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_candidate_target_launch_until(
+    input: CandidateTargetLaunchInput<'_>,
+    deadlines: PosixRustupStageDeadlines,
+) -> Result<CandidateTargetLaunch, String> {
+    prepare_candidate_target_launch_with_deadlines(input, Some(deadlines))
+}
+
+#[cfg(unix)]
+fn prepare_candidate_target_launch_with_deadlines(
+    input: CandidateTargetLaunchInput<'_>,
+    deadlines: Option<PosixRustupStageDeadlines>,
+) -> Result<CandidateTargetLaunch, String> {
     let cargo = crate::command::resolve_standard_cargo_executable()?;
     let cargo_authority = crate::command::resolve_posix_cargo_authority(&cargo, input.project)?;
     let rustup_authority = match &cargo_authority {
@@ -8038,7 +8381,15 @@ fn prepare_candidate_target_launch(
         }
         crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => authority,
     };
-    let rustup = stage_posix_rustup_authority(input.platform, input.sudo, rustup_authority)?;
+    let rustup = match deadlines {
+        Some(deadlines) => stage_posix_rustup_authority_until(
+            input.platform,
+            input.sudo,
+            rustup_authority,
+            deadlines,
+        )?,
+        None => stage_posix_rustup_authority(input.platform, input.sudo, rustup_authority)?,
+    };
     let cargo_protection = stage_posix_executable(
         input.platform,
         input.sudo,
@@ -8079,7 +8430,122 @@ fn prepare_candidate_target_launch(
         rustup,
         policy,
         isolated,
+        cargo_protection,
     })
+}
+
+#[cfg(unix)]
+fn prepare_retained_candidate_target_launch(
+    input: CandidateTargetLaunchInput<'_>,
+    fixture: &Path,
+    cargo_protection: &mut Option<PosixAdapterProtection>,
+) -> Result<RetainedCandidateTargetLaunch, String> {
+    let CandidateTargetLaunch {
+        cargo,
+        rustup,
+        policy,
+        isolated,
+        cargo_protection: retained,
+    } = prepare_candidate_target_launch(input)?;
+    *cargo_protection = Some(retained);
+    let retained = cargo_protection
+        .as_ref()
+        .ok_or_else(|| "candidate Cargo adapter authority was not retained".to_owned())?;
+    retained
+        .revalidate()
+        .map_err(|error| format!("cannot revalidate retained candidate Cargo adapter: {error}"))?;
+    #[cfg(target_os = "macos")]
+    verify_candidate_cargo_adapter_revalidation_rejections(fixture, retained)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = fixture;
+    Ok(RetainedCandidateTargetLaunch {
+        cargo,
+        rustup,
+        policy,
+        isolated,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_candidate_cargo_adapter_revalidation_rejections(
+    fixture: &Path,
+    retained: &PosixAdapterProtection,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = fixture.join("candidate-cargo-adapter-revalidation");
+    let adapter = root.join("cargo");
+    fs::create_dir(&root)
+        .and_then(|()| fs::copy(&retained.adapter, &adapter).map(|_| ()))
+        .and_then(|()| fs::set_permissions(&adapter, fs::Permissions::from_mode(0o555)))
+        .map_err(|error| format!("cannot prepare candidate Cargo adapter revalidation: {error}"))?;
+    let result = (|| {
+        let installation_root = fs::canonicalize(fixture).map_err(|error| {
+            format!("cannot bind candidate Cargo adapter verifier root: {error}")
+        })?;
+        let directory = fs::canonicalize(&root).map_err(|error| {
+            format!("cannot bind candidate Cargo adapter verifier directory: {error}")
+        })?;
+        let adapter = fs::canonicalize(&adapter).map_err(|error| {
+            format!("cannot bind candidate Cargo adapter verifier executable: {error}")
+        })?;
+        let protection = PosixAdapterProtection {
+            platform: ReleasePlatform::MacosAarch64,
+            installation_root_identity: posix_object_identity(&installation_root)?,
+            installation_root,
+            directory_identity: posix_object_identity(&directory)?,
+            directory,
+            adapter_identity: posix_object_identity(&adapter)?,
+            sha256: hell_testkit::sha256_file(&adapter).map_err(|error| {
+                format!("cannot hash candidate Cargo adapter verifier executable: {error}")
+            })?,
+            adapter: adapter.clone(),
+            staged_name: "cargo",
+            sudo: retained.sudo.clone(),
+            tools: retained.tools.clone(),
+            cleanup_required: false,
+        };
+        protection.revalidate()?;
+
+        let parked = root.join("cargo.parked");
+        fs::rename(&adapter, &parked)
+            .map_err(|error| format!("cannot park candidate Cargo adapter verifier: {error}"))?;
+        if protection.revalidate().is_ok() {
+            return Err("absent candidate Cargo adapter satisfied its retained receipt".to_owned());
+        }
+        fs::rename(&parked, &adapter)
+            .map_err(|error| format!("cannot restore absent candidate Cargo adapter: {error}"))?;
+        protection.revalidate()?;
+
+        fs::rename(&adapter, &parked).map_err(|error| {
+            format!("cannot park candidate Cargo adapter before substitution: {error}")
+        })?;
+        fs::copy(&parked, &adapter)
+            .and_then(|_| fs::set_permissions(&adapter, fs::Permissions::from_mode(0o555)))
+            .map_err(|error| format!("cannot substitute candidate Cargo adapter: {error}"))?;
+        if protection.revalidate().is_ok() {
+            return Err(
+                "same-byte candidate Cargo adapter substitution satisfied its retained receipt"
+                    .to_owned(),
+            );
+        }
+        fs::remove_file(&adapter)
+            .and_then(|()| fs::rename(&parked, &adapter))
+            .map_err(|error| {
+                format!("cannot restore substituted candidate Cargo adapter: {error}")
+            })?;
+        protection.revalidate()
+    })();
+    let cleanup = fs::remove_dir_all(&root)
+        .map_err(|error| format!("cannot clean candidate Cargo adapter revalidation: {error}"));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; candidate Cargo adapter revalidation cleanup also failed: {cleanup}"
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -8117,10 +8583,327 @@ struct CandidateTargetBrokerInput<'a> {
     adapter: &'a PosixAdapterProtection,
     candidate_user_id: u32,
     candidate_group_id: u32,
+    candidate_group_ids: &'a [u32],
     target: &'a Path,
     isolated: &'a Path,
     policy: &'a hell_testkit::CandidateLaunchPolicy,
     project: &'a Path,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct PosixSearchOnlyAncestor {
+    path: PathBuf,
+    guard: fs::File,
+    identity: PosixObjectIdentity,
+    active_mode: Option<u32>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct PosixSearchOnlyAncestorAuthority {
+    leaf: PathBuf,
+    leaf_guard: fs::File,
+    leaf_identity: PosixObjectIdentity,
+    ancestors: Vec<PosixSearchOnlyAncestor>,
+    first_transition: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl PosixSearchOnlyAncestorAuthority {
+    fn bind(leaf: &Path, transition_root: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let leaf = fs::canonicalize(leaf)
+            .map_err(|error| format!("cannot canonicalize search-only authority leaf: {error}"))?;
+        if !leaf.is_absolute() {
+            return Err("search-only authority leaf is not absolute".to_owned());
+        }
+        let leaf_guard = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(&leaf)
+            .map_err(|error| format!("cannot open search-only authority leaf: {error}"))?;
+        let leaf_identity = bind_posix_search_only_directory(&leaf, &leaf_guard, "leaf")?;
+        let parent = leaf
+            .parent()
+            .ok_or_else(|| "search-only authority leaf has no parent".to_owned())?;
+        let mut ancestors = Vec::new();
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            let guard = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+                .open(&current)
+                .map_err(|error| {
+                    format!(
+                        "cannot open search-only authority ancestor {}: {error}",
+                        current.display()
+                    )
+                })?;
+            let identity = bind_posix_search_only_directory(&current, &guard, "ancestor")?;
+            ancestors.push(PosixSearchOnlyAncestor {
+                path: current.clone(),
+                guard,
+                identity,
+                active_mode: None,
+            });
+        }
+        let transition_root = fs::canonicalize(transition_root).map_err(|error| {
+            format!("cannot canonicalize search-only authority transition root: {error}")
+        })?;
+        let first_transition = ancestors
+            .iter()
+            .position(|ancestor| ancestor.path == transition_root)
+            .ok_or_else(|| {
+                format!(
+                    "search-only authority transition root is not an ancestor of the leaf: {}",
+                    transition_root.display()
+                )
+            })?;
+        Ok(Self {
+            leaf,
+            leaf_guard,
+            leaf_identity,
+            ancestors,
+            first_transition,
+        })
+    }
+
+    fn transition<F>(
+        &mut self,
+        candidate_uid: u32,
+        candidate_group_ids: &[u32],
+        mut set_mode: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        let result = (|| {
+            self.require_leaf("before ancestor transition")?;
+            for (index, ancestor) in self.ancestors.iter_mut().enumerate() {
+                require_posix_search_only_directory(
+                    ancestor,
+                    ancestor.identity.mode,
+                    "before transition",
+                )?;
+                let Some(active_mode) = posix_search_only_transition_mode(
+                    &ancestor.identity,
+                    candidate_uid,
+                    candidate_group_ids,
+                ) else {
+                    continue;
+                };
+                if index < self.first_transition {
+                    return Err(format!(
+                        "search-only authority ancestor outside the transition root is not searchable by the candidate: {}",
+                        ancestor.path.display()
+                    ));
+                }
+                set_mode(&ancestor.path, active_mode)?;
+                ancestor.active_mode = Some(active_mode);
+                require_posix_search_only_directory(ancestor, active_mode, "after transition")?;
+                if !posix_principal_has_search_only_access(
+                    &PosixObjectIdentity {
+                        mode: active_mode,
+                        ..ancestor.identity.clone()
+                    },
+                    candidate_uid,
+                    candidate_group_ids,
+                ) {
+                    return Err(format!(
+                        "search-only authority ancestor did not become non-listable traversal authority: {}",
+                        ancestor.path.display()
+                    ));
+                }
+            }
+            self.require_leaf("after ancestor transition")
+        })();
+        if let Err(primary) = result {
+            let cleanup = self.restore(&mut set_mode);
+            return match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(format!(
+                    "{primary}; search-only ancestor rollback: {cleanup}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    fn restore<F>(&mut self, mut set_mode: F) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        let mut failures = Vec::new();
+        if let Err(error) = self.require_leaf("before ancestor restoration") {
+            failures.push(error);
+        }
+        for ancestor in self.ancestors.iter_mut().rev() {
+            let Some(active_mode) = ancestor.active_mode else {
+                if let Err(error) = require_posix_search_only_directory(
+                    ancestor,
+                    ancestor.identity.mode,
+                    "during ancestor restoration",
+                ) {
+                    failures.push(error);
+                }
+                continue;
+            };
+            if let Err(error) = require_posix_search_only_directory(
+                ancestor,
+                active_mode,
+                "before mode restoration",
+            ) {
+                failures.push(error);
+                continue;
+            }
+            if let Err(error) = set_mode(&ancestor.path, ancestor.identity.mode) {
+                failures.push(format!(
+                    "cannot restore search-only authority ancestor {}: {error}",
+                    ancestor.path.display()
+                ));
+                continue;
+            }
+            ancestor.active_mode = None;
+            if let Err(error) = require_posix_search_only_directory(
+                ancestor,
+                ancestor.identity.mode,
+                "after mode restoration",
+            ) {
+                failures.push(error);
+            }
+        }
+        if let Err(error) = self.require_leaf("after ancestor restoration") {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn require_leaf(&self, phase: &str) -> Result<(), String> {
+        let handle = self.leaf_guard.metadata().map_err(|error| {
+            format!("cannot inspect search-only authority leaf handle: {error}")
+        })?;
+        let path = fs::symlink_metadata(&self.leaf)
+            .map_err(|error| format!("cannot inspect search-only authority leaf path: {error}"))?;
+        let handle = posix_object_identity_from_metadata(&handle);
+        let path = posix_object_identity_from_metadata(&path);
+        if !posix_same_object(&self.leaf_identity, &handle)
+            || !posix_same_object(&self.leaf_identity, &path)
+            || path.mode != self.leaf_identity.mode
+            || handle.mode != self.leaf_identity.mode
+        {
+            Err(format!(
+                "search-only authority leaf identity or mode changed {phase}: {}",
+                self.leaf.display()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bind_posix_search_only_directory(
+    path: &Path,
+    guard: &fs::File,
+    label: &str,
+) -> Result<PosixObjectIdentity, String> {
+    let handle = guard
+        .metadata()
+        .map_err(|error| format!("cannot inspect search-only authority {label} handle: {error}"))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect search-only authority {label} path: {error}"))?;
+    if !handle.is_dir() || !path_metadata.is_dir() || path_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "search-only authority {label} is not an exact directory: {}",
+            path.display()
+        ));
+    }
+    let handle = posix_object_identity_from_metadata(&handle);
+    let path_identity = posix_object_identity_from_metadata(&path_metadata);
+    if !posix_same_object(&handle, &path_identity) || handle.mode != path_identity.mode {
+        return Err(format!(
+            "search-only authority {label} handle and path differ: {}",
+            path.display()
+        ));
+    }
+    Ok(handle)
+}
+
+#[cfg(target_os = "macos")]
+fn require_posix_search_only_directory(
+    ancestor: &PosixSearchOnlyAncestor,
+    expected_mode: u32,
+    phase: &str,
+) -> Result<(), String> {
+    let handle = ancestor.guard.metadata().map_err(|error| {
+        format!(
+            "cannot inspect search-only authority ancestor handle {}: {error}",
+            ancestor.path.display()
+        )
+    })?;
+    let path = fs::symlink_metadata(&ancestor.path).map_err(|error| {
+        format!(
+            "cannot inspect search-only authority ancestor path {}: {error}",
+            ancestor.path.display()
+        )
+    })?;
+    let handle = posix_object_identity_from_metadata(&handle);
+    let path = posix_object_identity_from_metadata(&path);
+    if !posix_same_object(&ancestor.identity, &handle)
+        || !posix_same_object(&ancestor.identity, &path)
+        || handle.mode != expected_mode
+        || path.mode != expected_mode
+    {
+        Err(format!(
+            "search-only authority ancestor identity or mode changed {phase}: {}",
+            ancestor.path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn posix_search_only_transition_mode(
+    identity: &PosixObjectIdentity,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> Option<u32> {
+    let (read, write, search) = if identity.owner == candidate_uid {
+        (0o400, 0o200, 0o100)
+    } else if candidate_group_ids.contains(&identity.group) {
+        (0o040, 0o020, 0o010)
+    } else {
+        (0o004, 0o002, 0o001)
+    };
+    if identity.mode & search != 0 {
+        None
+    } else {
+        Some((identity.mode & !(read | write)) | search)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn posix_principal_has_search_only_access(
+    identity: &PosixObjectIdentity,
+    candidate_uid: u32,
+    candidate_group_ids: &[u32],
+) -> bool {
+    let (read, write, search) = if identity.owner == candidate_uid {
+        (0o400, 0o200, 0o100)
+    } else if candidate_group_ids.contains(&identity.group) {
+        (0o040, 0o020, 0o010)
+    } else {
+        (0o004, 0o002, 0o001)
+    };
+    identity.mode & search != 0 && identity.mode & (read | write) == 0
 }
 
 #[cfg(target_os = "macos")]
@@ -8132,49 +8915,427 @@ struct FakeArchiveBrokerFixture {
 
 #[cfg(target_os = "macos")]
 fn verify_candidate_target_broker(input: &CandidateTargetBrokerInput<'_>) -> Result<(), String> {
-    let (broker_adapter, broker_inputs) = prepare_derived_archive_broker(input)?;
-    let fake = prepare_fake_archive_broker(input.fixture, input.sequence)?;
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| "derived broker cleanup deadline overflowed".to_owned())?;
-    let mut broker = match crate::command::NativeArchiveInputBroker::start_for_integration(
-        &broker_inputs,
+    let (broker_authority, broker_inputs) = prepare_derived_archive_broker(input)?;
+    let broker_adapter = broker_authority.adapter();
+    let transition_root = input
+        .fixture
+        .parent()
+        .ok_or_else(|| "candidate broker fixture has no traversal root".to_owned())?;
+    let mut traversal = PosixSearchOnlyAncestorAuthority::bind(broker_adapter, transition_root)?;
+    traversal.transition(
         input.candidate_user_id,
-        4,
-        64,
-    ) {
-        Ok(broker) => broker,
-        Err(primary) => return combine_fake_broker_start_failure(fake, primary),
-    };
-    let descendant = run_candidate_target_broker_descendant(input, &broker_adapter, &fake.socket);
-    let observation = observe_fake_archive_broker(&fake.listener);
-    drop(fake.listener);
-    let broker_cleanup = broker.close_until(deadline);
-    let staging_absence = broker_cleanup.as_ref().map_or(Ok(()), |()| {
-        if fs::read_dir(&broker_inputs)
-            .map_err(|error| format!("cannot attest derived broker cleanup: {error}"))?
-            .next()
-            .is_none()
-        {
+        input.candidate_group_ids,
+        |path, mode| set_candidate_broker_ancestor_mode(input, path, mode),
+    )?;
+    let result = (|| {
+        let fake = prepare_fake_archive_broker(input.fixture, input.sequence)?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| "derived broker cleanup deadline overflowed".to_owned())?;
+        let mut broker = match crate::command::NativeArchiveInputBroker::start_for_integration(
+            broker_inputs.path(),
+            input.candidate_user_id,
+            4,
+            64,
+        ) {
+            Ok(broker) => broker,
+            Err(primary) => return combine_fake_broker_start_failure(fake, primary),
+        };
+        broker_inputs.revalidate()?;
+        let descendant =
+            run_candidate_target_broker_descendant(input, broker_adapter, &fake.socket);
+        let descendant = descendant.and_then(|receipt| {
+            crate::command::require_native_archive_broker_test_staging_for_integration(
+                broker_inputs.path(),
+                &receipt,
+            )?;
             Ok(())
-        } else {
-            Err("derived broker staging remains after cleanup".to_owned())
+        });
+        let observation = observe_fake_archive_broker(&fake.listener, deadline);
+        drop(fake.listener);
+        let broker_cleanup = broker.close_until(deadline);
+        let staging_absence = broker_cleanup.as_ref().map_or(Ok(()), |()| {
+            broker_inputs.revalidate()?;
+            if fs::read_dir(broker_inputs.path())
+                .map_err(|error| format!("cannot attest derived broker cleanup: {error}"))?
+                .next()
+                .is_none()
+            {
+                Ok(())
+            } else {
+                Err("derived broker staging remains after cleanup".to_owned())
+            }
+        });
+        let fake_cleanup = remove_fake_archive_broker(&fake.root, &fake.socket);
+        combine_candidate_target_broker_results(
+            descendant,
+            observation,
+            broker_cleanup,
+            staging_absence,
+            fake_cleanup,
+        )
+    })();
+    let restoration =
+        traversal.restore(|path, mode| set_candidate_broker_ancestor_mode(input, path, mode));
+    drop(traversal);
+    let broker_cleanup = broker_authority
+        .remove_sealed(|path, mode| set_derived_archive_broker_mode(input, path, mode));
+    let mut failures = Vec::new();
+    for (label, outcome) in [
+        ("candidate broker", result),
+        ("candidate broker ancestor restoration", restoration),
+        ("derived broker sealed-subtree cleanup", broker_cleanup),
+    ] {
+        if let Err(error) = outcome {
+            failures.push(format!("{label}: {error}"));
         }
-    });
-    let fake_cleanup = remove_fake_archive_broker(&fake.root, &fake.socket);
-    combine_candidate_target_broker_results(
-        descendant,
-        observation,
-        broker_cleanup,
-        staging_absence,
-        fake_cleanup,
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_candidate_broker_ancestor_mode(
+    input: &CandidateTargetBrokerInput<'_>,
+    path: &Path,
+    mode: u32,
+) -> Result<(), String> {
+    let mode = format!("{mode:04o}");
+    let path = path_text(path, "candidate broker search-only ancestor")?;
+    trusted_tool_status(
+        input.sudo,
+        &input.adapter.tools.chmod,
+        posix_chmod_arguments(input.adapter.platform, &mode, path)?,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn set_derived_archive_broker_mode(
+    input: &CandidateTargetBrokerInput<'_>,
+    path: &Path,
+    mode: u32,
+) -> Result<(), String> {
+    let mode = format!("{mode:04o}");
+    trusted_tool_status(
+        input.sudo,
+        &input.adapter.tools.chmod,
+        posix_chmod_arguments(
+            input.adapter.platform,
+            &mode,
+            path_text(path, "derived broker cleanup authority")?,
+        )?,
+    )
+}
+
+#[cfg(target_os = "macos")]
+struct DerivedArchiveBrokerStagingAuthority {
+    path: PathBuf,
+    guard: fs::File,
+    identity: PosixObjectIdentity,
+}
+
+#[cfg(target_os = "macos")]
+struct DerivedArchiveBrokerCleanupAuthority {
+    adapter: PathBuf,
+    adapter_guard: fs::File,
+    adapter_identity: PosixObjectIdentity,
+    sealed: PathBuf,
+    sealed_guard: fs::File,
+    sealed_identity: PosixObjectIdentity,
+}
+
+#[cfg(target_os = "macos")]
+impl DerivedArchiveBrokerCleanupAuthority {
+    fn bind(adapter: &Path, sealed: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let adapter = fs::canonicalize(adapter)
+            .map_err(|error| format!("cannot canonicalize derived broker adapter: {error}"))?;
+        let sealed = fs::canonicalize(sealed)
+            .map_err(|error| format!("cannot canonicalize derived broker authority: {error}"))?;
+        if sealed.parent() != Some(adapter.as_path()) {
+            return Err("derived broker cleanup authority escaped its adapter".to_owned());
+        }
+        let open = |path: &Path, label: &str| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|error| format!("cannot open derived broker {label}: {error}"))
+        };
+        let adapter_guard = open(&adapter, "cleanup adapter authority")?;
+        let sealed_guard = open(&sealed, "sealed cleanup authority")?;
+        let adapter_identity = bind_posix_search_only_directory(
+            &adapter,
+            &adapter_guard,
+            "derived broker cleanup adapter",
+        )?;
+        let sealed_identity = bind_posix_search_only_directory(
+            &sealed,
+            &sealed_guard,
+            "derived broker sealed cleanup parent",
+        )?;
+        if adapter_identity.mode != 0o2755
+            || sealed_identity.mode != 0o700
+            || adapter_identity.owner != sealed_identity.owner
+            || adapter_identity.group != sealed_identity.group
+        {
+            return Err("derived broker cleanup authority mode or ownership differs".to_owned());
+        }
+        Ok(Self {
+            adapter,
+            adapter_guard,
+            adapter_identity,
+            sealed,
+            sealed_guard,
+            sealed_identity,
+        })
+    }
+
+    fn adapter(&self) -> &Path {
+        &self.adapter
+    }
+
+    fn revalidate(&self, sealed_mode: u32) -> Result<(), String> {
+        let adapter_handle =
+            posix_object_identity_from_metadata(&self.adapter_guard.metadata().map_err(
+                |error| format!("cannot inspect derived broker adapter handle: {error}"),
+            )?);
+        let adapter_path = posix_object_identity(&self.adapter)?;
+        let sealed_handle =
+            posix_object_identity_from_metadata(&self.sealed_guard.metadata().map_err(
+                |error| format!("cannot inspect derived broker sealed handle: {error}"),
+            )?);
+        let sealed_path = posix_object_identity(&self.sealed)?;
+        if self.sealed.parent() != Some(self.adapter.as_path())
+            || !posix_same_object(&self.adapter_identity, &adapter_handle)
+            || !posix_same_object(&self.adapter_identity, &adapter_path)
+            || adapter_handle.mode != 0o2755
+            || adapter_path.mode != 0o2755
+            || !posix_same_object(&self.sealed_identity, &sealed_handle)
+            || !posix_same_object(&self.sealed_identity, &sealed_path)
+            || sealed_handle.mode != sealed_mode
+            || sealed_path.mode != sealed_mode
+        {
+            return Err("derived broker cleanup authority identity or mode changed".to_owned());
+        }
+        Ok(())
+    }
+
+    fn seal<F>(&self, mut set_mode: F) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        self.revalidate(0o700)?;
+        set_mode(&self.sealed, 0o555)?;
+        self.revalidate(0o555)
+    }
+
+    fn remove_sealed<F>(&self, set_mode: F) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        self.revalidate(0o555)?;
+        self.open_and_remove(set_mode)
+    }
+
+    fn remove_after_failed_seal<F>(&self, set_mode: F) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        if self.revalidate(0o700).is_err() {
+            self.revalidate(0o555)?;
+        }
+        self.open_and_remove(set_mode)
+    }
+
+    fn open_and_remove<F>(&self, mut set_mode: F) -> Result<(), String>
+    where
+        F: FnMut(&Path, u32) -> Result<(), String>,
+    {
+        set_mode(&self.sealed, 0o700)?;
+        self.revalidate(0o700)?;
+        fs::remove_dir_all(&self.adapter)
+            .map_err(|error| format!("cannot remove derived broker sealed subtree: {error}"))?;
+        match fs::symlink_metadata(&self.adapter) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err("derived broker sealed subtree remains after cleanup".to_owned()),
+            Err(error) => Err(format!(
+                "cannot attest derived broker sealed-subtree absence: {error}"
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl DerivedArchiveBrokerStagingAuthority {
+    fn bind(path: &Path, expected_owner: u32, expected_group: u32) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| format!("cannot canonicalize derived broker staging: {error}"))?;
+        if canonical != path {
+            return Err(
+                "derived broker staging path differs from its canonical identity".to_owned(),
+            );
+        }
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("cannot open derived broker staging authority: {error}"))?;
+        let identity =
+            bind_posix_search_only_directory(path, &guard, "derived broker input staging")?;
+        if identity.owner != expected_owner
+            || identity.group != expected_group
+            || identity.mode != 0o2710
+        {
+            return Err(format!(
+                "derived broker staging ownership or mode differs from policy: owner={}, group={}, mode={:o}",
+                identity.owner, identity.group, identity.mode
+            ));
+        }
+        let authority = Self {
+            path: canonical,
+            guard,
+            identity,
+        };
+        authority.revalidate()?;
+        Ok(authority)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        let handle = self.guard.metadata().map_err(|error| {
+            format!("cannot inspect derived broker staging authority handle: {error}")
+        })?;
+        let path = fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("cannot inspect derived broker staging authority: {error}"))?;
+        let canonical = fs::canonicalize(&self.path).map_err(|error| {
+            format!("cannot canonicalize derived broker staging authority: {error}")
+        })?;
+        if path.file_type().is_symlink()
+            || !path.is_dir()
+            || canonical != self.path
+            || posix_object_identity_from_metadata(&handle) != self.identity
+            || posix_object_identity_from_metadata(&path) != self.identity
+        {
+            return Err("derived broker staging identity or mode changed after binding".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_derived_archive_broker_staging_authority_v1_for_integration()
+-> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let root = fs::canonicalize(env::temp_dir())
+        .map_err(|error| format!("cannot canonicalize derived broker receipt fixture: {error}"))?
+        .join(format!(
+            "hell-derived-archive-broker-receipt-{}-{}",
+            std::process::id(),
+            POSIX_ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+    let adapter = root.join("derived-native-archive-broker");
+    let sealed = adapter.join(".authority");
+    let staging = sealed.join("inputs");
+    fs::create_dir(&root)
+        .and_then(|()| fs::create_dir(&adapter))
+        .and_then(|()| fs::create_dir(&sealed))
+        .and_then(|()| fs::create_dir(&staging))
+        .map_err(|error| format!("cannot create derived broker receipt fixture: {error}"))?;
+    let result = (|| {
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o2755))
+            .and_then(|()| fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)))
+            .map_err(|error| format!("cannot prepare derived broker cleanup receipt: {error}"))?;
+        let cleanup = DerivedArchiveBrokerCleanupAuthority::bind(&adapter, &sealed)?;
+        let set_mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|error| format!("cannot transition derived broker receipt mode: {error}"))
+        };
+        cleanup.seal(set_mode)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o2710))
+            .map_err(|error| format!("cannot seal derived broker receipt fixture: {error}"))?;
+        let metadata = fs::symlink_metadata(&staging)
+            .map_err(|error| format!("cannot inspect derived broker receipt fixture: {error}"))?;
+        let authority =
+            DerivedArchiveBrokerStagingAuthority::bind(&staging, metadata.uid(), metadata.gid())?;
+
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o0710))
+            .map_err(|error| format!("cannot create derived broker mode drift: {error}"))?;
+        let mode_drift = match authority.revalidate() {
+            Ok(()) => return Err("derived broker staging mode drift was accepted".to_owned()),
+            Err(error) => error,
+        };
+        if !mode_drift.contains("identity or mode changed") {
+            return Err(format!(
+                "derived broker staging mode-drift diagnostic differs: {mode_drift}"
+            ));
+        }
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o2710))
+            .map_err(|error| format!("cannot restore derived broker staging mode: {error}"))?;
+        authority.revalidate()?;
+
+        set_mode(&sealed, 0o700)?;
+        cleanup.revalidate(0o700)?;
+        let parked = root.join("parked-inputs");
+        fs::rename(&staging, &parked)
+            .map_err(|error| format!("cannot park derived broker staging authority: {error}"))?;
+        fs::create_dir(&staging)
+            .map_err(|error| format!("cannot substitute derived broker staging: {error}"))?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o2710))
+            .map_err(|error| format!("cannot seal substituted derived broker staging: {error}"))?;
+        let substitution = match authority.revalidate() {
+            Ok(()) => return Err("derived broker staging substitution was accepted".to_owned()),
+            Err(error) => error,
+        };
+        if !substitution.contains("identity or mode changed") {
+            return Err(format!(
+                "derived broker staging substitution diagnostic differs: {substitution}"
+            ));
+        }
+        fs::remove_dir(&staging).map_err(|error| {
+            format!("cannot remove substituted derived broker staging: {error}")
+        })?;
+        fs::rename(&parked, &staging)
+            .map_err(|error| format!("cannot restore derived broker staging authority: {error}"))?;
+        authority.revalidate()?;
+        cleanup.seal(set_mode)?;
+        cleanup.revalidate(0o555)?;
+        cleanup.remove_sealed(set_mode)?;
+        if !root.is_dir() {
+            return Err("derived broker cleanup escaped its fixture root".to_owned());
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&root)
+        .map_err(|error| format!("cannot clean up derived broker receipt fixture: {error}"));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; {cleanup}")),
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn prepare_derived_archive_broker(
     input: &CandidateTargetBrokerInput<'_>,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<
+    (
+        DerivedArchiveBrokerCleanupAuthority,
+        DerivedArchiveBrokerStagingAuthority,
+    ),
+    String,
+> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let adapter = input.fixture.join("derived-native-archive-broker");
@@ -8185,20 +9346,58 @@ fn prepare_derived_archive_broker(
         .and_then(|()| fs::create_dir(&inputs))
         .map_err(|error| format!("cannot create derived broker fixture: {error}"))?;
     fs::set_permissions(&adapter, fs::Permissions::from_mode(0o2755))
-        .and_then(|()| fs::set_permissions(&authority, fs::Permissions::from_mode(0o555)))
+        .and_then(|()| fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)))
         .map_err(|error| format!("cannot seal derived broker fixture: {error}"))?;
+    let cleanup = DerivedArchiveBrokerCleanupAuthority::bind(&adapter, &authority)?;
+    if let Err(primary) =
+        cleanup.seal(|path, mode| set_derived_archive_broker_mode(input, path, mode))
+    {
+        let rollback = cleanup.remove_after_failed_seal(|path, mode| {
+            set_derived_archive_broker_mode(input, path, mode)
+        });
+        return match rollback {
+            Ok(()) => Err(primary),
+            Err(rollback) => Err(format!(
+                "{primary}; derived broker preparation rollback: {rollback}"
+            )),
+        };
+    }
     let candidate_group = input.candidate_group_id.to_string();
-    trusted_tool_status(
-        input.sudo,
-        &input.adapter.tools.change_group,
-        [
-            candidate_group.as_str(),
-            path_text(&inputs, "derived broker input staging")?,
-        ],
-    )?;
-    fs::set_permissions(&inputs, fs::Permissions::from_mode(0o2710))
-        .map_err(|error| format!("cannot confine derived broker fixture: {error}"))?;
-    Ok((adapter, inputs))
+    let staging = (|| {
+        trusted_tool_status(
+            input.sudo,
+            &input.adapter.tools.change_group,
+            [
+                candidate_group.as_str(),
+                path_text(&inputs, "derived broker input staging")?,
+            ],
+        )?;
+        trusted_tool_status(
+            input.sudo,
+            &input.adapter.tools.chmod,
+            posix_chmod_arguments(
+                input.adapter.platform,
+                "2710",
+                path_text(&inputs, "derived broker input staging")?,
+            )?,
+        )?;
+        let owner = posix_object_identity(&adapter)?.owner;
+        let staging =
+            DerivedArchiveBrokerStagingAuthority::bind(&inputs, owner, input.candidate_group_id)?;
+        staging.revalidate()?;
+        Ok(staging)
+    })();
+    match staging {
+        Ok(staging) => Ok((cleanup, staging)),
+        Err(primary) => match cleanup
+            .remove_sealed(|path, mode| set_derived_archive_broker_mode(input, path, mode))
+        {
+            Ok(()) => Err(primary),
+            Err(rollback) => Err(format!(
+                "{primary}; derived broker preparation rollback: {rollback}"
+            )),
+        },
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -8251,7 +9450,7 @@ fn run_candidate_target_broker_descendant(
     input: &CandidateTargetBrokerInput<'_>,
     broker_adapter: &Path,
     fake_socket: &Path,
-) -> Result<(), String> {
+) -> Result<crate::command::NativeArchiveBrokerDescendantReceipt, String> {
     let result =
         with_release_candidate_environment(input.target, input.isolated, 1, input.policy, || {
             CommandSpec::new(input.adapter.adapter.as_os_str(), Duration::from_secs(30))
@@ -8260,22 +9459,34 @@ fn run_candidate_target_broker_descendant(
                 .argument(fake_socket)
                 .argument(input.isolated.join("tmp"))
                 .current_directory(input.project)
-                .run()
+                .run_ambient_candidate_captured()
         })
         .map_err(|error| format!("cannot run restricted broker descendant: {error}"))?;
-    if result.status.success() && !result.timed_out {
-        Ok(())
-    } else {
-        Err(format!(
-            "restricted broker descendant failed: status={:?}; stderr={}",
+    if !result.status.success()
+        || result.timed_out
+        || result.stdout_truncated
+        || result.stderr_truncated
+        || !result.stderr.is_empty()
+    {
+        return Err(format!(
+            "restricted broker descendant failed: status={:?},timedOut={},stdoutBytes={},stdoutSha256={},stderrBytes={},stderrSha256={},stderr={}",
             result.status.code(),
+            result.timed_out,
+            result.stdout_bytes,
+            result.stdout_sha256.hex(),
+            result.stderr_bytes,
+            result.stderr_sha256.hex(),
             String::from_utf8_lossy(&result.stderr)
-        ))
+        ));
     }
+    crate::command::NativeArchiveBrokerDescendantReceipt::parse(&result.stdout)
 }
 
 #[cfg(target_os = "macos")]
-fn observe_fake_archive_broker(listener: &std::os::unix::net::UnixListener) -> Result<(), String> {
+fn observe_fake_archive_broker(
+    listener: &std::os::unix::net::UnixListener,
+    deadline: Instant,
+) -> Result<(), String> {
     use std::io::Read as _;
 
     listener
@@ -8284,13 +9495,46 @@ fn observe_fake_archive_broker(listener: &std::os::unix::net::UnixListener) -> R
     let (mut control, _) = listener
         .accept()
         .map_err(|error| format!("candidate did not prove fake broker connectability: {error}"))?;
-    control
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("cannot bound fake broker marker: {error}"))?;
     let mut marker = [0_u8; crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER.len()];
-    control
-        .read_exact(&mut marker)
-        .map_err(|error| format!("cannot read fake broker marker: {error}"))?;
+    let mut received = 0_usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("fake broker marker deadline expired".to_owned());
+        }
+        let timeout = i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let mut descriptors = [nix::poll::PollFd::new(
+            &control,
+            nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP,
+        )];
+        if nix::poll::poll(&mut descriptors, timeout)
+            .map_err(|error| format!("cannot poll fake broker marker: {error}"))?
+            == 0
+        {
+            return Err("fake broker marker deadline expired".to_owned());
+        }
+        let events = descriptors[0]
+            .revents()
+            .unwrap_or_else(nix::poll::PollFlags::empty);
+        if events.intersects(nix::poll::PollFlags::POLLERR | nix::poll::PollFlags::POLLNVAL) {
+            return Err("fake broker marker poll failed closed".to_owned());
+        }
+        let mut input = [0_u8; 1];
+        match control.read(&mut input) {
+            Ok(0) if received == marker.len() => break,
+            Ok(0) => return Err("fake broker marker closed before completion".to_owned()),
+            Ok(1) if received < marker.len() => {
+                marker[received] = input[0];
+                received += 1;
+            }
+            Ok(_) => return Err("fake broker marker contains trailing data".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("cannot read fake broker marker: {error}")),
+        }
+    }
     if marker != *crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER {
         return Err("candidate fake broker connectivity marker differs".to_owned());
     }
@@ -8298,6 +9542,40 @@ fn observe_fake_archive_broker(listener: &std::os::unix::net::UnixListener) -> R
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
         Ok(_) => Err("sealed-capability adapter connected to the typed decoy broker".to_owned()),
         Err(error) => Err(format!("cannot observe fake broker endpoint: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_fake_archive_broker_observer_for_integration() -> Result<(), String> {
+    use std::io::Write as _;
+
+    let sequence = POSIX_ARCHIVE_TRANSITION_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let trusted_fixture = std::env::current_exe()
+        .map_err(|error| format!("cannot bind fake broker observer executable: {error}"))?;
+    let fake = prepare_fake_archive_broker(&trusted_fixture, sequence)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "fake broker observer verifier deadline overflowed".to_owned())?;
+    let primary = (|| {
+        let mut control = std::os::unix::net::UnixStream::connect(&fake.socket)
+            .map_err(|error| format!("cannot connect fake broker observer verifier: {error}"))?;
+        control
+            .write_all(crate::command::NATIVE_ARCHIVE_FAKE_BROKER_CONNECTIVITY_MARKER)
+            .map_err(|error| format!("cannot write fake broker observer marker: {error}"))?;
+        control
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|error| format!("cannot close fake broker observer marker: {error}"))?;
+        observe_fake_archive_broker(&fake.listener, deadline)
+    })();
+    drop(fake.listener);
+    let cleanup = remove_fake_archive_broker(&fake.root, &fake.socket);
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; fake broker observer verifier cleanup also failed: {cleanup}"
+        )),
     }
 }
 
@@ -8421,6 +9699,11 @@ fn build_and_run_candidate_target_probe(
             String::from_utf8_lossy(&probe.stderr)
         ));
     }
+    #[cfg(target_os = "linux")]
+    crate::policy::verify_candidate_authorized_repository_result_rejected_for_integration(
+        input.project,
+        &probe,
+    )?;
     if input
         .workspace_target
         .join("candidate-direct-write")
@@ -8429,6 +9712,20 @@ fn build_and_run_candidate_target_probe(
         return Err("candidate reached the hosted target through confined ancestry".to_owned());
     }
     Ok(artifact)
+}
+
+#[cfg(unix)]
+fn build_candidate_target_probe_with_retained_adapter(
+    input: &CandidateTargetProbeInput<'_>,
+    cargo_protection: Option<&PosixAdapterProtection>,
+) -> Result<PathBuf, String> {
+    cargo_protection
+        .ok_or_else(|| "candidate Cargo adapter authority was lost after broker phase".to_owned())?
+        .revalidate()
+        .map_err(|error| {
+            format!("cannot revalidate candidate Cargo adapter after broker phase: {error}")
+        })?;
+    build_and_run_candidate_target_probe(input)
 }
 
 #[cfg(unix)]
@@ -8588,6 +9885,7 @@ fn verify_candidate_target_cleanup_probe(
 fn finish_candidate_target_verifier(
     result: Result<(), String>,
     principal_cleanup: Option<PosixPrincipalCleanup>,
+    mut cargo_protection: Option<PosixAdapterProtection>,
     transient_cleanup: &PosixVerifierTransientCleanup,
     process_authorities: &ResolvedPosixProcessAuthorities,
     fixture: &Path,
@@ -8599,19 +9897,578 @@ fn finish_candidate_target_verifier(
             .ok_or_else(|| "candidate verifier cleanup deadline overflowed".to_owned())
             .and_then(|deadline| transient_cleanup.cleanup_until(process_authorities, deadline)),
     };
+    let cargo_adapter_cleanup = cargo_protection.as_mut().map_or(Ok(()), |protection| {
+        protection.close().map_err(|error| {
+            format!("cannot explicitly clean retained candidate Cargo adapter: {error}")
+        })
+    });
     let transient_absence = transient_cleanup.require_absent();
     let fixture_cleanup = fs::remove_dir_all(fixture)
         .map_err(|error| format!("cannot remove candidate target verifier fixture: {error}"));
     combine_candidate_target_verifier_results(
         result,
         lifecycle_cleanup,
+        cargo_adapter_cleanup,
         transient_absence,
         fixture_cleanup,
     )
 }
 
-#[cfg(unix)]
-pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Result<(), String> {
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_PREPARATION_BUDGET: Duration = Duration::from_mins(1);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_SOURCE_HASH_BUDGET: Duration = Duration::from_mins(2);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_COPY_BUDGET: Duration = Duration::from_mins(3);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_ACL_CLEAR_BUDGET: Duration = Duration::from_mins(1);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_SEAL_BUDGET: Duration = Duration::from_mins(1);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_ACL_INVENTORY_BUDGET: Duration = Duration::from_mins(2);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_STAGED_HASH_BUDGET: Duration = Duration::from_mins(2);
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_BASE_INVENTORY_AUTHORITY_SETUP_BUDGET: Duration = Duration::from_secs(
+    LINUX_BASE_INVENTORY_PREPARATION_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_SOURCE_HASH_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_COPY_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_ACL_CLEAR_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_SEAL_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_ACL_INVENTORY_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_STAGED_HASH_BUDGET.as_secs(),
+);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_BEHAVIOR_BUDGET: Duration = Duration::from_secs(45);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_COMPLETION_BUDGET: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const LINUX_BASE_INVENTORY_CLEANUP_BUDGET: Duration = Duration::from_secs(45);
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_BASE_INVENTORY_SUITE_EXECUTION_BUDGET: Duration = Duration::from_secs(
+    LINUX_BASE_INVENTORY_AUTHORITY_SETUP_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_BEHAVIOR_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_BEHAVIOR_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_COMPLETION_BUDGET.as_secs()
+        + LINUX_BASE_INVENTORY_CLEANUP_BUDGET.as_secs(),
+);
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_BASE_INVENTORY_SUITE_COMPLETION_RESERVE: Duration =
+    LINUX_BASE_INVENTORY_CLEANUP_BUDGET;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxBaseInventorySetupDeadlines {
+    preparation: Instant,
+    rustup: PosixRustupStageDeadlines,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBaseInventorySetupDeadlines {
+    fn from_start(started: Instant) -> Result<Self, String> {
+        let advance = |deadline: Instant, budget: Duration, phase: &str| {
+            deadline
+                .checked_add(budget)
+                .ok_or_else(|| format!("Linux base inventory {phase} deadline overflowed"))
+        };
+        let preparation = advance(
+            started,
+            LINUX_BASE_INVENTORY_PREPARATION_BUDGET,
+            "preparation",
+        )?;
+        let source_inventory = advance(
+            preparation,
+            LINUX_BASE_INVENTORY_SOURCE_HASH_BUDGET,
+            "source inventory",
+        )?;
+        let copy = advance(source_inventory, LINUX_BASE_INVENTORY_COPY_BUDGET, "copy")?;
+        let acl_clear = advance(copy, LINUX_BASE_INVENTORY_ACL_CLEAR_BUDGET, "ACL clear")?;
+        let seal = advance(acl_clear, LINUX_BASE_INVENTORY_SEAL_BUDGET, "seal")?;
+        let acl_inventory = advance(
+            seal,
+            LINUX_BASE_INVENTORY_ACL_INVENTORY_BUDGET,
+            "ACL inventory",
+        )?;
+        let staged_inventory = advance(
+            acl_inventory,
+            LINUX_BASE_INVENTORY_STAGED_HASH_BUDGET,
+            "staged inventory",
+        )?;
+        let phase = |execution: Instant, label: &str| {
+            advance(execution, LINUX_BASE_INVENTORY_COMPLETION_BUDGET, label)
+                .map(|completion| (execution, completion))
+        };
+        let copy = phase(copy, "copy completion")?;
+        let acl_clear = phase(acl_clear, "ACL-clear completion")?;
+        let seal = phase(seal, "seal completion")?;
+        let acl_inventory = phase(acl_inventory, "ACL-inventory completion")?;
+        let staged_inventory = phase(staged_inventory, "staged-inventory completion")?;
+        let completion = staged_inventory.1;
+        if staged_inventory.0.checked_duration_since(started)
+            != Some(LINUX_BASE_INVENTORY_AUTHORITY_SETUP_BUDGET)
+        {
+            return Err("Linux base inventory setup budget derivation differs".to_owned());
+        }
+        Ok(Self {
+            preparation,
+            rustup: PosixRustupStageDeadlines {
+                source_inventory,
+                copy,
+                acl_clear,
+                seal,
+                acl_inventory,
+                staged_inventory,
+                completion,
+            },
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxBaseInventoryVerifierScenario {
+    Positive,
+    SetupExpired,
+    BehaviorExpired,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBaseInventoryVerifierScenario {
+    fn parse(value: Option<&OsStr>) -> Result<Self, String> {
+        match value.and_then(OsStr::to_str) {
+            None => Ok(Self::Positive),
+            Some("setup-expired") => Ok(Self::SetupExpired),
+            Some("behavior-expired") => Ok(Self::BehaviorExpired),
+            Some(_) => Err("unknown Linux base inventory verifier scenario".to_owned()),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::SetupExpired => "setup-expired",
+            Self::BehaviorExpired => "behavior-expired",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxBaseInventoryVerifierSetup {
+    repository: PathBuf,
+    expected_paths: Vec<PathBuf>,
+    protection: PosixCandidateTargetProtection,
+    launch: CandidateTargetLaunch,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct LinuxBaseInventoryPhaseReceipt {
+    phase: &'static str,
+    state: &'static str,
+    duration: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBaseInventoryPhaseReceipt {
+    fn json(&self) -> JsonValue {
+        object([
+            (
+                "durationMillis",
+                number(u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX)),
+            ),
+            ("phase", string(self.phase)),
+            ("state", string(self.state)),
+        ])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_deadline(budget: Duration, phase: &str) -> Result<Instant, String> {
+    Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| format!("Linux base inventory {phase} deadline overflowed"))
+}
+
+#[cfg(target_os = "linux")]
+fn require_linux_base_inventory_deadline(deadline: Instant, phase: &str) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        Err(format!("Linux base inventory {phase} deadline expired"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_inventory_fixture_git(
+    repository: &Path,
+    arguments: &[&str],
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+) -> Result<(), String> {
+    require_linux_base_inventory_deadline(execution_deadline, "setup")?;
+    let (progress, _receiver) = hell_testkit::SupervisedProgressObserver::bounded(1);
+    let result = CommandSpec::new("git", Duration::from_secs(30))
+        .git_safe_directory(repository)
+        .arguments(arguments.iter().copied())
+        .current_directory(repository)
+        .run_until(execution_deadline, completion_deadline, progress)
+        .map_err(|error| format!("cannot run synthetic inventory Git command: {error}"))?;
+    if !result.status.success() || result.timed_out {
+        return Err(format!(
+            "synthetic inventory Git command failed: status={:?}, timedOut={}, stderr={}",
+            result.status.code(),
+            result.timed_out,
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    for expected in ["quiescence-complete", "stdout-joined", "stderr-joined"] {
+        if !result
+            .phase_timings
+            .iter()
+            .any(|phase| phase.name == expected)
+        {
+            return Err(format!(
+                "synthetic inventory Git command lacks {expected} receipt"
+            ));
+        }
+    }
+    if result.phase_timings.last().map(|phase| phase.name) != Some("stdin-joined") {
+        return Err("synthetic inventory Git command lacks terminal stdin receipt".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_inventory_fixture_repository(
+    fixture: &Path,
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let repository = fixture.join("inventory-repository");
+    fs::create_dir(&repository)
+        .map_err(|error| format!("cannot create synthetic inventory repository: {error}"))?;
+    fs::create_dir(repository.join("nested"))
+        .map_err(|error| format!("cannot create synthetic inventory directory: {error}"))?;
+    fs::write(repository.join("alpha.txt"), b"alpha\n")
+        .map_err(|error| format!("cannot write synthetic inventory alpha: {error}"))?;
+    fs::write(repository.join("nested/beta.txt"), b"beta\n")
+        .map_err(|error| format!("cannot write synthetic inventory beta: {error}"))?;
+    run_linux_inventory_fixture_git(
+        &repository,
+        &["init", "--quiet", "."],
+        execution_deadline,
+        completion_deadline,
+    )?;
+    run_linux_inventory_fixture_git(
+        &repository,
+        &["add", "--", "alpha.txt", "nested/beta.txt"],
+        execution_deadline,
+        completion_deadline,
+    )?;
+    run_linux_inventory_fixture_git(
+        &repository,
+        &[
+            "-c",
+            "user.name=hell-ci",
+            "-c",
+            "user.email=hell-ci.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Bind inventory fixture",
+        ],
+        execution_deadline,
+        completion_deadline,
+    )?;
+    let repository = fs::canonicalize(repository)
+        .map_err(|error| format!("cannot canonicalize synthetic inventory repository: {error}"))?;
+    Ok((
+        repository,
+        vec![PathBuf::from("alpha.txt"), PathBuf::from("nested/beta.txt")],
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_base_inventory_verifier(
+    context: &CandidateTargetVerifierContext,
+    principal_cleanup: &mut Option<PosixPrincipalCleanup>,
+    deadlines: LinuxBaseInventorySetupDeadlines,
+) -> Result<LinuxBaseInventoryVerifierSetup, String> {
+    require_linux_base_inventory_deadline(deadlines.preparation, "setup preparation")?;
+    let (repository, expected_paths) = create_linux_inventory_fixture_repository(
+        &context.fixture,
+        deadlines.preparation,
+        deadlines.rustup.completion,
+    )?;
+    let workspace = prepare_candidate_target_workspace(&context.fixture)?;
+    require_linux_base_inventory_deadline(deadlines.preparation, "setup preparation")?;
+    let principal = allocate_candidate_target_principal(
+        &CandidateTargetPrincipalInput {
+            platform: context.platform,
+            process_authorities: &context.process_authorities,
+            transient_cleanup: &context.transient_cleanup,
+            sequence: context.sequence,
+            trusted_group: workspace.trusted_group,
+        },
+        principal_cleanup,
+    )?;
+    let protection = stage_candidate_target_for_verifier(&CandidateTargetStageInput {
+        sudo: &context.sudo,
+        adapter: &context.adapter,
+        transient: &context.transient,
+        workspace: &workspace,
+        principal: &principal,
+    })?;
+    let project = write_candidate_target_probe_project(&context.transient)?;
+    let launch = prepare_candidate_target_launch_until(
+        CandidateTargetLaunchInput {
+            platform: context.platform,
+            sudo: &context.sudo,
+            adapter: &context.adapter,
+            process_authorities: &context.process_authorities,
+            project: &project,
+            protection: &protection,
+            principal,
+        },
+        deadlines.rustup,
+    )?;
+    require_linux_base_inventory_deadline(deadlines.rustup.staged_inventory.0, "setup")?;
+    Ok(LinuxBaseInventoryVerifierSetup {
+        repository,
+        expected_paths,
+        protection,
+        launch,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_receipt_value(
+    scenario: LinuxBaseInventoryVerifierScenario,
+    phases: &[LinuxBaseInventoryPhaseReceipt],
+    primary: Option<(&'static str, &str)>,
+    repository: Option<&Path>,
+) -> JsonValue {
+    let primary = primary.map_or(JsonValue::Null, |(phase, detail)| {
+        object([("detail", string(detail)), ("phase", string(phase))])
+    });
+    object([
+        (
+            "phases",
+            JsonValue::Array(
+                phases
+                    .iter()
+                    .map(LinuxBaseInventoryPhaseReceipt::json)
+                    .collect(),
+            ),
+        ),
+        ("primary", primary),
+        (
+            "repositoryRoot",
+            repository.map_or(JsonValue::Null, |path| string(&path.display().to_string())),
+        ),
+        ("scenario", string(scenario.as_str())),
+        ("schemaVersion", number(1)),
+        ("state", string("verified")),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_receipt(
+    scenario: LinuxBaseInventoryVerifierScenario,
+    phases: &[LinuxBaseInventoryPhaseReceipt],
+    primary: Option<(&'static str, &str)>,
+    repository: Option<&Path>,
+) -> Result<String, String> {
+    String::from_utf8(canonical_json_bytes(&linux_base_inventory_receipt_value(
+        scenario, phases, primary, repository,
+    ))?)
+    .map_err(|_| "Linux base inventory verifier receipt is not UTF-8".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_setup_expired_receipt(
+    scenario: LinuxBaseInventoryVerifierScenario,
+) -> Result<String, String> {
+    String::from_utf8(canonical_json_bytes(
+        &linux_base_inventory_setup_expired_receipt_value(scenario),
+    )?)
+    .map_err(|_| "Linux base inventory setup-expired receipt is not UTF-8".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_setup_expired_receipt_value(
+    scenario: LinuxBaseInventoryVerifierScenario,
+) -> JsonValue {
+    let started = Instant::now();
+    let detail = "Linux base inventory setup deadline expired";
+    let phases = [
+        LinuxBaseInventoryPhaseReceipt {
+            phase: "setup",
+            state: "expired",
+            duration: started.elapsed(),
+        },
+        LinuxBaseInventoryPhaseReceipt {
+            phase: "completion",
+            state: "completed",
+            duration: Duration::ZERO,
+        },
+        LinuxBaseInventoryPhaseReceipt {
+            phase: "cleanup",
+            state: "completed",
+            duration: Duration::ZERO,
+        },
+    ];
+    linux_base_inventory_receipt_value(scenario, &phases, Some(("setup", detail)), None)
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_base_inventory_behavior(
+    scenario: LinuxBaseInventoryVerifierScenario,
+    setup: &LinuxBaseInventoryVerifierSetup,
+    phases: &mut Vec<LinuxBaseInventoryPhaseReceipt>,
+) -> Option<(&'static str, String)> {
+    let behavior_started = Instant::now();
+    let behavior_deadline = if scenario == LinuxBaseInventoryVerifierScenario::BehaviorExpired {
+        behavior_started
+    } else {
+        match linux_base_inventory_deadline(
+            LINUX_BASE_INVENTORY_BEHAVIOR_BUDGET,
+            "behavior-inventory",
+        ) {
+            Ok(deadline) => deadline,
+            Err(error) => return Some(("behavior-inventory", error)),
+        }
+    };
+    let behavior = require_linux_base_inventory_deadline(
+        behavior_deadline,
+        "behavior-inventory",
+    )
+    .and_then(|()| {
+        with_release_candidate_environment(
+            setup.protection.path(),
+            &setup.launch.isolated,
+            1,
+            &setup.launch.policy,
+            || {
+                crate::policy::verify_base_repository_inventory_inside_candidate_scope_with_paths_for_integration(
+                    &setup.repository,
+                    Some(&setup.expected_paths),
+                )
+            },
+        )
+    })
+    .and_then(|()| {
+        require_linux_base_inventory_deadline(behavior_deadline, "behavior-inventory")
+    });
+    phases.push(LinuxBaseInventoryPhaseReceipt {
+        phase: "behavior-inventory",
+        state: if behavior.is_ok() {
+            "completed"
+        } else if scenario == LinuxBaseInventoryVerifierScenario::BehaviorExpired {
+            "expired"
+        } else {
+            "failed"
+        },
+        duration: behavior_started.elapsed(),
+    });
+    behavior.err().map(|error| ("behavior-inventory", error))
+}
+
+#[cfg(target_os = "linux")]
+fn complete_linux_base_inventory_verifier(
+    phases: &mut Vec<LinuxBaseInventoryPhaseReceipt>,
+) -> Option<(&'static str, String)> {
+    let completion_started = Instant::now();
+    let completion =
+        linux_base_inventory_deadline(LINUX_BASE_INVENTORY_COMPLETION_BUDGET, "completion")
+            .and_then(|deadline| require_linux_base_inventory_deadline(deadline, "completion"))
+            .and_then(|()| {
+                if hell_testkit::candidate_launch_policy_is_installed_for_integration() {
+                    Err("Linux base inventory completion retained candidate policy".to_owned())
+                } else {
+                    Ok(())
+                }
+            });
+    phases.push(LinuxBaseInventoryPhaseReceipt {
+        phase: "completion",
+        state: if completion.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        duration: completion_started.elapsed(),
+    });
+    completion.err().map(|error| ("completion", error))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_linux_base_inventory_verifier(
+    context: &CandidateTargetVerifierContext,
+    principal_cleanup: &mut Option<PosixPrincipalCleanup>,
+    phases: &mut Vec<LinuxBaseInventoryPhaseReceipt>,
+    primary: Option<&(&'static str, String)>,
+) -> Result<(), String> {
+    let cleanup_started = Instant::now();
+    let cleanup_deadline =
+        linux_base_inventory_deadline(LINUX_BASE_INVENTORY_CLEANUP_BUDGET, "cleanup")?;
+    let lifecycle_cleanup = match principal_cleanup.take() {
+        Some(cleanup) => cleanup.finish(),
+        None => context
+            .transient_cleanup
+            .cleanup_until(&context.process_authorities, cleanup_deadline),
+    };
+    let cleanup = lifecycle_cleanup
+        .and_then(|()| context.transient_cleanup.require_absent())
+        .and_then(|()| {
+            fs::remove_dir_all(&context.fixture).map_err(|error| {
+                format!("cannot remove Linux base inventory verifier fixture: {error}")
+            })
+        })
+        .and_then(|()| require_linux_base_inventory_deadline(cleanup_deadline, "cleanup"));
+    phases.push(LinuxBaseInventoryPhaseReceipt {
+        phase: "cleanup",
+        state: if cleanup.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        duration: cleanup_started.elapsed(),
+    });
+    cleanup.map_err(|error| match primary {
+        Some((phase, primary)) => format!(
+            "Linux base inventory {phase} failed: {primary}; additionally, cleanup failed: {error}"
+        ),
+        None => format!("Linux base inventory cleanup failed: {error}"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_linux_base_inventory_scenario_result(
+    scenario: LinuxBaseInventoryVerifierScenario,
+    primary: Option<&(&'static str, String)>,
+) -> Result<(), String> {
+    match (scenario, primary) {
+        (LinuxBaseInventoryVerifierScenario::Positive, None) => Ok(()),
+        (LinuxBaseInventoryVerifierScenario::BehaviorExpired, Some((phase, detail)))
+            if *phase == "behavior-inventory"
+                && detail == "Linux base inventory behavior-inventory deadline expired" =>
+        {
+            Ok(())
+        }
+        (_, Some((phase, detail))) => Err(format!("Linux base inventory {phase} failed: {detail}")),
+        _ => Err("Linux base inventory negative scenario did not fail".to_owned()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_linux_base_inventory_candidate_scope_for_integration(
+    scenario: Option<&OsStr>,
+) -> Result<String, String> {
+    let scenario = LinuxBaseInventoryVerifierScenario::parse(scenario)?;
+    if scenario == LinuxBaseInventoryVerifierScenario::SetupExpired {
+        return linux_base_inventory_setup_expired_receipt(scenario);
+    }
+    let mut phases = Vec::new();
     let CandidateTargetVerifierContext {
         platform,
         process_authorities,
@@ -8622,59 +10479,282 @@ pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Resul
         transient_cleanup,
         sequence,
     } = allocate_candidate_target_verifier_context()?;
+    let context = CandidateTargetVerifierContext {
+        platform,
+        process_authorities,
+        sudo,
+        adapter,
+        fixture,
+        transient,
+        transient_cleanup,
+        sequence,
+    };
     let mut principal_cleanup = None;
-    let result = (|| {
-        let workspace_authority = prepare_candidate_target_workspace(&fixture)?;
-        let workspace_target = workspace_authority.target.clone();
-        let trusted_group = workspace_authority.trusted_group;
-        let principal_authority = allocate_candidate_target_principal(
-            &CandidateTargetPrincipalInput {
-                platform,
-                process_authorities: &process_authorities,
-                transient_cleanup: &transient_cleanup,
-                sequence,
-                trusted_group,
-            },
-            &mut principal_cleanup,
-        )?;
-        let candidate_user_id = principal_authority.user_id;
-        let candidate_group_id = principal_authority.group_id;
-        let mut protection = stage_candidate_target_for_verifier(&CandidateTargetStageInput {
-            sudo: &sudo,
-            adapter: &adapter,
-            transient: &transient,
-            workspace: &workspace_authority,
-            principal: &principal_authority,
-        })?;
-        let project = write_candidate_target_probe_project(&transient)?;
-        let CandidateTargetLaunch {
-            cargo,
-            rustup: rustup_protection,
-            policy,
-            isolated,
-        } = prepare_candidate_target_launch(CandidateTargetLaunchInput {
-            platform,
-            sudo: &sudo,
-            adapter: &adapter,
-            process_authorities: &process_authorities,
+    let setup_started = Instant::now();
+    let setup_deadlines = LinuxBaseInventorySetupDeadlines::from_start(setup_started)?;
+    let setup =
+        prepare_linux_base_inventory_verifier(&context, &mut principal_cleanup, setup_deadlines);
+    phases.push(LinuxBaseInventoryPhaseReceipt {
+        phase: "setup",
+        state: if setup.is_ok() { "completed" } else { "failed" },
+        duration: setup_started.elapsed(),
+    });
+
+    let mut primary = setup.as_ref().err().map(|error| ("setup", error.clone()));
+    let repository = setup.as_ref().ok().map(|value| value.repository.clone());
+    if let Ok(setup) = &setup {
+        let behavior = run_linux_base_inventory_behavior(scenario, setup, &mut phases);
+        if primary.is_none() {
+            primary = behavior;
+        }
+    }
+
+    if primary.is_none() {
+        primary = complete_linux_base_inventory_verifier(&mut phases);
+    } else {
+        let _completion = complete_linux_base_inventory_verifier(&mut phases);
+    }
+
+    drop(setup);
+    cleanup_linux_base_inventory_verifier(
+        &context,
+        &mut principal_cleanup,
+        &mut phases,
+        primary.as_ref(),
+    )?;
+    require_linux_base_inventory_scenario_result(scenario, primary.as_ref())?;
+    linux_base_inventory_receipt(
+        scenario,
+        &phases,
+        primary
+            .as_ref()
+            .map(|(phase, detail)| (*phase, detail.as_str())),
+        repository.as_deref(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_base_inventory_suite_receipt(
+    repository: &Path,
+    positive_phases: &[LinuxBaseInventoryPhaseReceipt],
+    positive_primary: Option<&(&'static str, String)>,
+    setup_expired: JsonValue,
+    expired_phases: &[LinuxBaseInventoryPhaseReceipt],
+    expired_primary: Option<&(&'static str, String)>,
+) -> Result<String, String> {
+    let receipts = JsonValue::Array(vec![
+        linux_base_inventory_receipt_value(
+            LinuxBaseInventoryVerifierScenario::Positive,
+            positive_phases,
+            positive_primary.map(|(phase, detail)| (*phase, detail.as_str())),
+            Some(repository),
+        ),
+        setup_expired,
+        linux_base_inventory_receipt_value(
+            LinuxBaseInventoryVerifierScenario::BehaviorExpired,
+            expired_phases,
+            expired_primary.map(|(phase, detail)| (*phase, detail.as_str())),
+            Some(repository),
+        ),
+    ]);
+    let suite = object([
+        ("receipts", receipts),
+        ("schemaVersion", number(1)),
+        ("state", string("verified")),
+    ]);
+    String::from_utf8(canonical_json_bytes(&suite)?)
+        .map_err(|_| "Linux base inventory suite receipt is not UTF-8".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_linux_base_inventory_candidate_scope_suite_v1_for_integration()
+-> Result<String, String> {
+    crate::command::with_ambient_candidate_commands_captured(
+        verify_linux_base_inventory_candidate_scope_suite_v1_captured,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_base_inventory_candidate_scope_suite_v1_captured() -> Result<String, String> {
+    let setup_expired = linux_base_inventory_setup_expired_receipt_value(
+        LinuxBaseInventoryVerifierScenario::SetupExpired,
+    );
+    let mut shared_setup_phase = Vec::new();
+    let context = allocate_candidate_target_verifier_context()?;
+    let mut principal_cleanup = None;
+    let setup_started = Instant::now();
+    let setup_deadlines = LinuxBaseInventorySetupDeadlines::from_start(setup_started)?;
+    let setup =
+        prepare_linux_base_inventory_verifier(&context, &mut principal_cleanup, setup_deadlines);
+    shared_setup_phase.push(LinuxBaseInventoryPhaseReceipt {
+        phase: "setup",
+        state: if setup.is_ok() { "completed" } else { "failed" },
+        duration: setup_started.elapsed(),
+    });
+    let setup = match setup {
+        Ok(setup) => setup,
+        Err(primary) => {
+            let mut cleanup_phases = Vec::new();
+            let cleanup = cleanup_linux_base_inventory_verifier(
+                &context,
+                &mut principal_cleanup,
+                &mut cleanup_phases,
+                Some(&("setup", primary.clone())),
+            );
+            return match cleanup {
+                Ok(()) => Err(format!("Linux base inventory setup failed: {primary}")),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+    };
+    let repository = setup.repository.clone();
+
+    let mut positive_phases = shared_setup_phase.clone();
+    let positive_primary = run_linux_base_inventory_behavior(
+        LinuxBaseInventoryVerifierScenario::Positive,
+        &setup,
+        &mut positive_phases,
+    );
+    let mut expired_phases = shared_setup_phase;
+    let expired_primary = run_linux_base_inventory_behavior(
+        LinuxBaseInventoryVerifierScenario::BehaviorExpired,
+        &setup,
+        &mut expired_phases,
+    );
+
+    let mut completion_phases = Vec::new();
+    let completion_primary = complete_linux_base_inventory_verifier(&mut completion_phases);
+    let completion_phase = completion_phases
+        .pop()
+        .ok_or_else(|| "Linux base inventory shared completion receipt is absent".to_owned())?;
+    positive_phases.push(completion_phase.clone());
+    expired_phases.push(completion_phase);
+
+    drop(setup);
+    let cleanup_primary = positive_primary
+        .as_ref()
+        .or(completion_primary.as_ref())
+        .or(expired_primary.as_ref());
+    let mut cleanup_phases = Vec::new();
+    cleanup_linux_base_inventory_verifier(
+        &context,
+        &mut principal_cleanup,
+        &mut cleanup_phases,
+        cleanup_primary,
+    )?;
+    let cleanup_phase = cleanup_phases
+        .pop()
+        .ok_or_else(|| "Linux base inventory shared cleanup receipt is absent".to_owned())?;
+    positive_phases.push(cleanup_phase.clone());
+    expired_phases.push(cleanup_phase);
+
+    let positive_primary = positive_primary.or(completion_primary);
+    require_linux_base_inventory_scenario_result(
+        LinuxBaseInventoryVerifierScenario::Positive,
+        positive_primary.as_ref(),
+    )?;
+    require_linux_base_inventory_scenario_result(
+        LinuxBaseInventoryVerifierScenario::BehaviorExpired,
+        expired_primary.as_ref(),
+    )?;
+    linux_base_inventory_suite_receipt(
+        &repository,
+        &positive_phases,
+        positive_primary.as_ref(),
+        setup_expired,
+        &expired_phases,
+        expired_primary.as_ref(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_base_inventory_inside_candidate_scope(
+    target: &Path,
+    isolated: &Path,
+    policy: &hell_testkit::CandidateLaunchPolicy,
+) -> Result<(), String> {
+    let repository = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "hell-ci manifest has no repository root".to_owned())?,
+    )
+    .map_err(|error| format!("cannot bind repository authority verifier root: {error}"))?;
+    with_release_candidate_environment(target, isolated, 1, policy, || {
+        crate::policy::verify_base_repository_inventory_inside_candidate_scope_for_integration(
+            &repository,
+        )
+    })
+}
+
+#[cfg(unix)]
+fn verify_posix_candidate_target_authority_primary(
+    context: &CandidateTargetVerifierContext,
+    principal_cleanup: &mut Option<PosixPrincipalCleanup>,
+    cargo_protection: &mut Option<PosixAdapterProtection>,
+) -> Result<(), String> {
+    let workspace_authority = prepare_candidate_target_workspace(&context.fixture)?;
+    let workspace_target = workspace_authority.target.clone();
+    let trusted_group = workspace_authority.trusted_group;
+    let principal_authority = allocate_candidate_target_principal(
+        &CandidateTargetPrincipalInput {
+            platform: context.platform,
+            process_authorities: &context.process_authorities,
+            transient_cleanup: &context.transient_cleanup,
+            sequence: context.sequence,
+            trusted_group,
+        },
+        principal_cleanup,
+    )?;
+    let candidate_user_id = principal_authority.user_id;
+    #[cfg(target_os = "macos")]
+    let candidate_group_id = principal_authority.group_id;
+    #[cfg(target_os = "macos")]
+    let candidate_group_ids = principal_authority.group_ids.clone();
+    let mut protection = stage_candidate_target_for_verifier(&CandidateTargetStageInput {
+        sudo: &context.sudo,
+        adapter: &context.adapter,
+        transient: &context.transient,
+        workspace: &workspace_authority,
+        principal: &principal_authority,
+    })?;
+    let project = write_candidate_target_probe_project(&context.transient)?;
+    let RetainedCandidateTargetLaunch {
+        cargo,
+        rustup: rustup_protection,
+        policy,
+        isolated,
+    } = prepare_retained_candidate_target_launch(
+        CandidateTargetLaunchInput {
+            platform: context.platform,
+            sudo: &context.sudo,
+            adapter: &context.adapter,
+            process_authorities: &context.process_authorities,
             project: &project,
             protection: &protection,
             principal: principal_authority,
-        })?;
-        #[cfg(target_os = "macos")]
-        verify_candidate_target_broker(&CandidateTargetBrokerInput {
-            fixture: &fixture,
-            sequence,
-            sudo: &sudo,
-            adapter: &adapter,
-            candidate_user_id,
-            candidate_group_id,
-            target: protection.path(),
-            isolated: &isolated,
-            policy: &policy,
-            project: &project,
-        })?;
-        let artifact = build_and_run_candidate_target_probe(&CandidateTargetProbeInput {
+        },
+        &context.fixture,
+        cargo_protection,
+    )?;
+    #[cfg(target_os = "linux")]
+    verify_linux_base_inventory_inside_candidate_scope(protection.path(), &isolated, &policy)?;
+    #[cfg(target_os = "macos")]
+    verify_candidate_target_broker(&CandidateTargetBrokerInput {
+        fixture: &context.fixture,
+        sequence: context.sequence,
+        sudo: &context.sudo,
+        adapter: &context.adapter,
+        candidate_user_id,
+        candidate_group_id,
+        candidate_group_ids: &candidate_group_ids,
+        target: protection.path(),
+        isolated: &isolated,
+        policy: &policy,
+        project: &project,
+    })?;
+    let artifact = build_candidate_target_probe_with_retained_adapter(
+        &CandidateTargetProbeInput {
             cargo: &cargo,
             rustup: &rustup_protection,
             policy: &policy,
@@ -8683,29 +10763,224 @@ pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Resul
             target: &protection,
             workspace_target: &workspace_target,
             candidate_user_id,
-        })?;
-        verify_candidate_target_export_rollback(&adapter, &mut protection, &workspace_target)?;
-        export_and_validate_candidate_target(&adapter, &mut protection, &workspace_target)?;
-        verify_candidate_target_cleanup_probe(&CandidateTargetCleanupProbeInput {
-            artifact: &artifact,
-            target: &protection,
-            workspace_target: &workspace_target,
-            isolated: &isolated,
-            policy: &policy,
-            project: &project,
-            candidate_user_id,
-        })?;
-        #[cfg(target_os = "linux")]
-        verify_linux_candidate_principal_rollback(&sudo)?;
-        Ok(())
-    })();
+        },
+        cargo_protection.as_ref(),
+    )?;
+    verify_candidate_target_export_rollback(&context.adapter, &mut protection, &workspace_target)?;
+    export_and_validate_candidate_target(&context.adapter, &mut protection, &workspace_target)?;
+    verify_candidate_target_cleanup_probe(&CandidateTargetCleanupProbeInput {
+        artifact: &artifact,
+        target: &protection,
+        workspace_target: &workspace_target,
+        isolated: &isolated,
+        policy: &policy,
+        project: &project,
+        candidate_user_id,
+    })?;
+    #[cfg(target_os = "linux")]
+    verify_linux_candidate_principal_rollback(&context.sudo)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_posix_candidate_target_authority_for_integration() -> Result<(), String> {
+    let context = allocate_candidate_target_verifier_context()?;
+    let mut principal_cleanup = None;
+    let mut cargo_protection = None;
+    let result = verify_posix_candidate_target_authority_primary(
+        &context,
+        &mut principal_cleanup,
+        &mut cargo_protection,
+    );
     finish_candidate_target_verifier(
         result,
         principal_cleanup.take(),
-        &transient_cleanup,
-        &process_authorities,
-        &fixture,
+        cargo_protection.take(),
+        &context.transient_cleanup,
+        &context.process_authorities,
+        &context.fixture,
     )
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct PosixProcessAuthorityFixtureDirectoryIdentity {
+    requested: PathBuf,
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl PosixProcessAuthorityFixtureDirectoryIdentity {
+    fn seal_and_bind(path: &Path, expected_mode: u32) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        fs::set_permissions(path, fs::Permissions::from_mode(expected_mode)).map_err(|error| {
+            format!(
+                "cannot seal process-authority fixture directory {}: {error}",
+                path.display()
+            )
+        })?;
+        let requested_metadata = fs::symlink_metadata(path).map_err(|error| {
+            format!(
+                "cannot inspect process-authority fixture directory {}: {error}",
+                path.display()
+            )
+        })?;
+        let canonical = fs::canonicalize(path).map_err(|error| {
+            format!(
+                "cannot canonicalize process-authority fixture directory {}: {error}",
+                path.display()
+            )
+        })?;
+        let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+            format!(
+                "cannot inspect canonical process-authority fixture directory {}: {error}",
+                canonical.display()
+            )
+        })?;
+        if requested_metadata.file_type().is_symlink()
+            || !requested_metadata.is_dir()
+            || !canonical_metadata.is_dir()
+            || canonical != path
+            || requested_metadata.dev() != canonical_metadata.dev()
+            || requested_metadata.ino() != canonical_metadata.ino()
+            || requested_metadata.uid() != canonical_metadata.uid()
+            || requested_metadata.gid() != canonical_metadata.gid()
+            || requested_metadata.mode() != canonical_metadata.mode()
+            || canonical_metadata.uid() != nix::unistd::geteuid().as_raw()
+            || canonical_metadata.mode() & 0o7777 != expected_mode
+        {
+            return Err(format!(
+                "process-authority fixture directory identity is not exact: {}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            requested: path.to_owned(),
+            canonical,
+            device: canonical_metadata.dev(),
+            inode: canonical_metadata.ino(),
+            owner: canonical_metadata.uid(),
+            group: canonical_metadata.gid(),
+            mode: canonical_metadata.mode(),
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let requested_metadata = fs::symlink_metadata(&self.requested).map_err(|error| {
+            format!(
+                "cannot revalidate process-authority fixture directory {}: {error}",
+                self.requested.display()
+            )
+        })?;
+        let canonical = fs::canonicalize(&self.requested).map_err(|error| {
+            format!(
+                "cannot recanonicalize process-authority fixture directory {}: {error}",
+                self.requested.display()
+            )
+        })?;
+        let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+            format!(
+                "cannot revalidate canonical process-authority fixture directory {}: {error}",
+                canonical.display()
+            )
+        })?;
+        if requested_metadata.file_type().is_symlink()
+            || !requested_metadata.is_dir()
+            || !canonical_metadata.is_dir()
+            || canonical != self.canonical
+            || requested_metadata.dev() != self.device
+            || requested_metadata.ino() != self.inode
+            || requested_metadata.uid() != self.owner
+            || requested_metadata.gid() != self.group
+            || requested_metadata.mode() != self.mode
+            || canonical_metadata.dev() != self.device
+            || canonical_metadata.ino() != self.inode
+            || canonical_metadata.uid() != self.owner
+            || canonical_metadata.gid() != self.group
+            || canonical_metadata.mode() != self.mode
+        {
+            return Err(format!(
+                "process-authority fixture directory identity changed: {}",
+                self.requested.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct PosixProcessAuthorityFixture {
+    root: PathBuf,
+    directories: Vec<PosixProcessAuthorityFixtureDirectoryIdentity>,
+}
+
+#[cfg(unix)]
+impl PosixProcessAuthorityFixture {
+    fn create(root: PathBuf) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut root_builder = fs::DirBuilder::new();
+        root_builder.mode(0o700);
+        root_builder.create(&root).map_err(|error| {
+            format!(
+                "cannot create process-authority fixture root {}: {error}",
+                root.display()
+            )
+        })?;
+        let primary = (|| {
+            let usr = root.join("usr");
+            let bin = usr.join("bin");
+            let mut directory_builder = fs::DirBuilder::new();
+            directory_builder.mode(0o755);
+            directory_builder
+                .create(&usr)
+                .map_err(|error| format!("cannot create process-authority fixture usr: {error}"))?;
+            directory_builder
+                .create(&bin)
+                .map_err(|error| format!("cannot create process-authority fixture bin: {error}"))?;
+            Ok(vec![
+                PosixProcessAuthorityFixtureDirectoryIdentity::seal_and_bind(&root, 0o700)?,
+                PosixProcessAuthorityFixtureDirectoryIdentity::seal_and_bind(&usr, 0o755)?,
+                PosixProcessAuthorityFixtureDirectoryIdentity::seal_and_bind(&bin, 0o755)?,
+            ])
+        })();
+        match primary {
+            Ok(directories) => Ok(Self { root, directories }),
+            Err(primary) => match fs::remove_dir_all(&root) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(format!(
+                    "{primary}; additionally, partial process-authority fixture cleanup failed: {cleanup}"
+                )),
+            },
+        }
+    }
+
+    fn revalidate_directories(&self) -> Result<(), String> {
+        for directory in &self.directories {
+            directory.revalidate()?;
+        }
+        Ok(())
+    }
+
+    fn close(self) -> Result<(), String> {
+        fs::remove_dir_all(&self.root)
+            .map_err(|error| format!("cannot remove process-authority fixture: {error}"))?;
+        match fs::symlink_metadata(&self.root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "cannot attest process-authority fixture absence: {error}"
+            )),
+            Ok(_) => Err("process-authority fixture remained after cleanup".to_owned()),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -8730,8 +11005,7 @@ pub(crate) fn verify_posix_process_authority_for_integration() -> Result<(), Str
             std::process::id(),
             POSIX_CANDIDATE_ENVIRONMENT_VERIFIER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-    fs::create_dir_all(root.join("usr/bin"))
-        .map_err(|error| format!("cannot create process-authority fixture: {error}"))?;
+    let fixture_directory = PosixProcessAuthorityFixture::create(root.clone())?;
     let result = (|| {
         symlink(root.join("usr/bin"), root.join("bin"))
             .map_err(|error| format!("cannot create merged-/usr fixture alias: {error}"))?;
@@ -8742,6 +11016,7 @@ pub(crate) fn verify_posix_process_authority_for_integration() -> Result<(), Str
             fs::set_permissions(&path, fs::Permissions::from_mode(0o555))
                 .map_err(|error| format!("cannot seal process-authority fixture tool: {error}"))?;
         }
+        fixture_directory.revalidate_directories()?;
         let resolve = |name: &str| {
             crate::command::resolve_absolute_standard_executable(&root.join("bin").join(name))
         };
@@ -8778,6 +11053,7 @@ pub(crate) fn verify_posix_process_authority_for_integration() -> Result<(), Str
         if swapped.is_ok() {
             return Err("process-tool role swap was accepted".to_owned());
         }
+        fixture_directory.revalidate_directories()?;
         fs::set_permissions(root.join("usr/bin/id"), fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("cannot mutate fixture metadata: {error}"))?;
         if hell_testkit::verify_posix_process_authorities_for_integration(retained).is_ok() {
@@ -8785,9 +11061,15 @@ pub(crate) fn verify_posix_process_authority_for_integration() -> Result<(), Str
         }
         Ok(())
     })();
-    let cleanup = fs::remove_dir_all(&root)
-        .map_err(|error| format!("cannot remove process-authority fixture: {error}"));
-    result.and(cleanup)
+    let cleanup = fixture_directory.close();
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(format!(
+            "{primary}; additionally, process-authority fixture cleanup failed: {cleanup}"
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -8879,9 +11161,14 @@ fn verify_macos_directory_service_parsers() -> Result<(), String> {
     let directory_service_inventory = b"nobody -2\nhellcandidate 550\nroot 0\n";
     if macos_directory_service_inventory_id(
         directory_service_inventory,
-        "hellcandidate",
+        "nobody",
         "candidate principal",
-    )? != Some(550)
+    )? != Some(u32::MAX - 1)
+        || macos_directory_service_inventory_id(
+            directory_service_inventory,
+            "hellcandidate",
+            "candidate principal",
+        )? != Some(550)
         || macos_directory_service_inventory_id(
             directory_service_inventory,
             "absentcandidate",
@@ -10817,30 +13104,20 @@ fn transition_posix_archive_adapter_children(
         std::slice::from_ref(&preseal.adapter_name),
         "native archive adapter authority",
     )?;
-    let group = protection.archive_adapter_group.to_string();
-    for path in [
-        &preseal.adapter,
-        &preseal.work_directory,
-        &preseal.temporary_directory,
-    ] {
-        trusted_tool_status(
-            &protection.sudo,
-            &protection.tools.change_group,
-            [
-                group.as_str(),
-                path_text(path, "native archive adapter child")?,
-            ],
-        )?;
-    }
-    trusted_tool_status(
-        &protection.sudo,
-        &protection.tools.change_group,
-        [
-            protection.candidate_primary_gid.to_string().as_str(),
-            path_text(&preseal.input_staging, "native archive input staging")?,
-        ],
+    transition_posix_archive_adapter_paths(
+        &PosixArchiveAdapterPathTransition {
+            platform: protection.platform,
+            sudo: &protection.sudo,
+            tools: &protection.tools,
+            trusted_owner: protection.archive_adapter_owner,
+            adapter_group: protection.archive_adapter_group,
+            adapter_group_name: None,
+            input_group: protection.candidate_primary_gid,
+            input_group_name: None,
+            deadline: None,
+        },
+        preseal,
     )?;
-    set_posix_archive_adapter_modes(protection, preseal)?;
     let sealed_input = fs::symlink_metadata(&preseal.input_staging)
         .map_err(|error| format!("cannot retain sealed native archive input staging: {error}"))?;
     if !posix_mutable_archive_directory_is_exact(
@@ -10859,10 +13136,59 @@ fn transition_posix_archive_adapter_children(
 }
 
 #[cfg(unix)]
-fn set_posix_archive_adapter_modes(
-    protection: &PosixSourceProtection,
+struct PosixArchiveAdapterPathTransition<'a> {
+    platform: ReleasePlatform,
+    sudo: &'a Path,
+    tools: &'a PosixAdapterTools,
+    trusted_owner: u32,
+    adapter_group: u32,
+    adapter_group_name: Option<&'a str>,
+    input_group: u32,
+    input_group_name: Option<&'a str>,
+    deadline: Option<Instant>,
+}
+
+#[cfg(unix)]
+fn transition_posix_archive_adapter_paths(
+    transition: &PosixArchiveAdapterPathTransition<'_>,
     preseal: &PosixArchiveAdapterPreseal,
 ) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let run = |tool: &crate::command::ResolvedStandardExecutable,
+               arguments: Vec<OsString>|
+     -> Result<(), String> {
+        match transition.deadline {
+            Some(deadline) => {
+                trusted_tool_status_before(deadline, transition.sudo, tool, arguments)
+            }
+            None => trusted_tool_status(transition.sudo, tool, arguments),
+        }
+    };
+    let adapter_group = transition
+        .adapter_group_name
+        .map_or_else(|| transition.adapter_group.to_string(), str::to_owned);
+    for path in [
+        &preseal.adapter,
+        &preseal.work_directory,
+        &preseal.temporary_directory,
+    ] {
+        run(
+            &transition.tools.change_group,
+            vec![OsString::from(&adapter_group), path.as_os_str().to_owned()],
+        )?;
+    }
+    run(
+        &transition.tools.change_group,
+        vec![
+            OsString::from(
+                transition
+                    .input_group_name
+                    .map_or_else(|| transition.input_group.to_string(), str::to_owned),
+            ),
+            preseal.input_staging.as_os_str().to_owned(),
+        ],
+    )?;
     for (mode, path, label) in [
         ("2755", &preseal.adapter, "native archive adapter"),
         (
@@ -10881,13 +13207,190 @@ fn set_posix_archive_adapter_modes(
             "candidate Stack temporary directory",
         ),
     ] {
-        trusted_tool_status(
-            &protection.sudo,
-            &protection.tools.chmod,
-            posix_chmod_arguments(protection.platform, mode, path_text(path, label)?)?,
+        run(
+            &transition.tools.chmod,
+            posix_chmod_arguments(transition.platform, mode, path_text(path, label)?)?
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
         )?;
     }
+    for (path, mode, group, label) in [
+        (
+            &preseal.adapter,
+            0o2755,
+            transition.adapter_group,
+            "adapter",
+        ),
+        (
+            &preseal.work_directory,
+            0o3770,
+            transition.adapter_group,
+            "work directory",
+        ),
+        (
+            &preseal.temporary_directory,
+            0o2770,
+            transition.adapter_group,
+            "temporary directory",
+        ),
+        (
+            &preseal.input_staging,
+            0o2710,
+            transition.input_group,
+            "input staging",
+        ),
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect sealed native archive {label}: {error}"))?;
+        if !posix_mutable_archive_directory_is_exact(&metadata, transition.trusted_owner, mode)
+            || metadata.gid() != group
+        {
+            return Err(format!(
+                "sealed native archive {label} differs after the authority transition"
+            ));
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub(crate) struct MacosRestrictedArchivePrincipal {
+    pub(crate) name: String,
+    pub(crate) uid: u32,
+    pub(crate) primary_gid: u32,
+    pub(crate) primary_group_name: String,
+    pub(crate) groups: Vec<u32>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn resolve_macos_restricted_archive_principal(
+    name: &str,
+    deadline: Instant,
+) -> Result<MacosRestrictedArchivePrincipal, String> {
+    let authorities = ResolvedPosixProcessAuthorities::resolve()?;
+    let uid = parse_posix_candidate_identity_output(
+        &exact_posix_candidate_identity_output_before(
+            deadline,
+            &authorities.identity,
+            "-u",
+            name,
+            "UID",
+        )?,
+        "restricted archive UID",
+    )?;
+    let primary_gid = parse_posix_candidate_identity_output(
+        &exact_posix_candidate_identity_output_before(
+            deadline,
+            &authorities.identity,
+            "-g",
+            name,
+            "primary GID",
+        )?,
+        "restricted archive primary GID",
+    )?;
+    let primary_group_name = parse_posix_candidate_group_name_output(
+        &exact_posix_candidate_identity_output_before(
+            deadline,
+            &authorities.identity,
+            "-gn",
+            name,
+            "primary group name",
+        )?,
+        "restricted archive primary group name",
+    )?;
+    if posix_group_gid(deadline, &primary_group_name)? != Some(primary_gid) {
+        return Err(
+            "restricted archive primary group name differs from its numeric identity".to_owned(),
+        );
+    }
+    let groups = posix_candidate_group_inventory(
+        &exact_posix_candidate_identity_output_before(
+            deadline,
+            &authorities.identity,
+            "-G",
+            name,
+            "complete group inventory",
+        )?,
+        primary_gid,
+    )
+    .ok_or_else(|| {
+        "restricted archive complete group inventory is not canonical or omits its primary GID"
+            .to_owned()
+    })?;
+    if uid == nix::unistd::geteuid().as_raw() {
+        return Err("restricted archive principal is the trusted runner".to_owned());
+    }
+    Ok(MacosRestrictedArchivePrincipal {
+        name: name.to_owned(),
+        uid,
+        primary_gid,
+        primary_group_name,
+        groups,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn transition_macos_restricted_archive_adapter(
+    adapter: &Path,
+    principal: &MacosRestrictedArchivePrincipal,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let adapter_metadata = fs::symlink_metadata(adapter)
+        .map_err(|error| format!("cannot inspect restricted archive adapter: {error}"))?;
+    if adapter_metadata.file_type().is_symlink()
+        || !adapter_metadata.is_dir()
+        || adapter_metadata.mode() & 0o7777 != 0o755
+        || principal.groups.contains(&adapter_metadata.gid())
+    {
+        return Err("restricted archive adapter differs before sealing".to_owned());
+    }
+    let work_directory = adapter.join(".stack-work");
+    let temporary_directory = work_directory.join("tmp");
+    let input_staging = adapter.join(".authority/inputs");
+    for (path, mode, label) in [
+        (&work_directory, 0o700, "work directory"),
+        (&temporary_directory, 0o770, "temporary directory"),
+        (&input_staging, 0o700, "input staging"),
+    ] {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            format!("cannot inspect restricted archive {label} before sealing: {error}")
+        })?;
+        if !posix_mutable_archive_directory_is_exact(&metadata, adapter_metadata.uid(), mode) {
+            return Err(format!("restricted archive {label} differs before sealing"));
+        }
+    }
+    let preseal = PosixArchiveAdapterPreseal {
+        adapter: adapter.to_owned(),
+        adapter_name: adapter
+            .file_name()
+            .ok_or_else(|| "restricted archive adapter name is absent".to_owned())?
+            .to_owned(),
+        work_directory,
+        temporary_directory,
+        input_staging,
+        stack_work: PathBuf::new(),
+        stack_work_identity: posix_object_identity(adapter)?,
+    };
+    let tools = resolve_posix_adapter_tools(ReleasePlatform::MacosAarch64)?;
+    let sudo = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/sudo"))?;
+    transition_posix_archive_adapter_paths(
+        &PosixArchiveAdapterPathTransition {
+            platform: ReleasePlatform::MacosAarch64,
+            sudo: sudo.invocation_path(),
+            tools: &tools,
+            trusted_owner: adapter_metadata.uid(),
+            adapter_group: principal.primary_gid,
+            adapter_group_name: Some(&principal.primary_group_name),
+            input_group: principal.primary_gid,
+            input_group_name: Some(&principal.primary_group_name),
+            deadline: Some(deadline),
+        },
+        &preseal,
+    )
 }
 
 #[cfg(unix)]
@@ -10895,7 +13398,8 @@ fn seal_posix_archive_adapter_authority<'a>(
     protection: &PosixSourceProtection,
     normalizer: &'a PosixAdapterProtection,
     archive_adapter: &mut crate::command::NativeArchiveAdapter,
-    authorization_deadline: Option<Instant>,
+    #[cfg(target_os = "macos")] authorization_deadline: Option<Instant>,
+    #[cfg(not(target_os = "macos"))] _authorization_deadline: Option<Instant>,
 ) -> Result<PosixArchiveAdapterSeal<'a>, String> {
     let preseal = validate_posix_archive_adapter_preseal(protection, normalizer, archive_adapter)?;
     let identities = transition_posix_archive_adapter_children(protection, &preseal)?;
@@ -10962,16 +13466,22 @@ fn seal_posix_archive_adapter_authority<'a>(
         temporary_directory: &sealed.temporary_directory,
         temporary_directory_identity: &sealed.temporary_directory_identity,
     })?;
-    if let Err(error) = archive_adapter.retain_sealed_authority(
-        protection.archive_adapter_group,
-        protection.candidate_uid,
-        authorization_deadline,
-    ) {
-        return Err(format!(
-            "{error}; archive restoration skipped without an exact quiescence receipt"
-        ));
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = archive_adapter.retain_sealed_authority(
+            protection.archive_adapter_group,
+            protection.candidate_uid,
+            authorization_deadline,
+        ) {
+            return Err(format!(
+                "{error}; archive restoration skipped without an exact quiescence receipt"
+            ));
+        }
     }
-    Ok(sealed)
+    #[cfg(target_os = "macos")]
+    return Ok(sealed);
+    #[cfg(not(target_os = "macos"))]
+    Err("the sealed native archive authority requires a macOS host; archive restoration skipped without an exact quiescence receipt".to_owned())
 }
 
 #[cfg(unix)]
@@ -11051,7 +13561,9 @@ fn path_text<'a>(path: &'a Path, label: &str) -> Result<&'a str, String> {
 #[cfg(unix)]
 impl Drop for PosixAdapterProtection {
     fn drop(&mut self) {
-        let _ = cleanup_posix_adapter(self);
+        if self.cleanup_required {
+            let _ = cleanup_posix_adapter(self);
+        }
     }
 }
 
@@ -11305,6 +13817,7 @@ fn populate_posix_adapter(stage: &PosixAdapterStage<'_>) -> Result<PosixAdapterP
         staged_name: stage.staged_name,
         sudo: stage.sudo.to_path_buf(),
         tools: stage.tools.clone(),
+        cleanup_required: true,
     })
 }
 
@@ -11376,13 +13889,7 @@ fn stage_posix_executable(
 
 #[cfg(unix)]
 fn cleanup_posix_adapter(protection: &PosixAdapterProtection) -> Result<(), String> {
-    if posix_object_identity(&protection.adapter)? != protection.adapter_identity
-        || hell_testkit::sha256_file(&protection.adapter)
-            .map_err(|error| format!("cannot rehash POSIX adapter before cleanup: {error}"))?
-            != protection.sha256
-    {
-        return Err("POSIX adapter identity changed before cleanup".to_owned());
-    }
+    protection.revalidate()?;
     cleanup_posix_adapter_paths(&PosixAdapterCleanup {
         platform: protection.platform,
         sudo: &protection.sudo,
@@ -11394,6 +13901,39 @@ fn cleanup_posix_adapter(protection: &PosixAdapterProtection) -> Result<(), Stri
         adapter: &protection.adapter,
         staged_name: protection.staged_name,
     })
+}
+
+#[cfg(unix)]
+impl PosixAdapterProtection {
+    fn revalidate(&self) -> Result<(), String> {
+        if posix_object_identity(&self.adapter)? != self.adapter_identity
+            || hell_testkit::sha256_file(&self.adapter)
+                .map_err(|error| format!("cannot rehash staged POSIX adapter: {error}"))?
+                != self.sha256
+            || posix_object_identity(&self.directory)? != self.directory_identity
+        {
+            return Err("POSIX adapter identity changed".to_owned());
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        cleanup_posix_adapter(self)?;
+        for (path, label) in [
+            (&self.adapter, "staged executable"),
+            (&self.directory, "adapter directory"),
+        ] {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(format!("POSIX {label} remains after cleanup")),
+                Err(error) => {
+                    return Err(format!("cannot attest POSIX {label} cleanup: {error}"));
+                }
+            }
+        }
+        self.cleanup_required = false;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -12072,20 +14612,606 @@ fn stage_windows_toolchain_until_with_entry_gate(
 }
 
 #[cfg(windows)]
+struct WindowsStackRuntimeProtection {
+    root: PathBuf,
+    identity: same_file::Handle,
+    closed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsStackRuntimeProtection {
+    fn cleanup_until(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        if Instant::now() >= deadline
+            || fs::canonicalize(&self.root).ok().as_deref() != Some(self.root.as_path())
+            || same_file::Handle::from_path(&self.root).ok().as_ref() != Some(&self.identity)
+        {
+            return Err("Windows Stack runtime cleanup authority changed".to_owned());
+        }
+        cleanup_partial_windows_toolchain_until(&self.root, deadline)?;
+        self.closed = true;
+        Ok(())
+    }
+
+    fn cleanup_until_with_retry(&mut self, deadline: Instant, context: &str) -> Result<(), String> {
+        match self.cleanup_until(deadline) {
+            Ok(()) => Ok(()),
+            Err(primary) if Instant::now() < deadline => {
+                self.cleanup_until(deadline).map_err(|retry| {
+                    format!(
+                        "{primary}; additionally, retained Windows Stack {context} cleanup retry failed: {retry}"
+                    )
+                })
+            }
+            Err(primary) => Err(primary),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_stack_root_configuration(value: &std::ffi::OsStr) -> Result<(), String> {
+    let requested = PathBuf::from(value);
+    if !requested.is_absolute()
+        || requested.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(
+            "trusted Windows STACK_ROOT configuration is not one absolute lexical path".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stage_windows_ghc_distribution_until(
+    source: &Path,
+    destination: &Path,
+    deadline: Instant,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let inventory = windows_toolchain_inventory_paths_until(source, deadline)?;
+    let mut directories = inventory
+        .iter()
+        .filter(|(_, directory)| *directory)
+        .map(|(relative, _)| relative.clone())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| path.components().count());
+    for relative in &directories {
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        fs::create_dir(destination.join(relative)).map_err(|error| {
+            format!("cannot create staged Windows GHC distribution directory: {error}")
+        })?;
+    }
+    let files = inventory
+        .into_iter()
+        .filter(|(_, directory)| !directory)
+        .map(|(relative, _)| relative)
+        .collect::<Vec<_>>();
+    let mut total_bytes = 0_u64;
+    for relative in &files {
+        if Instant::now() >= deadline {
+            return Err("Windows GHC distribution staging exceeded its deadline".to_owned());
+        }
+        let source_path = source.join(relative);
+        let source_identity = crate::command::WindowsBoundFileIdentity::bind_until_at(
+            &source_path,
+            deadline,
+            crate::command::WindowsFileIdentityPhase::ToolchainSourceBinding,
+            relative,
+        )?;
+        total_bytes = total_bytes
+            .checked_add(source_identity.size())
+            .filter(|bytes| *bytes <= WINDOWS_TOOLCHAIN_STAGE_BYTE_LIMIT)
+            .ok_or_else(|| "Windows GHC distribution exceeds the staging byte bound".to_owned())?;
+        source_identity.copy_to_new_until(&destination.join(relative), deadline, relative)?;
+        source_identity.revalidate_retained_path_until_at(
+            &source_path,
+            deadline,
+            crate::command::WindowsFileIdentityPhase::ToolchainSourceRevalidation,
+            relative,
+        )?;
+    }
+    Ok((files, directories))
+}
+
+#[cfg(windows)]
+struct WindowsGhcDistributionSource {
+    root: PathBuf,
+    ghc: PathBuf,
+    ghc_authority: hell_testkit::BoundProgramInvocation,
+    shim_authority: hell_testkit::WindowsGhcupShimAuthority,
+    ghc_bin: PathBuf,
+    mingw_bin: PathBuf,
+    strip: PathBuf,
+}
+
+#[cfg(windows)]
+struct WindowsGhcLibdirReceipt {
+    requested: PathBuf,
+    canonical: PathBuf,
+}
+
+#[cfg(windows)]
+struct WindowsGhcQueryReceipt {
+    value: String,
+    output_sha256: String,
+}
+
+#[cfg(windows)]
+fn query_windows_ghc_value_until(
+    program: &hell_testkit::BoundProgramInvocation,
+    executable: &Path,
+    argument: &'static str,
+    label: &'static str,
+    environment: &ProcessEnvironment,
+    deadline: Instant,
+) -> Result<WindowsGhcQueryReceipt, String> {
+    program
+        .windows_revalidate_for_integration()
+        .map_err(|error| format!("cannot revalidate retained Windows {label}: {error}"))?;
+    let execution_deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap_or(deadline)
+        .min(deadline);
+    let mut command =
+        CommandSpec::trusted_absolute(executable.to_path_buf(), Duration::from_secs(30))?
+            .argument(argument)
+            .cleared_environment();
+    for (variable, name) in [
+        (StandardVariable::Path, "PATH"),
+        (StandardVariable::PathExt, "PATHEXT"),
+        (StandardVariable::SystemRoot, "SystemRoot"),
+    ] {
+        command = command.environment(
+            name,
+            environment
+                .required_singleton_value(variable, name)
+                .map_err(|error| format!("trusted Windows {error}"))?,
+        );
+    }
+    let execution = command.run_ambient_candidate_captured_until(execution_deadline, deadline);
+    let revalidation = program
+        .windows_revalidate_for_integration()
+        .map_err(|error| error.to_string());
+    let output = match (execution, revalidation) {
+        (Ok(output), Ok(())) => output,
+        (Err(primary), Ok(())) => {
+            return Err(format!("cannot query retained Windows {label}: {primary}"));
+        }
+        (Ok(_), Err(revalidation)) => {
+            return Err(format!(
+                "cannot revalidate retained Windows {label} after query: {revalidation}"
+            ));
+        }
+        (Err(primary), Err(revalidation)) => {
+            return Err(format!(
+                "cannot query retained Windows {label}: {primary}; retained Windows {label} post-query revalidation also failed: {revalidation}"
+            ));
+        }
+    };
+    if output.timed_out
+        || !output.status.success()
+        || output.stdout_truncated
+        || output.stderr_truncated
+        || !output.stderr.is_empty()
+        || output.termination.cleanup_id.is_none()
+        || !output.termination.reaped
+    {
+        return Err(format!(
+            "retained Windows {label} query did not complete cleanly: status={} timedOut={} stdoutBytes={} stdoutSha256={} stderrBytes={} stderrSha256={} stdoutTruncated={} stderrTruncated={} cleanupId={:?} forced={} reaped={} quiescence={}",
+            output.status,
+            output.timed_out,
+            output.stdout_bytes,
+            output.stdout_sha256.hex(),
+            output.stderr_bytes,
+            output.stderr_sha256.hex(),
+            output.stdout_truncated,
+            output.stderr_truncated,
+            output.termination.cleanup_id,
+            output.termination.forced,
+            output.termination.reaped,
+            output.termination.candidate_quiescence_complete,
+        ));
+    }
+    crate::command::require_captured_command_terminal_receipt(&output, false, label)?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| format!("retained Windows {label} output is not UTF-8"))?;
+    let value = stdout
+        .strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
+    if value.is_empty()
+        || value != value.trim()
+        || value.contains(['\r', '\n', '\0'])
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "retained Windows {label} output is not one bounded value"
+        ));
+    }
+    let mut combined_output = Vec::with_capacity(output.stdout.len() + output.stderr.len() + 1);
+    combined_output.extend_from_slice(&output.stdout);
+    combined_output.push(0);
+    combined_output.extend_from_slice(&output.stderr);
+    Ok(WindowsGhcQueryReceipt {
+        value: value.to_owned(),
+        output_sha256: hell_testkit::sha256_bytes(&combined_output).hex(),
+    })
+}
+
+#[cfg(windows)]
+fn query_windows_ghc_libdir_until(
+    program: &hell_testkit::BoundProgramInvocation,
+    executable: &Path,
+    label: &'static str,
+    environment: &ProcessEnvironment,
+    deadline: Instant,
+) -> Result<WindowsGhcLibdirReceipt, String> {
+    let receipt = query_windows_ghc_value_until(
+        program,
+        executable,
+        "--print-libdir",
+        label,
+        environment,
+        deadline,
+    )?;
+    let requested = PathBuf::from(receipt.value);
+    let canonical = fs::canonicalize(&requested)
+        .map_err(|error| format!("cannot canonicalize retained Windows {label}: {error}"))?;
+    Ok(WindowsGhcLibdirReceipt {
+        requested,
+        canonical,
+    })
+}
+
+#[cfg(windows)]
+fn attest_windows_distribution_ghc_until(
+    native: &super::native_environment::WindowsNativeGhcAuthority,
+    shim: &hell_testkit::WindowsGhcupShimAuthority,
+    native_libdir: &WindowsGhcLibdirReceipt,
+    distribution: hell_testkit::BoundProgramInvocation,
+    ghc: &Path,
+    environment: &ProcessEnvironment,
+    deadline: Instant,
+) -> Result<hell_testkit::BoundProgramInvocation, String> {
+    shim.attest_target_until(&distribution, deadline)
+        .map_err(|error| format!("retained Windows GHCup shim target differs: {error}"))?;
+    let version = query_windows_ghc_value_until(
+        &distribution,
+        ghc,
+        "--numeric-version",
+        "distribution GHC version",
+        environment,
+        deadline,
+    )?;
+    let libdir = query_windows_ghc_libdir_until(
+        &distribution,
+        ghc,
+        "distribution GHC libdir",
+        environment,
+        deadline,
+    )?;
+    let public_receipt = hell_testkit::WindowsGhcSemanticReceipt::new(
+        native.parsed_version(),
+        native.output_sha256(),
+        native_libdir.requested.clone(),
+        native_libdir.canonical.clone(),
+    )
+    .map_err(|error| format!("cannot bind retained Windows public GHC receipt: {error}"))?;
+    let distribution_receipt = hell_testkit::WindowsGhcSemanticReceipt::new(
+        version.value,
+        &version.output_sha256,
+        libdir.requested,
+        libdir.canonical,
+    )
+    .map_err(|error| format!("cannot bind retained Windows distribution GHC receipt: {error}"))?;
+    shim.attest_distribution_until(
+        &distribution,
+        &public_receipt,
+        &distribution_receipt,
+        deadline,
+    )
+    .map_err(|error| format!("retained Windows GHC semantic relation differs: {error}"))?;
+    native.revalidate()?;
+    shim.revalidate_until(deadline)
+        .map_err(|error| format!("retained Windows GHCup shim authority changed: {error}"))?;
+    distribution
+        .windows_revalidate_for_integration()
+        .map_err(|error| format!("retained Windows distribution GHC changed: {error}"))?;
+    Ok(distribution)
+}
+
+#[cfg(windows)]
+fn discover_windows_ghc_distribution_until(
+    authority: &super::native_environment::WindowsNativeGhcAuthority,
+    environment: &ProcessEnvironment,
+    deadline: Instant,
+) -> Result<WindowsGhcDistributionSource, String> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    authority.revalidate()?;
+    let shim_authority = hell_testkit::WindowsGhcupShimAuthority::new_until(
+        authority.program().clone(),
+        authority.executable().with_extension("shim"),
+        deadline,
+    )
+    .map_err(|error| format!("cannot bind retained Windows GHCup shim authority: {error}"))?;
+    let libdir = query_windows_ghc_libdir_until(
+        authority.program(),
+        authority.executable(),
+        "native GHC libdir",
+        environment,
+        deadline,
+    )?;
+    let root = libdir
+        .canonical
+        .parent()
+        .ok_or_else(|| "retained Windows GHC libdir has no distribution root".to_owned())?
+        .to_path_buf();
+    let root_metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot inspect retained Windows GHC root: {error}"))?;
+    let version = authority.parsed_version();
+    if !libdir.requested.is_absolute()
+        || libdir.canonical.file_name() != Some(std::ffi::OsStr::new("lib"))
+        || root.file_name() != Some(std::ffi::OsStr::new(version))
+        || root.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("ghc"))
+        || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !root_metadata.is_dir()
+        || fs::canonicalize(&root).ok().as_deref() != Some(root.as_path())
+    {
+        return Err(
+            "retained Windows GHC does not name one canonical ghcup distribution".to_owned(),
+        );
+    }
+    let ghc_bin = root.join("bin");
+    let mingw_bin = root.join("mingw").join("bin");
+    let ghc = ghc_bin.join("ghc.exe");
+    let distribution = hell_testkit::BoundProgramInvocation::new_windows_direct_member_until(
+        &ghc_bin,
+        std::ffi::OsStr::new("ghc.exe"),
+        deadline,
+    )
+    .map_err(|error| format!("cannot bind retained Windows distribution ghc.exe: {error}"))?;
+    let strip = fs::canonicalize(mingw_bin.join("strip.exe")).map_err(|error| {
+        format!("cannot resolve retained Windows distribution strip.exe: {error}")
+    })?;
+    if fs::canonicalize(&ghc_bin).ok().as_deref() != Some(ghc_bin.as_path())
+        || fs::canonicalize(&mingw_bin).ok().as_deref() != Some(mingw_bin.as_path())
+        || strip.parent() != Some(mingw_bin.as_path())
+    {
+        return Err(
+            "retained Windows GHC/MinGW layout differs from the resolved native authority"
+                .to_owned(),
+        );
+    }
+    let ghc_authority = attest_windows_distribution_ghc_until(
+        authority,
+        &shim_authority,
+        &libdir,
+        distribution,
+        &ghc,
+        environment,
+        deadline,
+    )?;
+    Ok(WindowsGhcDistributionSource {
+        root,
+        ghc,
+        ghc_authority,
+        shim_authority,
+        ghc_bin,
+        mingw_bin,
+        strip,
+    })
+}
+
+#[cfg(windows)]
+struct WindowsStagedGhcLayout {
+    ghc: PathBuf,
+    ghc_bin: PathBuf,
+    mingw_bin: PathBuf,
+    strip: PathBuf,
+}
+
+#[cfg(windows)]
+fn windows_staged_ghc_layout(
+    source: &WindowsGhcDistributionSource,
+    immutable_root: &Path,
+) -> Result<WindowsStagedGhcLayout, String> {
+    let relative = |path: &Path, label: &str| {
+        path.strip_prefix(&source.root)
+            .map(|path| immutable_root.join(path))
+            .map_err(|_| format!("retained Windows {label} escaped its distribution root"))
+    };
+    Ok(WindowsStagedGhcLayout {
+        ghc: relative(&source.ghc, "GHC")?,
+        ghc_bin: relative(&source.ghc_bin, "GHC bin")?,
+        mingw_bin: relative(&source.mingw_bin, "MinGW bin")?,
+        strip: relative(&source.strip, "strip")?,
+    })
+}
+
+#[cfg(windows)]
+struct WindowsStackRuntimeStageInput<'a> {
+    target: &'a Path,
+    root: &'a Path,
+    source_stack: &'a Path,
+    source_ghc: &'a WindowsGhcDistributionSource,
+    ghc_authority: &'a super::native_environment::WindowsNativeGhcAuthority,
+    deadline: Instant,
+}
+
+#[cfg(windows)]
+fn construct_windows_stack_runtime_until(
+    input: &WindowsStackRuntimeStageInput<'_>,
+) -> Result<
+    (
+        hell_testkit::WindowsStackRuntimeAuthority,
+        same_file::Handle,
+    ),
+    String,
+> {
+    let bin = input.root.join("bin");
+    let stack_root = input.root.join("root");
+    let temporary = input.root.join("tmp");
+    let immutable_root = input.root.join(format!(
+        "system-ghc-{}",
+        input.ghc_authority.parsed_version()
+    ));
+    fs::create_dir(&bin)
+        .and_then(|()| fs::create_dir(&stack_root))
+        .and_then(|()| fs::create_dir(&temporary))
+        .and_then(|()| fs::create_dir(&immutable_root))
+        .map_err(|error| format!("cannot create Windows Stack runtime member: {error}"))?;
+    let (files, directories) = stage_windows_ghc_distribution_until(
+        &input.source_ghc.root,
+        &immutable_root,
+        input.deadline,
+    )?;
+    input.ghc_authority.revalidate()?;
+    input
+        .source_ghc
+        .shim_authority
+        .revalidate_until(input.deadline)
+        .map_err(|error| format!("retained Windows GHCup shim authority changed: {error}"))?;
+    input
+        .source_ghc
+        .ghc_authority
+        .windows_revalidate_for_integration()
+        .map_err(|error| format!("retained Windows distribution GHC changed: {error}"))?;
+    let source_identity = crate::command::WindowsBoundFileIdentity::bind_until_at(
+        input.source_stack,
+        input.deadline,
+        crate::command::WindowsFileIdentityPhase::ToolchainSourceBinding,
+        Path::new("stack.exe"),
+    )?;
+    let staged_stack = bin.join("stack.exe");
+    source_identity.copy_to_new_until(&staged_stack, input.deadline, Path::new("stack.exe"))?;
+    source_identity.revalidate_retained_path_until_at(
+        input.source_stack,
+        input.deadline,
+        crate::command::WindowsFileIdentityPhase::ToolchainSourceRevalidation,
+        Path::new("stack.exe"),
+    )?;
+    let source_stack =
+        source_identity.promote_program_invocation_until(input.source_stack, input.deadline)?;
+    let staged_ghc = windows_staged_ghc_layout(input.source_ghc, &immutable_root)?;
+    windows_confinement::protect_tree(&bin, false)?;
+    windows_confinement::protect_tree(&immutable_root, false)?;
+    let immutable_files = files
+        .into_iter()
+        .map(|relative| immutable_root.join(relative))
+        .collect();
+    let immutable_directories = directories
+        .into_iter()
+        .map(|relative| immutable_root.join(relative))
+        .collect();
+    let authority = hell_testkit::WindowsStackRuntimeAuthority::new_until(
+        hell_testkit::WindowsStackRuntimeAuthority::input(
+            source_stack,
+            staged_stack,
+            hell_testkit::WindowsStackRuntimeAuthority::system_ghc_input(
+                input.source_ghc.shim_authority.clone(),
+                input.source_ghc.ghc_authority.clone(),
+                staged_ghc.ghc,
+                staged_ghc.strip,
+                immutable_root,
+                staged_ghc.ghc_bin,
+                staged_ghc.mingw_bin,
+            ),
+            input.target.to_path_buf(),
+            input.root.to_path_buf(),
+            stack_root,
+            temporary,
+        ),
+        immutable_files,
+        immutable_directories,
+        input.deadline,
+    )
+    .map_err(|error| format!("cannot bind staged Windows Stack runtime: {error}"))?;
+    let identity = same_file::Handle::from_path(input.root)
+        .map_err(|error| format!("cannot retain Windows Stack runtime identity: {error}"))?;
+    Ok((authority, identity))
+}
+
+#[cfg(windows)]
+fn stage_windows_stack_runtime(
+    target: &Path,
+    environment: &ProcessEnvironment,
+    ghc_authority: &super::native_environment::WindowsNativeGhcAuthority,
+    deadline: Instant,
+    cleanup_deadline: Instant,
+) -> Result<
+    (
+        WindowsStackRuntimeProtection,
+        hell_testkit::WindowsStackRuntimeAuthority,
+    ),
+    String,
+> {
+    let source_stack =
+        crate::process_environment::ExecutableSearchPath::from_environment(environment)?
+            .resolve(std::ffi::OsStr::new("stack"))?;
+    let captured_stack_root = environment
+        .required_singleton_value(StandardVariable::StackRoot, "STACK_ROOT")
+        .map_err(|error| format!("trusted Windows {error}"))?;
+    validate_windows_stack_root_configuration(captured_stack_root)?;
+    let source_ghc = discover_windows_ghc_distribution_until(ghc_authority, environment, deadline)?;
+    let environment_root = target.join("release-child-environment");
+    fs::create_dir_all(&environment_root)
+        .map_err(|error| format!("cannot create Windows Stack environment root: {error}"))?;
+    let sequence = WINDOWS_STACK_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let root = environment_root.join(format!("stack-{}-{sequence}", std::process::id()));
+    fs::create_dir(&root)
+        .map_err(|error| format!("cannot create Windows Stack runtime: {error}"))?;
+    let result = construct_windows_stack_runtime_until(&WindowsStackRuntimeStageInput {
+        target,
+        root: &root,
+        source_stack: &source_stack,
+        source_ghc: &source_ghc,
+        ghc_authority,
+        deadline,
+    });
+    match result {
+        Ok((authority, identity)) => Ok((
+            WindowsStackRuntimeProtection {
+                identity,
+                root,
+                closed: false,
+            },
+            authority,
+        )),
+        Err(primary) => {
+            let cleanup = cleanup_partial_windows_toolchain_until(&root, cleanup_deadline);
+            Err(match cleanup {
+                Ok(()) => primary,
+                Err(cleanup) => format!(
+                    "{primary}; additionally, partial Windows Stack runtime cleanup failed: {cleanup}"
+                ),
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
 fn establish_candidate_process_confinement(
-    input: CandidateConfinementInput<'_>,
+    input: &CandidateConfinementInput<'_>,
 ) -> Result<CandidateConfinement, String> {
-    let CandidateConfinementInput {
-        candidate_root,
-        oracle_root,
-        workspace_target: target,
-        output,
-        ..
-    } = input;
+    let candidate_root = input.candidate_root;
+    let oracle_root = input.oracle_root;
+    let target = input.workspace_target;
+    let output = input.output;
     let toolchain_envelope = WindowsToolchainConstructionEnvelope::new()?;
     let cargo = crate::command::resolve_cargo_executable()?;
     let rustup = crate::command::resolve_windows_rustup_authority(&cargo, candidate_root)?;
     let mut toolchain = stage_windows_toolchain(&rustup, candidate_root, toolchain_envelope)?;
+    let mut stack_runtime = None;
     let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let staged_cargo = toolchain.root.join("bin/cargo.exe");
         let staged_rustc = toolchain.root.join("bin/rustc.exe");
@@ -12096,36 +15222,72 @@ fn establish_candidate_process_confinement(
             .iter()
             .map(|directory| toolchain.root.join(directory))
             .collect();
-        let environment = ProcessEnvironment::from_process();
-        let trusted_parent_path = environment
+        let trusted_parent_path = input
+            .environment
             .value(StandardVariable::Path)
             .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?
             .to_os_string();
-        let trusted_parent_system_root = hell_testkit::capture_windows_standard_system_root()
-            .map_err(|error| format!("cannot bind trusted Windows SystemRoot: {error}"))?;
+        let trusted_parent_pathext = input
+            .environment
+            .value(StandardVariable::PathExt)
+            .ok_or_else(|| "trusted Windows parent PATHEXT is unavailable".to_owned())?;
+        let trusted_parent_system_root = input
+            .environment
+            .required_singleton_value(StandardVariable::SystemRoot, "SystemRoot")
+            .map_err(|error| format!("cannot bind trusted Windows {error}"))?
+            .to_os_string();
+        let git = hell_testkit::WindowsGitExecutableAuthority::resolve_until(
+            &trusted_parent_path,
+            trusted_parent_pathext,
+            &trusted_parent_system_root,
+            toolchain_envelope.construction_deadline,
+            toolchain_envelope.execution_deadline,
+        )
+        .map_err(|error| format!("cannot bind trusted Windows Git authority: {error}"))?;
+        let current_exe = std::env::current_exe()
+            .map_err(|error| format!("cannot resolve trusted driver: {error}"))?;
+        let restricted_adapter = windows_restricted_adapter_path(&current_exe)?;
+        let launcher = windows_confinement::protect_launcher(&current_exe)?;
+        let restricted_adapter = windows_confinement::protect_launcher(&restricted_adapter)?;
+        windows_confinement::protect_tree(candidate_root, false)?;
+        windows_confinement::protect_tree(oracle_root, false)?;
+        windows_confinement::protect_tree(output, false)?;
+        windows_confinement::protect_tree(target, true)?;
+        let (protection, stack_authority) = stage_windows_stack_runtime(
+            target,
+            input.environment,
+            input.windows_ghc,
+            toolchain_envelope.construction_deadline,
+            toolchain_envelope.completion_deadline,
+        )?;
+        stack_runtime = Some(protection);
         let toolchain_authority =
             hell_testkit::WindowsToolchainAuthority::new_from_promoted_inventory_until(
-                windows_toolchain_executable_authority(
-                    rustup.cargo_source(),
-                    rustup.cargo().canonical(),
-                    staged_cargo.clone(),
-                ),
-                windows_toolchain_executable_authority(
-                    rustup.rustc_source(),
-                    rustup.rustc().canonical(),
-                    staged_rustc.clone(),
-                ),
-                toolchain.root.clone(),
+                hell_testkit::WindowsToolchainAuthorityInput::new(
+                    windows_toolchain_executable_authority(
+                        rustup.cargo_source(),
+                        rustup.cargo().canonical(),
+                        staged_cargo.clone(),
+                    ),
+                    windows_toolchain_executable_authority(
+                        rustup.rustc_source(),
+                        rustup.rustc().canonical(),
+                        staged_rustc.clone(),
+                    ),
+                    toolchain.root.clone(),
+                    staged_inventory_directories,
+                    trusted_parent_path,
+                    trusted_parent_system_root,
+                )
+                .with_git_authority(git)
+                .with_stack_authority(stack_authority),
                 staged_inventory_files,
-                staged_inventory_directories,
-                trusted_parent_path,
-                trusted_parent_system_root,
                 toolchain_envelope.construction_deadline,
                 toolchain_envelope.execution_deadline,
             )
             .map_err(|error| {
                 format!(
-                    "cannot bind staged Windows Rust toolchain: sourceToolchain={:?} \
+                    "cannot bind staged Windows Rust/Stack toolchain: sourceToolchain={:?} \
              stagedToolchain={:?} cargoInvocation={:?} cargoIdentity={:?} \
              selectedCargo={:?} stagedCargo={staged_cargo:?} rustcInvocation={:?} \
              rustcIdentity={:?} selectedRustc={:?} stagedRustc={staged_rustc:?} \
@@ -12140,15 +15302,6 @@ fn establish_candidate_process_confinement(
                     rustup.rustc().canonical(),
                 )
             })?;
-        let current_exe = std::env::current_exe()
-            .map_err(|error| format!("cannot resolve trusted driver: {error}"))?;
-        let restricted_adapter = windows_restricted_adapter_path(&current_exe)?;
-        let launcher = windows_confinement::protect_launcher(&current_exe)?;
-        let restricted_adapter = windows_confinement::protect_launcher(&restricted_adapter)?;
-        windows_confinement::protect_tree(candidate_root, false)?;
-        windows_confinement::protect_tree(oracle_root, false)?;
-        windows_confinement::protect_tree(output, false)?;
-        windows_confinement::protect_tree(target, true)?;
         hell_testkit::CandidateLaunchPolicy::windows(
             hell_testkit::WindowsLaunchAuthorities::new(
                 launcher,
@@ -12163,27 +15316,51 @@ fn establish_candidate_process_confinement(
     let policy = match setup {
         Ok(Ok(policy)) => policy,
         Ok(Err(primary)) => {
+            let stack_cleanup = stack_runtime.as_mut().map_or(Ok(()), |runtime| {
+                runtime.cleanup_until_with_retry(
+                    toolchain_envelope.completion_deadline,
+                    "candidate policy setup",
+                )
+            });
             let cleanup = toolchain.cleanup_until_with_retry(
                 toolchain_envelope.completion_deadline,
                 "candidate policy setup",
             );
-            return Err(match cleanup {
-                Ok(()) => primary,
-                Err(cleanup) => format!(
-                    "{primary}; additionally, Windows candidate toolchain cleanup failed: {cleanup}"
+            return Err(match (stack_cleanup, cleanup) {
+                (Ok(()), Ok(())) => primary,
+                (Err(stack), Ok(())) => format!(
+                    "{primary}; additionally, Windows Stack runtime cleanup failed: {stack}"
+                ),
+                (Ok(()), Err(toolchain)) => format!(
+                    "{primary}; additionally, Windows candidate toolchain cleanup failed: {toolchain}"
+                ),
+                (Err(stack), Err(toolchain)) => format!(
+                    "{primary}; additionally, Windows Stack runtime cleanup failed: {stack}; additionally, Windows candidate toolchain cleanup failed: {toolchain}"
                 ),
             });
         }
         Err(_) => {
             let primary = "Windows candidate confinement setup panicked".to_owned();
+            let stack_cleanup = stack_runtime.as_mut().map_or(Ok(()), |runtime| {
+                runtime.cleanup_until_with_retry(
+                    toolchain_envelope.completion_deadline,
+                    "candidate policy setup panic",
+                )
+            });
             let cleanup = toolchain.cleanup_until_with_retry(
                 toolchain_envelope.completion_deadline,
                 "candidate policy setup panic",
             );
-            return Err(match cleanup {
-                Ok(()) => primary,
-                Err(cleanup) => format!(
-                    "{primary}; additionally, Windows candidate toolchain cleanup failed: {cleanup}"
+            return Err(match (stack_cleanup, cleanup) {
+                (Ok(()), Ok(())) => primary,
+                (Err(stack), Ok(())) => format!(
+                    "{primary}; additionally, Windows Stack runtime cleanup failed: {stack}"
+                ),
+                (Ok(()), Err(toolchain)) => format!(
+                    "{primary}; additionally, Windows candidate toolchain cleanup failed: {toolchain}"
+                ),
+                (Err(stack), Err(toolchain)) => format!(
+                    "{primary}; additionally, Windows Stack runtime cleanup failed: {stack}; additionally, Windows candidate toolchain cleanup failed: {toolchain}"
                 ),
             });
         }
@@ -12194,6 +15371,9 @@ fn establish_candidate_process_confinement(
         candidate_root: candidate_root.to_path_buf(),
         oracle_root: oracle_root.to_path_buf(),
         candidate_target: target.to_path_buf(),
+        stack_runtime: stack_runtime.ok_or_else(|| {
+            "Windows Stack runtime is absent after candidate policy construction".to_owned()
+        })?,
         toolchain,
         toolchain_completion_deadline: toolchain_envelope.completion_deadline,
     })
@@ -12281,26 +15461,40 @@ impl NightlyWindowsLaunchAuthority {
                 .value(StandardVariable::Path)
                 .ok_or_else(|| "trusted Windows parent PATH is unavailable".to_owned())?
                 .to_os_string();
+            let trusted_parent_pathext = environment
+                .value(StandardVariable::PathExt)
+                .ok_or_else(|| "trusted Windows parent PATHEXT is unavailable".to_owned())?;
             let trusted_parent_system_root =
                 hell_testkit::capture_windows_standard_system_root()
                     .map_err(|error| format!("cannot bind trusted Windows SystemRoot: {error}"))?;
+            let git = hell_testkit::WindowsGitExecutableAuthority::resolve_until(
+                &trusted_parent_path,
+                trusted_parent_pathext,
+                &trusted_parent_system_root,
+                deadline,
+                cleanup_deadline,
+            )
+            .map_err(|error| format!("cannot bind trusted Windows Git authority: {error}"))?;
             let toolchain =
                 hell_testkit::WindowsToolchainAuthority::new_from_promoted_inventory_until(
-                    windows_toolchain_executable_authority(
-                        rustup.cargo_source(),
-                        rustup.cargo().canonical(),
-                        staged_cargo.clone(),
-                    ),
-                    windows_toolchain_executable_authority(
-                        rustup.rustc_source(),
-                        rustup.rustc().canonical(),
-                        staged_rustc.clone(),
-                    ),
-                    protection.root.clone(),
+                    hell_testkit::WindowsToolchainAuthorityInput::new(
+                        windows_toolchain_executable_authority(
+                            rustup.cargo_source(),
+                            rustup.cargo().canonical(),
+                            staged_cargo.clone(),
+                        ),
+                        windows_toolchain_executable_authority(
+                            rustup.rustc_source(),
+                            rustup.rustc().canonical(),
+                            staged_rustc.clone(),
+                        ),
+                        protection.root.clone(),
+                        inventory_directories,
+                        trusted_parent_path,
+                        trusted_parent_system_root,
+                    )
+                    .with_git_authority(git),
                     inventory_files,
-                    inventory_directories,
-                    trusted_parent_path,
-                    trusted_parent_system_root,
                     deadline,
                     deadline,
                 )
@@ -12721,6 +15915,8 @@ struct CandidateConfinement {
     #[cfg(windows)]
     candidate_target: PathBuf,
     #[cfg(windows)]
+    stack_runtime: WindowsStackRuntimeProtection,
+    #[cfg(windows)]
     toolchain: WindowsToolchainProtection,
     #[cfg(windows)]
     toolchain_completion_deadline: Instant,
@@ -12748,8 +15944,22 @@ impl CandidateConfinement {
     #[cfg(windows)]
     fn close_windows_toolchain_until(&mut self, deadline: Instant) -> Result<(), String> {
         drop(self.policy.take());
-        self.toolchain
-            .cleanup_until_with_retry(deadline, "release toolchain")?;
+        let stack_cleanup = self
+            .stack_runtime
+            .cleanup_until_with_retry(deadline, "release runtime");
+        let toolchain_cleanup = self
+            .toolchain
+            .cleanup_until_with_retry(deadline, "release toolchain");
+        match (stack_cleanup, toolchain_cleanup) {
+            (Ok(()), Ok(())) => {}
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(()), Err(primary)) => return Err(primary),
+            (Err(primary), Err(cleanup)) => {
+                return Err(format!(
+                    "{primary}; additionally, Windows release toolchain cleanup failed: {cleanup}"
+                ));
+            }
+        }
         match fs::symlink_metadata(&self.toolchain.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!(
@@ -13844,7 +17054,7 @@ fn macos_directory_service_inventory_id(
             if observed.is_some() {
                 return Err(format!("{label} directory-service inventory is duplicated"));
             }
-            observed = Some(parse_posix_candidate_identity_output(
+            observed = Some(parse_macos_directory_service_identity_output(
                 fields[1],
                 &format!("{label} cleanup identity"),
             )?);
@@ -14098,7 +17308,7 @@ fn candidate_principal_mutation_succeeded(result: &CommandResult) -> bool {
 
 #[cfg(target_os = "linux")]
 fn allocate_linux_candidate_principal(
-    authorities: Arc<ResolvedPosixProcessAuthorities>,
+    authorities: &Arc<ResolvedPosixProcessAuthorities>,
     prefix: &str,
 ) -> Result<(String, String, u32, PosixPrincipalCleanup), String> {
     let useradd =
@@ -14108,8 +17318,156 @@ fn allocate_linux_candidate_principal(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_candidate_principal_is_available(
+    candidate: &LinuxPrincipalCandidate,
+) -> Result<bool, String> {
+    let deadline = posix_identity_query_deadline("Linux candidate reservation")?;
+    let id = candidate.id.to_string();
+    Ok(linux_nss_key_is_absent(
+        deadline,
+        "passwd",
+        &candidate.principal,
+        "candidate principal name",
+    )? && linux_nss_key_is_absent(deadline, "group", &candidate.group, "candidate group name")?
+        && linux_nss_key_is_absent(deadline, "passwd", &id, "candidate UID")?
+        && linux_nss_key_is_absent(deadline, "group", &id, "candidate GID")?)
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_candidate_group(
+    sudo: &Path,
+    groupadd: &crate::command::ResolvedStandardExecutable,
+    candidate: &LinuxPrincipalCandidate,
+    mut cleanup: PosixPrincipalCleanup,
+) -> Result<Option<PosixPrincipalCleanup>, String> {
+    let id = candidate.id.to_string();
+    let result = match candidate_principal_mutation(
+        sudo,
+        groupadd,
+        ["--gid", id.as_str(), candidate.group.as_str()],
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let deadline = posix_identity_query_deadline("Linux group creation observation")?;
+            if posix_group_gid(deadline, &candidate.group)? == Some(candidate.id) {
+                cleanup.group_created = true;
+            }
+            let cleanup_result = cleanup.finish();
+            return cleanup_result.and(Err(format!(
+                "Linux candidate group creation transport failed: {error}"
+            )));
+        }
+    };
+    if candidate_principal_mutation_succeeded(&result) {
+        cleanup.group_created = true;
+        let deadline = posix_identity_query_deadline("Linux group binding")?;
+        if posix_group_gid(deadline, &candidate.group)? != Some(candidate.id) {
+            return Err("Linux candidate group binding changed after creation".to_owned());
+        }
+        return Ok(Some(cleanup));
+    }
+    let deadline = posix_identity_query_deadline("Linux group creation result")?;
+    if posix_group_gid(deadline, &candidate.group)? == Some(candidate.id) {
+        cleanup.group_created = true;
+        cleanup.finish()?;
+        return Err(
+            "Linux candidate group creation reported failure after creating its bound group"
+                .to_owned(),
+        );
+    }
+    let collided =
+        !linux_nss_key_is_absent(deadline, "group", &id, "candidate GID after collision")?
+            || !linux_nss_key_is_absent(
+                deadline,
+                "group",
+                &candidate.group,
+                "candidate group name after collision",
+            )?;
+    cleanup.active = false;
+    if collided {
+        return Ok(None);
+    }
+    Err(format!(
+        "Linux candidate group creation failed without an NSS collision: status={:?}; stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_candidate_user(
+    sudo: &Path,
+    useradd: &crate::command::ResolvedStandardExecutable,
+    candidate: &LinuxPrincipalCandidate,
+    mut cleanup: PosixPrincipalCleanup,
+) -> Result<Option<PosixPrincipalCleanup>, String> {
+    let id = candidate.id.to_string();
+    let result = match candidate_principal_mutation(
+        sudo,
+        useradd,
+        [
+            "--uid",
+            id.as_str(),
+            "--gid",
+            candidate.group.as_str(),
+            "--no-user-group",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            candidate.principal.as_str(),
+        ],
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let deadline = posix_identity_query_deadline("Linux principal creation observation")?;
+            if posix_principal_uid(deadline, ReleasePlatform::LinuxX86_64, &candidate.principal)?
+                == Some(candidate.id)
+            {
+                cleanup.user_created = true;
+            }
+            let cleanup_result = cleanup.finish();
+            return cleanup_result.and(Err(format!(
+                "Linux candidate user creation transport failed: {error}"
+            )));
+        }
+    };
+    if candidate_principal_mutation_succeeded(&result) {
+        cleanup.user_created = true;
+        return Ok(Some(cleanup));
+    }
+    let deadline = posix_identity_query_deadline("Linux principal creation result")?;
+    if posix_principal_uid(deadline, ReleasePlatform::LinuxX86_64, &candidate.principal)?
+        == Some(candidate.id)
+    {
+        cleanup.user_created = true;
+        cleanup.finish()?;
+        return Err(
+            "Linux candidate user creation reported failure after creating its bound principal"
+                .to_owned(),
+        );
+    }
+    let collided =
+        !linux_nss_key_is_absent(deadline, "passwd", &id, "candidate UID after collision")?
+            || !linux_nss_key_is_absent(
+                deadline,
+                "passwd",
+                &candidate.principal,
+                "candidate principal name after collision",
+            )?;
+    cleanup.finish()?;
+    if collided {
+        return Ok(None);
+    }
+    Err(format!(
+        "Linux candidate user creation failed without an NSS collision: status={:?}; stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn allocate_linux_candidate_principal_with_user_tool(
-    authorities: Arc<ResolvedPosixProcessAuthorities>,
+    authorities: &Arc<ResolvedPosixProcessAuthorities>,
     prefix: &str,
     useradd: &crate::command::ResolvedStandardExecutable,
     mut attempted: Option<&mut Option<LinuxPrincipalCandidate>>,
@@ -14133,180 +17491,55 @@ fn allocate_linux_candidate_principal_with_user_tool(
         let sequence = allocation
             .checked_add(u64::from(offset))
             .ok_or_else(|| "Linux principal name sequence overflowed".to_owned())?;
-        let principal = format!("{prefix}{}x{sequence}", std::process::id());
-        if principal.len() > 31
-            || !principal
+        let candidate = LinuxPrincipalCandidate {
+            principal: format!("{prefix}{}x{sequence}", std::process::id()),
+            group: String::new(),
+            id,
+        };
+        if candidate.principal.len() > 31
+            || !candidate
+                .principal
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         {
             return Err("Linux candidate principal name is outside policy".to_owned());
         }
-        let group = principal.clone();
-        let id_text = id.to_string();
-        let reservation_deadline = posix_identity_query_deadline("Linux candidate reservation")?;
-        if !linux_nss_key_is_absent(
-            reservation_deadline,
-            "passwd",
-            &principal,
-            "candidate principal name",
-        )? || !linux_nss_key_is_absent(
-            reservation_deadline,
-            "group",
-            &group,
-            "candidate group name",
-        )? || !linux_nss_key_is_absent(
-            reservation_deadline,
-            "passwd",
-            &id_text,
-            "candidate UID",
-        )? || !linux_nss_key_is_absent(reservation_deadline, "group", &id_text, "candidate GID")?
-        {
+        let candidate = LinuxPrincipalCandidate {
+            group: candidate.principal.clone(),
+            ..candidate
+        };
+        if !linux_candidate_principal_is_available(&candidate)? {
             continue;
         }
         if let Some(attempted) = attempted.as_deref_mut() {
-            *attempted = Some(LinuxPrincipalCandidate {
-                principal: principal.clone(),
-                group: group.clone(),
-                id,
-            });
+            *attempted = Some(candidate.clone());
         }
-        let mut cleanup = PosixPrincipalCleanup::new(
+        let cleanup = PosixPrincipalCleanup::new(
             ReleasePlatform::LinuxX86_64,
-            Arc::clone(&authorities),
-            principal.clone(),
-            group.clone(),
-            Some(id),
-            Some(id),
+            Arc::clone(authorities),
+            candidate.principal.clone(),
+            candidate.group.clone(),
+            Some(candidate.id),
+            Some(candidate.id),
         );
-        let group_result = match candidate_principal_mutation(
-            sudo,
-            &groupadd,
-            ["--gid", id_text.as_str(), group.as_str()],
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                let observation_deadline =
-                    posix_identity_query_deadline("Linux group creation observation")?;
-                if posix_group_gid(observation_deadline, &group)? == Some(id) {
-                    cleanup.group_created = true;
-                }
-                let cleanup_result = cleanup.finish();
-                return cleanup_result.and(Err(format!(
-                    "Linux candidate group creation transport failed: {error}"
-                )));
-            }
+        let Some(cleanup) = create_linux_candidate_group(sudo, &groupadd, &candidate, cleanup)?
+        else {
+            continue;
         };
-        if !candidate_principal_mutation_succeeded(&group_result) {
-            let observation_deadline =
-                posix_identity_query_deadline("Linux group creation result")?;
-            if posix_group_gid(observation_deadline, &group)? == Some(id) {
-                cleanup.group_created = true;
-                cleanup.finish()?;
-                return Err("Linux candidate group creation reported failure after creating its bound group".to_owned());
-            }
-            let collided = !linux_nss_key_is_absent(
-                observation_deadline,
-                "group",
-                &id_text,
-                "candidate GID after collision",
-            )? || !linux_nss_key_is_absent(
-                observation_deadline,
-                "group",
-                &group,
-                "candidate group name after collision",
-            )?;
-            if collided {
-                cleanup.active = false;
-                continue;
-            }
-            cleanup.active = false;
-            return Err(format!(
-                "Linux candidate group creation failed without an NSS collision: status={:?}; stderr={}",
-                group_result.status.code(),
-                String::from_utf8_lossy(&group_result.stderr)
-            ));
-        }
-        cleanup.group_created = true;
-        let group_binding_deadline = posix_identity_query_deadline("Linux group binding")?;
-        if posix_group_gid(group_binding_deadline, &group)? != Some(id) {
-            return Err("Linux candidate group binding changed after creation".to_owned());
-        }
-        let user_result = match candidate_principal_mutation(
-            sudo,
-            useradd,
-            [
-                "--uid",
-                id_text.as_str(),
-                "--gid",
-                group.as_str(),
-                "--no-user-group",
-                "--no-create-home",
-                "--shell",
-                "/usr/sbin/nologin",
-                principal.as_str(),
-            ],
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                let observation_deadline =
-                    posix_identity_query_deadline("Linux principal creation observation")?;
-                if posix_principal_uid(
-                    observation_deadline,
-                    ReleasePlatform::LinuxX86_64,
-                    &principal,
-                )? == Some(id)
-                {
-                    cleanup.user_created = true;
-                }
-                let cleanup_result = cleanup.finish();
-                return cleanup_result.and(Err(format!(
-                    "Linux candidate user creation transport failed: {error}"
-                )));
-            }
+        let Some(cleanup) = create_linux_candidate_user(sudo, useradd, &candidate, cleanup)? else {
+            continue;
         };
-        if !candidate_principal_mutation_succeeded(&user_result) {
-            let observation_deadline =
-                posix_identity_query_deadline("Linux principal creation result")?;
-            if posix_principal_uid(
-                observation_deadline,
-                ReleasePlatform::LinuxX86_64,
-                &principal,
-            )? == Some(id)
-            {
-                cleanup.user_created = true;
-                cleanup.finish()?;
-                return Err("Linux candidate user creation reported failure after creating its bound principal".to_owned());
-            }
-            let collided = !linux_nss_key_is_absent(
-                observation_deadline,
-                "passwd",
-                &id_text,
-                "candidate UID after collision",
-            )? || !linux_nss_key_is_absent(
-                observation_deadline,
-                "passwd",
-                &principal,
-                "candidate principal name after collision",
-            )?;
-            cleanup.finish()?;
-            if collided {
-                continue;
-            }
-            return Err(format!(
-                "Linux candidate user creation failed without an NSS collision: status={:?}; stderr={}",
-                user_result.status.code(),
-                String::from_utf8_lossy(&user_result.stderr)
-            ));
-        }
-        cleanup.user_created = true;
         let binding_deadline = posix_identity_query_deadline("Linux candidate binding")?;
-        if posix_principal_uid(binding_deadline, ReleasePlatform::LinuxX86_64, &principal)?
-            != Some(id)
-            || posix_group_gid(binding_deadline, &group)? != Some(id)
+        if posix_principal_uid(
+            binding_deadline,
+            ReleasePlatform::LinuxX86_64,
+            &candidate.principal,
+        )? != Some(candidate.id)
+            || posix_group_gid(binding_deadline, &candidate.group)? != Some(candidate.id)
         {
             return Err("Linux candidate principal binding changed after creation".to_owned());
         }
-        return Ok((principal, group, id, cleanup));
+        return Ok((candidate.principal, candidate.group, candidate.id, cleanup));
     }
     Err("Linux principal allocation range is exhausted".to_owned())
 }
@@ -14323,7 +17556,7 @@ fn verify_linux_candidate_principal_rollback(sudo: &Path) -> Result<(), String> 
     .map_err(|error| format!("cannot bind injected Linux user-creation failure: {error}"))?;
     let mut attempted = None;
     let error = match allocate_linux_candidate_principal_with_user_tool(
-        authorities,
+        &authorities,
         "hellrbk",
         &rejecting_useradd,
         Some(&mut attempted),
@@ -14362,7 +17595,7 @@ fn verify_linux_candidate_principal_rollback(sudo: &Path) -> Result<(), String> 
 
 #[cfg(target_os = "macos")]
 fn allocate_linux_candidate_principal(
-    _authorities: Arc<ResolvedPosixProcessAuthorities>,
+    _authorities: &Arc<ResolvedPosixProcessAuthorities>,
     _prefix: &str,
 ) -> Result<(String, String, u32, PosixPrincipalCleanup), String> {
     Err("Linux candidate principal allocation selected on macOS".to_owned())
@@ -14393,6 +17626,61 @@ where
         .checked_add(Duration::from_secs(30))
         .ok_or_else(|| "trusted confinement command deadline overflowed".to_owned())?;
     trusted_tool_status_before(deadline, sudo, tool, arguments)
+}
+
+#[cfg(unix)]
+fn trusted_tool_status_maybe_before<I, S>(
+    deadline: Option<Instant>,
+    sudo: &Path,
+    tool: &crate::command::ResolvedStandardExecutable,
+    arguments: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    match deadline {
+        Some(deadline) => trusted_tool_status_before(deadline, sudo, tool, arguments),
+        None => trusted_tool_status(sudo, tool, arguments),
+    }
+}
+
+#[cfg(unix)]
+fn trusted_tool_status_maybe_until<I, S>(
+    deadlines: Option<(Instant, Instant)>,
+    sudo: &Path,
+    tool: &crate::command::ResolvedStandardExecutable,
+    arguments: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let Some((execution, completion)) = deadlines else {
+        return trusted_tool_status(sudo, tool, arguments);
+    };
+    let remaining = execution
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "trusted confinement command deadline expired before launch".to_owned())?;
+    tool.revalidate()
+        .map_err(|error| format!("trusted confinement tool validation failed: {error}"))?;
+    let remaining = execution
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "trusted confinement command deadline expired after validation".to_owned())?
+        .min(remaining);
+    let (progress, _receiver) = hell_testkit::SupervisedProgressObserver::bounded(1);
+    let result = CommandSpec::new(sudo.as_os_str(), remaining)
+        .arguments(["-n", "--"])
+        .argument(tool.invocation_path())
+        .arguments(arguments)
+        .run_until(execution, completion, progress)
+        .map_err(|error| format!("trusted confinement command failed: {error}"))?;
+    if !result.status.success() || result.timed_out {
+        return Err("trusted confinement command did not succeed".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -14465,9 +17753,32 @@ fn exact_posix_candidate_identity_output(
     principal: &str,
     label: &str,
 ) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .ok_or_else(|| "candidate identity query deadline overflowed".to_owned())?;
+    exact_posix_candidate_identity_output_before(deadline, id, option, principal, label)
+}
+
+#[cfg(unix)]
+fn exact_posix_candidate_identity_output_before(
+    deadline: Instant,
+    id: &crate::command::ResolvedStandardExecutable,
+    option: &str,
+    principal: &str,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| format!("candidate {label} query deadline expired before validation"))?;
     id.revalidate()
         .map_err(|error| format!("trusted candidate identity validation failed: {error}"))?;
-    let result = CommandSpec::new(id.invocation_path().as_os_str(), Duration::from_secs(30))
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| format!("candidate {label} query deadline expired before launch"))?
+        .min(remaining);
+    let result = CommandSpec::new(id.invocation_path().as_os_str(), remaining)
         .arguments([option, principal])
         .run()
         .map_err(|error| format!("trusted candidate identity command failed: {error}"))?;
@@ -14498,6 +17809,44 @@ fn parse_posix_candidate_identity_output(output: &[u8], label: &str) -> Result<u
         return Err(format!("{label} is not canonically encoded"));
     }
     Ok(identity)
+}
+
+#[cfg(unix)]
+fn parse_macos_directory_service_identity_output(
+    output: &[u8],
+    label: &str,
+) -> Result<u32, String> {
+    if let Ok(identity) = parse_posix_candidate_identity_output(output, label) {
+        return Ok(identity);
+    }
+    let text = std::str::from_utf8(output).map_err(|_| format!("{label} is not UTF-8"))?;
+    let identity = text
+        .parse::<i32>()
+        .map_err(|_| format!("{label} is not one Darwin numeric identity"))?;
+    if identity >= 0 || text != identity.to_string() {
+        return Err(format!("{label} is not canonically encoded"));
+    }
+    Ok(u32::from_ne_bytes(identity.to_ne_bytes()))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_posix_candidate_group_name_output(output: &[u8], label: &str) -> Result<String, String> {
+    const POSIX_GROUP_NAME_BYTE_LIMIT: usize = 255;
+
+    let bytes = output
+        .strip_suffix(b"\n")
+        .ok_or_else(|| format!("{label} is not newline-terminated"))?;
+    if bytes.is_empty()
+        || bytes.len() > POSIX_GROUP_NAME_BYTE_LIMIT
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!("{label} is not one bounded canonical group name"));
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| format!("{label} is not UTF-8"))
 }
 
 #[cfg(unix)]
@@ -15732,12 +19081,13 @@ fn verify_candidate_remover_error_ordering() -> Result<(), String> {
     let composite = combine_candidate_target_verifier_results(
         Err("primary".to_owned()),
         Err("cleanup".to_owned()),
+        Err("cargo-adapter".to_owned()),
         Err("absence".to_owned()),
         Err("fixture".to_owned()),
     )
     .expect_err("composite verifier failures must remain observable");
     if composite
-        != "candidate target verifier: primary; candidate target verifier lifecycle cleanup: cleanup; candidate target verifier transient absence: absence; candidate target verifier fixture cleanup: fixture"
+        != "candidate target verifier: primary; candidate target verifier lifecycle cleanup: cleanup; candidate target verifier Cargo-adapter cleanup: cargo-adapter; candidate target verifier transient absence: absence; candidate target verifier fixture cleanup: fixture"
     {
         return Err("candidate remover composite error ordering changed".to_owned());
     }
@@ -15782,6 +19132,7 @@ fn verify_candidate_remover_escape(
         .map_err(|error| format!("cannot create remover symlink escape fixture: {error}"))?;
     fs::hard_link(&external, root.join("nested/peer"))
         .map_err(|error| format!("cannot create remover hard-link fixture: {error}"))?;
+    #[cfg(target_os = "macos")]
     seed_macos_remover_acl(root)?;
     run_posix_candidate_target_verifier_remover(&posix_verifier_removal_arguments(parent, root)?)?;
     if root.exists()
@@ -15798,21 +19149,16 @@ fn verify_candidate_remover_escape(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn seed_macos_remover_acl(root: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let acl = CommandSpec::new("/bin/chmod", Duration::from_secs(30))
-            .arguments(["+a", "everyone allow write"])
-            .argument(root.join("nested"))
-            .run()
-            .map_err(|error| format!("cannot seed remover ACL fixture: {error}"))?;
-        if !acl.status.success() || acl.timed_out {
-            return Err("macOS remover ACL fixture was not established".to_owned());
-        }
+    let acl = CommandSpec::new("/bin/chmod", Duration::from_secs(30))
+        .arguments(["+a", "everyone allow write"])
+        .argument(root.join("nested"))
+        .run()
+        .map_err(|error| format!("cannot seed remover ACL fixture: {error}"))?;
+    if !acl.status.success() || acl.timed_out {
+        return Err("macOS remover ACL fixture was not established".to_owned());
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = root;
     Ok(())
 }
 
@@ -16513,17 +19859,12 @@ fn base_final_platform_inventory() -> BTreeSet<&'static str> {
     ])
 }
 
-fn expected_final_platform_inventory(_platform: ReleasePlatform) -> BTreeSet<&'static str> {
-    let expected = base_final_platform_inventory();
-    #[cfg(target_os = "linux")]
-    let expected = {
-        let mut expected = expected;
-        if _platform == ReleasePlatform::LinuxX86_64 {
-            expected.insert("dependency-policy.json");
-            expected.insert("mutation-report.json");
-        }
-        expected
-    };
+fn expected_final_platform_inventory(platform: ReleasePlatform) -> BTreeSet<&'static str> {
+    let mut expected = base_final_platform_inventory();
+    if cfg!(target_os = "linux") && platform == ReleasePlatform::LinuxX86_64 {
+        expected.insert("dependency-policy.json");
+        expected.insert("mutation-report.json");
+    }
     expected
 }
 
@@ -18442,24 +21783,62 @@ fn command_gate(
 }
 
 const COMMAND_FAILURE_OUTPUT_BYTE_LIMIT: usize = 2 * 1024;
+const COMMAND_FAILURE_TRUNCATION_MARKER: &str = "\n<TRUNCATED:MIDDLE>\n";
 
-fn bounded_command_output(bytes: &[u8]) -> (String, bool) {
+struct BoundedCommandOutput {
+    detail: String,
+    truncated: bool,
+    prefix_utf8_bytes: usize,
+    suffix_utf8_bytes: usize,
+    omitted_utf8_bytes: usize,
+}
+
+fn bounded_command_output(bytes: &[u8]) -> BoundedCommandOutput {
     let rendered = String::from_utf8_lossy(bytes);
     if rendered.len() <= COMMAND_FAILURE_OUTPUT_BYTE_LIMIT {
-        return (rendered.into_owned(), false);
+        let prefix_utf8_bytes = rendered.len();
+        return BoundedCommandOutput {
+            detail: rendered.into_owned(),
+            truncated: false,
+            prefix_utf8_bytes,
+            suffix_utf8_bytes: 0,
+            omitted_utf8_bytes: 0,
+        };
     }
-    let boundary = (0..=COMMAND_FAILURE_OUTPUT_BYTE_LIMIT)
+    let retained_limit = COMMAND_FAILURE_OUTPUT_BYTE_LIMIT
+        .checked_sub(COMMAND_FAILURE_TRUNCATION_MARKER.len())
+        .expect("command failure marker must fit its detail bound");
+    let prefix_limit = retained_limit / 2;
+    let suffix_limit = retained_limit.saturating_sub(prefix_limit);
+    let prefix_end = (0..=prefix_limit)
         .rev()
         .find(|boundary| rendered.is_char_boundary(*boundary))
         .unwrap_or_default();
-    (rendered[..boundary].to_owned(), true)
+    let suffix_lower_bound = rendered.len().saturating_sub(suffix_limit);
+    let suffix_start = (suffix_lower_bound..=rendered.len())
+        .find(|boundary| rendered.is_char_boundary(*boundary))
+        .unwrap_or(rendered.len());
+    let prefix = &rendered[..prefix_end];
+    let suffix = &rendered[suffix_start..];
+    let omitted_utf8_bytes = suffix_start.saturating_sub(prefix_end);
+    let mut detail = String::with_capacity(COMMAND_FAILURE_OUTPUT_BYTE_LIMIT);
+    detail.push_str(prefix);
+    detail.push_str(COMMAND_FAILURE_TRUNCATION_MARKER);
+    detail.push_str(suffix);
+    BoundedCommandOutput {
+        detail,
+        truncated: true,
+        prefix_utf8_bytes: prefix.len(),
+        suffix_utf8_bytes: suffix.len(),
+        omitted_utf8_bytes,
+    }
 }
 
 fn command_failure_detail(name: &str, result: &CommandResult) -> String {
-    let (stdout, stdout_detail_truncated) = bounded_command_output(&result.stdout);
-    let (stderr, stderr_detail_truncated) = bounded_command_output(&result.stderr);
+    let stdout = bounded_command_output(&result.stdout);
+    let stderr = bounded_command_output(&result.stderr);
     format!(
-        "release gate {name} failed: status={:?}, timedOut={}, stdoutBytes={}, stderrBytes={}, stdoutSha256={}, stderrSha256={}, stdoutTruncated={}, stderrTruncated={}, stdoutDetailTruncated={stdout_detail_truncated}, stderrDetailTruncated={stderr_detail_truncated}, stdout={stdout:?}, stderr={stderr:?}",
+        "release gate {name} failed: status={:?}, timedOut={}, stdoutBytes={}, stderrBytes={}, stdoutSha256={}, stderrSha256={}, stdoutTruncated={}, stderrTruncated={}, stdoutDetailTruncated={}, stdoutDetailPrefixUtf8Bytes={}, stdoutDetailSuffixUtf8Bytes={}, stdoutDetailOmittedUtf8Bytes={}, stderrDetailTruncated={}, stderrDetailPrefixUtf8Bytes={}, stderrDetailSuffixUtf8Bytes={}, stderrDetailOmittedUtf8Bytes={}, stdout={:?}, stderr={:?}",
         result.status.code(),
         result.timed_out,
         result.stdout_bytes,
@@ -18468,6 +21847,16 @@ fn command_failure_detail(name: &str, result: &CommandResult) -> String {
         result.stderr_sha256.hex(),
         result.stdout_truncated,
         result.stderr_truncated,
+        stdout.truncated,
+        stdout.prefix_utf8_bytes,
+        stdout.suffix_utf8_bytes,
+        stdout.omitted_utf8_bytes,
+        stderr.truncated,
+        stderr.prefix_utf8_bytes,
+        stderr.suffix_utf8_bytes,
+        stderr.omitted_utf8_bytes,
+        stdout.detail,
+        stderr.detail,
     )
 }
 
@@ -18478,8 +21867,8 @@ fn command_evidence(
     arguments: &[String],
     result: &CommandResult,
 ) -> JsonValue {
-    let (stdout, stdout_detail_truncated) = bounded_command_output(&result.stdout);
-    let (stderr, stderr_detail_truncated) = bounded_command_output(&result.stderr);
+    let stdout = bounded_command_output(&result.stdout);
+    let stderr = bounded_command_output(&result.stderr);
     let mut evidence = BTreeMap::from([
         (
             "arguments".to_owned(),
@@ -18508,10 +21897,22 @@ fn command_evidence(
             }),
         ),
         ("stderrBytes".to_owned(), number(result.stderr_bytes)),
-        ("stderrDetail".to_owned(), string(&stderr)),
+        ("stderrDetail".to_owned(), string(&stderr.detail)),
         (
             "stderrDetailTruncated".to_owned(),
-            JsonValue::Bool(stderr_detail_truncated),
+            JsonValue::Bool(stderr.truncated),
+        ),
+        (
+            "stderrDetailPrefixUtf8Bytes".to_owned(),
+            number(u64::try_from(stderr.prefix_utf8_bytes).unwrap_or(u64::MAX)),
+        ),
+        (
+            "stderrDetailSuffixUtf8Bytes".to_owned(),
+            number(u64::try_from(stderr.suffix_utf8_bytes).unwrap_or(u64::MAX)),
+        ),
+        (
+            "stderrDetailOmittedUtf8Bytes".to_owned(),
+            number(u64::try_from(stderr.omitted_utf8_bytes).unwrap_or(u64::MAX)),
         ),
         (
             "stderrSha256".to_owned(),
@@ -18522,10 +21923,22 @@ fn command_evidence(
             JsonValue::Bool(result.stderr_truncated),
         ),
         ("stdoutBytes".to_owned(), number(result.stdout_bytes)),
-        ("stdoutDetail".to_owned(), string(&stdout)),
+        ("stdoutDetail".to_owned(), string(&stdout.detail)),
         (
             "stdoutDetailTruncated".to_owned(),
-            JsonValue::Bool(stdout_detail_truncated),
+            JsonValue::Bool(stdout.truncated),
+        ),
+        (
+            "stdoutDetailPrefixUtf8Bytes".to_owned(),
+            number(u64::try_from(stdout.prefix_utf8_bytes).unwrap_or(u64::MAX)),
+        ),
+        (
+            "stdoutDetailSuffixUtf8Bytes".to_owned(),
+            number(u64::try_from(stdout.suffix_utf8_bytes).unwrap_or(u64::MAX)),
+        ),
+        (
+            "stdoutDetailOmittedUtf8Bytes".to_owned(),
+            number(u64::try_from(stdout.omitted_utf8_bytes).unwrap_or(u64::MAX)),
         ),
         (
             "stdoutSha256".to_owned(),
@@ -18552,11 +21965,13 @@ fn command_evidence(
 #[cfg(any(unix, windows))]
 fn platform_failure_fixture_bytes(label: &[u8]) -> Vec<u8> {
     let limit = hell_testkit::complete_capture_byte_limit_for_integration();
-    let mut bytes = Vec::with_capacity(limit.saturating_add(label.len()).saturating_add(3));
+    let mut bytes = Vec::with_capacity(limit.saturating_add(label.len()).saturating_add(8));
     while bytes.len() < limit {
         let remaining = limit - bytes.len();
         bytes.extend_from_slice(&label[..label.len().min(remaining)]);
     }
+    bytes.extend_from_slice(b"tail-");
+    bytes.extend_from_slice(label);
     bytes.extend_from_slice("é".as_bytes());
     bytes.push(b'\n');
     bytes
@@ -18618,6 +22033,8 @@ fn validate_platform_failure_report(
     let receipt = json_member(evidence, "deterministic-command-failure")?.object()?;
     let stdout = platform_failure_fixture_bytes(b"out-");
     let stderr = platform_failure_fixture_bytes(b"err-");
+    let stdout_detail = json_member(receipt, "stdoutDetail")?.string()?;
+    let stderr_detail = json_member(receipt, "stderrDetail")?.string()?;
     if json_member(receipt, "schemaVersion")?.number()? != 2
         || json_member(receipt, "statusCode")?.number()? != 23
         || json_member(receipt, "timedOut")?.boolean()?
@@ -18629,6 +22046,13 @@ fn validate_platform_failure_report(
             != hell_testkit::sha256_bytes(&stdout).hex()
         || json_member(receipt, "stderrSha256")?.string()?
             != hell_testkit::sha256_bytes(&stderr).hex()
+        || !stdout_detail.contains(COMMAND_FAILURE_TRUNCATION_MARKER)
+        || !stderr_detail.contains(COMMAND_FAILURE_TRUNCATION_MARKER)
+        || !stdout_detail.ends_with("tail-out-é\n")
+        || !stderr_detail.ends_with("tail-err-é\n")
+        || stdout_detail.len() > COMMAND_FAILURE_OUTPUT_BYTE_LIMIT
+        || stderr_detail.len() > COMMAND_FAILURE_OUTPUT_BYTE_LIMIT
+        || !primary.contains("tail-err-é")
         || [
             "stdoutTruncated",
             "stderrTruncated",
@@ -18637,6 +22061,21 @@ fn validate_platform_failure_report(
         ]
         .into_iter()
         .any(|field| json_member(receipt, field).and_then(JsonValue::boolean) != Ok(true))
+        || [
+            "stdoutDetailPrefixUtf8Bytes",
+            "stdoutDetailSuffixUtf8Bytes",
+            "stdoutDetailOmittedUtf8Bytes",
+            "stderrDetailPrefixUtf8Bytes",
+            "stderrDetailSuffixUtf8Bytes",
+            "stderrDetailOmittedUtf8Bytes",
+        ]
+        .into_iter()
+        .any(|field| {
+            !matches!(
+                json_member(receipt, field).and_then(JsonValue::number),
+                Ok(value) if value != 0
+            )
+        })
     {
         return Err("platform failure report command receipt differs".to_owned());
     }
@@ -19065,21 +22504,69 @@ mod tests {
 
     #[test]
     fn suite_gate_preserves_repository_policy_failure_detail() {
+        static FIXTURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const POLICY_DETAIL: &str =
+            "tracked text file lacks a trailing newline: fixtures/policy-breach.toml";
+        const PRIMARY: &str = "release gate verify failed: Policy; failure[0]: \"release-assurance-policy: tracked text file lacks a trailing newline: fixtures/policy-breach.toml\"";
+
+        let candidate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .expect("canonicalize protected candidate checkout");
+        let sequence = FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fixture = std::env::temp_dir().join(format!(
+            "hell-ci-suite-gate-report-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&fixture).expect("create suite-gate report fixture");
+        let output = fixture.join("output");
+        std::fs::create_dir(&output).expect("create writable suite-gate report output");
+        let output =
+            std::fs::canonicalize(output).expect("canonicalize writable suite-gate report output");
+
         let mut gates = std::collections::BTreeMap::new();
         let mut evidence = std::collections::BTreeMap::new();
-        let error = suite_gate(
+        let result = suite_gate(
             "verify",
-            std::path::Path::new("candidate"),
-            std::path::Path::new("output"),
+            &candidate,
+            &output,
             synthetic_repository_policy_failure,
             &mut gates,
             &mut evidence,
-        )
-        .unwrap_err();
+        );
+        let persisted = std::fs::read(output.join("platform-failure-report.json"));
+        std::fs::remove_dir_all(&fixture).expect("remove suite-gate report fixture");
 
+        let error = result.expect_err("synthetic repository policy failure must be retained");
+        let persisted = persisted.expect("read persisted platform failure report");
+        assert_eq!(persisted.last(), Some(&b'\n'));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&persisted).expect("parse persisted platform failure report");
+
+        assert_eq!(error, PRIMARY);
         assert_eq!(
-            error,
-            "release gate verify failed: Policy; failure[0]: \"release-assurance-policy: tracked text file lacks a trailing newline: fixtures/policy-breach.toml\""
+            persisted,
+            serde_json::json!({
+                "detail": PRIMARY,
+                "failedGate": "verify",
+                "report": {
+                    "evidence": [],
+                    "failures": [format!("release-assurance-policy: {POLICY_DETAIL}")],
+                    "lifecycle": "complete",
+                    "passed": false,
+                    "schemaVersion": 1,
+                    "steps": [{
+                        "detail": POLICY_DETAIL,
+                        "durationMillis": 0,
+                        "name": "release-assurance-policy",
+                        "status": "failed"
+                    }],
+                    "suite": "verify"
+                },
+                "schemaVersion": 1,
+                "state": "failed"
+            })
         );
         assert!(gates.is_empty());
         assert!(evidence.is_empty());
@@ -20971,5 +24458,202 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
         acquisition.cleanup().unwrap();
         assert!(!directory.exists());
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn search_only_ancestor_fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sequence =
+            super::POSIX_ADAPTER_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "hell-search-only-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+        let ancestor = root.join("ancestor");
+        let leaf = ancestor.join("leaf");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        (root, leaf)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn local_search_only_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_only_ancestor_transition_preserves_non_listability_and_leaf_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (root, leaf) = search_only_ancestor_fixture("positive");
+        let metadata = std::fs::metadata(&root).unwrap();
+        let candidate_uid = metadata.uid().saturating_add(10_000);
+        let candidate_groups = [metadata.gid().saturating_add(10_000)];
+        let identity = super::posix_object_identity(&root).unwrap();
+        let active_mode =
+            super::posix_search_only_transition_mode(&identity, candidate_uid, &candidate_groups)
+                .unwrap();
+        let active_identity = super::PosixObjectIdentity {
+            mode: active_mode,
+            ..identity
+        };
+
+        assert_eq!(active_mode, 0o701);
+        assert!(super::posix_principal_has_search_only_access(
+            &active_identity,
+            candidate_uid,
+            &candidate_groups
+        ));
+        assert_eq!(
+            std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o7777,
+            0o2755
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_only_ancestor_transition_rejects_path_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let (root, leaf) = search_only_ancestor_fixture("substitution");
+        let parked = root.with_extension("parked");
+        let metadata = std::fs::metadata(&root).unwrap();
+        let candidate_uid = std::os::unix::fs::MetadataExt::uid(&metadata).saturating_add(10_000);
+        let candidate_groups =
+            [std::os::unix::fs::MetadataExt::gid(&metadata).saturating_add(10_000)];
+        let mut authority = super::PosixSearchOnlyAncestorAuthority::bind(&leaf, &root).unwrap();
+        std::fs::rename(&root, &parked).unwrap();
+        symlink(&parked, &root).unwrap();
+
+        let error = authority
+            .transition(candidate_uid, &candidate_groups, local_search_only_mode)
+            .unwrap_err();
+        assert!(error.contains("ancestor identity or mode changed"));
+
+        std::fs::remove_file(root).unwrap();
+        std::fs::remove_dir_all(parked).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_only_ancestor_restoration_is_deepest_first_and_exact() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (root, leaf) = search_only_ancestor_fixture("restoration");
+        let ancestor = root.join("ancestor");
+        let metadata = std::fs::metadata(&root).unwrap();
+        let candidate_uid = metadata.uid().saturating_add(10_000);
+        let candidate_groups = [metadata.gid().saturating_add(10_000)];
+        let mut authority = super::PosixSearchOnlyAncestorAuthority::bind(&leaf, &root).unwrap();
+        for entry in authority
+            .ancestors
+            .iter_mut()
+            .filter(|entry| entry.path == root || entry.path == ancestor)
+        {
+            let active_mode = super::posix_search_only_transition_mode(
+                &entry.identity,
+                candidate_uid,
+                &candidate_groups,
+            )
+            .unwrap();
+            local_search_only_mode(&entry.path, active_mode).unwrap();
+            entry.active_mode = Some(active_mode);
+        }
+        let mut restored = Vec::new();
+        authority
+            .restore(|path, mode| {
+                restored.push(path.to_path_buf());
+                local_search_only_mode(path, mode)
+            })
+            .unwrap();
+
+        assert_eq!(restored, vec![ancestor.clone(), root.clone()]);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&ancestor).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o7777,
+            0o2755
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_only_ancestor_cleanup_rejects_mode_drift_and_reports_chmod_failure() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (root, leaf) = search_only_ancestor_fixture("cleanup-negative");
+        let metadata = std::fs::metadata(&root).unwrap();
+        let candidate_uid = metadata.uid().saturating_add(10_000);
+        let candidate_groups = [metadata.gid().saturating_add(10_000)];
+        let mut authority = super::PosixSearchOnlyAncestorAuthority::bind(&leaf, &root).unwrap();
+        for entry in authority
+            .ancestors
+            .iter_mut()
+            .filter(|entry| entry.path == root || entry.path == root.join("ancestor"))
+        {
+            let active_mode = super::posix_search_only_transition_mode(
+                &entry.identity,
+                candidate_uid,
+                &candidate_groups,
+            )
+            .unwrap();
+            local_search_only_mode(&entry.path, active_mode).unwrap();
+            entry.active_mode = Some(active_mode);
+        }
+        std::fs::set_permissions(
+            root.join("ancestor"),
+            std::fs::Permissions::from_mode(0o703),
+        )
+        .unwrap();
+        let error = authority
+            .restore(|path, mode| {
+                if path == root {
+                    Err("injected chmod failure".to_owned())
+                } else {
+                    local_search_only_mode(path, mode)
+                }
+            })
+            .unwrap_err();
+        assert!(error.contains("identity or mode changed before mode restoration"));
+        assert!(error.contains("injected chmod failure"));
+        assert_eq!(
+            std::fs::metadata(root.join("ancestor"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o703
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            0o701
+        );
+
+        std::fs::set_permissions(
+            root.join("ancestor"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

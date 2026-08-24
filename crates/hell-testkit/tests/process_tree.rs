@@ -35,24 +35,58 @@ fn hostile_dual_stream_output_is_bounded_and_fully_digested() {
 
 #[test]
 fn exited_leader_cannot_leave_descendant_capture_pipes_open() {
-    let marker = std::env::temp_dir().join(format!(
-        "hell-testkit-pipe-descendant-{}-{}.marker",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("unnamed")
-    ));
-    let _ = std::fs::remove_file(&marker);
     let mut command = Command::new(helper());
-    command
-        .arg("spawn-grandchild-and-exit")
-        .arg("500")
-        .arg(&marker);
+    command.arg("spawn-capture-holder-and-exit");
     let started = Instant::now();
-    let output = run_supervised_command(&mut command, &[], Duration::from_secs(2))
-        .expect("capture process with an inherited descendant pipe");
+    let execution_deadline = started + Duration::from_secs(1);
+    let completion_deadline = started + Duration::from_secs(2);
+    let output = run_supervised_command_until(
+        &mut command,
+        &[],
+        execution_deadline,
+        completion_deadline,
+        None,
+    )
+    .expect("capture process with an acknowledged inherited descendant pipe");
+
     assert!(output.status.success());
-    assert!(started.elapsed() < Duration::from_secs(1));
-    std::thread::sleep(Duration::from_millis(650));
-    assert!(!marker.exists(), "pipe-holding descendant escaped cleanup");
+    assert!(!output.timed_out);
+    let termination = output
+        .termination
+        .expect("leader exit must retain process-tree cleanup receipt");
+    assert_ne!(termination.cleanup_id, 0);
+    assert!(termination.forced);
+    assert!(termination.reaped);
+    assert_eq!(
+        output.stdout.complete.as_deref(),
+        Some(b"capture-holder-stdout-ready-v1\n".as_slice())
+    );
+    assert_eq!(
+        output.stderr.complete.as_deref(),
+        Some(b"capture-holder-stderr-ready-v1\n".as_slice())
+    );
+    assert!(!output.stdout.truncated);
+    assert!(!output.stderr.truncated);
+
+    assert_eq!(
+        output
+            .phase_timings
+            .iter()
+            .map(|timing| timing.name)
+            .collect::<Vec<_>>(),
+        [
+            "bound-revalidated",
+            "policy-wrapped",
+            "child-spawned",
+            "deadline-started",
+            "leader-exited",
+            "tree-terminated",
+            "quiescence-complete",
+            "stdout-joined",
+            "stderr-joined",
+            "stdin-joined",
+        ]
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -87,6 +121,23 @@ fn setsid_double_fork_fixture_escapes_a_process_group_and_retains_pipes() {
         "fixture did not escape via setsid/double-fork"
     );
     std::fs::remove_file(marker).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_fixture_timeout_uses_reserved_reaped_cleanup() {
+    let mut command = Command::new(helper());
+    command.arg("verify-inherited-supervision-timeout");
+    let output = run_supervised_command(&mut command, &[], Duration::from_secs(5))
+        .expect("capture inherited-supervision timeout receipt");
+    assert!(output.status.success());
+    assert!(!output.timed_out);
+    assert!(output.termination.is_some_and(|receipt| receipt.reaped));
+    assert_eq!(
+        output.stdout.complete.as_deref(),
+        Some(b"timedOut=true terminationForced=true terminationReaped=true\n".as_slice())
+    );
+    assert_eq!(output.stderr.complete.as_deref(), Some([].as_slice()));
 }
 
 #[test]

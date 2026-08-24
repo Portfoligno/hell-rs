@@ -1,16 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hell_testkit::{sha256_bytes, sha256_file};
+use hell_testkit::{SupervisedProgressObserver, sha256_bytes, sha256_file};
 
 use crate::command::CommandSpec;
 use crate::identity::require_git_sha;
 use crate::json::{JsonValue, canonical_json_bytes};
 use crate::release::manifest::write_atomic;
+
+const ASSURANCE_FAILURE_EVIDENCE_EDGE_BYTES: usize = 1_024;
+const ASSURANCE_COMMAND_EXECUTION_TIMEOUT: Duration = Duration::from_mins(15);
+const ASSURANCE_COMMAND_COMPLETION_RESERVE: Duration = Duration::from_secs(30);
+const ASSURANCE_COMMAND_FAILURE_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone)]
 struct Mutant {
@@ -68,37 +74,38 @@ pub fn test_activation_suffix() -> Result<Vec<OsString>, String> {
     Ok(Vec::new())
 }
 
+#[cfg(feature = "mutation-testing")]
 pub(crate) fn without_test_activation_suffix(
     arguments: &[OsString],
 ) -> Result<&[OsString], String> {
-    #[cfg(feature = "mutation-testing")]
-    {
-        let marker_count = arguments
-            .iter()
-            .filter(|argument| *argument == "__hell_mutant")
-            .count();
-        if marker_count == 0 {
-            return Ok(arguments);
-        }
-        if marker_count != 1 || arguments.len() < 4 {
-            return Err("mutation argv suffix is malformed".to_owned());
-        }
-        let suffix = &arguments[arguments.len() - 4..];
-        if suffix[0] != "--skip"
-            || suffix[1] != "__hell_mutant"
-            || suffix[2] != "--skip"
-            || suffix[3].to_str().is_none()
-        {
-            return Err("mutation argv suffix is malformed".to_owned());
-        }
-        let selected = std::env::args_os().collect::<Vec<_>>();
-        if try_selected_mutant(&selected)?.as_deref() != suffix[3].to_str() {
-            return Err("mutation argv suffix differs from process activation".to_owned());
-        }
-        Ok(&arguments[..arguments.len() - 4])
+    let marker_count = arguments
+        .iter()
+        .filter(|argument| *argument == "__hell_mutant")
+        .count();
+    if marker_count == 0 {
+        return Ok(arguments);
     }
-    #[cfg(not(feature = "mutation-testing"))]
-    Ok(arguments)
+    if marker_count != 1 || arguments.len() < 4 {
+        return Err("mutation argv suffix is malformed".to_owned());
+    }
+    let suffix = &arguments[arguments.len() - 4..];
+    if suffix[0] != "--skip"
+        || suffix[1] != "__hell_mutant"
+        || suffix[2] != "--skip"
+        || suffix[3].to_str().is_none()
+    {
+        return Err("mutation argv suffix is malformed".to_owned());
+    }
+    let selected = std::env::args_os().collect::<Vec<_>>();
+    if try_selected_mutant(&selected)?.as_deref() != suffix[3].to_str() {
+        return Err("mutation argv suffix differs from process activation".to_owned());
+    }
+    Ok(&arguments[..arguments.len() - 4])
+}
+
+#[cfg(not(feature = "mutation-testing"))]
+pub(crate) fn without_test_activation_suffix(arguments: &[OsString]) -> &[OsString] {
+    arguments
 }
 
 fn selection_activates(selected: &str, site: &str) -> bool {
@@ -210,7 +217,7 @@ fn run_assurance(options: &AssuranceOptions) -> Result<String, String> {
             return Err(format!("duplicate assurance mutant {}", mutant.id));
         }
         validate_assurance_binding(&root, mutant)?;
-        records.push(run_assurance_mutant(&root, mutant)?);
+        records.push(run_assurance_mutant(&catalog_id, &root, mutant)?);
     }
     fs::create_dir_all(&options.output)
         .map_err(|error| format!("cannot create {}: {error}", options.output.display()))?;
@@ -234,7 +241,11 @@ fn run_assurance(options: &AssuranceOptions) -> Result<String, String> {
     ))
 }
 
-fn run_assurance_mutant(root: &Path, mutant: &AssuranceMutant) -> Result<JsonValue, String> {
+fn run_assurance_mutant(
+    catalog_id: &str,
+    root: &Path,
+    mutant: &AssuranceMutant,
+) -> Result<JsonValue, String> {
     let (program, arguments) = mutant
         .test_command
         .split_first()
@@ -246,14 +257,20 @@ fn run_assurance_mutant(root: &Path, mutant: &AssuranceMutant) -> Result<JsonVal
         ));
     }
     validate_argument_vector(&mutant.id, arguments)?;
-    let command = CommandSpec::new(program, Duration::from_mins(15)).current_directory(root);
-    let baseline = command
-        .clone()
-        .arguments(arguments.iter().map(String::as_str))
-        .run()
+    let command =
+        CommandSpec::new(program, ASSURANCE_COMMAND_EXECUTION_TIMEOUT).current_directory(root);
+    let baseline = run_assurance_command(&command, arguments)
         .map_err(|error| format!("cannot run assurance baseline {}: {error}", mutant.id))?;
     if !baseline.status.success() || baseline.timed_out {
-        return Err(format!("assurance baseline failed for {}", mutant.id));
+        return Err(assurance_command_failure(
+            catalog_id,
+            AssuranceCommandPhase::Baseline,
+            &mutant.id,
+            program,
+            arguments,
+            root,
+            &baseline,
+        )?);
     }
     let mut mutant_arguments = arguments.to_vec();
     if !mutant_arguments.iter().any(|argument| argument == "--") {
@@ -265,12 +282,18 @@ fn run_assurance_mutant(root: &Path, mutant: &AssuranceMutant) -> Result<JsonVal
         "--skip".to_owned(),
         mutant.id.clone(),
     ]);
-    let activated = command
-        .arguments(mutant_arguments.iter().map(String::as_str))
-        .run()
+    let activated = run_assurance_command(&command, &mutant_arguments)
         .map_err(|error| format!("cannot run assurance mutant {}: {error}", mutant.id))?;
     if activated.status.success() || activated.timed_out {
-        return Err(format!("assurance mutant survived: {}", mutant.id));
+        return Err(assurance_command_failure(
+            catalog_id,
+            AssuranceCommandPhase::Activated,
+            &mutant.id,
+            program,
+            &mutant_arguments,
+            root,
+            &activated,
+        )?);
     }
     Ok(JsonValue::Object(BTreeMap::from([
         ("claim".to_owned(), JsonValue::String(mutant.claim.clone())),
@@ -300,6 +323,810 @@ fn run_assurance_mutant(root: &Path, mutant: &AssuranceMutant) -> Result<JsonVal
             ),
         ),
     ])))
+}
+
+fn run_assurance_command(
+    command: &CommandSpec,
+    arguments: &[String],
+) -> Result<crate::command::CommandResult, crate::command::CommandRunError> {
+    let execution_deadline = Instant::now()
+        .checked_add(ASSURANCE_COMMAND_EXECUTION_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let completion_deadline = execution_deadline
+        .checked_add(ASSURANCE_COMMAND_COMPLETION_RESERVE)
+        .unwrap_or(execution_deadline);
+    let (progress, _receiver) = SupervisedProgressObserver::bounded(1);
+    command
+        .clone()
+        .arguments(arguments.iter().map(String::as_str))
+        .run_until(execution_deadline, completion_deadline, progress)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssuranceCommandPhase {
+    Baseline,
+    Activated,
+}
+
+impl AssuranceCommandPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Activated => "activated",
+        }
+    }
+
+    const fn policy_failure(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline-not-green",
+            Self::Activated => "activated-survived",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AssuranceOutputEvidence {
+    Complete {
+        bytes: Vec<u8>,
+    },
+    PrefixSuffix {
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+        omitted_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssuranceStreamFailureReceipt {
+    total_bytes: u64,
+    sha256: String,
+    capture_truncated: bool,
+    evidence: AssuranceOutputEvidence,
+}
+
+impl AssuranceStreamFailureReceipt {
+    fn new(
+        total_bytes: u64,
+        sha256: String,
+        capture_truncated: bool,
+        retained: &[u8],
+    ) -> Result<Self, String> {
+        let retained_bytes = u64::try_from(retained.len())
+            .map_err(|_| "assurance retained output length overflowed".to_owned())?;
+        if retained_bytes > total_bytes {
+            return Err("assurance retained output exceeds its total byte count".to_owned());
+        }
+        let edge = ASSURANCE_FAILURE_EVIDENCE_EDGE_BYTES;
+        let evidence = if !capture_truncated
+            && retained_bytes == total_bytes
+            && retained.len() <= edge.saturating_mul(2)
+        {
+            AssuranceOutputEvidence::Complete {
+                bytes: retained.to_vec(),
+            }
+        } else {
+            let prefix_len = retained.len().min(edge);
+            let suffix_len = retained.len().saturating_sub(prefix_len).min(edge);
+            let omitted_bytes = total_bytes
+                .checked_sub(u64::try_from(prefix_len + suffix_len).unwrap_or(u64::MAX))
+                .ok_or_else(|| "assurance output evidence exceeds its total bytes".to_owned())?;
+            AssuranceOutputEvidence::PrefixSuffix {
+                prefix: retained[..prefix_len].to_vec(),
+                suffix: retained[retained.len() - suffix_len..].to_vec(),
+                omitted_bytes,
+            }
+        };
+        Ok(Self {
+            total_bytes,
+            sha256,
+            capture_truncated,
+            evidence,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("assurance output digest is invalid".to_owned());
+        }
+        match &self.evidence {
+            AssuranceOutputEvidence::Complete { bytes } => {
+                if self.capture_truncated
+                    || u64::try_from(bytes.len()).ok() != Some(self.total_bytes)
+                    || bytes.len() > ASSURANCE_FAILURE_EVIDENCE_EDGE_BYTES.saturating_mul(2)
+                {
+                    return Err("assurance complete output evidence is inconsistent".to_owned());
+                }
+            }
+            AssuranceOutputEvidence::PrefixSuffix {
+                prefix,
+                suffix,
+                omitted_bytes,
+            } => {
+                if prefix.len() > ASSURANCE_FAILURE_EVIDENCE_EDGE_BYTES
+                    || suffix.len() > ASSURANCE_FAILURE_EVIDENCE_EDGE_BYTES
+                    || u64::try_from(prefix.len())
+                        .ok()
+                        .and_then(|prefix| {
+                            u64::try_from(suffix.len())
+                                .ok()
+                                .and_then(|suffix| prefix.checked_add(suffix))
+                        })
+                        .and_then(|retained| retained.checked_add(*omitted_bytes))
+                        != Some(self.total_bytes)
+                {
+                    return Err(
+                        "assurance prefix/suffix output evidence is inconsistent".to_owned()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn json(&self) -> JsonValue {
+        let evidence = match &self.evidence {
+            AssuranceOutputEvidence::Complete { bytes } => JsonValue::Object(BTreeMap::from([
+                ("bytesHex".to_owned(), JsonValue::String(hex_bytes(bytes))),
+                ("kind".to_owned(), JsonValue::String("complete".to_owned())),
+                ("omittedBytes".to_owned(), JsonValue::Number(0)),
+                (
+                    "renderedUtf8Lossy".to_owned(),
+                    JsonValue::String(String::from_utf8_lossy(bytes).into_owned()),
+                ),
+            ])),
+            AssuranceOutputEvidence::PrefixSuffix {
+                prefix,
+                suffix,
+                omitted_bytes,
+            } => JsonValue::Object(BTreeMap::from([
+                (
+                    "kind".to_owned(),
+                    JsonValue::String("prefix-suffix".to_owned()),
+                ),
+                ("omittedBytes".to_owned(), JsonValue::Number(*omitted_bytes)),
+                (
+                    "prefixBytesHex".to_owned(),
+                    JsonValue::String(hex_bytes(prefix)),
+                ),
+                (
+                    "prefixRenderedUtf8Lossy".to_owned(),
+                    JsonValue::String(String::from_utf8_lossy(prefix).into_owned()),
+                ),
+                (
+                    "suffixBytesHex".to_owned(),
+                    JsonValue::String(hex_bytes(suffix)),
+                ),
+                (
+                    "suffixRenderedUtf8Lossy".to_owned(),
+                    JsonValue::String(String::from_utf8_lossy(suffix).into_owned()),
+                ),
+            ])),
+        };
+        JsonValue::Object(BTreeMap::from([
+            (
+                "captureTruncated".to_owned(),
+                JsonValue::Bool(self.capture_truncated),
+            ),
+            ("evidence".to_owned(), evidence),
+            ("sha256".to_owned(), JsonValue::String(self.sha256.clone())),
+            ("totalBytes".to_owned(), JsonValue::Number(self.total_bytes)),
+        ]))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssuranceStatusFailureReceipt {
+    kind: String,
+    value: Option<String>,
+    success: bool,
+    timed_out: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssuranceLifecycleFailureReceipt {
+    cleanup_id: Option<u64>,
+    forced: bool,
+    reaped: bool,
+    candidate_quiescence_complete: bool,
+    phase_timings: Vec<(&'static str, u64)>,
+}
+
+struct AssuranceCommandInvocation<'a> {
+    catalog_id: &'a str,
+    phase: AssuranceCommandPhase,
+    mutant_id: &'a str,
+    program: &'a str,
+    arguments: &'a [String],
+    root: &'a Path,
+    execution_timeout: Duration,
+    completion_reserve: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssuranceCommandFailureReceipt {
+    schema_version: u64,
+    catalog_id: String,
+    mutant_id: String,
+    phase: AssuranceCommandPhase,
+    program: String,
+    arguments: Vec<String>,
+    cwd_encoding: String,
+    cwd_hex: String,
+    cwd_rendered: String,
+    duration_millis: u64,
+    execution_deadline_offset_millis: u64,
+    completion_deadline_offset_millis: u64,
+    status: AssuranceStatusFailureReceipt,
+    stdout: AssuranceStreamFailureReceipt,
+    stderr: AssuranceStreamFailureReceipt,
+    lifecycle: AssuranceLifecycleFailureReceipt,
+}
+
+impl AssuranceCommandFailureReceipt {
+    fn new(
+        invocation: &AssuranceCommandInvocation<'_>,
+        result: &crate::command::CommandResult,
+    ) -> Result<Self, String> {
+        let (cwd_encoding, cwd_bytes) = native_path_bytes(invocation.root);
+        let (status_kind, status_value) = command_status(result.status);
+        let receipt = Self {
+            schema_version: ASSURANCE_COMMAND_FAILURE_SCHEMA_VERSION,
+            catalog_id: invocation.catalog_id.to_owned(),
+            mutant_id: invocation.mutant_id.to_owned(),
+            phase: invocation.phase,
+            program: invocation.program.to_owned(),
+            arguments: invocation.arguments.to_vec(),
+            cwd_encoding: cwd_encoding.to_owned(),
+            cwd_hex: hex_bytes(&cwd_bytes),
+            cwd_rendered: invocation.root.to_string_lossy().into_owned(),
+            duration_millis: duration_millis(result.duration),
+            execution_deadline_offset_millis: duration_millis(invocation.execution_timeout),
+            completion_deadline_offset_millis: duration_millis(
+                invocation.execution_timeout + invocation.completion_reserve,
+            ),
+            status: AssuranceStatusFailureReceipt {
+                kind: status_kind.to_owned(),
+                value: status_value,
+                success: result.status.success(),
+                timed_out: result.timed_out,
+            },
+            stdout: AssuranceStreamFailureReceipt::new(
+                result.stdout_bytes,
+                result.stdout_sha256.hex(),
+                result.stdout_truncated,
+                &result.stdout,
+            )?,
+            stderr: AssuranceStreamFailureReceipt::new(
+                result.stderr_bytes,
+                result.stderr_sha256.hex(),
+                result.stderr_truncated,
+                &result.stderr,
+            )?,
+            lifecycle: AssuranceLifecycleFailureReceipt {
+                cleanup_id: result.termination.cleanup_id,
+                forced: result.termination.forced,
+                reaped: result.termination.reaped,
+                candidate_quiescence_complete: result.termination.candidate_quiescence_complete,
+                phase_timings: result
+                    .phase_timings
+                    .iter()
+                    .map(|timing| (timing.name, duration_millis(timing.elapsed)))
+                    .collect(),
+            },
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != ASSURANCE_COMMAND_FAILURE_SCHEMA_VERSION
+            || self.catalog_id.is_empty()
+            || self.mutant_id.is_empty()
+            || self.program.is_empty()
+            || self.arguments.is_empty()
+            || self.cwd_hex.is_empty()
+            || !matches!(
+                self.cwd_encoding.as_str(),
+                "unix-bytes" | "windows-utf16le" | "utf8-lossy"
+            )
+            || !matches!(
+                self.status.kind.as_str(),
+                "exit-code" | "signal" | "unknown"
+            )
+            || (self.status.kind == "unknown") != self.status.value.is_none()
+            || self.execution_deadline_offset_millis == 0
+            || self.completion_deadline_offset_millis < self.execution_deadline_offset_millis
+            || self.duration_millis > self.completion_deadline_offset_millis
+            || (self.phase == AssuranceCommandPhase::Baseline
+                && self.status.success
+                && !self.status.timed_out)
+            || (self.phase == AssuranceCommandPhase::Activated
+                && !self.status.success
+                && !self.status.timed_out)
+        {
+            return Err("assurance command failure receipt differs from schema".to_owned());
+        }
+        self.stdout.validate()?;
+        self.stderr.validate()?;
+        let phases = self
+            .lifecycle
+            .phase_timings
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        if !["stdout-joined", "stderr-joined", "stdin-joined"]
+            .iter()
+            .all(|expected| phases.contains(expected))
+            || phases.last() != Some(&"stdin-joined")
+        {
+            return Err("assurance command failure receipt lacks terminal I/O phases".to_owned());
+        }
+        Ok(())
+    }
+
+    fn json(&self) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            (
+                "catalogId".to_owned(),
+                JsonValue::String(self.catalog_id.clone()),
+            ),
+            ("command".to_owned(), self.command_json()),
+            (
+                "durationMillis".to_owned(),
+                JsonValue::Number(self.duration_millis),
+            ),
+            ("lifecycle".to_owned(), self.lifecycle_json()),
+            (
+                "mutantId".to_owned(),
+                JsonValue::String(self.mutant_id.clone()),
+            ),
+            (
+                "phase".to_owned(),
+                JsonValue::String(self.phase.as_str().to_owned()),
+            ),
+            (
+                "policyFailure".to_owned(),
+                JsonValue::String(self.phase.policy_failure().to_owned()),
+            ),
+            (
+                "schemaVersion".to_owned(),
+                JsonValue::Number(self.schema_version),
+            ),
+            ("status".to_owned(), self.status_json()),
+            ("stderr".to_owned(), self.stderr.json()),
+            ("stdout".to_owned(), self.stdout.json()),
+            (
+                "timedOut".to_owned(),
+                JsonValue::Bool(self.status.timed_out),
+            ),
+        ]))
+    }
+
+    fn command_json(&self) -> JsonValue {
+        let cwd = JsonValue::Object(BTreeMap::from([
+            (
+                "encoding".to_owned(),
+                JsonValue::String(self.cwd_encoding.clone()),
+            ),
+            ("hex".to_owned(), JsonValue::String(self.cwd_hex.clone())),
+            (
+                "rendered".to_owned(),
+                JsonValue::String(self.cwd_rendered.clone()),
+            ),
+        ]));
+        JsonValue::Object(BTreeMap::from([
+            (
+                "argv".to_owned(),
+                JsonValue::Array(
+                    std::iter::once(self.program.clone())
+                        .chain(self.arguments.iter().cloned())
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            ),
+            (
+                "completionDeadlineOffsetMillis".to_owned(),
+                JsonValue::Number(self.completion_deadline_offset_millis),
+            ),
+            ("cwd".to_owned(), cwd),
+            (
+                "executionDeadlineOffsetMillis".to_owned(),
+                JsonValue::Number(self.execution_deadline_offset_millis),
+            ),
+            (
+                "program".to_owned(),
+                JsonValue::String(self.program.clone()),
+            ),
+        ]))
+    }
+
+    fn lifecycle_json(&self) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            (
+                "candidateQuiescenceComplete".to_owned(),
+                JsonValue::Bool(self.lifecycle.candidate_quiescence_complete),
+            ),
+            (
+                "cleanupId".to_owned(),
+                self.lifecycle
+                    .cleanup_id
+                    .map_or(JsonValue::Null, JsonValue::Number),
+            ),
+            ("forced".to_owned(), JsonValue::Bool(self.lifecycle.forced)),
+            (
+                "phaseTimings".to_owned(),
+                JsonValue::Array(
+                    self.lifecycle
+                        .phase_timings
+                        .iter()
+                        .map(|(name, elapsed)| {
+                            JsonValue::Object(BTreeMap::from([
+                                ("elapsedMillis".to_owned(), JsonValue::Number(*elapsed)),
+                                ("name".to_owned(), JsonValue::String((*name).to_owned())),
+                            ]))
+                        })
+                        .collect(),
+                ),
+            ),
+            ("reaped".to_owned(), JsonValue::Bool(self.lifecycle.reaped)),
+            (
+                "stderrJoined".to_owned(),
+                JsonValue::Bool(
+                    self.lifecycle
+                        .phase_timings
+                        .iter()
+                        .any(|(name, _)| *name == "stderr-joined"),
+                ),
+            ),
+            (
+                "stdinJoined".to_owned(),
+                JsonValue::Bool(
+                    self.lifecycle
+                        .phase_timings
+                        .last()
+                        .is_some_and(|(name, _)| *name == "stdin-joined"),
+                ),
+            ),
+            (
+                "stdoutJoined".to_owned(),
+                JsonValue::Bool(
+                    self.lifecycle
+                        .phase_timings
+                        .iter()
+                        .any(|(name, _)| *name == "stdout-joined"),
+                ),
+            ),
+        ]))
+    }
+
+    fn status_json(&self) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            (
+                "kind".to_owned(),
+                JsonValue::String(self.status.kind.clone()),
+            ),
+            ("success".to_owned(), JsonValue::Bool(self.status.success)),
+            (
+                "value".to_owned(),
+                self.status
+                    .value
+                    .as_ref()
+                    .map_or(JsonValue::Null, |value| JsonValue::String(value.clone())),
+            ),
+        ]))
+    }
+}
+
+fn assurance_command_failure(
+    catalog_id: &str,
+    phase: AssuranceCommandPhase,
+    mutant_id: &str,
+    program: &str,
+    arguments: &[String],
+    root: &Path,
+    result: &crate::command::CommandResult,
+) -> Result<String, String> {
+    let invocation = AssuranceCommandInvocation {
+        catalog_id,
+        phase,
+        mutant_id,
+        program,
+        arguments,
+        root,
+        execution_timeout: ASSURANCE_COMMAND_EXECUTION_TIMEOUT,
+        completion_reserve: ASSURANCE_COMMAND_COMPLETION_RESERVE,
+    };
+    let receipt = AssuranceCommandFailureReceipt::new(&invocation, result)?;
+    let encoded = canonical_json_bytes(&receipt.json())?;
+    let rendered = String::from_utf8(encoded)
+        .map_err(|_| "assurance command failure receipt is not UTF-8".to_owned())?;
+    Ok(format!(
+        "assurance {} policy failure for {mutant_id}; assuranceCommandFailureReceipt={rendered}",
+        phase.as_str()
+    ))
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(unix)]
+fn native_path_bytes(path: &Path) -> (&'static str, Vec<u8>) {
+    use std::os::unix::ffi::OsStrExt as _;
+    ("unix-bytes", path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn native_path_bytes(path: &Path) -> (&'static str, Vec<u8>) {
+    use std::os::windows::ffi::OsStrExt as _;
+    (
+        "windows-utf16le",
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_path_bytes(path: &Path) -> (&'static str, Vec<u8>) {
+    ("utf8-lossy", path.to_string_lossy().as_bytes().to_vec())
+}
+
+#[cfg(unix)]
+fn command_status(status: std::process::ExitStatus) -> (&'static str, Option<String>) {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.code().map_or_else(
+        || {
+            status.signal().map_or(("unknown", None), |signal| {
+                ("signal", Some(signal.to_string()))
+            })
+        },
+        |code| ("exit-code", Some(code.to_string())),
+    )
+}
+
+#[cfg(not(unix))]
+fn command_status(status: std::process::ExitStatus) -> (&'static str, Option<String>) {
+    status
+        .code()
+        .map(|code| ("exit-code", Some(code.to_string())))
+        .unwrap_or(("unknown", None))
+}
+
+pub(crate) fn run_assurance_receipt_child_for_integration(mode: &str) -> ExitCode {
+    match mode {
+        "baseline-failure" => {
+            println!("baseline-stdout-tail");
+            eprintln!("baseline-stderr-tail");
+            ExitCode::from(23)
+        }
+        "activated-survival" => {
+            println!("activated-survival-stdout");
+            ExitCode::SUCCESS
+        }
+        "timeout" => loop {
+            std::thread::park();
+        },
+        "long-output" => {
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            let mut stdout_bytes = vec![b'o'; 5 * 1024 * 1024];
+            let mut stderr_bytes = vec![b'e'; 5 * 1024 * 1024];
+            stdout_bytes.extend_from_slice(b"long-stdout-tail\n");
+            stderr_bytes.extend_from_slice(b"long-stderr-tail\n");
+            if stdout.write_all(&stdout_bytes).is_err()
+                || stdout.flush().is_err()
+                || stderr.write_all(&stderr_bytes).is_err()
+                || stderr.flush().is_err()
+            {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::from(29)
+        }
+        _ => ExitCode::FAILURE,
+    }
+}
+
+pub(crate) fn verify_assurance_command_failure_receipts_for_integration() -> Result<String, String>
+{
+    let program_path = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve assurance receipt verifier: {error}"))?;
+    let program = program_path
+        .to_str()
+        .ok_or_else(|| "assurance receipt verifier path is not UTF-8".to_owned())?
+        .to_owned();
+    let root = fs::canonicalize(
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve assurance receipt cwd: {error}"))?,
+    )
+    .map_err(|error| format!("cannot canonicalize assurance receipt cwd: {error}"))?;
+    let scenarios = [
+        AssuranceReceiptScenario::new(
+            "baseline-failure",
+            AssuranceCommandPhase::Baseline,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        ),
+        AssuranceReceiptScenario::new(
+            "activated-survival",
+            AssuranceCommandPhase::Activated,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        ),
+        AssuranceReceiptScenario::new(
+            "timeout",
+            AssuranceCommandPhase::Baseline,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        ),
+        AssuranceReceiptScenario::new(
+            "long-output",
+            AssuranceCommandPhase::Baseline,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        ),
+    ];
+    let mut rendered = Vec::new();
+    for scenario in scenarios {
+        let receipt = run_assurance_receipt_scenario(&program_path, &program, &root, scenario)?;
+        reject_assurance_receipt_drift(&receipt)?;
+        rendered.push(receipt.json());
+    }
+    let summary = JsonValue::Object(BTreeMap::from([
+        ("receipts".to_owned(), JsonValue::Array(rendered)),
+        ("schemaVersion".to_owned(), JsonValue::Number(1)),
+        ("state".to_owned(), JsonValue::String("verified".to_owned())),
+    ]));
+    String::from_utf8(canonical_json_bytes(&summary)?)
+        .map_err(|_| "assurance receipt verifier summary is not UTF-8".to_owned())
+}
+
+#[derive(Clone, Copy)]
+struct AssuranceReceiptScenario {
+    mode: &'static str,
+    phase: AssuranceCommandPhase,
+    execution_timeout: Duration,
+    completion_reserve: Duration,
+}
+
+impl AssuranceReceiptScenario {
+    const fn new(
+        mode: &'static str,
+        phase: AssuranceCommandPhase,
+        execution_timeout: Duration,
+        completion_reserve: Duration,
+    ) -> Self {
+        Self {
+            mode,
+            phase,
+            execution_timeout,
+            completion_reserve,
+        }
+    }
+}
+
+fn run_assurance_receipt_scenario(
+    program_path: &Path,
+    program: &str,
+    root: &Path,
+    scenario: AssuranceReceiptScenario,
+) -> Result<AssuranceCommandFailureReceipt, String> {
+    let arguments = vec![
+        "__verify-assurance-command-failure-receipt-child".to_owned(),
+        scenario.mode.to_owned(),
+    ];
+    let execution_deadline = Instant::now()
+        .checked_add(scenario.execution_timeout)
+        .ok_or_else(|| "assurance receipt execution deadline overflowed".to_owned())?;
+    let completion_deadline = execution_deadline
+        .checked_add(scenario.completion_reserve)
+        .ok_or_else(|| "assurance receipt completion deadline overflowed".to_owned())?;
+    let (progress, _receiver) = SupervisedProgressObserver::bounded(1);
+    let result = CommandSpec::new(program_path, scenario.execution_timeout)
+        .arguments(arguments.iter().map(String::as_str))
+        .current_directory(root)
+        .run_until(execution_deadline, completion_deadline, progress)
+        .map_err(|error| {
+            format!(
+                "cannot run assurance receipt scenario {}: {error}",
+                scenario.mode
+            )
+        })?;
+    let invocation = AssuranceCommandInvocation {
+        catalog_id: "integration-assurance-catalog-v1",
+        phase: scenario.phase,
+        mutant_id: scenario.mode,
+        program,
+        arguments: &arguments,
+        root,
+        execution_timeout: scenario.execution_timeout,
+        completion_reserve: scenario.completion_reserve,
+    };
+    let receipt = AssuranceCommandFailureReceipt::new(&invocation, &result)?;
+    validate_assurance_receipt_scenario(scenario.mode, &receipt, &result)?;
+    Ok(receipt)
+}
+
+fn validate_assurance_receipt_scenario(
+    mode: &str,
+    receipt: &AssuranceCommandFailureReceipt,
+    result: &crate::command::CommandResult,
+) -> Result<(), String> {
+    let valid = match mode {
+        "baseline-failure" => {
+            result.status.code() == Some(23)
+                && !result.timed_out
+                && receipt_contains(&receipt.stdout, b"baseline-stdout-tail")
+                && receipt_contains(&receipt.stderr, b"baseline-stderr-tail")
+        }
+        "activated-survival" => result.status.success() && !result.timed_out,
+        "timeout" => result.timed_out && receipt.lifecycle.forced && receipt.lifecycle.reaped,
+        "long-output" => long_output_receipt_is_bounded(receipt),
+        _ => return Err("unknown assurance receipt scenario".to_owned()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("{mode} assurance failure receipt differs"))
+    }
+}
+
+fn long_output_receipt_is_bounded(receipt: &AssuranceCommandFailureReceipt) -> bool {
+    receipt.stdout.capture_truncated
+        && receipt.stderr.capture_truncated
+        && matches!(
+            &receipt.stdout.evidence,
+            AssuranceOutputEvidence::PrefixSuffix {
+                omitted_bytes: 1..,
+                ..
+            }
+        )
+        && matches!(
+            &receipt.stderr.evidence,
+            AssuranceOutputEvidence::PrefixSuffix {
+                omitted_bytes: 1..,
+                ..
+            }
+        )
+        && receipt_contains(&receipt.stdout, b"long-stdout-tail")
+        && receipt_contains(&receipt.stderr, b"long-stderr-tail")
+}
+
+fn reject_assurance_receipt_drift(receipt: &AssuranceCommandFailureReceipt) -> Result<(), String> {
+    let mut schema_drift = receipt.clone();
+    schema_drift.schema_version += 1;
+    if schema_drift.validate().is_ok() {
+        return Err("assurance receipt schema drift was accepted".to_owned());
+    }
+    let mut ordering_drift = receipt.clone();
+    ordering_drift.lifecycle.phase_timings.reverse();
+    if ordering_drift.validate().is_ok() {
+        return Err("assurance receipt terminal phase ordering drift was accepted".to_owned());
+    }
+    Ok(())
+}
+
+fn receipt_contains(receipt: &AssuranceStreamFailureReceipt, needle: &[u8]) -> bool {
+    match &receipt.evidence {
+        AssuranceOutputEvidence::Complete { bytes } => {
+            bytes.windows(needle.len()).any(|part| part == needle)
+        }
+        AssuranceOutputEvidence::PrefixSuffix { prefix, suffix, .. } => {
+            prefix.windows(needle.len()).any(|part| part == needle)
+                || suffix.windows(needle.len()).any(|part| part == needle)
+        }
+    }
 }
 
 fn validate_argument_vector(id: &str, arguments: &[String]) -> Result<(), String> {
