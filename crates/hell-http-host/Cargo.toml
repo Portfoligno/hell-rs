@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bytes = { version = "=1.12.1", default-features = false, features = ["std"] }
-hyper = { version = "=1.11.0", default-features = false, features = ["http1", "server"] }
+hyper = { version = "=1.11.1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt-multi-thread", "sync", "time"] }
 
