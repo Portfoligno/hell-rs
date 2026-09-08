@@ -13,7 +13,7 @@ use std::time::Duration;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", windows))]
 use crate::command::NativeProcessSpec;
 use crate::command::{CommandResult, CommandSpec, with_release_candidate_environment};
 #[cfg(unix)]
@@ -251,6 +251,8 @@ const MEMCORDON_INNER_CLEANUP_RESERVE: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 struct MemcordonLaunchAuthority {
+    prerequisite: super::output_reservation::PrerequisiteOutput,
+    collector: std::sync::Arc<crate::memcordon::ExecutionCollector>,
     runtime: hell_testkit::BoundProgramInvocation,
     report_directory: PathBuf,
     mechanism: String,
@@ -262,6 +264,7 @@ impl MemcordonLaunchAuthority {
         platform: ReleasePlatform,
         task_path: Option<&Path>,
         operation: &str,
+        plan_digest: &str,
     ) -> Result<Option<Self>, String> {
         if platform == ReleasePlatform::MacosAarch64 {
             if task_path.is_some() {
@@ -278,6 +281,18 @@ impl MemcordonLaunchAuthority {
             )
         })?;
         let qualified = crate::memcordon::qualified_policy(task_path, operation)?;
+        let prerequisite =
+            super::output_reservation::PrerequisiteOutput::bind(&qualified.evidence_root)?;
+        let collector = std::sync::Arc::new(crate::memcordon::ExecutionCollector::new(
+            qualified.evidence_root.clone(),
+            operation,
+            plan_digest,
+            if platform == ReleasePlatform::WindowsX86_64 {
+                hell_memcordon::CandidateBoundaryPolicy::SealedWindows
+            } else {
+                hell_memcordon::CandidateBoundaryPolicy::SealedLinux
+            },
+        )?);
         let runtime =
             hell_testkit::BoundProgramInvocation::new(qualified.runtime.clone(), qualified.runtime)
                 .map_err(|error| format!("cannot bind qualified MemCordon runtime: {error}"))?;
@@ -287,6 +302,8 @@ impl MemcordonLaunchAuthority {
             hell_memcordon::SealedAdmission::new(1)
         };
         Ok(Some(Self {
+            prerequisite,
+            collector,
             runtime,
             report_directory: qualified.report_directory,
             mechanism: qualified.mechanism,
@@ -306,6 +323,7 @@ impl MemcordonLaunchAuthority {
                 self.admission.clone(),
                 MEMCORDON_INNER_CLEANUP_RESERVE,
             )
+            .and_then(|policy| policy.with_memcordon_observer(self.collector.clone()))
             .map_err(|error| format!("cannot activate qualified MemCordon policy: {error}"))
     }
 }
@@ -418,10 +436,17 @@ fn prepare_platform_run_authority(
     if read_regular(&root.join("deny.toml"))? != include_bytes!("../../../../deny.toml") {
         return Err("candidate dependency policy differs from trusted automation".to_owned());
     }
+    let memcordon = MemcordonLaunchAuthority::bind(
+        platform,
+        memcordon_task.as_deref(),
+        memcordon_operation,
+        &plan.plan_sha256,
+    )?;
     #[cfg(windows)]
-    let native_environment = prepare_platform_output(platform, &output, &environment)?;
+    let native_environment =
+        prepare_platform_output(platform, &output, &environment, memcordon.as_ref())?;
     #[cfg(not(windows))]
-    prepare_platform_output(platform, &output, &environment)?;
+    prepare_platform_output(platform, &output, &environment, memcordon.as_ref())?;
     let output = fs::canonicalize(output)
         .map_err(|error| format!("cannot canonicalize platform output: {error}"))?;
     let workspace_target = root
@@ -432,8 +457,6 @@ fn prepare_platform_run_authority(
         return Err("candidate target directory is not absolute".to_owned());
     }
     require_candidate_target(&root, &workspace_target)?;
-    let memcordon =
-        MemcordonLaunchAuthority::bind(platform, memcordon_task.as_deref(), memcordon_operation)?;
     Ok(PlatformRunAuthority {
         platform,
         plan,
@@ -464,16 +487,9 @@ fn prepare_platform_output(
     platform: ReleasePlatform,
     output: &Path,
     environment: &ProcessEnvironment,
+    memcordon: Option<&MemcordonLaunchAuthority>,
 ) -> Result<super::native_environment::NativeEnvironmentCollection, String> {
-    if output.exists() {
-        return Err("platform output already exists".to_owned());
-    }
-    fs::create_dir_all(output.join("archive"))
-        .map_err(|error| format!("cannot create platform output: {error}"))?;
-    fs::create_dir(output.join("conformance-evidence"))
-        .map_err(|error| format!("cannot create conformance evidence output: {error}"))?;
-    fs::create_dir(output.join("conformance-observations"))
-        .map_err(|error| format!("cannot create conformance observation output: {error}"))?;
+    super::output_reservation::reserve(output, memcordon.map(|authority| &authority.prerequisite))?;
     let trusted_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     super::native_environment::collect_for_platform_from_environment(
         platform,
@@ -485,6 +501,10 @@ fn prepare_platform_output(
 
 pub(crate) fn run(request: PlatformRunRequest) -> Result<String, String> {
     let authority = prepare_platform_run_authority(request)?;
+    let collector = authority
+        .memcordon
+        .as_ref()
+        .map(|authority| authority.collector.clone());
     let mut confinement = establish_candidate_process_confinement(&CandidateConfinementInput {
         platform: authority.platform,
         candidate_root: &authority.root,
@@ -501,10 +521,19 @@ pub(crate) fn run(request: PlatformRunRequest) -> Result<String, String> {
         windows_ghc: &authority.windows_ghc,
     })?;
     let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(collector) = &collector {
+            collector.complete_phase("candidate-preflights")?;
+        }
         execute_confined_platform(authority, &mut confinement)
     }))
     .unwrap_or_else(|_| {
         Err("release platform gate panicked after acquiring confinement".to_owned())
+    });
+    let primary = primary.and_then(|result| {
+        if let Some(collector) = &collector {
+            collector.complete_phase("platform-gates")?;
+        }
+        Ok(result)
     });
     let principal_cleanup = confinement.finish_candidate_principal();
     #[cfg(windows)]
@@ -512,7 +541,14 @@ pub(crate) fn run(request: PlatformRunRequest) -> Result<String, String> {
     #[cfg(not(windows))]
     let toolchain_cleanup = Ok(());
     match (primary, principal_cleanup, toolchain_cleanup) {
-        (Ok(result), Ok(()), Ok(())) => Ok(result),
+        (Ok(result), Ok(()), Ok(())) => {
+            if let Some(collector) = &collector {
+                collector.complete_phase("principal-cleanup")?;
+                collector.complete_phase("toolchain-cleanup")?;
+                collector.seal()?;
+            }
+            Ok(result)
+        }
         (primary, principal, toolchain) => Err([primary.err(), principal.err(), toolchain.err()]
             .into_iter()
             .flatten()
@@ -646,6 +682,8 @@ struct NativeOracleSetup<'a> {
 
 struct NativeOracleExecutionInput<'a> {
     platform: ReleasePlatform,
+    #[cfg(unix)]
+    trusted_root: &'a Path,
     candidate_execution_root: &'a Path,
     oracle_execution_root: &'a Path,
     output: &'a Path,
@@ -683,6 +721,8 @@ fn prepare_confined_platform_oracle(
     let primary = execute_native_oracle_preparation(
         &NativeOracleExecutionInput {
             platform: input.platform,
+            #[cfg(unix)]
+            trusted_root: input.root,
             candidate_execution_root: &candidate_execution_root,
             oracle_execution_root: &oracle_execution_root,
             output: input.output,
@@ -814,7 +854,15 @@ fn execute_native_oracle_preparation(
         return Err(error.clone());
     }
     let launch_policy = setup.launch_policy.as_ref().map_err(Clone::clone)?;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    #[cfg(unix)]
+    let trusted_stack = if input.platform == ReleasePlatform::LinuxX86_64 {
+        Some(crate::command::TrustedStackIdentityQuery::acquire_linux(
+            input.trusted_root,
+        )?)
+    } else {
+        None
+    };
+    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hell_testkit::with_candidate_launch_policy(launch_policy, || {
             let oracle = prepare_oracle(
                 input.platform,
@@ -828,13 +876,27 @@ fn execute_native_oracle_preparation(
                 input.candidate_execution_root,
                 input.oracle_execution_root,
                 &setup.archive_adapter,
+                #[cfg(unix)]
+                trusted_stack.as_ref(),
             )?;
             Ok(NativeOraclePreparation { tools, oracle })
         })
     }))
     .unwrap_or_else(|_| {
         Err("native oracle preparation panicked before explicit cleanup".to_owned())
-    })
+    });
+    #[cfg(unix)]
+    if let Some(trusted_stack) = trusted_stack {
+        return match (primary, trusted_stack.close()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(format!("Stack identity cleanup failed: {cleanup}")),
+            (Err(primary), Err(cleanup)) => Err(format!(
+                "{primary}; Stack identity cleanup failed: {cleanup}"
+            )),
+        };
+    }
+    primary
 }
 
 fn complete_native_oracle_setup(
@@ -1093,11 +1155,31 @@ fn execute_confined_platform_gates(
     )]);
     #[cfg(windows)]
     let mut windows_release_binary = None;
-    let gate_result = with_release_candidate_environment(
+    #[cfg(unix)]
+    let cargo_source = input
+        .confinement
+        .cargo_deny_home_protection
+        .as_ref()
+        .map(|home| {
+            home.readiness_cargo
+                .as_ref()
+                .ok_or("readiness Cargo source is absent")
+        })
+        .transpose()?;
+    #[cfg(unix)]
+    if let Some(source) = cargo_source {
+        source.validate()?;
+    }
+    #[cfg(unix)]
+    let cargo_config = cargo_source.map(|source| source.config_path());
+    #[cfg(not(unix))]
+    let cargo_config = None;
+    let gate_result = crate::command::with_release_candidate_environment_and_cargo_source(
         input.target,
         input.candidate_environment_root,
         input.plan.source_date_epoch,
         input.confinement.policy()?,
+        cargo_config,
         || {
             run_platform_gates(PlatformGateInput {
                 platform: input.platform,
@@ -1117,6 +1199,17 @@ fn execute_confined_platform_gates(
             })
         },
     );
+    #[cfg(unix)]
+    let gate_result = match (
+        gate_result,
+        cargo_source.map(|source| source.validate()).transpose(),
+    ) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(primary), Ok(_)) | (Ok(()), Err(primary)) => Err(primary),
+        (Err(primary), Err(secondary)) => Err(format!(
+            "{primary}; readiness Cargo source postcheck failed: {secondary}"
+        )),
+    };
     validate_platform_gate_cleanup(
         &mut input,
         gate_result,
@@ -1842,7 +1935,7 @@ fn stage_posix_candidate_sources(
     source_protection.validate_candidate_environment("after candidate home probes")?;
     let (cargo_deny_home_protection, dependency_policy_protection) =
         if input.platform == ReleasePlatform::LinuxX86_64 {
-            let (home, policy) = stage_posix_cargo_deny_home(&PosixCargoDenyStageInput {
+            let (mut home, policy) = stage_posix_cargo_deny_home(&PosixCargoDenyStageInput {
                 platform: input.platform,
                 sudo: &principal.sudo,
                 adapter,
@@ -1850,10 +1943,18 @@ fn stage_posix_candidate_sources(
                 candidate_root: &source_protection.candidate,
                 candidate_sha: input.candidate_sha,
                 cargo,
+                diagnostic_output: input.output,
                 candidate_uid: principal.uid,
                 trusted_owner: principal.trusted_owner,
                 trusted_group_id: principal.trusted_group,
             })?;
+            home.readiness_cargo = Some(crate::readiness_cargo::ReadinessCargoSource::stage(
+                &source_protection.candidate,
+                &isolated.join("cargo"),
+                &staged_cargo_vendor_root(&home.home),
+                principal.trusted_owner,
+                principal.uid,
+            )?);
             (Some(home), Some(policy))
         } else {
             (None, None)
@@ -3724,6 +3825,7 @@ struct PosixCargoDenyHomeProtection {
     trusted_group_id: u32,
     advisory_lock: fs::File,
     metadata: PosixCargoDenyMetadataProtection,
+    readiness_cargo: Option<crate::readiness_cargo::ReadinessCargoSource>,
     active: bool,
 }
 
@@ -3996,6 +4098,7 @@ struct PosixCargoDenyStageInput<'a> {
     candidate_root: &'a Path,
     candidate_sha: &'a str,
     cargo: &'a crate::command::ResolvedCargoExecutable,
+    diagnostic_output: &'a Path,
     candidate_uid: u32,
     trusted_owner: u32,
     trusted_group_id: u32,
@@ -4019,10 +4122,12 @@ fn stage_posix_cargo_deny_home(
         candidate_root,
         candidate_sha,
         cargo,
+        diagnostic_output,
         candidate_uid,
         trusted_owner,
         trusted_group_id,
     } = *input;
+    let diagnostics = CargoDenyDiagnostics::reserve(diagnostic_output)?;
     let target_identity = posix_object_identity(target)?;
     let tools = resolve_posix_adapter_tools(platform)?;
     let environment_root = target.join("release-child-environment");
@@ -4037,7 +4142,7 @@ fn stage_posix_cargo_deny_home(
         .map_err(|error| format!("cannot reserve candidate cargo-deny home: {error}"))?;
     let copy_result = (|| {
         let mut seed = TrustedCargoCacheSeed::create(platform)?;
-        seed.fetch(cargo, candidate_root)?;
+        seed.fetch(cargo, candidate_root, &diagnostics)?;
         let mut entries = 1_usize;
         let mut bytes = 0_u64;
         copy_posix_cargo_cache_tree(seed.root(), &home, &mut entries, &mut bytes)?;
@@ -4050,6 +4155,7 @@ fn stage_posix_cargo_deny_home(
             candidate_root,
             candidate_sha,
             &final_metadata,
+            &diagnostics,
         )?;
         let advisory_lock = reserve_posix_cargo_deny_advisory_lock(&home)?;
         let metadata =
@@ -4102,6 +4208,7 @@ fn stage_posix_cargo_deny_home(
             trusted_group_id,
             advisory_lock,
             metadata,
+            readiness_cargo: None,
             active: true,
         },
         policy,
@@ -4441,7 +4548,7 @@ fn stage_posix_stack_root(
 
 #[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct TrustedCargoSeedInputFile {
+pub(crate) struct TrustedCargoSeedInputFile {
     identity: PosixObjectIdentity,
     size: u64,
     sha256: hell_testkit::Digest,
@@ -4449,7 +4556,7 @@ struct TrustedCargoSeedInputFile {
 
 #[cfg(unix)]
 impl TrustedCargoSeedInputFile {
-    fn bind(root: &Path, name: &str) -> Result<Self, String> {
+    pub(crate) fn bind(root: &Path, name: &str) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt as _;
 
         let path = root.join(name);
@@ -4474,7 +4581,7 @@ impl TrustedCargoSeedInputFile {
 }
 
 #[cfg(unix)]
-struct TrustedCargoCacheSeed {
+pub(super) struct TrustedCargoCacheSeed {
     root: PathBuf,
     identity: PosixObjectIdentity,
     active: bool,
@@ -4482,7 +4589,7 @@ struct TrustedCargoCacheSeed {
 
 #[cfg(unix)]
 impl TrustedCargoCacheSeed {
-    fn create(platform: ReleasePlatform) -> Result<Self, String> {
+    pub(super) fn create(platform: ReleasePlatform) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let parent = posix_adapter_installation_root(platform)?;
@@ -4516,15 +4623,15 @@ impl TrustedCargoCacheSeed {
         })
     }
 
-    fn vendor_root(&self) -> PathBuf {
+    pub(super) fn vendor_root(&self) -> PathBuf {
         staged_cargo_vendor_root(&self.root)
     }
 
-    fn root(&self) -> &Path {
+    pub(super) fn root(&self) -> &Path {
         &self.root
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let parent = self
@@ -4556,6 +4663,7 @@ impl TrustedCargoCacheSeed {
         &self,
         cargo: &crate::command::ResolvedCargoExecutable,
         candidate_root: &Path,
+        diagnostics: &CargoDenyDiagnostics,
     ) -> Result<(), String> {
         let manifest = candidate_root.join("Cargo.toml");
         let manifest_identity = TrustedCargoSeedInputFile::bind(candidate_root, "Cargo.toml")?;
@@ -4604,6 +4712,8 @@ impl TrustedCargoCacheSeed {
             &self.root,
             &metadata_path,
             &metadata.stdout,
+            diagnostics,
+            CargoDenyDiagnosticPhase::Seed,
         )?;
         self.revalidate_inputs(
             cargo,
@@ -4954,7 +5064,7 @@ fn frozen_lock_registry_package(
 }
 
 #[cfg(unix)]
-fn validate_staged_vendor_covers_frozen_lock(
+pub(super) fn validate_staged_vendor_covers_frozen_lock(
     document: &[u8],
     vendor_root: &Path,
 ) -> Result<(), String> {
@@ -5062,12 +5172,224 @@ fn validate_cargo_deny_metadata_document(
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+pub enum CargoDenyDiagnosticPhase {
+    Seed,
+    FinalHome,
+}
+
+#[cfg(unix)]
+pub struct CargoDenyDiagnostics {
+    directory: PathBuf,
+    identities: Vec<(PathBuf, PosixObjectIdentity)>,
+}
+
+#[cfg(unix)]
+impl CargoDenyDiagnostics {
+    /// Reserves durable trusted output, independently of transient Cargo homes.
+    pub fn reserve(output: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mut identities = Vec::new();
+        for path in [output.to_path_buf(), output.join("memcordon")] {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("cannot inspect cargo-deny diagnostic parent: {error}"))?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != nix::unistd::geteuid().as_raw()
+                || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+            {
+                return Err(
+                    "cargo-deny diagnostic parent differs from trusted output authority".to_owned(),
+                );
+            }
+            identities.push((path.clone(), posix_object_identity(&path)?));
+        }
+        let directory = output.join("memcordon").join("trusted-cargo-deny");
+        fs::create_dir(&directory)
+            .map_err(|error| format!("cannot reserve cargo-deny diagnostics: {error}"))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot protect cargo-deny diagnostics: {error}"))?;
+        identities.push((directory.clone(), posix_object_identity(&directory)?));
+        Ok(Self {
+            directory,
+            identities,
+        })
+    }
+
+    /// Persists bounded streams and terminal status before admitting success.
+    /// A persistence failure never replaces a failed command's primary status.
+    pub fn record(
+        &self,
+        phase: CargoDenyDiagnosticPhase,
+        arguments: &[OsString],
+        result: &CommandResult,
+    ) -> Result<(), String> {
+        let primary = if result.timed_out || !result.status.success() {
+            Err(format!(
+                "trusted cargo-deny authority checks failed with status {}",
+                result.status.code().unwrap_or(1)
+            ))
+        } else {
+            Ok(())
+        };
+        let retained = (|| {
+            for (path, expected) in &self.identities {
+                if posix_object_identity(path)? != *expected
+                    || fs::canonicalize(path).ok().as_deref() != Some(path.as_path())
+                {
+                    return Err("cargo-deny diagnostic output authority changed".to_owned());
+                }
+            }
+            let arguments = arguments
+                .iter()
+                .map(|argument| {
+                    argument
+                        .to_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "cargo-deny diagnostic argument is not UTF-8".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut document =
+                command_evidence("cargo-deny", Some("cargo-deny"), None, &arguments, result);
+            let (name, stdout_name, stderr_name) = match phase {
+                CargoDenyDiagnosticPhase::Seed => {
+                    ("seed.json", "seed.stdout.bin", "seed.stderr.bin")
+                }
+                CargoDenyDiagnosticPhase::FinalHome => (
+                    "final-home.json",
+                    "final-home.stdout.bin",
+                    "final-home.stderr.bin",
+                ),
+            };
+            let stdout = retain_cargo_deny_stream(
+                &self.directory,
+                stdout_name,
+                &result.stdout,
+                result.stdout_bytes,
+                &result.stdout_sha256,
+                result.stdout_truncated,
+            )?;
+            let stderr = retain_cargo_deny_stream(
+                &self.directory,
+                stderr_name,
+                &result.stderr,
+                result.stderr_bytes,
+                &result.stderr_sha256,
+                result.stderr_truncated,
+            )?;
+            let JsonValue::Object(fields) = &mut document else {
+                return Err("cargo-deny command evidence is not an object".to_owned());
+            };
+            fields.insert(
+                "diagnosticStreams".to_owned(),
+                object([
+                    ("schemaVersion", number(1)),
+                    (
+                        "limitBytes",
+                        number(CARGO_DENY_DIAGNOSTIC_STREAM_LIMIT as u64),
+                    ),
+                    ("stdout", stdout),
+                    ("stderr", stderr),
+                ]),
+            );
+            super::manifest::write_atomic_new(
+                &self.directory.join(name),
+                &canonical_json_bytes(&document)?,
+            )
+        })();
+        match (primary, retained) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(retention)) => Err(format!(
+                "cannot retain trusted cargo-deny diagnostics: {retention}"
+            )),
+            (Err(primary), Err(retention)) => Err(format!(
+                "{primary}; additionally, cannot retain trusted cargo-deny diagnostics: {retention}"
+            )),
+        }
+    }
+}
+
+// Per-stream diagnostic budget, separate from the generic human-readable preview.
+#[cfg(unix)]
+const CARGO_DENY_DIAGNOSTIC_STREAM_LIMIT: usize = 1024 * 1024;
+
+#[cfg(unix)]
+fn retain_cargo_deny_stream(
+    directory: &Path,
+    name: &str,
+    captured: &[u8],
+    original_bytes: u64,
+    original_sha256: &hell_testkit::Digest,
+    capture_truncated: bool,
+) -> Result<JsonValue, String> {
+    let captured_bytes =
+        u64::try_from(captured.len()).map_err(|_| "cargo-deny capture length overflowed")?;
+    let captured_sha256 = hell_testkit::sha256_bytes(captured);
+    if original_bytes < captured_bytes
+        || (!capture_truncated
+            && (original_bytes != captured_bytes || captured_sha256 != *original_sha256))
+    {
+        return Err("cargo-deny capture metadata is inconsistent".to_owned());
+    }
+    let retention_truncated = captured.len() > CARGO_DENY_DIAGNOSTIC_STREAM_LIMIT;
+    let prefix_bytes = if retention_truncated {
+        CARGO_DENY_DIAGNOSTIC_STREAM_LIMIT / 2
+    } else {
+        captured.len()
+    };
+    let suffix_bytes = if retention_truncated {
+        CARGO_DENY_DIAGNOSTIC_STREAM_LIMIT - prefix_bytes
+    } else {
+        0
+    };
+    let mut retained = Vec::with_capacity(prefix_bytes + suffix_bytes);
+    retained.extend_from_slice(&captured[..prefix_bytes]);
+    retained.extend_from_slice(&captured[captured.len() - suffix_bytes..]);
+    super::manifest::write_atomic_new(&directory.join(name), &retained)?;
+    Ok(object([
+        ("path", string(name)),
+        ("originalBytes", number(original_bytes)),
+        ("originalSha256", string(&original_sha256.hex())),
+        ("capturedBytes", number(captured_bytes)),
+        ("capturedSha256", string(&captured_sha256.hex())),
+        ("captureTruncated", JsonValue::Bool(capture_truncated)),
+        ("retainedBytes", number(retained.len() as u64)),
+        (
+            "retainedSha256",
+            string(&hell_testkit::sha256_bytes(&retained).hex()),
+        ),
+        ("retentionTruncated", JsonValue::Bool(retention_truncated)),
+        (
+            "complete",
+            JsonValue::Bool(!capture_truncated && !retention_truncated),
+        ),
+        (
+            "layout",
+            string(if retention_truncated {
+                "captured-prefix-suffix"
+            } else {
+                "captured-bytes"
+            }),
+        ),
+        ("prefixBytes", number(prefix_bytes as u64)),
+        ("suffixBytes", number(suffix_bytes as u64)),
+        (
+            "omittedCapturedBytes",
+            number(captured_bytes - retained.len() as u64),
+        ),
+    ]))
+}
+
+#[cfg(unix)]
 fn run_trusted_cargo_deny_authority_checks(
     cargo: &crate::command::ResolvedCargoExecutable,
     candidate_root: &Path,
     cargo_home: &Path,
     metadata: &Path,
     metadata_document: &[u8],
+    diagnostics: &CargoDenyDiagnostics,
+    phase: CargoDenyDiagnosticPhase,
 ) -> Result<hell_testkit::Digest, String> {
     let metadata_sha256 =
         validate_cargo_deny_metadata_document(cargo_home, metadata, metadata_document)?;
@@ -5085,22 +5407,16 @@ fn run_trusted_cargo_deny_authority_checks(
     if version != format!("cargo-deny {TRUSTED_CARGO_DENY_VERSION}") {
         return Err("trusted cargo-deny authority version differs from policy".to_owned());
     }
+    let arguments = trusted_cargo_deny_authority_arguments(cargo_home, metadata)?;
     let result = CommandSpec::cargo_deny(Duration::from_mins(10))
-        .arguments(trusted_cargo_deny_authority_arguments(
-            cargo_home, metadata,
-        )?)
+        .arguments(arguments.iter().cloned())
         .current_directory(candidate_root)
         .environment("CARGO", cargo.invocation_path().as_os_str().to_owned())
         .environment("CARGO_HOME", cargo_home.as_os_str())
         .environment("CARGO_TARGET_DIR", cargo_home.join("target"))
         .run()
         .map_err(|error| format!("cannot run trusted cargo-deny authority checks: {error}"))?;
-    if result.timed_out || !result.status.success() {
-        return Err(format!(
-            "trusted cargo-deny authority checks failed with status {}",
-            result.status.code().unwrap_or(1)
-        ));
-    }
+    diagnostics.record(phase, &arguments, &result)?;
     let observed_cargo_deny_sha256 = hell_testkit::sha256_file(cargo_deny.canonical_identity())
         .map_err(|error| format!("cannot rehash trusted cargo-deny authority: {error}"))?;
     let observed_metadata_sha256 =
@@ -5162,6 +5478,7 @@ fn run_final_home_cargo_deny_authority_checks(
     candidate_root: &Path,
     candidate_sha: &str,
     metadata: &FinalCargoDenyMetadata,
+    diagnostics: &CargoDenyDiagnostics,
 ) -> Result<Vec<u8>, String> {
     let cargo_deny_sha256 = run_trusted_cargo_deny_authority_checks(
         cargo,
@@ -5169,6 +5486,8 @@ fn run_final_home_cargo_deny_authority_checks(
         &metadata.home,
         &metadata.path,
         &metadata.bytes,
+        diagnostics,
+        CargoDenyDiagnosticPhase::FinalHome,
     )?;
     metadata.validate()?;
     validate_trusted_cargo_cache_tree(&metadata.home)?;
@@ -5541,7 +5860,7 @@ fn configure_staged_cargo_home_directory_source(home: &Path) -> Result<(), Strin
 }
 
 #[cfg(unix)]
-fn validate_trusted_cargo_cache_tree(root: &Path) -> Result<(), String> {
+pub(crate) fn validate_trusted_cargo_cache_tree(root: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut pending = vec![root.to_path_buf()];
@@ -5588,7 +5907,7 @@ fn validate_trusted_cargo_cache_tree(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn copy_posix_cargo_cache_tree(
+pub(super) fn copy_posix_cargo_cache_tree(
     source: &Path,
     destination: &Path,
     entries: &mut usize,
@@ -7832,7 +8151,13 @@ fn construct_posix_candidate_environment(
             &tools.chmod,
             posix_chmod_arguments(
                 platform,
-                "2770",
+                if platform == ReleasePlatform::LinuxX86_64
+                    && child.file_name() == Some(OsStr::new("cargo"))
+                {
+                    "3770"
+                } else {
+                    "2770"
+                },
                 path_text(child, "candidate writable root")?,
             )?,
         )?;
@@ -7841,11 +8166,12 @@ fn construct_posix_candidate_environment(
         std::iter::once(root.as_path()).chain(children.iter().map(PathBuf::as_path)),
         "candidate environment authority",
     )?;
-    capture_posix_candidate_environment(transient, &root, trusted_owner, candidate_group)
+    capture_posix_candidate_environment(platform, transient, &root, trusted_owner, candidate_group)
 }
 
 #[cfg(unix)]
 fn capture_posix_candidate_environment(
+    platform: ReleasePlatform,
     transient: &Path,
     root: &Path,
     owner: u32,
@@ -7870,7 +8196,11 @@ fn capture_posix_candidate_environment(
                 &root.path().join(name),
                 owner,
                 group,
-                0o2770,
+                if platform == ReleasePlatform::LinuxX86_64 && name == "cargo" {
+                    0o3770
+                } else {
+                    0o2770
+                },
                 "candidate environment capture",
             )
         })
@@ -9351,6 +9681,7 @@ pub(crate) fn verify_derived_archive_broker_staging_authority_v1_for_integration
             .map_err(|error| format!("cannot inspect derived broker receipt fixture: {error}"))?;
         let authority =
             DerivedArchiveBrokerStagingAuthority::bind(&staging, metadata.uid(), metadata.gid())?;
+        crate::command::verify_native_archive_derived_directory_modes_for_integration(&staging)?;
 
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o0710))
             .map_err(|error| format!("cannot create derived broker mode drift: {error}"))?;
@@ -13911,7 +14242,10 @@ fn stage_posix_executable(
     source_path: &Path,
     staged_name: &'static str,
 ) -> Result<PosixAdapterProtection, String> {
-    if !matches!(staged_name, "hell-ci" | "cargo" | "cargo-deny" | "stack") {
+    if !matches!(
+        staged_name,
+        "hell-ci" | "cargo" | "cargo-deny" | "cargo-fuzz" | "stack"
+    ) {
         return Err("trusted POSIX executable name differs from policy".to_owned());
     }
     let original = fs::symlink_metadata(source_path)
@@ -14100,7 +14434,10 @@ fn posix_adapter_cleanup_is_exact(
 ) -> bool {
     directory.parent() == Some(installation_root)
         && adapter.parent() == Some(directory)
-        && matches!(staged_name, "hell-ci" | "cargo" | "cargo-deny" | "stack")
+        && matches!(
+            staged_name,
+            "hell-ci" | "cargo" | "cargo-deny" | "cargo-fuzz" | "stack"
+        )
         && adapter.file_name() == Some(std::ffi::OsStr::new(staged_name))
 }
 
@@ -15495,7 +15832,347 @@ fn windows_toolchain_executable_authority(
 
 /// Dedicated-UID launch authority for one non-release Linux MemCordon root.
 #[cfg(target_os = "linux")]
+struct LinuxMemcordonWorkspace {
+    original: PathBuf,
+    source: PathBuf,
+    work: PathBuf,
+    directory: PathBuf,
+    identity: PosixObjectIdentity,
+    installation_root: PathBuf,
+    installation_identity: PosixObjectIdentity,
+    source_digest: String,
+    commit: String,
+    additional_inputs: Vec<(String, String)>,
+    sudo: PathBuf,
+    tools: PosixAdapterTools,
+    cleanup_deadline: Instant,
+    active: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxMemcordonWorkspace {
+    fn stage(
+        original: &Path,
+        operation: &str,
+        sudo: &Path,
+        deadline: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let commit = git_head_before(original, deadline)?;
+        let source_digest =
+            hell_testkit::sha256_bytes(&canonical_json_bytes(&source_inventory(original)?)?).hex();
+        let installation_root = posix_adapter_installation_root(ReleasePlatform::LinuxX86_64)?;
+        let installation_identity = posix_object_identity(&installation_root)?;
+        let tools = resolve_posix_adapter_tools(ReleasePlatform::LinuxX86_64)?;
+        let sequence = POSIX_ADAPTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = installation_root.join(format!(
+            "hell-rs-posix-sources-{}-{sequence}-operation",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)
+            .map_err(|error| format!("cannot reserve Linux workspace authority: {error}"))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("cannot bind workspace traversal mode: {error}"))?;
+        let mut stage = Self {
+            original: original.to_path_buf(),
+            source: directory.join("candidate"),
+            work: directory.join("work"),
+            identity: posix_object_identity(&directory)?,
+            directory,
+            installation_root,
+            installation_identity,
+            source_digest,
+            commit,
+            additional_inputs: Vec::new(),
+            sudo: sudo.to_path_buf(),
+            tools,
+            cleanup_deadline,
+            active: true,
+        };
+        let result = (|| {
+            let git =
+                crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/git"))
+                    .map_err(|error| {
+                        format!("cannot bind staged workspace Git authority: {error}")
+                    })?;
+            git.revalidate().map_err(|error| error.to_string())?;
+            for (cwd, arguments) in [
+                (
+                    original,
+                    vec![
+                        OsString::from("clone"),
+                        OsString::from("--no-local"),
+                        OsString::from("--no-checkout"),
+                        OsString::from("--template="),
+                        OsString::from("--"),
+                        original.as_os_str().to_owned(),
+                        stage.source.as_os_str().to_owned(),
+                    ],
+                ),
+                (
+                    stage.source.as_path(),
+                    vec![
+                        OsString::from("checkout"),
+                        OsString::from("--detach"),
+                        OsString::from(&stage.commit),
+                        OsString::from("--"),
+                    ],
+                ),
+                (
+                    stage.source.as_path(),
+                    vec![
+                        OsString::from("remote"),
+                        OsString::from("remove"),
+                        OsString::from("origin"),
+                    ],
+                ),
+            ] {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or("Linux source staging deadline expired")?;
+                let output = CommandSpec::new(git.invocation_path(), remaining)
+                    .git_safe_directory(cwd)
+                    .arguments(arguments)
+                    .current_directory(cwd)
+                    .run()
+                    .map_err(|error| format!("cannot stage Linux source snapshot: {error}"))?;
+                if !output.status.success() || output.timed_out {
+                    return Err(format!(
+                        "Linux source snapshot command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+            // Nightly consumes these independently bound host-produced inputs;
+            // no cache, credentials or unrelated untracked checkout files are copied.
+            for relative in [
+                "ci-out/linux-release-oracle",
+                "ci-out/dependency-policy.json",
+            ] {
+                let input = original.join(relative);
+                if input.exists() {
+                    let bytes = read_regular(&input)?;
+                    let destination = stage.source.join(relative);
+                    fs::create_dir_all(destination.parent().ok_or("staged input lacks parent")?)
+                        .map_err(|error| error.to_string())?;
+                    fs::write(&destination, &bytes)
+                        .map_err(|error| format!("cannot stage bound operation input: {error}"))?;
+                    fs::set_permissions(
+                        &destination,
+                        fs::metadata(&input)
+                            .map_err(|error| error.to_string())?
+                            .permissions(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    stage.additional_inputs.push((
+                        relative.to_owned(),
+                        hell_testkit::sha256_bytes(&bytes).hex(),
+                    ));
+                }
+            }
+            if operation == "fuzz" {
+                crate::fuzz::reserve_source_artifact_defaults(
+                    &stage.source.join("ci/fuzz-targets.toml"),
+                    &stage.source,
+                )?;
+            }
+            validate_trusted_cargo_cache_tree(&stage.source)
+                .map_err(|error| format!("Linux source tree is not closed: {error}"))?;
+            for mode in ["a+rX", "a-w"] {
+                trusted_tool_status_before(
+                    deadline,
+                    sudo,
+                    &stage.tools.chmod,
+                    [
+                        OsString::from("-R"),
+                        OsString::from(mode),
+                        stage.source.as_os_str().to_owned(),
+                    ],
+                )?;
+            }
+            fs::create_dir(&stage.work).map_err(|error| {
+                format!("cannot create staged operation writable root: {error}")
+            })?;
+            stage.validate()?;
+            Ok(())
+        })();
+        if let Err(primary) = result {
+            return Err(match stage.close() {
+                Ok(()) => primary,
+                Err(cleanup) => format!("{primary}; Linux workspace cleanup failed: {cleanup}"),
+            });
+        }
+        Ok(stage)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if posix_object_identity(&self.directory)? != self.identity
+            || git_head(&self.source)? != self.commit
+            || git_head(&self.original)? != self.commit
+        {
+            return Err("Linux staged workspace identity or subject changed".to_owned());
+        }
+        require_source_inventory(&self.original, &self.source_digest)?;
+        require_source_inventory(&self.source, &self.source_digest)?;
+        for (relative, digest) in &self.additional_inputs {
+            for root in [&self.original, &self.source] {
+                if hell_testkit::sha256_bytes(&read_regular(&root.join(relative))?).hex() != *digest
+                {
+                    return Err(format!(
+                        "Linux operation auxiliary input changed: {relative}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        if validate_posix_adapter_installation_root(
+            ReleasePlatform::LinuxX86_64,
+            &self.installation_root,
+        )? != self.installation_root
+            || posix_object_identity(&self.installation_root)? != self.installation_identity
+            || self.directory.parent() != Some(&self.installation_root)
+            || posix_object_identity(&self.directory)? != self.identity
+        {
+            return Err("Linux workspace cleanup authority changed".to_owned());
+        }
+        trusted_tool_status_before(
+            self.cleanup_deadline,
+            &self.sudo,
+            &self.tools.remove_file,
+            [
+                OsString::from("-rf"),
+                OsString::from("--"),
+                self.directory.as_os_str().to_owned(),
+            ],
+        )?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxMemcordonWorkspace {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.close();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_linux_memcordon_path_preflight(arguments: &[OsString]) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let [source, work, uid, operation] = arguments else {
+        return Err("Linux path preflight requires source, work and candidate uid".to_owned());
+    };
+    let uid = uid
+        .to_str()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or("invalid candidate preflight uid")?;
+    if uid == 0 || nix::unistd::geteuid().as_raw() != uid || nix::unistd::getegid().as_raw() != uid
+    {
+        return Err("Linux path preflight candidate identity differs".to_owned());
+    }
+    let source = Path::new(source);
+    let work = Path::new(work);
+    for (role, path) in [("source", source), ("work", work)] {
+        if !path.is_absolute() {
+            return Err(format!("{role} preflight path is not absolute"));
+        }
+        let ancestors = path.ancestors().collect::<Vec<_>>();
+        for (depth, ancestor) in ancestors.into_iter().rev().enumerate() {
+            let metadata = fs::symlink_metadata(ancestor).map_err(|error| {
+                format!("candidate {role} ancestor {depth} inspection failed: {error}")
+            })?;
+            println!(
+                "path_role={role} ancestor={depth} dev={} ino={} uid={} gid={} mode={:#o}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode()
+            );
+            fs::metadata(ancestor.join(".")).map_err(|error| {
+                format!("candidate {role} ancestor {depth} search failed: {error}")
+            })?;
+        }
+        if fs::canonicalize(path)
+            .map_err(|error| format!("candidate {role} canonicalization failed: {error}"))?
+            != path
+        {
+            return Err(format!("candidate {role} path is redirected"));
+        }
+    }
+    for relative in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "compat/assurance-mutants.toml",
+        "ci/fuzz-targets.toml",
+    ] {
+        fs::File::open(source.join(relative)).map_err(|error| {
+            format!("candidate immutable input {relative} read failed: {error}")
+        })?;
+    }
+    if fs::OpenOptions::new()
+        .write(true)
+        .open(source.join("Cargo.toml"))
+        .is_ok()
+    {
+        return Err("candidate can write immutable source input".to_owned());
+    }
+    let probe = work.join("candidate-path-probe");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| format!("candidate writable root creation failed: {error}"))?;
+    if file.metadata().map_err(|error| error.to_string())?.uid() != uid {
+        return Err("candidate probe owner differs".to_owned());
+    }
+    drop(file);
+    fs::remove_file(&probe)
+        .map_err(|error| format!("candidate writable root cleanup failed: {error}"))?;
+    let environment = ProcessEnvironment::from_process();
+    for (variable, name) in [
+        (StandardVariable::Cargo, "CARGO"),
+        (StandardVariable::Rustc, "RUSTC"),
+    ] {
+        let tool = PathBuf::from(environment.required_singleton_value(variable, name)?);
+        fs::canonicalize(&tool)
+            .map_err(|error| format!("candidate {name} path traversal failed: {error}"))?;
+        let output = CommandSpec::new(&tool, Duration::from_secs(10))
+            .argument("--version")
+            .current_directory(source)
+            .run()
+            .map_err(|error| format!("candidate {name} spawn failed: {error}"))?;
+        if !output.status.success() || output.timed_out {
+            return Err(format!(
+                "candidate {name} version probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    if operation == "fuzz" {
+        crate::fuzz::preflight_tool_requirements(source)?;
+    }
+    super::cargo_dependencies::prove_operation_dependencies_offline(
+        source,
+        operation.to_str().ok_or("operation is not UTF-8")?,
+    )?;
+    Ok("Linux candidate source/work/toolchain path authority verified".to_owned())
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct LinuxMemcordonLaunchAuthority {
+    operation: String,
     policy: Option<hell_testkit::CandidateLaunchPolicy>,
     executable: PathBuf,
     work_root: PathBuf,
@@ -15515,7 +16192,11 @@ pub(crate) struct LinuxMemcordonLaunchAuthority {
     principal: Option<PosixPrincipalCleanup>,
     adapter: Option<PosixAdapterProtection>,
     cargo_adapter: Option<PosixAdapterProtection>,
+    cargo_fuzz: Option<PosixAdapterProtection>,
+    fuzz_requirements: Option<crate::fuzz::FuzzToolRequirements>,
     rustup: Option<PosixRustupProtection>,
+    // Drop the principal and executable authorities before removing its paths.
+    workspace: Option<LinuxMemcordonWorkspace>,
 }
 
 #[cfg(target_os = "linux")]
@@ -15523,6 +16204,7 @@ impl LinuxMemcordonLaunchAuthority {
     pub(crate) fn acquire_until(
         workspace_root: &Path,
         work_root: &Path,
+        operation: &str,
         deadline: Instant,
         cleanup_deadline: Instant,
     ) -> Result<Self, String> {
@@ -15555,6 +16237,17 @@ impl LinuxMemcordonLaunchAuthority {
         }
         let process_authorities = ResolvedPosixProcessAuthorities::resolve()?;
         let sudo = process_authorities.sudo.invocation_path().to_path_buf();
+        let workspace = LinuxMemcordonWorkspace::stage(
+            &workspace_root,
+            operation,
+            &sudo,
+            deadline,
+            cleanup_deadline,
+        )?;
+        let workspace_root = workspace.source.clone();
+        let work_root = workspace.work.clone();
+        let work_metadata = fs::symlink_metadata(&work_root)
+            .map_err(|error| format!("cannot inspect staged Linux writable root: {error}"))?;
         let (principal_name, principal_group, principal_id, mut principal) =
             allocate_linux_candidate_principal(&process_authorities, "hellmcd")?;
         principal.deadline = Some(cleanup_deadline);
@@ -15582,8 +16275,18 @@ impl LinuxMemcordonLaunchAuthority {
         let adapter =
             stage_posix_executable(ReleasePlatform::LinuxX86_64, &sudo, &current_exe, "hell-ci")?;
         let cargo = crate::command::resolve_standard_cargo_executable()?;
-        let cargo_authority =
-            crate::command::resolve_posix_cargo_authority(&cargo, &workspace_root)?;
+        let fuzz_requirements = if operation == "fuzz" {
+            Some(crate::fuzz::tool_requirements(&workspace_root)?)
+        } else {
+            None
+        };
+        let cargo_authority = crate::command::resolve_posix_cargo_authority_for_toolchain(
+            &cargo,
+            &workspace_root,
+            fuzz_requirements
+                .as_ref()
+                .map(|requirements| requirements.toolchain.as_str()),
+        )?;
         let rustup_authority = match &cargo_authority {
             crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => authority,
             crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
@@ -15598,6 +16301,49 @@ impl LinuxMemcordonLaunchAuthority {
             cargo.canonical_identity(),
             "cargo",
         )?;
+        let cargo_fuzz = if let Some(requirements) = &fuzz_requirements {
+            let source = crate::command::resolve_standard_path_executable(std::ffi::OsStr::new(
+                "cargo-fuzz",
+            ))?;
+            source.revalidate()?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("fuzz tool acquisition deadline expired")?;
+            let version =
+                CommandSpec::trusted_standard(remaining.min(Duration::from_secs(10)), &source)?
+                    .argument("--version")
+                    .current_directory(&workspace_root)
+                    .run()
+                    .map_err(|error| error.to_string())?;
+            if version.timed_out
+                || !version.status.success()
+                || version.stdout_truncated
+                || version.stderr_truncated
+                || version
+                    .stdout
+                    .strip_prefix(b"cargo-fuzz ")
+                    .and_then(|bytes| bytes.strip_suffix(b"\n"))
+                    != Some(requirements.cargo_fuzz_version.as_bytes())
+            {
+                return Err("trusted cargo-fuzz version differs from validated manifest".to_owned());
+            }
+            let staged = stage_posix_executable(
+                ReleasePlatform::LinuxX86_64,
+                &sudo,
+                source.canonical_identity(),
+                "cargo-fuzz",
+            )?;
+            source.revalidate()?;
+            if hell_testkit::sha256_file(source.canonical_identity())
+                .map_err(|error| error.to_string())?
+                != staged.sha256
+            {
+                return Err("cargo-fuzz source changed while staging".to_owned());
+            }
+            Some(staged)
+        } else {
+            None
+        };
         let launch_authorities = hell_testkit::PosixLaunchAuthorities::new(
             adapter.adapter.clone(),
             adapter.sha256,
@@ -15633,9 +16379,24 @@ impl LinuxMemcordonLaunchAuthority {
             let home = work_root.join("home");
             let temporary = work_root.join("tmp");
             prepare_linux_memcordon_work_directories(
+                &sudo,
                 &work_root,
                 [&cargo_home, &cargo_target, &home, &temporary],
                 principal_id,
+                deadline,
+            )?;
+            super::cargo_dependencies::stage_operation_dependencies(
+                &workspace_root,
+                operation,
+                &cargo,
+                &rustup.home,
+                rustup
+                    .toolchain
+                    .to_str()
+                    .ok_or("selected toolchain is not UTF-8")?,
+                &workspace.directory.join("dependencies"),
+                &cargo_home,
+                deadline,
             )?;
             let selected_tool_bin = rustup
                 .home
@@ -15651,24 +16412,24 @@ impl LinuxMemcordonLaunchAuthority {
             {
                 return Err("staged Linux rustc authority is not canonical".to_owned());
             }
-            let environment = ProcessEnvironment::from_process();
-            let trusted_path = environment
-                .value(StandardVariable::Path)
-                .ok_or_else(|| "trusted Linux PATH is unavailable".to_owned())?;
-            let trusted_search = std::env::split_paths(trusted_path).collect::<Vec<_>>();
-            if trusted_search.is_empty() || trusted_search.iter().any(|path| !path.is_absolute()) {
-                return Err("trusted Linux PATH contains a non-absolute entry".to_owned());
-            }
             let cargo_adapter_directory = cargo_adapter
                 .adapter
                 .parent()
                 .ok_or_else(|| "staged Linux Cargo adapter has no parent".to_owned())?;
-            let tool_path = std::env::join_paths(
-                [cargo_adapter_directory.to_path_buf(), selected_tool_bin]
-                    .into_iter()
-                    .chain(trusted_search),
-            )
-            .map_err(|error| format!("cannot encode staged Linux tool PATH: {error}"))?;
+            // Only protected operation tools and platform system directories;
+            // runner-home PATH entries are neither accessible nor authority.
+            let mut search = vec![cargo_adapter_directory.to_path_buf(), selected_tool_bin];
+            if let Some(fuzz) = &cargo_fuzz {
+                search.push(
+                    fuzz.adapter
+                        .parent()
+                        .ok_or("cargo-fuzz staging parent absent")?
+                        .to_path_buf(),
+                );
+            }
+            search.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+            let tool_path = std::env::join_paths(search)
+                .map_err(|error| format!("cannot encode staged Linux tool PATH: {error}"))?;
             let delegated = posix_object_identity(&work_root)?;
             if delegated.device != work_identity.device
                 || delegated.inode != work_identity.inode
@@ -15721,6 +16482,8 @@ impl LinuxMemcordonLaunchAuthority {
             }
         };
         Ok(Self {
+            operation: operation.to_owned(),
+            workspace: Some(workspace),
             policy: Some(policy),
             executable: adapter.adapter.clone(),
             work_root,
@@ -15740,6 +16503,8 @@ impl LinuxMemcordonLaunchAuthority {
             principal: Some(principal),
             adapter: Some(adapter),
             cargo_adapter: Some(cargo_adapter),
+            cargo_fuzz,
+            fuzz_requirements,
             rustup: Some(rustup),
         })
     }
@@ -15775,6 +16540,157 @@ impl LinuxMemcordonLaunchAuthority {
 
     pub(crate) fn work_root(&self) -> &Path {
         &self.work_root
+    }
+
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self
+            .workspace
+            .as_ref()
+            .expect("active authority retains source workspace")
+            .source
+    }
+
+    pub(crate) fn preflight_until(&self, deadline: Instant, evidence: &Path) -> Result<(), String> {
+        if let Some(fuzz) = &self.cargo_fuzz {
+            fuzz.revalidate()?;
+            let requirements = self
+                .fuzz_requirements
+                .as_ref()
+                .ok_or("fuzz requirements absent")?;
+            write_atomic(
+                &evidence.join("fuzz-tool-authority.json"),
+                &canonical_json_bytes(&object([
+                    ("schemaVersion", number(1)),
+                    ("cargoFuzzSourceSha256", string(&fuzz.sha256.hex())),
+                    ("cargoFuzzStagedSha256", string(&fuzz.sha256.hex())),
+                    (
+                        "cargoFuzzStagedPath",
+                        string(path_text(&fuzz.adapter, "staged cargo-fuzz")?),
+                    ),
+                    ("cargoFuzzVersion", string(&requirements.cargo_fuzz_version)),
+                    ("requestedToolchain", string(&requirements.toolchain)),
+                    (
+                        "selectedToolchain",
+                        string(
+                            self.rustup_toolchain
+                                .to_str()
+                                .ok_or("selected toolchain is not UTF-8")?,
+                        ),
+                    ),
+                ]))?,
+            )?;
+        }
+        let workspace = self
+            .workspace
+            .as_ref()
+            .ok_or("Linux workspace authority absent")?;
+        let provenance = object([
+            ("schemaVersion", number(1)),
+            ("sourceCommit", string(&workspace.commit)),
+            ("sourceInventorySha256", string(&workspace.source_digest)),
+            (
+                "logicalRepository",
+                string(path_text(&workspace.original, "logical repository")?),
+            ),
+            (
+                "candidateRepository",
+                string(path_text(&workspace.source, "candidate repository")?),
+            ),
+            (
+                "candidateWorkRoot",
+                string(path_text(&workspace.work, "candidate work root")?),
+            ),
+            (
+                "additionalInputs",
+                JsonValue::Array(
+                    workspace
+                        .additional_inputs
+                        .iter()
+                        .map(|(path, digest)| {
+                            object([("path", string(path)), ("sha256", string(digest))])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+        write_atomic(
+            &evidence.join("workspace-authority.json"),
+            &canonical_json_bytes(&provenance)?,
+        )?;
+        let uid = self
+            .principal
+            .as_ref()
+            .and_then(|principal| principal.uid)
+            .ok_or("candidate uid is absent")?;
+        let mut command = NativeProcessSpec::new(&self.executable)
+            .arguments([
+                OsString::from("__memcordon-path-preflight"),
+                self.repository_root().as_os_str().to_owned(),
+                self.work_root.as_os_str().to_owned(),
+                OsString::from(uid.to_string()),
+                OsString::from(&self.operation),
+            ])
+            .current_directory(self.repository_root())
+            .construct()?;
+        let bound = self.configure_command(&mut command)?;
+        let manifest_count = self.fuzz_requirements.as_ref().map_or(1, |requirements| {
+            requirements.fuzz_directories.len().saturating_add(1)
+        });
+        let dependency_budget = Duration::from_secs(60)
+            .checked_mul(
+                u32::try_from(manifest_count).map_err(|_| "preflight manifest count overflowed")?,
+            )
+            .ok_or("preflight dependency budget overflowed")?;
+        let preflight_budget = dependency_budget
+            .checked_add(Duration::from_secs(50))
+            .ok_or("preflight version budget overflowed")?;
+        let execution = Instant::now()
+            .checked_add(preflight_budget)
+            .ok_or("path preflight deadline overflowed")?
+            .min(deadline);
+        let completion = execution
+            .checked_add(Duration::from_secs(10))
+            .ok_or("path preflight cleanup deadline overflowed")?
+            .min(deadline);
+        let output = hell_testkit::with_candidate_launch_policy(self.launch_policy()?, || {
+            hell_testkit::run_supervised_command_with_bound_program_until(
+                &mut command,
+                &[],
+                execution,
+                completion,
+                &bound,
+                None,
+            )
+        })
+        .map_err(|error| {
+            let primary = format!("Linux candidate path preflight could not launch: {error}");
+            match canonical_json_bytes(&object([
+                ("schemaVersion", number(1)),
+                ("error", string(&primary)),
+            ]))
+            .and_then(|bytes| write_atomic(&evidence.join("path-preflight-error.json"), &bytes))
+            {
+                Ok(()) => primary,
+                Err(retention) => {
+                    format!("{primary}; preflight error retention failed: {retention}")
+                }
+            }
+        })?;
+        crate::operation_evidence::retain(
+            &evidence.join("streams").join("path-preflight"),
+            &output,
+        )?;
+        if !output.status.success() || output.timed_out {
+            return Err(format!(
+                "Linux candidate path preflight failed: {}",
+                String::from_utf8_lossy(&output.stderr.prefix)
+            ));
+        }
+        self.workspace
+            .as_ref()
+            .expect("active workspace")
+            .validate()?;
+        Ok(())
     }
 
     /// Configures the one staged operation root with only bound standard tool
@@ -15837,77 +16753,153 @@ impl LinuxMemcordonLaunchAuthority {
     /// Ends launch authority and transfers the complete bounded work tree back
     /// to the trusted runner. Callers may copy fixed outputs only after this
     /// succeeds; candidate-owned links and special files fail closed.
-    pub(crate) fn retain_work_root_until(&mut self, deadline: Instant) -> Result<(), String> {
-        if self.retained {
-            return Err("Linux MemCordon work root was already retained".to_owned());
-        }
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| "Linux MemCordon retention deadline expired".to_owned())?;
-        drop(self.policy.take());
-        let candidate_id = self
-            .principal
-            .as_ref()
-            .and_then(|principal| principal.uid.zip(principal.gid))
-            .ok_or_else(|| "Linux MemCordon candidate identity receipt is absent".to_owned())?;
-        let current = posix_object_identity(&self.work_root)?;
-        if current.device != self.work_identity.device
-            || current.inode != self.work_identity.inode
-            || current.owner != self.work_identity.owner
-            || current.group != candidate_id.1
-            || current.mode != 0o2770
-        {
-            return Err(
-                "Linux MemCordon writable-root identity changed before retention".to_owned(),
-            );
-        }
-        let adapter = self
-            .adapter
-            .as_ref()
-            .ok_or_else(|| "Linux MemCordon retention adapter is absent".to_owned())?;
-        require_posix_adapter_unchanged(adapter)?;
-        let arguments = [
-            OsString::from("-n"),
-            OsString::from("--"),
-            adapter.adapter.as_os_str().to_owned(),
-            OsString::from("__release-normalize-memcordon-work-v1"),
-            self.work_root.as_os_str().to_owned(),
-            OsString::from(self.work_identity.device.to_string()),
-            OsString::from(self.work_identity.inode.to_string()),
-            OsString::from(candidate_id.0.to_string()),
-            OsString::from(candidate_id.1.to_string()),
-            OsString::from(self.work_identity.owner.to_string()),
-            OsString::from(self.original_group.to_string()),
-            OsString::from(self.original_mode.to_string()),
-        ];
-        let result = CommandSpec::new(self.sudo.as_os_str(), remaining)
-            .arguments(arguments)
-            .run()
-            .map_err(|error| format!("Linux MemCordon retention adapter failed: {error}"))?;
-        if !result.status.success() || result.timed_out || Instant::now() >= deadline {
-            return Err("Linux MemCordon retention adapter did not complete in time".to_owned());
-        }
-        require_posix_adapter_unchanged(adapter)?;
-        let retained = posix_object_identity(&self.work_root)?;
-        if retained.device != self.work_identity.device
-            || retained.inode != self.work_identity.inode
-            || retained.owner != self.work_identity.owner
-            || retained.group != self.original_group
-            || retained.mode != self.original_mode
-        {
-            return Err("retained Linux MemCordon work-root identity differs".to_owned());
-        }
-        self.retained = true;
-        Ok(())
+    pub(crate) fn retain_work_root_until(
+        &mut self,
+        deadline: Instant,
+        evidence: &Path,
+    ) -> Result<(), String> {
+        self.retain_work_root_attempt(
+            deadline,
+            evidence,
+            crate::retention_evidence::Attempt::Primary,
+        )
     }
 
-    pub(crate) fn close_until(mut self, deadline: Instant) -> Result<(), String> {
+    fn retain_work_root_attempt(
+        &mut self,
+        deadline: Instant,
+        evidence: &Path,
+        attempt: crate::retention_evidence::Attempt,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let diagnostic_root = attempt.directory(evidence);
+        let mut timed_out = None;
+        let retention = (|| {
+            if let Some(fuzz) = &self.cargo_fuzz {
+                fuzz.revalidate()?;
+            }
+            if self.retained {
+                return Err("Linux MemCordon work root was already retained".to_owned());
+            }
+            self.workspace
+                .as_ref()
+                .ok_or("Linux source workspace authority is absent")?
+                .validate()?;
+            drop(self.policy.take());
+            let candidate_id = self
+                .principal
+                .as_ref()
+                .and_then(|principal| principal.uid.zip(principal.gid))
+                .ok_or_else(|| "Linux MemCordon candidate identity receipt is absent".to_owned())?;
+            // Closing launch authority is not proof of process absence. Closed
+            // hard-link accounting requires the dedicated candidate UID to be
+            // quiescent, including error paths without a sealed exit receipt.
+            let principal = self
+                .principal
+                .as_ref()
+                .expect("candidate identity was bound");
+            principal.require_exact_identity_until(
+                deadline,
+                "-u",
+                candidate_id.0,
+                "UID before retention",
+            )?;
+            principal.require_exact_identity_until(
+                deadline,
+                "-g",
+                candidate_id.1,
+                "GID before retention",
+            )?;
+            principal.require_no_processes_until(candidate_id.0, deadline)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| "Linux MemCordon retention deadline expired".to_owned())?;
+            let current = posix_object_identity(&self.work_root)?;
+            if current.device != self.work_identity.device
+                || current.inode != self.work_identity.inode
+                || current.owner != self.work_identity.owner
+                || current.group != candidate_id.1
+                || current.mode != 0o2770
+            {
+                return Err(
+                    "Linux MemCordon writable-root identity changed before retention".to_owned(),
+                );
+            }
+            let adapter = self
+                .adapter
+                .as_ref()
+                .ok_or_else(|| "Linux MemCordon retention adapter is absent".to_owned())?;
+            require_posix_adapter_unchanged(adapter)?;
+            let arguments = [
+                OsString::from("-n"),
+                OsString::from("--"),
+                adapter.adapter.as_os_str().to_owned(),
+                OsString::from("__release-normalize-memcordon-work-v1"),
+                self.work_root.as_os_str().to_owned(),
+                OsString::from(self.work_identity.device.to_string()),
+                OsString::from(self.work_identity.inode.to_string()),
+                OsString::from(candidate_id.0.to_string()),
+                OsString::from(candidate_id.1.to_string()),
+                OsString::from(self.work_identity.owner.to_string()),
+                OsString::from(self.original_group.to_string()),
+                OsString::from(self.original_mode.to_string()),
+            ];
+            let result = CommandSpec::new(self.sudo.as_os_str(), remaining)
+                .arguments(arguments)
+                .run_trusted_host_captured()
+                .map_err(|error| {
+                    let timeout = error.kind() == std::io::ErrorKind::TimedOut;
+                    timed_out = Some(timeout);
+                    if timeout {
+                        format!("Linux MemCordon retention adapter supervision timed out: {error}")
+                    } else {
+                        format!("Linux MemCordon retention adapter execution failed: {error}")
+                    }
+                })?;
+            timed_out = Some(result.timed_out);
+            crate::retention_evidence::retain_result(
+                &diagnostic_root,
+                &(&result).into(),
+                Instant::now() >= deadline,
+            )?;
+            if Instant::now() >= deadline {
+                return Err("Linux MemCordon retention deadline expired while persisting adapter diagnostics".to_owned());
+            }
+            require_posix_adapter_unchanged(adapter)?;
+            let retained = posix_object_identity(&self.work_root)?;
+            if retained.device != self.work_identity.device
+                || retained.inode != self.work_identity.inode
+                || retained.owner != self.work_identity.owner
+                || retained.group != self.original_group
+                || retained.mode != self.original_mode
+            {
+                return Err("retained Linux MemCordon work-root identity differs".to_owned());
+            }
+            self.retained = true;
+            Ok(())
+        })();
+        retention.map_err(|primary| {
+            crate::retention_evidence::retain_failure(
+                &diagnostic_root,
+                primary,
+                started.elapsed(),
+                Instant::now() >= deadline,
+                timed_out,
+            )
+        })
+    }
+
+    pub(crate) fn close_until(mut self, deadline: Instant, evidence: &Path) -> Result<(), String> {
         if Instant::now() >= deadline {
             return Err("Linux MemCordon authority cleanup deadline expired".to_owned());
         }
         if !self.retained {
-            self.retain_work_root_until(deadline)?;
+            self.retain_work_root_attempt(
+                deadline,
+                evidence,
+                crate::retention_evidence::Attempt::CleanupRetry,
+            )?;
         }
         let current = posix_object_identity(&self.work_root)?;
         if current.device != self.work_identity.device
@@ -15925,6 +16917,10 @@ impl LinuxMemcordonLaunchAuthority {
         if let Some(mut cargo) = self.cargo_adapter.take() {
             cargo.close()?;
         }
+        if let Some(mut fuzz) = self.cargo_fuzz.take() {
+            fuzz.revalidate()?;
+            fuzz.close()?;
+        }
         if let Some(mut adapter) = self.adapter.take() {
             adapter.close()?;
         }
@@ -15934,6 +16930,9 @@ impl LinuxMemcordonLaunchAuthority {
             .ok_or_else(|| "Linux MemCordon principal cleanup is absent".to_owned())?;
         principal.deadline = Some(deadline);
         principal.finish()?;
+        if let Some(mut workspace) = self.workspace.take() {
+            workspace.close()?;
+        }
         if Instant::now() >= deadline {
             return Err("Linux MemCordon authority cleanup exceeded its deadline".to_owned());
         }
@@ -15959,37 +16958,83 @@ fn delegate_linux_memcordon_work_root(
 
 #[cfg(target_os = "linux")]
 fn prepare_linux_memcordon_work_directories<'a>(
+    sudo: &Path,
     root: &Path,
     directories: impl IntoIterator<Item = &'a PathBuf>,
     candidate_group: u32,
+    deadline: Instant,
 ) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    let root_identity = posix_object_identity(root)?;
+    let root_identity = bind_linux_memcordon_work_directory(root)?;
     if root_identity.group != candidate_group || root_identity.mode != 0o2770 {
         return Err("Linux MemCordon writable root is not delegated".to_owned());
     }
+    // Resolution remains inside acquire_until's setup/rollback boundary.
+    let chmod = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/chmod"))
+        .map_err(|error| format!("cannot bind Linux chmod authority: {error}"))?;
     for directory in directories {
+        if Instant::now() >= deadline {
+            return Err("Linux MemCordon work-directory setup deadline expired".to_owned());
+        }
+        if bind_linux_memcordon_work_directory(root)? != root_identity {
+            return Err("Linux MemCordon writable-root identity changed during setup".to_owned());
+        }
         if directory.parent() != Some(root) || directory.exists() {
             return Err("Linux MemCordon work-directory layout differs".to_owned());
         }
         fs::create_dir(directory)
             .map_err(|error| format!("cannot create Linux MemCordon work directory: {error}"))?;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o2770))
-            .map_err(|error| format!("cannot bind Linux MemCordon work-directory mode: {error}"))?;
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|error| format!("cannot inspect Linux MemCordon work directory: {error}"))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || metadata.uid() != root_identity.owner
-            || metadata.gid() != candidate_group
-            || metadata.permissions().mode() & 0o7777 != 0o2770
-            || fs::canonicalize(directory).ok().as_deref() != Some(directory.as_path())
+        let created = bind_linux_memcordon_work_directory(directory)?;
+        if created.owner != root_identity.owner || created.group != candidate_group {
+            return Err(format!(
+                "Linux MemCordon created work-directory authority differs: uid={} gid={}; expected uid={} gid={candidate_group}",
+                created.owner, created.group, root_identity.owner
+            ));
+        }
+        // The runner owns this directory but is deliberately not a member of
+        // its inherited candidate group. Linux clears SGID on unprivileged
+        // chmod in that case, so use the retained trusted setup authority.
+        trusted_tool_status_before(
+            deadline,
+            sudo,
+            &chmod,
+            [
+                OsString::from("2770"),
+                OsString::from("--"),
+                directory.as_os_str().to_owned(),
+            ],
+        )?;
+        let current = bind_linux_memcordon_work_directory(directory)?;
+        if current.device != created.device
+            || current.inode != created.inode
+            || current.owner != created.owner
+            || current.group != candidate_group
+            || current.mode != 0o2770
         {
-            return Err("Linux MemCordon work-directory authority differs".to_owned());
+            return Err(format!(
+                "Linux MemCordon work-directory authority differs: observed={current:?}; expected device={} inode={} uid={} gid={candidate_group} mode=0o2770",
+                created.device, created.inode, created.owner
+            ));
+        }
+        if bind_linux_memcordon_work_directory(root)? != root_identity {
+            return Err("Linux MemCordon writable-root identity changed during setup".to_owned());
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_linux_memcordon_work_directory(path: &Path) -> Result<PosixObjectIdentity, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect Linux MemCordon work directory: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(path).ok().as_deref() != Some(path)
+    {
+        return Err(
+            "Linux MemCordon work-directory path is redirected or not canonical".to_owned(),
+        );
+    }
+    Ok(posix_object_identity_from_metadata(&metadata))
 }
 
 #[cfg(target_os = "linux")]
@@ -19042,21 +20087,13 @@ fn revalidate_posix_candidate_target_entry(
 fn validate_posix_candidate_target_links(
     topology: &BTreeMap<PathBuf, PosixCandidateTargetTopologyEntry>,
 ) -> Result<(), String> {
-    let mut observed_links = BTreeMap::<(u64, u64), u64>::new();
-    for entry in topology.values().filter(|entry| !entry.directory) {
-        let observed = observed_links
-            .entry((entry.device, entry.inode))
-            .or_default();
-        *observed = observed
-            .checked_add(1)
-            .ok_or_else(|| "candidate target hard-link count overflowed".to_owned())?;
-    }
-    for entry in topology.values().filter(|entry| !entry.directory) {
-        if observed_links.get(&(entry.device, entry.inode)).copied() != Some(entry.links) {
-            return Err("candidate target contains a hard link outside its authority".to_owned());
-        }
-    }
-    Ok(())
+    crate::retention_evidence::tree::validate_closed_links(
+        topology
+            .values()
+            .filter(|entry| !entry.directory)
+            .map(|entry| (entry.device, entry.inode, entry.links)),
+    )
+    .map_err(|_| "candidate target contains a hard link outside its authority".to_owned())
 }
 
 #[cfg(unix)]
@@ -19465,7 +20502,7 @@ pub(crate) fn run_posix_candidate_cache_normalizer(arguments: &[OsString]) -> Re
 
 #[cfg(target_os = "linux")]
 pub(crate) fn run_linux_memcordon_work_normalizer(arguments: &[OsString]) -> Result<(), String> {
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let [
         root,
@@ -19525,97 +20562,22 @@ pub(crate) fn run_linux_memcordon_work_normalizer(arguments: &[OsString]) -> Res
     {
         return Err("Linux MemCordon work-root identity differs before retention".to_owned());
     }
-    let mut pending = vec![root.clone()];
-    let mut retained = Vec::new();
-    let mut entries = 0_usize;
-    let mut bytes = 0_u64;
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("cannot inspect Linux MemCordon work entry: {error}"))?;
-        let file_type = metadata.file_type();
-        if metadata.dev() != expected_device
-            || (metadata.uid() != candidate_owner && metadata.uid() != trusted_owner)
-            || (metadata.gid() != candidate_group && metadata.gid() != trusted_group)
-            || file_type.is_symlink()
-            || file_type.is_block_device()
-            || file_type.is_char_device()
-            || file_type.is_fifo()
-            || file_type.is_socket()
-            || (!file_type.is_dir() && !file_type.is_file())
-            || (file_type.is_file() && metadata.nlink() != 1)
-        {
-            return Err("Linux MemCordon work tree contains an unauthenticated entry".to_owned());
-        }
-        entries = entries
-            .checked_add(1)
-            .ok_or_else(|| "Linux MemCordon work entry count overflowed".to_owned())?;
-        bytes = bytes
-            .checked_add(if file_type.is_file() {
-                metadata.len()
-            } else {
-                0
-            })
-            .ok_or_else(|| "Linux MemCordon work byte count overflowed".to_owned())?;
-        if entries > POSIX_CANDIDATE_TARGET_ENTRY_LIMIT || bytes > POSIX_CANDIDATE_TARGET_BYTE_LIMIT
-        {
-            return Err("Linux MemCordon work tree exceeds its resource bound".to_owned());
-        }
-        if file_type.is_dir() {
-            for entry in fs::read_dir(&path)
-                .map_err(|error| format!("cannot enumerate Linux MemCordon work tree: {error}"))?
-            {
-                pending.push(
-                    entry
-                        .map_err(|error| {
-                            format!("cannot read Linux MemCordon work entry: {error}")
-                        })?
-                        .path(),
-                );
-            }
-        }
-        retained.push((
-            path,
-            file_type.is_dir(),
-            metadata.permissions().mode() & 0o111 != 0,
-            metadata.dev(),
-            metadata.ino(),
-        ));
-    }
-    retained.sort_by_key(|(path, _, _, _, _)| std::cmp::Reverse(path.components().count()));
-    for (path, directory, executable, device, inode) in retained {
-        std::os::unix::fs::chown(&path, Some(trusted_owner), Some(trusted_group))
-            .map_err(|error| format!("cannot retain Linux MemCordon work ownership: {error}"))?;
-        let retained_mode = if directory || executable {
-            0o700
-        } else {
-            0o600
-        };
-        fs::set_permissions(&path, fs::Permissions::from_mode(retained_mode))
-            .map_err(|error| format!("cannot retain Linux MemCordon work permissions: {error}"))?;
-        let after = fs::symlink_metadata(&path)
-            .map_err(|error| format!("cannot attest retained Linux MemCordon entry: {error}"))?;
-        if after.dev() != device
-            || after.ino() != inode
-            || after.uid() != trusted_owner
-            || after.gid() != trusted_group
-            || after.permissions().mode() & 0o7777 != retained_mode
-        {
-            return Err("retained Linux MemCordon work entry differs".to_owned());
-        }
-    }
-    fs::set_permissions(&root, fs::Permissions::from_mode(original_mode))
-        .map_err(|error| format!("cannot restore Linux MemCordon root mode: {error}"))?;
-    let retained_root = fs::symlink_metadata(&root)
-        .map_err(|error| format!("cannot attest retained Linux MemCordon work root: {error}"))?;
-    if retained_root.dev() != expected_device
-        || retained_root.ino() != expected_inode
-        || retained_root.uid() != trusted_owner
-        || retained_root.gid() != trusted_group
-        || retained_root.permissions().mode() & 0o7777 != original_mode
-    {
-        return Err("retained Linux MemCordon work-root identity differs".to_owned());
-    }
-    Ok(())
+    crate::retention_evidence::tree::Inventory::capture(
+        &root,
+        &root_metadata,
+        crate::retention_evidence::entry::Expected {
+            device: expected_device,
+            candidate_uid: candidate_owner,
+            trusted_uid: trusted_owner,
+            candidate_gid: candidate_group,
+            trusted_gid: trusted_group,
+        },
+        crate::retention_evidence::tree::Limits {
+            entries: POSIX_CANDIDATE_TARGET_ENTRY_LIMIT,
+            bytes: POSIX_CANDIDATE_TARGET_BYTE_LIMIT,
+        },
+    )?
+    .normalize(original_mode)
 }
 
 #[cfg(unix)]
@@ -21210,6 +22172,43 @@ fn run_linux_policy_and_build_gates(
         .ok_or_else(|| "Linux dependency-policy authority is absent".to_owned())?;
     policy.validate()?;
     cargo_deny_home.metadata.validate()?;
+    let cargo_source = cargo_deny_home
+        .readiness_cargo
+        .as_ref()
+        .ok_or("readiness Cargo source is absent")?;
+    cargo_source.validate()?;
+    let proof = cargo(
+        context.root,
+        Duration::from_secs(60),
+        [
+            "metadata",
+            "--locked",
+            "--offline",
+            "--all-features",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "x86_64-unknown-linux-gnu",
+        ],
+    )
+    .run_ambient_candidate_captured_until(
+        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_secs(70),
+    )
+    .map_err(|error| format!("candidate Cargo offline proof could not launch: {error}"))?;
+    if proof.timed_out
+        || !proof.status.success()
+        || proof.stdout_truncated
+        || proof.stderr_truncated
+    {
+        return Err(format!(
+            "candidate Cargo offline proof failed: status={:?}, timedOut={}, stderr={}",
+            proof.status,
+            proof.timed_out,
+            String::from_utf8_lossy(&proof.stderr)
+        ));
+    }
+    cargo_source.validate()?;
     let document = read_regular(&policy.path)?;
     verify_dependency_policy_result(
         &document,
@@ -22404,7 +23403,7 @@ fn retain_oracle_copy(
     .map_err(|error| format!("cannot verify retained oracle copy: {error}"))
 }
 
-fn linux_rust_commands(root: &Path) -> Vec<(&'static str, CommandSpec)> {
+pub(crate) fn linux_rust_commands(root: &Path) -> Vec<(&'static str, CommandSpec)> {
     vec![
         (
             "format",
@@ -23039,6 +24038,7 @@ fn tool_identities(
     candidate_root: &Path,
     oracle_source: &Path,
     archive_adapter: &crate::command::NativeArchiveAdapter,
+    #[cfg(unix)] trusted_stack: Option<&crate::command::TrustedStackIdentityQuery>,
 ) -> Result<BTreeMap<String, JsonValue>, String> {
     let mut identities = BTreeMap::new();
     for (name, command) in [
@@ -23054,23 +24054,29 @@ fn tool_identities(
                 .arguments(["--version", "--verbose"])
                 .current_directory(candidate_root),
         ),
-        (
-            "stack",
-            CommandSpec::new("stack", Duration::from_secs(30))
-                .argument("--numeric-version")
-                .current_directory(candidate_root),
-        ),
     ] {
         identities.insert(name.to_owned(), string(&tool_output(&command, name)?));
     }
-    if identities
-        .get("stack")
-        .ok_or_else(|| "Stack identity is missing".to_owned())?
-        .string()?
-        != "3.11.1"
-    {
-        return Err("Stack version differs from release policy".to_owned());
-    }
+    let stack = if platform == ReleasePlatform::LinuxX86_64 {
+        #[cfg(unix)]
+        {
+            let query = trusted_stack
+                .ok_or("Linux prebuilt oracle has no trusted Stack inventory authority")?;
+            validate_stack_identity_result(query.run()?)?
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("Linux Stack inventory requires its native host authority".to_owned());
+        }
+    } else {
+        validate_stack_identity_result(
+            archive_adapter
+                .stack_version(oracle_source)
+                .run()
+                .map_err(|error| format!("cannot identify stack: {error}"))?,
+        )?
+    };
+    identities.insert("stack".to_owned(), string(&stack));
     if platform != ReleasePlatform::LinuxX86_64 {
         if let Some(identity) = archive_adapter.identity_command() {
             identities.insert(
@@ -23096,6 +24102,13 @@ fn tool_output(command: &CommandSpec, label: &str) -> Result<String, String> {
     let result = command
         .run()
         .map_err(|error| format!("cannot identify {label}: {error}"))?;
+    tool_output_result(result, label)
+}
+
+fn tool_output_result(
+    result: crate::command::CommandResult,
+    label: &str,
+) -> Result<String, String> {
     if !result.status.success() || result.timed_out {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let stderr = stderr.chars().take(512).collect::<String>();
@@ -23103,6 +24116,11 @@ fn tool_output(command: &CommandSpec, label: &str) -> Result<String, String> {
             "{label} identity command failed with status {:?}, timedOut={}, stderr={stderr:?}",
             result.status.code(),
             result.timed_out
+        ));
+    }
+    if result.stdout_truncated || result.stderr_truncated {
+        return Err(format!(
+            "{label} identity command exceeded its output bounds"
         ));
     }
     let value = std::str::from_utf8(&result.stdout)
@@ -23113,6 +24131,17 @@ fn tool_output(command: &CommandSpec, label: &str) -> Result<String, String> {
         return Err(format!("{label} identity is empty"));
     }
     Ok(value)
+}
+
+#[doc(hidden)]
+pub fn validate_stack_identity_result(
+    result: crate::command::CommandResult,
+) -> Result<String, String> {
+    let version = tool_output_result(result, "stack")?;
+    if version != "3.11.1" {
+        return Err("Stack version differs from release policy".to_owned());
+    }
+    Ok(version)
 }
 
 fn validate_checkout(root: &Path, plan: &ReleasePlan) -> Result<(), String> {

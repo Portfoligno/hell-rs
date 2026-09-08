@@ -8,11 +8,13 @@ use crate::model;
 
 const MAX_LOCK_BYTES: u64 = 1024 * 1024;
 const LOCK_DOMAIN: &[u8] = b"hell-rs:external-input-lock:1";
-const ALLOWED_INPUT_KEYS: [&str; 17] = [
+const ALLOWED_INPUT_KEYS: [&str; 20] = [
     "acquisition-phase",
+    "asset-id",
     "cache-permitted",
     "commit",
     "expected-filename",
+    "exact-bytes",
     "id",
     "kind",
     "maximum-compressed-bytes",
@@ -23,6 +25,7 @@ const ALLOWED_INPUT_KEYS: [&str; 17] = [
     "platforms",
     "repository",
     "sha256",
+    "source-url",
     "timeout-seconds",
     "toolchain",
     "version",
@@ -192,7 +195,11 @@ fn parse_input(
 fn parse_field(id: &str, key: &str, encoded: &str) -> Result<Value, String> {
     match key {
         "cache-permitted" => Ok(Value::Bool(parse_boolean(encoded)?)),
-        "maximum-compressed-bytes" | "maximum-expanded-bytes" | "timeout-seconds" => {
+        "maximum-compressed-bytes"
+        | "maximum-expanded-bytes"
+        | "timeout-seconds"
+        | "asset-id"
+        | "exact-bytes" => {
             let number = parse_integer(encoded)?;
             if number == 0 {
                 return Err(format!("external input {id} has a zero bound"));

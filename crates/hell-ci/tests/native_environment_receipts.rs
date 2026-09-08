@@ -37,6 +37,33 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn authenticated_stack_fields_match_the_independent_canonical_lock_digest() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let path = repository.join("ci/external-inputs.toml");
+    let digest = hell_ci::native_environment_external_inputs_sha256_for_integration(&path).unwrap();
+    // Independently recomputed by hell-release-verifier's closed parser.
+    assert_eq!(
+        digest,
+        "8b78ffb78797b54aa9b56704ded5ae09954f260dfd1e4dae30b98d35f9f15d6c"
+    );
+    let original = fs::read_to_string(path).unwrap();
+    let fixture = Fixture::new();
+    for (name, from, to) in [
+        ("asset-zero", "asset-id = 446721552", "asset-id = 0"),
+        ("size-zero", "exact-bytes = 94141872", "exact-bytes = 0"),
+    ] {
+        let changed = original.replace(from, to);
+        assert_ne!(changed, original);
+        let path = fixture.write(name, changed.as_bytes());
+        assert!(hell_ci::native_environment_external_inputs_sha256_for_integration(&path).is_err());
+    }
+}
+
+#[test]
 fn native_receipts_bind_tools_external_inputs_and_exact_three_platform_set() {
     let fixture = Fixture::new();
     assert_live_candidate_confined_collection(&fixture);

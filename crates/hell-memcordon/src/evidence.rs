@@ -486,6 +486,144 @@ pub fn operation_ledger_json(entries: &[OperationLedgerEntryV1]) -> Result<Vec<u
     Ok(bytes)
 }
 
+pub const OPERATION_LEDGER_SCHEMA_V2: u32 = 2;
+pub const OPERATION_GROUP_PHASES_V2: [&str; 4] = [
+    "candidate-preflights",
+    "platform-gates",
+    "principal-cleanup",
+    "toolchain-cleanup",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationLedgerV2 {
+    pub schema_version: u32,
+    pub groups: Vec<OperationGroupV2>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationGroupV2 {
+    pub operation_id: String,
+    pub platform_plan_digest: String,
+    pub required_phases: Vec<String>,
+    pub completed_phases: Vec<String>,
+    pub reserved_invocation_ids: Vec<String>,
+    pub reservation_ledger_path: String,
+    pub reservation_ledger_digest: String,
+    pub invocations: Vec<OperationLedgerEntryV1>,
+    pub sealed: bool,
+}
+
+/// Validates exact logical plan completion and every reserved physical invocation.
+///
+/// # Errors
+/// Rejects unknown versions, incomplete groups, duplicate authority, or malformed receipts.
+pub fn validate_operation_ledger_v2(ledger: &OperationLedgerV2) -> Result<(), ContractError> {
+    if ledger.schema_version != OPERATION_LEDGER_SCHEMA_V2 || ledger.groups.len() != 1 {
+        return Err(ContractError::new(
+            "invalid grouped operation ledger schema or size",
+        ));
+    }
+    let mut groups = BTreeSet::new();
+    let mut entries = Vec::new();
+    for group in &ledger.groups {
+        if !matches!(group.operation_id.as_str(), "readiness" | "release")
+            || !groups.insert(&group.operation_id)
+            || !group.sealed
+            || group.required_phases != OPERATION_GROUP_PHASES_V2
+            || group.completed_phases != group.required_phases
+            || group.invocations.is_empty()
+            || group.invocations.len() > 100_000
+        {
+            return Err(ContractError::new(
+                "operation group is incomplete or outside the typed plan",
+            ));
+        }
+        require_digest(&group.platform_plan_digest)?;
+        if group.reservation_ledger_path != "invocation-reservations.json" {
+            return Err(ContractError::new(
+                "operation reservation ledger path differs",
+            ));
+        }
+        require_digest(&group.reservation_ledger_digest)?;
+        let observed = group
+            .invocations
+            .iter()
+            .map(|entry| entry.operation_id.clone())
+            .collect::<Vec<_>>();
+        if observed != group.reserved_invocation_ids {
+            return Err(ContractError::new(
+                "operation group reservation coverage differs",
+            ));
+        }
+        for entry in &group.invocations {
+            if entry.operation_id.is_empty()
+                || entry.operation_id.len() > 128
+                || !entry.operation_id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+            {
+                return Err(ContractError::new(
+                    "invalid operation group invocation identifier",
+                ));
+            }
+            if !matches!(
+                entry.boundary,
+                CandidateBoundaryPolicy::SealedLinux | CandidateBoundaryPolicy::SealedWindows
+            ) || entry.terminal != SealedTerminal::OrdinaryResult
+            {
+                return Err(ContractError::new(
+                    "operation group invocation lacks ordinary sealed completion",
+                ));
+            }
+            for (path, directory) in [
+                (&entry.raw_report_path, "raw"),
+                (&entry.normalized_report_path, "normalized"),
+                (&entry.identity_adapter_path, "adapters"),
+            ] {
+                if let Some(path) = path
+                    && path != &format!("{directory}/{}.json", entry.operation_id)
+                {
+                    return Err(ContractError::new(
+                        "operation group invocation evidence path differs",
+                    ));
+                }
+            }
+            if entry.boundary == CandidateBoundaryPolicy::SealedLinux
+                && entry.identity_adapter_path.is_some()
+            {
+                return Err(ContractError::new(
+                    "Linux operation group claims Windows adapter evidence",
+                ));
+            }
+            entries.push(entry.clone());
+        }
+    }
+    validate_operation_ledger(&entries)
+}
+
+/// Serializes validated groups deterministically, preserving reservation order.
+///
+/// # Errors
+/// Returns an error for an incomplete or malformed ledger.
+pub fn operation_ledger_v2_json(ledger: &OperationLedgerV2) -> Result<Vec<u8>, ContractError> {
+    validate_operation_ledger_v2(ledger)?;
+    let mut ordered = ledger.clone();
+    ordered
+        .groups
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    let mut bytes = serde_json::to_vec(&ordered).map_err(|error| {
+        ContractError::new(format!(
+            "cannot serialize grouped operation ledger: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 fn require_sealed_report_bindings(entry: &OperationLedgerEntryV1) -> Result<(), ContractError> {
     if entry.raw_report_path.is_none() || entry.normalized_report_path.is_none() {
         return Err(ContractError::new(

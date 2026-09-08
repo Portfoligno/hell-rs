@@ -8,10 +8,16 @@ use crate::json::{JsonValue, json_member, parse_json, require_exact_json_keys};
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
+#[cfg(test)]
+#[path = "../../tests/release_github/transport.rs"]
+pub(crate) mod fixture;
+
 pub(crate) struct GitHubClient {
     api: HttpEndpoint,
     credential: GithubCredential,
     agent: ureq::Agent,
+    #[cfg(test)]
+    fixture: Option<fixture::Transcript>,
 }
 
 struct HttpEndpoint {
@@ -20,22 +26,52 @@ struct HttpEndpoint {
     base_path: Vec<String>,
 }
 
+enum HttpResponse {
+    Network(ureq::http::Response<ureq::Body>),
+    #[cfg(test)]
+    Fixture(u16, Vec<u8>),
+}
+
+impl HttpResponse {
+    fn status(&self) -> u16 {
+        match self {
+            Self::Network(response) => response.status().as_u16(),
+            #[cfg(test)]
+            Self::Fixture(status, _) => *status,
+        }
+    }
+
+    fn read_body(self) -> Result<String, String> {
+        match self {
+            Self::Network(mut response) => response
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BYTES)
+                .read_to_string()
+                .map_err(|error| format!("GitHub API response failed: {error}")),
+            #[cfg(test)]
+            Self::Fixture(_, bytes) => {
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RESPONSE_BYTES {
+                    return Err("GitHub API response exceeded its byte bound".to_owned());
+                }
+                String::from_utf8(bytes)
+                    .map_err(|error| format!("GitHub API response failed: {error}"))
+            }
+        }
+    }
+}
+
 impl GitHubClient {
     #[cfg(test)]
-    pub(crate) fn for_test(address: std::net::SocketAddr) -> Self {
-        Self {
-            api: HttpEndpoint {
-                scheme: "http".to_owned(),
-                authority: address.to_string(),
-                base_path: Vec::new(),
-            },
-            credential: GithubCredential::from_value(OsString::from("test-token"))
+    pub(crate) fn for_test(fixture: fixture::Transcript) -> Self {
+        let mut client = Self::new(
+            "https://api.github.com",
+            GithubCredential::from_value(OsString::from("test-token"))
                 .expect("valid test credential"),
-            agent: ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .build()
-                .into(),
-        }
+        )
+        .expect("valid test API origin");
+        client.fixture = Some(fixture);
+        client
     }
     pub(crate) fn from_actions_environment() -> Result<Self, String> {
         let runtime = GithubRuntime::from_process()?;
@@ -65,6 +101,8 @@ impl GitHubClient {
             api: HttpEndpoint::parse(api)?,
             credential,
             agent: config.into(),
+            #[cfg(test)]
+            fixture: None,
         })
     }
 
@@ -315,22 +353,44 @@ impl GitHubClient {
         body: Option<&[u8]>,
         accepted: &[u16],
     ) -> Result<(u16, String), String> {
-        let mut response = self.credential.with_bearer_header(|authorization| {
+        if !matches!(
+            (method, body),
+            ("GET" | "DELETE", None) | ("POST" | "PATCH", Some(_))
+        ) {
+            return Err("unsupported GitHub API method/body combination".to_owned());
+        }
+        let response = self.credential.with_bearer_header(|authorization| {
+            let headers = [
+                ("Authorization", authorization),
+                ("Accept", "application/vnd.github+json"),
+                ("X-GitHub-Api-Version", "2026-03-10"),
+                ("User-Agent", "hell-ci"),
+            ];
+            #[cfg(test)]
+            if let Some(fixture) = &self.fixture {
+                return fixture
+                    .request(fixture::Request::observed(
+                        method,
+                        url,
+                        &headers,
+                        content_type.filter(|_| body.is_some()),
+                        body,
+                    ))
+                    .map(|(status, bytes)| HttpResponse::Fixture(status, bytes));
+            }
             let send = |request: ureq::RequestBuilder<ureq::typestate::WithoutBody>| {
-                request
-                    .header("Authorization", authorization)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2026-03-10")
-                    .header("User-Agent", "hell-ci")
-                    .call()
+                let mut request = request;
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                request.call()
             };
             let send_body = |request: ureq::RequestBuilder<ureq::typestate::WithBody>,
                              bytes: &[u8]| {
-                let request = request
-                    .header("Authorization", authorization)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2026-03-10")
-                    .header("User-Agent", "hell-ci");
+                let mut request = request;
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
                 let request = if let Some(value) = content_type {
                     request.header("Content-Type", value)
                 } else {
@@ -338,25 +398,21 @@ impl GitHubClient {
                 };
                 request.send(bytes)
             };
-            match (method, body) {
+            let response = match (method, body) {
                 ("GET", None) => send(self.agent.get(url)),
                 ("DELETE", None) => send(self.agent.delete(url)),
                 ("POST", Some(bytes)) => send_body(self.agent.post(url), bytes),
                 ("PATCH", Some(bytes)) => send_body(self.agent.patch(url), bytes),
                 _ => return Err("unsupported GitHub API method/body combination".to_owned()),
             }
-            .map_err(|error| format!("GitHub API request failed: {error}"))
+            .map_err(|error| format!("GitHub API request failed: {error}"))?;
+            Ok(HttpResponse::Network(response))
         })?;
-        let status = response.status().as_u16();
+        let status = response.status();
         if !accepted.contains(&status) {
             return Err(format!("GitHub API returned {status}"));
         }
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BYTES)
-            .read_to_string()
-            .map_err(|error| format!("GitHub API response failed: {error}"))?;
+        let body = response.read_body()?;
         Ok((status, body))
     }
 }
@@ -484,252 +540,5 @@ fn encode_segment(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::thread;
-
-    fn test_client(address: std::net::SocketAddr) -> GitHubClient {
-        GitHubClient::for_test(address)
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            bytes.extend_from_slice(&buffer[..read]);
-            let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let line = line.to_ascii_lowercase();
-                    line.strip_prefix("content-length: ")
-                        .and_then(|value| value.parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            if bytes.len() >= header_end + 4 + content_length {
-                return bytes;
-            }
-        }
-    }
-
-    #[test]
-    fn path_segments_are_encoded_without_query_fragments() {
-        let endpoint = HttpEndpoint::parse("https://api.github.com").unwrap();
-        assert_eq!(
-            endpoint.url(&["release/a b".to_owned()]),
-            "https://api.github.com/repos/release%2Fa%20b"
-        );
-    }
-
-    #[test]
-    fn github_enterprise_api_url_retains_its_https_authority_and_base_path() {
-        let endpoint = HttpEndpoint::parse("https://github.example.test/api/v3").unwrap();
-        assert_eq!(
-            endpoint.url(&["owner".to_owned(), "repo".to_owned()]),
-            "https://github.example.test/api/v3/repos/owner/repo"
-        );
-        assert!(endpoint.trusted_upload_url("https://github.example.test/uploads/1"));
-        assert!(!endpoint.trusted_upload_url("https://uploads.example.test/uploads/1"));
-    }
-
-    #[test]
-    fn actions_environment_values_are_validated_without_process_environment_mutation() {
-        let accepted = GitHubClient::from_actions_values(
-            Some(OsString::from("https://github.example.test/api/v3")),
-            Some(OsString::from("standard-token")),
-        );
-        assert!(accepted.is_ok());
-        for (api, token, expected) in [
-            (
-                None,
-                Some(OsString::from("token")),
-                "GITHUB_API_URL is required",
-            ),
-            (
-                Some(OsString::from("not-absolute")),
-                Some(OsString::from("token")),
-                "GITHUB_API_URL",
-            ),
-            (
-                Some(OsString::from("https://api.github.com")),
-                None,
-                "GITHUB_TOKEN is required",
-            ),
-            (
-                Some(OsString::from("https://api.github.com")),
-                Some(OsString::new()),
-                "GITHUB_TOKEN is invalid",
-            ),
-            (
-                Some(OsString::from("https://api.github.com")),
-                Some(OsString::from("bad\rvalue")),
-                "GITHUB_TOKEN is invalid",
-            ),
-            (
-                Some(OsString::from("https://api.github.com")),
-                Some(OsString::from("bad\nvalue")),
-                "GITHUB_TOKEN is invalid",
-            ),
-        ] {
-            let error = GitHubClient::from_actions_values(api, token)
-                .err()
-                .expect("invalid Actions values must fail");
-            assert!(error.contains(expected));
-            assert!(!error.contains("standard-token"));
-            assert!(!error.contains("bad\rvalue"));
-            assert!(!error.contains("bad\nvalue"));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_actions_token_is_rejected_without_echoing_its_bytes() {
-        use std::os::unix::ffi::OsStringExt as _;
-
-        let error = GitHubClient::from_actions_values(
-            Some(OsString::from("https://api.github.com")),
-            Some(OsString::from_vec(vec![0xff, 0xfe])),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error, "GITHUB_TOKEN must be UTF-8");
-    }
-
-    #[test]
-    fn branch_resolution_accepts_real_api_shape_and_sends_no_token_in_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let length = stream.read(&mut request).unwrap();
-            let request = std::str::from_utf8(&request[..length]).unwrap();
-            assert!(
-                request
-                    .starts_with("GET /repos/owner/repository/git/ref/heads/release%2F1 HTTP/1.1")
-            );
-            assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer test-token")
-            );
-            assert!(!request.lines().next().unwrap().contains("test-token"));
-            let body = concat!(
-                "{\"node_id\":\"node\",\"object\":{\"sha\":",
-                "\"1111111111111111111111111111111111111111\",",
-                "\"type\":\"commit\",\"url\":\"https://api.github.com/object\"},",
-                "\"ref\":\"refs/heads/release/1\",",
-                "\"url\":\"https://api.github.com/ref\"}"
-            );
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        let client = test_client(address);
-        assert_eq!(
-            client.branch_head("owner/repository", "release/1").unwrap(),
-            "1111111111111111111111111111111111111111"
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn release_listing_observes_drafts_and_rejects_duplicates() {
-        for (body, expected_error) in [
-            (r#"[{"tag_name":"v1","draft":true,"id":7}]"#, false),
-            (
-                r#"[{"tag_name":"v1","draft":true,"id":7},{"tag_name":"v1","draft":false,"id":8}]"#,
-                true,
-            ),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let body = body.to_owned();
-            let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let length = stream.read(&mut request).unwrap();
-                let request = std::str::from_utf8(&request[..length]).unwrap();
-                assert!(request.starts_with(
-                    "GET /repos/owner/repository/releases?per_page=100&page=1 HTTP/1.1"
-                ));
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            });
-            let result = test_client(address).release_state_by_tag("owner/repository", "v1");
-            assert_eq!(result.is_err(), expected_error);
-            if !expected_error {
-                assert!(result.unwrap().is_some());
-            }
-            server.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn draft_creation_is_observable_through_authenticated_release_listing() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let release = r#"{"assets":[],"body":"marker","draft":true,"id":7,"prerelease":false,"tag_name":"v1","target_commitish":"1111111111111111111111111111111111111111","upload_url":"http://uploads.invalid/{?name,label}"}"#;
-        let server = thread::spawn(move || {
-            for (index, status, body) in [
-                (0, "201 Created", release.to_owned()),
-                (1, "200 OK", format!("[{release}]")),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                let request = std::str::from_utf8(&request).unwrap();
-                if index == 0 {
-                    assert!(request.starts_with("POST /repos/owner/repository/releases HTTP/1.1"));
-                    assert!(
-                        request
-                            .to_ascii_lowercase()
-                            .contains("\r\nauthorization: bearer test-token\r\n")
-                    );
-                } else {
-                    assert!(request.starts_with(
-                        "GET /repos/owner/repository/releases?per_page=100&page=1 HTTP/1.1"
-                    ));
-                }
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        let client = test_client(address);
-        let created = client.create_draft("owner/repository", "{}").unwrap();
-        assert_eq!(
-            json_member(created.object().unwrap(), "id")
-                .unwrap()
-                .number()
-                .unwrap(),
-            7
-        );
-        let observed = client
-            .release_state_by_tag("owner/repository", "v1")
-            .unwrap()
-            .unwrap();
-        assert!(
-            json_member(observed.object().unwrap(), "draft")
-                .unwrap()
-                .boolean()
-                .unwrap()
-        );
-        server.join().unwrap();
-    }
-}
+#[path = "../../tests/release_github/mod.rs"]
+mod tests;

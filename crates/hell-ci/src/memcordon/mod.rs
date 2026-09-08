@@ -5,12 +5,24 @@ use hell_memcordon::{AcquisitionReceiptV1, ProviderLifecycleReceiptV1, ProviderL
 
 mod acquire;
 mod canary;
+mod collector;
 mod execute;
 mod finalize;
+mod prerequisite;
 mod provider;
 mod task;
 
+pub use collector::ExecutionCollector;
+pub use execute::compose_authority_result;
+pub use finalize::validate_execution_group_binding;
 pub(crate) use finalize::{verify_archived_finalized_evidence, verify_finalized_evidence};
+
+pub(crate) fn find_component_for_integration(
+    root: &std::path::Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    provider::find_component(root, name)
+}
 
 pub(crate) fn finalize_platform_report_for_integration(
     output: &std::path::Path,
@@ -22,6 +34,7 @@ pub(crate) fn finalize_platform_report_for_integration(
 }
 
 pub(crate) struct QualifiedPolicy {
+    pub(crate) evidence_root: PathBuf,
     pub(crate) runtime: PathBuf,
     pub(crate) report_directory: PathBuf,
     pub(crate) mechanism: String,
@@ -113,6 +126,7 @@ pub(crate) fn qualified_policy(
         return Err("qualified MemCordon CLI differs from acquisition evidence".to_owned());
     }
     Ok(QualifiedPolicy {
+        evidence_root: prerequisite::validate(&task, &acquisition, &provider)?,
         runtime,
         report_directory: std::fs::canonicalize(task.output.join("raw"))
             .map_err(|error| format!("cannot canonicalize MemCordon report directory: {error}"))?,

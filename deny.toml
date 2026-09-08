@@ -20,6 +20,14 @@ allow = [
   "Unicode-3.0",
 ]
 confidence-threshold = 0.8
+unused-license-exception = "deny"
+
+# The selected flate2 1.1.9 backend (also used by zip 4.6.1).
+# This declaration is scoped to the reviewed locked version, not Zlib globally.
+[[licenses.exceptions]]
+name = "zlib-rs"
+version = "=0.6.7"
+allow = ["Zlib"]
 
 [licenses.private]
 ignore = false
@@ -29,6 +37,16 @@ registries = []
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+reason = "hell-ci and ring 0.17.14 (rustls/ureq) require 0.2; hell-memcordon and tempfile 3.27.0 (memcordon-core 0.5.2-rc.23) require 0.4.3. Review on graph changes."
+
+[[bans.skip]]
+name = "winnow"
+version = "=0.7.15"
+reason = "toml 0.9.12+spec-1.1.0 requires 0.7.15 directly and 1.0.4 through toml_parser 1.1.3+spec-1.1.0. Review on graph changes."
 
 [sources]
 unknown-registry = "deny"

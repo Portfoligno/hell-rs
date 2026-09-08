@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const COMMITTED_DIGEST: &str = "9eb182168b23c65b81d51df3f6d56c720ae717b754c2881c967af2f50d8c7c44";
+const COMMITTED_DIGEST: &str = "8b78ffb78797b54aa9b56704ded5ae09954f260dfd1e4dae30b98d35f9f15d6c";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn repository_root() -> PathBuf {
@@ -76,6 +76,64 @@ fn external_input_digest_changes_and_unknown_fields_fail_closed() {
         );
     let unknown_path = fixture.write("unknown.toml", unknown.as_bytes());
     assert!(hell_release_verifier::external_input_lock_sha256(&unknown_path).is_err());
+}
+
+#[test]
+fn authenticated_executable_fields_are_typed_and_each_changes_the_authority_digest() {
+    let original = fs::read_to_string(repository_root().join("ci/external-inputs.toml")).unwrap();
+    let fixture = Fixture::new();
+    for (name, from, to) in [
+        ("asset", "asset-id = 446721552", "asset-id = 446721553"),
+        ("size", "exact-bytes = 94141872", "exact-bytes = 94141871"),
+        (
+            "source",
+            "source-url = \"https://github.com/commercialhaskell/stack/releases/download/v3.11.1/stack-3.11.1-linux-x86_64-bin\"",
+            "source-url = \"https://example.invalid/substituted-stack\"",
+        ),
+    ] {
+        let changed = original.replace(from, to);
+        assert_ne!(changed, original);
+        let path = fixture.write(name, changed.as_bytes());
+        assert_ne!(
+            hell_release_verifier::external_input_lock_sha256(&path).unwrap(),
+            COMMITTED_DIGEST
+        );
+        assert!(
+            hell_release_verifier::validate_external_input_lock(&path, COMMITTED_DIGEST).is_err()
+        );
+    }
+    for (name, from, to) in [
+        (
+            "asset-string",
+            "asset-id = 446721552",
+            "asset-id = \"446721552\"",
+        ),
+        ("asset-zero", "asset-id = 446721552", "asset-id = 0"),
+        (
+            "size-string",
+            "exact-bytes = 94141872",
+            "exact-bytes = \"94141872\"",
+        ),
+        ("size-zero", "exact-bytes = 94141872", "exact-bytes = 0"),
+        (
+            "source-number",
+            "source-url = \"https://github.com/commercialhaskell/stack/releases/download/v3.11.1/stack-3.11.1-linux-x86_64-bin\"",
+            "source-url = 123",
+        ),
+        (
+            "unknown",
+            "asset-id = 446721552",
+            "asset-id = 446721552\nasset-unknown = 1",
+        ),
+    ] {
+        let changed = original.replace(from, to);
+        assert_ne!(changed, original);
+        let path = fixture.write(name, changed.as_bytes());
+        assert!(
+            hell_release_verifier::external_input_lock_sha256(&path).is_err(),
+            "accepted {name}"
+        );
+    }
 }
 
 struct Fixture {

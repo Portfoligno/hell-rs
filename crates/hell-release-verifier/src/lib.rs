@@ -25,6 +25,16 @@ pub fn independent_sha256_for_test(bytes: &[u8]) -> String {
     digest::sha256_hex(bytes)
 }
 
+#[doc(hidden)]
+pub fn validate_memcordon_group_evidence_for_test(
+    operations: &[u8],
+    platform_report: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+    platform: MemcordonPlatform,
+) -> Result<(), String> {
+    memcordon_rc23::validate_group_evidence_for_test(operations, platform_report, files, platform)
+}
+
 /// Reconstructs the independently parsed external-input-lock digest.
 ///
 /// # Errors

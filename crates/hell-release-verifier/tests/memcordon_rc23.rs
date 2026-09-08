@@ -10,6 +10,229 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const GENUINE_LINUX_EXIT_123: &[u8] =
     include_bytes!("../../../fixtures/memcordon-rc23/schema8-linux-exit-123.json");
 
+const GROUP_LEDGER: &str =
+    include_str!("../../../fixtures/memcordon-rc23/operation-ledger-v2.json");
+
+fn complete_linux_group_fixture() -> (String, String, std::collections::BTreeMap<String, Vec<u8>>) {
+    use std::collections::BTreeMap;
+
+    let raw = report(
+        MemcordonPlatform::LinuxX86_64,
+        ExpectedTermination::ExitCode(123),
+    );
+    let normalized = projection(MemcordonPlatform::LinuxX86_64, 123, 123);
+    let request = sha256(br#"[{"display":"/opt/hell/bin/candidate","raw":null}]"#);
+    let journal = format!(
+        r#"{{"schema_version":1,"operation_id":"readiness","invocations":[{{"invocation_id":"readiness-invocation-00000001","request_digest":"{request}"}},{{"invocation_id":"readiness-invocation-00000002","request_digest":"{request}"}}]}}"#
+    );
+    let ledger = GROUP_LEDGER
+        .replace(
+            &format!("\"request_digest\": \"{DIGEST}\""),
+            &format!("\"request_digest\": \"{request}\""),
+        )
+        .replace(
+            &format!("\"raw_report_digest\": \"{DIGEST}\""),
+            &format!("\"raw_report_digest\": \"{}\"", sha256(&raw)),
+        )
+        .replace(
+            &format!("\"normalized_report_digest\": \"{DIGEST}\""),
+            &format!("\"normalized_report_digest\": \"{}\"", sha256(&normalized)),
+        )
+        .replace(
+            &format!("\"reservation_ledger_digest\": \"{DIGEST}\""),
+            &format!(
+                "\"reservation_ledger_digest\": \"{}\"",
+                sha256(journal.as_bytes())
+            ),
+        );
+    let mut files = BTreeMap::new();
+    files.insert(
+        "invocation-reservations.json".to_owned(),
+        journal.into_bytes(),
+    );
+    for id in [
+        "readiness-invocation-00000001",
+        "readiness-invocation-00000002",
+    ] {
+        files.insert(format!("raw/{id}.json"), raw.clone());
+        files.insert(format!("normalized/{id}.json"), normalized.clone());
+    }
+    (ledger, request, files)
+}
+
+#[test]
+fn independent_group_admits_expected_nonzero_invocations_only_with_complete_plan() {
+    use hell_release_verifier::validate_memcordon_group_evidence_for_test as validate;
+
+    let (ledger, request, mut files) = complete_linux_group_fixture();
+    let plan = format!(r#"{{"state":"passed","planSha256":"{DIGEST}"}}"#);
+    validate(
+        ledger.as_bytes(),
+        plan.as_bytes(),
+        &files,
+        MemcordonPlatform::LinuxX86_64,
+    )
+    .unwrap();
+    for altered in [
+        ledger.replace("\"sealed\": true", "\"sealed\": false"),
+        ledger.replace("\"schema_version\": 2", "\"schema_version\": 3"),
+        ledger.replace(
+            "readiness-invocation-00000002",
+            "readiness-invocation-00000001",
+        ),
+        ledger.replace("\"principal-cleanup\"", "\"missing-cleanup\""),
+        ledger.replace(&request, DIGEST),
+        ledger.replace(
+            "raw/readiness-invocation-00000002.json",
+            "raw/readiness-invocation-00000001.json",
+        ),
+    ] {
+        assert!(
+            validate(
+                altered.as_bytes(),
+                plan.as_bytes(),
+                &files,
+                MemcordonPlatform::LinuxX86_64
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        validate(
+            ledger.as_bytes(),
+            plan.replace("passed", "failed").as_bytes(),
+            &files,
+            MemcordonPlatform::LinuxX86_64
+        )
+        .is_err()
+    );
+    assert!(
+        validate(
+            ledger.as_bytes(),
+            plan.replace(DIGEST, &"a".repeat(DIGEST.len())).as_bytes(),
+            &files,
+            MemcordonPlatform::LinuxX86_64
+        )
+        .is_err()
+    );
+    let mut omitted = files.clone();
+    omitted.remove("raw/readiness-invocation-00000002.json");
+    assert!(
+        validate(
+            ledger.as_bytes(),
+            plan.as_bytes(),
+            &omitted,
+            MemcordonPlatform::LinuxX86_64
+        )
+        .is_err()
+    );
+    let old_journal = files.get("invocation-reservations.json").unwrap();
+    let unfinished = String::from_utf8(old_journal.clone()).unwrap().replace(
+        "]}", &format!(",{{\"invocation_id\":\"readiness-invocation-00000003\",\"request_digest\":\"{request}\"}}]}}"),
+    );
+    let rebound_ledger = ledger.replace(&sha256(old_journal), &sha256(unfinished.as_bytes()));
+    let mut incomplete = files.clone();
+    incomplete.insert(
+        "invocation-reservations.json".to_owned(),
+        unfinished.into_bytes(),
+    );
+    assert!(
+        validate(
+            rebound_ledger.as_bytes(),
+            plan.as_bytes(),
+            &incomplete,
+            MemcordonPlatform::LinuxX86_64
+        )
+        .is_err()
+    );
+    files.insert("invocation-reservations.json".to_owned(), b"{}".to_vec());
+    assert!(
+        validate(
+            ledger.as_bytes(),
+            plan.as_bytes(),
+            &files,
+            MemcordonPlatform::LinuxX86_64
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn independent_windows_group_binds_actual_adapter_terminal_status() {
+    use hell_release_verifier::validate_memcordon_group_evidence_for_test as validate;
+    use std::collections::BTreeMap;
+
+    let platform = MemcordonPlatform::WindowsX86_64;
+    let raw = report(platform, ExpectedTermination::WindowsStatus(7));
+    let normalized = projection(platform, 7, 7);
+    let request = sha256(br#"[{"display":"C:\\hell\\candidate.exe","raw":null}]"#);
+    let journal = format!(
+        r#"{{"schema_version":1,"operation_id":"readiness","invocations":[{{"invocation_id":"readiness-invocation-00000001","request_digest":"{request}"}},{{"invocation_id":"readiness-invocation-00000002","request_digest":"{request}"}}]}}"#
+    );
+    let mut ledger = GROUP_LEDGER
+        .replace("sealed-linux", "sealed-windows")
+        .replace(
+            &format!("\"request_digest\": \"{DIGEST}\""),
+            &format!("\"request_digest\": \"{request}\""),
+        )
+        .replace(
+            &format!("\"raw_report_digest\": \"{DIGEST}\""),
+            &format!("\"raw_report_digest\": \"{}\"", sha256(&raw)),
+        )
+        .replace(
+            &format!("\"normalized_report_digest\": \"{DIGEST}\""),
+            &format!("\"normalized_report_digest\": \"{}\"", sha256(&normalized)),
+        )
+        .replace(
+            &format!("\"reservation_ledger_digest\": \"{DIGEST}\""),
+            &format!(
+                "\"reservation_ledger_digest\": \"{}\"",
+                sha256(journal.as_bytes())
+            ),
+        );
+    let mut files = BTreeMap::new();
+    files.insert(
+        "invocation-reservations.json".to_owned(),
+        journal.into_bytes(),
+    );
+    for id in [
+        "readiness-invocation-00000001",
+        "readiness-invocation-00000002",
+    ] {
+        let adapter = format!(
+            r#"{{"schema_version":1,"operation_id":"{id}","candidate_released":true,"token_policy_digest":"{DIGEST}","command_binding_digest":"{DIGEST}","child_native_status":7,"direct_child_reaped":true,"adapter_outcome":"completed","relay_outcome":"completed"}}"#
+        );
+        ledger = ledger
+            .replacen(
+                "\"identity_adapter_path\": null",
+                &format!("\"identity_adapter_path\": \"adapters/{id}.json\""),
+                1,
+            )
+            .replacen(
+                "\"identity_adapter_digest\": null",
+                &format!(
+                    "\"identity_adapter_digest\": \"{}\"",
+                    sha256(adapter.as_bytes())
+                ),
+                1,
+            );
+        files.insert(format!("raw/{id}.json"), raw.clone());
+        files.insert(format!("normalized/{id}.json"), normalized.clone());
+        files.insert(format!("adapters/{id}.json"), adapter.into_bytes());
+    }
+    let plan = format!(r#"{{"state":"passed","planSha256":"{DIGEST}"}}"#);
+    validate(ledger.as_bytes(), plan.as_bytes(), &files, platform).unwrap();
+    let path = "adapters/readiness-invocation-00000001.json";
+    let original = files.remove(path).unwrap();
+    assert!(validate(ledger.as_bytes(), plan.as_bytes(), &files, platform).is_err());
+    let altered = String::from_utf8(original.clone())
+        .unwrap()
+        .replace("\"child_native_status\":7", "\"child_native_status\":8");
+    let rebound = ledger.replace(&sha256(&original), &sha256(altered.as_bytes()));
+    files.insert(path.to_owned(), altered.into_bytes());
+    assert!(validate(rebound.as_bytes(), plan.as_bytes(), &files, platform).is_err());
+}
+
 fn sha256(bytes: &[u8]) -> String {
     independent_sha256_for_test(bytes)
 }

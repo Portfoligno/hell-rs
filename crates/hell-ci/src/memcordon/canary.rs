@@ -12,7 +12,8 @@ use crate::json::{JsonValue, parse_json};
 use crate::release::manifest::{write_atomic, write_json};
 
 use super::provider::{
-    agent_name, cli_name, create_evidence_directories, find_component, number, run_bounded, string,
+    agent_name, cli_name, create_evidence_directories, find_component, number,
+    run_provider_frontend, string,
 };
 use super::task::Task;
 
@@ -44,7 +45,7 @@ pub(super) fn run(task: &Task) -> Result<String, String> {
         target.as_os_str().to_owned(),
         OsString::from("--version"),
     ];
-    let result = run_bounded(&cli, &arguments, CANARY_BUDGET, 2 * 1024 * 1024)?;
+    let result = run_provider_frontend(&cli, &arguments, CANARY_BUDGET, 2 * 1024 * 1024)?;
     write_atomic(
         &task.output.join("qualification-artifacts/canary.stdout"),
         &result.stdout,

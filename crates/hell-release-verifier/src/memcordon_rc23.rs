@@ -232,6 +232,7 @@ pub(crate) fn validate_archived_memcordon_platform(
             ));
         }
     }
+    validate_archived_group_bindings(operations, report, files, &prefix)?;
     validate_archived_operation_reports(operations, files, &prefix, platform)
 }
 
@@ -242,7 +243,7 @@ fn validate_archived_operation_reports(
     platform: MemcordonPlatform,
 ) -> Result<(), String> {
     let ledger = json::parse(operations)?;
-    for entry in ledger.array()? {
+    for entry in operation_ledger_entries(&ledger)?.entries {
         let fields = object(entry, "operation ledger entry")?;
         let raw_path = member(fields, "raw_report_path", "operation ledger entry")?.string()?;
         let normalized_path =
@@ -257,6 +258,7 @@ fn validate_archived_operation_reports(
             .ok_or_else(|| format!("independent MemCordon evidence lacks {normalized_path}"))?;
         let expected = expected_report_from_documents(raw, normalized, platform)?;
         validate_memcordon_rc23_projection(raw, normalized, &expected)?;
+        validate_archived_invocation_binding(fields, normalized, files, prefix, platform)?;
     }
     Ok(())
 }
@@ -333,6 +335,108 @@ fn expected_report_from_documents(
         deadline_token,
         termination,
     })
+}
+
+fn native_argument_json(value: &Value) -> Result<String, String> {
+    let mut bytes = json::canonical(value)?;
+    if bytes.pop() != Some(b'\n') {
+        return Err("native argument serialization lacks newline".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
+fn validate_archived_invocation_binding(
+    entry: &BTreeMap<String, Value>,
+    normalized: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+    prefix: &str,
+    platform: MemcordonPlatform,
+) -> Result<(), String> {
+    let normalized = json::parse(normalized)?;
+    let normalized = object(&normalized, "normalized report")?;
+    let argv = member(normalized, "target_argv", "normalized report")?.array()?;
+    // This is the declared NativeArgument wire order, independently encoded.
+    let mut arguments = Vec::new();
+    for argument in argv {
+        let argument = object(argument, "native argument")?;
+        let display = native_argument_json(member(argument, "display", "native argument")?)?;
+        let raw = match member(argument, "raw", "native argument")? {
+            Value::Null => "null".to_owned(),
+            Value::Object(raw) => format!(
+                "{{\"encoding\":{},\"data\":{}}}",
+                native_argument_json(member(raw, "encoding", "raw argument")?)?,
+                native_argument_json(member(raw, "data", "raw argument")?)?
+            ),
+            _ => return Err("invalid raw native argument".to_owned()),
+        };
+        arguments.push(format!("{{\"display\":{display},\"raw\":{raw}}}"));
+    }
+    let encoded = format!("[{}]", arguments.join(","));
+    if crate::digest::sha256_hex(encoded.as_bytes())
+        != member(entry, "request_digest", "operation invocation")?.string()?
+    {
+        return Err("operation invocation request digest differs".to_owned());
+    }
+    if platform == MemcordonPlatform::WindowsX86_64 {
+        let path = member(entry, "identity_adapter_path", "operation invocation")?.string()?;
+        let bytes = files
+            .get(&format!("{prefix}{path}"))
+            .ok_or("Windows identity receipt absent")?;
+        let adapter = json::parse(bytes)?;
+        let adapter = object(&adapter, "Windows identity receipt")?;
+        exact(
+            adapter,
+            &[
+                "schema_version",
+                "operation_id",
+                "candidate_released",
+                "token_policy_digest",
+                "command_binding_digest",
+                "child_native_status",
+                "direct_child_reaped",
+                "adapter_outcome",
+                "relay_outcome",
+            ],
+            "Windows identity receipt",
+        )?;
+        require_number(adapter, "schema_version", 1, "Windows identity receipt")?;
+        require_text(
+            adapter,
+            "operation_id",
+            member(entry, "operation_id", "operation invocation")?.string()?,
+            "Windows identity receipt",
+        )?;
+        for field in ["candidate_released", "direct_child_reaped"] {
+            require_true(adapter, field, "Windows identity receipt")?;
+        }
+        for field in ["token_policy_digest", "command_binding_digest"] {
+            require_digest(member(adapter, field, "Windows identity receipt")?.string()?)?;
+        }
+        require_text(
+            adapter,
+            "adapter_outcome",
+            "completed",
+            "Windows identity receipt",
+        )?;
+        if !matches!(
+            member(adapter, "relay_outcome", "Windows identity receipt")?.string()?,
+            "not_used" | "completed"
+        ) {
+            return Err("Windows identity relay is incomplete".to_owned());
+        }
+        let terminal = object(
+            member(normalized, "terminal", "normalized report")?,
+            "normalized terminal",
+        )?;
+        let status = member(terminal, "native_status", "normalized terminal")?.number()?;
+        require_number(
+            adapter,
+            "child_native_status",
+            status,
+            "Windows identity receipt",
+        )?;
+    }
+    Ok(())
 }
 
 /// Independently validates one successful, single-attempt `MemCordon` rc.23
@@ -1894,6 +1998,211 @@ fn validate_provider_cleanup(
     )
 }
 
+struct OperationLedgerView<'a> {
+    logical_ids: Vec<String>,
+    entries: Vec<&'a Value>,
+}
+
+pub(crate) fn validate_group_evidence_for_test(
+    operations: &[u8],
+    platform_report: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+    platform: MemcordonPlatform,
+) -> Result<(), String> {
+    let report = json::parse(platform_report)?;
+    let report = object(&report, "platform report")?;
+    require_text(report, "state", "passed", "platform report")?;
+    let inventory = files
+        .iter()
+        .map(|(path, bytes)| (path.clone(), crate::digest::sha256_hex(bytes)))
+        .collect();
+    let expected = ExpectedMemcordonFinalization {
+        platform,
+        candidate_commit: String::new(),
+        workflow_commit: String::new(),
+        runtime_lock_digest: String::new(),
+        provider_operation: "readiness".to_owned(),
+        required_operation_ids: vec!["readiness".to_owned()],
+    };
+    validate_operations(
+        operations,
+        &expected,
+        &expected.required_operation_ids,
+        &inventory,
+    )?;
+    validate_archived_group_bindings(operations, report, files, "")?;
+    validate_archived_operation_reports(operations, files, "", platform)
+}
+
+fn operation_ledger_entries(value: &Value) -> Result<OperationLedgerView<'_>, String> {
+    if let Value::Array(entries) = value {
+        if entries.len() != 1 {
+            return Err("v1 operation ledger must contain one root".to_owned());
+        }
+        let fields = object(&entries[0], "operation ledger entry")?;
+        let id = member(fields, "operation_id", "operation ledger entry")?.string()?;
+        if matches!(id, "readiness" | "release") {
+            return Err("logical platform tasks require a v2 operation group".to_owned());
+        }
+        return Ok(OperationLedgerView {
+            logical_ids: vec![id.to_owned()],
+            entries: entries.iter().collect(),
+        });
+    }
+    let fields = object(value, "grouped operation ledger")?;
+    exact(
+        fields,
+        &["schema_version", "groups"],
+        "grouped operation ledger",
+    )?;
+    require_number(fields, "schema_version", 2, "grouped operation ledger")?;
+    let groups = member(fields, "groups", "grouped operation ledger")?.array()?;
+    if groups.len() != 1 {
+        return Err("grouped operation ledger requires one logical task".to_owned());
+    }
+    let group = object(&groups[0], "operation group")?;
+    exact(
+        group,
+        &[
+            "operation_id",
+            "platform_plan_digest",
+            "required_phases",
+            "completed_phases",
+            "reserved_invocation_ids",
+            "reservation_ledger_path",
+            "reservation_ledger_digest",
+            "invocations",
+            "sealed",
+        ],
+        "operation group",
+    )?;
+    let id = member(group, "operation_id", "operation group")?.string()?;
+    if !matches!(id, "readiness" | "release") {
+        return Err("operation group is outside the platform plan".to_owned());
+    }
+    require_true(group, "sealed", "operation group")?;
+    require_digest(member(group, "platform_plan_digest", "operation group")?.string()?)?;
+    require_text(
+        group,
+        "reservation_ledger_path",
+        "invocation-reservations.json",
+        "operation group",
+    )?;
+    require_digest(member(group, "reservation_ledger_digest", "operation group")?.string()?)?;
+    let phases = [
+        "candidate-preflights",
+        "platform-gates",
+        "principal-cleanup",
+        "toolchain-cleanup",
+    ];
+    for key in ["required_phases", "completed_phases"] {
+        let observed = member(group, key, "operation group")?
+            .array()?
+            .iter()
+            .map(Value::string)
+            .collect::<Result<Vec<_>, _>>()?;
+        if observed != phases {
+            return Err("operation group phase coverage differs".to_owned());
+        }
+    }
+    let invocations = member(group, "invocations", "operation group")?.array()?;
+    if invocations.is_empty() || invocations.len() > 100_000 {
+        return Err("operation group invocation count is invalid".to_owned());
+    }
+    let reserved = member(group, "reserved_invocation_ids", "operation group")?
+        .array()?
+        .iter()
+        .map(Value::string)
+        .collect::<Result<Vec<_>, _>>()?;
+    let observed = invocations
+        .iter()
+        .map(|entry| member(object(entry, "invocation")?, "operation_id", "invocation")?.string())
+        .collect::<Result<Vec<_>, String>>()?;
+    if reserved != observed
+        || observed
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != observed.len()
+    {
+        return Err("operation group reservation coverage differs".to_owned());
+    }
+    Ok(OperationLedgerView {
+        logical_ids: vec![id.to_owned()],
+        entries: invocations.iter().collect(),
+    })
+}
+
+fn validate_archived_group_bindings(
+    operations: &[u8],
+    report: &BTreeMap<String, Value>,
+    files: &BTreeMap<String, Vec<u8>>,
+    prefix: &str,
+) -> Result<(), String> {
+    let ledger = json::parse(operations)?;
+    operation_ledger_entries(&ledger)?;
+    let Value::Object(fields) = &ledger else {
+        return Ok(());
+    };
+    let groups = member(fields, "groups", "grouped operation ledger")?.array()?;
+    let group = object(&groups[0], "operation group")?;
+    if member(group, "platform_plan_digest", "operation group")?.string()?
+        != member(report, "planSha256", "platform report")?.string()?
+    {
+        return Err("operation group platform plan digest differs".to_owned());
+    }
+    let path = member(group, "reservation_ledger_path", "operation group")?.string()?;
+    let bytes = files
+        .get(&format!("{prefix}{path}"))
+        .ok_or("operation reservation journal is absent")?;
+    if crate::digest::sha256_hex(bytes)
+        != member(group, "reservation_ledger_digest", "operation group")?.string()?
+    {
+        return Err("operation reservation journal digest differs".to_owned());
+    }
+    let journal = json::parse(bytes)?;
+    let journal = object(&journal, "reservation journal")?;
+    exact(
+        journal,
+        &["schema_version", "operation_id", "invocations"],
+        "reservation journal",
+    )?;
+    require_number(journal, "schema_version", 1, "reservation journal")?;
+    require_text(
+        journal,
+        "operation_id",
+        member(group, "operation_id", "operation group")?.string()?,
+        "reservation journal",
+    )?;
+    let reservations = member(journal, "invocations", "reservation journal")?.array()?;
+    let invocations = member(group, "invocations", "operation group")?.array()?;
+    if reservations.len() != invocations.len() {
+        return Err("reservation journal has unfinished invocations".to_owned());
+    }
+    for (reservation, invocation) in reservations.iter().zip(invocations) {
+        let reservation = object(reservation, "invocation reservation")?;
+        let invocation = object(invocation, "invocation")?;
+        exact(
+            reservation,
+            &["invocation_id", "request_digest"],
+            "invocation reservation",
+        )?;
+        require_text(
+            reservation,
+            "invocation_id",
+            member(invocation, "operation_id", "invocation")?.string()?,
+            "invocation reservation",
+        )?;
+        require_text(
+            reservation,
+            "request_digest",
+            member(invocation, "request_digest", "invocation")?.string()?,
+            "invocation reservation",
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_operations(
     bytes: &[u8],
     expected: &ExpectedMemcordonFinalization,
@@ -1901,8 +2210,21 @@ fn validate_operations(
     inventory: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let value = json::parse(bytes)?;
-    let entries = value.array()?;
-    if entries.len() != required.len() {
+    let ledger = operation_ledger_entries(&value)?;
+    if let Value::Object(fields) = &value {
+        let group = object(
+            &member(fields, "groups", "operation ledger")?.array()?[0],
+            "operation group",
+        )?;
+        let journal = member(group, "reservation_ledger_path", "operation group")?.string()?;
+        if inventory.get(journal).map(String::as_str)
+            != Some(member(group, "reservation_ledger_digest", "operation group")?.string()?)
+        {
+            return Err("operation reservation journal is not inventory bound".to_owned());
+        }
+    }
+    let entries = ledger.entries;
+    if ledger.logical_ids != required {
         return Err("operation ledger length differs from the trusted plan".to_owned());
     }
     let mut observed = Vec::with_capacity(entries.len());
@@ -1980,9 +2302,9 @@ fn validate_operations(
         exact(terminal, &["kind"], "operation terminal")?;
         require_text(terminal, "kind", "ordinary_result", "operation terminal")?;
     }
-    let observed = validate_operation_ids(&observed, "operation ledger")?;
-    if observed != required {
-        return Err("operation ledger differs from the trusted required operations".to_owned());
+    let unique = observed.iter().collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != observed.len() {
+        return Err("operation ledger has duplicate invocation ids".to_owned());
     }
     Ok(())
 }

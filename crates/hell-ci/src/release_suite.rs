@@ -1,13 +1,17 @@
+#[cfg(unix)]
+use crate::supervisor_fixture_ipc::{
+    Endpoint as FixtureEndpoint, Listener as SupervisorListener, Stream as SupervisorStream,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read as _, Write as IoWrite};
 #[cfg(windows)]
 use std::io::{Seek as _, SeekFrom};
-#[cfg(unix)]
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(windows)]
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{
+    Ipv4Addr, SocketAddrV4, TcpListener as SupervisorListener, TcpStream as SupervisorStream,
+};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
@@ -62,6 +66,8 @@ const NIGHTLY_SUPERVISOR_START_TIMEOUT: Duration = Duration::from_secs(30);
 const NIGHTLY_SUPERVISOR_START_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
 #[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC: &[u8] = b"hell-nightly-supervisor-v1\0";
+#[cfg(unix)]
+const NIGHTLY_SUPERVISOR_REQUEST_MAGIC: &[u8] = b"hell-nightly-supervisor-request-v3\0";
 #[cfg(any(unix, windows))]
 const NIGHTLY_SUPERVISOR_ELAPSED_NONE: u64 = u64::MAX;
 const NIGHTLY_SUPERVISOR_ELAPSED_MAX_MILLIS: u64 = u64::MAX - 1;
@@ -518,14 +524,17 @@ impl ExternalSupervisorPlan {
     }
 
     fn command(self, root: &Path, timeout: Duration) -> CommandSpec {
+        self.command_with_cargo(root, CommandSpec::cargo(timeout))
+    }
+
+    fn command_with_cargo(self, root: &Path, cargo: CommandSpec) -> CommandSpec {
         let command = match self {
-            Self::NightlyWorkspace => {
-                CommandSpec::cargo(timeout).arguments(nightly_workspace_test_arguments())
-            }
+            Self::NightlyWorkspace => cargo.arguments(nightly_workspace_test_arguments()),
             #[cfg(target_os = "macos")]
-            Self::MacosStagedNativeToolchain => CommandSpec::cargo(timeout)
-                .arguments(nightly_macos_staged_native_toolchain_arguments()),
-            Self::NightlyCoreData => CommandSpec::cargo(timeout).arguments([
+            Self::MacosStagedNativeToolchain => {
+                cargo.arguments(nightly_macos_staged_native_toolchain_arguments())
+            }
+            Self::NightlyCoreData => cargo.arguments([
                 "test",
                 "--package",
                 "hell-testkit",
@@ -539,21 +548,13 @@ impl ExternalSupervisorPlan {
                 "--nocapture",
             ]),
             #[cfg(windows)]
-            Self::WindowsAuthorityProbe => CommandSpec::cargo(timeout).arguments([
-                "check",
-                "--package",
-                "hell-builtins",
-                "--lib",
-                "--locked",
-            ]),
+            Self::WindowsAuthorityProbe => {
+                cargo.arguments(["check", "--package", "hell-builtins", "--lib", "--locked"])
+            }
             #[cfg(windows)]
-            Self::WindowsCoreAuthorityProbe => CommandSpec::cargo(timeout).arguments([
-                "check",
-                "--package",
-                "hell-digest",
-                "--lib",
-                "--locked",
-            ]),
+            Self::WindowsCoreAuthorityProbe => {
+                cargo.arguments(["check", "--package", "hell-digest", "--lib", "--locked"])
+            }
         };
         command.current_directory(root)
     }
@@ -867,6 +868,7 @@ fn run_direct_nightly_command(
 #[cfg(unix)]
 struct ExternalSupervisorRequest {
     plan: ExternalSupervisorPlan,
+    cargo_authority: Option<crate::nightly_cargo::NightlyCargoAuthority>,
     root: PathBuf,
     root_device: u64,
     root_inode: u64,
@@ -876,8 +878,8 @@ struct ExternalSupervisorRequest {
     session_device: u64,
     session_inode: u64,
     session_uid: u32,
-    terminal_observer: Option<SocketAddrV4>,
-    launch_gate: Option<SocketAddrV4>,
+    terminal_observer: Option<FixtureEndpoint>,
+    launch_gate: Option<FixtureEndpoint>,
     fixture_command: bool,
     fixture_control: ExternalSupervisorFixtureControl,
 }
@@ -979,8 +981,8 @@ struct ExternalSupervisorStartPolicy {
     total: Duration,
     cleanup_reserve: Duration,
     report_reserve: Duration,
-    terminal_observer: Option<SocketAddrV4>,
-    launch_gate: Option<SocketAddrV4>,
+    terminal_observer: Option<FixtureEndpoint>,
+    launch_gate: Option<FixtureEndpoint>,
     fixture_command: bool,
     fixture_control: ExternalSupervisorFixtureControl,
     session_parent: PathBuf,
@@ -1328,8 +1330,8 @@ struct PortabilityWorkerTracker {
 
 #[cfg(any(unix, windows))]
 struct ExternalSupervisorAcceptTask {
-    listener: TcpListener,
-    result: mpsc::SyncSender<std::io::Result<TcpStream>>,
+    listener: SupervisorListener,
+    result: mpsc::SyncSender<std::io::Result<SupervisorStream>>,
 }
 
 #[cfg(any(unix, windows))]
@@ -1370,8 +1372,8 @@ fn external_supervisor_accept_sender()
 
 #[cfg(any(unix, windows))]
 fn submit_external_supervisor_accept(
-    listener: TcpListener,
-) -> Result<mpsc::Receiver<std::io::Result<TcpStream>>, String> {
+    listener: SupervisorListener,
+) -> Result<mpsc::Receiver<std::io::Result<SupervisorStream>>, String> {
     let (result, receiver) = mpsc::sync_channel(1);
     external_supervisor_accept_sender()?
         .try_send(ExternalSupervisorAcceptTask { listener, result })
@@ -1664,9 +1666,31 @@ impl PortabilityChildProgress {
     }
 
     fn record_terminal(&mut self, phase: &str, state: PortabilityCaseState) {
-        let case = self.case.clone().unwrap_or_else(|| phase.to_owned());
-        self.record_attribution(phase, PortabilityAttributionEvent::Case(case, state));
-        self.subphase = Some("terminal".to_owned());
+        if matches!(
+            self.case_state,
+            Some(PortabilityCaseState::Active | PortabilityCaseState::StillRunning)
+        ) {
+            let case = self.case.clone().unwrap_or_else(|| phase.to_owned());
+            self.record_attribution_state(PortabilityAttributionEvent::Case(case, state));
+        } else if !matches!(state, PortabilityCaseState::Completed) {
+            // Aggregate failure cannot change a completed libtest outcome. Use
+            // its causal failure receipt, or attribute it to the worker phase.
+            if matches!(state, PortabilityCaseState::Failed)
+                && let Some(failed) = &self.failed_case
+            {
+                self.target.clone_from(&failed.target);
+                self.case = Some(failed.case.clone());
+                self.case_state = Some(PortabilityCaseState::Failed);
+            } else {
+                self.target = None;
+                self.case = Some(phase.to_owned());
+                self.case_state = Some(state);
+            }
+        }
+        self.record_attribution(
+            phase,
+            PortabilityAttributionEvent::Subphase("terminal".to_owned()),
+        );
     }
 
     fn retain_partial_line_evidence(&self, report: &mut Report, phase: &str) {
@@ -2488,6 +2512,49 @@ fn verify_nightly_saturated_progress_tail(envelope: SupervisionEnvelope) -> Resu
         return Err(
             "saturated advisory progress queue changed authoritative tail attribution".to_owned(),
         );
+    }
+    let mut terminated = progress.clone();
+    terminated.record_terminal("aggregate-failure-fixture", PortabilityCaseState::Failed);
+    if terminated.case.as_deref() != Some("second_failure")
+        || terminated.case_state.map(PortabilityCaseState::as_str) != Some("failed")
+        || terminated.failed_case != progress.failed_case
+        || terminated.failed_cases != progress.failed_cases
+    {
+        return Err("aggregate failure changed observed failed-case evidence".to_owned());
+    }
+    let mut unavailable = progress.clone();
+    unavailable.failed_case = None;
+    unavailable.failed_cases.clear();
+    unavailable.record_terminal("unattributed-worker-fixture", PortabilityCaseState::Failed);
+    if unavailable.target.is_some()
+        || unavailable.case.as_deref() != Some("unattributed-worker-fixture")
+        || unavailable.case_state.map(PortabilityCaseState::as_str) != Some("failed")
+        || unavailable.failed_case.is_some()
+        || !unavailable.failed_cases.is_empty()
+    {
+        return Err("unattributed aggregate failure was assigned to a passing test".to_owned());
+    }
+    let mut completed = progress.clone();
+    completed.record_terminal("completed-worker-fixture", PortabilityCaseState::Completed);
+    if completed.case.as_deref() != Some("later_success")
+        || completed.case_state.map(PortabilityCaseState::as_str) != Some("passed")
+    {
+        return Err("worker completion replaced an observed passing result".to_owned());
+    }
+    let mut active = PortabilityChildProgress::seeded(
+        "nightly",
+        "timeout-target",
+        "active-timeout-case",
+        "fixture",
+    );
+    active.record_terminal(
+        "timeout-worker-fixture",
+        PortabilityCaseState::TimedOutCleaned,
+    );
+    if active.case.as_deref() != Some("active-timeout-case")
+        || active.case_state.map(PortabilityCaseState::as_str) != Some("timed-out-cleaned")
+    {
+        return Err("active-case timeout lost its attribution".to_owned());
     }
     validate_portability_failed_case_receipt_report(
         &progress,
@@ -3743,7 +3810,7 @@ fn encode_external_supervisor_request(
     let root_length = u32::try_from(root.len())
         .map_err(|_| "nightly supervisor root path is too long".to_owned())?;
     let mut bytes = Vec::with_capacity(NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC.len() + root.len() + 96);
-    bytes.extend_from_slice(NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC);
+    bytes.extend_from_slice(NIGHTLY_SUPERVISOR_REQUEST_MAGIC);
     bytes.push(request.plan.code());
     bytes.extend_from_slice(&request.nonce.0);
     push_supervisor_u64(&mut bytes, request.session_device);
@@ -3754,19 +3821,34 @@ fn encode_external_supervisor_request(
     push_supervisor_u32(&mut bytes, request.root_uid);
     push_supervisor_u32(&mut bytes, request.root_mode);
     bytes.push(u8::from(request.terminal_observer.is_some()));
-    if let Some(observer) = request.terminal_observer {
-        bytes.extend_from_slice(&observer.ip().octets());
-        bytes.extend_from_slice(&observer.port().to_be_bytes());
+    if let Some(observer) = &request.terminal_observer {
+        let endpoint = observer.encode()?;
+        push_supervisor_u32(
+            &mut bytes,
+            u32::try_from(endpoint.len()).map_err(|_| "observer endpoint is too large")?,
+        );
+        bytes.extend_from_slice(&endpoint);
     }
     bytes.push(u8::from(request.launch_gate.is_some()));
-    if let Some(gate) = request.launch_gate {
-        bytes.extend_from_slice(&gate.ip().octets());
-        bytes.extend_from_slice(&gate.port().to_be_bytes());
+    if let Some(gate) = &request.launch_gate {
+        let endpoint = gate.encode()?;
+        push_supervisor_u32(
+            &mut bytes,
+            u32::try_from(endpoint.len()).map_err(|_| "gate endpoint is too large")?,
+        );
+        bytes.extend_from_slice(&endpoint);
     }
     bytes.push(u8::from(request.fixture_command));
     bytes.push(request.fixture_control as u8);
     push_supervisor_u32(&mut bytes, root_length);
     bytes.extend_from_slice(root);
+    let cargo = serde_json::to_vec(&request.cargo_authority)
+        .map_err(|error| format!("cannot encode Nightly Cargo authority: {error}"))?;
+    push_supervisor_u32(
+        &mut bytes,
+        u32::try_from(cargo.len()).map_err(|_| "Nightly Cargo authority is too large")?,
+    );
+    bytes.extend_from_slice(&cargo);
     if bytes.len() > NIGHTLY_SUPERVISOR_REQUEST_LIMIT {
         return Err("nightly supervisor request exceeds its byte limit".to_owned());
     }
@@ -3781,9 +3863,9 @@ fn decode_external_supervisor_request(bytes: &[u8]) -> Result<ExternalSupervisor
     let mut remaining = bytes;
     if take_supervisor_bytes(
         &mut remaining,
-        NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC.len(),
+        NIGHTLY_SUPERVISOR_REQUEST_MAGIC.len(),
         "protocol magic",
-    )? != NIGHTLY_SUPERVISOR_PROTOCOL_MAGIC
+    )? != NIGHTLY_SUPERVISOR_REQUEST_MAGIC
     {
         return Err("nightly supervisor request has invalid protocol magic".to_owned());
     }
@@ -3804,36 +3886,30 @@ fn decode_external_supervisor_request(bytes: &[u8]) -> Result<ExternalSupervisor
     let terminal_observer = match take_supervisor_bytes(&mut remaining, 1, "observer flag")?[0] {
         0 => None,
         1 => {
-            let address = Ipv4Addr::from(
-                <[u8; 4]>::try_from(take_supervisor_bytes(
-                    &mut remaining,
-                    4,
-                    "observer address",
-                )?)
-                .map_err(|_| "nightly supervisor observer address width drifted".to_owned())?,
-            );
-            let port = u16::from_be_bytes(
-                take_supervisor_bytes(&mut remaining, size_of::<u16>(), "observer port")?
-                    .try_into()
-                    .map_err(|_| "nightly supervisor observer port width drifted".to_owned())?,
-            );
-            Some(SocketAddrV4::new(address, port))
+            let length = usize::try_from(take_supervisor_u32(
+                &mut remaining,
+                "observer endpoint length",
+            )?)
+            .map_err(|_| "observer length is not representable")?;
+            Some(FixtureEndpoint::decode(take_supervisor_bytes(
+                &mut remaining,
+                length,
+                "observer endpoint",
+            )?)?)
         }
         _ => return Err("nightly supervisor observer flag is invalid".to_owned()),
     };
     let launch_gate = match take_supervisor_bytes(&mut remaining, 1, "gate flag")?[0] {
         0 => None,
         1 => {
-            let address = Ipv4Addr::from(
-                <[u8; 4]>::try_from(take_supervisor_bytes(&mut remaining, 4, "gate address")?)
-                    .map_err(|_| "nightly supervisor gate address width drifted".to_owned())?,
-            );
-            let port = u16::from_be_bytes(
-                take_supervisor_bytes(&mut remaining, size_of::<u16>(), "gate port")?
-                    .try_into()
-                    .map_err(|_| "nightly supervisor gate port width drifted".to_owned())?,
-            );
-            Some(SocketAddrV4::new(address, port))
+            let length =
+                usize::try_from(take_supervisor_u32(&mut remaining, "gate endpoint length")?)
+                    .map_err(|_| "gate length is not representable")?;
+            Some(FixtureEndpoint::decode(take_supervisor_bytes(
+                &mut remaining,
+                length,
+                "gate endpoint",
+            )?)?)
         }
         _ => return Err("nightly supervisor gate flag is invalid".to_owned()),
     };
@@ -3853,11 +3929,23 @@ fn decode_external_supervisor_request(bytes: &[u8]) -> Result<ExternalSupervisor
     let root = PathBuf::from(std::ffi::OsString::from_vec(
         take_supervisor_bytes(&mut remaining, root_length, "root")?.to_vec(),
     ));
+    let cargo_length = usize::try_from(take_supervisor_u32(
+        &mut remaining,
+        "Cargo authority length",
+    )?)
+    .map_err(|_| "Nightly Cargo authority length is not representable")?;
+    let cargo_authority = serde_json::from_slice(take_supervisor_bytes(
+        &mut remaining,
+        cargo_length,
+        "Cargo authority",
+    )?)
+    .map_err(|error| format!("cannot decode Nightly Cargo authority: {error}"))?;
     if !remaining.is_empty() {
         return Err("nightly supervisor request has trailing bytes".to_owned());
     }
     Ok(ExternalSupervisorRequest {
         plan,
+        cargo_authority,
         root,
         root_device,
         root_inode,
@@ -3881,6 +3969,43 @@ fn supervisor_nonce() -> Digest {
     bytes.extend_from_slice(&std::process::id().to_be_bytes());
     bytes.extend_from_slice(&SEQUENCE.fetch_add(1, Ordering::Relaxed).to_be_bytes());
     sha256_bytes(&bytes)
+}
+
+#[cfg(unix)]
+pub(crate) fn nightly_cargo_request_roundtrip(
+    root: &Path,
+    authority: &crate::nightly_cargo::NightlyCargoAuthority,
+) -> Result<crate::nightly_cargo::CommandProjection, String> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    let request = ExternalSupervisorRequest {
+        plan: ExternalSupervisorPlan::NightlyWorkspace,
+        cargo_authority: Some(authority.clone()),
+        root: root.to_path_buf(),
+        root_device: metadata.dev(),
+        root_inode: metadata.ino(),
+        root_uid: metadata.uid(),
+        root_mode: metadata.mode(),
+        nonce: supervisor_nonce(),
+        session_device: metadata.dev(),
+        session_inode: metadata.ino(),
+        session_uid: metadata.uid(),
+        terminal_observer: None,
+        launch_gate: None,
+        fixture_command: false,
+        fixture_control: ExternalSupervisorFixtureControl::Normal,
+    };
+    let bytes = encode_external_supervisor_request(&request)?;
+    let decoded = decode_external_supervisor_request(&bytes)?;
+    let command =
+        external_supervisor_command(&decoded, sha256_bytes(&bytes), Duration::from_secs(1))?;
+    Ok(crate::nightly_cargo::CommandProjection {
+        program: PathBuf::from(command.program),
+        directory: command
+            .current_directory
+            .ok_or("decoded Cargo command has no directory")?,
+        arguments: command.arguments,
+        environment: command.environment,
+    })
 }
 
 #[cfg(unix)]
@@ -5159,10 +5284,19 @@ fn external_supervisor_command(
     timeout: Duration,
 ) -> Result<CommandSpec, String> {
     if !request.fixture_command {
+        if let Some(authority) = &request.cargo_authority {
+            return Ok(request
+                .plan
+                .command_with_cargo(&request.root, authority.command(&request.root, timeout)?));
+        }
+        if cfg!(target_os = "linux") {
+            return Err("Linux Nightly supervisor request has no bound Cargo authority".to_owned());
+        }
         return Ok(request.plan.command(&request.root, timeout));
     }
     let gate = request
         .launch_gate
+        .as_ref()
         .ok_or_else(|| "nightly supervisor fixture command has no launch gate".to_owned())?;
     let executable = fs::canonicalize(
         std::env::current_exe()
@@ -5171,8 +5305,7 @@ fn external_supervisor_command(
     .map_err(|error| format!("cannot canonicalize nightly supervisor fixture child: {error}"))?;
     Ok(CommandSpec::new(executable, timeout).arguments([
         std::ffi::OsString::from("__nightly-supervisor-owned-child"),
-        std::ffi::OsString::from(gate.ip().to_string()),
-        std::ffi::OsString::from(gate.port().to_string()),
+        gate.argument()?,
         std::ffi::OsString::from(request_sha256.hex()),
         std::ffi::OsString::from(request.nonce.hex()),
     ]))
@@ -6189,7 +6322,7 @@ fn publish_external_supervisor_terminal(
     envelope: SupervisionEnvelope,
     terminal: &ExternalSupervisorTerminalReceipt,
 ) -> Result<ExternalSupervisorTerminalAcknowledgement, String> {
-    let acknowledged = if let Some(observer) = request.terminal_observer {
+    let acknowledged = if let Some(observer) = &request.terminal_observer {
         let connect_timeout = envelope
             .report_completion_deadline
             .saturating_duration_since(Instant::now());
@@ -6200,9 +6333,8 @@ fn publish_external_supervisor_terminal(
                 completion: Ok(()),
             });
         }
-        let mut observer =
-            TcpStream::connect_timeout(&std::net::SocketAddr::V4(observer), connect_timeout)
-                .map_err(|error| format!("cannot connect nightly terminal observer: {error}"))?;
+        let mut observer = SupervisorStream::connect(observer, connect_timeout)
+            .map_err(|error| format!("cannot connect nightly terminal observer: {error}"))?;
         write_supervisor_handshake(
             &mut observer,
             ExternalSupervisorMessage::Terminal,
@@ -6631,9 +6763,21 @@ fn prepare_external_supervisor_request(
         .metadata()
         .map_err(|error| format!("cannot bind nightly supervisor session owner: {error}"))?
         .uid();
+    #[cfg(target_os = "linux")]
+    let cargo_authority = if policy.fixture_command {
+        None
+    } else {
+        Some(crate::nightly_cargo::NightlyCargoAuthority::capture(
+            &root,
+            &crate::process_environment::ProcessEnvironment::from_process(),
+        )?)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let cargo_authority = None;
     Ok(PreparedExternalSupervisorRequest {
         request: ExternalSupervisorRequest {
             plan,
+            cargo_authority,
             root,
             root_device: root_metadata.dev(),
             root_inode: root_metadata.ino(),
@@ -6643,8 +6787,8 @@ fn prepare_external_supervisor_request(
             session_device: session.root_identity.0,
             session_inode: session.root_identity.1,
             session_uid,
-            terminal_observer: policy.terminal_observer,
-            launch_gate: policy.launch_gate,
+            terminal_observer: policy.terminal_observer.clone(),
+            launch_gate: policy.launch_gate.clone(),
             fixture_command: policy.fixture_command,
             fixture_control: policy.fixture_control,
         },
@@ -6652,7 +6796,7 @@ fn prepare_external_supervisor_request(
     })
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 fn parse_loopback_address(
     address: &std::ffi::OsStr,
     port: &std::ffi::OsStr,
@@ -6729,21 +6873,14 @@ fn decode_external_supervisor_session(
 pub(crate) fn run_external_supervisor_reporter_fixture(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), String> {
-    let [
-        root,
-        observer_address,
-        observer_port,
-        gate_address,
-        gate_port,
-    ] = arguments
-    else {
+    let [root, observer_endpoint, gate_endpoint] = arguments else {
         return Err(
-            "nightly supervisor reporter fixture requires root and two loopback addresses"
+            "nightly supervisor reporter fixture requires root and two private IPC endpoints"
                 .to_owned(),
         );
     };
-    let observer = parse_loopback_address(observer_address, observer_port)?;
-    let gate = parse_loopback_address(gate_address, gate_port)?;
+    let observer = FixtureEndpoint::from_argument(observer_endpoint)?;
+    let gate = FixtureEndpoint::from_argument(gate_endpoint)?;
     let total = Duration::from_mins(5);
     let started = start_external_nightly_supervisor_with_policy(
         Path::new(root),
@@ -6756,7 +6893,7 @@ pub(crate) fn run_external_supervisor_reporter_fixture(
             total,
             cleanup_reserve: Duration::from_mins(1),
             report_reserve: Duration::from_secs(30),
-            terminal_observer: Some(observer),
+            terminal_observer: Some(observer.clone()),
             launch_gate: Some(gate),
             fixture_command: true,
             fixture_control: ExternalSupervisorFixtureControl::Normal,
@@ -6764,8 +6901,11 @@ pub(crate) fn run_external_supervisor_reporter_fixture(
         },
     )?;
     let session = encode_external_supervisor_session(&started)?;
-    let mut observer = TcpStream::connect(observer)
+    let mut observer = SupervisorStream::connect(&observer, NIGHTLY_SUPERVISOR_START_TIMEOUT)
         .map_err(|error| format!("cannot connect nightly reporter observer: {error}"))?;
+    observer
+        .set_read_timeout(Some(NIGHTLY_SUPERVISOR_START_TIMEOUT))
+        .map_err(|error| format!("cannot bound nightly reporter observer read: {error}"))?;
     let mut framed = Vec::with_capacity(size_of::<u32>() + session.len());
     push_supervisor_u32(
         &mut framed,
@@ -6789,7 +6929,7 @@ pub(crate) fn run_external_supervisor_owned_child(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), String> {
     #[cfg(unix)]
-    let [address, port, request_sha256, nonce] = arguments else {
+    let [endpoint, request_sha256, nonce] = arguments else {
         return Err("nightly supervisor owned child requires gate and receipt binding".to_owned());
     };
     #[cfg(windows)]
@@ -6808,6 +6948,9 @@ pub(crate) fn run_external_supervisor_owned_child(
                 .to_owned(),
         );
     };
+    #[cfg(unix)]
+    let gate = FixtureEndpoint::from_argument(endpoint)?;
+    #[cfg(windows)]
     let gate = parse_loopback_address(address, port)?;
     let request_sha256 = request_sha256
         .to_str()
@@ -6835,7 +6978,11 @@ pub(crate) fn run_external_supervisor_owned_child(
         .stdin
         .take()
         .ok_or_else(|| "nightly owned grandchild stdin is unavailable".to_owned())?;
-    let mut gate = TcpStream::connect(gate)
+    #[cfg(unix)]
+    let gate_connection = SupervisorStream::connect(&gate, NIGHTLY_SUPERVISOR_START_TIMEOUT);
+    #[cfg(windows)]
+    let gate_connection = SupervisorStream::connect(gate);
+    let mut gate = gate_connection
         .map_err(|error| format!("cannot connect nightly owned child gate: {error}"))?;
     write_supervisor_handshake(
         &mut gate,
@@ -6876,7 +7023,7 @@ pub(crate) fn run_external_supervisor_owned_child(
 
 #[cfg(windows)]
 fn publish_windows_owned_child_receipt(
-    gate: &mut TcpStream,
+    gate: &mut SupervisorStream,
     session_path: &Path,
     writable_target: &Path,
     supervisor_pid: &std::ffi::OsStr,
@@ -7255,9 +7402,9 @@ pub(crate) fn run_external_supervisor_owned_grandchild() -> Result<(), String> {
 
 #[cfg(unix)]
 fn receive_external_supervisor_connection(
-    receiver: &mpsc::Receiver<std::io::Result<TcpStream>>,
+    receiver: &mpsc::Receiver<std::io::Result<SupervisorStream>>,
     phase: &str,
-) -> Result<TcpStream, String> {
+) -> Result<SupervisorStream, String> {
     receiver
         .recv_timeout(NIGHTLY_SUPERVISOR_START_TIMEOUT)
         .map_err(|error| format!("nightly supervisor {phase} exceeded its deadline: {error}"))?
@@ -7266,7 +7413,7 @@ fn receive_external_supervisor_connection(
 
 #[cfg(unix)]
 fn read_external_supervisor_session(
-    stream: &mut TcpStream,
+    stream: &mut SupervisorStream,
 ) -> Result<(PathBuf, u32, Digest, Digest), String> {
     stream
         .set_read_timeout(Some(NIGHTLY_SUPERVISOR_START_TIMEOUT))
@@ -7373,10 +7520,30 @@ struct ExternalSupervisorVerifierFinalizer {
     session_path: PathBuf,
     request_sha256: Digest,
     nonce: Digest,
-    reporter_release: Option<TcpStream>,
-    target_release: Option<TcpStream>,
+    reporter_release: Option<SupervisorStream>,
+    target_release: Option<SupervisorStream>,
     owned_pids: Vec<u32>,
     armed: bool,
+}
+
+#[cfg(unix)]
+fn wait_for_external_verifier_group_absence(pid: i32, deadline: Instant) -> Result<(), String> {
+    loop {
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "cannot attest nightly verifier process group {pid} absence: {error}"
+                ));
+            }
+            Ok(()) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(()) => {
+                return Err(format!(
+                    "nightly verifier process group {pid} remained past cleanup deadline"
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -7386,7 +7553,7 @@ impl ExternalSupervisorVerifierFinalizer {
         session_path: PathBuf,
         request_sha256: Digest,
         nonce: Digest,
-        reporter_release: Option<TcpStream>,
+        reporter_release: Option<SupervisorStream>,
     ) -> Self {
         Self {
             supervisor_pid,
@@ -7400,7 +7567,7 @@ impl ExternalSupervisorVerifierFinalizer {
         }
     }
 
-    fn retain_target_release(&mut self, release: TcpStream) {
+    fn retain_target_release(&mut self, release: SupervisorStream) {
         self.target_release = Some(release);
     }
 
@@ -7434,7 +7601,6 @@ impl ExternalSupervisorVerifierFinalizer {
             return Ok(());
         }
         self.armed = false;
-        self.release_controls();
         let mut cleanup_errors = Vec::new();
         let supervisor_pid = if self.supervisor_pid == 0 {
             cleanup_errors.push("nightly verifier supervisor pid is invalid".to_owned());
@@ -7449,11 +7615,38 @@ impl ExternalSupervisorVerifierFinalizer {
                 Some,
             )
         };
+        // Signal the isolated group before releasing controls or killing its
+        // leader. Never signal a group whose live leader has changed sessions.
+        let mut group_signal_error = None;
+        let mut supervisor_owned = false;
+        if let Some(pid) = supervisor_pid {
+            let leader = nix::unistd::Pid::from_raw(pid);
+            match (
+                nix::unistd::getpgid(Some(leader)),
+                nix::unistd::getsid(Some(leader)),
+            ) {
+                (Ok(group), Ok(session)) if group == leader && session == leader => {
+                    supervisor_owned = true;
+                    match nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(-pid),
+                        nix::sys::signal::Signal::SIGKILL,
+                    ) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(error) => group_signal_error = Some(error),
+                    }
+                }
+                (Err(nix::errno::Errno::ESRCH), _) | (_, Err(nix::errno::Errno::ESRCH)) => {}
+                identity => cleanup_errors.push(format!(
+                    "nightly verifier group leader identity differs: {identity:?}"
+                )),
+            }
+        }
+        self.release_controls();
         for pid in self
             .owned_pids
             .iter()
             .copied()
-            .chain((self.supervisor_pid != 0).then_some(self.supervisor_pid))
+            .chain(supervisor_owned.then_some(self.supervisor_pid))
         {
             let Ok(pid) = i32::try_from(pid) else {
                 cleanup_errors.push("nightly verifier owned pid is not representable".to_owned());
@@ -7466,17 +7659,6 @@ impl ExternalSupervisorVerifierFinalizer {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
                 Err(error) => cleanup_errors.push(format!(
                     "cannot terminate nightly verifier process {pid}: {error}"
-                )),
-            }
-        }
-        if let Some(supervisor_pid) = supervisor_pid {
-            match nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-supervisor_pid),
-                nix::sys::signal::Signal::SIGKILL,
-            ) {
-                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                Err(error) => cleanup_errors.push(format!(
-                    "cannot terminate nightly verifier process group {supervisor_pid}: {error}"
                 )),
             }
         }
@@ -7509,6 +7691,25 @@ impl ExternalSupervisorVerifierFinalizer {
                         break;
                     }
                 }
+            }
+        }
+        if let Some(pid) = supervisor_pid {
+            // The exit waiter retains Child ownership and reaps independently;
+            // leave its exit receipt available to the caller. Darwin may deny
+            // signaling a zombie-only group until that reaping completes.
+            let absence = wait_for_external_verifier_group_absence(pid, deadline);
+            if let Some(error) = group_signal_error {
+                if error != nix::errno::Errno::EPERM
+                    || absence.is_err()
+                    || !cleanup_errors.is_empty()
+                {
+                    cleanup_errors.push(format!(
+                        "cannot terminate nightly verifier process group {pid}: {error}"
+                    ));
+                }
+            }
+            if let Err(error) = absence {
+                cleanup_errors.push(error);
             }
         }
         if let Err(error) = close_external_supervisor_verifier_session(&self.session_path) {
@@ -7803,7 +8004,7 @@ fn observe_external_supervisor_control_failure(
 struct ExternalSupervisorRecoveryStart {
     started: ExternalSupervisorStarted,
     finalizer: ExternalSupervisorVerifierFinalizer,
-    gate: TcpStream,
+    gate: SupervisorStream,
     phase_started: Instant,
 }
 
@@ -7812,14 +8013,9 @@ fn start_external_supervisor_recovery_case(
     root: &Path,
     fixture_control: ExternalSupervisorFixtureControl,
 ) -> Result<ExternalSupervisorRecoveryStart, String> {
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let gate = SupervisorListener::bind()
         .map_err(|error| format!("cannot bind nightly recovery verifier gate: {error}"))?;
-    let gate_address = gate
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly recovery verifier gate: {error}"))?;
-    let std::net::SocketAddr::V4(gate_address) = gate_address else {
-        return Err("nightly recovery verifier gate is not IPv4".to_owned());
-    };
+    let gate_address = gate.endpoint();
     let gate_receiver = submit_external_supervisor_accept(gate)?;
     let total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
     let phase_started = Instant::now();
@@ -7906,14 +8102,9 @@ fn start_external_supervisor_recovery_case(
 
 #[cfg(unix)]
 fn verify_external_supervisor_finalizer_for_integration(root: &Path) -> Result<(), String> {
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let gate = SupervisorListener::bind()
         .map_err(|error| format!("cannot bind nightly finalizer verifier gate: {error}"))?;
-    let gate_address = gate
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly finalizer verifier gate: {error}"))?;
-    let std::net::SocketAddr::V4(gate_address) = gate_address else {
-        return Err("nightly finalizer verifier gate is not IPv4".to_owned());
-    };
+    let gate_address = gate.endpoint();
     let gate_receiver = submit_external_supervisor_accept(gate)?;
     let total = NIGHTLY_SUPERVISOR_START_TIMEOUT.saturating_mul(4);
     let phase_started = Instant::now();
@@ -7967,6 +8158,11 @@ fn verify_external_supervisor_finalizer_for_integration(root: &Path) -> Result<(
             .map_err(|_| "nightly finalizer descendant pid width drifted".to_owned())?,
     );
     finalizer.retain_owned_pids([target_pid, descendant_pid]);
+    let supervisor_pid = i32::try_from(started.pid())
+        .map_err(|_| "nightly finalizer supervisor pid is not representable".to_owned())?;
+    if wait_for_external_verifier_group_absence(supervisor_pid, Instant::now()).is_ok() {
+        return Err("nightly verifier accepted a live process group as absent".to_owned());
+    }
     finalizer.close()?;
     if !matches!(
         started.exit.wait_until(
@@ -8037,9 +8233,9 @@ fn verify_external_supervisor_reporter_fixture(
 
 #[cfg(unix)]
 struct ExternalSupervisorReporterFixture {
-    observer: TcpListener,
+    observer: SupervisorListener,
     finalizer: ExternalSupervisorVerifierFinalizer,
-    gate_stream: TcpStream,
+    gate_stream: SupervisorStream,
     session_path: PathBuf,
     supervisor_pid: u32,
     request_sha256: Digest,
@@ -8064,10 +8260,8 @@ fn start_external_supervisor_reporter_fixture(
     let reporter = CommandSpec::new(executable, NIGHTLY_SUPERVISOR_START_TIMEOUT).arguments([
         std::ffi::OsString::from("__nightly-supervisor-reporter-fixture"),
         root.as_os_str().to_owned(),
-        std::ffi::OsString::from(observer_address.ip().to_string()),
-        std::ffi::OsString::from(observer_address.port().to_string()),
-        std::ffi::OsString::from(gate_address.ip().to_string()),
-        std::ffi::OsString::from(gate_address.port().to_string()),
+        observer_address.argument()?,
+        gate_address.argument()?,
     ]);
     let (reporter_result, reporter_receiver) = mpsc::sync_channel(1);
     let reporter_worker = std::thread::Builder::new()
@@ -8163,7 +8357,8 @@ fn finish_external_supervisor_reporter_fixture(
         request_sha256,
         nonce,
     )?;
-    let terminal_receiver = submit_external_supervisor_accept(observer)?;
+    let terminal_receiver =
+        submit_external_supervisor_accept(observer.with_accept_timeout(Duration::from_mins(5)))?;
     let mut terminal_stream = terminal_receiver
         .recv_timeout(Duration::from_mins(5))
         .map_err(|error| format!("nightly terminal receipt exceeded its deadline: {error}"))?
@@ -8239,36 +8434,26 @@ fn finish_external_supervisor_reporter_fixture(
 
 #[cfg(unix)]
 struct ExternalSupervisorReporterEndpoints {
-    observer: TcpListener,
-    observer_address: SocketAddrV4,
-    session_receiver: mpsc::Receiver<std::io::Result<TcpStream>>,
-    gate_address: SocketAddrV4,
-    gate_receiver: mpsc::Receiver<std::io::Result<TcpStream>>,
+    observer: SupervisorListener,
+    observer_address: FixtureEndpoint,
+    session_receiver: mpsc::Receiver<std::io::Result<SupervisorStream>>,
+    gate_address: FixtureEndpoint,
+    gate_receiver: mpsc::Receiver<std::io::Result<SupervisorStream>>,
 }
 
 #[cfg(unix)]
 fn external_supervisor_reporter_endpoints() -> Result<ExternalSupervisorReporterEndpoints, String> {
-    let observer = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let observer = SupervisorListener::bind()
         .map_err(|error| format!("cannot bind nightly supervisor verifier observer: {error}"))?;
-    let observer_address = observer
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly supervisor verifier observer: {error}"))?;
-    let std::net::SocketAddr::V4(observer_address) = observer_address else {
-        return Err("nightly supervisor verifier observer is not IPv4".to_owned());
-    };
+    let observer_address = observer.endpoint();
     let session_receiver = submit_external_supervisor_accept(
         observer
             .try_clone()
             .map_err(|error| format!("cannot clone nightly session observer: {error}"))?,
     )?;
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let gate = SupervisorListener::bind()
         .map_err(|error| format!("cannot bind nightly supervisor verifier gate: {error}"))?;
-    let gate_address = gate
-        .local_addr()
-        .map_err(|error| format!("cannot inspect nightly supervisor verifier gate: {error}"))?;
-    let std::net::SocketAddr::V4(gate_address) = gate_address else {
-        return Err("nightly supervisor verifier gate is not IPv4".to_owned());
-    };
+    let gate_address = gate.endpoint();
     let gate_receiver = submit_external_supervisor_accept(gate)?;
     Ok(ExternalSupervisorReporterEndpoints {
         observer,
@@ -12006,7 +12191,7 @@ fn decode_windows_pre_ready_failure_frame(
 
 #[cfg(windows)]
 struct WindowsSupervisorFixtureExitGuard {
-    stream: TcpStream,
+    stream: SupervisorStream,
     request_sha256: Digest,
     nonce: Digest,
     exit_code: u32,
@@ -12024,7 +12209,7 @@ impl WindowsSupervisorFixtureExitGuard {
         if remaining.is_zero() {
             return Err("Windows supervisor exit-receipt deadline expired".to_owned());
         }
-        let stream = TcpStream::connect_timeout(
+        let stream = SupervisorStream::connect_timeout(
             &std::net::SocketAddr::V4(address),
             remaining.min(NIGHTLY_SUPERVISOR_START_TIMEOUT),
         )
@@ -16710,7 +16895,7 @@ fn publish_windows_reporter_fixture_receipt(
             "Windows reporter semantic fixture receipt cannot be truncated".to_owned()
         })?;
     }
-    let mut observer = TcpStream::connect(fixture.observer)
+    let mut observer = SupervisorStream::connect(fixture.observer)
         .map_err(|error| format!("cannot connect Windows reporter fixture observer: {error}"))?;
     windows_write_inherited_frame(&mut observer, &cleanup_authority)?;
     windows_write_inherited_frame(&mut observer, &receipt)?;
@@ -17971,11 +18156,11 @@ struct WindowsReporterExitObservation {
     nonce: Digest,
     staged_root: PathBuf,
     terminal: Option<mpsc::Receiver<AttributedWorkerTerminal>>,
-    exit_receipt: Option<TcpStream>,
-    exit_receiver: Option<mpsc::Receiver<Result<TcpStream, std::io::Error>>>,
-    reporter_control: Option<TcpStream>,
-    gate_receiver: Option<mpsc::Receiver<Result<TcpStream, std::io::Error>>>,
-    gate: Option<TcpStream>,
+    exit_receipt: Option<SupervisorStream>,
+    exit_receiver: Option<mpsc::Receiver<Result<SupervisorStream, std::io::Error>>>,
+    reporter_control: Option<SupervisorStream>,
+    gate_receiver: Option<mpsc::Receiver<Result<SupervisorStream, std::io::Error>>>,
+    gate: Option<SupervisorStream>,
     payload_processes: Option<(u32, u32)>,
     reporter_exited: bool,
     supervisor_exit_code: Option<u32>,
@@ -17991,9 +18176,9 @@ struct WindowsReporterExitObservation {
 struct WindowsReporterLaunchOwner {
     terminal: Option<mpsc::Receiver<AttributedWorkerTerminal>>,
     report_path: Option<PathBuf>,
-    reporter_control: Option<TcpStream>,
-    exit_receiver: Option<mpsc::Receiver<Result<TcpStream, std::io::Error>>>,
-    gate_receiver: Option<mpsc::Receiver<Result<TcpStream, std::io::Error>>>,
+    reporter_control: Option<SupervisorStream>,
+    exit_receiver: Option<mpsc::Receiver<Result<SupervisorStream, std::io::Error>>>,
+    gate_receiver: Option<mpsc::Receiver<Result<SupervisorStream, std::io::Error>>>,
     raw_cleanup_authority: Option<Vec<u8>>,
     verifier_nonce: Digest,
     observation: Option<WindowsReporterExitObservation>,
@@ -18038,8 +18223,8 @@ impl WindowsReporterLaunchOwner {
     fn new(
         terminal: mpsc::Receiver<AttributedWorkerTerminal>,
         report_path: PathBuf,
-        exit_receiver: mpsc::Receiver<Result<TcpStream, std::io::Error>>,
-        gate_receiver: Option<mpsc::Receiver<Result<TcpStream, std::io::Error>>>,
+        exit_receiver: mpsc::Receiver<Result<SupervisorStream, std::io::Error>>,
+        gate_receiver: Option<mpsc::Receiver<Result<SupervisorStream, std::io::Error>>>,
         deadline: Instant,
         cleanup_deadline: Instant,
         stage: &str,
@@ -18063,7 +18248,7 @@ impl WindowsReporterLaunchOwner {
         }
     }
 
-    fn retain_reporter_control(&mut self, observer: TcpStream) {
+    fn retain_reporter_control(&mut self, observer: SupervisorStream) {
         self.reporter_control = Some(observer);
     }
 
@@ -18350,7 +18535,7 @@ fn start_windows_reporter_exit_observation_typed(
             );
         }
     }
-    let receipt_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let receipt_listener = SupervisorListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind Windows reporter-exit observer: {error}"))?;
     let receipt_address = receipt_listener
         .local_addr()
@@ -18361,7 +18546,7 @@ fn start_windows_reporter_exit_observation_typed(
             .into());
     };
     let receipt_receiver = submit_external_supervisor_accept(receipt_listener)?;
-    let gate = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let gate = SupervisorListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind Windows reporter-exit gate: {error}"))?;
     let gate_address = gate
         .local_addr()
@@ -18372,7 +18557,7 @@ fn start_windows_reporter_exit_observation_typed(
     let gate_receiver = (stage == "payload-started")
         .then(|| submit_external_supervisor_accept(gate))
         .transpose()?;
-    let exit_observer = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let exit_observer = SupervisorListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("cannot bind Windows supervisor exit observer: {error}"))?;
     let exit_observer_address = exit_observer
         .local_addr()

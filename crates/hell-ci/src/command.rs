@@ -24,7 +24,8 @@ use hell_testkit::sha256_bytes;
 use hell_testkit::{
     BoundProgramInvocation, Digest, SupervisedProgressObserver, run_supervised_command,
     run_supervised_command_until, run_supervised_command_with_bound_program,
-    run_supervised_command_with_bound_program_until, run_supervised_host_command, sha256_file,
+    run_supervised_command_with_bound_program_until, run_supervised_host_command,
+    run_supervised_host_command_with_bound_program, sha256_file,
 };
 
 use crate::process_environment::{ChildEnvironment, ProcessEnvironment, StandardVariable};
@@ -68,6 +69,7 @@ pub(crate) enum NativeStdio {
 
 pub(crate) struct NativeProcessSpec {
     arguments: Vec<OsString>,
+    current_directory: Option<PathBuf>,
     program: OsString,
     stderr: NativeStdio,
     stdin: NativeStdio,
@@ -78,6 +80,7 @@ impl NativeProcessSpec {
     pub(crate) fn new(program: impl Into<OsString>) -> Self {
         Self {
             arguments: Vec::new(),
+            current_directory: None,
             program: program.into(),
             stderr: NativeStdio::Inherit,
             stdin: NativeStdio::Inherit,
@@ -90,7 +93,7 @@ impl NativeProcessSpec {
         self
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn arguments<I, S>(mut self, arguments: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -133,9 +136,20 @@ impl NativeProcessSpec {
             .map_err(|error| error.to_string())
     }
 
-    fn construct(self) -> Result<Command, String> {
+    #[cfg(any(target_os = "linux", windows))]
+    pub(crate) fn current_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.current_directory = Some(directory.into());
+        self
+    }
+
+    /// Constructs native argv with the typed child environment applied. Callers
+    /// retain responsibility for attaching their platform launch authority.
+    pub(crate) fn construct(self) -> Result<Command, String> {
         let mut command = Command::new(self.program);
         command.args(self.arguments);
+        if let Some(directory) = self.current_directory {
+            command.current_dir(directory);
+        }
         command.stdin(native_stdio(self.stdin));
         command.stdout(native_stdio(self.stdout));
         command.stderr(native_stdio(self.stderr));
@@ -7238,6 +7252,11 @@ impl NativeArchiveAdapter {
             .current_directory(self.stack_command_directory(source))
     }
 
+    pub(crate) fn stack_version(&self, source: &Path) -> CommandSpec {
+        self.apply(CommandSpec::new("stack", Duration::from_secs(30)).argument("--numeric-version"))
+            .current_directory(self.stack_command_directory(source))
+    }
+
     fn stack_command_directory(&self, source: &Path) -> PathBuf {
         match self.stack_yaml.as_deref() {
             Some(configured) => configured.parent().unwrap_or(source).to_path_buf(),
@@ -9611,6 +9630,7 @@ const SENSITIVE_ENVIRONMENT: [&str; 9] = [
 
 #[derive(Clone)]
 struct ReleaseCandidateEnvironment {
+    cargo_config: Option<PathBuf>,
     target: OsString,
     isolated: OsString,
     source_date_epoch: OsString,
@@ -9800,11 +9820,39 @@ pub(crate) fn with_release_candidate_environment<T>(
     launch_policy: &hell_testkit::CandidateLaunchPolicy,
     operation: impl FnOnce() -> T,
 ) -> T {
+    with_release_candidate_environment_and_cargo_source(
+        target,
+        isolated,
+        source_date_epoch,
+        launch_policy,
+        None,
+        operation,
+    )
+}
+
+pub(crate) fn with_release_candidate_environment_and_cargo_source<T>(
+    target: &Path,
+    isolated: &Path,
+    source_date_epoch: u64,
+    launch_policy: &hell_testkit::CandidateLaunchPolicy,
+    cargo_config: Option<PathBuf>,
+    operation: impl FnOnce() -> T,
+) -> T {
     let environment = ReleaseCandidateEnvironment {
+        cargo_config,
         target: target.as_os_str().to_owned(),
         isolated: isolated.as_os_str().to_owned(),
         source_date_epoch: source_date_epoch.to_string().into(),
     };
+    with_release_environment(environment, || {
+        hell_testkit::with_candidate_launch_policy(launch_policy, operation)
+    })
+}
+
+fn with_release_environment<T>(
+    environment: ReleaseCandidateEnvironment,
+    operation: impl FnOnce() -> T,
+) -> T {
     RELEASE_CANDIDATE_ENVIRONMENT.with(|slot| {
         struct Restore<'a> {
             slot: &'a RefCell<Option<ReleaseCandidateEnvironment>>,
@@ -9817,7 +9865,33 @@ pub(crate) fn with_release_candidate_environment<T>(
         }
         let previous = slot.replace(Some(environment));
         let _restore = Restore { slot, previous };
-        hell_testkit::with_candidate_launch_policy(launch_policy, operation)
+        operation()
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn readiness_cargo_projection(
+    source: &Path,
+    home: &Path,
+    config: &Path,
+) -> Vec<crate::readiness_cargo::ReadinessCargoCommandProjection> {
+    let environment = ReleaseCandidateEnvironment {
+        cargo_config: Some(config.to_path_buf()),
+        target: home.parent().unwrap().join("target").into_os_string(),
+        isolated: home.parent().unwrap().as_os_str().to_owned(),
+        source_date_epoch: OsString::from("1"),
+    };
+    with_release_environment(environment, || {
+        crate::release::platform::linux_rust_commands(source)
+            .into_iter()
+            .map(
+                |(name, command)| crate::readiness_cargo::ReadinessCargoCommandProjection {
+                    name: name.to_owned(),
+                    arguments: command.arguments,
+                    environment: command.environment,
+                },
+            )
+            .collect()
     })
 }
 
@@ -10036,14 +10110,29 @@ impl CommandSpec {
             }
             Err(error) => spec.program_resolution_error = Some(error),
         }
-        spec
+        spec.with_scoped_cargo_source()
     }
 
     pub(crate) fn trusted_cargo(timeout: Duration, resolved: &ResolvedCargoExecutable) -> Self {
         let mut spec = Self::new(resolved.invocation_path.clone().into_os_string(), timeout);
         spec.canonical_executable_identity = Some(resolved.canonical_identity.clone());
         spec.invocation_name = Some(resolved.invocation_name.clone());
-        spec
+        spec.with_scoped_cargo_source()
+    }
+
+    fn with_scoped_cargo_source(mut self) -> Self {
+        if let Some(config) = RELEASE_CANDIDATE_ENVIRONMENT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|environment| environment.cargo_config.clone())
+        }) {
+            self.arguments.extend([
+                OsString::from("--config"),
+                config.into_os_string(),
+                OsString::from("--offline"),
+            ]);
+        }
+        self
     }
 
     #[cfg(unix)]
@@ -10107,7 +10196,7 @@ impl CommandSpec {
         self
     }
 
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn cleared_environment(mut self) -> Self {
         self.environment.clear();
         self.clear_environment = true;
@@ -10362,10 +10451,7 @@ impl CommandSpec {
         started: Instant,
     ) -> Result<CommandResult, CommandRunError> {
         let output = if launch_authority == CommandLaunchAuthority::TrustedHost {
-            if deadlines.is_some()
-                || progress.is_some()
-                || self.canonical_executable_identity.is_some()
-            {
+            if deadlines.is_some() || progress.is_some() {
                 return Err(CommandRunError::new(
                     CommandRunPhase::SupervisedExecution,
                     std::io::Error::new(
@@ -10374,7 +10460,21 @@ impl CommandSpec {
                     ),
                 ));
             }
-            run_supervised_host_command(command, &[], self.timeout)
+            if let Some(expected) = &self.canonical_executable_identity {
+                let identity =
+                    BoundProgramInvocation::new(PathBuf::from(&self.program), expected.clone())
+                        .map_err(|error| {
+                            CommandRunError::new(CommandRunPhase::ProgramResolution, error)
+                        })?;
+                run_supervised_host_command_with_bound_program(
+                    command,
+                    &[],
+                    self.timeout,
+                    &identity,
+                )
+            } else {
+                run_supervised_host_command(command, &[], self.timeout)
+            }
         } else if let Some(expected) = &self.canonical_executable_identity {
             let identity =
                 BoundProgramInvocation::new(PathBuf::from(&self.program), expected.clone())
@@ -10430,6 +10530,160 @@ impl CommandSpec {
             windows_launch_control: output.windows_launch_control,
         };
         Ok(result)
+    }
+}
+
+#[doc(hidden)]
+#[cfg(unix)]
+pub fn run_bound_trusted_cargo_for_integration() -> Result<String, String> {
+    let cargo = resolve_standard_cargo_executable()?;
+    let result = CommandSpec::trusted_cargo(Duration::from_secs(10), &cargo)
+        .argument("--version")
+        .run_trusted_host_captured()
+        .map_err(|error| error.to_string())?;
+    if !result.status.success() || result.timed_out || result.stdout_truncated {
+        return Err("bound trusted Cargo version probe failed".to_owned());
+    }
+    String::from_utf8(result.stdout).map_err(|error| error.to_string())
+}
+
+/// Fixed host inventory only: this authority cannot run a Stack build or accept
+/// candidate-provided arguments. Bind before entering the candidate scope.
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct TrustedStackIdentityQuery {
+    acquisition: Option<crate::stack_acquire::ProtectedStack>,
+    stack: ResolvedStandardExecutable,
+    command: CommandSpec,
+    directory: PathBuf,
+    directory_handle: fs::File,
+    directory_identity: (u64, u64, u32, u32, u32),
+}
+
+#[cfg(unix)]
+impl TrustedStackIdentityQuery {
+    pub(crate) fn acquire_linux(directory: &Path) -> Result<Self, String> {
+        let mut acquisition = crate::stack_acquire::ProtectedStack::acquire()?;
+        let result = (|| {
+            acquisition.revalidate()?;
+            let stack = resolve_absolute_standard_executable(acquisition.path())?;
+            let query = Self::bind_resolved(directory, stack)?;
+            acquisition.revalidate()?;
+            Ok(query)
+        })();
+        match result {
+            Ok(mut query) => {
+                query.acquisition = Some(acquisition);
+                Ok(query)
+            }
+            Err(primary) => match acquisition.close() {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(format!(
+                    "{primary}; Stack binding cleanup failed: {cleanup}"
+                )),
+            },
+        }
+    }
+
+    pub(crate) fn close(mut self) -> Result<(), String> {
+        match self.acquisition.take() {
+            Some(mut acquisition) => acquisition.close(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn bind(directory: &Path) -> Result<Self, String> {
+        let environment = ProcessEnvironment::from_process();
+        let path = environment.required_singleton_value(StandardVariable::Path, "PATH")?;
+        let search = std::env::split_paths(&path).collect::<Vec<_>>();
+        let stack = resolve_stack_with_diagnostics(&search)?;
+        Self::bind_resolved(directory, stack)
+    }
+
+    /// Uses one fixed native fixture identity, never caller-supplied executable
+    /// or argv. Version semantics are tested separately from host routing.
+    #[doc(hidden)]
+    pub fn bind_native_fixture(directory: &Path) -> Result<Self, String> {
+        Self::bind_resolved(
+            directory,
+            resolve_absolute_standard_executable(Path::new("/usr/bin/true"))?,
+        )
+    }
+
+    fn bind_resolved(directory: &Path, stack: ResolvedStandardExecutable) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        stack.revalidate()?;
+        let directory = fs::canonicalize(directory)
+            .map_err(|error| format!("cannot bind trusted Stack identity directory: {error}"))?;
+        let directory_handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(&directory)
+            .map_err(|error| format!("cannot retain trusted Stack identity directory: {error}"))?;
+        let metadata = directory_handle
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        let command = CommandSpec::trusted_standard(Duration::from_secs(30), &stack)?
+            .release_candidate_environment()
+            .argument("--numeric-version")
+            .current_directory(&directory);
+        Ok(Self {
+            acquisition: None,
+            stack,
+            command,
+            directory,
+            directory_handle,
+            directory_identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.mode(),
+            ),
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Some(acquisition) = &self.acquisition {
+            acquisition.revalidate()?;
+        }
+        self.stack.revalidate()?;
+        if fs::canonicalize(&self.directory).map_err(|error| error.to_string())? != self.directory {
+            return Err("trusted Stack identity directory was redirected".to_owned());
+        }
+        for metadata in [
+            self.directory_handle.metadata(),
+            fs::symlink_metadata(&self.directory),
+        ] {
+            let metadata = metadata.map_err(|error| error.to_string())?;
+            if !metadata.is_dir()
+                || (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.mode(),
+                ) != self.directory_identity
+            {
+                return Err("trusted Stack identity directory changed".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn run(&self) -> Result<CommandResult, String> {
+        self.revalidate()?;
+        let result = self
+            .command
+            .run_trusted_host_captured()
+            .map_err(|error| format!("cannot execute bound trusted Stack identity query: {error}"));
+        let revalidation = self.revalidate();
+        match (result, revalidation) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(primary), Ok(())) | (Ok(_), Err(primary)) => Err(primary),
+            (Err(primary), Err(secondary)) => Err(format!("{primary}; additionally, {secondary}")),
+        }
     }
 }
 
@@ -10536,35 +10790,66 @@ pub(crate) fn resolve_standard_path_executable_from(
 
 #[cfg(unix)]
 fn resolved_standard_candidate(path: &Path) -> Option<ResolvedStandardExecutable> {
+    resolved_standard_candidate_checked(path).ok()
+}
+
+#[cfg(unix)]
+fn resolved_standard_candidate_checked(path: &Path) -> Result<ResolvedStandardExecutable, String> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = fs::metadata(path).ok()?;
+    let io = |predicate, error: std::io::Error| {
+        format!(
+            "{predicate}: kind={:?}, os={:?}",
+            error.kind(),
+            error.raw_os_error()
+        )
+    };
+    let metadata = fs::metadata(path).map_err(|error| io("candidate-metadata", error))?;
     if !metadata.is_file() {
-        return None;
+        return Err("candidate-kind: required regular file".to_owned());
     }
     #[cfg(unix)]
     {
         use nix::fcntl::AtFlags;
         use nix::unistd::{AccessFlags, faccessat};
 
-        if faccessat(None, path, AccessFlags::X_OK, AtFlags::AT_EACCESS).is_err() {
-            return None;
-        }
+        faccessat(None, path, AccessFlags::X_OK, AtFlags::AT_EACCESS)
+            .map_err(|error| format!("candidate-executable-access: errno={error}"))?;
     }
-    let canonical_identity = fs::canonicalize(path).ok()?;
-    let file_name = path.file_name()?;
-    let canonical_parent = fs::canonicalize(path.parent()?).ok()?;
-    let parent_before = fs::metadata(&canonical_parent).ok()?;
-    let before = fs::metadata(&canonical_identity).ok()?;
-    let after = fs::metadata(&canonical_identity).ok()?;
-    let parent_after = fs::metadata(&canonical_parent).ok()?;
+    let canonical_identity =
+        fs::canonicalize(path).map_err(|error| io("candidate-canonicalization", error))?;
+    let file_name = path
+        .file_name()
+        .ok_or("candidate-path: missing file name")?;
+    let canonical_parent = fs::canonicalize(path.parent().ok_or("candidate-path: missing parent")?)
+        .map_err(|error| io("parent-canonicalization", error))?;
+    let parent_before =
+        fs::metadata(&canonical_parent).map_err(|error| io("parent-metadata", error))?;
+    let before =
+        fs::metadata(&canonical_identity).map_err(|error| io("canonical-file-metadata", error))?;
+    let after =
+        fs::metadata(&canonical_identity).map_err(|error| io("canonical-file-recheck", error))?;
+    let parent_after =
+        fs::metadata(&canonical_parent).map_err(|error| io("parent-recheck", error))?;
     let trusted_owner =
         parent_before.uid() == 0 || parent_before.uid() == nix::unistd::geteuid().as_raw();
-    if !before.is_file()
-        || !parent_before.is_dir()
-        || !trusted_owner
-        || parent_before.mode() & 0o022 != 0
-        || parent_before.dev() != parent_after.dev()
+    if !before.is_file() || !parent_before.is_dir() {
+        return Err("canonical-kind: required regular file and directory parent".to_owned());
+    }
+    if !trusted_owner {
+        return Err(format!(
+            "parent-owner: observed={}, required=0-or-{}",
+            parent_before.uid(),
+            nix::unistd::geteuid().as_raw()
+        ));
+    }
+    if parent_before.mode() & 0o022 != 0 {
+        return Err(format!(
+            "parent-write-mode: observed={:#o}, forbidden-mask=0o022",
+            parent_before.mode() & 0o7777
+        ));
+    }
+    if parent_before.dev() != parent_after.dev()
         || parent_before.ino() != parent_after.ino()
         || parent_before.uid() != parent_after.uid()
         || parent_before.gid() != parent_after.gid()
@@ -10575,11 +10860,12 @@ fn resolved_standard_candidate(path: &Path) -> Option<ResolvedStandardExecutable
         || before.gid() != after.gid()
         || before.mode() != after.mode()
         || before.len() != after.len()
-        || fs::canonicalize(path).ok()? != canonical_identity
+        || fs::canonicalize(path).map_err(|error| io("candidate-canonical-recheck", error))?
+            != canonical_identity
     {
-        return None;
+        return Err("stable-identity: file or parent changed during admission".to_owned());
     }
-    Some(ResolvedStandardExecutable {
+    Ok(ResolvedStandardExecutable {
         invocation_path: canonical_parent.join(file_name),
         canonical_identity,
         parent_device: parent_before.dev(),
@@ -10594,6 +10880,56 @@ fn resolved_standard_candidate(path: &Path) -> Option<ResolvedStandardExecutable
         mode: before.mode(),
         bytes: before.len(),
     })
+}
+
+#[cfg(unix)]
+fn resolve_stack_with_diagnostics(
+    search: &[PathBuf],
+) -> Result<ResolvedStandardExecutable, String> {
+    const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+    const ENTRY_LIMIT: usize = 32;
+    let mut detail = String::new();
+    let mut omitted = 0usize;
+    for (index, directory) in search.iter().enumerate() {
+        let path = directory.join("stack");
+        let outcome = if directory.is_absolute() {
+            resolved_standard_candidate_checked(&path)
+        } else {
+            Err("search-directory: required absolute path".to_owned())
+        };
+        match outcome {
+            Ok(executable) => return Ok(executable),
+            Err(reason) => {
+                let entry = format!("; candidate[{index}]={path:?}: {reason}");
+                if index < ENTRY_LIMIT
+                    && detail.len().saturating_add(entry.len()) <= DIAGNOSTIC_LIMIT
+                {
+                    detail.push_str(&entry);
+                } else {
+                    omitted = omitted.saturating_add(1);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "cannot resolve stack from standard PATH; searched={}; omitted-diagnostics={omitted}{detail}",
+        search.len()
+    ))
+}
+
+#[doc(hidden)]
+#[cfg(unix)]
+pub struct StackExecutableInspection(ResolvedStandardExecutable);
+
+#[cfg(unix)]
+impl StackExecutableInspection {
+    pub fn bind(search: &[PathBuf]) -> Result<Self, String> {
+        resolve_stack_with_diagnostics(search).map(Self)
+    }
+
+    pub fn revalidate(&self) -> Result<(), String> {
+        self.0.revalidate()
+    }
 }
 
 pub(crate) fn resolve_cargo_executable() -> Result<ResolvedCargoExecutable, String> {
@@ -11358,7 +11694,25 @@ pub(crate) fn resolve_posix_cargo_authority(
     cargo: &ResolvedCargoExecutable,
     candidate_root: &Path,
 ) -> Result<ResolvedPosixCargoAuthority, String> {
+    resolve_posix_cargo_authority_for_toolchain(cargo, candidate_root, None)
+}
+
+#[cfg(unix)]
+pub(crate) fn resolve_posix_cargo_authority_for_toolchain(
+    cargo: &ResolvedCargoExecutable,
+    candidate_root: &Path,
+    requested_toolchain: Option<&str>,
+) -> Result<ResolvedPosixCargoAuthority, String> {
     use std::os::unix::fs::MetadataExt as _;
+
+    if requested_toolchain.is_some_and(|name| {
+        name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }) {
+        return Err("requested Rust toolchain name is not canonical".to_owned());
+    }
 
     if cargo.invocation_name.as_os_str() != OsStr::new("cargo")
         || cargo.invocation_path.file_name() != Some(OsStr::new("cargo"))
@@ -11380,6 +11734,11 @@ pub(crate) fn resolve_posix_cargo_authority(
     let same_as_rustup = cargo_metadata.dev() == standard_rustup.device
         && cargo_metadata.ino() == standard_rustup.inode;
     if !same_as_rustup {
+        if requested_toolchain.is_some() {
+            return Err(
+                "operation-specific toolchain requires bound Rustup Cargo authority".to_owned(),
+            );
+        }
         return Ok(ResolvedPosixCargoAuthority::Native {
             cargo: cargo_identity,
             standard_rustup,
@@ -11396,11 +11755,24 @@ pub(crate) fn resolve_posix_cargo_authority(
     )?)?;
     let home = fs::canonicalize(&home)
         .map_err(|error| format!("cannot canonicalize standard RUSTUP_HOME: {error}"))?;
-    let toolchain = parse_active_rustup_toolchain(&run_bound_rustup_probe(
+    let toolchain = parse_active_rustup_toolchain(&run_bound_rustup_probe_for_toolchain(
         &rustup,
         candidate_root,
         &["show", "active-toolchain"],
+        requested_toolchain,
     )?)?;
+    if let Some(requested) = requested_toolchain {
+        let selected = toolchain
+            .to_str()
+            .ok_or("selected Rust toolchain is not UTF-8")?;
+        if selected != requested
+            && !selected
+                .strip_prefix(requested)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+        {
+            return Err("resolved Rust toolchain differs from operation requirement".to_owned());
+        }
+    }
     let toolchain_root = home.join("toolchains").join(&toolchain);
     let canonical_toolchain = fs::canonicalize(&toolchain_root)
         .map_err(|error| format!("cannot canonicalize active Rust toolchain: {error}"))?;
@@ -11430,6 +11802,16 @@ fn run_bound_rustup_probe(
     candidate_root: &Path,
     arguments: &[&str],
 ) -> Result<Vec<u8>, String> {
+    run_bound_rustup_probe_for_toolchain(rustup, candidate_root, arguments, None)
+}
+
+#[cfg(unix)]
+fn run_bound_rustup_probe_for_toolchain(
+    rustup: &ResolvedStandardExecutable,
+    candidate_root: &Path,
+    arguments: &[&str],
+    requested_toolchain: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let identity = BoundProgramInvocation::new(
         rustup.invocation_path.clone(),
         rustup.canonical_identity.clone(),
@@ -11438,6 +11820,9 @@ fn run_bound_rustup_probe(
     let mut command = Command::new(&rustup.invocation_path);
     command.args(arguments).current_dir(candidate_root);
     hell_testkit::configure_release_child_environment(&mut command);
+    if let Some(toolchain) = requested_toolchain {
+        command.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
     let output = run_supervised_command_with_bound_program(
         &mut command,
         &[],
@@ -12245,6 +12630,11 @@ const NATIVE_ARCHIVE_BROKER_DESCENDANT_RECEIPT_BYTE_LIMIT: usize = 256;
 const NATIVE_ARCHIVE_INPUT_PATH_BYTE_LIMIT: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 const NATIVE_ARCHIVE_INPUT_STAGE_BYTE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
+// Darwin inherits the parent directory's group without setgid. The trusted
+// broker need not belong to the candidate group, so setting setgid here may
+// silently clear that bit. Derived directories have one exact 0750 contract.
+#[cfg(target_os = "macos")]
+const NATIVE_ARCHIVE_INPUT_DERIVED_DIRECTORY_MODE: u32 = 0o750;
 #[cfg(target_os = "macos")]
 const NATIVE_ARCHIVE_INPUT_REQUEST_ROOT_LIMIT: usize = NATIVE_ARCHIVE_MEMBER_LIMIT;
 #[cfg(target_os = "macos")]
@@ -13007,6 +13397,80 @@ struct NativeArchiveInputStaging<'a> {
 }
 
 #[cfg(target_os = "macos")]
+fn confine_native_archive_derived_directory(
+    staging_root: &Path,
+    path: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(NATIVE_ARCHIVE_INPUT_DERIVED_DIRECTORY_MODE),
+    )
+    .map_err(|error| format!("cannot confine native archive derived directory: {error}"))?;
+    let root =
+        NativeArchiveDirectoryReceipt::bind("trusted archive staging root", staging_root, deadline)
+            .map_err(|error| error.to_string())?;
+    let derived =
+        NativeArchiveDirectoryReceipt::bind("trusted archive derived directory", path, deadline)
+            .map_err(|error| error.to_string())?;
+    derived
+        .validate_derived_authority(&root)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_native_archive_derived_directory_modes_for_integration(
+    staging_root: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let request = staging_root.join("request-0");
+    let member = request.join("member-0");
+    for path in [&request, &member] {
+        fs::create_dir(path).map_err(|error| error.to_string())?;
+        confine_native_archive_derived_directory(staging_root, path, deadline)?;
+        let mut root =
+            NativeArchiveDirectoryReceipt::bind("fixture staging root", staging_root, deadline)
+                .map_err(|error| error.to_string())?;
+        let derived =
+            NativeArchiveDirectoryReceipt::bind("fixture derived directory", path, deadline)
+                .map_err(|error| error.to_string())?;
+        if derived.mode != 0o750 || derived.uid != root.uid || derived.gid != root.gid {
+            return Err(
+                "derived directory did not preserve the exact uid/gid/0750 contract".to_owned(),
+            );
+        }
+        root.uid ^= 1;
+        if derived.validate_derived_authority(&root).is_ok() {
+            return Err("derived directory authority accepted uid drift".to_owned());
+        }
+        root.uid ^= 1;
+        root.gid ^= 1;
+        if derived.validate_derived_authority(&root).is_ok() {
+            return Err("derived directory authority accepted gid drift".to_owned());
+        }
+        root.gid ^= 1;
+        for mode in [0o700, 0o770, 0o2750] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|error| error.to_string())?;
+            let derived =
+                NativeArchiveDirectoryReceipt::bind("fixture derived directory", path, deadline)
+                    .map_err(|error| error.to_string())?;
+            if derived.mode == mode && derived.validate_derived_authority(&root).is_ok() {
+                return Err("derived directory authority accepted mode drift".to_owned());
+            }
+        }
+        confine_native_archive_derived_directory(staging_root, path, deadline)?;
+    }
+    fs::remove_dir(&member)
+        .and_then(|()| fs::remove_dir(&request))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct NativeArchiveInputWireReceipt {
     device: u64,
@@ -13139,8 +13603,6 @@ impl NativeArchiveInputStaging<'_> {
         &mut self,
         received: &[ReceivedNativeArchiveInputMember],
     ) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let request_roots = self
             .accounting
             .request_roots
@@ -13173,8 +13635,10 @@ impl NativeArchiveInputStaging<'_> {
                 "cannot create native archive input request root: {error}"
             ));
         }
-        fs::set_permissions(self.request_root, fs::Permissions::from_mode(0o2750)).map_err(
-            |error| format!("cannot confine native archive input request root: {error}"),
+        confine_native_archive_derived_directory(
+            self.staging_root,
+            self.request_root,
+            self.deadline,
         )?;
         self.accounting.request_roots = request_roots;
         self.accounting.staged_entries = staged_entries;
@@ -13226,13 +13690,12 @@ impl NativeArchiveInputStaging<'_> {
         position: usize,
         member: &ReceivedNativeArchiveInputMember,
     ) -> Result<PathBuf, String> {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
 
         let member_root = self.request_root.join(format!("member-{position}"));
         fs::create_dir(&member_root)
             .map_err(|error| format!("cannot create native archive member root: {error}"))?;
-        fs::set_permissions(&member_root, fs::Permissions::from_mode(0o2750))
-            .map_err(|error| format!("cannot confine native archive member root: {error}"))?;
+        confine_native_archive_derived_directory(self.staging_root, &member_root, self.deadline)?;
         let destination = member_root.join(&member.name);
         let mut output = fs::OpenOptions::new()
             .write(true)
@@ -14175,6 +14638,29 @@ enum NativeArchiveDirectoryRetention {
 
 #[cfg(unix)]
 impl NativeArchiveDirectoryReceipt {
+    #[cfg(target_os = "macos")]
+    fn validate_derived_authority(&self, root: &Self) -> std::io::Result<()> {
+        if self.uid != root.uid
+            || self.gid != root.gid
+            || self.mode != NATIVE_ARCHIVE_INPUT_DERIVED_DIRECTORY_MODE
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "trusted archive input directory authority differs: {} uid={} gid={} mode={:#o}; expected uid={} gid={} mode={:#o}",
+                    self.path.display(),
+                    self.uid,
+                    self.gid,
+                    self.mode,
+                    root.uid,
+                    root.gid,
+                    NATIVE_ARCHIVE_INPUT_DERIVED_DIRECTORY_MODE,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn bind(label: &'static str, path: &Path, deadline: Instant) -> std::io::Result<Self> {
         Self::bind_with_retention(
             label,
@@ -14534,18 +15020,8 @@ impl NativeArchiveInputBrokerCapability {
             &request_root.path.join(components[1].as_os_str()),
             deadline,
         )?;
-        if request_root.uid != self.staging_root.uid
-            || request_root.gid != self.staging_root.gid
-            || request_root.mode != 0o2750
-            || member_root.uid != self.staging_root.uid
-            || member_root.gid != self.staging_root.gid
-            || member_root.mode != 0o2750
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "trusted archive input directory authority differs",
-            ));
-        }
+        request_root.validate_derived_authority(&self.staging_root)?;
+        member_root.validate_derived_authority(&self.staging_root)?;
         let path = self.staging_root.path.join(relative);
         let receipt = NativeArchiveFileReceipt::bind("trusted archive input", &path, deadline)?;
         if receipt
@@ -19068,7 +19544,8 @@ pub(crate) fn verify_native_archive_policy_for_integration() -> Result<(), Strin
 }
 
 #[cfg(unix)]
-fn verify_native_stack_command_policy() -> Result<(), String> {
+#[doc(hidden)]
+pub fn verify_native_stack_command_policy() -> Result<(), String> {
     let source = Path::new("oracle-source");
     let stack_yaml = Path::new("stack.yaml");
     let build = native_stack_build(source, stack_yaml, Duration::from_secs(1));
@@ -19135,6 +19612,7 @@ fn verify_native_stack_command_policy() -> Result<(), String> {
         .current_directory
         .as_deref()
         != Some(adapter_root)
+        || adapter.stack_version(source).current_directory.as_deref() != Some(adapter_root)
         || adapter.stack_path(source).current_directory.as_deref() != Some(adapter_root)
         || adapter
             .stack_ghc_version(source)
@@ -19143,6 +19621,9 @@ fn verify_native_stack_command_policy() -> Result<(), String> {
             != Some(adapter_root)
     {
         return Err("native Stack adapter commands escaped the configured adapter root".to_owned());
+    }
+    if adapter.stack_version(source).display_arguments() != ["--numeric-version"] {
+        return Err("native Stack version query is not the fixed identity operation".to_owned());
     }
     Ok(())
 }

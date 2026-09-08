@@ -1,10 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hell_memcordon::{
     AcquisitionReceiptV1, PROVIDER_CLEANUP_RECEIPT_SCHEMA_V1, PROVIDER_RECEIPT_SCHEMA_V1,
@@ -12,21 +9,17 @@ use hell_memcordon::{
     ProviderLifecycleState,
 };
 
+use crate::command::CommandSpec;
 use crate::json::{JsonValue, parse_json};
+use crate::provider_evidence::{
+    Captured, require_json_success, require_success, retain_command, retain_json_command,
+};
 use crate::release::manifest::{write_atomic, write_json};
 
 use super::task::Task;
 
 const ADMIN_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 const ADMIN_TIMEOUT: Duration = Duration::from_mins(3);
-
-pub(super) struct Captured {
-    pub(super) status: ExitStatus,
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
-    pub(super) stdout_overflow: bool,
-    pub(super) stderr_overflow: bool,
-}
 
 struct ProviderPreparation {
     acquisition: AcquisitionReceiptV1,
@@ -116,7 +109,8 @@ fn prepare_installation(task: &Task, agent: &Path) -> Result<ProviderPreparation
             "an existing MemCordon installation is present; refusing to replace it".to_owned(),
         );
     }
-    require_documented_absence(&preexisting, "pre-install package verification")?;
+    require_expected_verification_failure(&preexisting, "pre-install package verification")?;
+    prove_native_absence(task, "pre-install-footprint")?;
     lifecycle
         .transition(ProviderLifecycleState::Installing)
         .map_err(|error| error.to_string())?;
@@ -170,7 +164,7 @@ fn install_and_qualify(task: &Task, agent: &Path, cli: &Path) -> Result<(String,
     )?;
     require_success(&install, "package install")?;
 
-    let verify = run_bounded(
+    let verify = run_provider_frontend(
         agent,
         [
             OsStr::new("package"),
@@ -180,10 +174,14 @@ fn install_and_qualify(task: &Task, agent: &Path, cli: &Path) -> Result<(String,
         ADMIN_TIMEOUT,
         ADMIN_OUTPUT_LIMIT,
     )?;
-    require_json_success(&verify, "package verify")?;
+    retain_json_command(
+        &task.output.join("qualification-artifacts/package-verify"),
+        &verify,
+        "package verify",
+    )?;
     write_atomic(&task.output.join("package-verify.json"), &verify.stdout)?;
 
-    let doctor = run_bounded(
+    let doctor = run_provider_frontend(
         cli,
         [
             OsStr::new("doctor"),
@@ -194,7 +192,11 @@ fn install_and_qualify(task: &Task, agent: &Path, cli: &Path) -> Result<(String,
         ADMIN_TIMEOUT,
         ADMIN_OUTPUT_LIMIT,
     )?;
-    require_json_success(&doctor, "doctor --require sealed")?;
+    retain_json_command(
+        &task.output.join("qualification-artifacts/doctor"),
+        &doctor,
+        "doctor --require sealed",
+    )?;
     write_atomic(&task.output.join("doctor.json"), &doctor.stdout)?;
     Ok((
         hell_testkit::sha256_bytes(&verify.stdout).hex(),
@@ -207,20 +209,23 @@ pub(super) fn cleanup(task: &Task) -> Result<String, String> {
     let lease_path = task.output.join("provider-lease.json");
     if !lease_path.exists() {
         let acquisition = read_acquisition(task)?;
-        let receipt = ProviderCleanupReceiptV1 {
-            schema_version: PROVIDER_CLEANUP_RECEIPT_SCHEMA_V1,
-            provider_lease_id: lease_id(task, &acquisition),
-            operation_id: task.operation.clone(),
-            platform: acquisition.platform,
-            attempted: false,
-            final_state: ProviderLifecycleState::Absent,
-            installed_footprint_absent: true,
-            active_operations: 0,
-            failure: None,
-        };
+        let receipt = crate::provider_presence::unowned_cleanup_receipt(
+            lease_id(task, &acquisition),
+            task.operation.clone(),
+            acquisition.platform,
+            prove_native_absence(task, "unowned-cleanup-footprint"),
+        );
         receipt.validate().map_err(|error| error.to_string())?;
         write_serde(&task.output.join("provider-cleanup.json"), &receipt)?;
-        return Ok("MemCordon provider was not installed by this task".to_owned());
+        return receipt.failure.map_or_else(
+            || {
+                Ok(
+                    "MemCordon provider was not installed by this task; native footprint is absent"
+                        .to_owned(),
+                )
+            },
+            Err,
+        );
     }
     let lease_bytes =
         fs::read(&lease_path).map_err(|error| format!("cannot read provider lease: {error}"))?;
@@ -240,6 +245,17 @@ pub(super) fn cleanup(task: &Task) -> Result<String, String> {
         return Err("provider lease is not owned by this exact task".to_owned());
     }
     let agent = find_component(&task.runtime_root, agent_name())?;
+    #[cfg(windows)]
+    if let Err(error) = write_serde(
+        &task
+            .output
+            .join("qualification-artifacts/windows-attempt-diagnostics.json"),
+        &crate::windows_provider_diagnostics::collect(),
+    ) {
+        // Diagnostic collection is separate from provider retirement authority.
+        // Never leave the installed provider behind because evidence could not be written.
+        eprintln!("cannot retain Windows provider diagnostics before cleanup: {error}");
+    }
     let uninstall = run_elevated_agent(
         &agent,
         &[
@@ -276,8 +292,10 @@ pub(super) fn cleanup(task: &Task) -> Result<String, String> {
         if verify.status.success() {
             failure = Some("MemCordon package remains installed after uninstall".to_owned());
         } else if let Err(error) =
-            require_documented_absence(&verify, "post-uninstall package verification")
+            require_expected_verification_failure(&verify, "post-uninstall package verification")
         {
+            failure = Some(error);
+        } else if let Err(error) = prove_native_absence(task, "post-uninstall-footprint") {
             failure = Some(error);
         }
     }
@@ -305,10 +323,22 @@ pub(super) fn cleanup(task: &Task) -> Result<String, String> {
 }
 
 pub(super) fn find_component(root: &Path, name: &str) -> Result<PathBuf, String> {
-    let mut pending = vec![root.to_path_buf()];
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect runtime root: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("MemCordon runtime root is not a real directory".to_owned());
+    }
+    let root =
+        fs::canonicalize(root).map_err(|error| format!("cannot bind runtime root: {error}"))?;
+    let mut pending = vec![root.clone()];
     let mut found = Vec::new();
     let mut observed = 0_usize;
     while let Some(directory) = pending.pop() {
+        let metadata = fs::symlink_metadata(&directory)
+            .map_err(|error| format!("cannot inspect runtime directory: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("MemCordon runtime directory was redirected".to_owned());
+        }
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("cannot enumerate {}: {error}", directory.display()))?;
         for entry in entries {
@@ -331,7 +361,19 @@ pub(super) fn find_component(root: &Path, name: &str) -> Result<PathBuf, String>
         }
     }
     match found.as_slice() {
-        [path] => Ok(path.clone()),
+        [path] => {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("cannot inspect runtime component: {error}"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("MemCordon runtime component is not a regular file".to_owned());
+            }
+            let canonical = fs::canonicalize(path)
+                .map_err(|error| format!("cannot bind runtime component: {error}"))?;
+            if !canonical.is_absolute() || !canonical.starts_with(&root) || canonical != *path {
+                return Err("MemCordon runtime component escaped or redirected its root".to_owned());
+            }
+            Ok(canonical)
+        }
         [] => Err(format!("MemCordon runtime component {name} is missing")),
         _ => Err(format!("MemCordon runtime component {name} is ambiguous")),
     }
@@ -357,75 +399,64 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot spawn {}: {error}", program.display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "stdout pipe is missing".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "stderr pipe is missing".to_owned())?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, limit));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, limit));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let status = child
-                    .wait()
-                    .map_err(|error| format!("cannot reap timed-out process: {error}"))?;
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!(
-                    "{} exceeded its bounded deadline ({status})",
-                    program.display()
-                ));
-            }
-            Err(error) => return Err(format!("cannot wait for {}: {error}", program.display())),
-        }
-    };
-    let (stdout, stdout_overflow) = stdout_reader
-        .join()
-        .map_err(|_| "stdout reader panicked".to_owned())??;
-    let (stderr, stderr_overflow) = stderr_reader
-        .join()
-        .map_err(|_| "stderr reader panicked".to_owned())??;
+    // Provider administration and runtime qualification are trusted host work;
+    // candidate operations use the sealed platform authority in execute.rs.
+    let mut output = CommandSpec::new(program, timeout)
+        .arguments(
+            arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string()),
+        )
+        .release_candidate_environment()
+        .run_trusted_host_captured()
+        .map_err(|error| format!("cannot supervise {}: {error}", program.display()))?;
+    if output.timed_out {
+        return Err(format!(
+            "{} exceeded its bounded deadline ({})",
+            program.display(),
+            output.status
+        ));
+    }
+    let stdout_overflow =
+        output.stdout_truncated || u128::from(output.stdout_bytes) > limit as u128;
+    let stderr_overflow =
+        output.stderr_truncated || u128::from(output.stderr_bytes) > limit as u128;
+    output.stdout.truncate(limit);
+    output.stderr.truncate(limit);
     Ok(Captured {
-        status,
-        stdout,
-        stderr,
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
         stdout_overflow,
         stderr_overflow,
     })
 }
 
-fn read_bounded(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), String> {
-    let mut retained = Vec::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut overflow = false;
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot drain command output: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        let available = limit.saturating_sub(retained.len());
-        let keep = available.min(read);
-        retained.extend_from_slice(&buffer[..keep]);
-        overflow |= keep != read;
+pub(super) fn run_provider_frontend<I, S>(
+    program: &Path,
+    arguments: I,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Captured, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    {
+        let program = fs::canonicalize(program)
+            .map_err(|error| format!("cannot bind provider frontend: {error}"))?;
+        let (program, arguments) =
+            hell_testkit::provider_frontend::authorized_linux_frontend(&program, &arguments)
+                .map_err(|error| format!("cannot authorize non-root provider frontend: {error}"))?;
+        run_bounded(&program, &arguments, timeout, limit)
     }
-    Ok((retained, overflow))
+    #[cfg(not(target_os = "linux"))]
+    run_bounded(program, &arguments, timeout, limit)
 }
 
 fn run_elevated_agent(
@@ -459,54 +490,179 @@ fn run_elevated_agent(
     }
 }
 
-fn require_json_success(captured: &Captured, label: &str) -> Result<(), String> {
-    require_success(captured, label)?;
-    let text = std::str::from_utf8(&captured.stdout)
-        .map_err(|_| format!("{label} output is not UTF-8 JSON"))?;
-    parse_json(text).map(|_| ())
+fn require_expected_verification_failure(captured: &Captured, label: &str) -> Result<(), String> {
+    crate::provider_presence::verify_failure_protocol(
+        cfg!(target_os = "linux"),
+        captured.status.code(),
+        &captured.stdout,
+        &captured.stderr,
+        captured.stdout_overflow || captured.stderr_overflow,
+    )
+    .map_err(|error| format!("{label}: {error}"))
 }
 
-fn require_success(captured: &Captured, label: &str) -> Result<(), String> {
-    if captured.stdout_overflow || captured.stderr_overflow {
-        return Err(format!("{label} exceeded its output bound"));
-    }
-    if !captured.status.success() {
-        let diagnostic = String::from_utf8_lossy(&captured.stderr);
-        return Err(format!(
-            "{label} failed with {}: {diagnostic}",
-            captured.status
-        ));
+fn prove_native_absence(task: &Task, evidence_name: &str) -> Result<(), String> {
+    let mut observations = Vec::new();
+    let inspection = inspect_native_footprint(task, evidence_name, &mut observations);
+    let result = inspection.and_then(|()| crate::provider_presence::require_absent(&observations));
+    write_serde(
+        &task.output.join(evidence_name).with_extension("json"),
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "contract": "memcordon-0.5.2-rc.23",
+            "observations": observations,
+            "absent": result.is_ok(),
+            "failure": result.as_ref().err(),
+        }),
+    )?;
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_native_footprint(
+    task: &Task,
+    evidence_name: &str,
+    observations: &mut Vec<crate::provider_presence::Observation>,
+) -> Result<(), String> {
+    use crate::provider_presence::{LINUX_PATHS, LINUX_UNITS, Observation, Presence, observe_path};
+    observations.extend(LINUX_PATHS.iter().map(|path| observe_path(Path::new(path))));
+    for unit in LINUX_UNITS {
+        let captured = run_bounded(
+            Path::new("/usr/bin/systemctl"),
+            [
+                "show",
+                "--all",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=FragmentPath",
+                "--property=UnitFileState",
+                "--",
+                unit,
+            ],
+            Duration::from_secs(15),
+            ADMIN_OUTPUT_LIMIT,
+        )?;
+        retain_command(
+            &task
+                .output
+                .join("qualification-artifacts")
+                .join(evidence_name)
+                .join(unit),
+            &captured,
+        )?;
+        let state = require_success(&captured, "systemd footprint inspection")
+            .and_then(|()| crate::provider_presence::systemd_unit_absent(&captured.stdout));
+        observations.push(Observation {
+            authority: (*unit).to_owned(),
+            presence: if state.is_ok() {
+                Presence::Absent
+            } else {
+                Presence::Unreadable
+            },
+            detail: state.err(),
+        });
     }
     Ok(())
 }
 
-fn require_documented_absence(captured: &Captured, label: &str) -> Result<(), String> {
-    if captured.stdout_overflow || captured.stderr_overflow {
-        return Err(format!("{label} exceeded its output bound"));
+#[cfg(windows)]
+fn inspect_native_footprint(
+    task: &Task,
+    evidence_name: &str,
+    observations: &mut Vec<crate::provider_presence::Observation>,
+) -> Result<(), String> {
+    use crate::process_environment::{ProcessEnvironment, StandardVariable};
+    use crate::provider_presence::{
+        Observation, Presence, WINDOWS_PIPES, WINDOWS_SERVICES, observe_path,
+    };
+    let environment = ProcessEnvironment::from_process();
+    let program_files = PathBuf::from(
+        environment.required_singleton_value(StandardVariable::ProgramFiles, "ProgramFiles")?,
+    );
+    let program_data = PathBuf::from(
+        environment.required_singleton_value(StandardVariable::ProgramData, "ProgramData")?,
+    );
+    let system_root = PathBuf::from(
+        environment.required_singleton_value(StandardVariable::SystemRoot, "SystemRoot")?,
+    );
+    if [&program_files, &program_data, &system_root]
+        .iter()
+        .any(|path| !path.is_absolute())
+    {
+        return Err("Windows provider authority roots must be absolute".to_owned());
     }
-    if captured.status.success() {
-        return Err(format!("{label} reported an installed package"));
+    let state_parent = program_data.join("MemCordon");
+    let state = state_parent.join("sealed");
+    for path in [
+        program_files.join("MemCordon"),
+        state_parent,
+        state.join("package").join("scm-launcher-connect-ace-owned"),
+        state.join("guardian-slots"),
+        state,
+    ] {
+        observations.push(observe_path(&path));
     }
-    let stdout = std::str::from_utf8(&captured.stdout)
-        .map_err(|_| format!("{label} stdout is not UTF-8"))?;
-    let stderr = std::str::from_utf8(&captured.stderr)
-        .map_err(|_| format!("{label} stderr is not UTF-8"))?;
-    let diagnostic = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    if !diagnostic.contains("not installed") && !diagnostic.contains("not-installed") {
-        return Err(format!(
-            "{label} failed without the documented missing-package result"
-        ));
+    let sc = system_root.join("System32").join("sc.exe");
+    for service in WINDOWS_SERVICES {
+        let captured = run_bounded(
+            &sc,
+            ["query", service],
+            Duration::from_secs(15),
+            ADMIN_OUTPUT_LIMIT,
+        )?;
+        retain_command(
+            &task
+                .output
+                .join("qualification-artifacts")
+                .join(evidence_name)
+                .join(service),
+            &captured,
+        )?;
+        observations.push(Observation {
+            authority: (*service).to_owned(),
+            presence: if captured.status.code() == Some(1060)
+                && !captured.stdout_overflow
+                && !captured.stderr_overflow
+            {
+                Presence::Absent
+            } else if captured.status.success() {
+                Presence::Present
+            } else {
+                Presence::Unreadable
+            },
+            detail: Some(captured.status.to_string()),
+        });
+    }
+    let pipes = fs::read_dir(r"\\.\pipe\")
+        .map_err(|error| format!("cannot enumerate native pipe authority: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot inspect native pipe authority: {error}"))?;
+    for pipe in WINDOWS_PIPES {
+        let present = pipes
+            .iter()
+            .any(|name| name.to_string_lossy().eq_ignore_ascii_case(pipe));
+        observations.push(Observation {
+            authority: (*pipe).to_owned(),
+            presence: if present {
+                Presence::Present
+            } else {
+                Presence::Absent
+            },
+            detail: None,
+        });
     }
     Ok(())
 }
 
-fn retain_command(prefix: &Path, captured: &Captured) -> Result<(), String> {
-    let mut stdout = prefix.as_os_str().to_owned();
-    stdout.push(".stdout");
-    let mut stderr = prefix.as_os_str().to_owned();
-    stderr.push(".stderr");
-    write_atomic(Path::new(&stdout), &captured.stdout)?;
-    write_atomic(Path::new(&stderr), &captured.stderr)
+#[cfg(not(any(target_os = "linux", windows)))]
+fn inspect_native_footprint(
+    _task: &Task,
+    _evidence_name: &str,
+    _observations: &mut Vec<crate::provider_presence::Observation>,
+) -> Result<(), String> {
+    Err("native sealed provider footprint inspection is unsupported on this platform".to_owned())
 }
 
 fn read_acquisition(task: &Task) -> Result<AcquisitionReceiptV1, String> {
@@ -516,7 +672,7 @@ fn read_acquisition(task: &Task) -> Result<AcquisitionReceiptV1, String> {
         .map_err(|error| format!("MemCordon acquisition receipt is invalid: {error}"))
 }
 
-fn lease_id(task: &Task, acquisition: &AcquisitionReceiptV1) -> String {
+pub(super) fn lease_id(task: &Task, acquisition: &AcquisitionReceiptV1) -> String {
     let binding = format!(
         "{}\0{}\0{}",
         task.operation,

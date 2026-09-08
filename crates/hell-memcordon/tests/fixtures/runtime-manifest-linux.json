@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "project": "memcordon",
+  "version": "0.5.2-rc.23",
+  "source_commit": "67aa1f74d9a76713ab343ea2afbe6403da7429b7",
+  "target": "x86_64-unknown-linux-gnu",
+  "components": [
+    {
+      "id": "public-cli",
+      "path": "memcordon",
+      "role": "public-cli",
+      "size": 2141360,
+      "mode": 493,
+      "sha256": "3d14cb25b8a73001076778a133daf7834a8f6a7c4d8ca77ff7b835736d506d88"
+    },
+    {
+      "id": "sealed-agent",
+      "path": "memcordon-sealed-agent",
+      "role": "sealed-agent",
+      "size": 1453000,
+      "mode": 493,
+      "sha256": "f648a1dace7153afec0b8b34205ba406932e1139ba9ff3866588937e04f97d51"
+    }
+  ],
+  "sealed": {
+    "state": "included",
+    "agent_component": "sealed-agent",
+    "provider_protocol": 2,
+    "mechanism": "linux-pid-namespace-cgroup-v2",
+    "execution_report_schema": 8,
+    "plan_report_schema": 7,
+    "doctor_report_schema": 5,
+    "qualification_schema": 2
+  }
+}

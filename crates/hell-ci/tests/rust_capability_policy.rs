@@ -95,6 +95,29 @@ fn semantic_capability_policy_admits_exact_sites_and_rejects_ast_bypasses() {
 }
 
 #[test]
+fn repository_process_construction_stays_within_command_authority() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = Fixture::new();
+    let output = fixture.root.join("repository.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hell-ci"));
+    command
+        .args(["policy", "rust-capabilities", "--repository-root"])
+        .arg(&repository)
+        .arg("--policy")
+        .arg(repository.join("ci/rust-capabilities.toml"))
+        .arg("--output")
+        .arg(&output);
+    let result = hell_testkit::run_supervised_command(&mut command, &[], Duration::from_secs(30))
+        .expect("audit repository process construction under supervision");
+    assert!(!result.timed_out, "repository audit exceeded its deadline");
+    assert_terminal_cleanup_receipt(&result, "repository capability policy");
+    let report = read_json(&output);
+    assert!(result.status.success(), "{report}");
+    assert_eq!(report["admitted"], true);
+    assert_eq!(report["violations"], serde_json::json!([]));
+}
+
+#[test]
 fn committed_capability_vector_manifest_executes_the_exact_fixture_inventory() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let vectors = read_committed_vectors(&repository);

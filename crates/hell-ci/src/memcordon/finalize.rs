@@ -52,14 +52,11 @@ pub(super) fn run(
         }
     }
     let operations_bytes = read_regular(&output.join("operations.json"))?;
-    let operations: Vec<OperationLedgerEntryV1> = serde_json::from_slice(&operations_bytes)
-        .map_err(|error| format!("invalid MemCordon operation ledger: {error}"))?;
-    let canonical_operations =
-        hell_memcordon::operation_ledger_json(&operations).map_err(|error| error.to_string())?;
-    if canonical_operations != operations_bytes {
-        return Err("MemCordon operation ledger is not canonical".to_owned());
-    }
-    let observed_operation_ids = validate_operations(output, &acquisition, &operations)?;
+    let ledger = decode_ledger(&operations_bytes)?;
+    let operations = &ledger.operations;
+    validate_operations(output, &acquisition, operations)?;
+    validate_output_group(&ledger, output)?;
+    let observed_operation_ids = ledger.logical_ids.clone();
     let required_operation_ids = task.required_operation_ids.clone();
     let exact_coverage =
         sorted_unique(&required_operation_ids)? == sorted_unique(&observed_operation_ids)?;
@@ -148,6 +145,155 @@ fn platform_commits(output: &Path) -> Result<(String, String), String> {
     ))
 }
 
+struct DecodedLedger {
+    operations: Vec<OperationLedgerEntryV1>,
+    logical_ids: Vec<String>,
+    group: Option<hell_memcordon::OperationGroupV2>,
+}
+
+fn decode_ledger(bytes: &[u8]) -> Result<DecodedLedger, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if value.is_array() {
+        let operations: Vec<OperationLedgerEntryV1> =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if operations.len() != 1
+            || operations
+                .iter()
+                .any(|entry| matches!(entry.operation_id.as_str(), "readiness" | "release"))
+        {
+            return Err(
+                "logical platform tasks require the versioned execution-group ledger".to_owned(),
+            );
+        }
+        if hell_memcordon::operation_ledger_json(&operations).map_err(|error| error.to_string())?
+            != bytes
+        {
+            return Err("MemCordon operation ledger is not canonical".to_owned());
+        }
+        Ok(DecodedLedger {
+            logical_ids: operations
+                .iter()
+                .map(|entry| entry.operation_id.clone())
+                .collect(),
+            operations,
+            group: None,
+        })
+    } else {
+        let ledger: hell_memcordon::OperationLedgerV2 =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if hell_memcordon::operation_ledger_v2_json(&ledger).map_err(|error| error.to_string())?
+            != bytes
+        {
+            return Err("MemCordon execution-group ledger is not canonical".to_owned());
+        }
+        let group = ledger
+            .groups
+            .into_iter()
+            .next()
+            .ok_or("execution group is missing")?;
+        Ok(DecodedLedger {
+            operations: group.invocations.clone(),
+            logical_ids: vec![group.operation_id.clone()],
+            group: Some(group),
+        })
+    }
+}
+
+fn validate_output_group(ledger: &DecodedLedger, output: &Path) -> Result<(), String> {
+    if ledger.group.is_none() {
+        return Ok(());
+    }
+    let parent = output.parent().ok_or("platform evidence has no parent")?;
+    let mut report = None;
+    for path in [
+        output.join("platform-report.json"),
+        parent.join("platform-report.provisional.json"),
+        parent.join("platform-report.json"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                report = Some(read_regular(&path)?);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    validate_group(
+        ledger,
+        &|relative| read_regular(&output.join(relative)),
+        &report.ok_or("execution group lacks its completed platform plan report")?,
+    )
+}
+
+fn validate_group(
+    ledger: &DecodedLedger,
+    read: &impl Fn(&str) -> Result<Vec<u8>, String>,
+    platform_report: &[u8],
+) -> Result<(), String> {
+    let group = ledger.group.as_ref().ok_or("execution group is missing")?;
+    let report: serde_json::Value =
+        serde_json::from_slice(platform_report).map_err(|error| error.to_string())?;
+    if report["planSha256"] != group.platform_plan_digest || report["state"] != "passed" {
+        return Err(
+            "execution group is not bound to its successful typed platform plan".to_owned(),
+        );
+    }
+    let bytes = read(&group.reservation_ledger_path)?;
+    if hell_testkit::sha256_bytes(&bytes).hex() != group.reservation_ledger_digest {
+        return Err("execution reservation journal digest differs".to_owned());
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Journal {
+        schema_version: u32,
+        operation_id: String,
+        invocations: Vec<Reserved>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reserved {
+        invocation_id: String,
+        request_digest: String,
+    }
+    let journal: Journal = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if journal.schema_version != 1
+        || journal.operation_id != group.operation_id
+        || journal.invocations.len() != group.invocations.len()
+        || journal
+            .invocations
+            .iter()
+            .zip(&group.invocations)
+            .any(|(reservation, invocation)| {
+                reservation.invocation_id != invocation.operation_id
+                    || reservation.request_digest != invocation.request_digest
+            })
+    {
+        return Err("execution group omitted or changed a reserved invocation".to_owned());
+    }
+    Ok(())
+}
+
+pub fn validate_execution_group_binding(
+    ledger: &[u8],
+    journal: &[u8],
+    platform_report: &[u8],
+) -> Result<(), String> {
+    let ledger = decode_ledger(ledger)?;
+    validate_group(
+        &ledger,
+        &|path| {
+            if path == "invocation-reservations.json" {
+                Ok(journal.to_vec())
+            } else {
+                Err("unexpected execution journal path".to_owned())
+            }
+        },
+        platform_report,
+    )
+}
+
 fn validate_operations(
     root: &Path,
     acquisition: &AcquisitionReceiptV1,
@@ -218,7 +364,7 @@ fn validate_operations(
                         format!("invalid Windows identity adapter receipt: {error}")
                     })?;
                 adapter.validate().map_err(|error| error.to_string())?;
-                if adapter.operation_id != entry.operation_id {
+                if !adapter_matches(&adapter, entry, &normalized) {
                     return Err(format!(
                         "Windows identity adapter receipt differs from operation {}",
                         entry.operation_id
@@ -284,14 +430,10 @@ pub(crate) fn verify_finalized_evidence(
         return Err("MemCordon provider lifecycle is not cleanly finalized".to_owned());
     }
     let operations_bytes = read_regular(&output.join("operations.json"))?;
-    let operations: Vec<OperationLedgerEntryV1> = serde_json::from_slice(&operations_bytes)
-        .map_err(|error| format!("invalid MemCordon operation ledger: {error}"))?;
-    if hell_memcordon::operation_ledger_json(&operations).map_err(|error| error.to_string())?
-        != operations_bytes
-    {
-        return Err("MemCordon operation ledger is not canonical".to_owned());
-    }
-    let observed_operation_ids = validate_operations(output, &acquisition, &operations)?;
+    let ledger = decode_ledger(&operations_bytes)?;
+    validate_operations(output, &acquisition, &ledger.operations)?;
+    validate_output_group(&ledger, output)?;
+    let observed_operation_ids = ledger.logical_ids.clone();
     let required_operation_ids = sorted_unique(required_operation_ids)?;
     if observed_operation_ids != required_operation_ids {
         return Err("MemCordon operation coverage differs from the platform report".to_owned());
@@ -475,16 +617,12 @@ pub(crate) fn verify_archived_finalized_evidence(
         return Err("archived MemCordon provider lifecycle is not cleanly finalized".to_owned());
     }
     let operations_bytes = read("operations.json")?;
-    let operations: Vec<OperationLedgerEntryV1> = serde_json::from_slice(&operations_bytes)
-        .map_err(|error| format!("invalid archived MemCordon operation ledger: {error}"))?;
-    if hell_memcordon::operation_ledger_json(&operations).map_err(|error| error.to_string())?
-        != operations_bytes
-    {
-        return Err("archived MemCordon operation ledger is not canonical".to_owned());
+    let ledger = decode_ledger(&operations_bytes)?;
+    validate_archived_operations(&read, &ledger.operations, &acquisition, expected_platform)?;
+    if ledger.group.is_some() {
+        validate_group(&ledger, &read, &read("platform-report.json")?)?;
     }
-    hell_memcordon::validate_operation_ledger(&operations).map_err(|error| error.to_string())?;
-    let observed_operation_ids =
-        validate_archived_operations(&read, &operations, &acquisition, expected_platform)?;
+    let observed_operation_ids = ledger.logical_ids.clone();
     let required_operation_ids = sorted_unique(required_operation_ids)?;
     if sorted_unique(&observed_operation_ids)? != required_operation_ids {
         return Err("archived MemCordon operation coverage differs".to_owned());
@@ -632,7 +770,7 @@ fn validate_archived_operations(
             return Err("archived MemCordon operation digest differs".to_owned());
         }
         validate_archived_projection(entry, acquisition, &raw, &normalized)?;
-        validate_archived_adapter(read, entry, expected_platform)?;
+        validate_archived_adapter(read, entry, expected_platform, &normalized)?;
     }
     Ok(operations
         .iter()
@@ -669,6 +807,7 @@ fn validate_archived_adapter(
     read: &impl Fn(&str) -> Result<Vec<u8>, String>,
     entry: &OperationLedgerEntryV1,
     expected_platform: PlatformId,
+    normalized: &[u8],
 ) -> Result<(), String> {
     match expected_platform {
         PlatformId::WindowsX86_64 => {
@@ -685,7 +824,9 @@ fn validate_archived_adapter(
                     format!("invalid archived Windows identity adapter receipt: {error}")
                 })?;
             adapter.validate().map_err(|error| error.to_string())?;
-            if adapter.operation_id != entry.operation_id {
+            let projection = hell_memcordon::parse_schema8_projection(normalized)
+                .map_err(|error| error.to_string())?;
+            if !adapter_matches(&adapter, entry, &projection) {
                 return Err("archived Windows identity operation differs".to_owned());
             }
         }
@@ -697,6 +838,25 @@ fn validate_archived_adapter(
         PlatformId::MacosAarch64 => unreachable!("rejected above"),
     }
     Ok(())
+}
+
+fn adapter_matches(
+    adapter: &hell_memcordon::WindowsCandidateIdentityReceiptV1,
+    entry: &OperationLedgerEntryV1,
+    projection: &hell_memcordon::Schema8ProjectionV1,
+) -> bool {
+    adapter.operation_id == entry.operation_id
+        && adapter.candidate_released
+        && adapter.direct_child_reaped
+        && adapter.adapter_outcome == hell_memcordon::WindowsIdentityAdapterOutcomeV1::Completed
+        && matches!(
+            adapter.relay_outcome,
+            hell_memcordon::WindowsIdentityRelayOutcomeV1::NotUsed
+                | hell_memcordon::WindowsIdentityRelayOutcomeV1::Completed
+        )
+        && matches!(projection.terminal,
+            hell_memcordon::Schema8TerminalV1::CandidateExit { native_status }
+                if adapter.child_native_status == Some(native_status))
 }
 
 fn parse_inventory_bytes(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {

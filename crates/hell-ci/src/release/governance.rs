@@ -8,6 +8,9 @@ use crate::json::{JsonValue, canonical_json_bytes, json_member, parse_json};
 use super::manifest::{read_json, read_regular, write_json_new};
 use super::schema::{ReleasePlan, number, object, require_digest, string};
 
+#[cfg(feature = "mutation-testing")]
+mod transcript;
+
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const MAX_API_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
@@ -33,6 +36,8 @@ pub(crate) enum Phase {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotOptions {
+    #[cfg(feature = "mutation-testing")]
+    pub(crate) test_transcript: Option<PathBuf>,
     pub(crate) policy: PathBuf,
     pub(crate) api_policy: PathBuf,
     pub(crate) plan: PathBuf,
@@ -267,7 +272,20 @@ fn snapshot_inner(options: &SnapshotOptions) -> Result<(Snapshot, String), Failu
         .checked_add(Duration::from_mins(5))
         .ok_or_else(|| Failure::new("governance.deadline.overflow", "deadline overflowed"))?;
     let client = Client::new(&runtime, credential, &api, deadline)?;
-    let observations = observe(&policy, &plan, &runtime, options.phase, &client)?;
+    #[cfg(feature = "mutation-testing")]
+    let client = client.with_test_transcript(options.test_transcript.as_deref())?;
+    let observations = observe(&policy, &plan, &runtime, options.phase, &client);
+    #[cfg(feature = "mutation-testing")]
+    let observations = match (observations, client.require_transcript_exhausted()) {
+        (Err(primary), Err(exhaustion)) => Err(Failure::new(
+            primary.code,
+            format!("{}; {}", primary.message, exhaustion.message),
+        )),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(exhaustion)) => Err(exhaustion),
+        (Ok(observations), Ok(())) => Ok(observations),
+    };
+    let observations = observations?;
     if observations
         .values()
         .any(|observation| observation.evaluation == Evaluation::Mismatched)
@@ -1237,6 +1255,8 @@ fn validate_endpoint_path(id: &str, segments: &[String]) -> Result<(), String> {
 }
 
 struct Client<'a> {
+    #[cfg(feature = "mutation-testing")]
+    transcript: Option<std::cell::RefCell<transcript::Transcript>>,
     api: &'a ApiPolicy,
     credential: GithubCredential,
     deadline: Instant,
@@ -1248,6 +1268,17 @@ struct Client<'a> {
 struct Response {
     body: Option<JsonValue>,
     status: u16,
+}
+
+struct TransportResponse {
+    status: u16,
+    body: Result<Vec<u8>, String>,
+}
+
+enum TransportFailure {
+    Request(String),
+    #[cfg(feature = "mutation-testing")]
+    Fixture(Failure),
 }
 
 impl<'a> Client<'a> {
@@ -1263,6 +1294,8 @@ impl<'a> Client<'a> {
             .split_once('/')
             .ok_or_else(|| Failure::new("governance.repository.identity", "invalid repository"))?;
         Ok(Self {
+            #[cfg(feature = "mutation-testing")]
+            transcript: None,
             api,
             credential,
             deadline,
@@ -1302,43 +1335,27 @@ impl<'a> Client<'a> {
                 )
             })?;
             let timeout = remaining.min(self.api.request_timeout);
-            let loopback = self.root.starts_with("http://127.0.0.1:");
-            let agent = ureq::config::Config::builder()
-                .http_status_as_error(false)
-                .https_only(!loopback)
-                .max_redirects(0)
-                .proxy(None)
-                .timeout_connect(Some(self.api.connect_timeout.min(timeout)))
-                .timeout_global(Some(timeout))
-                .build()
-                .new_agent();
-            let response = self.credential.with_bearer_header(|authorization| {
-                agent
-                    .get(&url)
-                    .header("Authorization", authorization)
-                    .header("Accept", &self.api.accept)
-                    .header("X-GitHub-Api-Version", &self.api.api_version)
-                    .header("User-Agent", &self.api.user_agent)
-                    .call()
-                    .map_err(|error| format!("request failed: {error}"))
-            });
+            let response = self.request(&url, endpoint, timeout, attempt + 1 < attempts);
             match response {
-                Ok(mut response) => {
-                    let status = response.status().as_u16();
+                Ok(response) => {
+                    let status = response.status;
                     if matches!(status, 502..=504) && attempt + 1 < attempts {
                         continue;
                     }
-                    let body = response
-                        .body_mut()
-                        .with_config()
-                        .limit(endpoint.maximum_response_bytes)
-                        .read_to_vec()
-                        .map_err(|error| {
-                            Failure::new(
-                                "governance.response.read",
-                                format!("cannot read endpoint {endpoint_id}: {error}"),
-                            )
-                        })?;
+                    let body = response.body.map_err(|error| {
+                        Failure::new(
+                            "governance.response.read",
+                            format!("cannot read endpoint {endpoint_id}: {error}"),
+                        )
+                    })?;
+                    if u64::try_from(body.len()).unwrap_or(u64::MAX)
+                        > endpoint.maximum_response_bytes
+                    {
+                        return Err(Failure::new(
+                            "governance.response.read",
+                            "endpoint response exceeded its byte bound",
+                        ));
+                    }
                     let body = if body.is_empty() {
                         None
                     } else {
@@ -1357,8 +1374,12 @@ impl<'a> Client<'a> {
                     };
                     return Ok(Response { body, status });
                 }
-                Err(error) if attempt + 1 < attempts => last_error = Some(error),
-                Err(error) => {
+                #[cfg(feature = "mutation-testing")]
+                Err(TransportFailure::Fixture(error)) => return Err(error),
+                Err(TransportFailure::Request(error)) if attempt + 1 < attempts => {
+                    last_error = Some(error)
+                }
+                Err(TransportFailure::Request(error)) => {
                     return Err(Failure::new("governance.request.failed", error));
                 }
             }
@@ -1367,6 +1388,77 @@ impl<'a> Client<'a> {
             "governance.request.failed",
             last_error.unwrap_or_else(|| "request attempts were exhausted".to_owned()),
         ))
+    }
+
+    fn request(
+        &self,
+        url: &str,
+        endpoint: &EndpointPolicy,
+        timeout: Duration,
+        retry_available: bool,
+    ) -> Result<TransportResponse, TransportFailure> {
+        self.credential
+            .with_bearer_header(|authorization| {
+                let request = || {
+                    #[cfg(feature = "mutation-testing")]
+                    if let Some(transcript) = &self.transcript {
+                        return transcript
+                            .borrow_mut()
+                            .request(url, authorization, self.api);
+                    }
+                    let loopback = self.root.starts_with("http://127.0.0.1:");
+                    let agent = ureq::config::Config::builder()
+                        .http_status_as_error(false)
+                        .https_only(!loopback)
+                        .max_redirects(0)
+                        .proxy(None)
+                        .timeout_connect(Some(self.api.connect_timeout.min(timeout)))
+                        .timeout_global(Some(timeout))
+                        .build()
+                        .new_agent();
+                    let mut response = agent
+                        .get(url)
+                        .header("Authorization", authorization)
+                        .header("Accept", &self.api.accept)
+                        .header("X-GitHub-Api-Version", &self.api.api_version)
+                        .header("User-Agent", &self.api.user_agent)
+                        .call()
+                        .map_err(|error| {
+                            TransportFailure::Request(format!("request failed: {error}"))
+                        })?;
+                    let status = response.status().as_u16();
+                    let body = if matches!(status, 502..=504) && retry_available {
+                        Ok(Vec::new())
+                    } else {
+                        response
+                            .body_mut()
+                            .with_config()
+                            .limit(endpoint.maximum_response_bytes)
+                            .read_to_vec()
+                            .map_err(|error| error.to_string())
+                    };
+                    Ok(TransportResponse { status, body })
+                };
+                Ok(request())
+            })
+            .map_err(TransportFailure::Request)?
+    }
+
+    #[cfg(feature = "mutation-testing")]
+    fn with_test_transcript(mut self, path: Option<&Path>) -> Result<Self, Failure> {
+        self.transcript = path
+            .map(transcript::Transcript::read)
+            .transpose()?
+            .map(std::cell::RefCell::new);
+        Ok(self)
+    }
+
+    #[cfg(feature = "mutation-testing")]
+    fn require_transcript_exhausted(&self) -> Result<(), Failure> {
+        if let Some(transcript) = &self.transcript {
+            transcript.borrow().require_exhausted()?;
+        }
+        Ok(())
     }
 
     fn endpoint_url(

@@ -3,8 +3,6 @@ use std::fs;
 #[cfg(any(target_os = "linux", windows))]
 use std::path::Path;
 #[cfg(any(target_os = "linux", windows))]
-use std::process::Command;
-#[cfg(any(target_os = "linux", windows))]
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", windows))]
@@ -13,6 +11,8 @@ use hell_memcordon::{
     WindowsCandidateIdentityReceiptV1,
 };
 
+#[cfg(any(target_os = "linux", windows))]
+use crate::command::NativeProcessSpec;
 #[cfg(any(target_os = "linux", windows))]
 use crate::json::parse_json;
 #[cfg(any(target_os = "linux", windows))]
@@ -68,18 +68,22 @@ fn run_linux(task: &Task) -> Result<String, String> {
     let mut authority = crate::release::platform::LinuxMemcordonLaunchAuthority::acquire_until(
         &repository,
         &work_root,
+        &task.operation,
         execution_deadline,
         authority_cleanup_deadline,
     )?;
     let executable = authority.executable().to_path_buf();
-    let mut command = Command::new(&executable);
-    command
-        .arg("__memcordon-operation-child")
-        .arg(&task.operation)
-        .arg(&repository)
-        .arg(authority.work_root())
-        .current_dir(&repository);
+    let candidate_repository = authority.repository_root().to_path_buf();
+    let candidate_work_root = authority.work_root().to_path_buf();
     let primary = (|| {
+        authority.preflight_until(execution_deadline, &task.output)?;
+        let mut command = NativeProcessSpec::new(executable)
+            .argument("__memcordon-operation-child")
+            .argument(&task.operation)
+            .argument(&candidate_repository)
+            .argument(authority.work_root())
+            .current_directory(&candidate_repository)
+            .construct()?;
         authority.attach_memcordon(
             hell_testkit::BoundProgramInvocation::new(qualified.runtime.clone(), qualified.runtime)
                 .map_err(|error| format!("cannot bind qualified MemCordon CLI: {error}"))?,
@@ -99,12 +103,13 @@ fn run_linux(task: &Task) -> Result<String, String> {
             None,
         )
         .map_err(|error| format!("MemCordon operation execution failed: {error}"))?;
+        crate::operation_evidence::retain(
+            &task.output.join("streams").join(&task.operation),
+            &output,
+        )?;
         persist_operation(task, &output, CandidateBoundaryPolicy::SealedLinux, None)?;
         if !output.status.success() || output.timed_out {
-            return Err(format!(
-                "MemCordon operation {} returned {}",
-                task.operation, output.status
-            ));
+            return Err(crate::operation_evidence::failure(&task.operation, &output));
         }
         Ok(format!(
             "executed {} as one authenticated MemCordon root",
@@ -112,9 +117,17 @@ fn run_linux(task: &Task) -> Result<String, String> {
         ))
     })();
     let retention = authority
-        .retain_work_root_until(authority_cleanup_deadline)
-        .and_then(|()| retain_candidate_outputs(&task.operation, &work_root, &repository));
-    let authority_cleanup = authority.close_until(authority_cleanup_deadline);
+        .retain_work_root_until(authority_cleanup_deadline, &task.output)
+        .and_then(|()| {
+            if primary.is_err() && task.operation == "fuzz" {
+                crate::operation_evidence::retain_blocked_fuzz_report(
+                    &candidate_work_root,
+                    &task.output,
+                )?;
+            }
+            retain_candidate_outputs(&task.operation, &candidate_work_root, &repository)
+        });
+    let authority_cleanup = authority.close_until(authority_cleanup_deadline, &task.output);
     let work_root_cleanup = fs::remove_dir_all(&work_root)
         .map_err(|error| format!("cannot remove retained Linux work root: {error}"));
     let cleanup = match (authority_cleanup, work_root_cleanup) {
@@ -176,11 +189,11 @@ fn run_windows(task: &Task) -> Result<String, String> {
             CLEANUP_RESERVE,
         )?;
         let policy = authority.launch_policy()?;
-        let mut command = Command::new(&executable);
-        command
-            .arg("__memcordon-operation-child")
-            .arg(&task.operation)
-            .current_dir(&repository);
+        let mut command = NativeProcessSpec::new(executable)
+            .argument("__memcordon-operation-child")
+            .argument(&task.operation)
+            .current_directory(&repository)
+            .construct()?;
         let output = hell_testkit::run_memcordon_candidate_command_with_deadlines(
             &mut command,
             &[],
@@ -191,6 +204,10 @@ fn run_windows(task: &Task) -> Result<String, String> {
             None,
         )
         .map_err(|error| format!("MemCordon operation execution failed: {error}"))?;
+        crate::operation_evidence::retain(
+            &task.output.join("streams").join(&task.operation),
+            &output,
+        )?;
         let identity = policy
             .windows_memcordon_identity_receipt(&task.operation, &output)
             .map_err(|error| format!("cannot retain Windows identity receipt: {error}"))?;
@@ -201,10 +218,7 @@ fn run_windows(task: &Task) -> Result<String, String> {
             Some(&identity),
         )?;
         if !output.status.success() || output.timed_out {
-            return Err(format!(
-                "MemCordon operation {} returned {}",
-                task.operation, output.status
-            ));
+            return Err(crate::operation_evidence::failure(&task.operation, &output));
         }
         Ok(format!(
             "executed {} as one authenticated MemCordon root",
@@ -215,8 +229,7 @@ fn run_windows(task: &Task) -> Result<String, String> {
     compose_authority_result("Windows", primary, Ok(()), cleanup)
 }
 
-#[cfg(any(target_os = "linux", windows))]
-fn compose_authority_result(
+pub fn compose_authority_result(
     platform: &str,
     primary: Result<String, String>,
     retention: Result<(), String>,

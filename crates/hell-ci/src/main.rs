@@ -1,6 +1,24 @@
 pub mod assurance;
 mod capability_policy;
 mod command;
+#[doc(hidden)]
+#[cfg(unix)]
+pub use command::StackExecutableInspection;
+#[doc(hidden)]
+#[cfg(unix)]
+pub use command::TrustedStackIdentityQuery;
+#[doc(hidden)]
+#[cfg(unix)]
+pub use command::run_bound_trusted_cargo_for_integration;
+#[doc(hidden)]
+#[cfg(unix)]
+pub use command::verify_native_stack_command_policy;
+#[cfg(unix)]
+pub use command::{CommandResult, CommandTerminationResult};
+#[doc(hidden)]
+pub use release::platform::validate_stack_identity_result;
+#[cfg(unix)]
+pub use release::platform::{CargoDenyDiagnosticPhase, CargoDenyDiagnostics};
 mod compatibility;
 mod conformance;
 mod fixtures;
@@ -11,10 +29,42 @@ mod identity;
 mod json;
 mod memcordon;
 pub mod mutation;
+pub mod native_tool_evidence;
+#[cfg(unix)]
+pub mod nightly_cargo;
+#[doc(hidden)]
+pub mod operation_evidence;
 mod oracle_acquire;
 mod policy;
 pub mod process_environment;
 mod protocol;
+pub mod provider_evidence;
+pub mod provider_presence;
+#[cfg(unix)]
+pub mod readiness_cargo;
+pub mod retention_evidence;
+#[cfg(unix)]
+pub mod stack_acquire;
+#[cfg(unix)]
+pub mod supervisor_fixture_ipc;
+pub mod windows_provider_diagnostics;
+
+#[doc(hidden)]
+pub use memcordon::{
+    ExecutionCollector, compose_authority_result, validate_execution_group_binding,
+};
+#[cfg(unix)]
+#[doc(hidden)]
+pub use release::cargo_dependencies::{
+    FrozenDependencyInputs, dependency_directory_config, validate_dependency_vendor,
+};
+
+pub fn reserve_platform_output_for_integration(
+    output: &std::path::Path,
+    prerequisite: Option<&std::path::Path>,
+) -> Result<(), String> {
+    release::reserve_for_integration(output, prerequisite)
+}
 mod readiness;
 mod regression;
 mod release;
@@ -35,6 +85,14 @@ pub fn native_environment_external_inputs_sha256_for_integration(
     path: &Path,
 ) -> Result<String, String> {
     release::native_environment::external_inputs_sha256(path)
+}
+
+#[doc(hidden)]
+pub fn find_memcordon_component_for_integration(
+    root: &Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    memcordon::find_component_for_integration(root, name)
 }
 
 #[doc(hidden)]
@@ -1864,6 +1922,12 @@ fn dispatch_platform_normalizers(arguments: Vec<OsString>) -> ExitCode {
     if arguments.first().and_then(|value| value.to_str()) == Some("__memcordon-operation-child") {
         return run_memcordon_operation_child(&arguments[1..]);
     }
+    #[cfg(target_os = "linux")]
+    if arguments.first().and_then(|value| value.to_str()) == Some("__memcordon-path-preflight") {
+        return emit_cli_result(release::platform::run_linux_memcordon_path_preflight(
+            &arguments[1..],
+        ));
+    }
     dispatch_public_cli(arguments)
 }
 
@@ -1934,7 +1998,7 @@ fn run_memcordon_operation_child(arguments: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    dispatch_public_cli(command)
+    dispatch_public_cli_at_root(command, &repository)
 }
 
 fn memcordon_nightly_child_arguments(repository: &Path, work_root: &Path) -> Vec<OsString> {
@@ -1991,6 +2055,30 @@ fn run_memcordon_regression_child(repository: &Path) -> ExitCode {
             .arguments(arguments)
             .current_directory(repository)
             .run();
+        if let Ok(result) = &result {
+            eprintln!("MemCordon regression child captured cargo argv: {arguments:?}");
+            if let Err(error) = operation_evidence::forward_nested_capture(
+                &result.stdout,
+                &result.stderr,
+                std::io::stdout().lock(),
+                std::io::stderr().lock(),
+            ) {
+                eprintln!(
+                    "MemCordon regression child returned {} (timed_out={}); cannot forward diagnostics: {error}",
+                    result.status, result.timed_out
+                );
+                return ExitCode::FAILURE;
+            }
+            if result.stdout_truncated || result.stderr_truncated {
+                eprintln!(
+                    "MemCordon regression child capture truncated: stdout_bytes={} stdout_sha256={} stderr_bytes={} stderr_sha256={}",
+                    result.stdout_bytes,
+                    result.stdout_sha256.hex(),
+                    result.stderr_bytes,
+                    result.stderr_sha256.hex()
+                );
+            }
+        }
         match result {
             Ok(result) if result.status.success() && !result.timed_out => {}
             Ok(result) => {
@@ -2017,14 +2105,23 @@ fn dispatch_public_cli(arguments: Vec<OsString>) -> ExitCode {
             return ExitCode::from(40);
         }
     };
+    dispatch_public_cli_at_root(arguments, &root)
+}
+
+#[doc(hidden)]
+pub fn dispatch_public_cli_at_root(arguments: Vec<OsString>, root: &Path) -> ExitCode {
+    if !root.is_absolute() {
+        eprintln!("explicit repository root must be absolute");
+        return ExitCode::from(2);
+    }
     if compatibility::recognizes(&arguments) {
-        return compatibility::run_cli(&root, &arguments);
+        return compatibility::run_cli(root, &arguments);
     }
     if regression::recognizes(&arguments) {
         return regression::run_cli(&arguments);
     }
     if mutation::recognizes(&arguments) {
-        return mutation::run_cli(&root, &arguments);
+        return mutation::run_cli(root, &arguments);
     }
     if assurance::recognizes(&arguments) {
         return match assurance::run(&arguments) {
@@ -2062,7 +2159,7 @@ fn dispatch_public_cli(arguments: Vec<OsString>) -> ExitCode {
             }
         };
     }
-    dispatch_release_cli(arguments, &root)
+    dispatch_release_cli(arguments, root)
 }
 
 fn dispatch_release_cli(arguments: Vec<OsString>, root: &Path) -> ExitCode {

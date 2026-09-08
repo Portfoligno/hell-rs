@@ -18,13 +18,14 @@ pub use deadlines::{AbsoluteDeadlines, DeadlineError, InnerBudget};
 pub use evidence::{
     ACQUISITION_RECEIPT_SCHEMA_V1, AcquisitionReceiptV1, CandidateBoundaryPolicy, CandidateResult,
     ComponentObservationV1, FINALIZATION_RECEIPT_SCHEMA_V1, FinalizationReceiptV1,
-    OPERATION_RECEIPT_SCHEMA_V1, OperationClass, OperationLedgerEntryV1,
+    OPERATION_GROUP_PHASES_V2, OPERATION_LEDGER_SCHEMA_V2, OPERATION_RECEIPT_SCHEMA_V1,
+    OperationClass, OperationGroupV2, OperationLedgerEntryV1, OperationLedgerV2,
     PROVIDER_CLEANUP_RECEIPT_SCHEMA_V1, PROVIDER_RECEIPT_SCHEMA_V1, PlatformId,
     ProviderCleanupReceiptV1, ProviderLeaseStateMachine, ProviderLifecycleReceiptV1,
     ProviderLifecycleState, SealedOperationReceiptV1, SealedTerminal, TransportStatus,
     WINDOWS_CANDIDATE_IDENTITY_RECEIPT_SCHEMA_V1, WindowsCandidateIdentityReceiptV1,
     WindowsIdentityAdapterOutcomeV1, WindowsIdentityRelayOutcomeV1, operation_ledger_json,
-    validate_operation_ledger,
+    operation_ledger_v2_json, validate_operation_ledger, validate_operation_ledger_v2,
 };
 pub use invocation::{
     AuthorizedCandidateRequest, NativeArgument, NativeArgumentRaw, PreparedSealedInvocation,
@@ -41,7 +42,8 @@ pub use report::{
 pub use reservation::ReportReservation;
 pub use runtime_manifest::{
     MAX_ARCHIVE_ENTRIES, MAX_EXECUTABLE_BYTES, MAX_EXPANDED_BYTES, MAX_JSON_METADATA_BYTES,
-    RuntimeComponent, RuntimeManifest, validate_component_inventory,
+    RuntimeComponent, RuntimeComponentRole, RuntimeManifest, SealedRuntime,
+    validate_component_inventory,
 };
 
 /// Error returned when a versioned consumer contract is malformed.

@@ -653,6 +653,161 @@ fn copy_physical_fuzz_inventory(destination: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn freeze_artifact_fixture(path: &Path, restore: &mut Vec<FixturePermissionRestore>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let metadata = fs::symlink_metadata(path).unwrap();
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    restore.push(FixturePermissionRestore::new(path, metadata.permissions()));
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            freeze_artifact_fixture(&entry.unwrap().path(), restore);
+        }
+    }
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(if metadata.is_dir() { 0o555 } else { 0o444 }),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_fuzz_default_preparation_succeeds_read_only_and_final_prefix_targets_work() {
+    let fixture = Fixture::new("artifact-defaults");
+    let source = fixture.path("repository");
+    copy_physical_fuzz_inventory(&source);
+    let source = source.canonicalize().unwrap();
+    let manifest = repository_root().join("ci/fuzz-targets.toml");
+    let input = source.join("crates/hell-ci/fuzz/Cargo.toml");
+    let before = fs::read(&input).unwrap();
+    hell_ci::fuzz::reserve_source_artifact_defaults(&manifest, &source).unwrap();
+    let mut restore = Vec::new();
+    freeze_artifact_fixture(&source, &mut restore);
+    let default = source.join("crates/hell-ci/fuzz/artifacts/strict_json");
+    // Exact cargo-fuzz 0.13.2 preparatory operation, without compiling fuzzers.
+    fs::create_dir_all(&default).unwrap();
+    assert!(fs::read_dir(&default).unwrap().next().is_none());
+    let work = fixture.path("work");
+    fs::create_dir_all(work.join("ci-out/fuzz-artifacts")).unwrap();
+    fs::create_dir(work.join("corpus")).unwrap();
+    let work = work.canonicalize().unwrap();
+    let arguments =
+        hell_ci::fuzz::inspect_fuzz_artifact_campaign(&manifest, &source, &work, "strict_json")
+            .unwrap();
+    let separator = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap();
+    assert_eq!(&arguments[..2], ["fuzz", "run"]);
+    assert_eq!(&arguments[2..4], ["--fuzz-dir", "crates/hell-ci/fuzz"]);
+    let prefixes = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("-artifact_prefix="))
+                .map(|path| (index, PathBuf::from(path)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prefixes.len(), 1);
+    assert!(prefixes[0].0 > separator);
+    assert_eq!(
+        prefixes[0].1,
+        work.join("ci-out/fuzz-artifacts/strict_json")
+    );
+    assert_eq!(
+        arguments
+            .last()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_suffix('/')
+            .map(|value| value.starts_with("-artifact_prefix=")),
+        Some(true)
+    );
+    fs::write(
+        prefixes[0].1.join("retained-artifact-fixture"),
+        b"actual output authority\n",
+    )
+    .unwrap();
+    assert!(fs::read_dir(&default).unwrap().next().is_none());
+    assert_eq!(fs::read(&input).unwrap(), before);
+    drop(restore);
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_fuzz_default_reservation_rejects_preexisting_and_redirected_roots() {
+    for redirected in [false, true] {
+        let fixture = Fixture::new("artifact-preexisting");
+        let source = fixture.path("repository");
+        copy_physical_fuzz_inventory(&source);
+        let source = source.canonicalize().unwrap();
+        let artifacts = source.join("crates/hell-ci/fuzz/artifacts");
+        if redirected {
+            std::os::unix::fs::symlink(&fixture.root, &artifacts).unwrap();
+        } else {
+            fs::create_dir(&artifacts).unwrap();
+            fs::write(artifacts.join("unexpected"), b"preserve\n").unwrap();
+        }
+        assert!(
+            hell_ci::fuzz::reserve_source_artifact_defaults(
+                &repository_root().join("ci/fuzz-targets.toml"),
+                &source
+            )
+            .is_err()
+        );
+        if !redirected {
+            assert_eq!(
+                fs::read(artifacts.join("unexpected")).unwrap(),
+                b"preserve\n"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_fuzz_default_validation_rejects_contents_and_postreservation_symlinks() {
+    for redirected in [false, true] {
+        let fixture = Fixture::new("artifact-mutated");
+        let source = fixture.path("repository");
+        copy_physical_fuzz_inventory(&source);
+        let source = source.canonicalize().unwrap();
+        let manifest = repository_root().join("ci/fuzz-targets.toml");
+        hell_ci::fuzz::reserve_source_artifact_defaults(&manifest, &source).unwrap();
+        let default = source.join("crates/hell-ci/fuzz/artifacts/strict_json");
+        if redirected {
+            fs::remove_dir(&default).unwrap();
+            std::os::unix::fs::symlink(&fixture.root, &default).unwrap();
+        } else {
+            fs::write(default.join("unexpected"), b"not an admitted output\n").unwrap();
+        }
+        let mut restore = Vec::new();
+        freeze_artifact_fixture(&source, &mut restore);
+        let error = hell_ci::fuzz::inspect_fuzz_artifact_campaign(
+            &manifest,
+            &source,
+            &fixture.root,
+            "strict_json",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(if redirected {
+                "real directory"
+            } else {
+                "must remain empty"
+            }),
+            "{error}"
+        );
+        drop(restore);
+    }
+}
+
 #[test]
 fn production_fuzz_inventory_check_binds_all_physical_targets_and_corpora() {
     let fixture = Fixture::new("live");

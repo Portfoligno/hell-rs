@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "project": "memcordon",
+  "version": "0.5.2-rc.23",
+  "source_commit": "67aa1f74d9a76713ab343ea2afbe6403da7429b7",
+  "target": "x86_64-pc-windows-msvc",
+  "components": [
+    {
+      "id": "public-cli",
+      "path": "memcordon.exe",
+      "role": "public-cli",
+      "size": 2415616,
+      "mode": 493,
+      "sha256": "d29aa5d35c369af904eea7ad9b0dd698d8bb7552986b92ead4834b8e7d8bb084"
+    },
+    {
+      "id": "sealed-agent",
+      "path": "memcordon-sealed-agent.exe",
+      "role": "sealed-agent",
+      "size": 7187968,
+      "mode": 493,
+      "sha256": "58a232faeaa24b484629600e06e1e72f2228c4b0e08c5cb7ae732741a4ca7e84"
+    },
+    {
+      "id": "target-desktop-bootstrap",
+      "path": "memcordon-target-desktop-bootstrap.exe",
+      "role": "desktop-bootstrap",
+      "size": 1778176,
+      "mode": 493,
+      "sha256": "44bf8e98564fa70eb3de2cdb9444bb65e96c52af99f5208c9af3df07ef42d193"
+    },
+    {
+      "id": "session-broker",
+      "path": "memcordon-session-broker.exe",
+      "role": "session-broker",
+      "size": 938496,
+      "mode": 493,
+      "sha256": "5251dd1944685277d72eebaa1eeacb5f74f49c4b695a0661d055289fb1b2dad7"
+    }
+  ],
+  "sealed": {
+    "state": "included",
+    "agent_component": "sealed-agent",
+    "provider_protocol": 1,
+    "mechanism": "windows-job-object-v2",
+    "execution_report_schema": 8,
+    "plan_report_schema": 7,
+    "doctor_report_schema": 5,
+    "qualification_schema": 2
+  }
+}

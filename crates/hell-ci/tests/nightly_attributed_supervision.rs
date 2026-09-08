@@ -53,4 +53,25 @@ fn nightly_status_failures_preserve_distinct_primaries_outside_bounded_aggregate
                 .unwrap_or(&output.stderr.prefix),
         ),
     );
+    let stderr = String::from_utf8_lossy(
+        output
+            .stderr
+            .complete
+            .as_deref()
+            .unwrap_or(&output.stderr.prefix),
+    );
+    assert!(stderr.lines().any(|line| {
+        line.contains("phase=aggregate-failure-fixture")
+            && line.contains("case=second_failure caseState=failed")
+    }));
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| { line.contains("case=later_success caseState=failed") })
+    );
+    assert!(stderr.lines().any(|line| {
+        line.contains("phase=unattributed-worker-fixture")
+            && line.contains("case=unattributed-worker-fixture caseState=failed")
+            && !line.contains("target=")
+    }));
 }

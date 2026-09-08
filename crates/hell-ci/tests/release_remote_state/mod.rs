@@ -1,12 +1,10 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::json::parse_json;
+use crate::release::github::fixture::{Outcome, Request, Transcript};
 use crate::release::schema::Resolution;
 
 const CANDIDATE_SHA: &str = "434c9104de69600ce4a85601dc2ac48a45aa8f8f";
@@ -76,10 +74,15 @@ fn report_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hell-remote-state-{label}-{nonce}.json"))
 }
 
-fn response(status: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+fn response(status: &str, body: &str) -> Outcome {
+    Outcome::response(
+        status
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+        body,
     )
 }
 
@@ -107,18 +110,21 @@ fn annotated_tag_body(tag_sha: &str, commit_sha: &str) -> String {
     )
 }
 
-fn client_with_responses(responses: Vec<String>) -> (GitHubClient, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = GitHubClient::for_test(listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        for response in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            stream.write_all(response.as_bytes()).unwrap();
-        }
-    });
-    (client, server)
+fn client_with_responses(responses: Vec<Outcome>) -> (GitHubClient, Transcript) {
+    let paths = [
+        "/repos/o/r/git/ref/heads/release%2F1.0.0".to_owned(),
+        "/repos/o/r/git/ref/tags/v1.0.0".to_owned(),
+        format!("/repos/o/r/git/tags/{TAG_SHA}"),
+    ];
+    assert!(responses.len() <= paths.len());
+    let transcript = Transcript::new(
+        responses
+            .into_iter()
+            .zip(paths)
+            .map(|(response, path)| (Request::github("GET", &path, None, None), response))
+            .collect(),
+    );
+    (GitHubClient::for_test(transcript.clone()), transcript)
 }
 
 #[test]
@@ -158,7 +164,7 @@ fn remote_state_reports_stable_moved_tagged_and_failed_states() {
         let (client, server) = client_with_responses(responses);
         let report = report_path(scenario);
         let result = check_with_client(&plan(), &report, &client);
-        server.join().unwrap();
+        server.finish();
         let value = parse_json(&fs::read_to_string(&report).unwrap()).unwrap();
         let fields = value.object().unwrap();
         let observed = crate::json::json_member(fields, "state")
@@ -187,7 +193,7 @@ fn remote_state_report_is_create_new_and_does_not_contain_authorization() {
         response("404 Not Found", "{}"),
     ]);
     let result = check_with_client(&plan(), &report, &client);
-    server.join().unwrap();
+    server.finish();
     assert!(result.is_err());
     assert_eq!(fs::read(&report).unwrap(), b"sentinel\n");
     assert!(!result.unwrap_err().contains("test-token"));

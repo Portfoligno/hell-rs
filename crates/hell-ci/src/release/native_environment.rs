@@ -913,7 +913,7 @@ pub(crate) fn collect_for_platform_from_environment(
     let specs = tool_specs(platform, &lock);
     let mut receipts = Vec::new();
     for spec in specs {
-        receipts.push(collect_tool(&search, &spec, deadline)?);
+        receipts.push(collect_tool(&search, &spec, deadline, Some(output))?);
     }
     receipts.sort_by(|left, right| left.id.cmp(&right.id));
     let oracle_source_sha = lock
@@ -986,7 +986,7 @@ pub(crate) fn collect_windows_ghc_authority_for_integration(
         .find(|spec| spec.id == "ghc")
         .ok_or_else(|| "Windows native environment has no GHC specification".to_owned())?;
     let search = ExecutableSearchPath::from_environment(environment)?;
-    WindowsNativeGhcAuthority::from_receipt(&collect_tool(&search, &spec, deadline)?)
+    WindowsNativeGhcAuthority::from_receipt(&collect_tool(&search, &spec, deadline, None)?)
 }
 
 #[cfg(windows)]
@@ -1249,11 +1249,14 @@ fn collect_tool(
     search: &ExecutableSearchPath,
     spec: &ToolSpec,
     deadline: Instant,
+    diagnostic_output: Option<&Path>,
 ) -> Result<ToolReceipt, String> {
+    let resolution_started = Instant::now();
     if Instant::now() >= deadline {
         return Err("native environment absolute deadline expired".to_owned());
     }
     let resolved = resolve_tool(search, &spec.resolver, deadline)?;
+    let resolution_duration = resolution_started.elapsed();
     let executable = resolved.executable;
     let metadata = std::fs::symlink_metadata(&executable)
         .map_err(|error| format!("cannot inspect native tool {}: {error}", spec.id))?;
@@ -1263,87 +1266,127 @@ fn collect_tool(
             spec.id
         ));
     }
+    let hashing_started = Instant::now();
     let executable_sha256 = hell_testkit::sha256_file(&executable)
         .map_err(|error| format!("cannot hash native tool {}: {error}", spec.id))?
         .hex();
-    let execution_deadline = Instant::now()
+    let hashing_duration = hashing_started.elapsed();
+    let directory = std::env::current_dir()
+        .map_err(|error| format!("cannot bind native tool query working directory: {error}"))?;
+    let query_started = Instant::now();
+    let execution_deadline = query_started
         .checked_add(TOOL_TIMEOUT)
         .unwrap_or(deadline)
         .min(deadline);
+    let query = crate::native_tool_evidence::NativeToolQuery {
+        tool: spec.id,
+        executable: &executable,
+        executable_sha256: &executable_sha256,
+        arguments: spec.arguments,
+        directory: &directory,
+        resolution_duration,
+        hashing_duration,
+        execution_budget: execution_deadline.saturating_duration_since(query_started),
+        collection_remaining: deadline.saturating_duration_since(query_started),
+        started_unix_millis: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("native tool query clock predates epoch: {error}"))?
+            .as_millis(),
+    };
     let (progress, _receiver) = hell_testkit::SupervisedProgressObserver::bounded(1);
     let result = CommandSpec::new(executable.clone(), TOOL_TIMEOUT)
         .arguments(spec.arguments.iter().copied())
         .release_candidate_environment()
+        .current_directory(&directory)
         .run_until(execution_deadline, deadline, progress)
-        .map_err(|error| format!("native tool {} failed to execute: {error}", spec.id))?;
-    if result.timed_out
-        || !result.status.success()
-        || result.stdout_truncated
-        || result.stderr_truncated
-        || (result.termination.forced && !result.termination.reaped)
-    {
-        return Err(format!(
-            "native tool {} did not complete cleanly: status={} timedOut={} stdoutTruncated={} stderrTruncated={} forced={} reaped={}",
-            spec.id,
-            result.status,
-            result.timed_out,
-            result.stdout_truncated,
-            result.stderr_truncated,
-            result.termination.forced,
-            result.termination.reaped
-        ));
-    }
-    let stdout_bytes = result.stdout.len();
-    let mut output = result.stdout;
-    output.push(0);
-    output.extend_from_slice(&result.stderr);
-    let output_sha256 = hell_testkit::sha256_bytes(&output).hex();
-    let parsed_version = parse_tool_output(
-        spec.id,
-        spec.output_parser,
-        &output[..stdout_bytes],
-        &output[stdout_bytes + 1..],
-    )?;
-    if spec
-        .expected_version
-        .as_ref()
-        .is_some_and(|expected| !locked_tool_version_matches(spec.id, &parsed_version, expected))
-    {
-        return Err(format!(
-            "native tool {} differs from external-input lock",
-            spec.id
-        ));
-    }
-    let after = hell_testkit::sha256_file(&executable)
-        .map_err(|error| format!("cannot rehash native tool {}: {error}", spec.id))?
-        .hex();
-    if after != executable_sha256 || Instant::now() >= deadline {
-        return Err(format!(
-            "native tool {} changed or exceeded its deadline",
-            spec.id
-        ));
-    }
-    #[cfg(windows)]
-    if let Some(discovery) = &resolved.msvc_discovery {
-        discovery.validate()?;
-    }
-    Ok(ToolReceipt {
-        id: spec.id.to_owned(),
-        executable_sha256,
-        output_sha256,
-        parsed_version,
-        lock_version: spec.expected_version.clone(),
-        #[cfg(windows)]
-        authority: Some(
-            hell_testkit::BoundProgramInvocation::new_until(
-                executable.clone(),
-                executable.clone(),
-                deadline,
+        .map_err(|error| {
+            crate::native_tool_evidence::retain_failure(
+                diagnostic_output,
+                &query,
+                format!(
+                    "native tool {} failed to execute: phase={} kind={:?} os={:?}: {error}",
+                    spec.id,
+                    error.phase().as_str(),
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+                query_started.elapsed(),
+                error.completed(),
             )
-            .map_err(|error| format!("cannot retain native tool {}: {error}", spec.id))?,
-        ),
+        })?;
+    let outcome = (|| {
+        if result.timed_out
+            || !result.status.success()
+            || result.stdout_truncated
+            || result.stderr_truncated
+            || (result.termination.forced && !result.termination.reaped)
+        {
+            return Err(format!(
+                "native tool {} did not complete cleanly: status={} timedOut={} stdoutTruncated={} stderrTruncated={} forced={} reaped={}",
+                spec.id,
+                result.status,
+                result.timed_out,
+                result.stdout_truncated,
+                result.stderr_truncated,
+                result.termination.forced,
+                result.termination.reaped
+            ));
+        }
+        let mut output = hell_digest::Sha256::new();
+        output.update(&result.stdout);
+        output.update(&[0]);
+        output.update(&result.stderr);
+        let output_sha256 = output.finish().hex();
+        let parsed_version =
+            parse_tool_output(spec.id, spec.output_parser, &result.stdout, &result.stderr)?;
+        if spec.expected_version.as_ref().is_some_and(|expected| {
+            !locked_tool_version_matches(spec.id, &parsed_version, expected)
+        }) {
+            return Err(format!(
+                "native tool {} differs from external-input lock",
+                spec.id
+            ));
+        }
+        let after = hell_testkit::sha256_file(&executable)
+            .map_err(|error| format!("cannot rehash native tool {}: {error}", spec.id))?
+            .hex();
+        if after != executable_sha256 || Instant::now() >= deadline {
+            return Err(format!(
+                "native tool {} changed or exceeded its deadline",
+                spec.id
+            ));
+        }
         #[cfg(windows)]
-        resolved_executable: executable,
+        if let Some(discovery) = &resolved.msvc_discovery {
+            discovery.validate()?;
+        }
+        Ok(ToolReceipt {
+            id: spec.id.to_owned(),
+            executable_sha256: executable_sha256.clone(),
+            output_sha256,
+            parsed_version,
+            lock_version: spec.expected_version.clone(),
+            #[cfg(windows)]
+            authority: Some(
+                hell_testkit::BoundProgramInvocation::new_until(
+                    executable.clone(),
+                    executable.clone(),
+                    deadline,
+                )
+                .map_err(|error| format!("cannot retain native tool {}: {error}", spec.id))?,
+            ),
+            #[cfg(windows)]
+            resolved_executable: executable.clone(),
+        })
+    })();
+    outcome.map_err(|primary| {
+        crate::native_tool_evidence::retain_failure(
+            diagnostic_output,
+            &query,
+            primary,
+            query_started.elapsed(),
+            Some(&result),
+        )
     })
 }
 
@@ -1712,9 +1755,11 @@ impl ExternalInputLock {
                 table,
                 &[
                     "acquisition-phase",
+                    "asset-id",
                     "cache-permitted",
                     "commit",
                     "expected-filename",
+                    "exact-bytes",
                     "id",
                     "kind",
                     "maximum-compressed-bytes",
@@ -1725,6 +1770,7 @@ impl ExternalInputLock {
                     "platforms",
                     "repository",
                     "sha256",
+                    "source-url",
                     "timeout-seconds",
                     "toolchain",
                     "version",
@@ -1751,9 +1797,11 @@ impl ExternalInputLock {
             for (key, value) in table {
                 let json = match key.as_str() {
                     "cache-permitted" => JsonValue::Bool(boolean(value)?),
-                    "maximum-compressed-bytes" | "maximum-expanded-bytes" | "timeout-seconds" => {
-                        number(integer(value)?)
-                    }
+                    "maximum-compressed-bytes"
+                    | "maximum-expanded-bytes"
+                    | "timeout-seconds"
+                    | "asset-id"
+                    | "exact-bytes" => number(integer(value)?),
                     "platforms" => JsonValue::Array(
                         string_array(value)?
                             .iter()
@@ -1832,6 +1880,8 @@ fn validate_external_input(
         "maximum-compressed-bytes",
         "maximum-expanded-bytes",
         "timeout-seconds",
+        "asset-id",
+        "exact-bytes",
     ] {
         if fields
             .get(key)

@@ -364,6 +364,90 @@ struct FuzzDiagnostic {
     message: String,
 }
 
+/// Requirements obtained from the same complete manifest validation used by campaigns.
+#[cfg(unix)]
+pub(crate) struct FuzzToolRequirements {
+    pub(crate) toolchain: String,
+    pub(crate) cargo_fuzz_version: String,
+    #[cfg(target_os = "linux")]
+    pub(crate) fuzz_directories: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+pub(crate) fn tool_requirements(repository: &Path) -> Result<FuzzToolRequirements, String> {
+    let manifest = check_manifest(&repository.join("ci/fuzz-targets.toml"), repository)
+        .map_err(|error| error.message)?;
+    Ok(FuzzToolRequirements {
+        #[cfg(target_os = "linux")]
+        fuzz_directories: manifest
+            .targets
+            .iter()
+            .map(|target| target.fuzz_directory.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        toolchain: manifest.toolchain,
+        cargo_fuzz_version: manifest.cargo_fuzz_version,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn preflight_tool_requirements(repository: &Path) -> Result<(), String> {
+    let requirements = tool_requirements(repository)?;
+    let environment = crate::process_environment::ProcessEnvironment::from_process();
+    validate_fuzz_toolchain_environment(&requirements, &environment)?;
+    let tools = resolve_fuzz_tools().map_err(|error| error.message)?;
+    verify_cargo_fuzz_version(repository, &tools, &requirements.toolchain)
+        .map_err(|error| error.message)?;
+    if fs::OpenOptions::new()
+        .write(true)
+        .open(tools.cargo_fuzz.canonical_identity())
+        .is_ok()
+    {
+        return Err("candidate can modify protected cargo-fuzz executable".to_owned());
+    }
+    verify_fuzz_tools_unchanged(&tools).map_err(|error| error.message)
+}
+
+#[cfg(unix)]
+fn validate_fuzz_toolchain_environment(
+    requirements: &FuzzToolRequirements,
+    environment: &crate::process_environment::ProcessEnvironment,
+) -> Result<(), String> {
+    use crate::process_environment::StandardVariable;
+    let selected = environment
+        .value(StandardVariable::RustupToolchain)
+        .and_then(|value| value.to_str())
+        .ok_or("fuzz toolchain selection is absent")?;
+    if selected != requirements.toolchain
+        && !selected
+            .strip_prefix(&requirements.toolchain)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+    {
+        return Err("fuzz compiler toolchain differs from validated manifest".to_owned());
+    }
+    let home = environment
+        .value(StandardVariable::RustupHome)
+        .map(PathBuf::from)
+        .ok_or("fuzz Rustup home is absent")?;
+    let rustc = environment
+        .value(StandardVariable::Rustc)
+        .map(PathBuf::from)
+        .ok_or("fuzz explicit rustc is absent")?;
+    if rustc
+        != home
+            .join("toolchains")
+            .join(selected)
+            .join("bin")
+            .join("rustc")
+    {
+        return Err(
+            "fuzz explicit rustc differs from selected protected nightly toolchain".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 impl FuzzDiagnostic {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -919,6 +1003,8 @@ fn execute_campaigns(
 ) -> Result<Vec<TargetResult>, FuzzDiagnostic> {
     let mut results = Vec::with_capacity(manifest.targets.len());
     for target in &manifest.targets {
+        #[cfg(target_os = "linux")]
+        require_source_artifact_default(repository_root, target, true)?;
         let (command_timeout, staged_corpus, arguments) =
             prepare_campaign(manifest, work_root, target, staged_corpora)?;
         #[cfg(unix)]
@@ -949,6 +1035,27 @@ fn execute_campaigns(
                 ),
             )
         });
+        let execution = execution.and_then(|result| {
+            if result.timed_out || !result.status.success() {
+                return Err(FuzzDiagnostic::new(
+                    if result.timed_out {
+                        "fuzz.target.timeout"
+                    } else {
+                        "fuzz.target.failed"
+                    },
+                    format!(
+                        "fuzz target {:?} failed: status={:?}, timedOut={}, stdoutSha256={}, stderrSha256={}, stderr={:?}",
+                        target.id,
+                        result.status,
+                        result.timed_out,
+                        result.stdout_sha256.hex(),
+                        result.stderr_sha256.hex(),
+                        String::from_utf8_lossy(&result.stderr),
+                    ),
+                ));
+            }
+            Ok(result)
+        });
         let source_verification = verify_source_corpus_unchanged(
             target,
             repository_root,
@@ -958,7 +1065,12 @@ fn execute_campaigns(
                     "source fuzz corpus binding is missing",
                 )
             })?,
-        );
+        )
+        .and_then(|()| {
+            #[cfg(target_os = "linux")]
+            require_source_artifact_default(repository_root, target, true)?;
+            Ok(())
+        });
         let result = match (execution, source_verification) {
             (Ok(result), Ok(())) => result,
             (Err(primary), Ok(())) => return Err(primary),
@@ -967,30 +1079,12 @@ fn execute_campaigns(
                 return Err(FuzzDiagnostic::new(
                     primary.code,
                     format!(
-                        "{}; additionally, source corpus verification failed: {}",
+                        "{}; additionally, source verification failed: {}",
                         primary.message, source.message
                     ),
                 ));
             }
         };
-        if result.timed_out || !result.status.success() {
-            return Err(FuzzDiagnostic::new(
-                if result.timed_out {
-                    "fuzz.target.timeout"
-                } else {
-                    "fuzz.target.failed"
-                },
-                format!(
-                    "fuzz target {:?} failed: status={:?}, timedOut={}, stdoutSha256={}, stderrSha256={}, stderr={:?}",
-                    target.id,
-                    result.status,
-                    result.timed_out,
-                    result.stdout_sha256.hex(),
-                    result.stderr_sha256.hex(),
-                    String::from_utf8_lossy(&result.stderr),
-                ),
-            ));
-        }
         results.push(TargetResult {
             id: target.id.clone(),
             duration_millis: u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX),
@@ -1055,6 +1149,102 @@ fn prepare_campaign(
     .chain(engine_arguments)
     .collect();
     Ok((command_timeout, staged_corpus, arguments))
+}
+
+/// Reserves only empty cargo-fuzz compatibility directories before the existing
+/// trusted source freeze. These are not writable outputs or campaign evidence.
+/// cargo-fuzz 0.13.2 has no artifact-dir override and calls create_dir_all here
+/// before appending our final libFuzzer artifact_prefix argument.
+#[doc(hidden)]
+pub fn reserve_source_artifact_defaults(manifest_path: &Path, source: &Path) -> Result<(), String> {
+    let manifest = check_manifest(manifest_path, source).map_err(|error| error.message)?;
+    let mut roots = BTreeSet::new();
+    for target in &manifest.targets {
+        let fuzz_root = source.join(&target.fuzz_directory);
+        require_directory(&fuzz_root, "fuzz.artifact.invalid").map_err(|error| error.message)?;
+        if fs::canonicalize(&fuzz_root).map_err(|error| error.to_string())? != fuzz_root {
+            return Err("fuzz artifact compatibility root is redirected".to_owned());
+        }
+        let artifacts = fuzz_root.join("artifacts");
+        if roots.insert(artifacts.clone()) {
+            fs::create_dir(&artifacts).map_err(|error| {
+                format!("cannot reserve fresh cargo-fuzz default artifact root: {error}")
+            })?;
+        }
+        fs::create_dir(artifacts.join(&target.cargo_target)).map_err(|error| {
+            format!("cannot reserve fresh cargo-fuzz default artifact directory: {error}")
+        })?;
+        require_source_artifact_default(source, target, false).map_err(|error| error.message)?;
+    }
+    Ok(())
+}
+
+fn require_source_artifact_default(
+    source: &Path,
+    target: &ManifestTarget,
+    frozen: bool,
+) -> Result<(), FuzzDiagnostic> {
+    let fuzz_root = source.join(&target.fuzz_directory);
+    let artifact_root = fuzz_root.join("artifacts");
+    let directory = artifact_root.join(&target.cargo_target);
+    for path in [&fuzz_root, &artifact_root, &directory] {
+        require_directory(path, "fuzz.artifact.invalid")?;
+        if fs::canonicalize(path).ok().as_ref() != Some(path) {
+            return Err(FuzzDiagnostic::new(
+                "fuzz.artifact.invalid",
+                "cargo-fuzz default artifact path is redirected",
+            ));
+        }
+        #[cfg(unix)]
+        if frozen {
+            use std::os::unix::fs::PermissionsExt as _;
+            if fs::metadata(path)
+                .map_err(|error| FuzzDiagnostic::new("fuzz.artifact.invalid", error.to_string()))?
+                .permissions()
+                .mode()
+                & 0o222
+                != 0
+            {
+                return Err(FuzzDiagnostic::new(
+                    "fuzz.artifact.invalid",
+                    "cargo-fuzz default artifact path is not immutable",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = frozen;
+    }
+    if fs::read_dir(&directory)
+        .map_err(|error| FuzzDiagnostic::new("fuzz.artifact.invalid", error.to_string()))?
+        .next()
+        .is_some()
+    {
+        return Err(FuzzDiagnostic::new(
+            "fuzz.artifact.invalid",
+            "cargo-fuzz default artifact directory must remain empty",
+        ));
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn inspect_fuzz_artifact_campaign(
+    manifest_path: &Path,
+    source: &Path,
+    work: &Path,
+    target_id: &str,
+) -> Result<Vec<OsString>, String> {
+    let manifest = check_manifest(manifest_path, source).map_err(|error| error.message)?;
+    let target = manifest
+        .targets
+        .iter()
+        .find(|target| target.id == target_id)
+        .ok_or("unknown fuzz target")?;
+    require_source_artifact_default(source, target, true).map_err(|error| error.message)?;
+    let corpora = BTreeMap::from([(target.id.clone(), work.join("corpus"))]);
+    prepare_campaign(&manifest, work, target, &corpora)
+        .map(|(_, _, args)| args)
+        .map_err(|error| error.message)
 }
 
 fn verify_cargo_fuzz_version(
@@ -1126,6 +1316,48 @@ where
 #[cfg(unix)]
 pub(crate) fn verify_fuzz_toolchain_command_for_integration() -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("fixture repository missing")?;
+    let requirements = tool_requirements(repository)?;
+    if requirements.cargo_fuzz_version != "0.13.2" {
+        return Err("fixture fuzz version differs".to_owned());
+    }
+    let home = Path::new("/protected/toolchains");
+    let compiler = home
+        .join("toolchains")
+        .join(&requirements.toolchain)
+        .join("bin")
+        .join("rustc");
+    let good = vec![
+        (
+            OsString::from("RUSTUP_TOOLCHAIN"),
+            OsString::from(&requirements.toolchain),
+        ),
+        (OsString::from("RUSTUP_HOME"), home.as_os_str().to_owned()),
+        (OsString::from("RUSTC"), compiler.as_os_str().to_owned()),
+    ];
+    validate_fuzz_toolchain_environment(
+        &requirements,
+        &crate::process_environment::ProcessEnvironment::from_entries(good.clone()),
+    )?;
+    for variable in ["RUSTC", "RUSTUP_TOOLCHAIN", "RUSTUP_HOME"] {
+        let mut bad = good.clone();
+        bad.iter_mut()
+            .find(|(key, _)| key == variable)
+            .ok_or("fixture variable absent")?
+            .1 = OsString::from("stable");
+        if validate_fuzz_toolchain_environment(
+            &requirements,
+            &crate::process_environment::ProcessEnvironment::from_entries(bad),
+        )
+        .is_ok()
+        {
+            return Err(format!("mismatched fuzz {variable} was admitted"));
+        }
+    }
 
     let root = std::env::temp_dir().join(format!(
         "hell-ci-fuzz-toolchain-command-{}",

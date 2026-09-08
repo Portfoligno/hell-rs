@@ -752,6 +752,42 @@ const CAPTURE_HOLDER_STDOUT_READY: &str = "capture-holder-stdout-ready-v1\n";
 const CAPTURE_HOLDER_STDERR_READY: &str = "capture-holder-stderr-ready-v1\n";
 const CAPTURE_HOLDER_NONCE_MAX_BYTES: usize = 128;
 
+#[cfg(unix)]
+fn spawn_capture_holder_and_exit(arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    ensure_empty(arguments)?;
+    // Readiness has its own inherited local channel; stdout and stderr remain
+    // the actual capture descriptors whose descendant lifetime this fixture tests.
+    let (ready, child_ready) = UnixStream::pair().map_err(|error| error.to_string())?;
+    ready
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| error.to_string())?;
+    let nonce = format!("{CAPTURE_HOLDER_NONCE_SCHEMA}-{}", std::process::id());
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Command::new(executable)
+        .args([
+            OsString::from("hold-inherited-capture-pipes"),
+            nonce.clone().into(),
+        ])
+        .stdin(Stdio::from(OwnedFd::from(child_ready)))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut observed = Vec::with_capacity(nonce.len().saturating_add(1));
+    ready
+        .take(u64::try_from(nonce.len().saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut observed)
+        .map_err(|error| format!("capture-holder readiness failed: {error}"))?;
+    if observed != nonce.as_bytes() {
+        return Err("capture-holder readiness nonce differs".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn spawn_capture_holder_and_exit(arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
     ensure_empty(arguments)?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
@@ -795,6 +831,7 @@ fn spawn_capture_holder_and_exit(arguments: impl Iterator<Item = OsString>) -> R
 fn hold_inherited_capture_pipes(
     mut arguments: impl Iterator<Item = OsString>,
 ) -> Result<(), String> {
+    #[cfg(not(unix))]
     let port = parse_u16(arguments.next(), "PORT")?;
     let nonce = parse_capture_holder_nonce(arguments.next())?;
     ensure_empty(arguments)?;
@@ -807,11 +844,29 @@ fn hold_inherited_capture_pipes(
     std::io::stderr()
         .flush()
         .map_err(|error| error.to_string())?;
+    #[cfg(not(unix))]
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    let mut stream = {
+        use std::os::fd::AsFd as _;
+        let inherited = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|error| error.to_string())?;
+        let stream = std::os::unix::net::UnixStream::from(inherited);
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|error| error.to_string())?;
+        stream
+    };
     stream
         .write_all(nonce.as_bytes())
         .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| error.to_string())?;
     drop(stream);
     loop {
         std::thread::park();

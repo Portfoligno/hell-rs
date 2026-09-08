@@ -28,6 +28,24 @@ version = "3.11.1"
 acquisition-phase = "native-platform"
 
 [[input]]
+id = "linux-stack-executable"
+kind = "https-file"
+version = "3.11.1"
+repository = "commercialhaskell/stack"
+source-url = "https://github.com/commercialhaskell/stack/releases/download/v3.11.1/stack-3.11.1-linux-x86_64-bin"
+asset-id = 446721552
+exact-bytes = 94141872
+sha256 = "67c66e918801c41ae4d286b1c91f9124f691c1c7d56071b53889cf4a5c667550"
+maximum-compressed-bytes = 94141872
+maximum-expanded-bytes = 94141872
+media-type = "application/octet-stream"
+timeout-seconds = 300
+expected-filename = "stack-3.11.1-linux-x86_64-bin"
+platforms = ["linux-x86_64"]
+acquisition-phase = "native-platform"
+cache-permitted = false
+
+[[input]]
 id = "ghc"
 kind = "tool-version"
 version = "9.8.2"

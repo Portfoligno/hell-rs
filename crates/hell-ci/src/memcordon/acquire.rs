@@ -61,8 +61,13 @@ pub(super) fn run(task: &Task) -> Result<String, String> {
     let runtime_manifest_bytes = read_bounded_regular(&manifest_path, METADATA_LIMIT)?;
     let runtime_manifest =
         RuntimeManifest::parse(&runtime_manifest_bytes).map_err(|error| error.to_string())?;
-    if runtime_manifest.target != asset.target || runtime_manifest.archive_sha256 != asset.sha256 {
-        return Err("runtime manifest does not bind the selected archive".to_owned());
+    // The archive's digest and length were verified before extraction. Its
+    // embedded manifest binds the runtime identity, not its own containing bytes.
+    if runtime_manifest.target != asset.target
+        || runtime_manifest.version != lock.version
+        || runtime_manifest.source_commit != lock.source_commit
+    {
+        return Err("runtime manifest does not match the selected runtime".to_owned());
     }
     validate_component_inventory(&runtime_manifest, &asset.required_components)
         .map_err(|error| error.to_string())?;
@@ -491,28 +496,25 @@ fn validate_components(
     for component in &manifest.components {
         let path = root.join(&component.path);
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("runtime component {} is missing: {error}", component.name))?;
+            .map_err(|error| format!("runtime component {} is missing: {error}", component.id))?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
-            || metadata.len() != component.bytes
+            || metadata.len() != component.size
         {
             return Err(format!(
                 "runtime component {} metadata differs",
-                component.name
+                component.id
             ));
         }
         let sha256 = hell_testkit::sha256_file(&path)
-            .map_err(|error| format!("cannot hash runtime component {}: {error}", component.name))?
+            .map_err(|error| format!("cannot hash runtime component {}: {error}", component.id))?
             .hex();
         if sha256 != component.sha256 {
-            return Err(format!(
-                "runtime component {} digest differs",
-                component.name
-            ));
+            return Err(format!("runtime component {} digest differs", component.id));
         }
         observations.push(ComponentObservationV1 {
             path: component.path.clone(),
-            bytes: component.bytes,
+            bytes: component.size,
             sha256,
         });
     }

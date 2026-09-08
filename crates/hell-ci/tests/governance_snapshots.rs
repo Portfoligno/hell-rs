@@ -3,14 +3,22 @@ use std::ffi::OsStr;
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::fs;
+#[cfg(not(feature = "mutation-testing"))]
 use std::io::{Read as _, Write as _};
+#[cfg(not(feature = "mutation-testing"))]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(feature = "mutation-testing"))]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(feature = "mutation-testing"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(feature = "mutation-testing"))]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(feature = "mutation-testing"))]
+use std::time::Instant;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -45,6 +53,18 @@ impl Drop for Fixture {
 
 #[test]
 fn governance_snapshots_bind_runtime_plan_baseline_and_live_controls() {
+    with_governance_context(|context| {
+        let resolve = verify_resolve_snapshot(context);
+        let post_assembly = verify_post_assembly_snapshot(context, &resolve);
+        let pre_attestation = verify_pre_attestation_snapshot(context, &resolve, &post_assembly);
+        verify_pre_publish_snapshot(context, &resolve, &pre_attestation);
+        verify_disclosed_residuals(context);
+        verify_changed_baseline_rejection(context, &resolve, &post_assembly);
+        verify_runtime_identity_rejection(context);
+    });
+}
+
+fn with_governance_context(test: impl FnOnce(&GovernanceContext<'_>)) {
     let fixture = Fixture::new();
     #[cfg(windows)]
     let system_root = hell_testkit::capture_windows_standard_system_root()
@@ -68,13 +88,7 @@ fn governance_snapshots_bind_runtime_plan_baseline_and_live_controls() {
         #[cfg(windows)]
         system_root,
     };
-    let resolve = verify_resolve_snapshot(&context);
-    let post_assembly = verify_post_assembly_snapshot(&context, &resolve);
-    let pre_attestation = verify_pre_attestation_snapshot(&context, &resolve, &post_assembly);
-    verify_pre_publish_snapshot(&context, &resolve, &pre_attestation);
-    verify_disclosed_residuals(&context);
-    verify_changed_baseline_rejection(&context, &resolve, &post_assembly);
-    verify_runtime_identity_rejection(&context);
+    test(&context);
 }
 
 #[test]
@@ -123,14 +137,136 @@ fn governance_child_system_root_binding_is_exact_and_closed() {
     }
 }
 
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn governance_transcript_rejects_request_substitution_missing_and_unconsumed_steps() {
+    with_governance_context(|context| {
+        let provider = FakeProvider::start(provider_responses(context.identity, 41));
+        for field in [
+            "method",
+            "url",
+            "authorization_sha256",
+            "accept",
+            "api_version",
+            "user_agent",
+            "missing",
+            "extra",
+        ] {
+            let mut requests = provider.requests(context.identity);
+            let expected = match field {
+                "missing" => {
+                    requests.clear();
+                    "governance.fixture.request"
+                }
+                "extra" => {
+                    requests.push(requests[0].clone());
+                    "governance.fixture.unconsumed"
+                }
+                _ => {
+                    requests[0][field] = serde_json::json!("substituted");
+                    "governance.fixture.request"
+                }
+            };
+            let output = context.fixture.root.join(format!("rejected-{field}.json"));
+            let report = context
+                .fixture
+                .root
+                .join(format!("rejected-{field}-report.json"));
+            let result = context.run_transcript(
+                &SnapshotRequest::new("resolve", &output, &report, &provider.api_url()),
+                requests,
+            );
+            assert!(
+                !result.status.success(),
+                "fixture substitution admitted: {field}"
+            );
+            assert!(!output.exists());
+            assert_eq!(read_json(&report)["diagnostic"]["code"], expected);
+            assert!(
+                !String::from_utf8_lossy(&result.stderr.retained_bytes())
+                    .contains(&context.identity.token)
+            );
+        }
+    });
+}
+
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn governance_transcript_preserves_retries_forbidden_results_and_decoding() {
+    with_governance_context(|context| {
+        let provider = FakeProvider::start(provider_responses(context.identity, 41));
+        for case in [
+            "retry",
+            "exhausted",
+            "forbidden",
+            "invalid-utf8",
+            "invalid-json",
+        ] {
+            let mut requests = provider.requests(context.identity);
+            match case {
+                "retry" => {
+                    let mut retry = requests[0].clone();
+                    retry["outcome"] =
+                        serde_json::json!({"kind":"response","status":503,"body":[]});
+                    requests.insert(0, retry);
+                }
+                "exhausted" => {
+                    let mut retry = requests[0].clone();
+                    retry["outcome"] = serde_json::json!({"kind":"error","message":"fixture transport unavailable"});
+                    requests = vec![retry; 3];
+                }
+                "forbidden" => requests[3]["outcome"]["status"] = serde_json::json!(403),
+                "invalid-utf8" => requests[0]["outcome"]["body"] = serde_json::json!([255]),
+                "invalid-json" => {
+                    requests[0]["outcome"]["body"] = serde_json::json!(b"not JSON".as_slice())
+                }
+                _ => unreachable!(),
+            }
+            let output = context.fixture.root.join(format!("case-{case}.json"));
+            let report = context
+                .fixture
+                .root
+                .join(format!("case-{case}-report.json"));
+            let result = context.run_transcript(
+                &SnapshotRequest::new("resolve", &output, &report, &provider.api_url()),
+                requests,
+            );
+            assert_eq!(
+                result.status.success(),
+                matches!(case, "retry" | "forbidden"),
+                "case {case}: {:?}",
+                result.stderr
+            );
+            assert_eq!(
+                read_json(&report)["admitted"],
+                matches!(case, "retry" | "forbidden")
+            );
+            if case == "forbidden" {
+                assert_eq!(
+                    read_json(&output)["residualAssumptions"],
+                    serde_json::json!(["ruleset-api-unavailable", "tag-rules-api-unavailable"])
+                );
+            }
+            if case == "exhausted" {
+                assert_eq!(
+                    read_json(&report)["diagnostic"]["code"],
+                    "governance.request.failed"
+                );
+            }
+        }
+    });
+}
+
 fn verify_resolve_snapshot(context: &GovernanceContext<'_>) -> PathBuf {
     let snapshot = context.fixture.root.join("governance-resolve.json");
     let report = context.fixture.root.join("governance-resolve-report.json");
     let server = FakeProvider::start(provider_responses(context.identity, 41));
     let api_url = server.api_url();
-    let result = context.run(&SnapshotRequest::new(
-        "resolve", &snapshot, &report, &api_url,
-    ));
+    let result = context.run(
+        &SnapshotRequest::new("resolve", &snapshot, &report, &api_url),
+        Some(&server),
+    );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(result.status.success(), "{:?}", result.stderr);
     let value = read_json(&snapshot);
@@ -152,7 +288,9 @@ fn verify_post_assembly_snapshot(context: &GovernanceContext<'_>, resolve: &Path
     let api_url = server.api_url();
     let result = context.run(
         &SnapshotRequest::new("post-assembly", &snapshot, &report, &api_url).baseline(resolve),
+        Some(&server),
     );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(result.status.success(), "{:?}", result.stderr);
     let value = read_json(&snapshot);
@@ -181,7 +319,9 @@ fn verify_pre_attestation_snapshot(
         &SnapshotRequest::new("pre-attestation", &snapshot, &report, &api_url)
             .baseline(resolve)
             .predecessor(post_assembly),
+        Some(&server),
     );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(result.status.success(), "{:?}", result.stderr);
     let value = read_json(&snapshot);
@@ -209,7 +349,9 @@ fn verify_pre_publish_snapshot(
         &SnapshotRequest::new("pre-publish", &snapshot, &report, &api_url)
             .baseline(resolve)
             .predecessor(pre_attestation),
+        Some(&server),
     );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(result.status.success(), "{:?}", result.stderr);
     let value = read_json(&snapshot);
@@ -227,9 +369,11 @@ fn verify_disclosed_residuals(context: &GovernanceContext<'_>) {
     responses[3] = http_response("403 Forbidden", &serde_json::json!({}));
     let server = FakeProvider::start(responses);
     let api_url = server.api_url();
-    let result = context.run(&SnapshotRequest::new(
-        "resolve", &snapshot, &report, &api_url,
-    ));
+    let result = context.run(
+        &SnapshotRequest::new("resolve", &snapshot, &report, &api_url),
+        Some(&server),
+    );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(result.status.success(), "{:?}", result.stderr);
     assert_eq!(
@@ -252,7 +396,9 @@ fn verify_changed_baseline_rejection(
         &SnapshotRequest::new("pre-attestation", &output, &report, &api_url)
             .baseline(resolve)
             .predecessor(post_assembly),
+        Some(&server),
     );
+    #[cfg(not(feature = "mutation-testing"))]
     server.finish();
     assert!(!result.status.success());
     assert!(!output.exists());
@@ -273,6 +419,7 @@ fn verify_runtime_identity_rejection(context: &GovernanceContext<'_>) {
     let result = context.run(
         &SnapshotRequest::new("resolve", &output, &report, "http://127.0.0.1:9")
             .repository_id(context.identity.repository_id.wrapping_add(1)),
+        None,
     );
     assert!(!result.status.success());
     assert!(!output.exists());
@@ -523,8 +670,41 @@ impl<'a> SnapshotRequest<'a> {
 }
 
 impl GovernanceContext<'_> {
-    fn run(&self, request: &SnapshotRequest<'_>) -> hell_testkit::SupervisedOutput {
+    fn run(
+        &self,
+        request: &SnapshotRequest<'_>,
+        _provider: Option<&FakeProvider>,
+    ) -> hell_testkit::SupervisedOutput {
+        #[cfg(feature = "mutation-testing")]
+        {
+            let requests = _provider
+                .map(|provider| provider.requests(self.identity))
+                .unwrap_or_default();
+            self.run_transcript(request, requests)
+        }
+        #[cfg(not(feature = "mutation-testing"))]
+        {
+            let mut command = self.command(request);
+            append_test_activation(&mut command);
+            run_governance_command(&mut command)
+        }
+    }
+
+    #[cfg(feature = "mutation-testing")]
+    fn run_transcript(
+        &self,
+        request: &SnapshotRequest<'_>,
+        requests: Vec<serde_json::Value>,
+    ) -> hell_testkit::SupervisedOutput {
         let mut command = self.command(request);
+        let path = self.fixture.write(
+            &format!(
+                "transcript-{}.json",
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
+            &canonical_json(&serde_json::json!({"schema_version":1,"requests":requests})),
+        );
+        command.arg("--test-governance-transcript").arg(path);
         append_test_activation(&mut command);
         run_governance_command(&mut command)
     }
@@ -663,12 +843,14 @@ fn append_test_activation(command: &mut Command) {
     );
 }
 
+#[cfg(not(feature = "mutation-testing"))]
 struct FakeProvider {
     address: std::net::SocketAddr,
     server: Option<thread::JoinHandle<Result<(), String>>>,
     stop: Arc<AtomicBool>,
 }
 
+#[cfg(not(feature = "mutation-testing"))]
 impl FakeProvider {
     fn start(responses: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
@@ -766,6 +948,7 @@ impl FakeProvider {
     }
 }
 
+#[cfg(not(feature = "mutation-testing"))]
 impl Drop for FakeProvider {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -775,6 +958,46 @@ impl Drop for FakeProvider {
                 .expect("join fake provider during cleanup")
                 .expect("fake provider cleanup result");
         }
+    }
+}
+
+#[cfg(feature = "mutation-testing")]
+struct FakeProvider {
+    responses: Vec<String>,
+}
+
+#[cfg(feature = "mutation-testing")]
+impl FakeProvider {
+    fn start(responses: Vec<String>) -> Self {
+        Self { responses }
+    }
+
+    fn api_url(&self) -> String {
+        "http://127.0.0.1:9".to_owned()
+    }
+
+    fn requests(&self, identity: &RuntimeIdentity) -> Vec<serde_json::Value> {
+        let root = self.api_url();
+        let paths = [
+            "/repos/Portfoligno/hell-rs",
+            "/repos/Portfoligno/hell-rs/actions/permissions/workflow",
+            "/repos/Portfoligno/hell-rs/actions/permissions",
+            "/repos/Portfoligno/hell-rs/rulesets",
+            "/repos/Portfoligno/hell-rs",
+            "/repos/Portfoligno/hell-rs/git/ref/heads/release%2Fgovernance-fixture",
+            "/repos/Portfoligno/hell-rs/git/ref/tags/v1.0.0",
+        ];
+        assert_eq!(self.responses.len(), paths.len());
+        self.responses.iter().zip(paths).map(|(response, path)| {
+            let (headers, body) = response.split_once("\r\n\r\n").expect("fixture HTTP response");
+            let status = headers.split_ascii_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
+            serde_json::json!({
+                "method":"GET", "url":format!("{root}{path}"),
+                "authorization_sha256": hell_testkit::sha256_bytes(format!("Bearer {}", identity.token).as_bytes()).hex(),
+                "accept":"application/vnd.github+json", "api_version":"2022-11-28", "user_agent":"hell-rs-release-control/1",
+                "outcome":{"kind":"response","status":status,"body":body.as_bytes()},
+            })
+        }).collect()
     }
 }
 

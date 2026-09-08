@@ -27,6 +27,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
@@ -620,8 +621,8 @@ impl IngressControl {
     }
 }
 
-struct SanitizedIo {
-    stream: TcpStream,
+struct SanitizedIo<S> {
+    stream: S,
     ingress: IngressControl,
     head: Vec<u8>,
     output: std::collections::VecDeque<u8>,
@@ -635,9 +636,9 @@ struct SanitizedIo {
     wire_output: std::collections::VecDeque<u8>,
 }
 
-impl SanitizedIo {
+impl<S: AsyncRead + AsyncWrite + Unpin> SanitizedIo<S> {
     fn new(
-        stream: TcpStream,
+        stream: S,
         ingress: IngressControl,
         head_limit: Option<usize>,
         idle_timeout: Option<Duration>,
@@ -702,7 +703,7 @@ impl SanitizedIo {
     }
 }
 
-impl AsyncRead for SanitizedIo {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SanitizedIo<S> {
     #[allow(clippy::too_many_lines)]
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -812,7 +813,7 @@ impl AsyncRead for SanitizedIo {
     }
 }
 
-impl AsyncWrite for SanitizedIo {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SanitizedIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -868,7 +869,7 @@ impl AsyncWrite for SanitizedIo {
     }
 }
 
-impl SanitizedIo {
+impl<S: AsyncRead + AsyncWrite + Unpin> SanitizedIo<S> {
     fn poll_wire_output(&mut self, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         while !self.wire_output.is_empty() {
             let (front, back) = self.wire_output.as_slices();
@@ -1614,94 +1615,5 @@ impl Drop for EngineBody {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Write as _;
-    use std::time::Instant;
-
-    use super::*;
-
-    #[test]
-    fn completed_request_guards_do_not_accumulate_on_keep_alive_connections() {
-        let requests = ActiveRequests::new();
-        for _ in 0..10_000 {
-            let guard = requests.register(Cancellation::new());
-            assert_eq!(
-                requests
-                    .state
-                    .lock()
-                    .expect("active-request registry is available")
-                    .requests
-                    .len(),
-                1
-            );
-            drop(guard);
-        }
-        assert!(
-            requests
-                .state
-                .lock()
-                .expect("active-request registry is available")
-                .requests
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn ingress_idle_timeout_and_head_limit_are_enforced_before_hyper() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime starts");
-        runtime.block_on(async {
-            let listener = TcpListener::bind(("127.0.0.1", 0))
-                .await
-                .expect("test listener binds");
-            let address = listener.local_addr().expect("listener has an address");
-            let idle_client = std::net::TcpStream::connect(address).expect("client connects");
-            let (idle_stream, _) = listener.accept().await.expect("server accepts client");
-            let first_error = Arc::new(Mutex::new(None));
-            let mut idle = SanitizedIo::new(
-                idle_stream,
-                IngressControl::new(),
-                Some(128),
-                Some(Duration::from_millis(30)),
-                Arc::clone(&first_error),
-                WireControl::new(),
-            );
-            let started = Instant::now();
-            let idle_error = poll_fn(|context| {
-                let mut byte = [0_u8; 1];
-                let mut output = ReadBuf::new(&mut byte);
-                Pin::new(&mut idle).poll_read(context, &mut output)
-            })
-            .await
-            .expect_err("idle ingress times out");
-            assert_eq!(idle_error.kind(), std::io::ErrorKind::TimedOut);
-            assert!(started.elapsed() >= Duration::from_millis(25));
-            drop(idle_client);
-
-            let mut oversized_client =
-                std::net::TcpStream::connect(address).expect("second client connects");
-            let (oversized_stream, _) = listener.accept().await.expect("server accepts client");
-            oversized_client
-                .write_all(b"GET / HTTP/1.1\r\nHost: localhost")
-                .expect("client writes an unterminated oversized head");
-            let mut oversized = SanitizedIo::new(
-                oversized_stream,
-                IngressControl::new(),
-                Some(16),
-                None,
-                Arc::new(Mutex::new(None)),
-                WireControl::new(),
-            );
-            let head_error = poll_fn(|context| {
-                let mut byte = [0_u8; 1];
-                let mut output = ReadBuf::new(&mut byte);
-                Pin::new(&mut oversized).poll_read(context, &mut output)
-            })
-            .await
-            .expect_err("unterminated oversized head is rejected");
-            assert_eq!(head_error.kind(), std::io::ErrorKind::Other);
-        });
-    }
-}
+#[path = "../tests/ingress/mod.rs"]
+mod tests;

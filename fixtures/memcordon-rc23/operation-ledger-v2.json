@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "groups": [
+    {
+      "operation_id": "readiness",
+      "platform_plan_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "required_phases": [
+        "candidate-preflights",
+        "platform-gates",
+        "principal-cleanup",
+        "toolchain-cleanup"
+      ],
+      "completed_phases": [
+        "candidate-preflights",
+        "platform-gates",
+        "principal-cleanup",
+        "toolchain-cleanup"
+      ],
+      "reserved_invocation_ids": [
+        "readiness-invocation-00000001",
+        "readiness-invocation-00000002"
+      ],
+      "reservation_ledger_path": "invocation-reservations.json",
+      "reservation_ledger_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "invocations": [
+        {
+          "operation_id": "readiness-invocation-00000001",
+          "boundary": "sealed-linux",
+          "request_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "raw_report_path": "raw/readiness-invocation-00000001.json",
+          "raw_report_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "normalized_report_path": "normalized/readiness-invocation-00000001.json",
+          "normalized_report_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "identity_adapter_path": null,
+          "identity_adapter_digest": null,
+          "terminal": {
+            "kind": "ordinary_result"
+          }
+        },
+        {
+          "operation_id": "readiness-invocation-00000002",
+          "boundary": "sealed-linux",
+          "request_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "raw_report_path": "raw/readiness-invocation-00000002.json",
+          "raw_report_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "normalized_report_path": "normalized/readiness-invocation-00000002.json",
+          "normalized_report_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "identity_adapter_path": null,
+          "identity_adapter_digest": null,
+          "terminal": {
+            "kind": "ordinary_result"
+          }
+        }
+      ],
+      "sealed": true
+    }
+  ]
+}

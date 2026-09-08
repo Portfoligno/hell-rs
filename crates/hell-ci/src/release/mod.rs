@@ -1,5 +1,7 @@
 mod archive;
 pub(crate) mod assemble;
+#[cfg(unix)]
+pub(crate) mod cargo_dependencies;
 mod decision;
 mod event;
 mod final_verify;
@@ -7,6 +9,7 @@ mod github;
 pub(crate) mod governance;
 pub(crate) mod manifest;
 pub(crate) mod native_environment;
+mod output_reservation;
 pub(crate) mod plan;
 pub(crate) mod platform;
 mod publish;
@@ -19,6 +22,7 @@ pub(crate) use archive::assurance_extra_evidence_archive_member;
 pub(crate) use archive::{fuzz_verify_gzip, fuzz_verify_tar};
 pub(crate) use final_verify::fuzz_parse_publication_envelope;
 pub(crate) use final_verify::verify_transaction_for_integration;
+pub(crate) use output_reservation::reserve_for_integration;
 pub(crate) use verify::{assurance_omitted_subject, fuzz_parse_release_gate, fuzz_parse_subjects};
 
 use std::ffi::OsString;
@@ -26,6 +30,8 @@ use std::path::PathBuf;
 
 #[derive(Default)]
 struct Options {
+    #[cfg(feature = "mutation-testing")]
+    test_governance_transcript: Option<PathBuf>,
     output: Option<PathBuf>,
     report: Option<PathBuf>,
     resolution: Option<PathBuf>,
@@ -73,6 +79,10 @@ pub(crate) fn run(arguments: &[OsString]) -> Result<String, String> {
     #[cfg(not(feature = "mutation-testing"))]
     let option_arguments = crate::mutation::without_test_activation_suffix(&arguments[2..]);
     let options = parse_options(option_arguments)?;
+    #[cfg(feature = "mutation-testing")]
+    if options.test_governance_transcript.is_some() && command != "governance-snapshot" {
+        return Err("governance test transport is confined to governance snapshots".to_owned());
+    }
     match command {
         "resolve" => event::resolve(required(options.output, "--output")?),
         "plan" => plan::create(
@@ -190,6 +200,8 @@ fn run_final_verification(options: Options) -> Result<String, String> {
 
 fn run_governance_snapshot(options: Options) -> Result<String, String> {
     governance::snapshot(governance::SnapshotOptions {
+        #[cfg(feature = "mutation-testing")]
+        test_transcript: options.test_governance_transcript,
         policy: required(options.policy, "--policy")?,
         api_policy: required(options.api_policy, "--api-policy")?,
         plan: required(options.plan, "--plan")?,
@@ -218,6 +230,10 @@ fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
             .ok_or_else(|| format!("{flag} requires a value"))?;
         index += 1;
         match flag {
+            #[cfg(feature = "mutation-testing")]
+            "--test-governance-transcript" => {
+                set_path(&mut options.test_governance_transcript, value, flag)?
+            }
             "--output" => set_path(&mut options.output, value, flag)?,
             "--report" => set_path(&mut options.report, value, flag)?,
             "--resolution" => set_path(&mut options.resolution, value, flag)?,

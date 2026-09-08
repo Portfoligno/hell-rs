@@ -3,6 +3,7 @@
 mod artifact;
 mod collection_authority;
 mod corpus;
+pub mod provider_frontend;
 mod reviewed_set;
 mod runtime_obligations;
 mod windows_divergences;
@@ -281,6 +282,41 @@ struct MemcordonExecutionPolicy {
     mechanism: Arc<str>,
     admission: SealedAdmission,
     cleanup_reserve: Duration,
+    observer: Option<Arc<dyn SealedExecutionObserver>>,
+}
+
+/// Task-owned accounting of actual sealed launch reservations and completions.
+pub trait SealedExecutionObserver: std::fmt::Debug + Send + Sync {
+    /// Reserves accounting for the exact target arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observer cannot admit or persist the reservation.
+    fn reserve(&self, target_argv: &[NativeArgument]) -> std::io::Result<String>;
+    /// Retains evidence for a rejected invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reservation or rejected evidence cannot be validated or retained.
+    fn rejected(
+        &self,
+        invocation_id: &str,
+        report: &Path,
+        stdout: &BoundedCapture,
+        stderr: &BoundedCapture,
+        detail: &str,
+    ) -> std::io::Result<()>;
+    /// Records the authenticated completion of a reserved invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if completion evidence cannot be validated or retained.
+    fn completed(
+        &self,
+        invocation_id: &str,
+        output: &mut SupervisedOutput,
+        windows_identity: Option<&hell_memcordon::WindowsCandidateIdentityReceiptV1>,
+    ) -> std::io::Result<()>;
 }
 
 impl MemcordonExecutionPolicy {
@@ -341,6 +377,7 @@ impl MemcordonExecutionPolicy {
             mechanism,
             admission,
             cleanup_reserve,
+            observer: None,
         })
     }
 
@@ -380,18 +417,29 @@ impl MemcordonExecutionPolicy {
                     .map(|value| NativeArgument::from_os_str(value)),
             )
             .collect::<Vec<_>>();
+        let observation = self
+            .observer
+            .as_ref()
+            .map(|observer| {
+                observer
+                    .reserve(&expected_argv)
+                    .map(|id| (Arc::clone(observer), id))
+            })
+            .transpose()?;
         let directory = command.get_current_dir().map(Path::to_owned);
         let environment = command
             .get_envs()
             .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
             .collect::<Vec<_>>();
-        let mut frontend = Command::new(runtime);
-        frontend.args(hell_memcordon::sealed_arguments(
-            report.path(),
-            budget,
-            &target,
-            &target_arguments,
-        )?);
+        let frontend_arguments =
+            hell_memcordon::sealed_arguments(report.path(), budget, &target, &target_arguments)?;
+        #[cfg(target_os = "linux")]
+        let (frontend_program, frontend_arguments) =
+            provider_frontend::authorized_linux_frontend(&runtime, &frontend_arguments)?;
+        #[cfg(not(target_os = "linux"))]
+        let frontend_program = runtime;
+        let mut frontend = Command::new(frontend_program);
+        frontend.args(frontend_arguments);
         if let Some(directory) = directory {
             frontend.current_dir(directory);
         }
@@ -412,6 +460,7 @@ impl MemcordonExecutionPolicy {
             expected_argv,
             mechanism: Arc::clone(&self.mechanism),
             admission: Some(admission),
+            observation,
         })
     }
 }
@@ -421,6 +470,7 @@ struct PendingSealedOperation {
     expected_argv: Vec<NativeArgument>,
     mechanism: Arc<str>,
     admission: Option<AdmissionLease>,
+    observation: Option<(Arc<dyn SealedExecutionObserver>, String)>,
 }
 
 impl PendingSealedOperation {
@@ -5808,6 +5858,22 @@ impl CandidateLaunchPolicy {
             cleanup_reserve,
             &self.writable_roots,
         )?));
+        Ok(self)
+    }
+
+    /// Attaches task-owned accounting to the sealed execution policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no sealed supervisor authority is configured.
+    pub fn with_memcordon_observer(
+        mut self,
+        observer: Arc<dyn SealedExecutionObserver>,
+    ) -> std::io::Result<Self> {
+        let policy = self.sealed_supervisor.as_mut().ok_or_else(|| {
+            std::io::Error::other("sealed execution observer requires MemCordon authority")
+        })?;
+        Arc::make_mut(policy).observer = Some(observer);
         Ok(self)
     }
 
@@ -22651,6 +22717,24 @@ pub fn run_supervised_host_command(
     without_candidate_launch_policy(|| run_supervised_command(command, input, timeout))
 }
 
+/// Runs one bounded trusted-host command with its executable identity retained.
+/// Ambient candidate authority is suppressed only for this operation and is
+/// restored on success, failure, or unwind.
+///
+/// # Errors
+///
+/// Returns an error if executable binding, supervision, capture, or cleanup fails.
+pub fn run_supervised_host_command_with_bound_program(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    bound_program: &BoundProgramInvocation,
+) -> std::io::Result<SupervisedOutput> {
+    without_candidate_launch_policy(|| {
+        run_supervised_command_with_bound_program(command, input, timeout, bound_program)
+    })
+}
+
 /// Runs a structured command while preserving one separately bound logical
 /// executable alias and revalidating its canonical file identity.
 ///
@@ -22841,6 +22925,10 @@ fn run_supervised_command_inner(
         .map(|policy| policy.wrap_memcordon_frontend(command, execution_deadline))
         .transpose()?
         .flatten();
+    let observation = pending_sealed
+        .as_ref()
+        .and_then(|pending| pending.observation.clone());
+    let completion_policy = launch_policy.clone();
     record_supervised_phase(&mut phase_timings, started, "policy-wrapped");
     let mut quiescence = QuiescenceGuard::new(launch_policy);
     command
@@ -22903,7 +22991,24 @@ fn run_supervised_command_inner(
         .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
     record_supervised_phase(&mut phase_timings, started, "stdin-joined");
     let sealed = pending_sealed
-        .map(|pending| pending.complete(status))
+        .map(|pending| {
+            let report = pending.report.path().to_owned();
+            pending.complete(status).map_err(|error| {
+                let mut detail = format!(
+                    "{error}; raw sealed report retained at {}",
+                    report.display()
+                );
+                if let Some((observer, id)) = &observation
+                    && let Err(retention) =
+                        observer.rejected(id, &report, &stdout, &stderr, &detail)
+                {
+                    std::fmt::Write::write_fmt(&mut detail, format_args!(
+                        "; additionally, rejected invocation evidence retention failed: {retention}"
+                    )).expect("writing to a String cannot fail");
+                }
+                std::io::Error::other(detail)
+            })
+        })
         .transpose()
         .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
     #[cfg(windows)]
@@ -22917,7 +23022,7 @@ fn run_supervised_command_inner(
             )
         })
         .transpose()?;
-    Ok(SupervisedOutput {
+    let mut output = SupervisedOutput {
         status,
         stdout,
         stderr,
@@ -22932,7 +23037,23 @@ fn run_supervised_command_inner(
         candidate_quiescence_complete,
         #[cfg(windows)]
         windows_launch_control,
-    })
+    };
+    if let Some((observer, invocation_id)) = observation {
+        #[cfg(windows)]
+        let identity = Some(
+            completion_policy
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("sealed completion lost candidate policy"))?
+                .windows_memcordon_identity_receipt(&invocation_id, &output)?,
+        );
+        #[cfg(not(windows))]
+        let identity = {
+            let _ = completion_policy;
+            None
+        };
+        observer.completed(&invocation_id, &mut output, identity.as_ref())?;
+    }
+    Ok(output)
 }
 
 fn finish_supervised_wait(
