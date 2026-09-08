@@ -300,7 +300,7 @@ needs = []
 runner = "ubuntu-24.04"
 timeout-minutes = 30
 permission = "contents-read"
-artifact-output = "none"
+artifact-output = "regression-corpus-memcordon"
 command = "regression-corpus"
 
 [job.regression-subject.validate]
@@ -308,7 +308,7 @@ needs = []
 runner = "ubuntu-24.04"
 timeout-minutes = 30
 permission = "contents-read"
-artifact-output = "none"
+artifact-output = "regression-subject-memcordon"
 command = "regression-subject"
 
 [job.release.resolve]
@@ -409,7 +409,7 @@ credential = "none"
 
 [command.readiness-linux]
 executable = "./automation/target/ci/hell-ci"
-arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation/ci/memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [command.readiness-macos]
@@ -419,7 +419,7 @@ credential = "none"
 
 [command.readiness-windows]
 executable = ".\\automation\\target\\ci\\hell-ci.exe"
-arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation\\ci\\memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [command.readiness-verify]
@@ -444,7 +444,7 @@ credential = "github-token"
 
 [command.release-linux]
 executable = "./automation/target/ci/hell-ci"
-arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation/ci/memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [command.release-macos]
@@ -454,7 +454,7 @@ credential = "none"
 
 [command.release-windows]
 executable = ".\\automation\\target\\ci\\hell-ci.exe"
-arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation\\ci\\memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [command.release-assemble]
@@ -514,12 +514,12 @@ credential = "none"
 
 [command.nightly-linux-current]
 executable = "./target/ci/hell-ci"
-arguments = ["nightly", "--oracle", "ci-out/linux-release-oracle", "--oracle-sha256", "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9", "--dependency-attestation", "ci-out/dependency-policy.json", "--report", "ci-out/nightly-linux.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
 credential = "none"
 
 [command.fuzz-smoke]
 executable = "./target/ci/hell-ci"
-arguments = ["fuzz", "smoke", "--manifest", "ci/fuzz-targets.toml", "--repository-root", ".", "--output", "ci-out/fuzz-smoke.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
 credential = "none"
 
 [command.fuzz-current]
@@ -534,12 +534,12 @@ credential = "none"
 
 [command.nightly-windows]
 executable = ".\\target\\ci\\hell-ci.exe"
-arguments = ["portability", "--report", "ci-out\\nightly-windows.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
 credential = "none"
 
 [command.mutation-assurance]
 executable = "./target/ci/hell-ci"
-arguments = ["mutation", "assurance", "--manifest", "compat/assurance-mutants.toml", "--repository-root", ".", "--output", "ci-out/mutation"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
 credential = "none"
 
 [command.assurance-render]
@@ -558,13 +558,13 @@ arguments = ["mutation", "run", "--output", "ci-out/mutation/mutation-score.json
 credential = "none"
 
 [command.regression-corpus]
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
 credential = "none"
 
 [command.regression-subject]
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
 credential = "none"
 
 [cache.cargo-downloads]
@@ -762,7 +762,7 @@ with.key = "readiness-plan-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFi
 [physical.job.ci.linux]
 name = "Technical readiness / Linux x86_64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015", "s016", "s017"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s018", "s019", "s020", "s021", "s012", "s022", "s023", "s013", "s024", "s014", "s015", "s016", "s017"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -879,7 +879,7 @@ credential = "none"
 name = "Run Linux technical readiness gate"
 kind = "run"
 executable = "./automation/target/ci/hell-ci"
-arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["readiness", "platform", "--platform", "linux-x86_64", "--plan", "readiness-input/readiness-plan.json", "--conformance-plan", "readiness-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation/ci/memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [physical.step.ci.linux.s013]
@@ -929,6 +929,61 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "automation/target"
 with.key = "readiness-linux-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.step.ci.linux.s018]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.ci.linux.s019]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.linux.s020]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.linux.s021]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.linux.s022]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.linux.s023]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.linux.s024]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
 
 [physical.job.ci.macos]
 name = "Technical readiness / macOS aarch64"
@@ -1085,7 +1140,7 @@ with.key = "readiness-macos-${{ runner.os }}-${{ runner.arch }}-automation-targe
 [physical.job.ci.windows]
 name = "Technical readiness / Windows x86_64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s015", "s016", "s017", "s018", "s010", "s019", "s020", "s011", "s021", "s012", "s013", "s014"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -1185,7 +1240,7 @@ credential = "none"
 name = "Run Windows technical readiness gate"
 kind = "run"
 executable = ".\\automation\\target\\ci\\hell-ci.exe"
-arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["readiness", "platform", "--platform", "windows-x86_64", "--plan", "readiness-input\\readiness-plan.json", "--conformance-plan", "readiness-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation\\ci\\memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [physical.step.ci.windows.s011]
@@ -1226,6 +1281,61 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "automation/target"
 with.key = "readiness-windows-${{ runner.os }}-${{ runner.arch }}-automation-target-${{ github.sha }}"
+
+[physical.step.ci.windows.s015]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.ci.windows.s016]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "acquire", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.windows.s017]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "prepare", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.windows.s018]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "canary", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.windows.s019]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "cleanup", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.windows.s020]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "finalize", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "readiness"]
+credential = "none"
+
+[physical.step.ci.windows.s021]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
 
 [physical.job.ci.verify]
 name = "Blocker-zero technical release eligibility"
@@ -1598,7 +1708,7 @@ dispatch-inputs = []
 [physical.job.mutation.mutation]
 name = "Release-relevant advisory mutation catalog"
 outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009"]
+steps = ["s000", "s001", "s002", "s003", "s010", "s011", "s012", "s013", "s004", "s005", "s006", "s014", "s015", "s007", "s016", "s008", "s009"]
 
 [physical.step.mutation.mutation.s000]
 name = "Check out exact pushed source"
@@ -1649,10 +1759,10 @@ arguments = ["assurance", "check", "--map", "spec/assurance-map.toml", "--reposi
 credential = "none"
 
 [physical.step.mutation.mutation.s006]
-name = "Execute source-bound release assurance mutants"
+name = "Execute source-bound release assurance mutants as one sealed root"
 kind = "run"
 executable = "./target/ci/hell-ci"
-arguments = ["mutation", "assurance", "--manifest", "compat/assurance-mutants.toml", "--repository-root", ".", "--output", "ci-out/mutation"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
 credential = "none"
 
 [physical.step.mutation.mutation.s007]
@@ -1662,7 +1772,7 @@ kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
 with.name = "mutation-${{ github.run_id }}-${{ github.run_attempt }}"
-with.path = "ci-out/mutation\nci-out/assurance-check.json\nci-out/assurance-map.md\n"
+with.path = "ci-out/mutation\nci-out/assurance-check.json\nci-out/assurance-map.md\nplatform-out/memcordon\n"
 with.if-no-files-found = "error"
 with.retention-days = "30"
 
@@ -1684,6 +1794,61 @@ with-order = ["path", "key"]
 with.path = "target"
 with.key = "mutation-${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
 
+[physical.step.mutation.mutation.s010]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.mutation.mutation.s011]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
+credential = "none"
+
+[physical.step.mutation.mutation.s012]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
+credential = "none"
+
+[physical.step.mutation.mutation.s013]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
+credential = "none"
+
+[physical.step.mutation.mutation.s014]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation"]
+credential = "none"
+
+[physical.step.mutation.mutation.s015]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "mutation", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.mutation.mutation.s016]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
 [physical.workflow.nightly]
 permission = "contents-read"
 dispatch-inputs = []
@@ -1691,7 +1856,7 @@ dispatch-inputs = []
 [physical.job.nightly.linux]
 name = "Extended verification / Linux"
 outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s014", "s015", "s016", "s017", "s005", "s006", "s007", "s008", "s009", "s010", "s018", "s019", "s011", "s020", "s012", "s013"]
 
 [physical.step.nightly.linux.s000]
 name = "Check out exact source"
@@ -1756,10 +1921,10 @@ arguments = ["oracle-acquire", "acquire", "--artifact", "ci-out/linux-release-or
 credential = "none"
 
 [physical.step.nightly.linux.s008]
-name = "Run extended Linux oracle suite"
+name = "Run extended Linux oracle suite as one sealed root"
 kind = "run"
 executable = "./target/ci/hell-ci"
-arguments = ["nightly", "--oracle", "ci-out/linux-release-oracle", "--oracle-sha256", "5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9", "--dependency-attestation", "ci-out/dependency-policy.json", "--report", "ci-out/nightly-linux.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
 credential = "none"
 
 [physical.step.nightly.linux.s009]
@@ -1783,7 +1948,7 @@ kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
 with.name = "nightly-linux-${{ github.run_id }}-${{ github.run_attempt }}"
-with.path = "ci-out"
+with.path = "ci-out\nplatform-out/memcordon\n"
 with.if-no-files-found = "ignore"
 with.retention-days = "30"
 
@@ -1805,10 +1970,65 @@ with-order = ["path", "key"]
 with.path = "target"
 with.key = "nightly-linux-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
 
+[physical.step.nightly.linux.s014]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.nightly.linux.s015]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.linux.s016]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.linux.s017]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.linux.s018]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.linux.s019]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.nightly.linux.s020]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
 [physical.job.nightly.fuzz]
 name = "Broad parser and evidence fuzzing"
 outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s016", "s017", "s018", "s019", "s008", "s020", "s021", "s009", "s010", "s011", "s022", "s012", "s013", "s014", "s015"]
 
 [physical.step.nightly.fuzz.s000]
 name = "Check out exact source"
@@ -1877,10 +2097,10 @@ arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--
 credential = "none"
 
 [physical.step.nightly.fuzz.s008]
-name = "Run complete bounded fuzz matrix"
+name = "Run complete bounded fuzz matrix as one sealed root"
 kind = "run"
 executable = "./target/ci/hell-ci"
-arguments = ["fuzz", "smoke", "--manifest", "ci/fuzz-targets.toml", "--repository-root", ".", "--output", "ci-out/fuzz-smoke.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
 credential = "none"
 
 [physical.step.nightly.fuzz.s009]
@@ -1890,7 +2110,7 @@ kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
 with.name = "fuzz-smoke-report-${{ github.run_id }}-${{ github.run_attempt }}"
-with.path = "ci-out/fuzz-smoke.json"
+with.path = "ci-out/fuzz-smoke.json\nplatform-out/memcordon\n"
 with.if-no-files-found = "error"
 with.retention-days = "90"
 
@@ -1951,6 +2171,61 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "target"
 with.key = "nightly-fuzz-driver-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.nightly.fuzz.s016]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.nightly.fuzz.s017]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s018]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s019]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s020]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s021]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "fuzz", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.nightly.fuzz.s022]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
 
 [physical.job.nightly.macos]
 name = "Extended portability / macOS"
@@ -2097,7 +2372,7 @@ with.key = "nightly-macos-${{ runner.os }}-${{ runner.arch }}-stack-3.11.1-ghc-9
 [physical.job.nightly.windows]
 name = "Extended portability / Windows"
 outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s015", "s016", "s017", "s018", "s008", "s009", "s010", "s019", "s020", "s011", "s021", "s012", "s013", "s014"]
 
 [physical.step.nightly.windows.s000]
 name = "Check out exact source"
@@ -2174,7 +2449,7 @@ credential = "none"
 name = "Run extended Windows portability"
 kind = "run"
 executable = ".\\target\\ci\\hell-ci.exe"
-arguments = ["portability", "--report", "ci-out\\nightly-windows.json"]
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "nightly"]
 credential = "none"
 
 [physical.step.nightly.windows.s009]
@@ -2198,7 +2473,7 @@ kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
 with.name = "nightly-windows-${{ github.run_id }}-${{ github.run_attempt }}"
-with.path = "ci-out"
+with.path = "ci-out\nplatform-out/memcordon\n"
 with.if-no-files-found = "ignore"
 with.retention-days = "30"
 
@@ -2229,14 +2504,71 @@ with-order = ["path", "key"]
 with.path = "${{ steps.setup-stack.outputs.stack-root }}\noracle-source/.stack-work\n"
 with.key = "nightly-windows-stack-3.11.1-ghc-9.8.2-${{ hashFiles('oracle-source/stack.yaml', 'oracle-source/stack.yaml.lock', 'oracle-source/package.yaml', 'oracle-source/hell.cabal', 'oracle-source/src/**') }}"
 
+[physical.step.nightly.windows.s015]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.nightly.windows.s016]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "acquire", "--task", "ci\\memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.windows.s017]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "prepare", "--task", "ci\\memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.windows.s018]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "canary", "--task", "ci\\memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.windows.s019]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "cleanup", "--task", "ci\\memcordon-tasks-v1.toml", "--operation", "nightly"]
+credential = "none"
+
+[physical.step.nightly.windows.s020]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "finalize", "--task", "ci\\memcordon-tasks-v1.toml", "--operation", "nightly", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.nightly.windows.s021]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
 [physical.workflow.regression-corpus]
 permission = "contents-read"
 dispatch-inputs = []
 
 [physical.job.regression-corpus.validate]
 name = "Validate committed regression corpus"
-outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006"]
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s007", "s008", "s009", "s010", "s011", "s003", "s012", "s013", "s015", "s014", "s005", "s006"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
 [physical.step.regression-corpus.validate.s000]
 name = "Check out exact pushed source"
@@ -2266,17 +2598,10 @@ with.path = "target"
 with.key = "regression-corpus-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
 
 [physical.step.regression-corpus.validate.s003]
-name = "Validate typed corpus tests"
+name = "Validate regression corpus as one sealed root"
 kind = "run"
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
-credential = "none"
-
-[physical.step.regression-corpus.validate.s004]
-name = "Validate CLI oracle regressions"
-kind = "run"
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
 credential = "none"
 
 [physical.step.regression-corpus.validate.s005]
@@ -2297,14 +2622,90 @@ with-order = ["path", "key"]
 with.path = "target"
 with.key = "regression-corpus-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
 
+[physical.step.regression-corpus.validate.s007]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s008]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.regression-corpus.validate.s009]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s010]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s011]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s012]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s013]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-corpus", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.regression-corpus.validate.s014]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.regression-corpus.validate.s015]
+name = "Upload MemCordon evidence"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "regression-corpus-memcordon-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out/memcordon"
+with.if-no-files-found = "error"
+with.retention-days = "30"
+
 [physical.workflow.regression-subject]
 permission = "contents-read"
 dispatch-inputs = []
 
 [physical.job.regression-subject.validate]
 name = "Revalidate exact pushed subject"
-outputs = []
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006"]
+outputs = ["artifact_id", "artifact_digest"]
+steps = ["s000", "s001", "s002", "s007", "s008", "s009", "s010", "s011", "s003", "s012", "s013", "s015", "s014", "s005", "s006"]
+output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
+output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
 [physical.step.regression-subject.validate.s000]
 name = "Check out exact pushed subject"
@@ -2334,17 +2735,10 @@ with.path = "target"
 with.key = "regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
 
 [physical.step.regression-subject.validate.s003]
-name = "Run typed corpus tests"
+name = "Revalidate regression subject as one sealed root"
 kind = "run"
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-testkit", "--test", "typed_corpus"]
-credential = "none"
-
-[physical.step.regression-subject.validate.s004]
-name = "Run CLI oracle regressions"
-kind = "run"
-executable = "cargo"
-arguments = ["test", "--locked", "--package", "hell-cli", "--test", "oracle_regressions"]
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "execute", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
 credential = "none"
 
 [physical.step.regression-subject.validate.s005]
@@ -2364,6 +2758,80 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "target"
 with.key = "regression-subject-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '**/build.rs', '.cargo/**', 'crates/**/*.rs', 'builtins/**', 'compat/**', 'fixtures/**', 'baseline.toml', 'deny.toml', 'release-policy.toml', 'spec/**', '.github/**') }}"
+
+[physical.step.regression-subject.validate.s007]
+name = "Build CI driver"
+kind = "run"
+executable = "cargo"
+arguments = ["build", "--locked", "--profile", "ci", "--package", "hell-ci", "--bin", "hell-ci"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s008]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.regression-subject.validate.s009]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s010]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s011]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s012]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s013]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "ci/memcordon-tasks-v1.toml", "--operation", "regression-subject", "--candidate-commit", "${{ github.sha }}", "--workflow-commit", "${{ github.workflow_sha }}"]
+credential = "none"
+
+[physical.step.regression-subject.validate.s014]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('ci/memcordon-runtime-v1.toml', 'ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.regression-subject.validate.s015]
+name = "Upload MemCordon evidence"
+id = "upload"
+if = "${{ always() }}"
+kind = "action"
+action = "upload-artifact"
+with-order = ["name", "path", "if-no-files-found", "retention-days"]
+with.name = "regression-subject-memcordon-${{ github.run_id }}-${{ github.run_attempt }}"
+with.path = "platform-out/memcordon"
+with.if-no-files-found = "error"
+with.retention-days = "30"
 
 [physical.workflow.release]
 run-name = "Release candidate ${{ inputs.candidate_branch }} by @${{ github.actor }}"
@@ -2480,7 +2948,7 @@ with.key = "release-resolve-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('a
 [physical.job.release.linux]
 name = "Release gate / Linux x86_64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012", "s013", "s014", "s015"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s016", "s017", "s018", "s019", "s011", "s020", "s021", "s012", "s022", "s013", "s014", "s015"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -2589,12 +3057,13 @@ credential = "none"
 name = "Run Linux release gate, collect conformance evidence, and package"
 kind = "run"
 executable = "./automation/target/ci/hell-ci"
-arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["release", "platform", "--platform", "linux-x86_64", "--plan", "release-input/release-plan.json", "--conformance-plan", "release-input/conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation/ci/memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [physical.step.release.linux.s012]
 name = "Upload exact Linux result"
 id = "upload"
+if = "${{ always() }}"
 kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
@@ -2629,6 +3098,61 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "candidate-target"
 with.key = "release-linux-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.linux.s016]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.release.linux.s017]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "acquire", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.linux.s018]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "prepare", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.linux.s019]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "canary", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.linux.s020]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "cleanup", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.linux.s021]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = "./automation/target/ci/hell-ci"
+arguments = ["memcordon", "finalize", "--task", "automation/ci/memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.linux.s022]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache/memcordon-downloads-v1"
+with.key = "memcordon-v1-linux-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
 
 [physical.job.release.macos]
 name = "Release gate / macOS aarch64"
@@ -2767,7 +3291,7 @@ with.key = "release-macos-target-${{ needs.resolve.outputs.build_inputs_digest }
 [physical.job.release.windows]
 name = "Release gate / Windows x86_64"
 outputs = ["artifact_id", "artifact_digest"]
-steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s009", "s010", "s011", "s012"]
+steps = ["s000", "s001", "s002", "s003", "s004", "s005", "s006", "s007", "s008", "s013", "s014", "s015", "s016", "s009", "s017", "s018", "s010", "s019", "s011", "s012"]
 output.artifact_id = "${{ steps.upload.outputs.artifact-id }}"
 output.artifact_digest = "${{ steps.upload.outputs.artifact-digest }}"
 
@@ -2859,12 +3383,13 @@ credential = "none"
 name = "Run Windows release gate, collect conformance evidence, and package"
 kind = "run"
 executable = ".\\automation\\target\\ci\\hell-ci.exe"
-arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--output", "platform-out"]
+arguments = ["release", "platform", "--platform", "windows-x86_64", "--plan", "release-input\\release-plan.json", "--conformance-plan", "release-input\\conformance-plan.json", "--repository-root", "candidate", "--oracle-source", "oracle-source", "--memcordon-task", "automation\\ci\\memcordon-tasks-v1.toml", "--output", "platform-out"]
 credential = "none"
 
 [physical.step.release.windows.s010]
 name = "Upload exact Windows result"
 id = "upload"
+if = "${{ always() }}"
 kind = "action"
 action = "upload-artifact"
 with-order = ["name", "path", "if-no-files-found", "retention-days"]
@@ -2890,6 +3415,61 @@ action = "cache-save"
 with-order = ["path", "key"]
 with.path = "candidate-target"
 with.key = "release-windows-target-${{ needs.resolve.outputs.build_inputs_digest }}"
+
+[physical.step.release.windows.s013]
+name = "Restore pinned MemCordon downloads"
+id = "memcordon-cache"
+kind = "action"
+action = "cache-restore"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
+
+[physical.step.release.windows.s014]
+name = "Acquire pinned MemCordon runtime"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "acquire", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.windows.s015]
+name = "Install and qualify MemCordon provider"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "prepare", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.windows.s016]
+name = "Run MemCordon adoption canary"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "canary", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.windows.s017]
+name = "Retire MemCordon provider"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "cleanup", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.windows.s018]
+name = "Finalize MemCordon evidence"
+if = "${{ always() }}"
+kind = "run"
+executable = ".\\automation\\target\\ci\\hell-ci.exe"
+arguments = ["memcordon", "finalize", "--task", "automation\\ci\\memcordon-tasks-v1.toml", "--operation", "release"]
+credential = "none"
+
+[physical.step.release.windows.s019]
+name = "Save verified MemCordon downloads"
+if = "${{ always() && steps.memcordon-cache.outcome == 'success' && steps.memcordon-cache.outputs.cache-hit != 'true' }}"
+kind = "action"
+action = "cache-save"
+with-order = ["path", "key"]
+with.path = "ci-tool-cache\\memcordon-downloads-v1"
+with.key = "memcordon-v1-windows-x86-64-${{ hashFiles('automation/ci/memcordon-runtime-v1.toml', 'automation/ci/memcordon-tasks-v1.toml') }}"
 
 [physical.job.release.assemble]
 name = "Assemble exact release bundle"

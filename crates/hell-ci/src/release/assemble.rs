@@ -520,6 +520,7 @@ fn collect_platform_evidence(
             format!("platform-manifests/{}.json", platform.id()),
             manifest_bytes,
         );
+        copy_memcordon_members(&root, platform, &mut evidence_members)?;
         require_report_manifest_identity(&report_value, &manifest, &root, platform)?;
         let archive_name = format!("hell-v{}-{}.tar.gz", plan.version, platform.id());
         let bytes =
@@ -684,6 +685,51 @@ fn copy_manifest_members(
     Ok(())
 }
 
+fn copy_memcordon_members(
+    platform_root: &Path,
+    platform: ReleasePlatform,
+    archive_members: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    if platform == ReleasePlatform::MacosAarch64 {
+        return Ok(());
+    }
+    let root = platform_root.join("memcordon");
+    let inventory = read_regular(&root.join("inventory.sha256"))?;
+    let inventory_text = std::str::from_utf8(&inventory)
+        .map_err(|_| "MemCordon inventory is not UTF-8".to_owned())?;
+    for line in inventory_text.lines() {
+        let (digest, relative) = line
+            .split_once("  ")
+            .ok_or_else(|| "MemCordon inventory line lacks its exact separator".to_owned())?;
+        super::schema::require_digest(digest, "MemCordon inventory digest")?;
+        let relative_path = Path::new(relative);
+        if relative_path.as_os_str().is_empty()
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("MemCordon inventory contains an unsafe path".to_owned());
+        }
+        let bytes = read_regular(&root.join(relative_path))?;
+        if hell_testkit::sha256_bytes(&bytes).hex() != digest {
+            return Err(format!("MemCordon inventory digest differs for {relative}"));
+        }
+        archive_members.insert(format!("memcordon/{}/{relative}", platform.id()), bytes);
+    }
+    for name in ["inventory.sha256", "finalization.json"] {
+        archive_members.insert(
+            format!("memcordon/{}/{name}", platform.id()),
+            read_regular(&root.join(name))?,
+        );
+    }
+    archive_members.insert(
+        format!("memcordon/{}/platform-report.json", platform.id()),
+        read_regular(&platform_root.join("platform-report.json"))?,
+    );
+    Ok(())
+}
+
 fn oracle_binding(root: &Path) -> Result<crate::conformance::OracleBinding, String> {
     let value = read_json(&root.join("oracle-report.json"))?;
     let fields = value.object()?;
@@ -739,6 +785,7 @@ pub(crate) fn verify_platform_report(
             "gates",
             "imageOS",
             "imageVersion",
+            "memcordon",
             "nativeEnvironmentSha256",
             "planSha256",
             "platform",
@@ -760,6 +807,7 @@ pub(crate) fn verify_platform_report(
         .parent()
         .ok_or_else(|| "platform report has no artifact root".to_owned())?;
     require_platform_report_evidence(fields, artifact_root, plan, conformance, platform)?;
+    require_platform_report_memcordon(fields, artifact_root, plan, platform)?;
     require_platform_report_gates(fields, platform)?;
     Ok(value)
 }
@@ -770,7 +818,7 @@ fn require_platform_report_binding(
     conformance: &crate::conformance::ConformancePlan,
     platform: ReleasePlatform,
 ) -> Result<(), String> {
-    if json_member(fields, "schemaVersion")?.number()? != 2
+    if json_member(fields, "schemaVersion")?.number()? != 3
         || json_member(fields, "state")?.string()? != "passed"
         || json_member(fields, "platform")?.string()? != platform.id()
         || json_member(fields, "candidateSha")?.string()? != plan.resolution.candidate_sha
@@ -794,6 +842,72 @@ fn require_platform_report_binding(
             "{} platform report is not exactly plan-bound",
             platform.id()
         ));
+    }
+    Ok(())
+}
+
+fn require_platform_report_memcordon(
+    fields: &BTreeMap<String, JsonValue>,
+    artifact_root: &Path,
+    plan: &ReleasePlan,
+    platform: ReleasePlatform,
+) -> Result<(), String> {
+    let value = json_member(fields, "memcordon")?;
+    if platform == ReleasePlatform::MacosAarch64 {
+        return if matches!(value, JsonValue::Null) {
+            Ok(())
+        } else {
+            Err("macOS platform report must not claim MemCordon evidence".to_owned())
+        };
+    }
+    let memcordon = value.object()?;
+    require_exact_json_keys(
+        memcordon,
+        &[
+            "evidencePath",
+            "finalizationSha256",
+            "inventorySha256",
+            "operationIds",
+            "runtimeLockSha256",
+            "schemaVersion",
+        ],
+    )?;
+    if json_member(memcordon, "schemaVersion")?.number()? != 1
+        || json_member(memcordon, "evidencePath")?.string()? != "memcordon"
+    {
+        return Err("platform MemCordon binding schema or path differs".to_owned());
+    }
+    let operation_ids = json_member(memcordon, "operationIds")?
+        .array()?
+        .iter()
+        .map(|value| value.string().map(str::to_owned))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_operation = if plan.resolution.workflow_ref == "technical-readiness" {
+        "readiness"
+    } else {
+        "release"
+    };
+    if operation_ids != [expected_operation.to_owned()] {
+        return Err("platform MemCordon operation set differs from the trusted task".to_owned());
+    }
+    let platform_id = match platform {
+        ReleasePlatform::LinuxX86_64 => hell_memcordon::PlatformId::LinuxX86_64,
+        ReleasePlatform::WindowsX86_64 => hell_memcordon::PlatformId::WindowsX86_64,
+        ReleasePlatform::MacosAarch64 => unreachable!("handled above"),
+    };
+    let binding = crate::memcordon::verify_finalized_evidence(
+        &artifact_root.join("memcordon"),
+        platform_id,
+        &plan.resolution.candidate_sha,
+        &plan.resolution.workflow_sha,
+        &operation_ids,
+    )?;
+    if json_member(memcordon, "finalizationSha256")?.string()? != binding.finalization_sha256
+        || json_member(memcordon, "inventorySha256")?.string()? != binding.inventory_sha256
+        || json_member(memcordon, "runtimeLockSha256")?.string()? != binding.runtime_lock_sha256
+        || operation_ids != binding.operation_ids
+    {
+        return Err("platform MemCordon digest binding differs".to_owned());
     }
     Ok(())
 }
@@ -892,6 +1006,7 @@ pub(crate) fn fuzz_parse_platform_report(value: &JsonValue) -> Result<(), String
             "gates",
             "imageOS",
             "imageVersion",
+            "memcordon",
             "nativeEnvironmentSha256",
             "planSha256",
             "platform",
@@ -915,12 +1030,39 @@ pub(crate) fn fuzz_parse_platform_report(value: &JsonValue) -> Result<(), String
 fn fuzz_validate_platform_report_fields(
     fields: &BTreeMap<String, JsonValue>,
 ) -> Result<ReleasePlatform, String> {
-    if json_member(fields, "schemaVersion")?.number()? != 2
+    if json_member(fields, "schemaVersion")?.number()? != 3
         || json_member(fields, "state")?.string()? != "passed"
     {
         return Err("unsupported or non-passing platform report".to_owned());
     }
     let platform = ReleasePlatform::parse(json_member(fields, "platform")?.string()?)?;
+    match (platform, json_member(fields, "memcordon")?) {
+        (ReleasePlatform::MacosAarch64, JsonValue::Null) => {}
+        (ReleasePlatform::LinuxX86_64 | ReleasePlatform::WindowsX86_64, value) => {
+            let binding = value.object()?;
+            require_exact_json_keys(
+                binding,
+                &[
+                    "evidencePath",
+                    "finalizationSha256",
+                    "inventorySha256",
+                    "operationIds",
+                    "runtimeLockSha256",
+                    "schemaVersion",
+                ],
+            )?;
+            if json_member(binding, "schemaVersion")?.number()? != 1
+                || json_member(binding, "evidencePath")?.string()? != "memcordon"
+                || json_member(binding, "operationIds")?.array()?.is_empty()
+            {
+                return Err("invalid platform MemCordon binding".to_owned());
+            }
+            for name in ["finalizationSha256", "inventorySha256", "runtimeLockSha256"] {
+                super::schema::require_digest(json_member(binding, name)?.string()?, name)?;
+            }
+        }
+        _ => return Err("platform MemCordon applicability differs".to_owned()),
+    }
     for name in [
         "archiveSha256",
         "buildInputsSha256",
@@ -1015,6 +1157,9 @@ fn verify_platform_inventory(
     if platform == ReleasePlatform::LinuxX86_64 {
         expected.insert("dependency-policy.json");
         expected.insert("mutation-report.json");
+    }
+    if platform != ReleasePlatform::MacosAarch64 {
+        expected.insert("memcordon");
     }
     if directory_entries(root)? != expected.iter().map(|name| (*name).to_owned()).collect() {
         return Err(format!(

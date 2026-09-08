@@ -176,3 +176,36 @@ vectors = ["wrong-native-environment-receipt"]
 fuzz-targets = ["native_environment"]
 mutants = []
 residual-assumptions = ["github-hosted-runner-operation"]
+
+[[claim]]
+id = "REL-MEMCORDON-SEALED-BOUNDARY"
+statement = "Every Linux and Windows candidate-root operation requires one qualified MemCordon sealed boundary with exact native arguments and terminal provenance; no standard fallback is admitted."
+severity = "release-blocking"
+implementation = ["crates/hell-memcordon/src/report.rs", "crates/hell-host/src/process_tree.rs", "crates/hell-ci/src/release/platform.rs", "crates/hell-ci/tests/memcordon_mutations.rs", "crates/hell-release-verifier/src/memcordon_rc23.rs"]
+workflow-gates = ["release/linux", "release/windows", "release/final-verify"]
+vectors = ["linux-evidence-relabeled-as-windows", "primary-accepts-independent-rejects"]
+fuzz-targets = ["memcordon_schema8_wire", "memcordon_native_argv", "memcordon_status_provenance", "memcordon_deadline_and_admission"]
+mutants = []
+residual-assumptions = ["github-hosted-runner-operation"]
+
+[[claim]]
+id = "REL-MEMCORDON-EVIDENCE-EXACT"
+statement = "Primary and independent parsers require exact raw-to-normalized schema-8 agreement, complete native predicate inventories, and exact plan-provided operation coverage."
+severity = "release-blocking"
+implementation = ["crates/hell-memcordon/src/report.rs", "crates/hell-ci/src/release/assemble.rs", "crates/hell-ci/src/release/verify.rs", "crates/hell-ci/tests/memcordon_mutations.rs", "crates/hell-release-verifier/src/memcordon_rc23.rs"]
+workflow-gates = ["release/linux", "release/windows", "release/final-verify"]
+vectors = ["missing-cell", "missing-memcordon-finalization", "substituted-memcordon-finalization", "primary-accepts-independent-rejects", "independent-accepts-primary-rejects"]
+fuzz-targets = ["memcordon_schema8_wire", "memcordon_operation_projection", "memcordon_status_provenance"]
+mutants = []
+residual-assumptions = []
+
+[[claim]]
+id = "REL-MEMCORDON-CLEANUP-CLOSED"
+statement = "Release finalization requires provider removal, absent installed footprint, zero active operations, and digest-bound cleanup, ledger, and inventory evidence."
+severity = "release-blocking"
+implementation = ["crates/hell-memcordon/src/evidence.rs", "crates/hell-ci/src/memcordon/finalize.rs", "crates/hell-ci/tests/memcordon_platform_finalization.rs", "crates/hell-release-verifier/src/memcordon_rc23.rs"]
+workflow-gates = ["release/linux", "release/windows", "release/final-verify"]
+vectors = ["summary-producer-failed", "missing-cell", "missing-memcordon-finalization", "substituted-memcordon-finalization"]
+fuzz-targets = ["memcordon_provider_lifecycle", "memcordon_operation_projection"]
+mutants = []
+residual-assumptions = ["github-hosted-runner-operation"]

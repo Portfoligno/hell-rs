@@ -1,0 +1,51 @@
+schema-version = 1
+version = "0.5.2-rc.23"
+repository = "Portfoligno/memcordon"
+release-id = 384239676
+source-commit = "67aa1f74d9a76713ab343ea2afbe6403da7429b7"
+execution-schema = 8
+plan-schema = 7
+doctor-schema = 5
+clean-schema = 2
+package-inspection-schema = 4
+
+[metadata.release-manifest]
+asset-id = 549148426
+filename = "release-manifest.json"
+bytes = 11529
+sha256 = "39127a1aefe3d4ca5b657b31cd2fe043dcc808cf9390d45c11a553ee680c7ca9"
+
+[metadata.publication-report]
+asset-id = 549153965
+filename = "publication-report.json"
+bytes = 11698
+sha256 = "f1423382eaf7a9549c9af141a9bc172d8ee613d04af6f08a8fcda71a68c3053a"
+
+[metadata.checksums]
+asset-id = 549148232
+filename = "SHA256SUMS"
+bytes = 709
+sha256 = "4fc5d1d91a719e591ceed70bb5b26c02088ed93e370356515b12a089a66379cc"
+
+[platform.linux-x86_64]
+asset-id = 549148407
+filename = "memcordon-v0.5.2-rc.23-x86_64-unknown-linux-gnu.tar.gz"
+bytes = 3133920
+sha256 = "839c4918eef67be4e6a773e7f0840d0665480a4c0d874c72432a208315db479d"
+target = "x86_64-unknown-linux-gnu"
+mechanism = "linux-pid-namespace-cgroup-v2"
+required-components = ["memcordon", "memcordon-sealed-agent"]
+
+[platform.windows-x86_64]
+asset-id = 549148389
+filename = "memcordon-v0.5.2-rc.23-x86_64-pc-windows-msvc.zip"
+bytes = 6326811
+sha256 = "90047dd584bcec2206314aeccf6555d51c4c123f7769a89a29489b0e06316278"
+target = "x86_64-pc-windows-msvc"
+mechanism = "windows-job-object-v2"
+required-components = [
+  "memcordon.exe",
+  "memcordon-sealed-agent.exe",
+  "memcordon-target-desktop-bootstrap.exe",
+  "memcordon-session-broker.exe",
+]

@@ -415,7 +415,7 @@ pub(crate) fn read_evidence(path: &Path, epoch: u64) -> Result<BTreeMap<String, 
         count = count
             .checked_add(1)
             .ok_or_else(|| "conformance evidence entry count overflow".to_owned())?;
-        if count > MAX_EVIDENCE_ENTRIES.saturating_add(EVIDENCE_DIRECTORIES.len()) {
+        if count > MAX_EVIDENCE_ENTRIES.saturating_mul(2) {
             return Err("conformance evidence archive has too many entries".to_owned());
         }
         let mut entry = entry
@@ -449,7 +449,9 @@ pub(crate) fn read_evidence(path: &Path, epoch: u64) -> Result<BTreeMap<String, 
         }
         validate_evidence_header(entry.header(), kind, epoch)?;
         if kind.is_dir() {
-            if !EVIDENCE_DIRECTORIES.contains(&name.as_str()) {
+            if !EVIDENCE_DIRECTORIES.contains(&name.as_str())
+                && !valid_memcordon_archive_path(&name)
+            {
                 return Err("conformance evidence archive has an unexpected directory".to_owned());
             }
         } else {
@@ -639,6 +641,7 @@ fn classify_evidence_tar(bytes: &[u8], epoch: u64) -> Result<(), &'static str> {
             && !path
                 .strip_prefix("observations/")
                 .is_some_and(observation_archive_name)
+            && !valid_memcordon_archive_path(path)
         {
             return Err("release.archive.extra-member");
         }
@@ -751,16 +754,19 @@ fn validate_evidence_members(members: &BTreeMap<String, Vec<u8>>) -> Result<(), 
     let mut total = 0_u64;
     for (name, bytes) in members {
         validate_archive_path(name)?;
+        let memcordon = valid_memcordon_archive_path(name);
         let allowed = required.contains(name.as_str())
             || name.strip_prefix("records/").is_some_and(|tail| {
                 record_archive_name(tail, "ev-") || record_archive_name(tail, "gx-")
             })
             || name
                 .strip_prefix("observations/")
-                .is_some_and(observation_archive_name);
+                .is_some_and(observation_archive_name)
+            || memcordon;
         if (!allowed && !crate::mutation::active("allow-extra-archive-member"))
-            || Path::new(name).extension().and_then(|value| value.to_str()) != Some("json")
-            || !bytes.ends_with(b"\n")
+            || (!memcordon
+                && (Path::new(name).extension().and_then(|value| value.to_str()) != Some("json")
+                    || !bytes.ends_with(b"\n")))
         {
             return Err(format!("invalid conformance evidence member {name:?}"));
         }
@@ -821,9 +827,23 @@ fn canonical_evidence_bytes(
     epoch: u64,
     members: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
-    let mut entries = EVIDENCE_DIRECTORIES
+    let mut directories = EVIDENCE_DIRECTORIES
         .iter()
-        .map(|path| ((*path).to_owned(), None))
+        .map(|path| (*path).to_owned())
+        .collect::<BTreeSet<_>>();
+    for path in members.keys().filter(|path| path.starts_with("memcordon/")) {
+        let mut parent = Path::new(path).parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(directory.to_string_lossy().into_owned());
+            parent = directory.parent();
+        }
+    }
+    let mut entries = directories
+        .into_iter()
+        .map(|path| (path, None))
         .chain(
             members
                 .iter()
@@ -856,6 +876,22 @@ fn canonical_evidence_bytes(
             .map_err(|error| format!("cannot close conformance evidence gzip: {error}"))?;
     }
     Ok(compressed)
+}
+
+fn valid_memcordon_archive_path(path: &str) -> bool {
+    let Some(tail) = path
+        .strip_prefix("memcordon/linux-x86_64/")
+        .or_else(|| path.strip_prefix("memcordon/windows-x86_64/"))
+    else {
+        return matches!(
+            path,
+            "memcordon" | "memcordon/linux-x86_64" | "memcordon/windows-x86_64"
+        );
+    };
+    !tail.is_empty()
+        && tail
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn append_directory<W: Write>(

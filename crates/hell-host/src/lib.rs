@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::sync::Arc;
 
+mod frontend;
 #[cfg(not(windows))]
 mod process_environment;
 mod process_tree;
@@ -14,6 +15,11 @@ mod process_tree;
 #[cfg(not(windows))]
 use process_environment::ProcessEnvironment;
 
+pub use frontend::{
+    FrontendChild, FrontendTerminationReport, RetainedFrontendTerminationReceipt,
+    RetainedFrontendTerminationSnapshot, RetainedFrontendTerminationState,
+    retained_frontend_termination_receipt,
+};
 #[cfg(unix)]
 #[doc(hidden)]
 pub use process_tree::verify_termination_deadline_for_integration;

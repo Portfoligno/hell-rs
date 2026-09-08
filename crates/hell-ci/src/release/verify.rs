@@ -680,6 +680,19 @@ fn verify_evidence_archive(
     let evidence_bytes = read_regular(&evidence_path)?;
     let evidence_sha256 = hell_testkit::sha256_bytes(&evidence_bytes).hex();
     let members = archive::read_evidence(&evidence_path, inventory.plan.source_date_epoch)?;
+    for (platform, platform_id) in [
+        ("linux-x86_64", hell_memcordon::PlatformId::LinuxX86_64),
+        ("windows-x86_64", hell_memcordon::PlatformId::WindowsX86_64),
+    ] {
+        crate::memcordon::verify_archived_finalized_evidence(
+            &members,
+            &format!("memcordon/{platform}/"),
+            platform_id,
+            &inventory.plan.resolution.candidate_sha,
+            &inventory.plan.resolution.workflow_sha,
+            &["release".to_owned()],
+        )?;
+    }
     if members.get("conformance-plan.json") != Some(&inventory.bundled_plan_bytes) {
         return Err("evidence archive conformance plan differs from bundle".to_owned());
     }

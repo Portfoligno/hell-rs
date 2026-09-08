@@ -39,7 +39,7 @@ struct VectorRegistration {
     diagnostic: Option<&'static str>,
 }
 
-const VECTOR_REGISTRY: [VectorRegistration; 37] = [
+const VECTOR_REGISTRY: [VectorRegistration; 39] = [
     registration("known-good", "none", None),
     registration(
         "duplicate-json-key",
@@ -212,6 +212,16 @@ const VECTOR_REGISTRY: [VectorRegistration; 37] = [
         Some("release.protocol.downgrade"),
     ),
     registration(
+        "missing-memcordon-finalization",
+        "missing-memcordon-finalization",
+        Some("release.independent-verifier-rejected"),
+    ),
+    registration(
+        "substituted-memcordon-finalization",
+        "substituted-memcordon-finalization",
+        Some("release.independent-verifier-rejected"),
+    ),
+    registration(
         "primary-accepts-independent-rejects",
         "primary-accepts-independent-rejects",
         Some("release.verifier-disagreement"),
@@ -299,7 +309,10 @@ pub(crate) fn verify_registry(options: RegistryOptions) -> Result<String, String
         &object([
             ("schemaVersion", number(1)),
             ("state", string("verified")),
-            ("vectorCount", number(37)),
+            (
+                "vectorCount",
+                number(u64::try_from(VECTOR_REGISTRY.len()).unwrap_or(u64::MAX)),
+            ),
             ("vectors", JsonValue::Array(vectors)),
         ]),
     )?;
@@ -1147,15 +1160,107 @@ fn apply_mutation(root: &Path, vector: &Vector) -> Result<(), String> {
             &["schemaVersion"],
             JsonValue::Number(1),
         ),
+        other => apply_archive_mutation(root, other),
+    }
+}
+
+fn apply_archive_mutation(root: &Path, mutation: &str) -> Result<(), String> {
+    match mutation {
+        "missing-memcordon-finalization" => {
+            mutate_memcordon_evidence(root, MemcordonMutation::MissingFinalization)
+        }
+        "substituted-memcordon-finalization" => {
+            mutate_memcordon_evidence(root, MemcordonMutation::SubstitutedFinalization)
+        }
         other => TarMutation::from_id(other).map_or_else(
             || {
                 Err(format!(
                     "release vector mutation {other:?} has no production materializer"
                 ))
             },
-            |mutation| mutate_evidence_tar(root, mutation),
+            |archive_mutation| mutate_evidence_tar(root, archive_mutation),
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+enum MemcordonMutation {
+    MissingFinalization,
+    SubstitutedFinalization,
+}
+
+fn mutate_memcordon_evidence(root: &Path, mutation: MemcordonMutation) -> Result<(), String> {
+    const BLOCK: usize = 512;
+    let path = root.join("bundle/conformance-evidence.tar.gz");
+    let compressed = read_regular(&path)?;
+    let mut tar = Vec::new();
+    GzDecoder::new(compressed.as_slice())
+        .read_to_end(&mut tar)
+        .map_err(|error| format!("cannot expand MemCordon release vector evidence: {error}"))?;
+    let target = "memcordon/linux-x86_64/finalization.json";
+    let mut offset = 0_usize;
+    let mut found = None;
+    while let Some(header) = tar.get(offset..offset.saturating_add(BLOCK)) {
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let path_end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        let name = std::str::from_utf8(&header[..path_end])
+            .map_err(|_| "release vector tar member name is not UTF-8".to_owned())?;
+        let size = parse_tar_octal(&header[124..136])?;
+        let padded = size
+            .checked_add(BLOCK - 1)
+            .ok_or_else(|| "release vector tar member size overflow".to_owned())?
+            / BLOCK
+            * BLOCK;
+        let end = offset
+            .checked_add(BLOCK)
+            .and_then(|value| value.checked_add(padded))
+            .ok_or_else(|| "release vector tar offset overflow".to_owned())?;
+        if name == target {
+            found = Some((offset, offset + BLOCK, size, end));
+            break;
+        }
+        offset = end;
+    }
+    let (header_start, payload_start, size, member_end) =
+        found.ok_or_else(|| "release vector lacks MemCordon finalization".to_owned())?;
+    match mutation {
+        MemcordonMutation::MissingFinalization => {
+            tar.drain(header_start..member_end);
+        }
+        MemcordonMutation::SubstitutedFinalization => {
+            let payload = tar
+                .get_mut(payload_start..payload_start.saturating_add(size))
+                .ok_or_else(|| "MemCordon finalization payload is truncated".to_owned())?;
+            let byte = payload
+                .iter_mut()
+                .find(|byte| **byte == b't')
+                .ok_or_else(|| "MemCordon finalization lacks a mutable byte".to_owned())?;
+            *byte = b'f';
+        }
+    }
+    let mutated = canonical_gzip(&tar)?;
+    write_atomic(&path, &mutated)?;
+    update_subject_digest(
+        &root.join("bundle/SUBJECTS.sha256"),
+        "conformance-evidence.tar.gz",
+        &hell_testkit::sha256_bytes(&mutated).hex(),
+    )
+}
+
+fn parse_tar_octal(bytes: &[u8]) -> Result<usize, String> {
+    let text = bytes
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0 && *byte != b' ')
+        .collect::<Vec<_>>();
+    let text = std::str::from_utf8(&text)
+        .map_err(|_| "release vector tar size is not ASCII".to_owned())?;
+    usize::from_str_radix(text, 8).map_err(|_| "release vector tar size is invalid".to_owned())
 }
 
 #[derive(Clone, Copy)]

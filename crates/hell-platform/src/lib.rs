@@ -7,9 +7,11 @@ use std::sync::Arc;
 use hell_runtime::RuntimeContext;
 
 pub use hell_host::{
-    CleanupLease, CleanupLifecycleReceipt, HostServices, RetainedTerminationReceipt,
-    RetainedTerminationSnapshot, RetainedTerminationState, SupervisedChild, TerminationReport,
-    WaitOutcome, retained_termination_receipt,
+    CleanupLease, CleanupLifecycleReceipt, FrontendChild, FrontendTerminationReport, HostServices,
+    RetainedFrontendTerminationReceipt, RetainedFrontendTerminationSnapshot,
+    RetainedFrontendTerminationState, RetainedTerminationReceipt, RetainedTerminationSnapshot,
+    RetainedTerminationState, SupervisedChild, TerminationReport, WaitOutcome,
+    retained_frontend_termination_receipt, retained_termination_receipt,
 };
 
 #[derive(Clone, Debug, Default)]

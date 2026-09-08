@@ -21,6 +21,9 @@ Generated from `spec/assurance-map.toml`. Edit the TOML map and run
 | `CI-TERMINAL-SUMMARY` | release-blocking | A producer failure or skipped verifier yields one failing terminal readiness summary and cannot appear admitted. |
 | `CI-SEMANTIC-CAPABILITIES` | release-blocking | Ambient environment access, child-environment mutation, and subprocess launch are confined to exact sealed Rust capability items. |
 | `REL-NATIVE-ENVIRONMENT` | release-blocking | Each required native platform report binds its observed environment and immutable external-input lock. |
+| `REL-MEMCORDON-SEALED-BOUNDARY` | release-blocking | Every Linux and Windows candidate-root operation requires one qualified MemCordon sealed boundary with exact native arguments and terminal provenance; no standard fallback is admitted. |
+| `REL-MEMCORDON-EVIDENCE-EXACT` | release-blocking | Primary and independent parsers require exact raw-to-normalized schema-8 agreement, complete native predicate inventories, and exact plan-provided operation coverage. |
+| `REL-MEMCORDON-CLEANUP-CLOSED` | release-blocking | Release finalization requires provider removal, absent installed footprint, zero active operations, and digest-bound cleanup, ledger, and inventory evidence. |
 
 The machine-readable map is authoritative for implementation paths, workflow
 gates, vectors, fuzz targets, mutants, and residual assumptions.

@@ -10,6 +10,7 @@ members = [
     "crates/hell-digest",
     "crates/hell-http-host",
     "crates/hell-host",
+    "crates/hell-memcordon",
     "crates/hell-platform",
     "crates/hell-release-publisher",
     "crates/hell-release-verifier",

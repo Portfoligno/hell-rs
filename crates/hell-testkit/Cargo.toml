@@ -12,6 +12,7 @@ mutation-testing = ["compat-tracing"]
 flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
 hell-builtins = { version = "0.1.0", path = "../hell-builtins" }
 hell-digest = { version = "0.1.0", path = "../hell-digest" }
+hell-memcordon = { version = "0.1.0", path = "../hell-memcordon" }
 hell-platform = { version = "0.1.0", path = "../hell-platform" }
 tar = "0.4.44"
 

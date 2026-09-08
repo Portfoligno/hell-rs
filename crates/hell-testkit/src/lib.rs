@@ -23,7 +23,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use hell_platform::{CleanupLease, SupervisedChild, TerminationReport, WaitOutcome};
+use hell_memcordon::{AdmissionLease, NativeArgument, ReportReservation, SealedAdmission};
+use hell_platform::{
+    CleanupLease, FrontendChild, FrontendTerminationReport, SupervisedChild, TerminationReport,
+    WaitOutcome,
+};
 pub use hell_platform::{
     CleanupLifecycleReceipt, RetainedTerminationReceipt, RetainedTerminationSnapshot,
     RetainedTerminationState,
@@ -267,6 +271,190 @@ pub struct CandidateLaunchPolicy {
     #[cfg(windows)]
     toolchain: WindowsToolchainAuthority,
     writable_roots: Arc<[PathBuf]>,
+    sealed_supervisor: Option<Arc<MemcordonExecutionPolicy>>,
+}
+
+#[derive(Clone, Debug)]
+struct MemcordonExecutionPolicy {
+    runtime: BoundProgramInvocation,
+    report_directory: PathBuf,
+    mechanism: Arc<str>,
+    admission: SealedAdmission,
+    cleanup_reserve: Duration,
+}
+
+impl MemcordonExecutionPolicy {
+    fn new(
+        runtime: BoundProgramInvocation,
+        report_directory: PathBuf,
+        mechanism: impl Into<Arc<str>>,
+        admission: SealedAdmission,
+        cleanup_reserve: Duration,
+        writable_roots: &[PathBuf],
+    ) -> std::io::Result<Self> {
+        runtime.revalidate(runtime.invocation_path.as_os_str())?;
+        let metadata = fs::symlink_metadata(&report_directory)?;
+        if !report_directory.is_absolute()
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || fs::canonicalize(&report_directory)? != report_directory
+            || writable_roots
+                .iter()
+                .any(|root| report_directory.starts_with(root))
+            || cleanup_reserve < Duration::from_secs(1)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sealed runtime/report authority is not canonical",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.mode() & 0o777 != 0o700 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sealed report directory is not runner-private mode 0700",
+                ));
+            }
+        }
+        let mechanism = mechanism.into();
+        let expected = if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+            "linux-pid-namespace-cgroup-v2"
+        } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+            "windows-job-object-v2"
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "sealed candidate policy supports only Linux and Windows x86-64",
+            ));
+        };
+        if mechanism.as_ref() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sealed mechanism differs from the current platform",
+            ));
+        }
+        Ok(Self {
+            runtime,
+            report_directory,
+            mechanism,
+            admission,
+            cleanup_reserve,
+        })
+    }
+
+    fn wrap_frontend(
+        &self,
+        command: &mut Command,
+        execution_deadline: Instant,
+    ) -> std::io::Result<PendingSealedOperation> {
+        require_before_deadline(execution_deadline, "sealed admission")?;
+        let admission = self
+            .admission
+            .acquire_until(execution_deadline)
+            .map_err(std::io::Error::other)?;
+        let runtime = self
+            .runtime
+            .revalidate(self.runtime.invocation_path.as_os_str())?;
+        let report = ReportReservation::create(&self.report_directory)?;
+        let remaining = execution_deadline.saturating_duration_since(Instant::now());
+        let budget = remaining.checked_sub(self.cleanup_reserve).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sealed launch leaves no provider cleanup reserve",
+            )
+        })?;
+        let target = PathBuf::from(command.get_program());
+        if !target.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "authorized sealed target is not absolute after identity wrapping",
+            ));
+        }
+        let target_arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let expected_argv = std::iter::once(NativeArgument::from_os_str(target.as_os_str()))
+            .chain(
+                target_arguments
+                    .iter()
+                    .map(|value| NativeArgument::from_os_str(value)),
+            )
+            .collect::<Vec<_>>();
+        let directory = command.get_current_dir().map(Path::to_owned);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (OsString::from(name), value.map(OsString::from)))
+            .collect::<Vec<_>>();
+        let mut frontend = Command::new(runtime);
+        frontend.args(hell_memcordon::sealed_arguments(
+            report.path(),
+            budget,
+            &target,
+            &target_arguments,
+        )?);
+        if let Some(directory) = directory {
+            frontend.current_dir(directory);
+        }
+        frontend.env_clear();
+        for (name, value) in environment {
+            match value {
+                Some(value) => {
+                    frontend.env(name, value);
+                }
+                None => {
+                    frontend.env_remove(name);
+                }
+            }
+        }
+        *command = frontend;
+        Ok(PendingSealedOperation {
+            report,
+            expected_argv,
+            mechanism: Arc::clone(&self.mechanism),
+            admission: Some(admission),
+        })
+    }
+}
+
+struct PendingSealedOperation {
+    report: ReportReservation,
+    expected_argv: Vec<NativeArgument>,
+    mechanism: Arc<str>,
+    admission: Option<AdmissionLease>,
+}
+
+impl PendingSealedOperation {
+    fn complete(
+        mut self,
+        frontend_status: ExitStatus,
+    ) -> std::io::Result<CompletedSealedOperation> {
+        let bytes = self.report.read_bounded()?;
+        let projection =
+            hell_memcordon::project_schema8_report(&bytes, &self.mechanism, &self.expected_argv)
+                .map_err(std::io::Error::other)?;
+        if frontend_status.code() != Some(projection.wrapper_status) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sealed frontend status differs from authenticated report",
+            ));
+        }
+        let digest = sha256_bytes(&bytes);
+        self.admission
+            .take()
+            .expect("pending sealed operation retains admission")
+            .retire();
+        Ok(CompletedSealedOperation {
+            report: self.report.path().to_path_buf(),
+            digest,
+            projection,
+        })
+    }
+}
+
+struct CompletedSealedOperation {
+    report: PathBuf,
+    digest: Digest,
+    projection: hell_memcordon::Schema8ProjectionV1,
 }
 
 #[cfg(windows)]
@@ -5525,6 +5713,7 @@ impl CandidateLaunchPolicy {
             uid,
             primary_gid,
             writable_roots: writable_roots.into(),
+            sealed_supervisor: None,
         })
     }
 
@@ -5593,7 +5782,113 @@ impl CandidateLaunchPolicy {
             restricted_adapter,
             toolchain,
             writable_roots: writable_roots.into(),
+            sealed_supervisor: None,
         })
+    }
+
+    /// Requires candidate roots to run through one exact `MemCordon` sealed frontend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime/report authority is not canonical or
+    /// the mechanism does not match this compilation platform.
+    pub fn with_memcordon_sealed(
+        mut self,
+        runtime: BoundProgramInvocation,
+        report_directory: PathBuf,
+        mechanism: impl Into<Arc<str>>,
+        admission: SealedAdmission,
+        cleanup_reserve: Duration,
+    ) -> std::io::Result<Self> {
+        self.sealed_supervisor = Some(Arc::new(MemcordonExecutionPolicy::new(
+            runtime,
+            report_directory,
+            mechanism,
+            admission,
+            cleanup_reserve,
+            &self.writable_roots,
+        )?));
+        Ok(self)
+    }
+
+    /// Reconciles a successful Windows identity-adapter result with its sealed report.
+    ///
+    /// The immutable restricted-adapter digest is the token-policy identity;
+    /// the adapter's authenticated native request digest is the exact command
+    /// binding. This conversion is available only after the explicit candidate
+    /// policy runner has completed both control planes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both receipts are present, valid, successful,
+    /// and agree on the full-width native candidate status.
+    #[cfg(windows)]
+    pub fn windows_memcordon_identity_receipt(
+        &self,
+        operation_id: impl Into<String>,
+        output: &SupervisedOutput,
+    ) -> std::io::Result<hell_memcordon::WindowsCandidateIdentityReceiptV1> {
+        if self.sealed_supervisor.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate policy lacks MemCordon authority",
+            ));
+        }
+        let control = output.windows_launch_control.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows identity-adapter control receipt is absent",
+            )
+        })?;
+        control.validate()?;
+        let projection = output.memcordon_projection.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows MemCordon projection is absent",
+            )
+        })?;
+        let native_status = match projection.terminal {
+            hell_memcordon::Schema8TerminalV1::CandidateExit { native_status } => native_status,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Windows identity receipt requires an ordinary candidate exit",
+                ));
+            }
+        };
+        if control.state != "completed"
+            || control.status_code.map(i32::cast_unsigned) != Some(native_status)
+            || output.status.code() != Some(projection.wrapper_status)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows identity adapter and MemCordon status provenance differ",
+            ));
+        }
+        let receipt = hell_memcordon::WindowsCandidateIdentityReceiptV1 {
+            schema_version: hell_memcordon::WINDOWS_CANDIDATE_IDENTITY_RECEIPT_SCHEMA_V1,
+            operation_id: operation_id.into(),
+            candidate_released: true,
+            token_policy_digest: self.restricted_adapter.sha256().hex(),
+            command_binding_digest: control.request_sha256.hex(),
+            child_native_status: Some(native_status),
+            direct_child_reaped: control.termination.reaped,
+            adapter_outcome: hell_memcordon::WindowsIdentityAdapterOutcomeV1::Completed,
+            relay_outcome: hell_memcordon::WindowsIdentityRelayOutcomeV1::Completed,
+        };
+        receipt.validate().map_err(std::io::Error::other)?;
+        Ok(receipt)
+    }
+
+    fn wrap_memcordon_frontend(
+        &self,
+        command: &mut Command,
+        execution_deadline: Instant,
+    ) -> std::io::Result<Option<PendingSealedOperation>> {
+        self.sealed_supervisor
+            .as_ref()
+            .map(|authority| authority.wrap_frontend(command, execution_deadline))
+            .transpose()
     }
 
     #[cfg(unix)]
@@ -21987,6 +22282,68 @@ struct QuiescenceGuard {
     policy: Option<CandidateLaunchPolicy>,
 }
 
+enum CandidateChild {
+    ProcessTree(SupervisedChild),
+    SealedFrontend(FrontendChild),
+}
+
+impl CandidateChild {
+    fn cleanup_lease(&self) -> std::io::Result<CleanupLease> {
+        match self {
+            Self::ProcessTree(child) => child.cleanup_lease(),
+            Self::SealedFrontend(child) => child.cleanup_lease(),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        match self {
+            Self::ProcessTree(child) => child.take_stdin(),
+            Self::SealedFrontend(child) => child.take_stdin(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        match self {
+            Self::ProcessTree(child) => child.take_stdout(),
+            Self::SealedFrontend(child) => child.take_stdout(),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match self {
+            Self::ProcessTree(child) => child.take_stderr(),
+            Self::SealedFrontend(child) => child.take_stderr(),
+        }
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> std::io::Result<WaitOutcome> {
+        match self {
+            Self::ProcessTree(child) => child.wait_until(deadline),
+            Self::SealedFrontend(child) => child.wait_until(deadline),
+        }
+    }
+
+    fn terminate_until(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<(ExitStatus, CandidateTermination)> {
+        match self {
+            Self::ProcessTree(child) => child
+                .terminate_until(deadline)
+                .map(|(status, report)| (status, CandidateTermination::ProcessTree(report))),
+            Self::SealedFrontend(child) => child
+                .terminate_until(deadline)
+                .map(|(status, report)| (status, CandidateTermination::Frontend(report))),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CandidateTermination {
+    ProcessTree(TerminationReport),
+    Frontend(FrontendTerminationReport),
+}
+
 impl QuiescenceGuard {
     fn new(policy: Option<CandidateLaunchPolicy>) -> Self {
         Self { policy }
@@ -22001,6 +22358,10 @@ pub struct SupervisedOutput {
     pub stderr: BoundedCapture,
     pub timed_out: bool,
     pub termination: Option<TerminationReport>,
+    pub frontend_termination: Option<FrontendTerminationReport>,
+    pub memcordon_report_path: Option<PathBuf>,
+    pub memcordon_report_sha256: Option<Digest>,
+    pub memcordon_projection: Option<hell_memcordon::Schema8ProjectionV1>,
     pub phase_timings: Vec<SupervisedPhaseTiming>,
     pub prelaunch_evidence: Option<String>,
     pub candidate_quiescence_complete: bool,
@@ -22395,6 +22756,43 @@ pub fn run_supervised_command_with_bound_program_until(
     )
 }
 
+/// Runs one bound command under an explicit sealed candidate policy.
+///
+/// Unlike the standalone entry point, this retains the platform identity
+/// adapter and postcondition authority carried by [`CandidateLaunchPolicy`].
+/// It is therefore the required entry point for Windows candidate roots.
+///
+/// # Errors
+///
+/// Returns an error when the policy is not MemCordon-qualified or execution,
+/// report validation, adapter reconciliation, or cleanup fails.
+pub fn run_memcordon_candidate_command_with_deadlines(
+    command: &mut Command,
+    input: &[u8],
+    execution_deadline: Instant,
+    completion_deadline: Instant,
+    bound_program: &BoundProgramInvocation,
+    policy: &CandidateLaunchPolicy,
+    progress: Option<SupervisedProgressObserver>,
+) -> std::io::Result<SupervisedOutput> {
+    if policy.sealed_supervisor.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "explicit candidate policy lacks MemCordon authority",
+        ));
+    }
+    with_candidate_launch_policy(policy, || {
+        run_supervised_command_with_bound_program_until(
+            command,
+            input,
+            execution_deadline,
+            completion_deadline,
+            bound_program,
+            progress,
+        )
+    })
+}
+
 fn record_supervised_phase(
     timings: &mut Vec<SupervisedPhaseTiming>,
     started: Instant,
@@ -22406,6 +22804,7 @@ fn record_supervised_phase(
     });
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_supervised_command_inner(
     command: &mut Command,
     input: &[u8],
@@ -22437,6 +22836,11 @@ fn run_supervised_command_inner(
     if let Some(policy) = &launch_policy {
         policy.wrap(command, bound_program)?;
     }
+    let pending_sealed = launch_policy
+        .as_ref()
+        .map(|policy| policy.wrap_memcordon_frontend(command, execution_deadline))
+        .transpose()?
+        .flatten();
     record_supervised_phase(&mut phase_timings, started, "policy-wrapped");
     let mut quiescence = QuiescenceGuard::new(launch_policy);
     command
@@ -22445,7 +22849,11 @@ fn run_supervised_command_inner(
         .stderr(Stdio::piped());
     let _ = completion_reaper_sender()?;
     require_before_deadline(execution_deadline, "child spawn")?;
-    let mut child = SupervisedChild::spawn(command)?;
+    let mut child = if pending_sealed.is_some() {
+        CandidateChild::SealedFrontend(FrontendChild::spawn(command)?)
+    } else {
+        CandidateChild::ProcessTree(SupervisedChild::spawn(command)?)
+    };
     record_supervised_phase(&mut phase_timings, started, "child-spawned");
 
     let cleanup_deadline = completion_deadline.unwrap_or(execution_deadline);
@@ -22465,7 +22873,7 @@ fn run_supervised_command_inner(
         cleanup_deadline,
     )
     .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
-    let (status, timed_out, termination) = finish_supervised_wait(
+    let (status, timed_out, termination, frontend_termination) = finish_supervised_wait(
         &wait,
         &mut child,
         &mut quiescence,
@@ -22494,6 +22902,10 @@ fn run_supervised_command_inner(
     join_writer_until(io.stdin, completion_deadline)
         .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
     record_supervised_phase(&mut phase_timings, started, "stdin-joined");
+    let sealed = pending_sealed
+        .map(|pending| pending.complete(status))
+        .transpose()
+        .map_err(|error| with_supervised_io_receipt(error, &io_receipt))?;
     #[cfg(windows)]
     let windows_launch_control = windows_launch_control
         .map(|authority| {
@@ -22511,6 +22923,10 @@ fn run_supervised_command_inner(
         stderr,
         timed_out,
         termination,
+        frontend_termination,
+        memcordon_report_path: sealed.as_ref().map(|value| value.report.clone()),
+        memcordon_report_sha256: sealed.as_ref().map(|value| value.digest),
+        memcordon_projection: sealed.map(|value| value.projection),
         phase_timings,
         prelaunch_evidence,
         candidate_quiescence_complete,
@@ -22521,13 +22937,18 @@ fn run_supervised_command_inner(
 
 fn finish_supervised_wait(
     wait: &WaitOutcome,
-    child: &mut SupervisedChild,
+    child: &mut CandidateChild,
     quiescence: &mut QuiescenceGuard,
     cleanup_deadline: Instant,
     io_receipt: &SupervisedIoReceipt,
     phase_timings: &mut Vec<SupervisedPhaseTiming>,
     started: Instant,
-) -> std::io::Result<(std::process::ExitStatus, bool, Option<TerminationReport>)> {
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    bool,
+    Option<TerminationReport>,
+    Option<FrontendTerminationReport>,
+)> {
     match wait {
         WaitOutcome::Exited(status) => {
             record_supervised_phase(phase_timings, started, "leader-exited");
@@ -22538,7 +22959,8 @@ fn finish_supervised_wait(
                 with_quiescence_after_error(error, quiescence, cleanup_deadline, io_receipt)
             })?;
             record_supervised_phase(phase_timings, started, "tree-terminated");
-            Ok((*status, false, Some(cleanup)))
+            let (tree, frontend) = split_candidate_termination(cleanup);
+            Ok((*status, false, tree, frontend))
         }
         WaitOutcome::DeadlineExpired => {
             record_supervised_phase(phase_timings, started, "deadline-expired");
@@ -22547,18 +22969,30 @@ fn finish_supervised_wait(
                     with_quiescence_after_error(error, quiescence, cleanup_deadline, io_receipt)
                 })?;
             record_supervised_phase(phase_timings, started, "tree-terminated");
-            if !termination.reaped {
+            let (tree, frontend) = split_candidate_termination(termination);
+            if tree.is_some_and(|report| !report.reaped)
+                || frontend.is_some_and(|report| !report.reaped)
+            {
                 return Err(std::io::Error::other(
-                    "timed-out process tree was not completely reaped",
+                    "timed-out child frontend was not completely reaped",
                 ));
             }
-            Ok((status, true, Some(termination)))
+            Ok((status, true, tree, frontend))
         }
     }
 }
 
+fn split_candidate_termination(
+    termination: CandidateTermination,
+) -> (Option<TerminationReport>, Option<FrontendTerminationReport>) {
+    match termination {
+        CandidateTermination::ProcessTree(report) => (Some(report), None),
+        CandidateTermination::Frontend(report) => (None, Some(report)),
+    }
+}
+
 fn spawn_supervised_io_with_cleanup(
-    child: &mut SupervisedChild,
+    child: &mut CandidateChild,
     quiescence: &mut QuiescenceGuard,
     input: &[u8],
     progress: Option<SupervisedProgressObserver>,
@@ -22574,7 +23008,7 @@ fn spawn_supervised_io_with_cleanup(
 }
 
 fn wait_supervised_child_until(
-    child: &mut SupervisedChild,
+    child: &mut CandidateChild,
     quiescence: &mut QuiescenceGuard,
     execution_deadline: Instant,
     cleanup_deadline: Instant,
@@ -22589,7 +23023,7 @@ fn wait_supervised_child_until(
 }
 
 fn cleanup_supervised_child_after_error(
-    child: &mut SupervisedChild,
+    child: &mut CandidateChild,
     quiescence: &mut QuiescenceGuard,
     deadline: Instant,
 ) -> std::io::Result<()> {
@@ -22845,7 +23279,7 @@ enum SupervisedIoProbe {
 }
 
 fn spawn_supervised_io_with_probe(
-    child: &mut SupervisedChild,
+    child: &mut CandidateChild,
     input: &[u8],
     progress: Option<SupervisedProgressObserver>,
     probe: SupervisedIoProbe,
@@ -23115,8 +23549,10 @@ fn verify_supervised_io_failure_receipts_for_integration() -> Result<(), String>
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = SupervisedChild::spawn(&mut command)
-            .map_err(|error| format!("cannot spawn supervised I/O launch fixture: {error}"))?;
+        let mut child = CandidateChild::ProcessTree(
+            SupervisedChild::spawn(&mut command)
+                .map_err(|error| format!("cannot spawn supervised I/O launch fixture: {error}"))?,
+        );
         let Err(error) = spawn_supervised_io_with_probe(&mut child, &[], None, probe) else {
             return Err("injected supervised I/O launch unexpectedly succeeded".to_owned());
         };
@@ -23142,8 +23578,10 @@ fn verify_supervised_io_failure_receipts_for_integration() -> Result<(), String>
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = SupervisedChild::spawn(&mut command)
-        .map_err(|error| format!("cannot spawn supervised I/O panic fixture: {error}"))?;
+    let mut child = CandidateChild::ProcessTree(
+        SupervisedChild::spawn(&mut command)
+            .map_err(|error| format!("cannot spawn supervised I/O panic fixture: {error}"))?,
+    );
     let tasks =
         spawn_supervised_io_with_probe(&mut child, &[], None, SupervisedIoProbe::PanicStdout)
             .map_err(|error| format!("cannot launch supervised I/O panic fixture: {error}"))?;

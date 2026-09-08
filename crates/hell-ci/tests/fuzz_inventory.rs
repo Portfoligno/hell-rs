@@ -11,7 +11,7 @@ static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 const MAX_FIXTURE_FILE_BYTES: u64 = 1024 * 1024;
 
-const REQUIRED_TARGETS: [&str; 31] = [
+const REQUIRED_TARGETS: [&str; 41] = [
     "strict_json",
     "release_plan",
     "conformance_plan",
@@ -43,6 +43,16 @@ const REQUIRED_TARGETS: [&str; 31] = [
     "independent_gnu_tar",
     "independent_subjects",
     "independent_publication_envelope",
+    "memcordon_runtime_lock",
+    "memcordon_runtime_manifest",
+    "memcordon_archive_member_policy",
+    "memcordon_schema8_wire",
+    "memcordon_native_argv",
+    "memcordon_operation_projection",
+    "memcordon_status_provenance",
+    "memcordon_deadline_and_admission",
+    "memcordon_provider_lifecycle",
+    "memcordon_windows_identity_receipt",
 ];
 
 const RETAINED_TARGETS: [&str; 5] = [
@@ -661,7 +671,7 @@ fn production_fuzz_inventory_check_binds_all_physical_targets_and_corpora() {
     );
     assert_eq!(
         fs::read_to_string(report).expect("fuzz inventory report must exist"),
-        "{\"requiredTargetCount\":31,\"retainedTargetCount\":5,\"schemaVersion\":1,\"state\":\"checked\",\"targetCount\":36}\n"
+        "{\"requiredTargetCount\":41,\"retainedTargetCount\":5,\"schemaVersion\":1,\"state\":\"checked\",\"targetCount\":46}\n"
     );
 }
 

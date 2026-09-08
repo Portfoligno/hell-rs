@@ -1,0 +1,33 @@
+schema-version = 1
+runtime-lock = "ci/memcordon-runtime-v1.toml"
+output-root = "platform-out/memcordon"
+download-cache = "ci-tool-cache/memcordon-downloads-v1"
+runtime-root = "ci-tool-cache/memcordon-runtime-v1"
+
+[operation.readiness]
+plan-kind = "readiness"
+required-operation-ids = ["readiness"]
+
+[operation.release]
+plan-kind = "release"
+required-operation-ids = ["release"]
+
+[operation.nightly]
+plan-kind = "nightly"
+required-operation-ids = ["nightly"]
+
+[operation.mutation]
+plan-kind = "mutation"
+required-operation-ids = ["mutation"]
+
+[operation.regression-corpus]
+plan-kind = "regression-corpus"
+required-operation-ids = ["regression-corpus"]
+
+[operation.regression-subject]
+plan-kind = "regression-subject"
+required-operation-ids = ["regression-subject"]
+
+[operation.fuzz]
+plan-kind = "fuzz"
+required-operation-ids = ["fuzz"]

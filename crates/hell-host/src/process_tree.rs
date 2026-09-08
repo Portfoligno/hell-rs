@@ -262,7 +262,7 @@ impl Clone for CleanupLease {
 }
 
 impl CleanupLease {
-    fn acquire() -> io::Result<Self> {
+    pub(crate) fn acquire() -> io::Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let tracker = late_termination_tracker();
         let mut admitted = tracker

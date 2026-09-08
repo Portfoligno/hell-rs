@@ -11,7 +11,7 @@ use crate::command::{CommandSpec, ResolvedCargoExecutable, resolve_cargo_executa
 use crate::command::{ResolvedStandardExecutable, resolve_standard_path_executable};
 use crate::json::{self, JsonValue};
 
-const REQUIRED_TARGETS: [&str; 31] = [
+const REQUIRED_TARGETS: [&str; 41] = [
     "strict_json",
     "release_plan",
     "conformance_plan",
@@ -43,7 +43,19 @@ const REQUIRED_TARGETS: [&str; 31] = [
     "independent_gnu_tar",
     "independent_subjects",
     "independent_publication_envelope",
+    "memcordon_runtime_lock",
+    "memcordon_runtime_manifest",
+    "memcordon_archive_member_policy",
+    "memcordon_schema8_wire",
+    "memcordon_native_argv",
+    "memcordon_operation_projection",
+    "memcordon_status_provenance",
+    "memcordon_deadline_and_admission",
+    "memcordon_provider_lifecycle",
+    "memcordon_windows_identity_receipt",
 ];
+
+const PRE_MEMCORDON_REQUIRED_TARGETS: usize = 31;
 
 const RETAINED_TARGETS: [&str; 5] = [
     "requirement_toml",
@@ -84,6 +96,16 @@ pub enum Target {
     GzipFraming,
     GnuTarSubset,
     ReleaseBundleInventory,
+    MemcordonRuntimeLock,
+    MemcordonRuntimeManifest,
+    MemcordonArchiveMemberPolicy,
+    MemcordonSchema8Wire,
+    MemcordonNativeArgv,
+    MemcordonOperationProjection,
+    MemcordonStatusProvenance,
+    MemcordonDeadlineAndAdmission,
+    MemcordonProviderLifecycle,
+    MemcordonWindowsIdentityReceipt,
 }
 
 impl Target {
@@ -108,6 +130,16 @@ impl Target {
             "gzip_framing" => Some(Self::GzipFraming),
             "gnu_tar_subset" => Some(Self::GnuTarSubset),
             "release_bundle_inventory" => Some(Self::ReleaseBundleInventory),
+            "memcordon_runtime_lock" => Some(Self::MemcordonRuntimeLock),
+            "memcordon_runtime_manifest" => Some(Self::MemcordonRuntimeManifest),
+            "memcordon_archive_member_policy" => Some(Self::MemcordonArchiveMemberPolicy),
+            "memcordon_schema8_wire" => Some(Self::MemcordonSchema8Wire),
+            "memcordon_native_argv" => Some(Self::MemcordonNativeArgv),
+            "memcordon_operation_projection" => Some(Self::MemcordonOperationProjection),
+            "memcordon_status_provenance" => Some(Self::MemcordonStatusProvenance),
+            "memcordon_deadline_and_admission" => Some(Self::MemcordonDeadlineAndAdmission),
+            "memcordon_provider_lifecycle" => Some(Self::MemcordonProviderLifecycle),
+            "memcordon_windows_identity_receipt" => Some(Self::MemcordonWindowsIdentityReceipt),
             _ => None,
         }
     }
@@ -176,8 +208,97 @@ pub fn exercise(target: Target, bytes: &[u8]) -> Result<(), FuzzFailure> {
             .and_then(|value| crate::release::governance::fuzz_parse_profile(&value)),
         Target::NativeEnvironment => canonical_value(bytes)
             .and_then(|value| crate::release::native_environment::fuzz_parse_receipt(&value)),
+        Target::MemcordonRuntimeLock => std::str::from_utf8(bytes)
+            .map_err(|_| "MemCordon runtime lock fuzz input is not UTF-8".to_owned())
+            .and_then(|text| {
+                hell_memcordon::RuntimeLock::parse(text).map_err(|error| error.to_string())
+            })
+            .map(|_| ()),
+        Target::MemcordonRuntimeManifest => hell_memcordon::RuntimeManifest::parse(bytes)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Target::MemcordonArchiveMemberPolicy => crate::memcordon::fuzz_archive_member_policy(bytes),
+        Target::MemcordonSchema8Wire => hell_memcordon::validate_schema8_wire(bytes)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Target::MemcordonNativeArgv => fuzz_native_argument(bytes),
+        Target::MemcordonOperationProjection => hell_memcordon::parse_schema8_projection(bytes)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Target::MemcordonStatusProvenance => canonical_value(bytes).and_then(|_| {
+            serde_json::from_slice::<hell_memcordon::SealedOperationReceiptV1>(bytes)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }),
+        Target::MemcordonDeadlineAndAdmission => fuzz_deadline_admission(bytes),
+        Target::MemcordonProviderLifecycle => fuzz_provider_lifecycle(bytes),
+        Target::MemcordonWindowsIdentityReceipt => canonical_value(bytes).and_then(|_| {
+            let receipt =
+                serde_json::from_slice::<hell_memcordon::WindowsCandidateIdentityReceiptV1>(bytes)
+                    .map_err(|error| error.to_string())?;
+            receipt.validate().map_err(|error| error.to_string())
+        }),
     };
     result.map_err(FuzzFailure::invalid)
+}
+
+fn fuzz_native_argument(bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    let value = {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::OsStr::from_bytes(bytes)
+    };
+    #[cfg(not(unix))]
+    let value = std::ffi::OsStr::new(
+        std::str::from_utf8(bytes)
+            .map_err(|_| "native argv fuzz input is not UTF-8 on this platform".to_owned())?,
+    );
+    hell_memcordon::NativeArgument::from_os_str(value)
+        .validate()
+        .map_err(str::to_owned)
+}
+
+fn fuzz_deadline_admission(bytes: &[u8]) -> Result<(), String> {
+    let execute_offset = u64::from(bytes.first().copied().unwrap_or(0)).saturating_add(1);
+    let complete_offset = execute_offset
+        .saturating_add(u64::from(bytes.get(1).copied().unwrap_or(0)))
+        .saturating_add(1);
+    let now = std::time::Instant::now();
+    let deadlines = hell_memcordon::AbsoluteDeadlines::new(
+        now + Duration::from_millis(execute_offset),
+        now + Duration::from_millis(complete_offset),
+    )
+    .map_err(|error| error.to_string())?;
+    let reserve = Duration::from_millis(u64::from(bytes.get(2).copied().unwrap_or(0)));
+    let _ = deadlines.inner_budget(now, reserve);
+    let admission = hell_memcordon::SealedAdmission::new(
+        usize::from(bytes.get(3).copied().unwrap_or(0)).saturating_add(1),
+    );
+    admission.close();
+    Ok(())
+}
+
+fn fuzz_provider_lifecycle(bytes: &[u8]) -> Result<(), String> {
+    use hell_memcordon::{ProviderLeaseStateMachine, ProviderLifecycleState};
+    const STATES: [ProviderLifecycleState; 10] = [
+        ProviderLifecycleState::Absent,
+        ProviderLifecycleState::Acquired,
+        ProviderLifecycleState::PackageInspected,
+        ProviderLifecycleState::Installing,
+        ProviderLifecycleState::Qualified,
+        ProviderLifecycleState::Running,
+        ProviderLifecycleState::Draining,
+        ProviderLifecycleState::Uninstalling,
+        ProviderLifecycleState::Removed,
+        ProviderLifecycleState::FailedDirty,
+    ];
+    let mut lifecycle = ProviderLeaseStateMachine::default();
+    for byte in bytes.iter().take(64) {
+        lifecycle
+            .transition(STATES[usize::from(*byte) % STATES.len()])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn canonical_value(bytes: &[u8]) -> Result<JsonValue, String> {
@@ -264,18 +385,23 @@ pub fn recognizes(arguments: &[OsString]) -> bool {
 /// Returns an error when command arguments, the manifest, the physical fuzz
 /// inventory, a campaign, or report persistence fails.
 pub fn run_cli(arguments: &[OsString]) -> Result<String, String> {
-    let (command, manifest, repository_root, output) = parse_cli_options(arguments)?;
+    let (command, manifest, repository_root, work_root, output) = parse_cli_options(arguments)?;
+    let work_root = fs::canonicalize(&work_root)
+        .map_err(|error| format!("cannot canonicalize fuzz work root: {error}"))?;
+    if !work_root.is_dir() {
+        return Err("fuzz work root is not a directory".to_owned());
+    }
     if output.exists() {
         return Err("fuzz check output already exists".to_owned());
     }
     let result = check_manifest(&manifest, &repository_root)
-        .and_then(|inventory| fuzz_report(&command, &inventory, &repository_root));
+        .and_then(|inventory| fuzz_report(&command, &inventory, &repository_root, &work_root));
     persist_fuzz_result(&command, &output, result)
 }
 
 fn parse_cli_options(
     arguments: &[OsString],
-) -> Result<(String, PathBuf, PathBuf, PathBuf), String> {
+) -> Result<(String, PathBuf, PathBuf, PathBuf, PathBuf), String> {
     let command = arguments
         .get(1)
         .and_then(|value| value.to_str())
@@ -283,6 +409,7 @@ fn parse_cli_options(
         .to_owned();
     let mut manifest = None;
     let mut repository_root = None;
+    let mut work_root = None;
     let mut output = None;
     let mut index = 2;
     while index < arguments.len() {
@@ -297,8 +424,9 @@ fn parse_cli_options(
             "--repository-root" if repository_root.is_none() => {
                 repository_root = Some(PathBuf::from(value));
             }
+            "--work-root" if work_root.is_none() => work_root = Some(PathBuf::from(value)),
             "--output" if output.is_none() => output = Some(PathBuf::from(value)),
-            "--manifest" | "--repository-root" | "--output" => {
+            "--manifest" | "--repository-root" | "--work-root" | "--output" => {
                 return Err(format!("{flag} was provided more than once"));
             }
             _ => return Err(format!("unknown fuzz option {flag:?}")),
@@ -308,48 +436,52 @@ fn parse_cli_options(
     let manifest = manifest.ok_or_else(|| "fuzz command requires --manifest".to_owned())?;
     let repository_root =
         repository_root.ok_or_else(|| "fuzz command requires --repository-root".to_owned())?;
+    let work_root = work_root.unwrap_or_else(|| repository_root.clone());
     let output = output.ok_or_else(|| "fuzz command requires --output".to_owned())?;
-    Ok((command, manifest, repository_root, output))
+    Ok((command, manifest, repository_root, work_root, output))
 }
 
 fn fuzz_report(
     command: &str,
     inventory: &Manifest,
     repository_root: &Path,
+    work_root: &Path,
 ) -> Result<JsonValue, FuzzDiagnostic> {
     if command == "smoke" {
-        execute_cargo_fuzz_campaigns(inventory, repository_root).map(|(tools, results)| {
-            object([
-                ("requiredTargetCount", number(31)),
-                ("retainedTargetCount", number(5)),
-                ("schemaVersion", number(1)),
-                ("state", string("passed")),
-                ("targetCount", number(36)),
-                (
-                    "targetResults",
-                    JsonValue::Array(results.iter().map(target_result_json).collect()),
-                ),
-                (
-                    "toolReceipt",
-                    object([
-                        ("cargoExecutableSha256", string(&tools.cargo_sha256)),
-                        (
-                            "cargoFuzzExecutableSha256",
-                            string(&tools.cargo_fuzz_sha256),
-                        ),
-                        ("cargoFuzzVersion", string("0.13.2")),
-                        ("toolchain", string("nightly-2026-07-31")),
-                    ]),
-                ),
-            ])
-        })
+        execute_cargo_fuzz_campaigns(inventory, repository_root, work_root).map(
+            |(tools, results)| {
+                object([
+                    ("requiredTargetCount", number(41)),
+                    ("retainedTargetCount", number(5)),
+                    ("schemaVersion", number(1)),
+                    ("state", string("passed")),
+                    ("targetCount", number(46)),
+                    (
+                        "targetResults",
+                        JsonValue::Array(results.iter().map(target_result_json).collect()),
+                    ),
+                    (
+                        "toolReceipt",
+                        object([
+                            ("cargoExecutableSha256", string(&tools.cargo_sha256)),
+                            (
+                                "cargoFuzzExecutableSha256",
+                                string(&tools.cargo_fuzz_sha256),
+                            ),
+                            ("cargoFuzzVersion", string("0.13.2")),
+                            ("toolchain", string("nightly-2026-07-31")),
+                        ]),
+                    ),
+                ])
+            },
+        )
     } else if command == "check" {
         Ok(object([
-            ("requiredTargetCount", number(31)),
+            ("requiredTargetCount", number(41)),
             ("retainedTargetCount", number(5)),
             ("schemaVersion", number(1)),
             ("state", string("checked")),
-            ("targetCount", number(36)),
+            ("targetCount", number(46)),
         ]))
     } else {
         Err(FuzzDiagnostic::new("fuzz.command.invalid", fuzz_usage()))
@@ -393,7 +525,7 @@ fn persist_fuzz_result(
 }
 
 fn fuzz_usage() -> String {
-    "usage: hell-ci fuzz check|smoke --manifest PATH --repository-root PATH --output PATH"
+    "usage: hell-ci fuzz check|smoke --manifest PATH --repository-root PATH [--work-root PATH] --output PATH"
         .to_owned()
 }
 
@@ -417,6 +549,22 @@ fn check_manifest(path: &Path, repository_root: &Path) -> Result<Manifest, FuzzD
     verify_registry(&manifest)?;
     verify_physical_inventory(&manifest, &repository_root)?;
     Ok(manifest)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn checked_target_ids(
+    path: &Path,
+    repository_root: &Path,
+) -> Result<BTreeSet<String>, String> {
+    check_manifest(path, repository_root)
+        .map(|manifest| {
+            manifest
+                .targets
+                .into_iter()
+                .map(|target| target.id)
+                .collect()
+        })
+        .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
 }
 
 fn parse_manifest(text: &str) -> Result<Manifest, FuzzDiagnostic> {
@@ -594,14 +742,20 @@ fn verify_registry(manifest: &Manifest) -> Result<(), FuzzDiagnostic> {
         .iter()
         .map(|target| target.id.as_str())
         .collect::<Vec<_>>();
-    let expected = REQUIRED_TARGETS
-        .into_iter()
+    let expected = REQUIRED_TARGETS[..PRE_MEMCORDON_REQUIRED_TARGETS]
+        .iter()
+        .copied()
         .chain(RETAINED_TARGETS)
+        .chain(
+            REQUIRED_TARGETS[PRE_MEMCORDON_REQUIRED_TARGETS..]
+                .iter()
+                .copied(),
+        )
         .collect::<Vec<_>>();
     if observed != expected {
         return Err(FuzzDiagnostic::new(
             "fuzz.manifest.inventory",
-            "fuzz manifest differs from the exact ordered 31 required plus 5 retained targets",
+            "fuzz manifest differs from the exact ordered 41 required plus 5 retained targets",
         ));
     }
     for target in &manifest.targets {
@@ -707,6 +861,7 @@ fn verify_physical_inventory(
 fn execute_cargo_fuzz_campaigns(
     manifest: &Manifest,
     repository_root: &Path,
+    work_root: &Path,
 ) -> Result<(FuzzToolReceipt, Vec<TargetResult>), FuzzDiagnostic> {
     if manifest.toolchain != "nightly-2026-07-31"
         || manifest.cargo_fuzz_version != "0.13.2"
@@ -728,8 +883,8 @@ fn execute_cargo_fuzz_campaigns(
                 .map(|snapshot| (target.id.clone(), snapshot))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let staged_corpora = stage_corpora(manifest, repository_root, &source_snapshots)?;
-    let artifact_root = repository_root.join("ci-out").join("fuzz-artifacts");
+    let staged_corpora = stage_corpora(manifest, repository_root, work_root, &source_snapshots)?;
+    let artifact_root = work_root.join("ci-out").join("fuzz-artifacts");
     if artifact_root.exists() {
         return Err(FuzzDiagnostic::new(
             "fuzz.artifact.invalid",
@@ -745,6 +900,7 @@ fn execute_cargo_fuzz_campaigns(
     let results = execute_campaigns(
         manifest,
         repository_root,
+        work_root,
         &tools,
         &source_snapshots,
         &staged_corpora,
@@ -756,6 +912,7 @@ fn execute_cargo_fuzz_campaigns(
 fn execute_campaigns(
     manifest: &Manifest,
     repository_root: &Path,
+    work_root: &Path,
     tools: &FuzzToolReceipt,
     source_snapshots: &BTreeMap<String, CorpusSnapshot>,
     staged_corpora: &BTreeMap<String, PathBuf>,
@@ -763,7 +920,7 @@ fn execute_campaigns(
     let mut results = Vec::with_capacity(manifest.targets.len());
     for target in &manifest.targets {
         let (command_timeout, staged_corpus, arguments) =
-            prepare_campaign(manifest, repository_root, target, staged_corpora)?;
+            prepare_campaign(manifest, work_root, target, staged_corpora)?;
         #[cfg(unix)]
         let command = unix_cargo_fuzz_command(
             &manifest.toolchain,
@@ -848,11 +1005,11 @@ fn execute_campaigns(
 
 fn prepare_campaign(
     manifest: &Manifest,
-    repository_root: &Path,
+    work_root: &Path,
     target: &ManifestTarget,
     staged_corpora: &BTreeMap<String, PathBuf>,
 ) -> Result<(u64, PathBuf, Vec<OsString>), FuzzDiagnostic> {
-    let artifact_directory = repository_root.join(&target.artifact_directory);
+    let artifact_directory = work_root.join(&target.artifact_directory);
     fs::create_dir(&artifact_directory).map_err(|error| {
         FuzzDiagnostic::new(
             "fuzz.artifact.invalid",
@@ -875,6 +1032,16 @@ fn prepare_campaign(
             "staged fuzz corpus binding is missing",
         )
     })?;
+    let engine_arguments = target.engine_arguments.iter().map(|argument| {
+        if argument.starts_with("-artifact_prefix=") {
+            OsString::from(format!(
+                "-artifact_prefix={}/",
+                artifact_directory.display()
+            ))
+        } else {
+            OsString::from(argument)
+        }
+    });
     let arguments = [
         OsString::from("fuzz"),
         OsString::from("run"),
@@ -885,7 +1052,7 @@ fn prepare_campaign(
         OsString::from("--"),
     ]
     .into_iter()
-    .chain(target.engine_arguments.iter().map(OsString::from))
+    .chain(engine_arguments)
     .collect();
     Ok((command_timeout, staged_corpus, arguments))
 }
@@ -1142,9 +1309,10 @@ fn target_result_json(result: &TargetResult) -> JsonValue {
 fn stage_corpora(
     manifest: &Manifest,
     repository_root: &Path,
+    work_root: &Path,
     source_snapshots: &BTreeMap<String, CorpusSnapshot>,
 ) -> Result<BTreeMap<String, PathBuf>, FuzzDiagnostic> {
-    let staging_root = repository_root.join("ci-out").join("fuzz-corpora");
+    let staging_root = work_root.join("ci-out").join("fuzz-corpora");
     if staging_root.exists() {
         return Err(FuzzDiagnostic::new(
             "fuzz.corpus.staging",

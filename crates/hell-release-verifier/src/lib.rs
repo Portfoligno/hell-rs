@@ -2,6 +2,7 @@ mod archive;
 mod digest;
 mod external_inputs;
 mod json;
+mod memcordon_rc23;
 mod model;
 mod verifier;
 
@@ -10,7 +11,19 @@ pub mod fuzz;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub use memcordon_rc23::{
+    ExpectedMemcordonFinalization, ExpectedMemcordonReport, ExpectedNativeArgument,
+    ExpectedTermination, MemcordonFinalizationDocuments, MemcordonPlatform,
+    ValidatedMemcordonFinalization, ValidatedMemcordonReport, validate_memcordon_rc23_finalization,
+    validate_memcordon_rc23_projection, validate_memcordon_rc23_report,
+};
 pub use verifier::{Options as VerifyOptions, verify, verify_envelope, verify_vectors};
+
+#[doc(hidden)]
+#[must_use]
+pub fn independent_sha256_for_test(bytes: &[u8]) -> String {
+    digest::sha256_hex(bytes)
+}
 
 /// Reconstructs the independently parsed external-input-lock digest.
 ///

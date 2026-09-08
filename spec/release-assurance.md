@@ -240,6 +240,56 @@ unclassified mismatch, all obligations consumed, and every planned exemption
 consumed exactly once. `NotApplicable`, `Excluded`, and `Exempted` remain
 distinct and are never added to verified totals.
 
+## MemCordon sealed execution evidence
+
+Every Linux x86-64 and Windows x86-64 candidate-root operation is launched
+through the digest-pinned MemCordon `0.5.2-rc.23` runtime after package
+inspection, provider installation, qualification, and an adoption canary. The
+trusted plan supplies the required operation ids. A producer cannot shrink
+coverage to the reports it happened to create, and no standard-boundary
+fallback can satisfy a sealed operation.
+
+The candidate remains inside the repository's existing identity and writable-
+root policy. MemCordon supplies the outer process-tree boundary and terminal
+retirement proof. On Linux this encloses the trusted candidate identity
+adapter. On Windows it encloses the restricted-token identity adapter without
+creating a competing production Job. macOS retains its existing native
+confinement and does not emit MemCordon evidence.
+
+Each operation binds the exact native argument vector, inner attempt deadline,
+raw schema-8 report, normalized projection, mechanism, status provenance, and
+all generic and platform-native launch and retirement predicates. The tagged
+terminal projection distinguishes candidate exit (including candidate exit
+124), Unix signal, and MemCordon inner deadline. A wide Windows native status
+is preserved as `u32` even when the portable frontend status is 125.
+
+Primary parsing is implemented by `hell-memcordon`; the independent
+`hell-release-verifier` has a separate bounded JSON model and does not link the
+provider or primary parser. Both paths close unknown fields, require exactly
+one non-restarted sealed attempt, compare raw and normalized semantics, and
+reject incomplete native predicate inventories. Finalization additionally
+recomputes the provider-cleanup, operation-ledger, and inventory digests and
+requires every raw-report, normalized-report, and Windows adapter reference to
+match that finalized inventory.
+
+Provider cleanup is release evidence rather than best effort. The platform is
+blocked unless cleanup reaches `removed`, the installed footprint is absent,
+zero operations remain active, and no cleanup failure is recorded. The final
+receipt binds that result to the candidate commit, workflow commit, runtime
+lock digest, exact required and observed operation sets, and immutable
+inventory. See [`memcordon-integration.md`](memcordon-integration.md) for the
+normative consumer contract and artifact layout.
+
+Linux and Windows platform execution emits a provisional report only. Cleanup
+finalization replaces it with the immutable schema-v3 platform report and
+binds the finalized MemCordon receipt and inventory digests. Assembly retains
+the exact inventory-bound MemCordon subtree in the conformance evidence
+archive. The primary bundle verifier reprojects it with `hell-memcordon`; the
+independent verifier separately reparses every raw report, normalized
+projection, ledger entry, cleanup receipt, finalization receipt, and platform
+binding. Missing or substituted finalization bytes are release-protocol
+negative vectors.
+
 ## Blocking gates and evidence retention
 
 The ordered Linux gate inventory is `runner-identity`,

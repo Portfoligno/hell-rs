@@ -56,3 +56,65 @@ package = "cargo-fuzz"
 version = "0.13.2"
 toolchain = "nightly-2026-07-31"
 acquisition-phase = "fuzz"
+
+[[input]]
+id = "memcordon-release-manifest"
+kind = "https-file"
+sha256 = "39127a1aefe3d4ca5b657b31cd2fe043dcc808cf9390d45c11a553ee680c7ca9"
+maximum-compressed-bytes = 11529
+maximum-expanded-bytes = 2097152
+media-type = "application/json"
+timeout-seconds = 90
+expected-filename = "release-manifest.json"
+acquisition-phase = "native-platform"
+cache-permitted = true
+
+[[input]]
+id = "memcordon-publication-report"
+kind = "https-file"
+sha256 = "f1423382eaf7a9549c9af141a9bc172d8ee613d04af6f08a8fcda71a68c3053a"
+maximum-compressed-bytes = 11698
+maximum-expanded-bytes = 2097152
+media-type = "application/json"
+timeout-seconds = 90
+expected-filename = "publication-report.json"
+acquisition-phase = "native-platform"
+cache-permitted = true
+
+[[input]]
+id = "memcordon-sha256sums"
+kind = "https-file"
+sha256 = "4fc5d1d91a719e591ceed70bb5b26c02088ed93e370356515b12a089a66379cc"
+maximum-compressed-bytes = 709
+maximum-expanded-bytes = 2097152
+media-type = "text/plain"
+timeout-seconds = 90
+expected-filename = "SHA256SUMS"
+acquisition-phase = "native-platform"
+cache-permitted = true
+
+[[input]]
+id = "memcordon-linux-x86-64-runtime"
+kind = "https-file"
+sha256 = "839c4918eef67be4e6a773e7f0840d0665480a4c0d874c72432a208315db479d"
+maximum-compressed-bytes = 3133920
+maximum-expanded-bytes = 134217728
+media-type = "application/gzip"
+timeout-seconds = 300
+expected-filename = "memcordon-v0.5.2-rc.23-x86_64-unknown-linux-gnu.tar.gz"
+platforms = ["linux-x86_64"]
+acquisition-phase = "native-platform"
+cache-permitted = true
+
+[[input]]
+id = "memcordon-windows-x86-64-runtime"
+kind = "https-file"
+sha256 = "90047dd584bcec2206314aeccf6555d51c4c123f7769a89a29489b0e06316278"
+maximum-compressed-bytes = 6326811
+maximum-expanded-bytes = 134217728
+media-type = "application/zip"
+timeout-seconds = 300
+expected-filename = "memcordon-v0.5.2-rc.23-x86_64-pc-windows-msvc.zip"
+platforms = ["windows-x86_64"]
+acquisition-phase = "native-platform"
+cache-permitted = true

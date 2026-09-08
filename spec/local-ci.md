@@ -124,6 +124,44 @@ target/ci/hell-ci fuzz smoke --manifest ci/fuzz-targets.toml --repository-root .
 
 Use fresh output paths when repeating artifact-producing commands.
 
+## MemCordon native boundary
+
+Linux x86-64 and Windows x86-64 candidate-root gates require the exact
+MemCordon runtime declared by `ci/memcordon-runtime-v1.toml`. Acquisition is
+unprivileged and cacheable only as verified download bytes. Provider
+installation, qualification, admission, execution evidence, and cleanup are
+host-local and must be repeated on every fresh native host.
+
+Run the lifecycle with typed task arguments rather than environment aliases:
+
+```text
+target/ci/hell-ci memcordon acquire --task ci/memcordon-tasks-v1.toml --operation readiness
+target/ci/hell-ci memcordon prepare --task ci/memcordon-tasks-v1.toml --operation readiness
+target/ci/hell-ci memcordon canary --task ci/memcordon-tasks-v1.toml --operation readiness
+target/ci/hell-ci memcordon cleanup --task ci/memcordon-tasks-v1.toml --operation readiness
+target/ci/hell-ci memcordon finalize --task ci/memcordon-tasks-v1.toml --operation readiness
+```
+
+Replace `readiness` with `release`, `nightly`, `mutation`,
+`regression-corpus`, `regression-subject`, or `fuzz` only for the corresponding
+committed task. Cleanup is required after preparation even when a candidate
+operation fails. Finalization admits no result until provider removal and
+absence are proven, active operation count is zero, and the exact required
+operation set has matching raw and normalized report digests. The fixed
+artifacts are written beneath `platform-out/memcordon`; use a fresh directory
+when repeating the lifecycle.
+
+For readiness and release, the native platform command writes only
+`platform-report.provisional.json`. The finalizer creates the sole admissible
+schema-v3 `platform-report.json` after cleanup, binds the MemCordon
+finalization, inventory, runtime-lock digest, and exact operation set, then
+retires the provisional file. Assembly rejects either a missing final report
+or a surviving provisional report.
+
+macOS does not run these commands and does not claim a MemCordon boundary. It
+continues to use the existing process-group/watchdog and uid-wide quiescence
+checks documented below.
+
 ## Native and hosted boundaries
 
 Use a clean committed candidate checkout on each native operating system and a

@@ -247,6 +247,69 @@ const WINDOWS_TOOLCHAIN_CONSTRUCTION_CLEANUP_RESERVE: Duration = Duration::from_
 #[cfg(windows)]
 const WINDOWS_TOOLCHAIN_LIFECYCLE_EXECUTION_BUDGET: Duration = Duration::from_mins(120);
 
+const MEMCORDON_INNER_CLEANUP_RESERVE: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Debug)]
+struct MemcordonLaunchAuthority {
+    runtime: hell_testkit::BoundProgramInvocation,
+    report_directory: PathBuf,
+    mechanism: String,
+    admission: hell_memcordon::SealedAdmission,
+}
+
+impl MemcordonLaunchAuthority {
+    fn bind(
+        platform: ReleasePlatform,
+        task_path: Option<&Path>,
+        operation: &str,
+    ) -> Result<Option<Self>, String> {
+        if platform == ReleasePlatform::MacosAarch64 {
+            if task_path.is_some() {
+                return Err(
+                    "macOS release platform must not receive MemCordon authority".to_owned(),
+                );
+            }
+            return Ok(None);
+        }
+        let task_path = task_path.ok_or_else(|| {
+            format!(
+                "{} platform requires --memcordon-task after provider qualification",
+                platform.id()
+            )
+        })?;
+        let qualified = crate::memcordon::qualified_policy(task_path, operation)?;
+        let runtime =
+            hell_testkit::BoundProgramInvocation::new(qualified.runtime.clone(), qualified.runtime)
+                .map_err(|error| format!("cannot bind qualified MemCordon runtime: {error}"))?;
+        let admission = if platform == ReleasePlatform::WindowsX86_64 {
+            hell_memcordon::SealedAdmission::windows_default()
+        } else {
+            hell_memcordon::SealedAdmission::new(1)
+        };
+        Ok(Some(Self {
+            runtime,
+            report_directory: qualified.report_directory,
+            mechanism: qualified.mechanism,
+            admission,
+        }))
+    }
+
+    fn attach(
+        &self,
+        policy: hell_testkit::CandidateLaunchPolicy,
+    ) -> Result<hell_testkit::CandidateLaunchPolicy, String> {
+        policy
+            .with_memcordon_sealed(
+                self.runtime.clone(),
+                self.report_directory.clone(),
+                self.mechanism.clone(),
+                self.admission.clone(),
+                MEMCORDON_INNER_CLEANUP_RESERVE,
+            )
+            .map_err(|error| format!("cannot activate qualified MemCordon policy: {error}"))
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 struct WindowsToolchainConstructionEnvelope {
@@ -284,6 +347,7 @@ struct PlatformRunAuthority {
     oracle_source: PathBuf,
     output: PathBuf,
     workspace_target: PathBuf,
+    memcordon: Option<MemcordonLaunchAuthority>,
     runner_identity: (String, String),
     image_os: String,
     image_version: String,
@@ -300,17 +364,33 @@ struct PlatformRunAuthority {
     windows_ghc: super::native_environment::WindowsNativeGhcAuthority,
 }
 
+pub(crate) struct PlatformRunRequest {
+    pub(crate) platform: ReleasePlatform,
+    pub(crate) plan_path: PathBuf,
+    pub(crate) conformance_plan_path: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) oracle_source: PathBuf,
+    pub(crate) output: PathBuf,
+    pub(crate) memcordon_task: Option<PathBuf>,
+    pub(crate) memcordon_operation: &'static str,
+}
+
 fn prepare_platform_run_authority(
-    platform: ReleasePlatform,
-    plan_path: &Path,
-    conformance_plan_path: &Path,
-    root: PathBuf,
-    oracle_source: PathBuf,
-    output: PathBuf,
+    request: PlatformRunRequest,
 ) -> Result<PlatformRunAuthority, String> {
+    let PlatformRunRequest {
+        platform,
+        plan_path,
+        conformance_plan_path,
+        root,
+        oracle_source,
+        output,
+        memcordon_task,
+        memcordon_operation,
+    } = request;
     let environment = ProcessEnvironment::from_process();
-    let plan = ReleasePlan::parse(&read_json(plan_path)?)?;
-    let conformance_plan = validate_conformance_plan(&plan, conformance_plan_path)?;
+    let plan = ReleasePlan::parse(&read_json(&plan_path)?)?;
+    let conformance_plan = validate_conformance_plan(&plan, &conformance_plan_path)?;
     let root = fs::canonicalize(root)
         .map_err(|error| format!("cannot canonicalize candidate root: {error}"))?;
     let oracle_source = fs::canonicalize(oracle_source)
@@ -352,6 +432,8 @@ fn prepare_platform_run_authority(
         return Err("candidate target directory is not absolute".to_owned());
     }
     require_candidate_target(&root, &workspace_target)?;
+    let memcordon =
+        MemcordonLaunchAuthority::bind(platform, memcordon_task.as_deref(), memcordon_operation)?;
     Ok(PlatformRunAuthority {
         platform,
         plan,
@@ -360,6 +442,7 @@ fn prepare_platform_run_authority(
         oracle_source,
         output,
         workspace_target,
+        memcordon,
         runner_identity,
         image_os,
         image_version,
@@ -400,24 +483,8 @@ fn prepare_platform_output(
     )
 }
 
-pub(crate) fn run(
-    platform: ReleasePlatform,
-    plan_path: impl Into<PathBuf>,
-    conformance_plan_path: impl Into<PathBuf>,
-    root: PathBuf,
-    oracle_source: PathBuf,
-    output: PathBuf,
-) -> Result<String, String> {
-    let plan_path = plan_path.into();
-    let conformance_plan_path = conformance_plan_path.into();
-    let authority = prepare_platform_run_authority(
-        platform,
-        &plan_path,
-        &conformance_plan_path,
-        root,
-        oracle_source,
-        output,
-    )?;
+pub(crate) fn run(request: PlatformRunRequest) -> Result<String, String> {
+    let authority = prepare_platform_run_authority(request)?;
     let mut confinement = establish_candidate_process_confinement(&CandidateConfinementInput {
         platform: authority.platform,
         candidate_root: &authority.root,
@@ -427,6 +494,7 @@ pub(crate) fn run(
         candidate_sha: &authority.plan.resolution.candidate_sha,
         workspace_target: &authority.workspace_target,
         output: &authority.output,
+        memcordon: authority.memcordon.as_ref(),
         #[cfg(windows)]
         environment: &authority.environment,
         #[cfg(windows)]
@@ -465,6 +533,7 @@ fn execute_confined_platform(
         oracle_source,
         output,
         workspace_target,
+        memcordon: _,
         runner_identity,
         image_os,
         image_version,
@@ -1416,7 +1485,12 @@ fn write_platform_reports(input: &PlatformReportInput<'_>) -> Result<(), String>
         .object()?
         .clone();
     let report = build_platform_report(input, &conformance_gate)?;
-    write_json(&input.output.join("platform-report.json"), &report)?;
+    let platform_report = if input.platform == ReleasePlatform::MacosAarch64 {
+        input.output.join("platform-report.json")
+    } else {
+        input.output.join("platform-report.provisional.json")
+    };
+    write_json(&platform_report, &report)?;
     write_json(
         &input.output.join("package-report.json"),
         &object([
@@ -1495,7 +1569,8 @@ fn build_platform_report(
         ),
         ("runAttempt", number(input.plan.resolution.run_attempt)),
         ("runId", number(input.plan.resolution.run_id)),
-        ("schemaVersion", number(2)),
+        ("memcordon", JsonValue::Null),
+        ("schemaVersion", number(3)),
         ("state", string("passed")),
         ("tag", string(&input.plan.tag)),
         ("toolIdentities", JsonValue::Object(input.tools.clone())),
@@ -1535,6 +1610,7 @@ struct CandidateConfinementInput<'a> {
     candidate_sha: &'a str,
     workspace_target: &'a Path,
     output: &'a Path,
+    memcordon: Option<&'a MemcordonLaunchAuthority>,
     #[cfg(windows)]
     environment: &'a ProcessEnvironment,
     #[cfg(windows)]
@@ -1804,6 +1880,7 @@ struct PosixCandidateLaunchInput<'a> {
     stack_protection: Option<&'a PosixAdapterProtection>,
     stack_root: Option<&'a PosixStackRootProtection>,
     source_stage: &'a PosixCandidateSourceStage,
+    memcordon: Option<&'a MemcordonLaunchAuthority>,
 }
 
 #[cfg(unix)]
@@ -1867,6 +1944,10 @@ fn build_posix_candidate_launch_policy(
         writable_roots,
     )
     .map_err(|error| format!("cannot establish candidate launch policy: {error}"))?;
+    let policy = match input.memcordon {
+        Some(authority) => authority.attach(policy)?,
+        None => policy,
+    };
     preflight_posix_driver_receipt_as_candidate(
         input.source_stage.candidate_target.path(),
         &input.source_stage.isolated,
@@ -1990,6 +2071,7 @@ fn establish_candidate_process_confinement(
         stack_protection: stack_protection.as_ref(),
         stack_root: stack_root_protection.as_ref(),
         source_stage: &source_stage,
+        memcordon: input.memcordon,
     })?;
     Ok(CandidateConfinement {
         policy: Some(policy),
@@ -2553,6 +2635,7 @@ pub(crate) fn verify_windows_candidate_target_authority_for_integration() -> Res
                 candidate_sha: "0000000000000000000000000000000000000000",
                 workspace_target: &target,
                 output: &output,
+                memcordon: None,
                 environment: &process_environment,
                 windows_ghc: &windows_ghc,
             },
@@ -15302,7 +15385,7 @@ fn establish_candidate_process_confinement(
                     rustup.rustc().canonical(),
                 )
             })?;
-        hell_testkit::CandidateLaunchPolicy::windows(
+        let policy = hell_testkit::CandidateLaunchPolicy::windows(
             hell_testkit::WindowsLaunchAuthorities::new(
                 launcher,
                 restricted_adapter,
@@ -15311,7 +15394,11 @@ fn establish_candidate_process_confinement(
             .map_err(|error| format!("cannot bind Windows launch authorities: {error}"))?,
             vec![target.to_path_buf()],
         )
-        .map_err(|error| format!("cannot establish Windows candidate launch policy: {error}"))
+        .map_err(|error| format!("cannot establish Windows candidate launch policy: {error}"))?;
+        match input.memcordon {
+            Some(authority) => authority.attach(policy),
+            None => Ok(policy),
+        }
     }));
     let policy = match setup {
         Ok(Ok(policy)) => policy,
@@ -15406,6 +15493,523 @@ fn windows_toolchain_executable_authority(
     }
 }
 
+/// Dedicated-UID launch authority for one non-release Linux MemCordon root.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxMemcordonLaunchAuthority {
+    policy: Option<hell_testkit::CandidateLaunchPolicy>,
+    executable: PathBuf,
+    work_root: PathBuf,
+    cargo_home: PathBuf,
+    cargo_target: PathBuf,
+    home: PathBuf,
+    temporary: PathBuf,
+    tool_path: OsString,
+    rustc: PathBuf,
+    rustup_home: PathBuf,
+    rustup_toolchain: OsString,
+    work_identity: PosixObjectIdentity,
+    original_group: u32,
+    original_mode: u32,
+    retained: bool,
+    sudo: PathBuf,
+    principal: Option<PosixPrincipalCleanup>,
+    adapter: Option<PosixAdapterProtection>,
+    cargo_adapter: Option<PosixAdapterProtection>,
+    rustup: Option<PosixRustupProtection>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxMemcordonLaunchAuthority {
+    pub(crate) fn acquire_until(
+        workspace_root: &Path,
+        work_root: &Path,
+        deadline: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if Instant::now() >= deadline || deadline >= cleanup_deadline {
+            return Err("Linux MemCordon authority deadlines are not ordered".to_owned());
+        }
+        let workspace_root = fs::canonicalize(workspace_root)
+            .map_err(|error| format!("cannot canonicalize Linux operation root: {error}"))?;
+        let work_metadata = fs::symlink_metadata(work_root)
+            .map_err(|error| format!("cannot inspect Linux operation writable root: {error}"))?;
+        let work_root = fs::canonicalize(work_root).map_err(|error| {
+            format!("cannot canonicalize Linux operation writable root: {error}")
+        })?;
+        if work_metadata.file_type().is_symlink()
+            || !work_metadata.is_dir()
+            || !work_root.starts_with(&workspace_root)
+            || fs::read_dir(&work_root)
+                .map_err(|error| {
+                    format!("cannot enumerate Linux operation writable root: {error}")
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(
+                "Linux operation writable root must be one empty canonical workspace directory"
+                    .to_owned(),
+            );
+        }
+        let process_authorities = ResolvedPosixProcessAuthorities::resolve()?;
+        let sudo = process_authorities.sudo.invocation_path().to_path_buf();
+        let (principal_name, principal_group, principal_id, mut principal) =
+            allocate_linux_candidate_principal(&process_authorities, "hellmcd")?;
+        principal.deadline = Some(cleanup_deadline);
+        let identity_output = exact_posix_candidate_identity_output(
+            &process_authorities.identity,
+            "-G",
+            &principal_name,
+            "MemCordon candidate group inventory",
+        )?;
+        let group_ids = posix_candidate_group_inventory(&identity_output, principal_id)
+            .ok_or_else(|| {
+                "Linux MemCordon candidate group inventory is not canonical".to_owned()
+            })?;
+        if group_ids.contains(&work_metadata.gid()) {
+            return Err(
+                "Linux MemCordon candidate unexpectedly belongs to the trusted runner group"
+                    .to_owned(),
+            );
+        }
+        let current_exe = fs::canonicalize(
+            std::env::current_exe()
+                .map_err(|error| format!("cannot resolve Linux MemCordon adapter: {error}"))?,
+        )
+        .map_err(|error| format!("cannot canonicalize Linux MemCordon adapter: {error}"))?;
+        let adapter =
+            stage_posix_executable(ReleasePlatform::LinuxX86_64, &sudo, &current_exe, "hell-ci")?;
+        let cargo = crate::command::resolve_standard_cargo_executable()?;
+        let cargo_authority =
+            crate::command::resolve_posix_cargo_authority(&cargo, &workspace_root)?;
+        let rustup_authority = match &cargo_authority {
+            crate::command::ResolvedPosixCargoAuthority::Rustup(authority) => authority,
+            crate::command::ResolvedPosixCargoAuthority::Native { .. } => {
+                return reject_native_posix_cargo_authority();
+            }
+        };
+        let rustup =
+            stage_posix_rustup_authority(ReleasePlatform::LinuxX86_64, &sudo, rustup_authority)?;
+        let cargo_adapter = stage_posix_executable(
+            ReleasePlatform::LinuxX86_64,
+            &sudo,
+            cargo.canonical_identity(),
+            "cargo",
+        )?;
+        let launch_authorities = hell_testkit::PosixLaunchAuthorities::new(
+            adapter.adapter.clone(),
+            adapter.sha256,
+            cargo.canonical_identity().to_path_buf(),
+            cargo_adapter.adapter.clone(),
+            cargo_adapter.sha256,
+            posix_cargo_source_authority(&cargo_authority, Some(&rustup))?,
+        );
+        let identity = hell_testkit::PosixCandidateIdentity::new(
+            principal_name,
+            principal_id,
+            principal_id,
+            group_ids,
+            principal_group,
+        )
+        .map_err(|error| format!("cannot bind Linux MemCordon candidate identity: {error}"))?;
+        let work_identity = posix_object_identity(&work_root)?;
+        let original_group = work_metadata.gid();
+        let original_mode = work_metadata.permissions().mode() & 0o7777;
+        if let Err(error) = delegate_linux_memcordon_work_root(&sudo, &work_root, principal_id) {
+            let restore =
+                restore_linux_memcordon_work_root(&sudo, &work_root, original_group, original_mode);
+            return Err(match restore {
+                Ok(()) => error,
+                Err(restore) => format!(
+                    "{error}; additionally, Linux MemCordon delegation rollback failed: {restore}"
+                ),
+            });
+        }
+        let setup = (|| {
+            let cargo_home = work_root.join("cargo-home");
+            let cargo_target = work_root.join("target");
+            let home = work_root.join("home");
+            let temporary = work_root.join("tmp");
+            prepare_linux_memcordon_work_directories(
+                &work_root,
+                [&cargo_home, &cargo_target, &home, &temporary],
+                principal_id,
+            )?;
+            let selected_tool_bin = rustup
+                .home
+                .join("toolchains")
+                .join(&rustup.toolchain)
+                .join("bin");
+            let rustc = selected_tool_bin.join("rustc");
+            let rustc_metadata = fs::symlink_metadata(&rustc)
+                .map_err(|error| format!("cannot inspect staged Linux rustc: {error}"))?;
+            if rustc_metadata.file_type().is_symlink()
+                || !rustc_metadata.is_file()
+                || fs::canonicalize(&rustc).ok().as_deref() != Some(rustc.as_path())
+            {
+                return Err("staged Linux rustc authority is not canonical".to_owned());
+            }
+            let environment = ProcessEnvironment::from_process();
+            let trusted_path = environment
+                .value(StandardVariable::Path)
+                .ok_or_else(|| "trusted Linux PATH is unavailable".to_owned())?;
+            let trusted_search = std::env::split_paths(trusted_path).collect::<Vec<_>>();
+            if trusted_search.is_empty() || trusted_search.iter().any(|path| !path.is_absolute()) {
+                return Err("trusted Linux PATH contains a non-absolute entry".to_owned());
+            }
+            let cargo_adapter_directory = cargo_adapter
+                .adapter
+                .parent()
+                .ok_or_else(|| "staged Linux Cargo adapter has no parent".to_owned())?;
+            let tool_path = std::env::join_paths(
+                [cargo_adapter_directory.to_path_buf(), selected_tool_bin]
+                    .into_iter()
+                    .chain(trusted_search),
+            )
+            .map_err(|error| format!("cannot encode staged Linux tool PATH: {error}"))?;
+            let delegated = posix_object_identity(&work_root)?;
+            if delegated.device != work_identity.device
+                || delegated.inode != work_identity.inode
+                || delegated.owner != work_identity.owner
+                || delegated.group != principal_id
+                || delegated.mode != 0o2770
+            {
+                return Err("Linux MemCordon writable-root delegation differs".to_owned());
+            }
+            let policy = hell_testkit::CandidateLaunchPolicy::posix_with_process_authorities(
+                sudo.clone(),
+                process_authorities.launch_authorities()?,
+                launch_authorities,
+                identity,
+                vec![work_root.clone()],
+            )
+            .map_err(|error| {
+                format!("cannot establish Linux MemCordon candidate policy: {error}")
+            })?;
+            if Instant::now() >= deadline {
+                return Err(
+                    "Linux MemCordon authority acquisition exceeded its deadline".to_owned(),
+                );
+            }
+            Ok::<_, String>((
+                policy,
+                cargo_home,
+                cargo_target,
+                home,
+                temporary,
+                tool_path,
+                rustc,
+            ))
+        })();
+        let (policy, cargo_home, cargo_target, home, temporary, tool_path, rustc) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                let restore = restore_linux_memcordon_work_root(
+                    &sudo,
+                    &work_root,
+                    original_group,
+                    original_mode,
+                );
+                return Err(match restore {
+                    Ok(()) => error,
+                    Err(restore) => format!(
+                        "{error}; additionally, Linux MemCordon setup rollback failed: {restore}"
+                    ),
+                });
+            }
+        };
+        Ok(Self {
+            policy: Some(policy),
+            executable: adapter.adapter.clone(),
+            work_root,
+            cargo_home,
+            cargo_target,
+            home,
+            temporary,
+            tool_path,
+            rustc,
+            rustup_home: rustup.home.clone(),
+            rustup_toolchain: rustup.toolchain.clone(),
+            work_identity,
+            original_group,
+            original_mode,
+            retained: false,
+            sudo,
+            principal: Some(principal),
+            adapter: Some(adapter),
+            cargo_adapter: Some(cargo_adapter),
+            rustup: Some(rustup),
+        })
+    }
+
+    pub(crate) fn attach_memcordon(
+        &mut self,
+        runtime: hell_testkit::BoundProgramInvocation,
+        report_directory: PathBuf,
+        mechanism: impl Into<std::sync::Arc<str>>,
+        admission: hell_memcordon::SealedAdmission,
+        cleanup_reserve: Duration,
+    ) -> Result<(), String> {
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| "Linux MemCordon launch policy was already closed".to_owned())?
+            .clone()
+            .with_memcordon_sealed(
+                runtime,
+                report_directory,
+                mechanism,
+                admission,
+                cleanup_reserve,
+            )
+            .map_err(|error| format!("cannot bind Linux MemCordon authority: {error}"))?;
+        self.policy = Some(policy);
+        Ok(())
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) fn work_root(&self) -> &Path {
+        &self.work_root
+    }
+
+    /// Configures the one staged operation root with only bound standard tool
+    /// environment. The returned identity must be passed to the explicit
+    /// MemCordon candidate runner.
+    pub(crate) fn configure_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<hell_testkit::BoundProgramInvocation, String> {
+        if self.policy.is_none()
+            || self.retained
+            || command.get_program() != self.executable.as_os_str()
+        {
+            return Err(
+                "Linux MemCordon operation command differs from its launch authority".to_owned(),
+            );
+        }
+        let bound = hell_testkit::BoundProgramInvocation::new(
+            self.executable.clone(),
+            self.executable.clone(),
+        )
+        .map_err(|error| format!("cannot bind staged Linux MemCordon driver: {error}"))?;
+        command.env_clear().envs([
+            (OsString::from("CARGO"), self.cargo_adapter_path().into()),
+            (OsString::from("CARGO_HOME"), self.cargo_home.clone().into()),
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                self.cargo_target.clone().into(),
+            ),
+            (OsString::from("HOME"), self.home.clone().into()),
+            (OsString::from("PATH"), self.tool_path.clone()),
+            (OsString::from("RUSTC"), self.rustc.clone().into()),
+            (
+                OsString::from("RUSTUP_HOME"),
+                self.rustup_home.clone().into(),
+            ),
+            (
+                OsString::from("RUSTUP_TOOLCHAIN"),
+                self.rustup_toolchain.clone(),
+            ),
+            (OsString::from("TMPDIR"), self.temporary.clone().into()),
+        ]);
+        Ok(bound)
+    }
+
+    fn cargo_adapter_path(&self) -> &Path {
+        &self
+            .cargo_adapter
+            .as_ref()
+            .expect("active Linux MemCordon authority retains its Cargo adapter")
+            .adapter
+    }
+
+    pub(crate) fn launch_policy(&self) -> Result<&hell_testkit::CandidateLaunchPolicy, String> {
+        self.policy
+            .as_ref()
+            .ok_or_else(|| "Linux MemCordon launch policy was already closed".to_owned())
+    }
+
+    /// Ends launch authority and transfers the complete bounded work tree back
+    /// to the trusted runner. Callers may copy fixed outputs only after this
+    /// succeeds; candidate-owned links and special files fail closed.
+    pub(crate) fn retain_work_root_until(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.retained {
+            return Err("Linux MemCordon work root was already retained".to_owned());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| "Linux MemCordon retention deadline expired".to_owned())?;
+        drop(self.policy.take());
+        let candidate_id = self
+            .principal
+            .as_ref()
+            .and_then(|principal| principal.uid.zip(principal.gid))
+            .ok_or_else(|| "Linux MemCordon candidate identity receipt is absent".to_owned())?;
+        let current = posix_object_identity(&self.work_root)?;
+        if current.device != self.work_identity.device
+            || current.inode != self.work_identity.inode
+            || current.owner != self.work_identity.owner
+            || current.group != candidate_id.1
+            || current.mode != 0o2770
+        {
+            return Err(
+                "Linux MemCordon writable-root identity changed before retention".to_owned(),
+            );
+        }
+        let adapter = self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| "Linux MemCordon retention adapter is absent".to_owned())?;
+        require_posix_adapter_unchanged(adapter)?;
+        let arguments = [
+            OsString::from("-n"),
+            OsString::from("--"),
+            adapter.adapter.as_os_str().to_owned(),
+            OsString::from("__release-normalize-memcordon-work-v1"),
+            self.work_root.as_os_str().to_owned(),
+            OsString::from(self.work_identity.device.to_string()),
+            OsString::from(self.work_identity.inode.to_string()),
+            OsString::from(candidate_id.0.to_string()),
+            OsString::from(candidate_id.1.to_string()),
+            OsString::from(self.work_identity.owner.to_string()),
+            OsString::from(self.original_group.to_string()),
+            OsString::from(self.original_mode.to_string()),
+        ];
+        let result = CommandSpec::new(self.sudo.as_os_str(), remaining)
+            .arguments(arguments)
+            .run()
+            .map_err(|error| format!("Linux MemCordon retention adapter failed: {error}"))?;
+        if !result.status.success() || result.timed_out || Instant::now() >= deadline {
+            return Err("Linux MemCordon retention adapter did not complete in time".to_owned());
+        }
+        require_posix_adapter_unchanged(adapter)?;
+        let retained = posix_object_identity(&self.work_root)?;
+        if retained.device != self.work_identity.device
+            || retained.inode != self.work_identity.inode
+            || retained.owner != self.work_identity.owner
+            || retained.group != self.original_group
+            || retained.mode != self.original_mode
+        {
+            return Err("retained Linux MemCordon work-root identity differs".to_owned());
+        }
+        self.retained = true;
+        Ok(())
+    }
+
+    pub(crate) fn close_until(mut self, deadline: Instant) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("Linux MemCordon authority cleanup deadline expired".to_owned());
+        }
+        if !self.retained {
+            self.retain_work_root_until(deadline)?;
+        }
+        let current = posix_object_identity(&self.work_root)?;
+        if current.device != self.work_identity.device
+            || current.inode != self.work_identity.inode
+            || current.owner != self.work_identity.owner
+            || current.group != self.original_group
+            || current.mode != self.original_mode
+        {
+            return Err("Linux MemCordon retained writable-root identity changed".to_owned());
+        }
+        if let Some(mut rustup) = self.rustup.take() {
+            cleanup_posix_rustup_authority(&rustup)?;
+            rustup.active = false;
+        }
+        if let Some(mut cargo) = self.cargo_adapter.take() {
+            cargo.close()?;
+        }
+        if let Some(mut adapter) = self.adapter.take() {
+            adapter.close()?;
+        }
+        let mut principal = self
+            .principal
+            .take()
+            .ok_or_else(|| "Linux MemCordon principal cleanup is absent".to_owned())?;
+        principal.deadline = Some(deadline);
+        principal.finish()?;
+        if Instant::now() >= deadline {
+            return Err("Linux MemCordon authority cleanup exceeded its deadline".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn delegate_linux_memcordon_work_root(
+    sudo: &Path,
+    root: &Path,
+    candidate_group: u32,
+) -> Result<(), String> {
+    let chgrp = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/chgrp"))
+        .map_err(|error| format!("cannot bind Linux chgrp authority: {error}"))?;
+    let chmod = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/chmod"))
+        .map_err(|error| format!("cannot bind Linux chmod authority: {error}"))?;
+    let group = candidate_group.to_string();
+    let path = path_text(root, "Linux MemCordon writable root")?;
+    trusted_tool_status(sudo, &chgrp, ["--", &group, path])?;
+    trusted_tool_status(sudo, &chmod, ["2770", "--", path])
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_memcordon_work_directories<'a>(
+    root: &Path,
+    directories: impl IntoIterator<Item = &'a PathBuf>,
+    candidate_group: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let root_identity = posix_object_identity(root)?;
+    if root_identity.group != candidate_group || root_identity.mode != 0o2770 {
+        return Err("Linux MemCordon writable root is not delegated".to_owned());
+    }
+    for directory in directories {
+        if directory.parent() != Some(root) || directory.exists() {
+            return Err("Linux MemCordon work-directory layout differs".to_owned());
+        }
+        fs::create_dir(directory)
+            .map_err(|error| format!("cannot create Linux MemCordon work directory: {error}"))?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o2770))
+            .map_err(|error| format!("cannot bind Linux MemCordon work-directory mode: {error}"))?;
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|error| format!("cannot inspect Linux MemCordon work directory: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != root_identity.owner
+            || metadata.gid() != candidate_group
+            || metadata.permissions().mode() & 0o7777 != 0o2770
+            || fs::canonicalize(directory).ok().as_deref() != Some(directory.as_path())
+        {
+            return Err("Linux MemCordon work-directory authority differs".to_owned());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_memcordon_work_root(
+    sudo: &Path,
+    root: &Path,
+    original_group: u32,
+    original_mode: u32,
+) -> Result<(), String> {
+    let chgrp = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/chgrp"))
+        .map_err(|error| format!("cannot bind Linux chgrp authority: {error}"))?;
+    let chmod = crate::command::resolve_absolute_standard_executable(Path::new("/usr/bin/chmod"))
+        .map_err(|error| format!("cannot bind Linux chmod authority: {error}"))?;
+    let group = original_group.to_string();
+    let mode = format!("{original_mode:o}");
+    let path = path_text(root, "Linux MemCordon writable root")?;
+    trusted_tool_status(sudo, &chmod, [&mode, "--", path])?;
+    trusted_tool_status(sudo, &chgrp, ["--", &group, path])
+}
+
 /// One staged Windows Rust authority retained across both Nightly phases.
 #[cfg(windows)]
 pub(crate) struct NightlyWindowsLaunchAuthority {
@@ -15434,6 +16038,16 @@ impl NightlyWindowsLaunchAuthority {
         deadline: Instant,
         cleanup_deadline: Instant,
     ) -> Result<Self, String> {
+        Self::acquire_until_with_writable_roots(root, target, &[], deadline, cleanup_deadline)
+    }
+
+    pub(crate) fn acquire_until_with_writable_roots(
+        root: &Path,
+        target: &Path,
+        extra_writable_roots: &[PathBuf],
+        deadline: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<Self, String> {
         if Instant::now() >= deadline {
             return Err(
                 "Windows Nightly launch authority deadline expired before acquisition".to_owned(),
@@ -15443,6 +16057,30 @@ impl NightlyWindowsLaunchAuthority {
             .map_err(|error| format!("cannot canonicalize Windows Nightly root: {error}"))?;
         let target = fs::canonicalize(target)
             .map_err(|error| format!("cannot canonicalize Windows Nightly target: {error}"))?;
+        let mut writable_roots = vec![target.clone()];
+        for path in extra_writable_roots {
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                format!("cannot inspect Windows Nightly writable root: {error}")
+            })?;
+            let canonical = fs::canonicalize(path).map_err(|error| {
+                format!("cannot canonicalize Windows Nightly writable root: {error}")
+            })?;
+            if !path.is_absolute()
+                || metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || canonical != *path
+                || writable_roots.iter().any(|root| {
+                    canonical.starts_with(root.as_path()) || root.starts_with(&canonical)
+                })
+            {
+                return Err(
+                    "Windows Nightly writable roots are not canonical distinct directories"
+                        .to_owned(),
+                );
+            }
+            windows_confinement::protect_tree(&canonical, true)?;
+            writable_roots.push(canonical);
+        }
         let cargo = crate::command::resolve_cargo_executable()?;
         let rustup = crate::command::resolve_windows_rustup_authority(&cargo, &root)?;
         let mut protection =
@@ -15523,10 +16161,10 @@ impl NightlyWindowsLaunchAuthority {
             )
             .map_err(|error| format!("cannot bind Windows Nightly launch authorities: {error}"))?;
             let policy =
-                hell_testkit::CandidateLaunchPolicy::windows(authorities, vec![target.clone()])
+                hell_testkit::CandidateLaunchPolicy::windows(authorities, writable_roots.clone())
                     .map_err(|error| {
-                        format!("cannot establish Windows Nightly launch policy: {error}")
-                    })?;
+                    format!("cannot establish Windows Nightly launch policy: {error}")
+                })?;
             let manifest = protection
                 .directories
                 .iter()
@@ -15588,6 +16226,37 @@ impl NightlyWindowsLaunchAuthority {
 
     pub(crate) fn staged_cargo(&self) -> &Path {
         &self.staged_cargo
+    }
+
+    pub(crate) fn attach_memcordon(
+        &mut self,
+        runtime: hell_testkit::BoundProgramInvocation,
+        report_directory: PathBuf,
+        mechanism: impl Into<std::sync::Arc<str>>,
+        admission: hell_memcordon::SealedAdmission,
+        cleanup_reserve: Duration,
+    ) -> Result<(), String> {
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| "Windows Nightly launch policy was already closed".to_owned())?
+            .clone()
+            .with_memcordon_sealed(
+                runtime,
+                report_directory,
+                mechanism,
+                admission,
+                cleanup_reserve,
+            )
+            .map_err(|error| format!("cannot bind Windows Nightly MemCordon authority: {error}"))?;
+        self.policy = Some(policy);
+        Ok(())
+    }
+
+    pub(crate) fn launch_policy(&self) -> Result<&hell_testkit::CandidateLaunchPolicy, String> {
+        self.policy
+            .as_ref()
+            .ok_or_else(|| "Windows Nightly launch policy was already closed".to_owned())
     }
 
     pub(crate) fn staged_root(&self) -> &Path {
@@ -18794,6 +19463,161 @@ pub(crate) fn run_posix_candidate_cache_normalizer(arguments: &[OsString]) -> Re
     normalize_candidate_cache_tree(&root, Some((owner, group)))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn run_linux_memcordon_work_normalizer(arguments: &[OsString]) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let [
+        root,
+        device,
+        inode,
+        candidate_owner,
+        candidate_group,
+        trusted_owner,
+        trusted_group,
+        original_mode,
+    ] = arguments
+    else {
+        return Err(
+            "trusted Linux MemCordon normalizer requires one root and seven identity fields"
+                .to_owned(),
+        );
+    };
+    let parse_u64 = |value: &OsString, label: &str| -> Result<u64, String> {
+        let text = value
+            .to_str()
+            .ok_or_else(|| format!("Linux MemCordon {label} is not UTF-8"))?;
+        let parsed = text
+            .parse::<u64>()
+            .map_err(|_| format!("Linux MemCordon {label} is malformed"))?;
+        if text != parsed.to_string() {
+            return Err(format!("Linux MemCordon {label} is not canonical"));
+        }
+        Ok(parsed)
+    };
+    let parse_u32 = |value: &OsString, label: &str| -> Result<u32, String> {
+        parse_u64(value, label)?
+            .try_into()
+            .map_err(|_| format!("Linux MemCordon {label} exceeds u32"))
+    };
+    let root = PathBuf::from(root);
+    let expected_device = parse_u64(device, "root device")?;
+    let expected_inode = parse_u64(inode, "root inode")?;
+    let candidate_owner = parse_u32(candidate_owner, "candidate owner")?;
+    let candidate_group = parse_u32(candidate_group, "candidate group")?;
+    let trusted_owner = parse_u32(trusted_owner, "trusted owner")?;
+    let trusted_group = parse_u32(trusted_group, "trusted group")?;
+    let original_mode = parse_u32(original_mode, "original mode")?;
+    if original_mode > 0o7777 || candidate_owner == trusted_owner {
+        return Err("Linux MemCordon identity or mode fields overlap".to_owned());
+    }
+    let root_metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot inspect Linux MemCordon work root: {error}"))?;
+    if !root.is_absolute()
+        || root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || fs::canonicalize(&root).ok().as_deref() != Some(root.as_path())
+        || root_metadata.dev() != expected_device
+        || root_metadata.ino() != expected_inode
+        || root_metadata.uid() != trusted_owner
+        || root_metadata.gid() != candidate_group
+        || root_metadata.permissions().mode() & 0o7777 != 0o2770
+    {
+        return Err("Linux MemCordon work-root identity differs before retention".to_owned());
+    }
+    let mut pending = vec![root.clone()];
+    let mut retained = Vec::new();
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect Linux MemCordon work entry: {error}"))?;
+        let file_type = metadata.file_type();
+        if metadata.dev() != expected_device
+            || (metadata.uid() != candidate_owner && metadata.uid() != trusted_owner)
+            || (metadata.gid() != candidate_group && metadata.gid() != trusted_group)
+            || file_type.is_symlink()
+            || file_type.is_block_device()
+            || file_type.is_char_device()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+            || (!file_type.is_dir() && !file_type.is_file())
+            || (file_type.is_file() && metadata.nlink() != 1)
+        {
+            return Err("Linux MemCordon work tree contains an unauthenticated entry".to_owned());
+        }
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| "Linux MemCordon work entry count overflowed".to_owned())?;
+        bytes = bytes
+            .checked_add(if file_type.is_file() {
+                metadata.len()
+            } else {
+                0
+            })
+            .ok_or_else(|| "Linux MemCordon work byte count overflowed".to_owned())?;
+        if entries > POSIX_CANDIDATE_TARGET_ENTRY_LIMIT || bytes > POSIX_CANDIDATE_TARGET_BYTE_LIMIT
+        {
+            return Err("Linux MemCordon work tree exceeds its resource bound".to_owned());
+        }
+        if file_type.is_dir() {
+            for entry in fs::read_dir(&path)
+                .map_err(|error| format!("cannot enumerate Linux MemCordon work tree: {error}"))?
+            {
+                pending.push(
+                    entry
+                        .map_err(|error| {
+                            format!("cannot read Linux MemCordon work entry: {error}")
+                        })?
+                        .path(),
+                );
+            }
+        }
+        retained.push((
+            path,
+            file_type.is_dir(),
+            metadata.permissions().mode() & 0o111 != 0,
+            metadata.dev(),
+            metadata.ino(),
+        ));
+    }
+    retained.sort_by_key(|(path, _, _, _, _)| std::cmp::Reverse(path.components().count()));
+    for (path, directory, executable, device, inode) in retained {
+        std::os::unix::fs::chown(&path, Some(trusted_owner), Some(trusted_group))
+            .map_err(|error| format!("cannot retain Linux MemCordon work ownership: {error}"))?;
+        let retained_mode = if directory || executable {
+            0o700
+        } else {
+            0o600
+        };
+        fs::set_permissions(&path, fs::Permissions::from_mode(retained_mode))
+            .map_err(|error| format!("cannot retain Linux MemCordon work permissions: {error}"))?;
+        let after = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot attest retained Linux MemCordon entry: {error}"))?;
+        if after.dev() != device
+            || after.ino() != inode
+            || after.uid() != trusted_owner
+            || after.gid() != trusted_group
+            || after.permissions().mode() & 0o7777 != retained_mode
+        {
+            return Err("retained Linux MemCordon work entry differs".to_owned());
+        }
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(original_mode))
+        .map_err(|error| format!("cannot restore Linux MemCordon root mode: {error}"))?;
+    let retained_root = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot attest retained Linux MemCordon work root: {error}"))?;
+    if retained_root.dev() != expected_device
+        || retained_root.ino() != expected_inode
+        || retained_root.uid() != trusted_owner
+        || retained_root.gid() != trusted_group
+        || retained_root.permissions().mode() & 0o7777 != original_mode
+    {
+        return Err("retained Linux MemCordon work-root identity differs".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 struct PosixVerifierRemovalPolicy {
@@ -19859,11 +20683,25 @@ fn base_final_platform_inventory() -> BTreeSet<&'static str> {
     ])
 }
 
-fn expected_final_platform_inventory(platform: ReleasePlatform) -> BTreeSet<&'static str> {
+fn base_provisional_platform_inventory() -> BTreeSet<&'static str> {
     let mut expected = base_final_platform_inventory();
+    expected.remove("platform-report.json");
+    expected.insert("platform-report.provisional.json");
+    expected
+}
+
+fn expected_final_platform_inventory(platform: ReleasePlatform) -> BTreeSet<&'static str> {
+    let mut expected = if platform == ReleasePlatform::MacosAarch64 {
+        base_final_platform_inventory()
+    } else {
+        base_provisional_platform_inventory()
+    };
     if cfg!(target_os = "linux") && platform == ReleasePlatform::LinuxX86_64 {
         expected.insert("dependency-policy.json");
         expected.insert("mutation-report.json");
+    }
+    if platform != ReleasePlatform::MacosAarch64 {
+        expected.insert("memcordon");
     }
     expected
 }
@@ -19878,9 +20716,10 @@ pub(crate) fn verify_windows_final_platform_inventory_for_integration() -> Resul
         "conformance-evidence-manifest.json",
         "conformance-observations",
         "native-environment.json",
+        "memcordon",
         "oracle-report.json",
         "package-report.json",
-        "platform-report.json",
+        "platform-report.provisional.json",
         "source-inventory.json",
     ]);
     if observed != expected {

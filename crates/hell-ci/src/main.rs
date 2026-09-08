@@ -9,6 +9,7 @@ mod fuzz_surfaces;
 mod github_runtime;
 mod identity;
 mod json;
+mod memcordon;
 pub mod mutation;
 mod oracle_acquire;
 mod policy;
@@ -34,6 +35,21 @@ pub fn native_environment_external_inputs_sha256_for_integration(
     path: &Path,
 ) -> Result<String, String> {
     release::native_environment::external_inputs_sha256(path)
+}
+
+#[doc(hidden)]
+pub fn finalize_memcordon_platform_report_for_integration(
+    output: &Path,
+    finalization: &hell_memcordon::FinalizationReceiptV1,
+    finalization_bytes: &[u8],
+    inventory_bytes: &[u8],
+) -> Result<(), String> {
+    memcordon::finalize_platform_report_for_integration(
+        output,
+        finalization,
+        finalization_bytes,
+        inventory_bytes,
+    )
 }
 
 #[cfg(windows)]
@@ -1723,6 +1739,18 @@ fn dispatch_platform_children(arguments: Vec<OsString>) -> ExitCode {
             }
         };
     }
+    #[cfg(target_os = "linux")]
+    if arguments.first().and_then(|value| value.to_str())
+        == Some("__release-normalize-memcordon-work-v1")
+    {
+        return match release::platform::run_linux_memcordon_work_normalizer(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     #[cfg(unix)]
     if arguments.first().and_then(|value| value.to_str())
         == Some("__release-remove-candidate-target-verifier")
@@ -1833,7 +1861,152 @@ fn dispatch_platform_normalizers(arguments: Vec<OsString>) -> ExitCode {
     {
         return command::run_windows_write_restricted_child(&arguments[1..]);
     }
+    if arguments.first().and_then(|value| value.to_str()) == Some("__memcordon-operation-child") {
+        return run_memcordon_operation_child(&arguments[1..]);
+    }
     dispatch_public_cli(arguments)
+}
+
+fn run_memcordon_operation_child(arguments: &[OsString]) -> ExitCode {
+    let Some(operation) = arguments.first().and_then(|value| value.to_str()) else {
+        eprintln!("MemCordon operation child requires one operation");
+        return ExitCode::from(2);
+    };
+    #[cfg(target_os = "linux")]
+    let [_, repository, work_root] = arguments else {
+        eprintln!("Linux MemCordon operation child requires repository and work roots");
+        return ExitCode::from(2);
+    };
+    #[cfg(target_os = "linux")]
+    let (repository, work_root) = (PathBuf::from(repository), PathBuf::from(work_root));
+    #[cfg(not(target_os = "linux"))]
+    let [_] = arguments else {
+        eprintln!("MemCordon operation child accepts exactly one operation");
+        return ExitCode::from(2);
+    };
+    #[cfg(not(target_os = "linux"))]
+    let repository = match std::fs::canonicalize(".") {
+        Ok(repository) => repository,
+        Err(error) => {
+            eprintln!("cannot canonicalize MemCordon operation root: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let work_root = repository.clone();
+    if !repository.is_absolute() || !work_root.is_absolute() {
+        eprintln!("MemCordon operation child roots must be absolute");
+        return ExitCode::from(2);
+    }
+    let command = match operation {
+        "mutation" => [
+            OsString::from("mutation"),
+            OsString::from("assurance"),
+            OsString::from("--manifest"),
+            repository
+                .join("compat/assurance-mutants.toml")
+                .into_os_string(),
+            OsString::from("--repository-root"),
+            repository.clone().into_os_string(),
+            OsString::from("--output"),
+            work_root.join("ci-out/mutation").into_os_string(),
+        ]
+        .into(),
+        "fuzz" => [
+            OsString::from("fuzz"),
+            OsString::from("smoke"),
+            OsString::from("--manifest"),
+            repository.join("ci/fuzz-targets.toml").into_os_string(),
+            OsString::from("--repository-root"),
+            repository.clone().into_os_string(),
+            OsString::from("--work-root"),
+            work_root.clone().into_os_string(),
+            OsString::from("--output"),
+            work_root.join("ci-out/fuzz-smoke.json").into_os_string(),
+        ]
+        .into(),
+        "nightly" => memcordon_nightly_child_arguments(&repository, &work_root),
+        "regression-corpus" | "regression-subject" => {
+            return run_memcordon_regression_child(&repository);
+        }
+        _ => {
+            eprintln!("unsupported MemCordon operation child {operation}");
+            return ExitCode::from(2);
+        }
+    };
+    dispatch_public_cli(command)
+}
+
+fn memcordon_nightly_child_arguments(repository: &Path, work_root: &Path) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        vec![
+            OsString::from("portability"),
+            OsString::from("--report"),
+            repository
+                .join("ci-out/nightly-windows.json")
+                .into_os_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            OsString::from("nightly"),
+            OsString::from("--oracle"),
+            repository
+                .join("ci-out/linux-release-oracle")
+                .into_os_string(),
+            OsString::from("--oracle-sha256"),
+            OsString::from("5ccc78e62200eb5aea8b9da9161334c61848d0d3e7de2f270929920cfbf357c9"),
+            OsString::from("--dependency-attestation"),
+            repository
+                .join("ci-out/dependency-policy.json")
+                .into_os_string(),
+            OsString::from("--report"),
+            work_root.join("ci-out/nightly-linux.json").into_os_string(),
+        ]
+    }
+}
+
+fn run_memcordon_regression_child(repository: &Path) -> ExitCode {
+    for arguments in [
+        [
+            "test",
+            "--locked",
+            "--package",
+            "hell-testkit",
+            "--test",
+            "typed_corpus",
+        ],
+        [
+            "test",
+            "--locked",
+            "--package",
+            "hell-cli",
+            "--test",
+            "oracle_regressions",
+        ],
+    ] {
+        let result = command::CommandSpec::cargo(std::time::Duration::from_mins(30))
+            .arguments(arguments)
+            .current_directory(repository)
+            .run();
+        match result {
+            Ok(result) if result.status.success() && !result.timed_out => {}
+            Ok(result) => {
+                eprintln!(
+                    "MemCordon regression child failed with {} (timed_out={})",
+                    result.status, result.timed_out
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("cannot start MemCordon regression child: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn dispatch_public_cli(arguments: Vec<OsString>) -> ExitCode {
@@ -1893,89 +2066,29 @@ fn dispatch_public_cli(arguments: Vec<OsString>) -> ExitCode {
 }
 
 fn dispatch_release_cli(arguments: Vec<OsString>, root: &Path) -> ExitCode {
+    if memcordon::recognizes(&arguments) {
+        return emit_cli_result(memcordon::run(&arguments));
+    }
     if readiness::recognizes(&arguments) {
-        return match readiness::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(readiness::run(&arguments));
     }
     if protocol::recognizes(&arguments) {
-        return match protocol::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(protocol::run(&arguments));
     }
     if repository::recognizes(&arguments) {
-        return match repository::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(repository::run(&arguments));
     }
     if capability_policy::recognizes(&arguments) {
-        return match capability_policy::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(capability_policy::run(&arguments));
     }
     if release::native_environment::recognizes(&arguments) {
-        return match release::native_environment::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(release::native_environment::run(&arguments));
     }
     if release::recognizes(&arguments) {
-        return match release::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(release::run(&arguments));
     }
     if oracle_acquire::recognizes(&arguments) {
-        return match oracle_acquire::run(&arguments) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        return emit_cli_result(oracle_acquire::run(&arguments));
     }
     let invocation = match parse(arguments) {
         Ok(invocation) => invocation,
@@ -1985,6 +2098,19 @@ fn dispatch_release_cli(arguments: Vec<OsString>, root: &Path) -> ExitCode {
         }
     };
     run(&invocation, root)
+}
+
+fn emit_cli_result(result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2280,12 +2406,16 @@ mod tests {
         const URL: &str =
             "https://github.com/chrisdone/hell/releases/download/2026-05-29/hell-linux-amd64";
         let record = include_str!("../oracle/linux-amd64.toml");
+        let external_inputs = include_str!("../../../ci/external-inputs.toml");
         let workflow = include_str!("../../../.github/workflows/nightly.yml");
         assert!(record.contains(DIGEST));
         assert!(record.contains(URL));
-        assert!(workflow.contains(DIGEST));
+        assert!(external_inputs.contains(DIGEST));
         assert!(workflow.contains(
             "run: ./target/ci/hell-ci oracle-acquire acquire --artifact ci-out/linux-release-oracle --provider-response ci-out/linux-release-provider.json --receipt ci-out/linux-release-oracle-receipt.json"
+        ));
+        assert!(workflow.contains(
+            "run: ./target/ci/hell-ci memcordon execute --task ci/memcordon-tasks-v1.toml --operation nightly"
         ));
         assert!(!workflow.contains("hell-ci release-oracle "));
     }

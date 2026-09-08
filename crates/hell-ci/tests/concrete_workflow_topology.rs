@@ -704,6 +704,98 @@ const READINESS_PLAN_EXPECTED_COMMANDS: &[&[&str]] = &[
     ],
 ];
 
+const EXPECTED_MUTATION_COMMANDS: &[&[&str]] = &[
+    &[
+        "cargo",
+        "build",
+        "--locked",
+        "--profile",
+        "ci",
+        "--package",
+        "hell-ci",
+        "--bin",
+        "hell-ci",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "acquire",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "prepare",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "canary",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "assurance",
+        "render",
+        "--map",
+        "spec/assurance-map.toml",
+        "--output",
+        "ci-out/assurance-map.md",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "assurance",
+        "check",
+        "--map",
+        "spec/assurance-map.toml",
+        "--repository-root",
+        ".",
+        "--output",
+        "ci-out/assurance-check.json",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "execute",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "cleanup",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+    ],
+    &[
+        "./target/ci/hell-ci",
+        "memcordon",
+        "finalize",
+        "--task",
+        "ci/memcordon-tasks-v1.toml",
+        "--operation",
+        "mutation",
+        "--candidate-commit",
+        "${{ github.sha }}",
+        "--workflow-commit",
+        "${{ github.workflow_sha }}",
+    ],
+];
+
 #[test]
 fn mutation_workflow_executes_the_map_and_source_bound_catalog() {
     let projection: serde_yaml::Value = serde_yaml::from_slice(
@@ -739,53 +831,7 @@ fn mutation_workflow_executes_the_map_and_source_bound_catalog() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        commands,
-        [
-            vec![
-                "cargo",
-                "build",
-                "--locked",
-                "--profile",
-                "ci",
-                "--package",
-                "hell-ci",
-                "--bin",
-                "hell-ci",
-            ],
-            vec![
-                "./target/ci/hell-ci",
-                "assurance",
-                "render",
-                "--map",
-                "spec/assurance-map.toml",
-                "--output",
-                "ci-out/assurance-map.md",
-            ],
-            vec![
-                "./target/ci/hell-ci",
-                "assurance",
-                "check",
-                "--map",
-                "spec/assurance-map.toml",
-                "--repository-root",
-                ".",
-                "--output",
-                "ci-out/assurance-check.json",
-            ],
-            vec![
-                "./target/ci/hell-ci",
-                "mutation",
-                "assurance",
-                "--manifest",
-                "compat/assurance-mutants.toml",
-                "--repository-root",
-                ".",
-                "--output",
-                "ci-out/mutation",
-            ],
-        ]
-    );
+    assert_eq!(commands, EXPECTED_MUTATION_COMMANDS);
 }
 
 #[test]

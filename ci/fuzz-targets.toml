@@ -580,3 +580,163 @@ engine-arguments = ["-runs=64", "-timeout=10", "-max_len=16777216", "-artifact_p
 corpus = "crates/hell-ci/fuzz/corpus/semantic_trace"
 artifact-directory = "ci-out/fuzz-artifacts/semantic_trace"
 invariant = "semantic-trace-no-panic"
+
+[[target]]
+id = "memcordon_runtime_lock"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_runtime_lock"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_runtime_lock.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_runtime_lock/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_runtime_lock"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_runtime_lock"
+invariant = "strict-runtime-lock"
+
+[[target]]
+id = "memcordon_runtime_manifest"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_runtime_manifest"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_runtime_manifest.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_runtime_manifest/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_runtime_manifest"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_runtime_manifest"
+invariant = "strict-runtime-manifest"
+
+[[target]]
+id = "memcordon_archive_member_policy"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_archive_member_policy"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_archive_member_policy.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_archive_member_policy/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_archive_member_policy"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_archive_member_policy"
+invariant = "safe-archive-paths"
+
+[[target]]
+id = "memcordon_schema8_wire"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_schema8_wire"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_schema8_wire.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_schema8_wire/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_schema8_wire"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_schema8_wire"
+invariant = "closed-schema8-wire"
+
+[[target]]
+id = "memcordon_native_argv"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_native_argv"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_native_argv.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_native_argv/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_native_argv"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_native_argv"
+invariant = "native-argv-fidelity"
+
+[[target]]
+id = "memcordon_operation_projection"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_operation_projection"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_operation_projection.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_operation_projection/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_operation_projection"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_operation_projection"
+invariant = "strict-operation-projection"
+
+[[target]]
+id = "memcordon_status_provenance"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_status_provenance"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_status_provenance.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_status_provenance/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_status_provenance"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_status_provenance"
+invariant = "typed-status-provenance"
+
+[[target]]
+id = "memcordon_deadline_and_admission"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_deadline_and_admission"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_deadline_and_admission.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_deadline_and_admission/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_deadline_and_admission"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_deadline_and_admission"
+invariant = "bounded-deadline-admission"
+
+[[target]]
+id = "memcordon_provider_lifecycle"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_provider_lifecycle"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_provider_lifecycle.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_provider_lifecycle/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_provider_lifecycle"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_provider_lifecycle"
+invariant = "legal-provider-transitions"
+
+[[target]]
+id = "memcordon_windows_identity_receipt"
+implementation = "primary"
+class = "release-authority"
+fuzz-directory = "crates/hell-ci/fuzz"
+cargo-target = "memcordon_windows_identity_receipt"
+source = "crates/hell-ci/fuzz/fuzz_targets/memcordon_windows_identity_receipt.rs"
+maximum-input-bytes = 1048576
+maximum-depth = 64
+maximum-records = 65536
+timeout-seconds = 10
+engine-arguments = ["-runs=64", "-timeout=10", "-max_len=1048576", "-artifact_prefix=ci-out/fuzz-artifacts/memcordon_windows_identity_receipt/"]
+corpus = "crates/hell-ci/fuzz/corpus/memcordon_windows_identity_receipt"
+artifact-directory = "ci-out/fuzz-artifacts/memcordon_windows_identity_receipt"
+invariant = "strict-windows-identity-receipt"

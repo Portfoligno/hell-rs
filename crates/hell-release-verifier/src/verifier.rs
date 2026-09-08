@@ -305,6 +305,20 @@ fn verify_inner(options: &Options) -> Result<Verification, Failure> {
         projection.archive_limits,
     )
     .map_err(|error| Failure::new(error.code, error.message))?;
+    crate::memcordon_rc23::validate_archived_memcordon_platform(
+        &evidence.files,
+        crate::MemcordonPlatform::LinuxX86_64,
+        &plan.candidate_sha,
+        &plan.workflow_sha,
+        "release",
+    )?;
+    crate::memcordon_rc23::validate_archived_memcordon_platform(
+        &evidence.files,
+        crate::MemcordonPlatform::WindowsX86_64,
+        &plan.candidate_sha,
+        &plan.workflow_sha,
+        "release",
+    )?;
     let report = verify_evidence_and_ledger(&EvidenceVerification {
         projection: &projection,
         plan: &plan,
@@ -1620,6 +1634,14 @@ fn collect_evidence_inventory(
         }
         manifests.insert(platform.to_owned(), manifest);
     }
+    expected_files.extend(
+        input
+            .evidence
+            .files
+            .keys()
+            .filter(|path| path.starts_with("memcordon/"))
+            .cloned(),
+    );
     require_shared_oracle_source(&manifests)?;
     if input
         .evidence
@@ -1844,11 +1866,26 @@ fn verify_reconstructed_report(
 }
 
 fn validate_evidence_roots(input: &EvidenceVerification<'_>) -> Result<TrustedInputs, Failure> {
-    let expected_directories = BTreeSet::from([
+    let mut expected_directories = BTreeSet::from([
         "observations".to_owned(),
         "platform-manifests".to_owned(),
         "records".to_owned(),
     ]);
+    for path in input
+        .evidence
+        .files
+        .keys()
+        .filter(|path| path.starts_with("memcordon/"))
+    {
+        let mut parent = Path::new(path).parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            expected_directories.insert(directory.to_string_lossy().into_owned());
+            parent = directory.parent();
+        }
+    }
     if input.evidence.directories != expected_directories {
         return Err(Failure::new(
             "release.archive.extra-member",
@@ -5199,6 +5236,8 @@ fn required_vector_ids() -> Vec<&'static str> {
         "wrong-native-environment-receipt",
         "wrong-governance-profile",
         "protocol-downgrade",
+        "missing-memcordon-finalization",
+        "substituted-memcordon-finalization",
         "primary-accepts-independent-rejects",
         "independent-accepts-primary-rejects",
     ]

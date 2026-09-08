@@ -53,6 +53,7 @@ struct Options {
     phase: Option<governance::Phase>,
     expected_artifact_digest: Option<String>,
     platform: Option<schema::ReleasePlatform>,
+    memcordon_task: Option<PathBuf>,
 }
 
 pub(crate) fn recognizes(arguments: &[OsString]) -> bool {
@@ -80,14 +81,16 @@ pub(crate) fn run(arguments: &[OsString]) -> Result<String, String> {
             required(options.output, "--output")?,
             required(options.report, "--report")?,
         ),
-        "platform" => platform::run(
-            required(options.platform, "--platform")?,
-            required(options.plan, "--plan")?,
-            required(options.conformance_plan, "--conformance-plan")?,
-            required(options.repository_root, "--repository-root")?,
-            required(options.oracle_source, "--oracle-source")?,
-            required(options.output, "--output")?,
-        ),
+        "platform" => platform::run(platform::PlatformRunRequest {
+            platform: required(options.platform, "--platform")?,
+            plan_path: required(options.plan, "--plan")?,
+            conformance_plan_path: required(options.conformance_plan, "--conformance-plan")?,
+            root: required(options.repository_root, "--repository-root")?,
+            oracle_source: required(options.oracle_source, "--oracle-source")?,
+            output: required(options.output, "--output")?,
+            memcordon_task: options.memcordon_task,
+            memcordon_operation: "release",
+        }),
         "assemble" => assemble::run(
             required(options.plan, "--plan")?,
             required(options.conformance_plan, "--conformance-plan")?,
@@ -232,6 +235,7 @@ fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
             }
             "--platform-input" => set_path(&mut options.platform_input, value, flag)?,
             "--manifest" => set_path(&mut options.manifest, value, flag)?,
+            "--memcordon-task" => set_path(&mut options.memcordon_task, value, flag)?,
             "--vectors-root" => set_path(&mut options.vectors_root, value, flag)?,
             "--obligation-rules" => set_path(&mut options.obligation_rules, value, flag)?,
             "--spec" => set_path(&mut options.specification, value, flag)?,

@@ -179,5 +179,75 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "memcordon_runtime_lock"
+path = "fuzz_targets/memcordon_runtime_lock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_runtime_manifest"
+path = "fuzz_targets/memcordon_runtime_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_archive_member_policy"
+path = "fuzz_targets/memcordon_archive_member_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_schema8_wire"
+path = "fuzz_targets/memcordon_schema8_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_native_argv"
+path = "fuzz_targets/memcordon_native_argv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_operation_projection"
+path = "fuzz_targets/memcordon_operation_projection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_status_provenance"
+path = "fuzz_targets/memcordon_status_provenance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_deadline_and_admission"
+path = "fuzz_targets/memcordon_deadline_and_admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_provider_lifecycle"
+path = "fuzz_targets/memcordon_provider_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcordon_windows_identity_receipt"
+path = "fuzz_targets/memcordon_windows_identity_receipt.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

@@ -30,6 +30,7 @@ struct Options {
     state: Option<String>,
     artifact_id: Option<u64>,
     artifact_digest: Option<String>,
+    memcordon_task: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +78,7 @@ pub(crate) fn run(arguments: &[OsString]) -> Result<String, String> {
                 required(options.repository_root, "--repository-root")?,
                 required(options.oracle_source, "--oracle-source")?,
                 required(options.output, "--output")?,
+                options.memcordon_task,
             )
         }
         "verify" => {
@@ -203,19 +205,22 @@ fn platform(
     root: PathBuf,
     oracle_source: PathBuf,
     output: PathBuf,
+    memcordon_task: Option<PathBuf>,
 ) -> Result<String, String> {
     let plan = ReadinessPlan::parse(&read_json(plan_path)?)?;
     validate_conformance_binding(&plan, &conformance_plan_path)?;
     let execution_path = transient_execution_plan(&output, &plan);
     write_json(&execution_path, &execution_plan(&plan)?.json())?;
-    let result = crate::release::platform::run(
+    let result = crate::release::platform::run(crate::release::platform::PlatformRunRequest {
         platform,
-        execution_path.clone(),
+        plan_path: execution_path.clone(),
         conformance_plan_path,
         root,
         oracle_source,
         output,
-    );
+        memcordon_task,
+        memcordon_operation: "readiness",
+    });
     remove_transient(&execution_path, result)
 }
 
@@ -1585,6 +1590,7 @@ fn parse_options(arguments: &[OsString]) -> Result<Options, String> {
                 }
                 options.platform = Some(ReleasePlatform::parse(utf8(value, flag)?)?);
             }
+            "--memcordon-task" => set_path(&mut options.memcordon_task, value, flag)?,
             "--job" => set_text(&mut options.job, value, flag)?,
             "--state" => set_text(&mut options.state, value, flag)?,
             "--artifact-id" => set_number(&mut options.artifact_id, value, flag)?,

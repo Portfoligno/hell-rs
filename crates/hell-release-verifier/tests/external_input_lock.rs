@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const COMMITTED_DIGEST: &str = "7f0419b74fc05ead0ada84bc399c48f8142ca0d48c7c00146ed14c68b3220a79";
+const COMMITTED_DIGEST: &str = "9eb182168b23c65b81d51df3f6d56c720ae717b754c2881c967af2f50d8c7c44";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn repository_root() -> PathBuf {

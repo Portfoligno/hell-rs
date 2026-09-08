@@ -212,6 +212,18 @@ mutation = "protocol-downgrade"
 diagnostic = "release.protocol.downgrade"
 
 [[vector]]
+id = "missing-memcordon-finalization"
+valid = false
+mutation = "missing-memcordon-finalization"
+diagnostic = "release.independent-verifier-rejected"
+
+[[vector]]
+id = "substituted-memcordon-finalization"
+valid = false
+mutation = "substituted-memcordon-finalization"
+diagnostic = "release.independent-verifier-rejected"
+
+[[vector]]
 id = "primary-accepts-independent-rejects"
 valid = false
 mutation = "primary-accepts-independent-rejects"

@@ -105,12 +105,12 @@ fn committed_manifest_matches_the_primary_registry_and_stable_diagnostics() {
     assert_eq!(root.len(), 4, "registry report root must be exact");
     assert_eq!(root.get("schemaVersion"), Some(&Value::from(1)));
     assert_eq!(root.get("state"), Some(&Value::from("verified")));
-    assert_eq!(root.get("vectorCount"), Some(&Value::from(37)));
+    assert_eq!(root.get("vectorCount"), Some(&Value::from(39)));
     let vectors = root
         .get("vectors")
         .and_then(Value::as_array)
         .expect("registry vectors must be an array");
-    assert_eq!(vectors.len(), 37);
+    assert_eq!(vectors.len(), 39);
 
     let known_good = required_object(&vectors[0], "known-good vector");
     assert_eq!(known_good.len(), 4);
