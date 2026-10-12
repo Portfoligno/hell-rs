@@ -73,7 +73,7 @@ jobs:
         run: ./automation/target/ci/hell-ci release plan --resolution release-state/resolution.json --repository-root candidate --output release-plan --report release-reports/plan.json
       - name: Upload exact release plan
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-plan
@@ -166,7 +166,7 @@ jobs:
         run: ./automation/target/ci/hell-ci release platform --platform linux-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-policy,conformance-plan-binding,case-catalog,normalizer-catalog,divergence-catalog,verify,format,clippy,workspace-tests,documentation,dependency-policy,release-examples,release-mutation-catalog,linux-release-oracle-digest,conformance-evidence,divergence-prototypes,release-build,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Linux result
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: platform-out
@@ -264,7 +264,7 @@ jobs:
         run: ./automation/target/ci/hell-ci release platform --platform macos-aarch64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input/release-plan.json --conformance-plan release-input/conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact macOS result
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: platform-out
@@ -354,7 +354,7 @@ jobs:
         run: .\automation\target\ci\hell-ci.exe release platform --platform windows-x86_64 --required-gates runner-identity,candidate-checkout,oracle-checkout,conformance-plan-binding,portability,workspace-tests,release-build,native-oracle-build,conformance-evidence,divergence-prototypes,archive-verification,package-smoke --plan release-input\release-plan.json --conformance-plan release-input\conformance-plan.json --repository-root candidate --oracle-source oracle-source --output platform-out
       - name: Upload exact Windows result
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows-${{ github.run_id }}-${{ github.run_attempt }}
           path: platform-out
@@ -435,7 +435,7 @@ jobs:
         run: ./automation/target/ci/hell-ci release check-remote-state --plan release-input/plan/release-plan.json --report release-reports/post-assembly-remote-state.json
       - name: Retain release assembly diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-conformance-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-reports
@@ -443,7 +443,7 @@ jobs:
           retention-days: 30
       - name: Upload exact release bundle
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-bundle-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-bundle

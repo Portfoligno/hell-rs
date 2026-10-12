@@ -45,7 +45,7 @@ jobs:
         run: ./target/ci/hell-ci mutation run --output ci-out/mutation/mutation-score.json
       - name: Upload advisory mutation evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mutation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out/mutation
