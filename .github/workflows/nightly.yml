@@ -57,7 +57,7 @@ jobs:
         run: ./target/ci/hell-ci divergence-prototype verify
       - name: Upload nightly bounded compatibility evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out
@@ -140,7 +140,7 @@ jobs:
         run: ./target/ci/hell-ci fuzz-corpus verify-clean --input crates/hell-ci/fuzz/corpus
       - name: Retain evolving semantic fuzz corpora
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: semantic-fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out/fuzz-corpora
@@ -148,7 +148,7 @@ jobs:
           retention-days: 30
       - name: Retain semantic fuzz crash artifacts
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: semantic-fuzz-crashes-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out/fuzz-artifacts
@@ -243,7 +243,7 @@ jobs:
         run: ./target/ci/hell-ci native-oracle-shard --source oracle-source --platform macos-arm64 --dependency-attestation ci-out/dependency-policy.json --report ci-out/macos-oracle.json
       - name: Upload nightly report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out
@@ -332,7 +332,7 @@ jobs:
         run: .\target\ci\hell-ci.exe native-oracle-shard --source oracle-source --platform windows-amd64 --dependency-attestation ci-out\dependency-policy.json --report ci-out\windows-oracle.json
       - name: Upload nightly report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-windows-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-out
